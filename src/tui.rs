@@ -1,6 +1,9 @@
 //! Ratatui view state and terminal lifecycle.
 
-use std::io::{Stdout, stdout};
+use std::{
+    io::{Stdout, stdout},
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow};
 use crossterm::{
@@ -27,7 +30,9 @@ use crate::{
 #[derive(Clone, Debug, Default)]
 pub struct TuiState {
     identity: Option<Health>,
+    pending_identity: Option<Health>,
     counter: Option<u64>,
+    recovery: Option<(u32, Duration)>,
     fatal_error: Option<String>,
 }
 
@@ -36,15 +41,31 @@ impl TuiState {
         match event {
             ManagedEvent::Connecting => {
                 self.identity = None;
+                self.pending_identity = None;
                 self.counter = None;
+                self.recovery = None;
                 self.fatal_error = None;
             }
             ManagedEvent::Connected(identity) => {
-                self.identity = Some(identity);
+                self.pending_identity = Some(identity);
                 self.fatal_error = None;
             }
-            ManagedEvent::Snapshot(snapshot) => self.counter = Some(snapshot.value),
+            ManagedEvent::Snapshot(snapshot) => {
+                if self
+                    .pending_identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.instance_id == snapshot.instance_id)
+                {
+                    self.identity = self.pending_identity.take();
+                }
+                self.counter = Some(snapshot.value);
+                self.recovery = None;
+            }
             ManagedEvent::CounterUpdated(update) => self.counter = Some(update.value),
+            ManagedEvent::Recovering { attempt, retry_in } => {
+                self.recovery = Some((attempt, retry_in));
+                self.fatal_error = None;
+            }
             ManagedEvent::Fatal(error) => self.fatal_error = Some(error),
         }
     }
@@ -142,6 +163,13 @@ fn status_text(state: &TuiState) -> String {
     if let Some(error) = &state.fatal_error {
         return format!("Connection failed: {error}");
     }
+    if let Some((attempt, retry_in)) = state.recovery {
+        let last_server = state.identity.as_ref().map_or_else(
+            || "no previous server".to_owned(),
+            |identity| format!("last server pid {}", identity.pid),
+        );
+        return format!("Recovering (attempt {attempt}, retry in {retry_in:?}) | {last_server}");
+    }
     match &state.identity {
         Some(identity) => format!(
             "Connected | pid {} | server {}",
@@ -155,7 +183,7 @@ fn status_text(state: &TuiState) -> String {
 fn status_style(state: &TuiState) -> Style {
     if state.fatal_error.is_some() {
         Style::default().fg(Color::Red)
-    } else if state.identity.is_some() {
+    } else if state.identity.is_some() && state.recovery.is_none() {
         Style::default().fg(Color::Green)
     } else {
         Style::default().fg(Color::Yellow)

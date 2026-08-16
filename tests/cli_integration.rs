@@ -3,7 +3,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -15,7 +15,7 @@ use axum::{
     routing::get,
 };
 use chidori::{
-    managed_client::{ManagedClient, ManagedClientConfig},
+    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
         BUILD_IDENTITY, CounterSnapshot, Health, LifecycleState, PROTOCOL_VERSION,
         RuntimeDescriptor, SNAPSHOT_EVENT,
@@ -93,6 +93,192 @@ async fn simultaneous_launchers_converge_on_one_authenticated_server() {
 
     drop(clients);
     stop_test_server(state_dir.path(), channel);
+}
+
+#[tokio::test]
+async fn managed_clients_recover_from_a_crash_and_converge_on_one_replacement() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "crash-recovery-test";
+    let config = ManagedClientConfig::new(state_dir.path(), channel)
+        .expect("configure managed client")
+        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+    let mut first = ManagedClient::connect(config.clone())
+        .await
+        .expect("connect first managed client");
+    let mut second = ManagedClient::connect(config)
+        .await
+        .expect("connect second managed client");
+    let (first_identity, _) = receive_initial_state(&mut first).await;
+    let (second_identity, _) = receive_initial_state(&mut second).await;
+    assert_eq!(first_identity.instance_id, second_identity.instance_id);
+
+    stop_test_server(state_dir.path(), channel);
+
+    let (first_recovered, second_recovered) = tokio::join!(
+        receive_recovered_state(&mut first, first_identity.instance_id),
+        receive_recovered_state(&mut second, second_identity.instance_id),
+    );
+    assert_ne!(first_recovered.0.instance_id, first_identity.instance_id);
+    assert_eq!(
+        first_recovered.0.instance_id,
+        second_recovered.0.instance_id
+    );
+    assert_eq!(first_recovered.0.pid, second_recovered.0.pid);
+    assert_eq!(first_recovered.1.instance_id, first_recovered.0.instance_id);
+    assert_eq!(
+        second_recovered.1.instance_id,
+        second_recovered.0.instance_id
+    );
+
+    let (first_update, second_update) = tokio::join!(
+        receive_counter_update(&mut first),
+        receive_counter_update(&mut second),
+    );
+    assert!(first_update.value > first_recovered.1.value);
+    assert!(second_update.value > second_recovered.1.value);
+
+    drop(first);
+    let later_second_update = receive_counter_update(&mut second).await;
+    assert!(later_second_update.value > second_update.value);
+
+    drop(second);
+    stop_test_server(state_dir.path(), channel);
+}
+
+async fn receive_recovered_state(
+    client: &mut ManagedClient,
+    previous_instance_id: Uuid,
+) -> (Health, CounterSnapshot) {
+    timeout(Duration::from_secs(10), async {
+        let mut saw_recovering = false;
+        let mut recovered_identity = None;
+        loop {
+            match client.next().await.expect("managed client remains open") {
+                ManagedEvent::Recovering { .. } => saw_recovering = true,
+                ManagedEvent::Connected(identity) if saw_recovering => {
+                    assert_ne!(identity.instance_id, previous_instance_id);
+                    recovered_identity = Some(identity);
+                }
+                ManagedEvent::Snapshot(snapshot) if recovered_identity.is_some() => {
+                    return (recovered_identity.expect("recovered identity"), snapshot);
+                }
+                ManagedEvent::Fatal(error) => panic!("managed client recovery failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("managed client recovers from the crashed server")
+}
+
+async fn receive_counter_update(client: &mut ManagedClient) -> chidori::protocol::CounterUpdate {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match client.next().await.expect("managed client remains open") {
+                ManagedEvent::CounterUpdated(update) => return update,
+                ManagedEvent::Fatal(error) => panic!("managed client failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("counter updates resume after recovery")
+}
+
+#[tokio::test]
+async fn recovery_backoff_is_exponential_and_capped_at_five_seconds() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "recovery-backoff-test";
+    let _fixture = ReadinessFixture::spawn_recovery_backoff(state_dir.path(), channel).await;
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_server_executable(state_dir.path().join("must-not-spawn")),
+    )
+    .await
+    .expect("connect managed client");
+    receive_initial_state(&mut client).await;
+
+    let mut previous_nonzero_wait = None;
+    let mut observed_cap = false;
+    for expected_attempt in 1..=10 {
+        let event = timeout(
+            previous_nonzero_wait.unwrap_or(Duration::ZERO) + Duration::from_secs(2),
+            client.next(),
+        )
+        .await
+        .expect("next recovery state arrives")
+        .expect("managed client remains open");
+        let ManagedEvent::Recovering { attempt, retry_in } = event else {
+            panic!("expected recovering event, got {event:?}");
+        };
+        assert_eq!(attempt, expected_attempt);
+        assert!(retry_in <= Duration::from_secs(5));
+        if expected_attempt == 1 {
+            assert!(retry_in.is_zero());
+        } else if let Some(previous) = previous_nonzero_wait {
+            assert_eq!(
+                retry_in,
+                previous.saturating_mul(2).min(Duration::from_secs(5))
+            );
+        } else {
+            assert!(!retry_in.is_zero());
+        }
+        if retry_in == Duration::from_secs(5) {
+            observed_cap = true;
+            break;
+        }
+        if !retry_in.is_zero() {
+            previous_nonzero_wait = Some(retry_in);
+        }
+    }
+
+    assert!(
+        observed_cap,
+        "recovery backoff never reached its five-second cap"
+    );
+}
+
+#[tokio::test]
+async fn dropping_a_recovering_client_cancels_its_next_network_attempt_promptly() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "recovery-cancellation-test";
+    let fixture = ReadinessFixture::spawn_recovery_backoff(state_dir.path(), channel).await;
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_server_executable(state_dir.path().join("must-not-spawn")),
+    )
+    .await
+    .expect("connect managed client");
+    receive_initial_state(&mut client).await;
+
+    let first = timeout(Duration::from_secs(1), client.next())
+        .await
+        .expect("first recovery state arrives")
+        .expect("managed client remains open");
+    let ManagedEvent::Recovering { attempt, retry_in } = first else {
+        panic!("expected recovering event, got {first:?}");
+    };
+    assert_eq!(attempt, 1);
+    assert_eq!(retry_in, Duration::ZERO);
+    let second = timeout(Duration::from_secs(1), client.next())
+        .await
+        .expect("scheduled retry state arrives")
+        .expect("managed client remains open");
+    let ManagedEvent::Recovering { attempt, retry_in } = second else {
+        panic!("expected recovering event, got {second:?}");
+    };
+    assert_eq!(attempt, 2);
+    assert_eq!(retry_in, Duration::from_millis(50));
+    let requests_before_drop = fixture.event_requests();
+
+    let drop_started = std::time::Instant::now();
+    drop(client);
+    assert!(drop_started.elapsed() < Duration::from_millis(100));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(fixture.event_requests(), requests_before_drop);
 }
 
 #[tokio::test]
@@ -467,12 +653,15 @@ struct ReadinessState {
     lifecycle: Arc<Mutex<LifecycleState>>,
     events_opened: Arc<AtomicBool>,
     events_ready: Arc<AtomicBool>,
+    event_requests: Arc<AtomicUsize>,
+    disconnect_after_snapshot: bool,
 }
 
 struct ReadinessFixture {
     lifecycle: Arc<Mutex<LifecycleState>>,
     events_opened: Arc<AtomicBool>,
     events_ready: Arc<AtomicBool>,
+    event_requests: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -481,6 +670,19 @@ impl ReadinessFixture {
         state_dir: &std::path::Path,
         channel: &str,
         initial_lifecycle: LifecycleState,
+    ) -> Self {
+        Self::spawn_with_event_behavior(state_dir, channel, initial_lifecycle, false).await
+    }
+
+    async fn spawn_recovery_backoff(state_dir: &std::path::Path, channel: &str) -> Self {
+        Self::spawn_with_event_behavior(state_dir, channel, LifecycleState::Ready, true).await
+    }
+
+    async fn spawn_with_event_behavior(
+        state_dir: &std::path::Path,
+        channel: &str,
+        initial_lifecycle: LifecycleState,
+        disconnect_after_snapshot: bool,
     ) -> Self {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -504,11 +706,14 @@ impl ReadinessFixture {
         let lifecycle = Arc::new(Mutex::new(initial_lifecycle));
         let events_opened = Arc::new(AtomicBool::new(false));
         let events_ready = Arc::new(AtomicBool::new(true));
+        let event_requests = Arc::new(AtomicUsize::new(0));
         let state = ReadinessState {
             descriptor,
             lifecycle: lifecycle.clone(),
             events_opened: events_opened.clone(),
             events_ready: events_ready.clone(),
+            event_requests: event_requests.clone(),
+            disconnect_after_snapshot,
         };
         let app = Router::new()
             .route("/health", get(readiness_health))
@@ -524,8 +729,13 @@ impl ReadinessFixture {
             lifecycle,
             events_opened,
             events_ready,
+            event_requests,
             task,
         }
+    }
+
+    fn event_requests(&self) -> usize {
+        self.event_requests.load(Ordering::SeqCst)
     }
 }
 
@@ -555,6 +765,10 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
         return StatusCode::UNAUTHORIZED.into_response();
     }
     state.events_opened.store(true, Ordering::SeqCst);
+    let request_index = state.event_requests.fetch_add(1, Ordering::SeqCst);
+    if state.disconnect_after_snapshot && request_index > 0 {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     if !state.events_ready.load(Ordering::SeqCst) {
         return std::future::pending().await;
     }
@@ -575,7 +789,11 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
                 .expect("serialize fixture snapshot"),
         )
     });
-    Sse::new(first.chain(stream::pending())).into_response()
+    if state.disconnect_after_snapshot {
+        Sse::new(first).into_response()
+    } else {
+        Sse::new(first.chain(stream::pending())).into_response()
+    }
 }
 
 fn fixture_authenticated(headers: &HeaderMap, token: &str) -> bool {

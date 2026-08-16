@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use eventsource_stream::{Event, Eventsource};
+use eventsource_stream::{Event, EventStreamError, Eventsource};
 use fs2::FileExt;
 use futures_util::StreamExt;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -26,6 +26,8 @@ use crate::{
 const SERVER_LOG_FILE: &str = "server.log";
 const SERVER_LOG_TAIL_BYTES: u64 = 8 * 1024;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const INITIAL_RECOVERY_BACKOFF: Duration = Duration::from_millis(50);
+const MAX_RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct ManagedClientConfig {
@@ -78,6 +80,7 @@ pub enum ManagedEvent {
     Connected(Health),
     Snapshot(CounterSnapshot),
     CounterUpdated(CounterUpdate),
+    Recovering { attempt: u32, retry_in: Duration },
     Fatal(String),
 }
 
@@ -89,43 +92,10 @@ pub struct ManagedClient {
 impl ManagedClient {
     pub async fn connect(config: ManagedClientConfig) -> Result<Self> {
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
-        let (descriptor, health) = ensure_server(&config, deadline).await?;
-
         let http = reqwest::Client::new();
-        let response = match tokio::time::timeout_at(
-            deadline,
-            http.get(format!("{}/v1/events", descriptor.base_url))
-                .bearer_auth(&descriptor.token)
-                .send(),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response.error_for_status().map_err(|error| {
-                startup_error(
-                    &config,
-                    &format!("server rejected the initial event stream: {error}"),
-                )
-            })?,
-            Ok(Err(error)) => {
-                return Err(startup_error(
-                    &config,
-                    &format!("could not open the initial event stream: {error}"),
-                ));
-            }
-            Err(_) => {
-                return Err(startup_error(
-                    &config,
-                    "initial event stream did not open within 15s",
-                ));
-            }
-        };
+        let connection = establish_connection(&config, &http, deadline).await?;
         let (events_tx, events_rx) = mpsc::channel(32);
-        let task = tokio::spawn(stream_events(
-            response,
-            events_tx,
-            health,
-            descriptor.instance_id,
-        ));
+        let task = tokio::spawn(run_managed_client(config, http, connection, events_tx));
 
         Ok(Self {
             events: events_rx,
@@ -136,6 +106,52 @@ impl ManagedClient {
     pub async fn next(&mut self) -> Option<ManagedEvent> {
         self.events.recv().await
     }
+}
+
+struct ActiveConnection {
+    descriptor: RuntimeDescriptor,
+    health: Health,
+    response: reqwest::Response,
+}
+
+async fn establish_connection(
+    config: &ManagedClientConfig,
+    http: &reqwest::Client,
+    deadline: tokio::time::Instant,
+) -> Result<ActiveConnection> {
+    let (descriptor, health) = ensure_server(config, deadline).await?;
+    let response = match tokio::time::timeout_at(
+        deadline,
+        http.get(format!("{}/v1/events", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .send(),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response.error_for_status().map_err(|error| {
+            startup_error(
+                config,
+                &format!("server rejected the initial event stream: {error}"),
+            )
+        })?,
+        Ok(Err(error)) => {
+            return Err(startup_error(
+                config,
+                &format!("could not open the initial event stream: {error}"),
+            ));
+        }
+        Err(_) => {
+            return Err(startup_error(
+                config,
+                "initial event stream did not open within 15s",
+            ));
+        }
+    };
+    Ok(ActiveConnection {
+        descriptor,
+        health,
+        response,
+    })
 }
 
 pub async fn start_server(config: &ManagedClientConfig) -> Result<Health> {
@@ -324,33 +340,92 @@ impl Drop for ManagedClient {
     }
 }
 
-async fn stream_events(
-    response: reqwest::Response,
+async fn run_managed_client(
+    config: ManagedClientConfig,
+    http: reqwest::Client,
+    mut connection: ActiveConnection,
     events: mpsc::Sender<ManagedEvent>,
-    health: Health,
-    expected_instance_id: uuid::Uuid,
 ) {
     if events.send(ManagedEvent::Connecting).await.is_err() {
         return;
     }
-    if events.send(ManagedEvent::Connected(health)).await.is_err() {
-        return;
-    }
 
+    loop {
+        if events
+            .send(ManagedEvent::Connected(connection.health))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        match stream_events(
+            connection.response,
+            &events,
+            connection.descriptor.instance_id,
+        )
+        .await
+        {
+            Ok(StreamOutcome::Disconnected) => {}
+            Ok(StreamOutcome::ReceiverClosed) => return,
+            Err(error) => {
+                let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
+                return;
+            }
+        }
+
+        let mut attempt = 1;
+        let mut retry_in = Duration::ZERO;
+        loop {
+            if events
+                .send(ManagedEvent::Recovering { attempt, retry_in })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(retry_in).await;
+
+            let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+            match establish_connection(&config, &http, deadline).await {
+                Ok(recovered) => {
+                    connection = recovered;
+                    break;
+                }
+                Err(_) => {
+                    attempt = attempt.saturating_add(1);
+                    retry_in = next_recovery_backoff(retry_in);
+                }
+            }
+        }
+    }
+}
+
+fn next_recovery_backoff(previous: Duration) -> Duration {
+    if previous.is_zero() {
+        INITIAL_RECOVERY_BACKOFF
+    } else {
+        previous.saturating_mul(2).min(MAX_RECOVERY_BACKOFF)
+    }
+}
+
+enum StreamOutcome {
+    Disconnected,
+    ReceiverClosed,
+}
+
+async fn stream_events(
+    response: reqwest::Response,
+    events: &mpsc::Sender<ManagedEvent>,
+    expected_instance_id: uuid::Uuid,
+) -> Result<StreamOutcome> {
     let mut stream = response.bytes_stream().eventsource();
     let mut last_revision = None;
     let mut saw_snapshot = false;
     while let Some(next) = stream.next().await {
         let event = match next {
             Ok(event) => event,
-            Err(error) => {
-                let _ = events
-                    .send(ManagedEvent::Fatal(format!(
-                        "server event stream failed: {error}"
-                    )))
-                    .await;
-                return;
-            }
+            Err(EventStreamError::Transport(_)) => return Ok(StreamOutcome::Disconnected),
+            Err(error) => bail!("server event stream failed: {error}"),
         };
         let managed_event = match decode_event(
             event,
@@ -360,19 +435,14 @@ async fn stream_events(
         ) {
             Ok(event) => event,
             Err(error) => {
-                let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
-                return;
+                return Err(error);
             }
         };
         if events.send(managed_event).await.is_err() {
-            return;
+            return Ok(StreamOutcome::ReceiverClosed);
         }
     }
-    let _ = events
-        .send(ManagedEvent::Fatal(
-            "server event stream closed unexpectedly".to_owned(),
-        ))
-        .await;
+    Ok(StreamOutcome::Disconnected)
 }
 
 fn decode_event(
