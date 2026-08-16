@@ -1,8 +1,27 @@
 use chidori::{
     managed_client::{ManagedClient, ManagedEvent},
-    protocol::{CounterSnapshot, Health},
+    protocol::{CounterSnapshot, Health, RuntimeDescriptor},
 };
 use tokio::time::{Duration, timeout};
+
+pub fn write_runtime_descriptor(path: impl AsRef<std::path::Path>, descriptor: &RuntimeDescriptor) {
+    let path = path.as_ref();
+    serde_json::to_writer(
+        std::fs::File::create(path)
+            .unwrap_or_else(|error| panic!("create runtime descriptor {path:?}: {error}")),
+        descriptor,
+    )
+    .unwrap_or_else(|error| panic!("write runtime descriptor {path:?}: {error}"));
+}
+
+pub fn read_runtime_descriptor(path: impl AsRef<std::path::Path>) -> RuntimeDescriptor {
+    let path = path.as_ref();
+    serde_json::from_reader(
+        std::fs::File::open(path)
+            .unwrap_or_else(|error| panic!("open runtime descriptor {path:?}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("decode runtime descriptor {path:?}: {error}"))
+}
 
 pub async fn receive_initial_state(client: &mut ManagedClient) -> (Health, CounterSnapshot) {
     assert!(matches!(

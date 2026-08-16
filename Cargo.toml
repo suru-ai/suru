@@ -22,3 +22,6 @@ uuid = { version = "1.18.1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 sysinfo = "0.37.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }

@@ -20,6 +20,7 @@ use crate::{
         COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
         RuntimeDescriptor, SNAPSHOT_EVENT,
     },
+    runtime::protect_current_user_file,
 };
 
 const SERVER_LOG_FILE: &str = "server.log";
@@ -245,6 +246,7 @@ fn spawn_detached(config: &ManagedClientConfig) -> Result<Child> {
     let stdout = log_options
         .open(&log_path)
         .with_context(|| format!("open server log {log_path:?}"))?;
+    protect_current_user_file(&log_path)?;
     let stderr = stdout.try_clone().context("clone server log handle")?;
 
     let mut command = Command::new(&config.server_executable);

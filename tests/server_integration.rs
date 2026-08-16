@@ -7,7 +7,7 @@ use tokio::time::{Duration, timeout};
 
 mod support;
 
-use support::receive_initial_state;
+use support::{read_runtime_descriptor, receive_initial_state, write_runtime_descriptor};
 
 #[tokio::test]
 async fn authenticated_health_describes_the_ready_server() {
@@ -81,6 +81,13 @@ async fn authenticated_health_describes_the_ready_server() {
             & 0o777;
         assert_eq!(descriptor_mode, 0o600);
 
+        let lock_mode = std::fs::metadata(state_dir.path().join("health-test/server.lock"))
+            .expect("read server lock metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(lock_mode, 0o600);
+
         let directory_mode = std::fs::metadata(state_dir.path().join("health-test"))
             .expect("read runtime directory metadata")
             .permissions()
@@ -109,11 +116,7 @@ async fn server_recovers_from_an_abandoned_partial_publication() {
             .await
             .expect("recover from abandoned partial publication");
 
-    let published: chidori::protocol::RuntimeDescriptor = serde_json::from_reader(
-        std::fs::File::open(runtime_dir.join("runtime.json"))
-            .expect("open recovered runtime descriptor"),
-    )
-    .expect("decode recovered runtime descriptor");
+    let published = read_runtime_descriptor(runtime_dir.join("runtime.json"));
     assert_eq!(published.instance_id, server.descriptor().instance_id);
 
     server.shutdown().await.expect("shut down server");
@@ -159,20 +162,11 @@ async fn shutdown_does_not_remove_a_descriptor_owned_by_another_instance() {
     let server = server::spawn(config.clone()).await.expect("spawn server");
     let mut replacement = server.descriptor().clone();
     replacement.instance_id = uuid::Uuid::new_v4();
-    serde_json::to_writer(
-        std::fs::File::create(config.descriptor_path())
-            .expect("replace runtime descriptor fixture"),
-        &replacement,
-    )
-    .expect("write replacement runtime descriptor fixture");
+    write_runtime_descriptor(config.descriptor_path(), &replacement);
 
     server.shutdown().await.expect("shut down original server");
 
-    let remaining: chidori::protocol::RuntimeDescriptor = serde_json::from_reader(
-        std::fs::File::open(config.descriptor_path())
-            .expect("replacement runtime descriptor remains"),
-    )
-    .expect("decode replacement runtime descriptor");
+    let remaining = read_runtime_descriptor(config.descriptor_path());
     assert_eq!(remaining.instance_id, replacement.instance_id);
 }
 
@@ -197,11 +191,7 @@ async fn descriptor_replacement_never_exposes_a_partial_publication() {
         protocol_version: chidori::protocol::PROTOCOL_VERSION,
         build_identity: chidori::protocol::BUILD_IDENTITY.to_owned(),
     };
-    serde_json::to_writer(
-        std::fs::File::create(&descriptor_path).expect("create stale runtime descriptor"),
-        &stale,
-    )
-    .expect("write stale runtime descriptor");
+    write_runtime_descriptor(&descriptor_path, &stale);
 
     let ready = Arc::new(Barrier::new(2));
     let stop = Arc::new(AtomicBool::new(false));

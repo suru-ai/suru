@@ -28,6 +28,7 @@ use crate::protocol::{
     BUILD_IDENTITY, COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
     PROTOCOL_VERSION, RuntimeDescriptor, SNAPSHOT_EVENT,
 };
+use crate::runtime::protect_current_user_file;
 
 pub type ServerConfig = RuntimeConfig;
 
@@ -93,6 +94,7 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
         .context("open server election lock")?;
     lock.try_lock_exclusive()
         .context("another server already owns this channel")?;
+    protect_current_user_file(&config.lock_path())?;
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -273,6 +275,7 @@ fn write_descriptor(path: &Path, descriptor: &RuntimeDescriptor) -> Result<()> {
         .persist(path)
         .map_err(|error| error.error)
         .context("publish runtime descriptor atomically")?;
+    protect_current_user_file(path)?;
     published
         .sync_all()
         .context("flush published runtime descriptor")?;
@@ -294,11 +297,36 @@ fn sync_runtime_directory(_path: &Path) -> Result<()> {
 }
 
 fn remove_own_descriptor(path: &Path, instance_id: Uuid) {
-    let belongs_to_instance = File::open(path)
+    let initially_belongs_to_instance = File::open(path)
         .ok()
         .and_then(|file| serde_json::from_reader::<_, RuntimeDescriptor>(file).ok())
         .is_some_and(|descriptor| descriptor.instance_id == instance_id);
-    if belongs_to_instance {
-        let _ = fs::remove_file(path);
+    if !initially_belongs_to_instance {
+        return;
+    }
+
+    // Move the exact path entry aside before deleting it. If another writer replaced the
+    // descriptor after the first identity check, the quarantined file will fail the second check
+    // and be restored without overwriting anything newer at the canonical path.
+    let quarantine_path = path.with_extension(format!(
+        "cleanup-{}-{}",
+        instance_id,
+        Uuid::new_v4().simple()
+    ));
+    if fs::rename(path, &quarantine_path).is_err() {
+        return;
+    }
+
+    let quarantined_belongs_to_instance = File::open(&quarantine_path)
+        .ok()
+        .and_then(|file| serde_json::from_reader::<_, RuntimeDescriptor>(file).ok())
+        .is_some_and(|descriptor| descriptor.instance_id == instance_id);
+    if quarantined_belongs_to_instance {
+        let _ = fs::remove_file(&quarantine_path);
+        return;
+    }
+
+    if fs::hard_link(&quarantine_path, path).is_ok() {
+        let _ = fs::remove_file(&quarantine_path);
     }
 }

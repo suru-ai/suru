@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 mod support;
 
-use support::receive_initial_state;
+use support::{read_runtime_descriptor, receive_initial_state, write_runtime_descriptor};
 
 #[tokio::test]
 async fn simultaneous_launchers_converge_on_one_authenticated_server() {
@@ -127,9 +127,8 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
     let channel = "stale-live-pid-test";
     let runtime_dir = state_dir.path().join(channel);
     std::fs::create_dir_all(&runtime_dir).expect("create stale runtime directory");
-    serde_json::to_writer(
-        std::fs::File::create(runtime_dir.join("runtime.json"))
-            .expect("create stale runtime descriptor"),
+    write_runtime_descriptor(
+        runtime_dir.join("runtime.json"),
         &RuntimeDescriptor {
             base_url: "http://127.0.0.1:9".to_owned(),
             token: "stale-token".to_owned(),
@@ -138,8 +137,7 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
             protocol_version: PROTOCOL_VERSION,
             build_identity: BUILD_IDENTITY.to_owned(),
         },
-    )
-    .expect("write stale runtime descriptor");
+    );
 
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
@@ -187,11 +185,7 @@ async fn managed_client_recovers_from_malformed_and_partially_written_descriptor
         .await
         .expect("recover from invalid runtime descriptor");
         let (identity, _) = receive_initial_state(&mut client).await;
-        let published: RuntimeDescriptor = serde_json::from_reader(
-            std::fs::File::open(runtime_dir.join("runtime.json"))
-                .expect("open recovered runtime descriptor"),
-        )
-        .expect("decode recovered runtime descriptor");
+        let published = read_runtime_descriptor(runtime_dir.join("runtime.json"));
         assert_eq!(published.instance_id, identity.instance_id);
         assert_eq!(published.pid, identity.pid);
 
@@ -220,12 +214,7 @@ async fn reuse_requires_an_authenticated_matching_server_identity() {
         std::fs::create_dir_all(&runtime_dir).expect("create stale runtime directory");
         let mut stale = decoy.descriptor().clone();
         mutate(&mut stale);
-        serde_json::to_writer(
-            std::fs::File::create(runtime_dir.join("runtime.json"))
-                .expect("create stale runtime descriptor"),
-            &stale,
-        )
-        .expect("write stale runtime descriptor");
+        write_runtime_descriptor(runtime_dir.join("runtime.json"), &stale);
 
         let mut client = ManagedClient::connect(
             ManagedClientConfig::new(state_dir.path(), channel)
@@ -278,10 +267,7 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
         String::from_utf8_lossy(&output.stderr)
     );
     let descriptor_path = state_dir.path().join(channel).join("runtime.json");
-    let first_descriptor: RuntimeDescriptor = serde_json::from_reader(
-        std::fs::File::open(&descriptor_path).expect("open first runtime descriptor"),
-    )
-    .expect("decode first runtime descriptor");
+    let first_descriptor = read_runtime_descriptor(&descriptor_path);
 
     let repeated = Command::new(env!("CARGO_BIN_EXE_chidori"))
         .args(["server", "start"])
@@ -294,10 +280,7 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
         "repeated server start failed: {}",
         String::from_utf8_lossy(&repeated.stderr)
     );
-    let repeated_descriptor: RuntimeDescriptor = serde_json::from_reader(
-        std::fs::File::open(descriptor_path).expect("open repeated runtime descriptor"),
-    )
-    .expect("decode repeated runtime descriptor");
+    let repeated_descriptor = read_runtime_descriptor(descriptor_path);
     assert_eq!(repeated_descriptor.pid, first_descriptor.pid);
     assert_eq!(
         repeated_descriptor.instance_id,
@@ -516,12 +499,7 @@ impl ReadinessFixture {
         };
         let runtime_dir = state_dir.join(channel);
         std::fs::create_dir_all(&runtime_dir).expect("create fixture runtime directory");
-        serde_json::to_writer(
-            std::fs::File::create(runtime_dir.join("runtime.json"))
-                .expect("create fixture runtime descriptor"),
-            &descriptor,
-        )
-        .expect("write fixture runtime descriptor");
+        write_runtime_descriptor(runtime_dir.join("runtime.json"), &descriptor);
 
         let lifecycle = Arc::new(Mutex::new(initial_lifecycle));
         let events_opened = Arc::new(AtomicBool::new(false));
@@ -609,10 +587,7 @@ fn fixture_authenticated(headers: &HeaderMap, token: &str) -> bool {
 
 fn stop_test_server(state_dir: &std::path::Path, channel: &str) {
     let descriptor_path = state_dir.join(channel).join("runtime.json");
-    let descriptor: RuntimeDescriptor = serde_json::from_reader(
-        std::fs::File::open(descriptor_path).expect("open test server descriptor"),
-    )
-    .expect("decode test server descriptor");
+    let descriptor = read_runtime_descriptor(descriptor_path);
     let mut system = System::new_all();
     system.refresh_all();
     let process = system
