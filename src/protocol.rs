@@ -56,7 +56,6 @@ pub struct CounterUpdate {
 #[serde(rename_all = "snake_case")]
 pub enum ShutdownReason {
     Manual,
-    Replacement,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
