@@ -1,6 +1,6 @@
 use chidori::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
-    protocol::{Health, LifecycleState},
+    protocol::{Health, LifecycleState, ShutdownReason},
     server::{self, ServerConfig},
 };
 use tokio::time::{Duration, timeout};
@@ -435,6 +435,51 @@ async fn managed_client_receives_snapshot_before_absolute_counter_updates() {
 
     drop(client);
     server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn graceful_server_shutdown_emits_intent_without_starting_crash_recovery() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "shutdown-intent-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let instance_id = server.descriptor().instance_id;
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "shutdown-intent-test")
+            .expect("configure managed client"),
+    )
+    .await
+    .expect("connect managed client");
+    receive_initial_state(&mut client).await;
+
+    let observe_shutdown = async {
+        loop {
+            match timeout(Duration::from_secs(1), client.next())
+                .await
+                .expect("shutdown intent arrives")
+            {
+                Some(ManagedEvent::ServerShutdown(shutdown)) => {
+                    assert_eq!(shutdown.instance_id, instance_id);
+                    assert_eq!(shutdown.reason, ShutdownReason::Manual);
+                    break;
+                }
+                Some(ManagedEvent::CounterUpdated(_)) => {}
+                Some(ManagedEvent::Recovering(status)) => {
+                    panic!("graceful shutdown triggered recovery: {status:?}")
+                }
+                Some(event) => panic!("expected shutdown intent, got {event:?}"),
+                None => panic!("managed client closed without shutdown intent"),
+            }
+        }
+        assert!(matches!(
+            timeout(Duration::from_secs(1), client.next()).await,
+            Ok(None)
+        ));
+    };
+    let (shutdown_result, ()) = tokio::join!(server.shutdown(), observe_shutdown);
+    shutdown_result.expect("shut down server gracefully");
 }
 
 #[tokio::test]

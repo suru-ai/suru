@@ -18,7 +18,7 @@ use chidori::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
         BUILD_IDENTITY, CounterSnapshot, Health, LifecycleState, PROTOCOL_VERSION,
-        RuntimeDescriptor, SNAPSHOT_EVENT,
+        RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown, ShutdownReason,
     },
     server::{self, ServerConfig},
 };
@@ -154,7 +154,7 @@ async fn receive_recovered_state(
         let mut recovered_identity = None;
         loop {
             match client.next().await.expect("managed client remains open") {
-                ManagedEvent::Recovering { .. } => saw_recovering = true,
+                ManagedEvent::Recovering(_) => saw_recovering = true,
                 ManagedEvent::Connected(identity) if saw_recovering => {
                     assert_ne!(identity.instance_id, previous_instance_id);
                     recovered_identity = Some(identity);
@@ -209,27 +209,27 @@ async fn recovery_backoff_is_exponential_and_capped_at_five_seconds() {
         .await
         .expect("next recovery state arrives")
         .expect("managed client remains open");
-        let ManagedEvent::Recovering { attempt, retry_in } = event else {
+        let ManagedEvent::Recovering(status) = event else {
             panic!("expected recovering event, got {event:?}");
         };
-        assert_eq!(attempt, expected_attempt);
-        assert!(retry_in <= Duration::from_secs(5));
+        assert_eq!(status.attempt, expected_attempt);
+        assert!(status.retry_in <= Duration::from_secs(5));
         if expected_attempt == 1 {
-            assert!(retry_in.is_zero());
+            assert!(status.retry_in.is_zero());
         } else if let Some(previous) = previous_nonzero_wait {
             assert_eq!(
-                retry_in,
+                status.retry_in,
                 previous.saturating_mul(2).min(Duration::from_secs(5))
             );
         } else {
-            assert!(!retry_in.is_zero());
+            assert!(!status.retry_in.is_zero());
         }
-        if retry_in == Duration::from_secs(5) {
+        if status.retry_in == Duration::from_secs(5) {
             observed_cap = true;
             break;
         }
-        if !retry_in.is_zero() {
-            previous_nonzero_wait = Some(retry_in);
+        if !status.retry_in.is_zero() {
+            previous_nonzero_wait = Some(status.retry_in);
         }
     }
 
@@ -257,20 +257,20 @@ async fn dropping_a_recovering_client_cancels_its_next_network_attempt_promptly(
         .await
         .expect("first recovery state arrives")
         .expect("managed client remains open");
-    let ManagedEvent::Recovering { attempt, retry_in } = first else {
+    let ManagedEvent::Recovering(status) = first else {
         panic!("expected recovering event, got {first:?}");
     };
-    assert_eq!(attempt, 1);
-    assert_eq!(retry_in, Duration::ZERO);
+    assert_eq!(status.attempt, 1);
+    assert_eq!(status.retry_in, Duration::ZERO);
     let second = timeout(Duration::from_secs(1), client.next())
         .await
         .expect("scheduled retry state arrives")
         .expect("managed client remains open");
-    let ManagedEvent::Recovering { attempt, retry_in } = second else {
+    let ManagedEvent::Recovering(status) = second else {
         panic!("expected recovering event, got {second:?}");
     };
-    assert_eq!(attempt, 2);
-    assert_eq!(retry_in, Duration::from_millis(50));
+    assert_eq!(status.attempt, 2);
+    assert_eq!(status.retry_in, Duration::from_millis(50));
     let requests_before_drop = fixture.event_requests();
 
     let drop_started = std::time::Instant::now();
@@ -279,6 +279,36 @@ async fn dropping_a_recovering_client_cancels_its_next_network_attempt_promptly(
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     assert_eq!(fixture.event_requests(), requests_before_drop);
+}
+
+#[tokio::test]
+async fn authenticated_shutdown_intent_does_not_trigger_crash_recovery() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "shutdown-intent-test";
+    let fixture = ReadinessFixture::spawn_shutdown_intent(state_dir.path(), channel).await;
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_server_executable(state_dir.path().join("must-not-spawn")),
+    )
+    .await
+    .expect("connect managed client");
+    let (identity, _) = receive_initial_state(&mut client).await;
+
+    let shutdown = timeout(Duration::from_secs(1), client.next())
+        .await
+        .expect("shutdown intent arrives")
+        .expect("managed client reports shutdown intent");
+    let ManagedEvent::ServerShutdown(shutdown) = shutdown else {
+        panic!("expected shutdown intent, got {shutdown:?}");
+    };
+    assert_eq!(shutdown.instance_id, identity.instance_id);
+    assert_eq!(shutdown.reason, ShutdownReason::Manual);
+    assert!(matches!(
+        timeout(Duration::from_secs(1), client.next()).await,
+        Ok(None)
+    ));
+    assert_eq!(fixture.event_requests(), 1);
 }
 
 #[tokio::test]
@@ -654,7 +684,14 @@ struct ReadinessState {
     events_opened: Arc<AtomicBool>,
     events_ready: Arc<AtomicBool>,
     event_requests: Arc<AtomicUsize>,
-    disconnect_after_snapshot: bool,
+    event_behavior: FixtureEventBehavior,
+}
+
+#[derive(Clone, Copy)]
+enum FixtureEventBehavior {
+    StayConnected,
+    DisconnectAfterSnapshot,
+    ShutdownAfterSnapshot,
 }
 
 struct ReadinessFixture {
@@ -671,18 +708,40 @@ impl ReadinessFixture {
         channel: &str,
         initial_lifecycle: LifecycleState,
     ) -> Self {
-        Self::spawn_with_event_behavior(state_dir, channel, initial_lifecycle, false).await
+        Self::spawn_with_event_behavior(
+            state_dir,
+            channel,
+            initial_lifecycle,
+            FixtureEventBehavior::StayConnected,
+        )
+        .await
     }
 
     async fn spawn_recovery_backoff(state_dir: &std::path::Path, channel: &str) -> Self {
-        Self::spawn_with_event_behavior(state_dir, channel, LifecycleState::Ready, true).await
+        Self::spawn_with_event_behavior(
+            state_dir,
+            channel,
+            LifecycleState::Ready,
+            FixtureEventBehavior::DisconnectAfterSnapshot,
+        )
+        .await
+    }
+
+    async fn spawn_shutdown_intent(state_dir: &std::path::Path, channel: &str) -> Self {
+        Self::spawn_with_event_behavior(
+            state_dir,
+            channel,
+            LifecycleState::Ready,
+            FixtureEventBehavior::ShutdownAfterSnapshot,
+        )
+        .await
     }
 
     async fn spawn_with_event_behavior(
         state_dir: &std::path::Path,
         channel: &str,
         initial_lifecycle: LifecycleState,
-        disconnect_after_snapshot: bool,
+        event_behavior: FixtureEventBehavior,
     ) -> Self {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -713,7 +772,7 @@ impl ReadinessFixture {
             events_opened: events_opened.clone(),
             events_ready: events_ready.clone(),
             event_requests: event_requests.clone(),
-            disconnect_after_snapshot,
+            event_behavior,
         };
         let app = Router::new()
             .route("/health", get(readiness_health))
@@ -766,7 +825,11 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
     }
     state.events_opened.store(true, Ordering::SeqCst);
     let request_index = state.event_requests.fetch_add(1, Ordering::SeqCst);
-    if state.disconnect_after_snapshot && request_index > 0 {
+    if matches!(
+        state.event_behavior,
+        FixtureEventBehavior::DisconnectAfterSnapshot
+    ) && request_index > 0
+    {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     if !state.events_ready.load(Ordering::SeqCst) {
@@ -789,10 +852,27 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
                 .expect("serialize fixture snapshot"),
         )
     });
-    if state.disconnect_after_snapshot {
-        Sse::new(first).into_response()
-    } else {
-        Sse::new(first.chain(stream::pending())).into_response()
+    match state.event_behavior {
+        FixtureEventBehavior::StayConnected => {
+            Sse::new(first.chain(stream::pending())).into_response()
+        }
+        FixtureEventBehavior::DisconnectAfterSnapshot => Sse::new(first).into_response(),
+        FixtureEventBehavior::ShutdownAfterSnapshot => {
+            let shutdown = ServerShutdown {
+                instance_id: state.descriptor.instance_id,
+                reason: ShutdownReason::Manual,
+            };
+            let shutdown_event = stream::once(async move {
+                Ok::<_, Infallible>(
+                    Event::default()
+                        .event(SERVER_SHUTDOWN_EVENT)
+                        .id("0")
+                        .json_data(shutdown)
+                        .expect("serialize shutdown intent"),
+                )
+            });
+            Sse::new(first.chain(shutdown_event)).into_response()
+        }
     }
 }
 

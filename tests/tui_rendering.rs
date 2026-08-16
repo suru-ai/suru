@@ -1,5 +1,5 @@
 use chidori::{
-    managed_client::ManagedEvent,
+    managed_client::{ManagedEvent, RecoveryStatus},
     protocol::{CounterSnapshot, Health, LifecycleState},
     tui::{TuiState, render},
 };
@@ -86,10 +86,10 @@ fn recovering_view_retains_the_last_known_counter_and_server_identity() {
         revision: 17,
     }));
 
-    state.apply(ManagedEvent::Recovering {
+    state.apply(ManagedEvent::Recovering(RecoveryStatus {
         attempt: 2,
         retry_in: Duration::from_millis(500),
-    });
+    }));
 
     let screen = rendered_rows(&state).join("\n");
 
@@ -117,10 +117,10 @@ fn recovered_view_switches_identity_and_counter_together_on_the_fresh_snapshot()
         value: 17,
         revision: 17,
     }));
-    state.apply(ManagedEvent::Recovering {
+    state.apply(ManagedEvent::Recovering(RecoveryStatus {
         attempt: 1,
         retry_in: Duration::ZERO,
-    });
+    }));
     state.apply(ManagedEvent::Connected(Health {
         instance_id: recovered_instance_id,
         pid: 84_848,

@@ -26,7 +26,8 @@ use uuid::Uuid;
 use crate::RuntimeConfig;
 use crate::protocol::{
     BUILD_IDENTITY, COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
-    PROTOCOL_VERSION, RuntimeDescriptor, SNAPSHOT_EVENT,
+    PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown,
+    ShutdownReason,
 };
 use crate::runtime::protect_current_user_file;
 
@@ -35,6 +36,7 @@ pub type ServerConfig = RuntimeConfig;
 pub struct RunningServer {
     descriptor: RuntimeDescriptor,
     lifecycle: watch::Sender<LifecycleState>,
+    shutdown_intent: watch::Sender<Option<ServerShutdown>>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<()>>,
 }
@@ -62,6 +64,10 @@ impl RunningServer {
 
     async fn request_shutdown(&mut self) {
         self.lifecycle.send_replace(LifecycleState::Stopping);
+        self.shutdown_intent.send_replace(Some(ServerShutdown {
+            instance_id: self.descriptor.instance_id,
+            reason: ShutdownReason::Manual,
+        }));
         tokio::task::yield_now().await;
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
@@ -74,6 +80,7 @@ struct AppState {
     descriptor: Arc<RuntimeDescriptor>,
     lifecycle: watch::Sender<LifecycleState>,
     counter: watch::Sender<CounterState>,
+    shutdown_intent: watch::Sender<Option<ServerShutdown>>,
 }
 
 #[derive(Clone, Copy)]
@@ -115,10 +122,12 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
         revision: 0,
     });
     let (lifecycle, _) = watch::channel(LifecycleState::Starting);
+    let (shutdown_intent, _) = watch::channel(None);
     let state = AppState {
         descriptor: Arc::new(descriptor.clone()),
         lifecycle: lifecycle.clone(),
         counter: counter.clone(),
+        shutdown_intent: shutdown_intent.clone(),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -156,6 +165,7 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
     Ok(RunningServer {
         descriptor,
         lifecycle,
+        shutdown_intent,
         shutdown: Some(shutdown_tx),
         task,
     })
@@ -170,6 +180,7 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
     }
 
     let mut receiver = state.counter.subscribe();
+    let shutdown_receiver = state.shutdown_intent.subscribe();
     let current = *receiver.borrow_and_update();
     let snapshot = CounterSnapshot {
         instance_id: state.descriptor.instance_id,
@@ -182,22 +193,52 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
         .json_data(snapshot)
         .expect("counter snapshots always serialize");
     let first = stream::once(async move { Ok::<_, std::convert::Infallible>(snapshot_event) });
-    let updates = stream::unfold(receiver, |mut receiver| async move {
-        if receiver.changed().await.is_err() {
-            return None;
-        }
-        let current = *receiver.borrow_and_update();
-        let update = CounterUpdate {
-            value: current.value,
-            revision: current.revision,
-        };
-        let event = Event::default()
-            .event(COUNTER_UPDATED_EVENT)
-            .id(update.revision.to_string())
-            .json_data(update)
-            .expect("counter updates always serialize");
-        Some((Ok::<_, std::convert::Infallible>(event), receiver))
-    });
+    let updates = stream::unfold(
+        (receiver, shutdown_receiver, false),
+        |(mut receiver, mut shutdown_receiver, finished)| async move {
+            if finished {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                changed = shutdown_receiver.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    let shutdown = shutdown_receiver.borrow_and_update().clone()?;
+                    let revision = receiver.borrow().revision;
+                    let event = Event::default()
+                        .event(SERVER_SHUTDOWN_EVENT)
+                        .id(revision.to_string())
+                        .json_data(shutdown)
+                        .expect("server shutdown intents always serialize");
+                    Some((
+                        Ok::<_, std::convert::Infallible>(event),
+                        (receiver, shutdown_receiver, true),
+                    ))
+                }
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    let current = *receiver.borrow_and_update();
+                    let update = CounterUpdate {
+                        value: current.value,
+                        revision: current.revision,
+                    };
+                    let event = Event::default()
+                        .event(COUNTER_UPDATED_EVENT)
+                        .id(update.revision.to_string())
+                        .json_data(update)
+                        .expect("counter updates always serialize");
+                    Some((
+                        Ok::<_, std::convert::Infallible>(event),
+                        (receiver, shutdown_receiver, false),
+                    ))
+                }
+            }
+        },
+    );
 
     Sse::new(first.chain(updates))
         .keep_alive(

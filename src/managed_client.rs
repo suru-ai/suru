@@ -18,7 +18,7 @@ use crate::{
     RuntimeConfig,
     protocol::{
         COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
-        RuntimeDescriptor, SNAPSHOT_EVENT,
+        RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown,
     },
     runtime::protect_current_user_file,
 };
@@ -80,8 +80,15 @@ pub enum ManagedEvent {
     Connected(Health),
     Snapshot(CounterSnapshot),
     CounterUpdated(CounterUpdate),
-    Recovering { attempt: u32, retry_in: Duration },
+    Recovering(RecoveryStatus),
+    ServerShutdown(ServerShutdown),
     Fatal(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryStatus {
+    pub attempt: u32,
+    pub retry_in: Duration,
 }
 
 pub struct ManagedClient {
@@ -366,6 +373,7 @@ async fn run_managed_client(
         .await
         {
             Ok(StreamOutcome::Disconnected) => {}
+            Ok(StreamOutcome::ServerShutdown) => return,
             Ok(StreamOutcome::ReceiverClosed) => return,
             Err(error) => {
                 let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
@@ -377,7 +385,10 @@ async fn run_managed_client(
         let mut retry_in = Duration::ZERO;
         loop {
             if events
-                .send(ManagedEvent::Recovering { attempt, retry_in })
+                .send(ManagedEvent::Recovering(RecoveryStatus {
+                    attempt,
+                    retry_in,
+                }))
                 .await
                 .is_err()
             {
@@ -410,6 +421,7 @@ fn next_recovery_backoff(previous: Duration) -> Duration {
 
 enum StreamOutcome {
     Disconnected,
+    ServerShutdown,
     ReceiverClosed,
 }
 
@@ -438,8 +450,12 @@ async fn stream_events(
                 return Err(error);
             }
         };
+        let server_shutdown = matches!(managed_event, ManagedEvent::ServerShutdown(_));
         if events.send(managed_event).await.is_err() {
             return Ok(StreamOutcome::ReceiverClosed);
+        }
+        if server_shutdown {
+            return Ok(StreamOutcome::ServerShutdown);
         }
     }
     Ok(StreamOutcome::Disconnected)
@@ -486,6 +502,14 @@ fn decode_event(
             }
             *last_revision = Some(update.revision);
             Ok(ManagedEvent::CounterUpdated(update))
+        }
+        SERVER_SHUTDOWN_EVENT => {
+            let shutdown: ServerShutdown =
+                serde_json::from_str(&event.data).context("decode server shutdown intent")?;
+            if shutdown.instance_id != expected_instance_id {
+                bail!("shutdown intent came from an unexpected server instance");
+            }
+            Ok(ManagedEvent::ServerShutdown(shutdown))
         }
         name => bail!("server sent unknown event type '{name}'"),
     }

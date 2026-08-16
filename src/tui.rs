@@ -1,9 +1,6 @@
 //! Ratatui view state and terminal lifecycle.
 
-use std::{
-    io::{Stdout, stdout},
-    time::Duration,
-};
+use std::io::{Stdout, stdout};
 
 use anyhow::{Result, anyhow};
 use crossterm::{
@@ -23,7 +20,7 @@ use ratatui::{
 };
 
 use crate::{
-    managed_client::{ManagedClient, ManagedEvent},
+    managed_client::{ManagedClient, ManagedEvent, RecoveryStatus},
     protocol::Health,
 };
 
@@ -32,7 +29,7 @@ pub struct TuiState {
     identity: Option<Health>,
     pending_identity: Option<Health>,
     counter: Option<u64>,
-    recovery: Option<(u32, Duration)>,
+    recovery: Option<RecoveryStatus>,
     fatal_error: Option<String>,
 }
 
@@ -62,10 +59,11 @@ impl TuiState {
                 self.recovery = None;
             }
             ManagedEvent::CounterUpdated(update) => self.counter = Some(update.value),
-            ManagedEvent::Recovering { attempt, retry_in } => {
-                self.recovery = Some((attempt, retry_in));
+            ManagedEvent::Recovering(status) => {
+                self.recovery = Some(status);
                 self.fatal_error = None;
             }
+            ManagedEvent::ServerShutdown(_) => self.recovery = None,
             ManagedEvent::Fatal(error) => self.fatal_error = Some(error),
         }
     }
@@ -124,6 +122,7 @@ async fn run_loop(
                         terminal.draw(|frame| render(frame, &state))?;
                         return Err(anyhow!(error));
                     }
+                    Some(ManagedEvent::ServerShutdown(_)) => return Ok(()),
                     Some(event) => state.apply(event),
                     None => return Err(anyhow!("managed client stopped unexpectedly")),
                 }
@@ -163,12 +162,15 @@ fn status_text(state: &TuiState) -> String {
     if let Some(error) = &state.fatal_error {
         return format!("Connection failed: {error}");
     }
-    if let Some((attempt, retry_in)) = state.recovery {
+    if let Some(recovery) = state.recovery {
         let last_server = state.identity.as_ref().map_or_else(
             || "no previous server".to_owned(),
             |identity| format!("last server pid {}", identity.pid),
         );
-        return format!("Recovering (attempt {attempt}, retry in {retry_in:?}) | {last_server}");
+        return format!(
+            "Recovering (attempt {}, retry in {:?}) | {last_server}",
+            recovery.attempt, recovery.retry_in
+        );
     }
     match &state.identity {
         Some(identity) => format!(
