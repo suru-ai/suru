@@ -1,8 +1,8 @@
 //! Client-side ownership of server discovery and event streaming.
 
 use std::{
-    fs::{self, File, OpenOptions},
-    path::{Path, PathBuf},
+    fs::{File, OpenOptions},
+    path::Path,
     process::{Command, Stdio},
     time::Duration,
 };
@@ -12,48 +12,15 @@ use eventsource_stream::{Event, Eventsource};
 use futures_util::StreamExt;
 use tokio::{sync::mpsc, task::JoinHandle};
 
-use crate::protocol::{CounterSnapshot, CounterUpdate, Health, LifecycleState, RuntimeDescriptor};
+use crate::{
+    RuntimeConfig,
+    protocol::{
+        COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
+        RuntimeDescriptor, SNAPSHOT_EVENT,
+    },
+};
 
-#[derive(Clone, Debug)]
-pub struct ManagedClientConfig {
-    state_dir: PathBuf,
-    channel: String,
-}
-
-impl ManagedClientConfig {
-    pub fn new(state_dir: impl AsRef<Path>, channel: impl Into<String>) -> Self {
-        Self {
-            state_dir: state_dir.as_ref().to_path_buf(),
-            channel: channel.into(),
-        }
-    }
-
-    fn descriptor_path(&self) -> Result<PathBuf> {
-        let channel_is_safe = !self.channel.is_empty()
-            && self.channel != "."
-            && self.channel != ".."
-            && self
-                .channel
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
-        if !channel_is_safe {
-            bail!("channel must contain only letters, numbers, '.', '-', or '_'");
-        }
-        Ok(self.state_dir.join(&self.channel).join("runtime.json"))
-    }
-
-    pub fn state_dir(&self) -> &Path {
-        &self.state_dir
-    }
-
-    pub fn channel(&self) -> &str {
-        &self.channel
-    }
-
-    fn runtime_dir(&self) -> PathBuf {
-        self.state_dir.join(&self.channel)
-    }
-}
+pub type ManagedClientConfig = RuntimeConfig;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManagedEvent {
@@ -120,7 +87,7 @@ pub async fn start_server(config: &ManagedClientConfig) -> Result<Health> {
 }
 
 async fn probe(config: &ManagedClientConfig) -> Result<(RuntimeDescriptor, Health)> {
-    let descriptor = read_descriptor(&config.descriptor_path()?)?;
+    let descriptor = read_descriptor(&config.descriptor_path())?;
     validate_loopback_url(&descriptor.base_url)?;
     let health = reqwest::Client::new()
         .get(format!("{}/health", descriptor.base_url))
@@ -138,16 +105,7 @@ async fn probe(config: &ManagedClientConfig) -> Result<(RuntimeDescriptor, Healt
 }
 
 fn spawn_detached(config: &ManagedClientConfig) -> Result<()> {
-    config.descriptor_path()?;
-    let runtime_dir = config.runtime_dir();
-    fs::create_dir_all(&runtime_dir)
-        .with_context(|| format!("create runtime directory {runtime_dir:?}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("protect runtime directory {runtime_dir:?}"))?;
-    }
+    let runtime_dir = config.create_private_runtime_dir()?;
 
     let log_path = runtime_dir.join("server.log");
     let mut log_options = OpenOptions::new();
@@ -167,9 +125,9 @@ fn spawn_detached(config: &ManagedClientConfig) -> Result<()> {
     command
         .arg("__server")
         .arg("--state-dir")
-        .arg(&config.state_dir)
+        .arg(config.state_dir())
         .arg("--channel")
-        .arg(&config.channel)
+        .arg(config.channel())
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -257,7 +215,7 @@ fn decode_event(
         .parse::<u64>()
         .context("server event has an invalid revision ID")?;
     match event.event.as_str() {
-        "snapshot" => {
+        SNAPSHOT_EVENT => {
             if *saw_snapshot {
                 bail!("server sent more than one snapshot");
             }
@@ -273,7 +231,7 @@ fn decode_event(
             *last_revision = Some(snapshot.revision);
             Ok(ManagedEvent::Snapshot(snapshot))
         }
-        "counter_updated" => {
+        COUNTER_UPDATED_EVENT => {
             if !*saw_snapshot {
                 bail!("server sent a counter update before its snapshot");
             }

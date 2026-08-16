@@ -1,11 +1,11 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::State,
@@ -23,58 +23,15 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::RuntimeConfig;
 use crate::protocol::{
-    BUILD_IDENTITY, CounterSnapshot, CounterUpdate, Health, LifecycleState, PROTOCOL_VERSION,
-    RuntimeDescriptor,
+    BUILD_IDENTITY, COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
+    PROTOCOL_VERSION, RuntimeDescriptor, SNAPSHOT_EVENT,
 };
 
-const RUNTIME_FILE: &str = "runtime.json";
 const LOCK_FILE: &str = "server.lock";
 
-#[derive(Clone, Debug)]
-pub struct ServerConfig {
-    state_dir: PathBuf,
-    channel: String,
-}
-
-impl ServerConfig {
-    pub fn new(state_dir: impl AsRef<Path>, channel: impl Into<String>) -> Self {
-        Self {
-            state_dir: state_dir.as_ref().to_path_buf(),
-            channel: channel.into(),
-        }
-    }
-
-    pub fn runtime_dir(&self) -> PathBuf {
-        self.state_dir.join(&self.channel)
-    }
-
-    pub fn state_dir(&self) -> &Path {
-        &self.state_dir
-    }
-
-    pub fn channel(&self) -> &str {
-        &self.channel
-    }
-
-    pub fn descriptor_path(&self) -> PathBuf {
-        self.runtime_dir().join(RUNTIME_FILE)
-    }
-
-    fn validate(&self) -> Result<()> {
-        let channel_is_safe = !self.channel.is_empty()
-            && self.channel != "."
-            && self.channel != ".."
-            && self
-                .channel
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
-        if !channel_is_safe {
-            bail!("channel must contain only letters, numbers, '.', '-', or '_'");
-        }
-        Ok(())
-    }
-}
+pub type ServerConfig = RuntimeConfig;
 
 pub struct RunningServer {
     descriptor: RuntimeDescriptor,
@@ -121,9 +78,7 @@ struct CounterState {
 }
 
 pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
-    config.validate()?;
-    let runtime_dir = config.runtime_dir();
-    create_private_dir(&runtime_dir)?;
+    let runtime_dir = config.create_private_runtime_dir()?;
 
     let lock = OpenOptions::new()
         .create(true)
@@ -198,7 +153,7 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
         revision: current.revision,
     };
     let snapshot_event = Event::default()
-        .event("snapshot")
+        .event(SNAPSHOT_EVENT)
         .id(snapshot.revision.to_string())
         .json_data(snapshot)
         .expect("counter snapshots always serialize");
@@ -213,7 +168,7 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
             revision: current.revision,
         };
         let event = Event::default()
-            .event("counter_updated")
+            .event(COUNTER_UPDATED_EVENT)
             .id(update.revision.to_string())
             .json_data(update)
             .expect("counter updates always serialize");
@@ -263,17 +218,6 @@ fn is_authenticated(headers: &HeaderMap, token: &str) -> bool {
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value == format!("Bearer {token}"))
-}
-
-fn create_private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("create runtime directory {path:?}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("protect runtime directory {path:?}"))?;
-    }
-    Ok(())
 }
 
 fn write_descriptor(path: &Path, descriptor: &RuntimeDescriptor) -> Result<()> {

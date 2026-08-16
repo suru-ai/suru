@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(CliCommand::InternalServer { state_dir, channel }) => {
-            server::spawn(ServerConfig::new(state_dir, channel))
+            server::spawn(ServerConfig::new(state_dir, channel)?)
                 .await?
                 .run_until_ctrl_c()
                 .await
@@ -79,5 +79,5 @@ fn default_client_config() -> Result<ManagedClientConfig> {
             "release".to_owned()
         }
     });
-    Ok(ManagedClientConfig::new(state_dir, channel))
+    ManagedClientConfig::new(state_dir, channel)
 }

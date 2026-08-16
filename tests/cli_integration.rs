@@ -24,9 +24,11 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let mut client = ManagedClient::connect(ManagedClientConfig::new(state_dir.path(), channel))
-        .await
-        .expect("connect after start command has exited");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure managed client"),
+    )
+    .await
+    .expect("connect after start command has exited");
     let event = timeout(Duration::from_secs(1), client.next())
         .await
         .expect("connected event arrives")

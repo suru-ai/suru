@@ -8,9 +8,11 @@ use tokio::time::{Duration, timeout};
 #[tokio::test]
 async fn authenticated_health_describes_the_ready_server() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let server = server::spawn(ServerConfig::new(state_dir.path(), "health-test"))
-        .await
-        .expect("spawn server");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "health-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
     let descriptor = server.descriptor().clone();
     let client = reqwest::Client::new();
 
@@ -64,12 +66,15 @@ async fn authenticated_health_describes_the_ready_server() {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let descriptor_mode =
-            std::fs::metadata(ServerConfig::new(state_dir.path(), "health-test").descriptor_path())
-                .expect("read runtime descriptor metadata")
-                .permissions()
-                .mode()
-                & 0o777;
+        let descriptor_mode = std::fs::metadata(
+            ServerConfig::new(state_dir.path(), "health-test")
+                .expect("configure server")
+                .descriptor_path(),
+        )
+        .expect("read runtime descriptor metadata")
+        .permissions()
+        .mode()
+            & 0o777;
         assert_eq!(descriptor_mode, 0o600);
 
         let directory_mode = std::fs::metadata(state_dir.path().join("health-test"))
@@ -86,14 +91,18 @@ async fn authenticated_health_describes_the_ready_server() {
 #[tokio::test]
 async fn managed_client_receives_snapshot_before_absolute_counter_updates() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let server = server::spawn(ServerConfig::new(state_dir.path(), "events-test"))
-        .await
-        .expect("spawn server");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "events-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
     let descriptor = server.descriptor().clone();
-    let mut client =
-        ManagedClient::connect(ManagedClientConfig::new(state_dir.path(), "events-test"))
-            .await
-            .expect("connect managed client");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "events-test")
+            .expect("configure managed client"),
+    )
+    .await
+    .expect("connect managed client");
 
     let connected = timeout(Duration::from_secs(1), client.next())
         .await
@@ -133,16 +142,18 @@ async fn managed_client_receives_snapshot_before_absolute_counter_updates() {
 #[tokio::test]
 async fn counter_advances_without_connected_clients() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let server = server::spawn(ServerConfig::new(state_dir.path(), "idle-counter-test"))
-        .await
-        .expect("spawn server");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "idle-counter-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
 
     tokio::time::sleep(Duration::from_millis(1_100)).await;
 
-    let mut client = ManagedClient::connect(ManagedClientConfig::new(
-        state_dir.path(),
-        "idle-counter-test",
-    ))
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "idle-counter-test")
+            .expect("configure managed client"),
+    )
     .await
     .expect("connect after server has run without clients");
     assert!(matches!(

@@ -3,6 +3,8 @@ use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const BUILD_IDENTITY: &str = concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION"));
+pub const SNAPSHOT_EVENT: &str = "snapshot";
+pub const COUNTER_UPDATED_EVENT: &str = "counter_updated";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
