@@ -10,6 +10,8 @@ support others down the line.
 
 ## Agent skills
 
+Skills are present under the .agents/skills directory. Read from there if a skill trigger fails.
+
 ### Issue tracker
 
 Issues and specs are tracked in GitHub Issues. See `docs/agents/issue-tracker.md`.
