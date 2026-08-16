@@ -2,13 +2,15 @@
 
 use std::{
     fs::{File, OpenOptions},
-    path::Path,
-    process::{Command, Stdio},
+    io::{Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use eventsource_stream::{Event, Eventsource};
+use fs2::FileExt;
 use futures_util::StreamExt;
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -20,10 +22,58 @@ use crate::{
     },
 };
 
-pub type ManagedClientConfig = RuntimeConfig;
+const SERVER_LOG_FILE: &str = "server.log";
+const SERVER_LOG_TAIL_BYTES: u64 = 8 * 1024;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Debug)]
+pub struct ManagedClientConfig {
+    runtime: RuntimeConfig,
+    server_executable: PathBuf,
+}
+
+impl ManagedClientConfig {
+    pub fn new(state_dir: impl AsRef<Path>, channel: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            runtime: RuntimeConfig::new(state_dir, channel)?,
+            server_executable: std::env::current_exe()
+                .context("find current Chidori executable")?,
+        })
+    }
+
+    pub fn with_server_executable(mut self, executable: impl Into<PathBuf>) -> Self {
+        self.server_executable = executable.into();
+        self
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        self.runtime.state_dir()
+    }
+
+    pub fn channel(&self) -> &str {
+        self.runtime.channel()
+    }
+
+    fn descriptor_path(&self) -> PathBuf {
+        self.runtime.descriptor_path()
+    }
+
+    fn create_private_runtime_dir(&self) -> Result<PathBuf> {
+        self.runtime.create_private_runtime_dir()
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        self.runtime.lock_path()
+    }
+
+    fn log_path(&self) -> PathBuf {
+        self.runtime.runtime_dir().join(SERVER_LOG_FILE)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManagedEvent {
+    Connecting,
     Connected(Health),
     Snapshot(CounterSnapshot),
     CounterUpdated(CounterUpdate),
@@ -37,17 +87,37 @@ pub struct ManagedClient {
 
 impl ManagedClient {
     pub async fn connect(config: ManagedClientConfig) -> Result<Self> {
-        let (descriptor, health) = probe(&config).await?;
+        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        let (descriptor, health) = ensure_server(&config, deadline).await?;
 
         let http = reqwest::Client::new();
-        let response = http
-            .get(format!("{}/v1/events", descriptor.base_url))
-            .bearer_auth(&descriptor.token)
-            .send()
-            .await
-            .context("open server event stream")?
-            .error_for_status()
-            .context("server rejected event stream")?;
+        let response = match tokio::time::timeout_at(
+            deadline,
+            http.get(format!("{}/v1/events", descriptor.base_url))
+                .bearer_auth(&descriptor.token)
+                .send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response.error_for_status().map_err(|error| {
+                startup_error(
+                    &config,
+                    &format!("server rejected the initial event stream: {error}"),
+                )
+            })?,
+            Ok(Err(error)) => {
+                return Err(startup_error(
+                    &config,
+                    &format!("could not open the initial event stream: {error}"),
+                ));
+            }
+            Err(_) => {
+                return Err(startup_error(
+                    &config,
+                    "initial event stream did not open within 15s",
+                ));
+            }
+        };
         let (events_tx, events_rx) = mpsc::channel(32);
         let task = tokio::spawn(stream_events(
             response,
@@ -68,19 +138,76 @@ impl ManagedClient {
 }
 
 pub async fn start_server(config: &ManagedClientConfig) -> Result<Health> {
-    if let Ok((_, health)) = probe(config).await {
-        return Ok(health);
-    }
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    ensure_server(config, deadline)
+        .await
+        .map(|(_, health)| health)
+}
 
-    spawn_detached(config)?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+async fn ensure_server(
+    config: &ManagedClientConfig,
+    deadline: tokio::time::Instant,
+) -> Result<(RuntimeDescriptor, Health)> {
+    let mut spawned = None;
     loop {
-        let error = match probe(config).await {
-            Ok((_, health)) => return Ok(health),
-            Err(error) => error,
+        let probe_result = match tokio::time::timeout_at(deadline, probe(config)).await {
+            Ok(result) => result,
+            Err(_) => {
+                return Err(startup_error(
+                    config,
+                    "detached Chidori server did not become ready within 15s",
+                ));
+            }
         };
+        let error = match probe_result {
+            Ok((descriptor, health)) => match health.lifecycle {
+                LifecycleState::Ready => return Ok((descriptor, health)),
+                LifecycleState::Starting => {
+                    anyhow::anyhow!("registered Chidori server is still starting")
+                }
+                LifecycleState::Stopping => {
+                    anyhow::anyhow!("registered Chidori server is stopping")
+                }
+                LifecycleState::Failed => {
+                    return Err(startup_error(
+                        config,
+                        "registered Chidori server reported failed startup",
+                    ));
+                }
+            },
+            Err(error) => {
+                if spawned.is_none() {
+                    spawned = Some(spawn_detached(config).map_err(|spawn_error| {
+                        startup_error(
+                            config,
+                            &format!(
+                                "could not launch the detached Chidori server: {spawn_error:#}"
+                            ),
+                        )
+                    })?);
+                }
+                error
+            }
+        };
+        if let Some(process) = spawned.as_mut()
+            && let Some(status) = process
+                .try_wait()
+                .context("inspect detached server process")?
+            && !another_server_owns_channel(config)
+        {
+            return Err(startup_error(
+                config,
+                &format!(
+                    "detached Chidori server exited before becoming ready ({})",
+                    describe_exit(status)
+                ),
+            ));
+        }
         if tokio::time::Instant::now() >= deadline {
-            return Err(error).context("detached Chidori server did not become ready within 15s");
+            return Err(startup_error(
+                config,
+                &format!("detached Chidori server did not become ready within 15s: {error:#}"),
+            ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -104,10 +231,10 @@ async fn probe(config: &ManagedClientConfig) -> Result<(RuntimeDescriptor, Healt
     Ok((descriptor, health))
 }
 
-fn spawn_detached(config: &ManagedClientConfig) -> Result<()> {
+fn spawn_detached(config: &ManagedClientConfig) -> Result<Child> {
     let runtime_dir = config.create_private_runtime_dir()?;
 
-    let log_path = runtime_dir.join("server.log");
+    let log_path = runtime_dir.join(SERVER_LOG_FILE);
     let mut log_options = OpenOptions::new();
     log_options.create(true).append(true);
     #[cfg(unix)]
@@ -120,8 +247,7 @@ fn spawn_detached(config: &ManagedClientConfig) -> Result<()> {
         .with_context(|| format!("open server log {log_path:?}"))?;
     let stderr = stdout.try_clone().context("clone server log handle")?;
 
-    let executable = std::env::current_exe().context("find current Chidori executable")?;
-    let mut command = Command::new(executable);
+    let mut command = Command::new(&config.server_executable);
     command
         .arg("__server")
         .arg("--state-dir")
@@ -132,8 +258,48 @@ fn spawn_detached(config: &ManagedClientConfig) -> Result<()> {
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     configure_detached_process(&mut command);
-    command.spawn().context("spawn detached Chidori server")?;
-    Ok(())
+    command.spawn().context("spawn detached Chidori server")
+}
+
+fn another_server_owns_channel(config: &ManagedClientConfig) -> bool {
+    let Ok(lock) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(config.lock_path())
+    else {
+        return false;
+    };
+    lock.try_lock_exclusive().is_err()
+}
+
+fn describe_exit(status: ExitStatus) -> String {
+    status.code().map_or_else(
+        || "terminated by a signal".to_owned(),
+        |code| format!("exit code {code}"),
+    )
+}
+
+fn startup_error(config: &ManagedClientConfig, message: &str) -> anyhow::Error {
+    let log_path = config.log_path();
+    match read_log_tail(&log_path) {
+        Ok(tail) if !tail.is_empty() => anyhow!(
+            "{message}. Inspect {log_path:?} and retry.\nRecent server log ({log_path:?}):\n{tail}"
+        ),
+        _ => anyhow!("{message}. Inspect {log_path:?} and retry."),
+    }
+}
+
+fn read_log_tail(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("open server log {path:?}"))?;
+    let length = file.metadata().context("read server log metadata")?.len();
+    file.seek(SeekFrom::Start(
+        length.saturating_sub(SERVER_LOG_TAIL_BYTES),
+    ))
+    .context("seek to recent server log")?;
+    let mut tail = Vec::with_capacity(SERVER_LOG_TAIL_BYTES as usize);
+    file.read_to_end(&mut tail)
+        .context("read recent server log")?;
+    Ok(String::from_utf8_lossy(&tail).trim().to_owned())
 }
 
 #[cfg(unix)]
@@ -162,6 +328,9 @@ async fn stream_events(
     health: Health,
     expected_instance_id: uuid::Uuid,
 ) {
+    if events.send(ManagedEvent::Connecting).await.is_err() {
+        return;
+    }
     if events.send(ManagedEvent::Connected(health)).await.is_err() {
         return;
     }
@@ -265,9 +434,6 @@ fn validate_loopback_url(base_url: &str) -> Result<()> {
 }
 
 fn validate_identity(descriptor: &RuntimeDescriptor, health: &Health) -> Result<()> {
-    if health.lifecycle != LifecycleState::Ready {
-        bail!("registered server is not ready");
-    }
     if health.instance_id != descriptor.instance_id
         || health.pid != descriptor.pid
         || health.protocol_version != descriptor.protocol_version

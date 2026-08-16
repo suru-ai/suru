@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
         None => {
             let client = ManagedClient::connect(default_client_config()?)
                 .await
-                .context("connect to the Chidori server; run `chidori server start` first")?;
+                .context("prepare the managed Chidori server connection")?;
             tui::run(client).await
         }
     }

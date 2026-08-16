@@ -6,6 +6,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 const RUNTIME_FILE: &str = "runtime.json";
+const LOCK_FILE: &str = "server.lock";
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -45,6 +46,10 @@ impl RuntimeConfig {
 
     pub fn descriptor_path(&self) -> PathBuf {
         self.runtime_dir().join(RUNTIME_FILE)
+    }
+
+    pub(crate) fn lock_path(&self) -> PathBuf {
+        self.runtime_dir().join(LOCK_FILE)
     }
 
     pub(crate) fn create_private_runtime_dir(&self) -> Result<PathBuf> {

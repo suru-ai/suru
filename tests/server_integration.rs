@@ -5,6 +5,10 @@ use chidori::{
 };
 use tokio::time::{Duration, timeout};
 
+mod support;
+
+use support::receive_initial_state;
+
 #[tokio::test]
 async fn authenticated_health_describes_the_ready_server() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -104,23 +108,9 @@ async fn managed_client_receives_snapshot_before_absolute_counter_updates() {
     .await
     .expect("connect managed client");
 
-    let connected = timeout(Duration::from_secs(1), client.next())
-        .await
-        .expect("connected event arrives")
-        .expect("managed client remains open");
-    let ManagedEvent::Connected(identity) = connected else {
-        panic!("expected connected event, got {connected:?}");
-    };
+    let (identity, snapshot) = receive_initial_state(&mut client).await;
     assert_eq!(identity.instance_id, descriptor.instance_id);
     assert_eq!(identity.pid, descriptor.pid);
-
-    let snapshot = timeout(Duration::from_secs(1), client.next())
-        .await
-        .expect("snapshot arrives")
-        .expect("managed client remains open");
-    let ManagedEvent::Snapshot(snapshot) = snapshot else {
-        panic!("expected snapshot event, got {snapshot:?}");
-    };
     assert_eq!(snapshot.instance_id, descriptor.instance_id);
     assert_eq!(snapshot.value, 0);
     assert_eq!(snapshot.revision, 0);
@@ -156,14 +146,7 @@ async fn counter_advances_without_connected_clients() {
     )
     .await
     .expect("connect after server has run without clients");
-    assert!(matches!(
-        client.next().await,
-        Some(ManagedEvent::Connected(_))
-    ));
-    let snapshot = client.next().await.expect("receive counter snapshot");
-    let ManagedEvent::Snapshot(snapshot) = snapshot else {
-        panic!("expected snapshot event, got {snapshot:?}");
-    };
+    let (_, snapshot) = receive_initial_state(&mut client).await;
     assert!(snapshot.value >= 1);
     assert_eq!(snapshot.value, snapshot.revision);
 

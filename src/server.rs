@@ -29,12 +29,11 @@ use crate::protocol::{
     PROTOCOL_VERSION, RuntimeDescriptor, SNAPSHOT_EVENT,
 };
 
-const LOCK_FILE: &str = "server.lock";
-
 pub type ServerConfig = RuntimeConfig;
 
 pub struct RunningServer {
     descriptor: RuntimeDescriptor,
+    lifecycle: watch::Sender<LifecycleState>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<()>>,
 }
@@ -45,9 +44,7 @@ impl RunningServer {
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
+        self.request_shutdown().await;
         self.task.await.context("server task panicked")?
     }
 
@@ -56,11 +53,17 @@ impl RunningServer {
             task = &mut self.task => task.context("server task panicked")?,
             signal = tokio::signal::ctrl_c() => {
                 signal.context("listen for Ctrl-C")?;
-                if let Some(shutdown) = self.shutdown.take() {
-                    let _ = shutdown.send(());
-                }
+                self.request_shutdown().await;
                 self.task.await.context("server task panicked")?
             }
+        }
+    }
+
+    async fn request_shutdown(&mut self) {
+        self.lifecycle.send_replace(LifecycleState::Stopping);
+        tokio::task::yield_now().await;
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
         }
     }
 }
@@ -68,6 +71,7 @@ impl RunningServer {
 #[derive(Clone)]
 struct AppState {
     descriptor: Arc<RuntimeDescriptor>,
+    lifecycle: watch::Sender<LifecycleState>,
     counter: watch::Sender<CounterState>,
 }
 
@@ -78,14 +82,14 @@ struct CounterState {
 }
 
 pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
-    let runtime_dir = config.create_private_runtime_dir()?;
+    config.create_private_runtime_dir()?;
 
     let lock = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(runtime_dir.join(LOCK_FILE))
+        .open(config.lock_path())
         .context("open server election lock")?;
     lock.try_lock_exclusive()
         .context("another server already owns this channel")?;
@@ -108,8 +112,10 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
         value: 0,
         revision: 0,
     });
+    let (lifecycle, _) = watch::channel(LifecycleState::Starting);
     let state = AppState {
         descriptor: Arc::new(descriptor.clone()),
+        lifecycle: lifecycle.clone(),
         counter: counter.clone(),
     };
     let app = Router::new()
@@ -119,6 +125,7 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let descriptor_path = config.descriptor_path();
     let instance_id = descriptor.instance_id;
+    let task_lifecycle = lifecycle.clone();
     let task = tokio::spawn(async move {
         let _lock = lock;
         let counter_task = tokio::spawn(run_counter(counter));
@@ -128,13 +135,25 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
             })
             .await
             .context("serve local HTTP API");
+        if result.is_err() {
+            task_lifecycle.send_replace(LifecycleState::Failed);
+        }
         counter_task.abort();
         remove_own_descriptor(&descriptor_path, instance_id);
         result
     });
+    lifecycle.send_if_modified(|state| {
+        if *state == LifecycleState::Starting {
+            *state = LifecycleState::Ready;
+            true
+        } else {
+            false
+        }
+    });
 
     Ok(RunningServer {
         descriptor,
+        lifecycle,
         shutdown: Some(shutdown_tx),
         task,
     })
@@ -143,6 +162,9 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
 async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if *state.lifecycle.borrow() != LifecycleState::Ready {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
 
     let mut receiver = state.counter.subscribe();
@@ -206,7 +228,7 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
     Json(Health {
         instance_id: state.descriptor.instance_id,
         pid: state.descriptor.pid,
-        lifecycle: LifecycleState::Ready,
+        lifecycle: state.lifecycle.borrow().clone(),
         protocol_version: state.descriptor.protocol_version,
         build_identity: state.descriptor.build_identity.clone(),
     })

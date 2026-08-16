@@ -34,6 +34,11 @@ pub struct TuiState {
 impl TuiState {
     pub fn apply(&mut self, event: ManagedEvent) {
         match event {
+            ManagedEvent::Connecting => {
+                self.identity = None;
+                self.counter = None;
+                self.fatal_error = None;
+            }
             ManagedEvent::Connected(identity) => {
                 self.identity = Some(identity);
                 self.fatal_error = None;
