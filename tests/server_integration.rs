@@ -93,6 +93,165 @@ async fn authenticated_health_describes_the_ready_server() {
 }
 
 #[tokio::test]
+async fn server_recovers_from_an_abandoned_partial_publication() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "partial-publication-test";
+    let runtime_dir = state_dir.path().join(channel);
+    std::fs::create_dir_all(&runtime_dir).expect("create runtime directory");
+    std::fs::write(
+        runtime_dir.join(format!("runtime.{}.tmp", std::process::id())),
+        b"{\"base_url\":",
+    )
+    .expect("seed abandoned partial publication");
+
+    let server =
+        server::spawn(ServerConfig::new(state_dir.path(), channel).expect("configure server"))
+            .await
+            .expect("recover from abandoned partial publication");
+
+    let published: chidori::protocol::RuntimeDescriptor = serde_json::from_reader(
+        std::fs::File::open(runtime_dir.join("runtime.json"))
+            .expect("open recovered runtime descriptor"),
+    )
+    .expect("decode recovered runtime descriptor");
+    assert_eq!(published.instance_id, server.descriptor().instance_id);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn server_holds_the_channel_election_lock_for_its_lifetime() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "lifetime-lock-test";
+    let config = ServerConfig::new(state_dir.path(), channel).expect("configure server");
+    let first = server::spawn(config.clone())
+        .await
+        .expect("spawn election winner");
+    let first_token = first.descriptor().token.clone();
+
+    let contender = server::spawn(config.clone())
+        .await
+        .err()
+        .expect("a second server cannot own the same channel");
+    assert!(
+        contender
+            .to_string()
+            .contains("another server already owns")
+    );
+
+    first.shutdown().await.expect("shut down election winner");
+    assert!(
+        !config.descriptor_path().exists(),
+        "the election winner removes its own descriptor"
+    );
+    let successor = server::spawn(config)
+        .await
+        .expect("elect a successor after the winner exits");
+    assert_ne!(successor.descriptor().token, first_token);
+    successor.shutdown().await.expect("shut down successor");
+}
+
+#[tokio::test]
+async fn shutdown_does_not_remove_a_descriptor_owned_by_another_instance() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config =
+        ServerConfig::new(state_dir.path(), "ownership-cleanup-test").expect("configure server");
+    let server = server::spawn(config.clone()).await.expect("spawn server");
+    let mut replacement = server.descriptor().clone();
+    replacement.instance_id = uuid::Uuid::new_v4();
+    serde_json::to_writer(
+        std::fs::File::create(config.descriptor_path())
+            .expect("replace runtime descriptor fixture"),
+        &replacement,
+    )
+    .expect("write replacement runtime descriptor fixture");
+
+    server.shutdown().await.expect("shut down original server");
+
+    let remaining: chidori::protocol::RuntimeDescriptor = serde_json::from_reader(
+        std::fs::File::open(config.descriptor_path())
+            .expect("replacement runtime descriptor remains"),
+    )
+    .expect("decode replacement runtime descriptor");
+    assert_eq!(remaining.instance_id, replacement.instance_id);
+}
+
+#[tokio::test]
+async fn descriptor_replacement_never_exposes_a_partial_publication() {
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config =
+        ServerConfig::new(state_dir.path(), "atomic-publication-test").expect("configure server");
+    let runtime_dir = state_dir.path().join("atomic-publication-test");
+    std::fs::create_dir_all(&runtime_dir).expect("create runtime directory");
+    let descriptor_path = config.descriptor_path();
+    let stale = chidori::protocol::RuntimeDescriptor {
+        base_url: "http://127.0.0.1:9".to_owned(),
+        token: "stale-token".to_owned(),
+        instance_id: uuid::Uuid::new_v4(),
+        pid: 1,
+        protocol_version: chidori::protocol::PROTOCOL_VERSION,
+        build_identity: chidori::protocol::BUILD_IDENTITY.to_owned(),
+    };
+    serde_json::to_writer(
+        std::fs::File::create(&descriptor_path).expect("create stale runtime descriptor"),
+        &stale,
+    )
+    .expect("write stale runtime descriptor");
+
+    let ready = Arc::new(Barrier::new(2));
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let descriptor_path = descriptor_path.clone();
+        let ready = ready.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || -> Result<Vec<uuid::Uuid>, String> {
+            let mut observed = Vec::new();
+            let first: chidori::protocol::RuntimeDescriptor = serde_json::from_reader(
+                std::fs::File::open(&descriptor_path)
+                    .map_err(|error| format!("open initial descriptor: {error}"))?,
+            )
+            .map_err(|error| format!("decode initial descriptor: {error}"))?;
+            observed.push(first.instance_id);
+            ready.wait();
+            while !stop.load(Ordering::SeqCst) {
+                let descriptor: chidori::protocol::RuntimeDescriptor = serde_json::from_reader(
+                    std::fs::File::open(&descriptor_path)
+                        .map_err(|error| format!("open descriptor during publication: {error}"))?,
+                )
+                .map_err(|error| format!("decode descriptor during publication: {error}"))?;
+                observed.push(descriptor.instance_id);
+                std::thread::yield_now();
+            }
+            Ok(observed)
+        })
+    };
+    ready.wait();
+
+    let server = server::spawn(config)
+        .await
+        .expect("replace stale descriptor");
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    stop.store(true, Ordering::SeqCst);
+    let observed = reader
+        .join()
+        .expect("descriptor reader does not panic")
+        .expect("every observed descriptor is complete");
+
+    assert!(observed.contains(&stale.instance_id));
+    assert!(observed.contains(&server.descriptor().instance_id));
+    assert!(observed.iter().all(|instance_id| {
+        *instance_id == stale.instance_id || *instance_id == server.descriptor().instance_id
+    }));
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn managed_client_receives_snapshot_before_absolute_counter_updates() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let server = server::spawn(

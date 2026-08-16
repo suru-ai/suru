@@ -243,21 +243,53 @@ fn is_authenticated(headers: &HeaderMap, token: &str) -> bool {
 }
 
 fn write_descriptor(path: &Path, descriptor: &RuntimeDescriptor) -> Result<()> {
-    let temporary_path = path.with_extension(format!("{}.tmp", std::process::id()));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
+    let runtime_dir = path
+        .parent()
+        .context("runtime descriptor has no directory")?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".runtime-")
+        .suffix(".tmp")
+        .tempfile_in(runtime_dir)
+        .with_context(|| format!("create temporary runtime descriptor in {runtime_dir:?}"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .context("protect temporary runtime descriptor")?;
     }
-    let mut file = options
-        .open(&temporary_path)
-        .with_context(|| format!("create temporary runtime descriptor {temporary_path:?}"))?;
-    serde_json::to_writer(&mut file, descriptor).context("encode runtime descriptor")?;
-    file.write_all(b"\n").context("finish runtime descriptor")?;
-    file.sync_all().context("flush runtime descriptor")?;
-    fs::rename(&temporary_path, path).context("publish runtime descriptor atomically")?;
+    serde_json::to_writer(temporary.as_file_mut(), descriptor)
+        .context("encode runtime descriptor")?;
+    temporary
+        .as_file_mut()
+        .write_all(b"\n")
+        .context("finish runtime descriptor")?;
+    temporary
+        .as_file()
+        .sync_all()
+        .context("flush runtime descriptor")?;
+    let published = temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .context("publish runtime descriptor atomically")?;
+    published
+        .sync_all()
+        .context("flush published runtime descriptor")?;
+    sync_runtime_directory(runtime_dir)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_runtime_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .with_context(|| format!("open runtime directory {path:?}"))?
+        .sync_all()
+        .with_context(|| format!("flush runtime directory {path:?}"))
+}
+
+#[cfg(not(unix))]
+fn sync_runtime_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 

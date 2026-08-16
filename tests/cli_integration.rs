@@ -1,6 +1,6 @@
 use std::{
     convert::Infallible,
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -20,6 +20,7 @@ use chidori::{
         BUILD_IDENTITY, CounterSnapshot, Health, LifecycleState, PROTOCOL_VERSION,
         RuntimeDescriptor, SNAPSHOT_EVENT,
     },
+    server::{self, ServerConfig},
 };
 use futures_util::{StreamExt, stream};
 use sysinfo::{Pid, System};
@@ -29,6 +30,236 @@ use uuid::Uuid;
 mod support;
 
 use support::receive_initial_state;
+
+#[tokio::test]
+async fn simultaneous_launchers_converge_on_one_authenticated_server() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "concurrent-election-test";
+    let config = ManagedClientConfig::new(state_dir.path(), channel)
+        .expect("configure managed client")
+        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+
+    let client_launches = (0..4)
+        .map(|_| {
+            let config = config.clone();
+            tokio::spawn(async move { ManagedClient::connect(config).await })
+        })
+        .collect::<Vec<_>>();
+    let command_launches = (0..4)
+        .map(|_| {
+            let state_dir = state_dir.path().to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                Command::new(env!("CARGO_BIN_EXE_chidori"))
+                    .args(["server", "start"])
+                    .env("CHIDORI_STATE_DIR", state_dir)
+                    .env("CHIDORI_CHANNEL", channel)
+                    .output()
+                    .expect("run concurrent server start command")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut clients = Vec::new();
+    for launch in client_launches {
+        clients.push(
+            launch
+                .await
+                .expect("managed client launch task does not panic")
+                .expect("managed client launch succeeds"),
+        );
+    }
+    let mut command_outputs = Vec::new();
+    for launch in command_launches {
+        let output = launch.await.expect("server start task does not panic");
+        assert!(
+            output.status.success(),
+            "concurrent server start failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        command_outputs.push(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+
+    let mut identities = Vec::new();
+    for client in &mut clients {
+        identities.push(receive_initial_state(client).await.0);
+    }
+    let winner = identities.first().expect("at least one server identity");
+    assert!(identities.iter().all(|identity| {
+        identity.pid == winner.pid && identity.instance_id == winner.instance_id
+    }));
+    assert!(command_outputs.iter().all(|output| {
+        output.contains(&winner.pid.to_string()) && output.contains(&winner.instance_id.to_string())
+    }));
+
+    drop(clients);
+    stop_test_server(state_dir.path(), channel);
+}
+
+#[tokio::test]
+async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let unrelated_channel = "unrelated-live-process";
+    let mut unrelated = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_chidori"))
+            .arg("__server")
+            .arg("--state-dir")
+            .arg(state_dir.path())
+            .arg("--channel")
+            .arg(unrelated_channel)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn unrelated live process"),
+    );
+    let unrelated_descriptor = state_dir
+        .path()
+        .join(unrelated_channel)
+        .join("runtime.json");
+    timeout(Duration::from_secs(2), async {
+        while !unrelated_descriptor.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("unrelated live process publishes its descriptor");
+
+    let channel = "stale-live-pid-test";
+    let runtime_dir = state_dir.path().join(channel);
+    std::fs::create_dir_all(&runtime_dir).expect("create stale runtime directory");
+    serde_json::to_writer(
+        std::fs::File::create(runtime_dir.join("runtime.json"))
+            .expect("create stale runtime descriptor"),
+        &RuntimeDescriptor {
+            base_url: "http://127.0.0.1:9".to_owned(),
+            token: "stale-token".to_owned(),
+            instance_id: Uuid::new_v4(),
+            pid: unrelated.0.id(),
+            protocol_version: PROTOCOL_VERSION,
+            build_identity: BUILD_IDENTITY.to_owned(),
+        },
+    )
+    .expect("write stale runtime descriptor");
+
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+    )
+    .await
+    .expect("recover from stale descriptor");
+    let (identity, _) = receive_initial_state(&mut client).await;
+
+    assert_ne!(identity.pid, unrelated.0.id());
+    assert!(
+        unrelated
+            .0
+            .try_wait()
+            .expect("inspect unrelated live process")
+            .is_none(),
+        "unrelated live process was terminated from stale metadata"
+    );
+
+    drop(client);
+    stop_test_server(state_dir.path(), channel);
+}
+
+#[tokio::test]
+async fn managed_client_recovers_from_malformed_and_partially_written_descriptors() {
+    for (channel, stale_contents) in [
+        ("malformed-descriptor-test", b"not-json".as_slice()),
+        (
+            "partial-descriptor-test",
+            br#"{"base_url":"http://127.0.0.1:9","token":"partial""#.as_slice(),
+        ),
+    ] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let runtime_dir = state_dir.path().join(channel);
+        std::fs::create_dir_all(&runtime_dir).expect("create stale runtime directory");
+        std::fs::write(runtime_dir.join("runtime.json"), stale_contents)
+            .expect("seed invalid runtime descriptor");
+
+        let mut client = ManagedClient::connect(
+            ManagedClientConfig::new(state_dir.path(), channel)
+                .expect("configure managed client")
+                .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+        )
+        .await
+        .expect("recover from invalid runtime descriptor");
+        let (identity, _) = receive_initial_state(&mut client).await;
+        let published: RuntimeDescriptor = serde_json::from_reader(
+            std::fs::File::open(runtime_dir.join("runtime.json"))
+                .expect("open recovered runtime descriptor"),
+        )
+        .expect("decode recovered runtime descriptor");
+        assert_eq!(published.instance_id, identity.instance_id);
+        assert_eq!(published.pid, identity.pid);
+
+        drop(client);
+        stop_test_server(state_dir.path(), channel);
+    }
+}
+
+#[tokio::test]
+async fn reuse_requires_an_authenticated_matching_server_identity() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let decoy = server::spawn(
+        ServerConfig::new(state_dir.path(), "authenticated-decoy").expect("configure decoy server"),
+    )
+    .await
+    .expect("spawn decoy server");
+
+    for (channel, mutate) in [
+        (
+            "wrong-token-registration",
+            mutate_wrong_token as fn(&mut RuntimeDescriptor),
+        ),
+        ("wrong-identity-registration", mutate_instance_id),
+    ] {
+        let runtime_dir = state_dir.path().join(channel);
+        std::fs::create_dir_all(&runtime_dir).expect("create stale runtime directory");
+        let mut stale = decoy.descriptor().clone();
+        mutate(&mut stale);
+        serde_json::to_writer(
+            std::fs::File::create(runtime_dir.join("runtime.json"))
+                .expect("create stale runtime descriptor"),
+            &stale,
+        )
+        .expect("write stale runtime descriptor");
+
+        let mut client = ManagedClient::connect(
+            ManagedClientConfig::new(state_dir.path(), channel)
+                .expect("configure managed client")
+                .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+        )
+        .await
+        .expect("replace unauthenticated or identity-inconsistent registration");
+        let (identity, _) = receive_initial_state(&mut client).await;
+        assert_ne!(identity.instance_id, decoy.descriptor().instance_id);
+
+        drop(client);
+        stop_test_server(state_dir.path(), channel);
+    }
+
+    decoy.shutdown().await.expect("shut down decoy server");
+}
+
+fn mutate_wrong_token(descriptor: &mut RuntimeDescriptor) {
+    descriptor.token = "incorrect-token".to_owned();
+}
+
+fn mutate_instance_id(descriptor: &mut RuntimeDescriptor) {
+    descriptor.instance_id = Uuid::new_v4();
+}
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 #[tokio::test]
 async fn server_start_returns_after_a_detached_server_is_ready() {
