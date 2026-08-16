@@ -96,7 +96,166 @@ async fn authenticated_health_describes_the_ready_server() {
         assert_eq!(directory_mode, 0o700);
     }
 
+    #[cfg(windows)]
+    {
+        assert_windows_current_user_only(state_dir.path().join("health-test"));
+        assert_windows_current_user_only(
+            ServerConfig::new(state_dir.path(), "health-test")
+                .expect("configure server")
+                .descriptor_path(),
+        );
+        assert_windows_current_user_only(state_dir.path().join("health-test/server.lock"));
+    }
+
     server.shutdown().await.expect("shut down server");
+}
+
+#[cfg(windows)]
+fn assert_windows_current_user_only(path: impl AsRef<std::path::Path>) {
+    use std::{mem, os::windows::ffi::OsStrExt, ptr};
+
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree},
+        Security::{
+            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+            GetSecurityDescriptorControl, GetTokenInformation, SE_DACL_PROTECTED, TOKEN_QUERY,
+            TOKEN_USER, TokenUser,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    struct LocalSecurityDescriptor(*mut std::ffi::c_void);
+    impl Drop for LocalSecurityDescriptor {
+        fn drop(&mut self) {
+            // SAFETY: GetNamedSecurityInfoW allocated this descriptor with LocalAlloc.
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+    struct OwnedHandle(HANDLE);
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: OpenProcessToken returned this owned handle.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    let path = path.as_ref();
+    let path_utf16 = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: path is NUL-terminated and the requested output pointers are writable.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path_utf16.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    assert_eq!(status, ERROR_SUCCESS, "read DACL for {path:?}");
+    assert!(!descriptor.is_null(), "security descriptor for {path:?}");
+    assert!(!dacl.is_null(), "DACL for {path:?}");
+    let descriptor = LocalSecurityDescriptor(descriptor);
+
+    let mut control = 0;
+    let mut revision = 0;
+    // SAFETY: descriptor is live and both output pointers are writable.
+    assert_ne!(
+        unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) },
+        0,
+        "read DACL control flags for {path:?}"
+    );
+    assert_ne!(
+        control & SE_DACL_PROTECTED,
+        0,
+        "DACL inherits broader access for {path:?}"
+    );
+
+    let mut acl_info = ACL_SIZE_INFORMATION::default();
+    // SAFETY: dacl is owned by the live descriptor and acl_info is writable.
+    assert_ne!(
+        unsafe {
+            GetAclInformation(
+                dacl,
+                ptr::from_mut(&mut acl_info).cast(),
+                mem::size_of_val(&acl_info) as u32,
+                AclSizeInformation,
+            )
+        },
+        0,
+        "inspect DACL for {path:?}"
+    );
+    assert_eq!(
+        acl_info.AceCount, 1,
+        "DACL grants access to more than the current user for {path:?}"
+    );
+    let mut ace = ptr::null_mut();
+    // SAFETY: the DACL reports one ACE and ace points to writable storage.
+    assert_ne!(
+        unsafe { GetAce(dacl, 0, &mut ace) },
+        0,
+        "read DACL entry for {path:?}"
+    );
+    // SAFETY: the sole ACE was created as an ACCESS_ALLOWED_ACE by the runtime SDDL.
+    let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    assert_eq!(
+        ace.Header.AceType, ACCESS_ALLOWED_ACE_TYPE,
+        "sole DACL entry does not grant access for {path:?}"
+    );
+
+    let mut token = ptr::null_mut();
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle and token is writable.
+    assert_ne!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+        0,
+        "open current process token"
+    );
+    let token = OwnedHandle(token);
+    let mut required_bytes = 0;
+    // SAFETY: a null buffer with length zero is the documented size-query operation.
+    unsafe {
+        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut required_bytes);
+    }
+    assert!(required_bytes > 0, "size current user token data");
+    let mut token_data = vec![0usize; (required_bytes as usize).div_ceil(mem::size_of::<usize>())];
+    // SAFETY: token_data is aligned, writable, and at least required_bytes long.
+    assert_ne!(
+        unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                token_data.as_mut_ptr().cast(),
+                required_bytes,
+                &mut required_bytes,
+            )
+        },
+        0,
+        "read current user token data"
+    );
+    // SAFETY: GetTokenInformation initialized the buffer with TOKEN_USER.
+    let token_user = unsafe { &*token_data.as_ptr().cast::<TOKEN_USER>() };
+    let ace_sid = ptr::addr_of!(ace.SidStart).cast_mut().cast();
+    // SAFETY: both pointers refer to valid SIDs owned by live allocations.
+    assert_ne!(
+        unsafe { EqualSid(ace_sid, token_user.User.Sid) },
+        0,
+        "DACL is not restricted to the current user for {path:?}"
+    );
 }
 
 #[tokio::test]
