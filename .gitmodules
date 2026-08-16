@@ -1,0 +1,16 @@
+[submodule "references/t3code"]
+	path = references/t3code
+	url = https://github.com/pingdotgg/t3code.git
+	branch = main
+[submodule "references/opencode"]
+	path = references/opencode
+	url = https://github.com/anomalyco/opencode.git
+	branch = v2
+[submodule "references/copilot-sdk"]
+	path = references/copilot-sdk
+	url = https://github.com/github/copilot-sdk.git
+	branch = main
+[submodule "references/codex"]
+	path = references/codex
+	url = https://github.com/openai/codex.git
+	branch = main
