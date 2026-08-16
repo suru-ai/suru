@@ -1,0 +1,3 @@
+# Use a user-scoped reusable local server
+
+Chidori uses one long-lived local server per OS user and installation channel rather than one server per project or TUI. Clients discover the server through a locked, atomically published runtime descriptor, authenticate over loopback HTTP, reuse a matching build, and replace a mismatched build; the server survives after all clients disconnect so multiple projects and interfaces can share its orchestration state. Server-to-client updates use a snapshot-first SSE stream with monotonic revisions, keeping clients thin while allowing them to recover from missed connections without an initial replay log.
