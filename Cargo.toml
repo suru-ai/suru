@@ -4,3 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.99"
+axum = "0.8.4"
+clap = { version = "4.5.46", features = ["derive"] }
+crossterm = { version = "0.28.1", features = ["event-stream"] }
+dirs = "6.0.0"
+eventsource-stream = "0.2.3"
+fs2 = "0.4.3"
+futures-util = "0.3.31"
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "stream"] }
+ratatui = "0.29.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+tokio = { version = "1.47.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+uuid = { version = "1.18.1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+sysinfo = "0.37.2"
+tempfile = "3.21.0"
