@@ -261,6 +261,67 @@ async fn authenticated_session_stream_starts_with_a_complete_revisioned_snapshot
 }
 
 #[tokio::test]
+async fn active_session_stream_does_not_delay_graceful_server_shutdown() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid workspace");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "session-shutdown-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Explain this workspace".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+    let response = client
+        .get(format!(
+            "{}/v1/sessions/{}/events",
+            descriptor.base_url, created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("open Session stream")
+        .error_for_status()
+        .expect("Session stream authenticates");
+    let mut events = response.bytes_stream().eventsource();
+    timeout(Duration::from_secs(1), events.next())
+        .await
+        .expect("Session snapshot arrives")
+        .expect("Session stream remains open")
+        .expect("decode Session snapshot event");
+
+    timeout(Duration::from_secs(1), server.shutdown())
+        .await
+        .expect("active Session stream does not delay graceful shutdown")
+        .expect("shut down server");
+    assert!(
+        timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("Session stream closes on shutdown")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_client() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid workspace");

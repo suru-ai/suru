@@ -50,6 +50,34 @@ session_identity!(TurnId);
 session_identity!(MessageId);
 session_identity!(ActivityId);
 
+macro_rules! named_identity {
+    ($name:ident) => {
+        #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+    };
+}
+
+named_identity!(AgentId);
+named_identity!(ProviderId);
+named_identity!(ModelId);
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SessionRevision(pub u64);
@@ -71,9 +99,9 @@ pub struct Workspace {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentIdentity {
-    pub agent: String,
-    pub provider: String,
-    pub model: String,
+    pub agent: AgentId,
+    pub provider: ProviderId,
+    pub model: ModelId,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -86,11 +86,20 @@ impl TuiState {
                 self.fatal_error = None;
             }
             ManagedEvent::Snapshot(snapshot) => {
-                if self
+                let confirms_pending_identity = self
                     .pending_identity
                     .as_ref()
-                    .is_some_and(|identity| identity.instance_id == snapshot.instance_id)
-                {
+                    .is_some_and(|identity| identity.instance_id == snapshot.instance_id);
+                if confirms_pending_identity {
+                    let replaced_server = self
+                        .identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.instance_id != snapshot.instance_id);
+                    if replaced_server {
+                        self.session = None;
+                        self.composer.clear();
+                        self.submission_error = None;
+                    }
                     self.identity = self.pending_identity.take();
                 }
                 self.counter = Some(snapshot.value);
@@ -487,7 +496,11 @@ async fn run_loop(
                                 ApplicationTransition::CreateSession(request) => {
                                     match client.create_session(request).await {
                                         Ok(created) => {
-                                            match client.subscribe_session(created.session.id).await {
+                                            let session_id = created.session.id;
+                                            application.handle_event(ApplicationEvent::Session(
+                                                SessionEvent::Snapshot(created),
+                                            ))?;
+                                            match client.subscribe_session(session_id).await {
                                                 Ok(subscription) => {
                                                     session_subscription = Some(subscription);
                                                 }

@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 use chidori::protocol::{
-    Activity, ActivityId, ActivityKind, AgentIdentity, CreateSessionRequest, InitialPrompt,
-    Message, MessageId, MessageRole, Prompt, PromptId, PromptStatus, Session, SessionChange,
-    SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
-    SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
+    Activity, ActivityId, ActivityKind, AgentId, AgentIdentity, CreateSessionRequest,
+    InitialPrompt, Message, MessageId, MessageRole, ModelId, Prompt, PromptId, PromptStatus,
+    ProviderId, Session, SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision,
+    SessionSnapshot, SessionStatus, SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -22,9 +22,9 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 path: PathBuf::from("/work/chidori"),
             },
             agent: Some(AgentIdentity {
-                agent: "coding".to_owned(),
-                provider: "codex".to_owned(),
-                model: "gpt-5".to_owned(),
+                agent: AgentId::new("coding"),
+                provider: ProviderId::new("codex"),
+                model: ModelId::new("gpt-5"),
             }),
             status: SessionStatus::Idle,
         },

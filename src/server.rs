@@ -391,11 +391,17 @@ async fn session_events(
         );
     };
 
-    Sse::new(session_event_stream(snapshot, Duration::from_secs(10))).into_response()
+    Sse::new(session_event_stream(
+        snapshot,
+        state.shutdown.subscribe_to_intent(),
+        Duration::from_secs(10),
+    ))
+    .into_response()
 }
 
 fn session_event_stream(
     snapshot: SessionSnapshot,
+    shutdown: watch::Receiver<Option<ServerShutdown>>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
     let snapshot_event = Event::default()
@@ -405,13 +411,23 @@ fn session_event_stream(
         .expect("Session snapshots always serialize");
     stream::once(async move { Ok::<_, std::convert::Infallible>(snapshot_event) }).chain(
         stream::unfold(
-            tokio::time::interval_at(Instant::now() + keepalive_interval, keepalive_interval),
-            |mut keepalive| async move {
-                keepalive.tick().await;
-                Some((
-                    Ok::<_, std::convert::Infallible>(Event::default().comment("keep-alive")),
-                    keepalive,
-                ))
+            (
+                tokio::time::interval_at(Instant::now() + keepalive_interval, keepalive_interval),
+                shutdown,
+            ),
+            |(mut keepalive, mut shutdown)| async move {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        let _ = changed;
+                        None
+                    }
+                    _ = keepalive.tick() => Some((
+                        Ok::<_, std::convert::Infallible>(
+                            Event::default().comment("keep-alive"),
+                        ),
+                        (keepalive, shutdown),
+                    )),
+                }
             },
         ),
     )

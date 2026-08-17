@@ -199,6 +199,34 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
     );
     assert!(!transcript.contains("Chidori Counter"));
 
+    let replacement_instance = Uuid::new_v4();
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Recovering(
+            RecoveryStatus {
+                attempt: 1,
+                retry_in: Duration::ZERO,
+            },
+        )))
+        .expect("handle replacement recovery");
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(replacement_instance, 84_848),
+        )))
+        .expect("handle replacement connection");
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
+            CounterSnapshot {
+                instance_id: replacement_instance,
+                value: 0,
+                revision: 0,
+            },
+        )))
+        .expect("confirm replacement server snapshot");
+    let after_replacement = rendered_application_rows(&application).join("\n");
+    assert!(after_replacement.contains("What would you like to work on?"));
+    assert!(!after_replacement.contains("Explain this workspace"));
+    assert!(!after_replacement.contains("No Agent is selected"));
+
     drop(subscription);
     drop(client);
     server.shutdown().await.expect("shut down server");
