@@ -12,7 +12,10 @@ use tokio::time::{Duration, timeout};
 
 mod support;
 
-use support::{read_runtime_descriptor, receive_initial_state, write_runtime_descriptor};
+use support::{
+    read_runtime_descriptor, receive_initial_state, request_server_shutdown,
+    write_runtime_descriptor,
+};
 
 #[tokio::test]
 async fn authenticated_health_describes_the_ready_server() {
@@ -729,16 +732,7 @@ async fn authenticated_replacement_stop_emits_replacement_intent() {
         .expect("snapshot arrives")
         .expect("snapshot is valid");
 
-    let response = http
-        .post(format!("{}/v1/server/stop", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .json(&ServerShutdown {
-            instance_id: descriptor.instance_id,
-            reason: ShutdownReason::Replacement,
-        })
-        .send()
-        .await
-        .expect("request replacement shutdown");
+    let response = request_server_shutdown(&descriptor, ShutdownReason::Replacement).await;
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
 
     let event = timeout(Duration::from_secs(1), async {

@@ -33,7 +33,10 @@ use uuid::Uuid;
 
 mod support;
 
-use support::{read_runtime_descriptor, receive_initial_state, write_runtime_descriptor};
+use support::{
+    read_runtime_descriptor, receive_initial_state, request_server_shutdown,
+    write_runtime_descriptor,
+};
 
 #[tokio::test]
 async fn launching_current_build_replaces_an_authenticated_mismatched_server() {
@@ -163,16 +166,7 @@ async fn incompatible_replacement_protocol_is_a_strict_fatal_error() {
     .expect("attach to original server");
     receive_initial_state(&mut attached).await;
 
-    let response = reqwest::Client::new()
-        .post(format!("{}/v1/server/stop", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .json(&ServerShutdown {
-            instance_id: descriptor.instance_id,
-            reason: ShutdownReason::Replacement,
-        })
-        .send()
-        .await
-        .expect("request replacement transition");
+    let response = request_server_shutdown(&descriptor, ShutdownReason::Replacement).await;
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
     timeout(Duration::from_secs(1), async {
         while !original.is_stopped() {
@@ -204,6 +198,31 @@ async fn incompatible_replacement_protocol_is_a_strict_fatal_error() {
     assert!(fatal.contains("incompatible"));
 
     drop(incompatible);
+}
+
+#[tokio::test]
+async fn launcher_refuses_to_reuse_or_replace_an_incompatible_protocol() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "incompatible-registered-build-test";
+    let incompatible = BuildReplacementFixture::spawn_with_protocol(
+        state_dir.path(),
+        channel,
+        "chidori@old-incompatible-build",
+        PROTOCOL_VERSION - 1,
+    )
+    .await;
+    let config = ManagedClientConfig::new(state_dir.path(), channel)
+        .expect("configure current launcher")
+        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+
+    let error = start_server(&config)
+        .await
+        .expect_err("incompatible server cannot be reused or safely replaced")
+        .to_string();
+
+    assert!(error.contains("registered Chidori server protocol version"));
+    assert!(error.contains("incompatible"));
+    assert!(incompatible.shutdown_request().is_none());
 }
 
 #[tokio::test]

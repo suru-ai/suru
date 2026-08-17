@@ -1,6 +1,6 @@
 use chidori::{
     managed_client::{ManagedClient, ManagedEvent},
-    protocol::{CounterSnapshot, Health, RuntimeDescriptor},
+    protocol::{CounterSnapshot, Health, RuntimeDescriptor, ServerShutdown, ShutdownReason},
 };
 use tokio::time::{Duration, timeout};
 
@@ -45,4 +45,20 @@ pub async fn receive_initial_state(client: &mut ManagedClient) -> (Health, Count
         panic!("expected snapshot event, got {snapshot:?}");
     };
     (identity, snapshot)
+}
+
+pub async fn request_server_shutdown(
+    descriptor: &RuntimeDescriptor,
+    reason: ShutdownReason,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/v1/server/stop", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&ServerShutdown {
+            instance_id: descriptor.instance_id,
+            reason,
+        })
+        .send()
+        .await
+        .expect("request authenticated server shutdown")
 }

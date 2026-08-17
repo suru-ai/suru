@@ -245,12 +245,59 @@ pub async fn stop_server(config: &ManagedClientConfig) -> Result<Health> {
             bail!("cannot stop unreachable Chidori server: {reason}")
         }
     };
+    let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
+    shutdown_registered_instance(
+        config,
+        &descriptor,
+        health.instance_id,
+        ShutdownReason::Manual,
+        deadline,
+    )
+    .await?;
+    Ok(health)
+}
+
+struct ShutdownPolicy {
+    request_deadline: tokio::time::Instant,
+    transition_races_are_expected: bool,
+    wait_for_channel_release: bool,
+    action: &'static str,
+    timeout_message: &'static str,
+}
+
+fn shutdown_policy(reason: ShutdownReason, deadline: tokio::time::Instant) -> ShutdownPolicy {
+    match reason {
+        ShutdownReason::Manual => ShutdownPolicy {
+            request_deadline: (tokio::time::Instant::now() + STATUS_TIMEOUT).min(deadline),
+            transition_races_are_expected: false,
+            wait_for_channel_release: false,
+            action: "manual stop",
+            timeout_message: "Chidori server did not stop within 5s",
+        },
+        ShutdownReason::Replacement => ShutdownPolicy {
+            request_deadline: deadline,
+            transition_races_are_expected: true,
+            wait_for_channel_release: true,
+            action: "replacement stop",
+            timeout_message: "mismatched Chidori server did not release the channel before startup timed out",
+        },
+    }
+}
+
+async fn shutdown_registered_instance(
+    config: &ManagedClientConfig,
+    descriptor: &RuntimeDescriptor,
+    instance_id: uuid::Uuid,
+    reason: ShutdownReason,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    let policy = shutdown_policy(reason, deadline);
     let request = ServerShutdown {
-        instance_id: health.instance_id,
-        reason: ShutdownReason::Manual,
+        instance_id,
+        reason,
     };
-    let response = tokio::time::timeout(
-        STATUS_TIMEOUT,
+    let response = tokio::time::timeout_at(
+        policy.request_deadline,
         reqwest::Client::new()
             .post(format!("{}/v1/server/stop", descriptor.base_url))
             .bearer_auth(&descriptor.token)
@@ -258,38 +305,48 @@ pub async fn stop_server(config: &ManagedClientConfig) -> Result<Health> {
             .send(),
     )
     .await
-    .context("manual stop request timed out")?
-    .context("send manual stop request")?;
-    if response.status() == reqwest::StatusCode::CONFLICT {
-        bail!("registered Chidori server changed before it could be stopped");
+    .with_context(|| format!("{} request timed out", policy.action));
+    match response {
+        Ok(Ok(response)) if response.status() == reqwest::StatusCode::CONFLICT => {
+            if !policy.transition_races_are_expected {
+                bail!("registered Chidori server changed before it could be stopped");
+            }
+        }
+        Ok(Ok(response)) => {
+            response
+                .error_for_status()
+                .with_context(|| format!("server rejected {} request", policy.action))?;
+        }
+        Ok(Err(_)) if policy.transition_races_are_expected => {}
+        Ok(Err(error)) => {
+            return Err(error).with_context(|| format!("send {} request", policy.action));
+        }
+        Err(error) => return Err(error),
     }
-    response
-        .error_for_status()
-        .context("server rejected manual stop request")?;
 
-    let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
     let mut target_stopped = false;
     loop {
         if !target_stopped {
             target_stopped = matches!(
-                tokio::time::timeout_at(deadline, inspect_health(&descriptor)).await,
+                tokio::time::timeout_at(deadline, inspect_health(descriptor)).await,
                 Ok(Err(HealthInspectionError::Unreachable(_)))
             );
         }
         let registration_released = match read_descriptor(&config.descriptor_path()) {
-            Ok(current) => current.instance_id != request.instance_id,
+            Ok(current) => current.instance_id != instance_id,
             Err(_) => !config.descriptor_path().exists(),
         };
-        if target_stopped && registration_released {
-            break;
+        let channel_released =
+            !policy.wait_for_channel_release || channel_lock_is_released(config)?;
+        if target_stopped && registration_released && channel_released {
+            return Ok(());
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            bail!("Chidori server did not stop within 5s")
+            bail!(policy.timeout_message)
         }
         tokio::time::sleep_until((now + Duration::from_millis(25)).min(deadline)).await;
     }
-    Ok(health)
 }
 
 enum RegistrationInspection {
@@ -390,6 +447,15 @@ async fn ensure_server(
         };
         let error = match probe_result {
             Ok((descriptor, health)) => match health.lifecycle {
+                LifecycleState::Ready if health.protocol_version != PROTOCOL_VERSION => {
+                    return Err(startup_error(
+                        config,
+                        &format!(
+                            "registered Chidori server protocol version {} is incompatible with client protocol version {PROTOCOL_VERSION}",
+                            health.protocol_version
+                        ),
+                    ));
+                }
                 LifecycleState::Ready if health.build_identity != BUILD_IDENTITY => {
                     replace_server(config, &descriptor, &health, deadline).await?;
                     anyhow::anyhow!("registered Chidori server is being replaced")
@@ -452,48 +518,14 @@ async fn replace_server(
     health: &Health,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
-    let request = ServerShutdown {
-        instance_id: health.instance_id,
-        reason: ShutdownReason::Replacement,
-    };
-    let response = tokio::time::timeout_at(
+    shutdown_registered_instance(
+        config,
+        descriptor,
+        health.instance_id,
+        ShutdownReason::Replacement,
         deadline,
-        reqwest::Client::new()
-            .post(format!("{}/v1/server/stop", descriptor.base_url))
-            .bearer_auth(&descriptor.token)
-            .json(&request)
-            .send(),
     )
     .await
-    .context("replacement stop request timed out")?
-    .context("send replacement stop request")?;
-    if response.status() != reqwest::StatusCode::CONFLICT {
-        response
-            .error_for_status()
-            .context("server rejected replacement stop request")?;
-    }
-
-    let mut target_stopped = false;
-    loop {
-        if !target_stopped {
-            target_stopped = matches!(
-                tokio::time::timeout_at(deadline, inspect_health(descriptor)).await,
-                Ok(Err(HealthInspectionError::Unreachable(_)))
-            );
-        }
-        let registration_released = match read_descriptor(&config.descriptor_path()) {
-            Ok(current) => current.instance_id != request.instance_id,
-            Err(_) => !config.descriptor_path().exists(),
-        };
-        if target_stopped && registration_released && channel_lock_is_released(config)? {
-            return Ok(());
-        }
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            bail!("mismatched Chidori server did not release the channel before startup timed out")
-        }
-        tokio::time::sleep_until((now + Duration::from_millis(25)).min(deadline)).await;
-    }
 }
 
 fn channel_lock_is_released(config: &ManagedClientConfig) -> Result<bool> {
@@ -610,6 +642,12 @@ impl Drop for ManagedClient {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RecoveryStrategy {
+    EnsureOwnBuild,
+    FollowReplacement,
+}
+
 async fn run_managed_client(
     config: ManagedClientConfig,
     http: reqwest::Client,
@@ -620,7 +658,7 @@ async fn run_managed_client(
         return;
     }
 
-    let mut follows_replacement = false;
+    let mut recovery_strategy = RecoveryStrategy::EnsureOwnBuild;
     loop {
         if events
             .send(ManagedEvent::Connected(connection.health))
@@ -640,7 +678,7 @@ async fn run_managed_client(
             Ok(StreamOutcome::Disconnected) => {}
             Ok(StreamOutcome::ManualShutdown) => return,
             Ok(StreamOutcome::Replacement { instance_id }) => {
-                follows_replacement = true;
+                recovery_strategy = RecoveryStrategy::FollowReplacement;
                 replaced_instance_id = Some(instance_id);
             }
             Ok(StreamOutcome::ReceiverClosed) => return,
@@ -650,7 +688,7 @@ async fn run_managed_client(
             }
         }
 
-        if follows_replacement {
+        if matches!(recovery_strategy, RecoveryStrategy::FollowReplacement) {
             if events
                 .send(ManagedEvent::Recovering(RecoveryStatus {
                     attempt: 1,
