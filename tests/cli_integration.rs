@@ -19,7 +19,9 @@ use axum::{
 };
 use chidori::{
     build_identity,
-    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, start_server},
+    managed_client::{
+        ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus, start_server,
+    },
     protocol::{
         COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
         PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown,
@@ -177,7 +179,7 @@ async fn attached_client_reconnects_to_the_replacement_and_its_fresh_snapshot() 
 }
 
 #[tokio::test]
-async fn incompatible_replacement_protocol_is_a_strict_fatal_error() {
+async fn attached_old_client_surfaces_a_strict_fatal_error_for_an_incompatible_replacement() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "incompatible-build-replacement-test";
     let inert_build_identity = inert_server_build_identity(state_dir.path());
@@ -210,6 +212,18 @@ async fn incompatible_replacement_protocol_is_a_strict_fatal_error() {
     )
     .await;
 
+    let recovering = timeout(Duration::from_secs(2), attached.next())
+        .await
+        .expect("old client processes replacement intent promptly")
+        .expect("managed client remains open");
+    assert!(matches!(
+        recovering,
+        ManagedEvent::Recovering(RecoveryStatus {
+            attempt: 1,
+            retry_in: Duration::ZERO,
+        })
+    ));
+
     let fatal = timeout(Duration::from_secs(2), async {
         loop {
             match attached.next().await.expect("managed client remains open") {
@@ -228,10 +242,10 @@ async fn incompatible_replacement_protocol_is_a_strict_fatal_error() {
 }
 
 #[tokio::test]
-async fn launcher_refuses_to_reuse_or_replace_an_incompatible_protocol() {
+async fn launcher_replaces_a_build_and_protocol_mismatch_before_connecting() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "incompatible-registered-build-test";
-    let incompatible = BuildReplacementFixture::spawn_with_protocol(
+    let mismatched = BuildReplacementFixture::spawn_with_protocol(
         state_dir.path(),
         channel,
         "chidori@old-incompatible-build",
@@ -242,9 +256,55 @@ async fn launcher_refuses_to_reuse_or_replace_an_incompatible_protocol() {
         .expect("configure current launcher")
         .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
 
+    let previous = mismatched.descriptor();
+    let replacement = start_server(&config)
+        .await
+        .expect("replace the stale build despite its incompatible event protocol");
+
+    assert_ne!(replacement.instance_id, previous.instance_id);
+    assert_ne!(replacement.pid, previous.pid);
+    assert_eq!(replacement.build_identity, chidori_binary_build_identity());
+    assert_eq!(replacement.protocol_version, PROTOCOL_VERSION);
+    let shutdown = mismatched
+        .shutdown_request()
+        .expect("stale server receives authenticated replacement request");
+    assert_eq!(shutdown.instance_id, previous.instance_id);
+    assert_eq!(shutdown.reason, ShutdownReason::Replacement);
+    assert!(
+        mismatched.is_stopped(),
+        "launcher returned before the exact stale instance released its channel lock"
+    );
+
+    let mut client = ManagedClient::connect(config)
+        .await
+        .expect("connect launching client to replacement server");
+    let (identity, snapshot) = receive_initial_state(&mut client).await;
+    assert_eq!(identity.instance_id, replacement.instance_id);
+    assert_eq!(snapshot.instance_id, replacement.instance_id);
+    assert!(snapshot.revision < 41, "replacement snapshot must be fresh");
+
+    drop(client);
+    stop_test_server(state_dir.path(), channel);
+}
+
+#[tokio::test]
+async fn launcher_rejects_a_protocol_incompatible_matching_build_without_replacing_it() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "incompatible-matching-build-test";
+    let incompatible = BuildReplacementFixture::spawn_with_protocol(
+        state_dir.path(),
+        channel,
+        &chidori_binary_build_identity(),
+        PROTOCOL_VERSION - 1,
+    )
+    .await;
+    let config = ManagedClientConfig::new(state_dir.path(), channel)
+        .expect("configure current launcher")
+        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+
     let error = start_server(&config)
         .await
-        .expect_err("incompatible server cannot be reused or safely replaced")
+        .expect_err("matching build with an incompatible protocol cannot be reused")
         .to_string();
 
     assert!(error.contains("registered Chidori server protocol version"));

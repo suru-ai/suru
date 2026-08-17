@@ -459,15 +459,6 @@ async fn ensure_server(
         };
         let error = match probe_result {
             Ok((descriptor, health)) => match health.lifecycle {
-                LifecycleState::Ready if health.protocol_version != PROTOCOL_VERSION => {
-                    return Err(startup_error(
-                        config,
-                        &format!(
-                            "registered Chidori server protocol version {} is incompatible with client protocol version {PROTOCOL_VERSION}",
-                            health.protocol_version
-                        ),
-                    ));
-                }
                 LifecycleState::Ready if health.build_identity != launching_build_identity => {
                     spawned = None;
                     shutdown_registered_instance(
@@ -479,6 +470,15 @@ async fn ensure_server(
                     )
                     .await?;
                     anyhow::anyhow!("registered Chidori server is being replaced")
+                }
+                LifecycleState::Ready if health.protocol_version != PROTOCOL_VERSION => {
+                    return Err(startup_error(
+                        config,
+                        &format!(
+                            "registered Chidori server protocol version {} is incompatible with client protocol version {PROTOCOL_VERSION}",
+                            health.protocol_version
+                        ),
+                    ));
                 }
                 LifecycleState::Ready => return Ok((descriptor, health)),
                 LifecycleState::Starting => {
