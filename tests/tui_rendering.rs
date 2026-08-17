@@ -1,6 +1,8 @@
 use chidori::{
     managed_client::{ManagedEvent, RecoveryStatus},
-    protocol::{CounterSnapshot, Health, LifecycleState, ServerShutdown, ShutdownReason},
+    protocol::{
+        CounterSnapshot, Health, LifecycleState, ServerIdentity, ServerShutdown, ShutdownReason,
+    },
     tui::{TuiState, render},
 };
 use ratatui::{Terminal, backend::TestBackend};
@@ -20,15 +22,21 @@ fn rendered_rows(state: &TuiState) -> Vec<String> {
         .collect()
 }
 
+fn ready_health(instance_id: Uuid, pid: u32) -> Health {
+    Health::new(
+        ServerIdentity {
+            instance_id,
+            pid,
+            protocol_version: 1,
+            build_identity: "chidori@test".to_owned(),
+        },
+        LifecycleState::Ready,
+    )
+}
+
 fn connected_state(instance_id: Uuid, pid: u32, value: u64) -> TuiState {
     let mut state = TuiState::default();
-    state.apply(ManagedEvent::Connected(Health {
-        instance_id,
-        pid,
-        lifecycle: LifecycleState::Ready,
-        protocol_version: 1,
-        build_identity: "chidori@test".to_owned(),
-    }));
+    state.apply(ManagedEvent::Connected(ready_health(instance_id, pid)));
     state.apply(ManagedEvent::Snapshot(CounterSnapshot {
         instance_id,
         value,
@@ -102,13 +110,10 @@ fn recovered_view_switches_identity_and_counter_together_on_the_fresh_snapshot()
         attempt: 1,
         retry_in: Duration::ZERO,
     }));
-    state.apply(ManagedEvent::Connected(Health {
-        instance_id: recovered_instance_id,
-        pid: 84_848,
-        lifecycle: LifecycleState::Ready,
-        protocol_version: 1,
-        build_identity: "chidori@test".to_owned(),
-    }));
+    state.apply(ManagedEvent::Connected(ready_health(
+        recovered_instance_id,
+        84_848,
+    )));
 
     let awaiting_snapshot = rendered_rows(&state).join("\n");
     assert!(awaiting_snapshot.contains("Recovering"));

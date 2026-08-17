@@ -27,8 +27,8 @@ use uuid::Uuid;
 use crate::RuntimeConfig;
 use crate::build_identity;
 use crate::protocol::{
-    COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
-    PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown,
+    COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, LifecycleState, PROTOCOL_VERSION,
+    RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerIdentity, ServerShutdown,
     ShutdownReason,
 };
 use crate::runtime::protect_current_user_file;
@@ -64,7 +64,7 @@ impl RunningServer {
 
     fn request_shutdown(&self) {
         self.shutdown.request(ServerShutdown {
-            instance_id: self.descriptor.instance_id,
+            instance_id: self.descriptor.identity.instance_id,
             reason: ShutdownReason::Manual,
         });
     }
@@ -136,14 +136,16 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
         .await
         .context("bind loopback server")?;
     let address = listener.local_addr().context("read server address")?;
-    let descriptor = RuntimeDescriptor {
-        base_url: format!("http://{address}"),
-        token: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
-        instance_id: Uuid::new_v4(),
-        pid: std::process::id(),
-        protocol_version: PROTOCOL_VERSION,
-        build_identity: build_identity::for_current_executable()?,
-    };
+    let descriptor = RuntimeDescriptor::new(
+        format!("http://{address}"),
+        format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
+        ServerIdentity {
+            instance_id: Uuid::new_v4(),
+            pid: std::process::id(),
+            protocol_version: PROTOCOL_VERSION,
+            build_identity: build_identity::for_current_executable()?,
+        },
+    );
     write_descriptor(&config.descriptor_path(), &descriptor)?;
 
     let (counter, _) = watch::channel(CounterState {
@@ -169,7 +171,7 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
         .route("/v1/server/stop", post(stop_server))
         .with_state(state);
     let descriptor_path = config.descriptor_path();
-    let instance_id = descriptor.instance_id;
+    let instance_id = descriptor.identity.instance_id;
     let task_lifecycle = lifecycle.clone();
     let task = tokio::spawn(async move {
         let _lock = lock;
@@ -212,7 +214,7 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
     }
 
     Sse::new(event_stream(
-        state.descriptor.instance_id,
+        state.descriptor.identity.instance_id,
         state.counter.subscribe(),
         state.shutdown.subscribe_to_intent(),
         Duration::from_secs(10),
@@ -327,14 +329,7 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    Json(Health {
-        instance_id: state.descriptor.instance_id,
-        pid: state.descriptor.pid,
-        lifecycle: state.shutdown.lifecycle(),
-        protocol_version: state.descriptor.protocol_version,
-        build_identity: state.descriptor.build_identity.clone(),
-    })
-    .into_response()
+    Json(state.descriptor.health(state.shutdown.lifecycle())).into_response()
 }
 
 async fn stop_server(State(state): State<AppState>, request: Request) -> StatusCode {
@@ -347,7 +342,7 @@ async fn stop_server(State(state): State<AppState>, request: Request) -> StatusC
     let Ok(request) = serde_json::from_slice::<ServerShutdown>(&body) else {
         return StatusCode::BAD_REQUEST;
     };
-    if request.instance_id != state.descriptor.instance_id {
+    if request.instance_id != state.descriptor.identity.instance_id {
         return StatusCode::CONFLICT;
     }
 
@@ -418,7 +413,7 @@ fn remove_own_descriptor(path: &Path, instance_id: Uuid) {
     let initially_belongs_to_instance = File::open(path)
         .ok()
         .and_then(|file| serde_json::from_reader::<_, RuntimeDescriptor>(file).ok())
-        .is_some_and(|descriptor| descriptor.instance_id == instance_id);
+        .is_some_and(|descriptor| descriptor.identity.instance_id == instance_id);
     if !initially_belongs_to_instance {
         return;
     }
@@ -438,7 +433,7 @@ fn remove_own_descriptor(path: &Path, instance_id: Uuid) {
     let quarantined_belongs_to_instance = File::open(&quarantine_path)
         .ok()
         .and_then(|file| serde_json::from_reader::<_, RuntimeDescriptor>(file).ok())
-        .is_some_and(|descriptor| descriptor.instance_id == instance_id);
+        .is_some_and(|descriptor| descriptor.identity.instance_id == instance_id);
     if quarantined_belongs_to_instance {
         let _ = fs::remove_file(&quarantine_path);
         return;

@@ -1,7 +1,10 @@
 use chidori::{
     build_identity,
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, stop_server},
-    protocol::{Health, LifecycleState, SERVER_SHUTDOWN_EVENT, ServerShutdown, ShutdownReason},
+    protocol::{
+        Health, LifecycleState, SERVER_SHUTDOWN_EVENT, ServerIdentity, ServerShutdown,
+        ShutdownReason,
+    },
     server::{self, ServerConfig},
 };
 use eventsource_stream::Eventsource;
@@ -594,10 +597,12 @@ async fn descriptor_replacement_never_exposes_a_partial_publication() {
     let stale = chidori::protocol::RuntimeDescriptor {
         base_url: "http://127.0.0.1:9".to_owned(),
         token: "stale-token".to_owned(),
-        instance_id: uuid::Uuid::new_v4(),
-        pid: 1,
-        protocol_version: chidori::protocol::PROTOCOL_VERSION,
-        build_identity: "stale-build".to_owned(),
+        identity: ServerIdentity {
+            instance_id: uuid::Uuid::new_v4(),
+            pid: 1,
+            protocol_version: chidori::protocol::PROTOCOL_VERSION,
+            build_identity: "stale-build".to_owned(),
+        },
     };
     write_runtime_descriptor(&descriptor_path, &stale);
 

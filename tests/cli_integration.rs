@@ -23,8 +23,8 @@ use chidori::{
     },
     protocol::{
         COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
-        PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown,
-        ShutdownReason,
+        PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerIdentity,
+        ServerShutdown, ShutdownReason,
     },
     server::{self, ServerConfig},
 };
@@ -902,10 +902,12 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
         &RuntimeDescriptor {
             base_url: "http://127.0.0.1:9".to_owned(),
             token: "stale-token".to_owned(),
-            instance_id: Uuid::new_v4(),
-            pid: unrelated.0.id(),
-            protocol_version: PROTOCOL_VERSION,
-            build_identity: "stale-build".to_owned(),
+            identity: ServerIdentity {
+                instance_id: Uuid::new_v4(),
+                pid: unrelated.0.id(),
+                protocol_version: PROTOCOL_VERSION,
+                build_identity: "stale-build".to_owned(),
+            },
         },
     );
 
@@ -1120,10 +1122,12 @@ async fn server_status_distinguishes_lifecycle_stale_and_unreachable_registratio
         &RuntimeDescriptor {
             base_url: unreachable_url,
             token: "unreachable-token".to_owned(),
-            instance_id: Uuid::new_v4(),
-            pid: u32::MAX,
-            protocol_version: PROTOCOL_VERSION,
-            build_identity: "unreachable-build".to_owned(),
+            identity: ServerIdentity {
+                instance_id: Uuid::new_v4(),
+                pid: u32::MAX,
+                protocol_version: PROTOCOL_VERSION,
+                build_identity: "unreachable-build".to_owned(),
+            },
         },
     );
     let unreachable_output =
@@ -1798,10 +1802,12 @@ impl ReadinessFixture {
                 listener.local_addr().expect("read fixture address")
             ),
             token: "readiness-fixture-token".to_owned(),
-            instance_id,
-            pid: std::process::id(),
-            protocol_version: PROTOCOL_VERSION,
-            build_identity,
+            identity: ServerIdentity {
+                instance_id,
+                pid: std::process::id(),
+                protocol_version: PROTOCOL_VERSION,
+                build_identity,
+            },
         };
         let runtime_dir = state_dir.join(channel);
         std::fs::create_dir_all(&runtime_dir).expect("create fixture runtime directory");
@@ -1856,14 +1862,7 @@ async fn readiness_health(State(state): State<ReadinessState>, headers: HeaderMa
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let lifecycle = state.lifecycle.lock().expect("lock lifecycle").clone();
-    Json(Health {
-        instance_id: state.descriptor.instance_id,
-        pid: state.descriptor.pid,
-        lifecycle,
-        protocol_version: state.descriptor.protocol_version,
-        build_identity: state.descriptor.build_identity.clone(),
-    })
-    .into_response()
+    Json(state.descriptor.health(lifecycle)).into_response()
 }
 
 async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMap) -> Response {
@@ -2067,10 +2066,12 @@ impl BuildReplacementFixture {
                 listener.local_addr().expect("read old-build address")
             ),
             token: "old-build-fixture-token".to_owned(),
-            instance_id: Uuid::new_v4(),
-            pid: u32::MAX - 1,
-            protocol_version,
-            build_identity: build_identity.to_owned(),
+            identity: ServerIdentity {
+                instance_id: Uuid::new_v4(),
+                pid: u32::MAX - 1,
+                protocol_version,
+                build_identity: build_identity.to_owned(),
+            },
         };
         let descriptor_path = runtime_dir.join("runtime.json");
         write_runtime_descriptor(&descriptor_path, &descriptor);
@@ -2159,14 +2160,7 @@ async fn build_replacement_health(
     if !fixture_authenticated(&headers, &descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(Health {
-        instance_id: descriptor.instance_id,
-        pid: descriptor.pid,
-        lifecycle: state.lifecycle.lock().expect("lock lifecycle").clone(),
-        protocol_version: descriptor.protocol_version,
-        build_identity: descriptor.build_identity,
-    })
-    .into_response()
+    Json(descriptor.health(state.lifecycle.lock().expect("lock lifecycle").clone())).into_response()
 }
 
 async fn build_replacement_events(

@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
             let health = start_server(&config).await?;
             println!(
                 "Chidori server ready (pid {}, instance {})",
-                health.pid, health.instance_id
+                health.identity.pid, health.identity.instance_id
             );
             Ok(())
         }
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
             let health = stop_server(&default_client_config()?).await?;
             println!(
                 "Chidori server stopped (pid {}, instance {})",
-                health.pid, health.instance_id
+                health.identity.pid, health.identity.instance_id
             );
             Ok(())
         }

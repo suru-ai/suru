@@ -21,13 +21,13 @@ use ratatui::{
 
 use crate::{
     managed_client::{ManagedClient, ManagedEvent, RecoveryStatus},
-    protocol::{Health, ShutdownReason},
+    protocol::{ServerIdentity, ShutdownReason},
 };
 
 #[derive(Clone, Debug, Default)]
 pub struct TuiState {
-    identity: Option<Health>,
-    pending_identity: Option<Health>,
+    identity: Option<ServerIdentity>,
+    pending_identity: Option<ServerIdentity>,
     counter: Option<u64>,
     recovery: Option<RecoveryStatus>,
     /// Manual stop preserves the last confirmed identity and counter as useful final context.
@@ -46,8 +46,8 @@ impl TuiState {
                 self.manually_stopped = false;
                 self.fatal_error = None;
             }
-            ManagedEvent::Connected(identity) => {
-                self.pending_identity = Some(identity);
+            ManagedEvent::Connected(health) => {
+                self.pending_identity = Some(health.identity);
                 self.manually_stopped = false;
                 self.fatal_error = None;
             }
@@ -203,7 +203,7 @@ fn status_text(state: &TuiState) -> String {
     }
 }
 
-fn server_identity_text(identity: &Health) -> String {
+fn server_identity_text(identity: &ServerIdentity) -> String {
     format!(
         "pid {} | server {}",
         identity.pid,
