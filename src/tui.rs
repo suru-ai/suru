@@ -81,6 +81,56 @@ impl TuiState {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct Application {
+    state: TuiState,
+}
+
+#[derive(Debug)]
+pub enum ApplicationEvent {
+    Command(CommandId),
+    Managed(ManagedEvent),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandId {
+    Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplicationTransition {
+    Continue,
+    Exit,
+}
+
+impl Application {
+    pub fn handle_event(&mut self, event: ApplicationEvent) -> Result<ApplicationTransition> {
+        match event {
+            ApplicationEvent::Command(CommandId::Quit) => Ok(ApplicationTransition::Exit),
+            ApplicationEvent::Managed(ManagedEvent::Fatal(error)) => Err(anyhow!(error)),
+            ApplicationEvent::Managed(event @ ManagedEvent::ServerShutdown(_)) => {
+                self.state.apply(event);
+                Ok(ApplicationTransition::Exit)
+            }
+            ApplicationEvent::Managed(event) => {
+                self.state.apply(event);
+                Ok(ApplicationTransition::Continue)
+            }
+        }
+    }
+
+    pub fn render(&self, frame: &mut Frame<'_>) {
+        render(frame, &self.state);
+    }
+}
+
+pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
+    match event {
+        InputEvent::Key(key) if is_quit(key) => Some(CommandId::Quit),
+        _ => None,
+    }
+}
+
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     let [main, status_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
@@ -121,30 +171,36 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut client: ManagedClient,
 ) -> Result<()> {
-    let mut state = TuiState::default();
+    let mut application = Application::default();
     let mut input = EventStream::new();
 
     loop {
-        terminal.draw(|frame| render(frame, &state))?;
+        terminal.draw(|frame| application.render(frame))?;
         tokio::select! {
             managed_event = client.next() => {
                 match managed_event {
-                    Some(ManagedEvent::Fatal(error)) => return Err(anyhow!(error)),
-                    Some(event @ ManagedEvent::ServerShutdown(_)) => {
-                        state.apply(event);
-                        terminal.draw(|frame| render(frame, &state))?;
-                        return Ok(());
+                    Some(event) => {
+                        let transition = application
+                            .handle_event(ApplicationEvent::Managed(event))?;
+                        if transition == ApplicationTransition::Exit {
+                            terminal.draw(|frame| application.render(frame))?;
+                            return Ok(());
+                        }
                     }
-                    Some(event) => state.apply(event),
                     None => return Err(anyhow!("managed client stopped unexpectedly")),
                 }
             }
             input_event = input.next() => {
                 match input_event {
-                    Some(Ok(InputEvent::Key(key))) if is_quit(key) => {
-                        return Ok(());
+                    Some(Ok(event)) => {
+                        if let Some(command) = command_for_terminal_event(event) {
+                            let transition = application
+                                .handle_event(ApplicationEvent::Command(command))?;
+                            if transition == ApplicationTransition::Exit {
+                                return Ok(());
+                            }
+                        }
                     }
-                    Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(error.into()),
                     None => return Ok(()),
                 }

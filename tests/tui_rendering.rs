@@ -3,23 +3,35 @@ use chidori::{
     protocol::{
         CounterSnapshot, Health, LifecycleState, ServerIdentity, ServerShutdown, ShutdownReason,
     },
-    tui::{TuiState, render},
+    tui::{
+        Application, ApplicationEvent, ApplicationTransition, CommandId, TuiState,
+        command_for_terminal_event, render,
+    },
 };
-use ratatui::{Terminal, backend::TestBackend};
+use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{Frame, Terminal, backend::TestBackend};
 use std::time::Duration;
 use uuid::Uuid;
 
-fn rendered_rows(state: &TuiState) -> Vec<String> {
+fn rendered_rows(render: impl FnOnce(&mut Frame<'_>)) -> Vec<String> {
     let mut terminal = Terminal::new(TestBackend::new(80, 15)).expect("create test terminal");
     terminal
-        .draw(|frame| render(frame, state))
-        .expect("render TUI state");
+        .draw(render)
+        .expect("render headless TUI application");
     let buffer = terminal.backend().buffer();
     buffer
         .content()
         .chunks(buffer.area.width as usize)
         .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
         .collect()
+}
+
+fn rendered_state_rows(state: &TuiState) -> Vec<String> {
+    rendered_rows(|frame| render(frame, state))
+}
+
+fn rendered_application_rows(application: &Application) -> Vec<String> {
+    rendered_rows(|frame| application.render(frame))
 }
 
 fn ready_health(instance_id: Uuid, pid: u32) -> Health {
@@ -46,8 +58,48 @@ fn connected_state(instance_id: Uuid, pid: u32, value: u64) -> TuiState {
 }
 
 #[test]
+fn headless_application_handles_terminal_and_managed_events_through_the_production_renderer() {
+    let instance_id =
+        Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
+    let mut application = Application::default();
+
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(instance_id, 42_424),
+        )))
+        .expect("handle connected event");
+    let managed_transition = application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
+            CounterSnapshot {
+                instance_id,
+                value: 17,
+                revision: 17,
+            },
+        )))
+        .expect("handle counter snapshot");
+    assert_eq!(managed_transition, ApplicationTransition::Continue);
+
+    let screen = rendered_application_rows(&application).join("\n");
+    assert!(screen.contains("17"));
+    assert!(screen.contains("Connected"));
+    assert!(screen.contains("pid 42424"));
+    assert!(screen.contains("c2f03bd2"));
+
+    let command = command_for_terminal_event(InputEvent::Key(KeyEvent::new(
+        KeyCode::Char('q'),
+        KeyModifiers::NONE,
+    )))
+    .expect("map terminal input to a semantic command");
+    assert_eq!(command, CommandId::Quit);
+    let terminal_transition = application
+        .handle_event(ApplicationEvent::Command(command))
+        .expect("handle terminal command");
+    assert_eq!(terminal_transition, ApplicationTransition::Exit);
+}
+
+#[test]
 fn connecting_view_exposes_connection_state_before_a_snapshot_arrives() {
-    let screen = rendered_rows(&TuiState::default()).join("\n");
+    let screen = rendered_state_rows(&TuiState::default()).join("\n");
 
     assert!(screen.contains("--"));
     assert!(screen.contains("Connecting to Chidori server..."));
@@ -59,7 +111,7 @@ fn connected_view_centers_the_counter_and_shows_server_identity() {
         Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
     let state = connected_state(instance_id, 42_424, 17);
 
-    let rendered = rendered_rows(&state);
+    let rendered = rendered_state_rows(&state);
 
     let counter_position = rendered
         .iter()
@@ -92,7 +144,7 @@ fn recovering_view_retains_the_last_known_counter_and_server_identity() {
         retry_in: Duration::from_millis(500),
     }));
 
-    let screen = rendered_rows(&state).join("\n");
+    let screen = rendered_state_rows(&state).join("\n");
 
     assert!(screen.contains("17"));
     assert!(screen.contains("Recovering"));
@@ -115,7 +167,7 @@ fn recovered_view_switches_identity_and_counter_together_on_the_fresh_snapshot()
         84_848,
     )));
 
-    let awaiting_snapshot = rendered_rows(&state).join("\n");
+    let awaiting_snapshot = rendered_state_rows(&state).join("\n");
     assert!(awaiting_snapshot.contains("Recovering"));
     assert!(awaiting_snapshot.contains("17"));
     assert!(awaiting_snapshot.contains("pid 42424"));
@@ -126,7 +178,7 @@ fn recovered_view_switches_identity_and_counter_together_on_the_fresh_snapshot()
         value: 1,
         revision: 1,
     }));
-    let recovered = rendered_rows(&state).join("\n");
+    let recovered = rendered_state_rows(&state).join("\n");
     assert!(recovered.contains("Connected"));
     assert!(recovered.contains("pid 84848"));
     assert!(recovered.contains("a4cc72ad"));
@@ -144,7 +196,7 @@ fn manual_stop_view_retains_the_last_known_counter_and_server_identity() {
         reason: ShutdownReason::Manual,
     }));
 
-    let screen = rendered_rows(&state).join("\n");
+    let screen = rendered_state_rows(&state).join("\n");
     assert!(screen.contains("17"));
     assert!(screen.contains("Shared server stopped intentionally"));
     assert!(screen.contains("pid 42424"));
@@ -161,7 +213,7 @@ fn fatal_protocol_error_is_rendered_visibly_with_the_last_known_state() {
         "server sent unknown event type 'future_event'".to_owned(),
     ));
 
-    let screen = rendered_rows(&state).join("\n");
+    let screen = rendered_state_rows(&state).join("\n");
     assert!(screen.contains("17"));
     assert!(screen.contains("Connection failed"));
     assert!(screen.contains("unknown event type 'future_event'"));
