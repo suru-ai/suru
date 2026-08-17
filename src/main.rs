@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use chidori::{
-    managed_client::{ManagedClient, ManagedClientConfig, start_server},
+    managed_client::{
+        ManagedClient, ManagedClientConfig, ServerStatus, server_status, start_server, stop_server,
+    },
     server::{self, ServerConfig},
     tui,
 };
@@ -33,6 +35,8 @@ enum CliCommand {
 #[derive(Debug, Subcommand)]
 enum ServerCommand {
     Start,
+    Status,
+    Stop,
 }
 
 #[tokio::main]
@@ -45,6 +49,27 @@ async fn main() -> Result<()> {
             let health = start_server(&config).await?;
             println!(
                 "Chidori server ready (pid {}, instance {})",
+                health.pid, health.instance_id
+            );
+            Ok(())
+        }
+        Some(CliCommand::Server {
+            command: ServerCommand::Status,
+        }) => {
+            let status = server_status(&default_client_config()?).await?;
+            if matches!(status, ServerStatus::Ready(_)) {
+                println!("{status}");
+                Ok(())
+            } else {
+                anyhow::bail!(status)
+            }
+        }
+        Some(CliCommand::Server {
+            command: ServerCommand::Stop,
+        }) => {
+            let health = stop_server(&default_client_config()?).await?;
+            println!(
+                "Chidori server stopped (pid {}, instance {})",
                 health.pid, health.instance_id
             );
             Ok(())

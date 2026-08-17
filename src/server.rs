@@ -2,16 +2,17 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::State,
+    body::to_bytes,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response, sse::Event, sse::KeepAlive, sse::Sse},
-    routing::get,
+    routing::{get, post},
 };
 use fs2::FileExt;
 use futures_util::{StreamExt, stream};
@@ -35,9 +36,7 @@ pub type ServerConfig = RuntimeConfig;
 
 pub struct RunningServer {
     descriptor: RuntimeDescriptor,
-    lifecycle: watch::Sender<LifecycleState>,
-    shutdown_intent: watch::Sender<Option<ServerShutdown>>,
-    shutdown: Option<oneshot::Sender<()>>,
+    shutdown: ShutdownController,
     task: JoinHandle<Result<()>>,
 }
 
@@ -63,14 +62,36 @@ impl RunningServer {
     }
 
     async fn request_shutdown(&mut self) {
-        self.lifecycle.send_replace(LifecycleState::Stopping);
-        self.shutdown_intent.send_replace(Some(ServerShutdown {
+        self.shutdown.request(ServerShutdown {
             instance_id: self.descriptor.instance_id,
             reason: ShutdownReason::Manual,
-        }));
-        tokio::task::yield_now().await;
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+        });
+    }
+}
+
+#[derive(Clone)]
+struct ShutdownController {
+    lifecycle: watch::Sender<LifecycleState>,
+    shutdown_intent: watch::Sender<Option<ServerShutdown>>,
+    shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl ShutdownController {
+    fn request(&self, request: ServerShutdown) {
+        self.lifecycle.send_replace(LifecycleState::Stopping);
+        self.shutdown_intent.send_replace(Some(request));
+        let shutdown = self
+            .shutdown
+            .lock()
+            .expect("shutdown sender lock is not poisoned")
+            .take();
+        if let Some(shutdown) = shutdown {
+            tokio::spawn(async move {
+                // Keep health and existing streams available briefly so the accepted response and
+                // final authenticated intent can reach clients before graceful transport closure.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = shutdown.send(());
+            });
         }
     }
 }
@@ -81,6 +102,7 @@ struct AppState {
     lifecycle: watch::Sender<LifecycleState>,
     counter: watch::Sender<CounterState>,
     shutdown_intent: watch::Sender<Option<ServerShutdown>>,
+    shutdown: ShutdownController,
 }
 
 #[derive(Clone, Copy)]
@@ -123,17 +145,24 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
     });
     let (lifecycle, _) = watch::channel(LifecycleState::Starting);
     let (shutdown_intent, _) = watch::channel(None);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let shutdown = ShutdownController {
+        lifecycle: lifecycle.clone(),
+        shutdown_intent: shutdown_intent.clone(),
+        shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
+    };
     let state = AppState {
         descriptor: Arc::new(descriptor.clone()),
         lifecycle: lifecycle.clone(),
         counter: counter.clone(),
         shutdown_intent: shutdown_intent.clone(),
+        shutdown: shutdown.clone(),
     };
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/events", get(events))
+        .route("/v1/server/stop", post(stop_server))
         .with_state(state);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let descriptor_path = config.descriptor_path();
     let instance_id = descriptor.instance_id;
     let task_lifecycle = lifecycle.clone();
@@ -164,9 +193,7 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
 
     Ok(RunningServer {
         descriptor,
-        lifecycle,
-        shutdown_intent,
-        shutdown: Some(shutdown_tx),
+        shutdown,
         task,
     })
 }
@@ -276,6 +303,24 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         build_identity: state.descriptor.build_identity.clone(),
     })
     .into_response()
+}
+
+async fn stop_server(State(state): State<AppState>, request: Request) -> StatusCode {
+    if !is_authenticated(request.headers(), &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let Ok(body) = to_bytes(request.into_body(), 16 * 1024).await else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Ok(request) = serde_json::from_slice::<ServerShutdown>(&body) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if request.instance_id != state.descriptor.instance_id {
+        return StatusCode::CONFLICT;
+    }
+
+    state.shutdown.request(request);
+    StatusCode::ACCEPTED
 }
 
 fn is_authenticated(headers: &HeaderMap, token: &str) -> bool {

@@ -355,6 +355,17 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
         },
     );
 
+    let stop = run_server_cli(state_dir.path(), channel, "stop").await;
+    assert!(!stop.status.success());
+    assert!(
+        unrelated
+            .0
+            .try_wait()
+            .expect("inspect unrelated process after refused stop")
+            .is_none(),
+        "server stop terminated a process based only on stale metadata"
+    );
+
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
             .expect("configure managed client")
@@ -464,6 +475,303 @@ impl Drop for ChildGuard {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+#[tokio::test]
+async fn server_status_reports_authenticated_ready_and_missing_states() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "status-ready-test";
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_chidori"))
+        .args(["server", "status"])
+        .env("CHIDORI_STATE_DIR", state_dir.path())
+        .env("CHIDORI_CHANNEL", channel)
+        .output()
+        .expect("inspect missing server status");
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("missing"),
+        "missing status was not identified: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
+    let started = Command::new(env!("CARGO_BIN_EXE_chidori"))
+        .args(["server", "start"])
+        .env("CHIDORI_STATE_DIR", state_dir.path())
+        .env("CHIDORI_CHANNEL", channel)
+        .output()
+        .expect("start server for status command");
+    assert!(
+        started.status.success(),
+        "server start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let descriptor = read_runtime_descriptor(state_dir.path().join(channel).join("runtime.json"));
+
+    let ready = Command::new(env!("CARGO_BIN_EXE_chidori"))
+        .args(["server", "status"])
+        .env("CHIDORI_STATE_DIR", state_dir.path())
+        .env("CHIDORI_CHANNEL", channel)
+        .output()
+        .expect("inspect ready server status");
+    assert!(
+        ready.status.success(),
+        "ready status failed: {}",
+        String::from_utf8_lossy(&ready.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&ready.stdout);
+    assert!(stdout.contains("ready"));
+    assert!(stdout.contains(&descriptor.pid.to_string()));
+    assert!(stdout.contains(&descriptor.instance_id.to_string()));
+
+    stop_test_server(state_dir.path(), channel);
+}
+
+#[tokio::test]
+async fn server_status_distinguishes_lifecycle_stale_and_unreachable_registrations() {
+    for (channel, lifecycle, expected) in [
+        ("status-starting-test", LifecycleState::Starting, "starting"),
+        ("status-stopping-test", LifecycleState::Stopping, "stopping"),
+        ("status-failed-test", LifecycleState::Failed, "failed"),
+    ] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let _fixture = ReadinessFixture::spawn(state_dir.path(), channel, lifecycle).await;
+
+        let output = run_server_cli(state_dir.path(), channel, "status").await;
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "expected {expected} status, got: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stale_state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let stale_channel = "status-stale-test";
+    let _fixture =
+        ReadinessFixture::spawn(stale_state_dir.path(), stale_channel, LifecycleState::Ready).await;
+    let stale_path = stale_state_dir
+        .path()
+        .join(stale_channel)
+        .join("runtime.json");
+    let mut stale = read_runtime_descriptor(&stale_path);
+    stale.instance_id = Uuid::new_v4();
+    write_runtime_descriptor(&stale_path, &stale);
+    let stale_output = run_server_cli(stale_state_dir.path(), stale_channel, "status").await;
+    assert!(!stale_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&stale_output.stderr).contains("stale"),
+        "stale registration was not identified: {}",
+        String::from_utf8_lossy(&stale_output.stderr)
+    );
+
+    let unreachable_state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let unreachable_channel = "status-unreachable-test";
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("reserve an unused loopback address");
+    let unreachable_url = format!(
+        "http://{}",
+        listener.local_addr().expect("read unused address")
+    );
+    drop(listener);
+    let runtime_dir = unreachable_state_dir.path().join(unreachable_channel);
+    std::fs::create_dir_all(&runtime_dir).expect("create unreachable runtime directory");
+    write_runtime_descriptor(
+        runtime_dir.join("runtime.json"),
+        &RuntimeDescriptor {
+            base_url: unreachable_url,
+            token: "unreachable-token".to_owned(),
+            instance_id: Uuid::new_v4(),
+            pid: u32::MAX,
+            protocol_version: PROTOCOL_VERSION,
+            build_identity: BUILD_IDENTITY.to_owned(),
+        },
+    );
+    let unreachable_output =
+        run_server_cli(unreachable_state_dir.path(), unreachable_channel, "status").await;
+    assert!(!unreachable_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&unreachable_output.stderr).contains("unreachable"),
+        "unreachable registration was not identified: {}",
+        String::from_utf8_lossy(&unreachable_output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn server_stop_notifies_attached_clients_and_remains_stopped() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "cli-manual-stop-test";
+    let started = run_server_cli(state_dir.path(), channel, "start").await;
+    assert!(
+        started.status.success(),
+        "server start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let descriptor_path = state_dir.path().join(channel).join("runtime.json");
+    let descriptor = read_runtime_descriptor(&descriptor_path);
+    let mut managed = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure attached managed client"),
+    )
+    .await
+    .expect("attach managed client before manual stop");
+    receive_initial_state(&mut managed).await;
+
+    let stopped = run_server_cli(state_dir.path(), channel, "stop").await;
+    assert!(
+        stopped.status.success(),
+        "server stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&stopped.stdout);
+    assert!(stdout.contains("stopped"));
+    assert!(stdout.contains(&descriptor.pid.to_string()));
+    assert!(stdout.contains(&descriptor.instance_id.to_string()));
+
+    let shutdown = timeout(Duration::from_secs(1), async {
+        loop {
+            match managed.next().await {
+                Some(ManagedEvent::ServerShutdown(shutdown)) => break shutdown,
+                Some(ManagedEvent::CounterUpdated(_)) => {}
+                Some(ManagedEvent::Recovering(status)) => {
+                    panic!("manual stop triggered recovery: {status:?}")
+                }
+                Some(event) => panic!("expected manual shutdown intent, got {event:?}"),
+                None => panic!("attached client closed before manual intent"),
+            }
+        }
+    })
+    .await
+    .expect("attached client receives manual stop intent");
+    assert_eq!(shutdown.instance_id, descriptor.instance_id);
+    assert_eq!(shutdown.reason, ShutdownReason::Manual);
+    assert!(matches!(
+        timeout(Duration::from_secs(1), managed.next()).await,
+        Ok(None)
+    ));
+
+    assert!(!descriptor_path.exists());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !descriptor_path.exists(),
+        "manual stop was undone by immediate recovery"
+    );
+    let status = run_server_cli(state_dir.path(), channel, "status").await;
+    assert!(!status.status.success());
+    assert!(String::from_utf8_lossy(&status.stderr).contains("missing"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "attached-tui-manual-stop-test";
+    let started = run_server_cli(state_dir.path(), channel, "start").await;
+    assert!(
+        started.status.success(),
+        "server start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let mut tui = AttachedTuiGuard(Some(
+        Command::new("script")
+            .args(["-qef", "/dev/null", "--", env!("CARGO_BIN_EXE_chidori")])
+            .env("CHIDORI_STATE_DIR", state_dir.path())
+            .env("CHIDORI_CHANNEL", channel)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch attached TUI in a pseudo-terminal"),
+    ));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        tui.0
+            .as_mut()
+            .expect("attached TUI process")
+            .try_wait()
+            .expect("inspect attached TUI")
+            .is_none(),
+        "attached TUI exited before the manual stop"
+    );
+
+    let stopped = run_server_cli(state_dir.path(), channel, "stop").await;
+    assert!(
+        stopped.status.success(),
+        "server stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if tui
+                .0
+                .as_mut()
+                .expect("attached TUI process")
+                .try_wait()
+                .expect("inspect attached TUI exit")
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("attached TUI exits after manual stop");
+
+    let output = tui
+        .0
+        .take()
+        .expect("attached TUI process")
+        .wait_with_output()
+        .expect("collect attached TUI output");
+    assert!(
+        output.status.success(),
+        "attached TUI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let screen = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        screen.contains("\u{1b}[?1049l"),
+        "attached TUI did not leave the alternate screen"
+    );
+    assert!(
+        screen.contains("\u{1b}[?25h"),
+        "attached TUI did not restore the cursor"
+    );
+}
+
+#[cfg(target_os = "linux")]
+struct AttachedTuiGuard(Option<Child>);
+
+#[cfg(target_os = "linux")]
+impl Drop for AttachedTuiGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+async fn run_server_cli(
+    state_dir: &std::path::Path,
+    channel: &str,
+    command: &str,
+) -> std::process::Output {
+    let state_dir = state_dir.to_path_buf();
+    let channel = channel.to_owned();
+    let command = command.to_owned();
+    tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_chidori"))
+            .args(["server", &command])
+            .env("CHIDORI_STATE_DIR", state_dir)
+            .env("CHIDORI_CHANNEL", channel)
+            .output()
+            .expect("run server CLI command")
+    })
+    .await
+    .expect("server CLI command task does not panic")
 }
 
 #[tokio::test]

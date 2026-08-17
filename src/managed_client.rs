@@ -18,7 +18,7 @@ use crate::{
     RuntimeConfig,
     protocol::{
         COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
-        RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown,
+        RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown, ShutdownReason,
     },
     runtime::protect_current_user_file,
 };
@@ -26,6 +26,8 @@ use crate::{
 const SERVER_LOG_FILE: &str = "server.log";
 const SERVER_LOG_TAIL_BYTES: u64 = 8 * 1024;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_RECOVERY_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
 
@@ -94,6 +96,52 @@ pub struct RecoveryStatus {
 pub struct ManagedClient {
     events: mpsc::Receiver<ManagedEvent>,
     task: JoinHandle<()>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServerStatus {
+    Missing,
+    Starting(Health),
+    Ready(Health),
+    Stopping(Health),
+    Failed(Health),
+    Stale(String),
+    Unreachable(String),
+}
+
+impl std::fmt::Display for ServerStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(
+                formatter,
+                "Chidori server missing (no runtime registration)"
+            ),
+            Self::Starting(health) => write!(
+                formatter,
+                "Chidori server starting (pid {}, instance {})",
+                health.pid, health.instance_id
+            ),
+            Self::Ready(health) => write!(
+                formatter,
+                "Chidori server ready (pid {}, instance {})",
+                health.pid, health.instance_id
+            ),
+            Self::Stopping(health) => write!(
+                formatter,
+                "Chidori server stopping (pid {}, instance {})",
+                health.pid, health.instance_id
+            ),
+            Self::Failed(health) => write!(
+                formatter,
+                "Chidori server failed (pid {}, instance {})",
+                health.pid, health.instance_id
+            ),
+            Self::Stale(reason) => {
+                write!(formatter, "Chidori server registration stale: {reason}")
+            }
+            Self::Unreachable(reason) => write!(formatter, "Chidori server unreachable: {reason}"),
+        }
+    }
 }
 
 impl ManagedClient {
@@ -166,6 +214,122 @@ pub async fn start_server(config: &ManagedClientConfig) -> Result<Health> {
     ensure_server(config, deadline)
         .await
         .map(|(_, health)| health)
+}
+
+pub async fn server_status(config: &ManagedClientConfig) -> Result<ServerStatus> {
+    if !config
+        .descriptor_path()
+        .try_exists()
+        .context("inspect runtime descriptor")?
+    {
+        return Ok(ServerStatus::Missing);
+    }
+
+    let descriptor = match read_descriptor(&config.descriptor_path()) {
+        Ok(descriptor) => descriptor,
+        Err(error) => return Ok(ServerStatus::Stale(format!("{error:#}"))),
+    };
+    if let Err(error) = validate_loopback_url(&descriptor.base_url) {
+        return Ok(ServerStatus::Stale(format!("{error:#}")));
+    }
+
+    let health = match tokio::time::timeout(STATUS_TIMEOUT, inspect_health(&descriptor)).await {
+        Ok(Ok(health)) => health,
+        Ok(Err(HealthInspectionError::Stale(reason))) => {
+            return Ok(ServerStatus::Stale(reason));
+        }
+        Ok(Err(HealthInspectionError::Unreachable(reason))) => {
+            return Ok(ServerStatus::Unreachable(reason));
+        }
+        Err(_) => {
+            return Ok(ServerStatus::Unreachable(
+                "authenticated health check timed out".to_owned(),
+            ));
+        }
+    };
+    Ok(match health.lifecycle {
+        LifecycleState::Starting => ServerStatus::Starting(health),
+        LifecycleState::Ready => ServerStatus::Ready(health),
+        LifecycleState::Stopping => ServerStatus::Stopping(health),
+        LifecycleState::Failed => ServerStatus::Failed(health),
+    })
+}
+
+pub async fn stop_server(config: &ManagedClientConfig) -> Result<Health> {
+    let descriptor = read_descriptor(&config.descriptor_path())?;
+    validate_loopback_url(&descriptor.base_url)?;
+    let health = match tokio::time::timeout(STATUS_TIMEOUT, inspect_health(&descriptor)).await {
+        Ok(Ok(health)) => health,
+        Ok(Err(HealthInspectionError::Stale(reason))) => {
+            bail!("cannot stop stale Chidori server registration: {reason}")
+        }
+        Ok(Err(HealthInspectionError::Unreachable(reason))) => {
+            bail!("cannot stop unreachable Chidori server: {reason}")
+        }
+        Err(_) => bail!("cannot stop unreachable Chidori server: health check timed out"),
+    };
+    let request = ServerShutdown {
+        instance_id: health.instance_id,
+        reason: ShutdownReason::Manual,
+    };
+    let response = tokio::time::timeout(
+        STATUS_TIMEOUT,
+        reqwest::Client::new()
+            .post(format!("{}/v1/server/stop", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .json(&request)
+            .send(),
+    )
+    .await
+    .context("manual stop request timed out")?
+    .context("send manual stop request")?;
+    if response.status() == reqwest::StatusCode::CONFLICT {
+        bail!("registered Chidori server changed before it could be stopped");
+    }
+    response
+        .error_for_status()
+        .context("server rejected manual stop request")?;
+
+    let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
+    loop {
+        match read_descriptor(&config.descriptor_path()) {
+            Ok(current) if current.instance_id != request.instance_id => break,
+            Err(_) if !config.descriptor_path().exists() => break,
+            _ if tokio::time::Instant::now() >= deadline => {
+                bail!("Chidori server did not stop within 5s")
+            }
+            _ => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    Ok(health)
+}
+
+enum HealthInspectionError {
+    Stale(String),
+    Unreachable(String),
+}
+
+async fn inspect_health(
+    descriptor: &RuntimeDescriptor,
+) -> std::result::Result<Health, HealthInspectionError> {
+    let response = reqwest::Client::new()
+        .get(format!("{}/health", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .map_err(|error| HealthInspectionError::Unreachable(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(HealthInspectionError::Stale(format!(
+            "authenticated health request returned {}",
+            response.status()
+        )));
+    }
+    let health = response.json::<Health>().await.map_err(|error| {
+        HealthInspectionError::Stale(format!("invalid health response: {error}"))
+    })?;
+    validate_identity(descriptor, &health)
+        .map_err(|error| HealthInspectionError::Stale(error.to_string()))?;
+    Ok(health)
 }
 
 async fn ensure_server(

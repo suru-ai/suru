@@ -1,6 +1,6 @@
 use chidori::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
-    protocol::{Health, LifecycleState, ShutdownReason},
+    protocol::{Health, LifecycleState, ServerShutdown, ShutdownReason},
     server::{self, ServerConfig},
 };
 use tokio::time::{Duration, timeout};
@@ -66,6 +66,40 @@ async fn authenticated_health_describes_the_ready_server() {
         reqwest::StatusCode::UNAUTHORIZED
     );
 
+    let stop_request = ServerShutdown {
+        instance_id: descriptor.instance_id,
+        reason: ShutdownReason::Manual,
+    };
+    let missing_stop_auth = client
+        .post(format!("{}/v1/server/stop", descriptor.base_url))
+        .json(&stop_request)
+        .send()
+        .await
+        .expect("request stop without authentication");
+    assert_eq!(
+        missing_stop_auth.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let malformed_missing_stop_auth = client
+        .post(format!("{}/v1/server/stop", descriptor.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body("not-json")
+        .send()
+        .await
+        .expect("request malformed stop without authentication");
+    assert_eq!(
+        malformed_missing_stop_auth.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let wrong_stop_auth = client
+        .post(format!("{}/v1/server/stop", descriptor.base_url))
+        .bearer_auth("wrong-token")
+        .json(&stop_request)
+        .send()
+        .await
+        .expect("request stop with incorrect authentication");
+    assert_eq!(wrong_stop_auth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -108,6 +142,118 @@ async fn authenticated_health_describes_the_ready_server() {
     }
 
     server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn stop_refuses_a_mismatched_instance_without_affecting_the_server() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "mismatched-stop-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{}/v1/server/stop", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&ServerShutdown {
+            instance_id: uuid::Uuid::new_v4(),
+            reason: ShutdownReason::Manual,
+        })
+        .send()
+        .await
+        .expect("request shutdown for the wrong instance");
+
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let health = client
+        .get(format!("{}/health", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("request health after rejected shutdown")
+        .error_for_status()
+        .expect("server remains reachable after rejected shutdown")
+        .json::<Health>()
+        .await
+        .expect("decode health after rejected shutdown");
+    assert_eq!(health.instance_id, descriptor.instance_id);
+    assert_eq!(health.lifecycle, LifecycleState::Ready);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn authenticated_manual_stop_notifies_clients_and_removes_its_registration() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config = ServerConfig::new(state_dir.path(), "manual-stop-test").expect("configure server");
+    let server = server::spawn(config.clone()).await.expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let mut managed = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "manual-stop-test")
+            .expect("configure managed client"),
+    )
+    .await
+    .expect("connect managed client");
+    receive_initial_state(&mut managed).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{}/v1/server/stop", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&ServerShutdown {
+            instance_id: descriptor.instance_id,
+            reason: ShutdownReason::Manual,
+        })
+        .send()
+        .await
+        .expect("request manual shutdown");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+
+    let stopping = client
+        .get(format!("{}/health", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("request health during graceful shutdown")
+        .error_for_status()
+        .expect("health remains available during graceful shutdown")
+        .json::<Health>()
+        .await
+        .expect("decode stopping health");
+    assert_eq!(stopping.lifecycle, LifecycleState::Stopping);
+
+    let shutdown = timeout(Duration::from_secs(1), async {
+        loop {
+            match managed.next().await {
+                Some(ManagedEvent::ServerShutdown(shutdown)) => break shutdown,
+                Some(ManagedEvent::CounterUpdated(_)) => {}
+                Some(ManagedEvent::Recovering(status)) => {
+                    panic!("manual shutdown triggered recovery: {status:?}")
+                }
+                Some(event) => panic!("expected manual shutdown intent, got {event:?}"),
+                None => panic!("managed client closed before shutdown intent"),
+            }
+        }
+    })
+    .await
+    .expect("managed client receives manual shutdown intent");
+    assert_eq!(shutdown.instance_id, descriptor.instance_id);
+    assert_eq!(shutdown.reason, ShutdownReason::Manual);
+    assert!(matches!(
+        timeout(Duration::from_secs(1), managed.next()).await,
+        Ok(None)
+    ));
+
+    timeout(Duration::from_secs(1), async {
+        while config.descriptor_path().exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stopping server removes its own registration");
+    server.shutdown().await.expect("join stopped server");
 }
 
 #[cfg(windows)]
