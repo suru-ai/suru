@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::to_bytes,
-    extract::{Request, State},
+    extract::{Path as AxumPath, Request, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response, sse::Event, sse::Sse},
     routing::{get, post},
@@ -27,11 +27,13 @@ use uuid::Uuid;
 use crate::RuntimeConfig;
 use crate::build_identity;
 use crate::protocol::{
-    COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, LifecycleState, PROTOCOL_VERSION,
-    RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerIdentity, ServerShutdown,
-    ShutdownReason,
+    COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, CreateSessionRequest, LifecycleState,
+    PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT,
+    SNAPSHOT_EVENT, ServerIdentity, ServerShutdown, SessionError, SessionErrorCode, SessionId,
+    SessionSnapshot, ShutdownReason,
 };
 use crate::runtime::protect_current_user_file;
+use crate::sessions::{CreateSessionError, SessionStore};
 
 pub type ServerConfig = RuntimeConfig;
 
@@ -109,6 +111,7 @@ impl ShutdownController {
 struct AppState {
     descriptor: Arc<RuntimeDescriptor>,
     counter: watch::Sender<CounterState>,
+    sessions: SessionStore,
     shutdown: ShutdownController,
 }
 
@@ -163,11 +166,14 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
     let state = AppState {
         descriptor: Arc::new(descriptor.clone()),
         counter: counter.clone(),
+        sessions: SessionStore::default(),
         shutdown: shutdown.clone(),
     };
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/events", get(events))
+        .route("/v1/sessions", post(create_session))
+        .route("/v1/sessions/{session_id}/events", get(session_events))
         .route("/v1/server/stop", post(stop_server))
         .with_state(state);
     let descriptor_path = config.descriptor_path();
@@ -330,6 +336,100 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
     }
 
     Json(state.descriptor.health(state.shutdown.lifecycle())).into_response()
+}
+
+async fn create_session(State(state): State<AppState>, request: Request) -> Response {
+    if !is_authenticated(request.headers(), &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(body) = to_bytes(request.into_body(), 64 * 1024).await else {
+        return session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidCommand,
+            "Session command body is too large",
+        );
+    };
+    let Ok(request) = serde_json::from_slice::<CreateSessionRequest>(&body) else {
+        return session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidCommand,
+            "Session command is not valid JSON",
+        );
+    };
+
+    match state.sessions.create(request) {
+        Ok(snapshot) => (StatusCode::CREATED, Json(snapshot)).into_response(),
+        Err(CreateSessionError::EmptyPrompt) => session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::EmptyPrompt,
+            "Prompt must contain non-whitespace text",
+        ),
+        Err(CreateSessionError::InvalidWorkspace) => session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::InvalidWorkspace,
+            "Workspace must be an existing local directory",
+        ),
+    }
+}
+
+async fn session_events(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if state.shutdown.lifecycle() != LifecycleState::Ready {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(snapshot) = state.sessions.snapshot(session_id) else {
+        return session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        );
+    };
+
+    Sse::new(session_event_stream(snapshot, Duration::from_secs(10))).into_response()
+}
+
+fn session_event_stream(
+    snapshot: SessionSnapshot,
+    keepalive_interval: Duration,
+) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
+    let snapshot_event = Event::default()
+        .event(SESSION_SNAPSHOT_EVENT)
+        .id(snapshot.revision.0.to_string())
+        .json_data(snapshot)
+        .expect("Session snapshots always serialize");
+    stream::once(async move { Ok::<_, std::convert::Infallible>(snapshot_event) }).chain(
+        stream::unfold(
+            tokio::time::interval_at(Instant::now() + keepalive_interval, keepalive_interval),
+            |mut keepalive| async move {
+                keepalive.tick().await;
+                Some((
+                    Ok::<_, std::convert::Infallible>(Event::default().comment("keep-alive")),
+                    keepalive,
+                ))
+            },
+        ),
+    )
+}
+
+fn session_error_response(
+    status: StatusCode,
+    code: SessionErrorCode,
+    message: impl Into<String>,
+) -> Response {
+    (
+        status,
+        Json(SessionError {
+            code,
+            message: message.into(),
+        }),
+    )
+        .into_response()
 }
 
 async fn stop_server(State(state): State<AppState>, request: Request) -> StatusCode {

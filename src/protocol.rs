@@ -1,3 +1,5 @@
+use std::{fmt, path::PathBuf};
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -5,6 +7,215 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const SNAPSHOT_EVENT: &str = "snapshot";
 pub const COUNTER_UPDATED_EVENT: &str = "counter_updated";
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
+pub const SESSION_SNAPSHOT_EVENT: &str = "session_snapshot";
+pub const SESSION_UPDATED_EVENT: &str = "session_updated";
+
+macro_rules! session_identity {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(Uuid);
+
+        impl $name {
+            pub fn new() -> Self {
+                Self(Uuid::new_v4())
+            }
+
+            pub const fn from_uuid(value: Uuid) -> Self {
+                Self(value)
+            }
+
+            pub const fn as_uuid(self) -> Uuid {
+                self.0
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+    };
+}
+
+session_identity!(SessionId);
+session_identity!(PromptId);
+session_identity!(TurnId);
+session_identity!(MessageId);
+session_identity!(ActivityId);
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SessionRevision(pub u64);
+
+impl SessionRevision {
+    pub const INITIAL: Self = Self(1);
+
+    pub fn immediately_follows(self, previous: Self) -> bool {
+        previous.0.checked_add(1) == Some(self.0)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Workspace {
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentIdentity {
+    pub agent: String,
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Idle,
+    Active,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptStatus {
+    Pending,
+    Delivered,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStatus {
+    Active,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRole {
+    User,
+    Agent,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityKind {
+    Status,
+    Error,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Session {
+    pub id: SessionId,
+    pub workspace: Workspace,
+    pub agent: Option<AgentIdentity>,
+    pub status: SessionStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Prompt {
+    pub id: PromptId,
+    pub text: String,
+    pub status: PromptStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Turn {
+    pub id: TurnId,
+    pub prompt_id: PromptId,
+    pub status: TurnStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Message {
+    pub id: MessageId,
+    pub turn_id: TurnId,
+    pub role: MessageRole,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Activity {
+    pub id: ActivityId,
+    pub turn_id: TurnId,
+    pub kind: ActivityKind,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSnapshot {
+    pub session: Session,
+    pub revision: SessionRevision,
+    pub prompts: Vec<Prompt>,
+    pub turns: Vec<Turn>,
+    pub messages: Vec<Message>,
+    pub activities: Vec<Activity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionUpdate {
+    pub session_id: SessionId,
+    pub revision: SessionRevision,
+    pub changes: Vec<SessionChange>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionChange {
+    PromptAdded { prompt: Prompt },
+    TurnAdded { turn: Turn },
+    MessageAdded { message: Message },
+    ActivityAdded { activity: Activity },
+    TurnStatusChanged { turn_id: TurnId, status: TurnStatus },
+    SessionStatusChanged { status: SessionStatus },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialPrompt {
+    pub id: PromptId,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateSessionRequest {
+    pub workspace: Workspace,
+    pub prompt: InitialPrompt,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionErrorCode {
+    InvalidCommand,
+    EmptyPrompt,
+    InvalidWorkspace,
+    SessionNotFound,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionError {
+    pub code: SessionErrorCode,
+    pub message: String,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

@@ -1,6 +1,10 @@
 //! Ratatui view state and terminal lifecycle.
 
-use std::io::{Stdout, stdout};
+use std::{
+    future::pending,
+    io::{Stdout, stdout},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Result, anyhow};
 use crossterm::{
@@ -15,16 +19,21 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph},
 };
 
 use crate::{
-    managed_client::{ManagedClient, ManagedEvent, RecoveryStatus},
-    protocol::{ServerIdentity, ShutdownReason},
+    managed_client::{
+        ManagedClient, ManagedEvent, RecoveryStatus, SessionEvent, SessionSubscription,
+    },
+    protocol::{
+        ActivityKind, CreateSessionRequest, InitialPrompt, MessageRole, PromptId, ServerIdentity,
+        SessionChange, SessionSnapshot, ShutdownReason, Workspace,
+    },
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TuiState {
     identity: Option<ServerIdentity>,
     pending_identity: Option<ServerIdentity>,
@@ -33,9 +42,34 @@ pub struct TuiState {
     /// Manual stop preserves the last confirmed identity and counter as useful final context.
     manually_stopped: bool,
     fatal_error: Option<String>,
+    workspace: PathBuf,
+    composer: String,
+    submission_error: Option<String>,
+    session: Option<SessionSnapshot>,
+}
+
+impl Default for TuiState {
+    fn default() -> Self {
+        Self::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
 }
 
 impl TuiState {
+    fn new(workspace: impl AsRef<Path>) -> Self {
+        Self {
+            identity: None,
+            pending_identity: None,
+            counter: None,
+            recovery: None,
+            manually_stopped: false,
+            fatal_error: None,
+            workspace: workspace.as_ref().to_owned(),
+            composer: String::new(),
+            submission_error: None,
+            session: None,
+        }
+    }
+
     pub fn apply(&mut self, event: ManagedEvent) {
         match event {
             ManagedEvent::Connecting => {
@@ -79,6 +113,50 @@ impl TuiState {
             ManagedEvent::Fatal(error) => self.fatal_error = Some(error),
         }
     }
+
+    fn apply_session(&mut self, event: SessionEvent) -> Result<()> {
+        match event {
+            SessionEvent::Snapshot(snapshot) => {
+                self.composer.clear();
+                self.submission_error = None;
+                self.session = Some(snapshot);
+            }
+            SessionEvent::Updated(update) => {
+                let Some(snapshot) = self.session.as_mut() else {
+                    return Err(anyhow!("Session update arrived before its snapshot"));
+                };
+                if snapshot.session.id != update.session_id {
+                    return Err(anyhow!("Session update targeted a different Session"));
+                }
+                if !update.revision.immediately_follows(snapshot.revision) {
+                    return Err(anyhow!("Session update revision is not monotonic"));
+                }
+                for change in update.changes {
+                    match change {
+                        SessionChange::PromptAdded { prompt } => snapshot.prompts.push(prompt),
+                        SessionChange::TurnAdded { turn } => snapshot.turns.push(turn),
+                        SessionChange::MessageAdded { message } => snapshot.messages.push(message),
+                        SessionChange::ActivityAdded { activity } => {
+                            snapshot.activities.push(activity);
+                        }
+                        SessionChange::TurnStatusChanged { turn_id, status } => {
+                            let Some(turn) =
+                                snapshot.turns.iter_mut().find(|turn| turn.id == turn_id)
+                            else {
+                                return Err(anyhow!("Session update referenced an unknown Turn"));
+                            };
+                            turn.status = status;
+                        }
+                        SessionChange::SessionStatusChanged { status } => {
+                            snapshot.session.status = status;
+                        }
+                    }
+                }
+                snapshot.revision = update.revision;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -90,23 +168,68 @@ pub struct Application {
 pub enum ApplicationEvent {
     Command(CommandId),
     Managed(ManagedEvent),
+    Session(SessionEvent),
+    SessionCreationFailed(String),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandId {
     Quit,
+    SubmitPrompt,
+    DeleteBackward,
+    InsertText(String),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplicationTransition {
     Continue,
     Exit,
+    CreateSession(CreateSessionRequest),
 }
 
 impl Application {
+    pub fn new(workspace: impl AsRef<Path>) -> Self {
+        Self {
+            state: TuiState::new(workspace),
+        }
+    }
+
     pub fn handle_event(&mut self, event: ApplicationEvent) -> Result<ApplicationTransition> {
         match event {
             ApplicationEvent::Command(CommandId::Quit) => Ok(ApplicationTransition::Exit),
+            ApplicationEvent::Command(CommandId::InsertText(text)) => {
+                if self.state.session.is_none() {
+                    self.state.composer.push_str(&text);
+                    self.state.submission_error = None;
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::DeleteBackward) => {
+                if self.state.session.is_none() {
+                    self.state.composer.pop();
+                    self.state.submission_error = None;
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::SubmitPrompt) => {
+                if self.state.session.is_some() {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                if self.state.composer.trim().is_empty() {
+                    self.state.submission_error =
+                        Some("Prompt must contain non-whitespace text".to_owned());
+                    return Ok(ApplicationTransition::Continue);
+                }
+                Ok(ApplicationTransition::CreateSession(CreateSessionRequest {
+                    workspace: Workspace {
+                        path: self.state.workspace.clone(),
+                    },
+                    prompt: InitialPrompt {
+                        id: PromptId::new(),
+                        text: self.state.composer.clone(),
+                    },
+                }))
+            }
             ApplicationEvent::Managed(ManagedEvent::Fatal(error)) => Err(anyhow!(error)),
             ApplicationEvent::Managed(event @ ManagedEvent::ServerShutdown(_)) => {
                 self.state.apply(event);
@@ -114,6 +237,14 @@ impl Application {
             }
             ApplicationEvent::Managed(event) => {
                 self.state.apply(event);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Session(event) => {
+                self.state.apply_session(event)?;
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SessionCreationFailed(error) => {
+                self.state.submission_error = Some(error);
                 Ok(ApplicationTransition::Continue)
             }
         }
@@ -126,32 +257,89 @@ impl Application {
 
 pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
     match event {
+        InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,
         InputEvent::Key(key) if is_quit(key) => Some(CommandId::Quit),
+        InputEvent::Key(key)
+            if key.code == KeyCode::Enter
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            Some(CommandId::SubmitPrompt)
+        }
+        InputEvent::Key(key) if key.code == KeyCode::Backspace => Some(CommandId::DeleteBackward),
+        InputEvent::Key(key)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            match key.code {
+                KeyCode::Char(character) => Some(CommandId::InsertText(character.to_string())),
+                _ => None,
+            }
+        }
+        InputEvent::Paste(text) => Some(CommandId::InsertText(text)),
         _ => None,
     }
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
-    let [main, status_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
-    let panel = centered_rect(main, 36, 7);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Chidori Counter ")
-        .title_alignment(Alignment::Center)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(panel);
-    frame.render_widget(block, panel);
+    if let Some(snapshot) = &state.session {
+        render_session(frame, state, snapshot);
+    } else {
+        render_landing(frame, state);
+    }
+}
 
-    let counter = state
-        .counter
-        .map_or_else(|| "--".to_owned(), |value| value.to_string());
-    let counter_area = Rect::new(inner.x, inner.y + inner.height / 2, inner.width, 1);
+fn render_landing(frame: &mut Frame<'_>, state: &TuiState) {
+    let [main, status_area] =
+        Layout::vertical([Constraint::Min(7), Constraint::Length(1)]).areas(frame.area());
+    let panel = centered_rect(main, 72, 8);
+    let [brand_area, question_area, error_area, composer_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(3),
+    ])
+    .areas(panel);
     frame.render_widget(
-        Paragraph::new(counter)
+        Paragraph::new("Chidori")
             .alignment(Alignment::Center)
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-        counter_area,
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        brand_area,
+    );
+    frame.render_widget(
+        Paragraph::new("What would you like to work on?").alignment(Alignment::Center),
+        question_area,
+    );
+    if let Some(error) = &state.submission_error {
+        frame.render_widget(
+            Paragraph::new(error.as_str())
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::Red)),
+            error_area,
+        );
+    }
+    let content = if state.composer.is_empty() {
+        Span::styled(
+            "Type a Prompt and press Enter",
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        Span::raw(state.composer.clone())
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(content)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Prompt ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        composer_area,
     );
 
     frame.render_widget(
@@ -162,17 +350,105 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     );
 }
 
+fn render_session(frame: &mut Frame<'_>, state: &TuiState, snapshot: &SessionSnapshot) {
+    let [header_area, transcript_area, status_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::styled(
+                "Chidori",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                snapshot
+                    .session
+                    .workspace
+                    .path
+                    .to_string_lossy()
+                    .into_owned(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
+        header_area,
+    );
+
+    let mut lines = Vec::new();
+    for turn in &snapshot.turns {
+        for message in snapshot
+            .messages
+            .iter()
+            .filter(|message| message.turn_id == turn.id)
+        {
+            let (prefix, style) = match message.role {
+                MessageRole::User => (
+                    "┃ ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                MessageRole::Agent => ("  ", Style::default()),
+            };
+            push_prefixed_lines(&mut lines, prefix, &message.content, style);
+        }
+        for activity in snapshot
+            .activities
+            .iter()
+            .filter(|activity| activity.turn_id == turn.id)
+        {
+            let style = match activity.kind {
+                ActivityKind::Status => Style::default().fg(Color::DarkGray),
+                ActivityKind::Error => Style::default().fg(Color::Red),
+            };
+            let prefix = match activity.kind {
+                ActivityKind::Status => "  ",
+                ActivityKind::Error => "  Error: ",
+            };
+            push_prefixed_lines(&mut lines, prefix, &activity.text, style);
+        }
+        lines.push(Line::default());
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::TOP)),
+        transcript_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(status_text(state)))
+            .alignment(Alignment::Center)
+            .style(status_style(state)),
+        status_area,
+    );
+}
+
+fn push_prefixed_lines(lines: &mut Vec<Line<'static>>, prefix: &str, content: &str, style: Style) {
+    for (index, line) in content.lines().enumerate() {
+        lines.push(Line::styled(
+            format!("{}{line}", if index == 0 { prefix } else { "  " }),
+            style,
+        ));
+    }
+}
+
 pub async fn run(client: ManagedClient) -> Result<()> {
+    let workspace =
+        std::env::current_dir().map_err(|error| anyhow!("read current Workspace: {error}"))?;
     let mut session = TerminalSession::enter()?;
-    run_loop(&mut session.terminal, client).await
+    run_loop(&mut session.terminal, client, workspace).await
 }
 
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut client: ManagedClient,
+    workspace: PathBuf,
 ) -> Result<()> {
-    let mut application = Application::default();
+    let mut application = Application::new(workspace);
     let mut input = EventStream::new();
+    let mut session_subscription: Option<SessionSubscription> = None;
 
     loop {
         terminal.draw(|frame| application.render(frame))?;
@@ -190,14 +466,49 @@ async fn run_loop(
                     None => return Err(anyhow!("managed client stopped unexpectedly")),
                 }
             }
+            session_event = next_session_event(&mut session_subscription) => {
+                match session_event {
+                    Some(Ok(event)) => {
+                        application.handle_event(ApplicationEvent::Session(event))?;
+                    }
+                    Some(Err(error)) => return Err(anyhow!(error)),
+                    None => session_subscription = None,
+                }
+            }
             input_event = input.next() => {
                 match input_event {
                     Some(Ok(event)) => {
                         if let Some(command) = command_for_terminal_event(event) {
                             let transition = application
                                 .handle_event(ApplicationEvent::Command(command))?;
-                            if transition == ApplicationTransition::Exit {
-                                return Ok(());
+                            match transition {
+                                ApplicationTransition::Continue => {}
+                                ApplicationTransition::Exit => return Ok(()),
+                                ApplicationTransition::CreateSession(request) => {
+                                    match client.create_session(request).await {
+                                        Ok(created) => {
+                                            match client.subscribe_session(created.session.id).await {
+                                                Ok(subscription) => {
+                                                    session_subscription = Some(subscription);
+                                                }
+                                                Err(error) => {
+                                                    application.handle_event(
+                                                        ApplicationEvent::SessionCreationFailed(
+                                                            error.to_string(),
+                                                        ),
+                                                    )?;
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            application.handle_event(
+                                                ApplicationEvent::SessionCreationFailed(
+                                                    error.to_string(),
+                                                ),
+                                            )?;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -209,12 +520,20 @@ async fn run_loop(
     }
 }
 
+async fn next_session_event(
+    subscription: &mut Option<SessionSubscription>,
+) -> Option<std::result::Result<SessionEvent, String>> {
+    match subscription {
+        Some(subscription) => subscription.next().await,
+        None => pending().await,
+    }
+}
+
 fn is_quit(key: KeyEvent) -> bool {
     if key.kind != KeyEventKind::Press {
         return false;
     }
-    matches!(key.code, KeyCode::Char('q'))
-        || (matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL))
+    matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {

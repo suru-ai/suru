@@ -1,0 +1,132 @@
+//! Authenticated Session stream transport and provider-neutral event decoding.
+
+use anyhow::{Context, Result, bail};
+use eventsource_stream::Eventsource;
+use futures_util::StreamExt;
+use tokio::{sync::mpsc, task::JoinHandle};
+
+use crate::protocol::{
+    RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SessionId, SessionSnapshot,
+    SessionUpdate,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionEvent {
+    Snapshot(SessionSnapshot),
+    Updated(SessionUpdate),
+}
+
+pub struct SessionSubscription {
+    events: mpsc::Receiver<Result<SessionEvent, String>>,
+    task: JoinHandle<()>,
+}
+
+impl SessionSubscription {
+    pub(super) async fn open(
+        http: &reqwest::Client,
+        descriptor: &RuntimeDescriptor,
+        session_id: SessionId,
+    ) -> Result<Self> {
+        let response = http
+            .get(format!(
+                "{}/v1/sessions/{session_id}/events",
+                descriptor.base_url
+            ))
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await?
+            .error_for_status()
+            .context("server rejected the Session event stream")?;
+        let (events_tx, events_rx) = mpsc::channel(32);
+        let task = tokio::spawn(consume(response, session_id, events_tx));
+        Ok(Self {
+            events: events_rx,
+            task,
+        })
+    }
+
+    pub async fn next(&mut self) -> Option<Result<SessionEvent, String>> {
+        self.events.recv().await
+    }
+}
+
+impl Drop for SessionSubscription {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn consume(
+    response: reqwest::Response,
+    session_id: SessionId,
+    events: mpsc::Sender<Result<SessionEvent, String>>,
+) {
+    let mut stream = response.bytes_stream().eventsource();
+    let mut saw_snapshot = false;
+    let mut last_revision = None;
+    while let Some(next) = stream.next().await {
+        let decoded = match next {
+            Ok(event) => decode_event(event, session_id, &mut saw_snapshot, &mut last_revision),
+            Err(error) => Err(anyhow::anyhow!("Session event stream failed: {error}")),
+        };
+        let failed = decoded.is_err();
+        if events
+            .send(decoded.map_err(|error| error.to_string()))
+            .await
+            .is_err()
+            || failed
+        {
+            return;
+        }
+    }
+}
+
+fn decode_event(
+    event: eventsource_stream::Event,
+    session_id: SessionId,
+    saw_snapshot: &mut bool,
+    last_revision: &mut Option<crate::protocol::SessionRevision>,
+) -> Result<SessionEvent> {
+    let event_revision = event
+        .id
+        .parse::<u64>()
+        .context("Session event has an invalid revision ID")?;
+    match event.event.as_str() {
+        SESSION_SNAPSHOT_EVENT => {
+            if *saw_snapshot {
+                bail!("Session stream sent more than one snapshot");
+            }
+            let snapshot: SessionSnapshot =
+                serde_json::from_str(&event.data).context("decode Session snapshot")?;
+            if snapshot.session.id != session_id {
+                bail!("Session snapshot came from an unexpected Session");
+            }
+            if snapshot.revision.0 != event_revision {
+                bail!("Session snapshot revision does not match its SSE ID");
+            }
+            *saw_snapshot = true;
+            *last_revision = Some(snapshot.revision);
+            Ok(SessionEvent::Snapshot(snapshot))
+        }
+        SESSION_UPDATED_EVENT => {
+            if !*saw_snapshot {
+                bail!("Session stream sent an update before its snapshot");
+            }
+            let update: SessionUpdate =
+                serde_json::from_str(&event.data).context("decode Session update")?;
+            if update.session_id != session_id {
+                bail!("Session update came from an unexpected Session");
+            }
+            if update.revision.0 != event_revision {
+                bail!("Session update revision does not match its SSE ID");
+            }
+            if !last_revision.is_some_and(|previous| update.revision.immediately_follows(previous))
+            {
+                bail!("Session update revision is not monotonic");
+            }
+            *last_revision = Some(update.revision);
+            Ok(SessionEvent::Updated(update))
+        }
+        name => bail!("Session stream sent unknown event type '{name}'"),
+    }
+}

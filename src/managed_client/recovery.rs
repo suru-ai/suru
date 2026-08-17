@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::protocol::{Health, LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor};
 
@@ -28,9 +28,19 @@ pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient
     let http = reqwest::Client::new();
     let connection = establish_connection(&config, &http, deadline).await?;
     let (events_tx, events_rx) = mpsc::channel(32);
-    let task = tokio::spawn(run_managed_client(config, http, connection, events_tx));
+    let (descriptor_tx, descriptor_rx) = watch::channel(connection.descriptor.clone());
+    let managed_http = http.clone();
+    let task = tokio::spawn(run_managed_client(
+        config,
+        managed_http,
+        connection,
+        events_tx,
+        descriptor_tx,
+    ));
     Ok(ManagedClient {
         events: events_rx,
+        http,
+        descriptor: descriptor_rx,
         task,
     })
 }
@@ -75,6 +85,7 @@ async fn run_managed_client(
     http: reqwest::Client,
     mut connection: ActiveConnection,
     events: mpsc::Sender<ManagedEvent>,
+    descriptor: watch::Sender<RuntimeDescriptor>,
 ) {
     if events.send(ManagedEvent::Connecting).await.is_err() {
         return;
@@ -82,6 +93,7 @@ async fn run_managed_client(
     let mut protocol_state = StreamProtocolState::default();
 
     loop {
+        descriptor.send_replace(connection.descriptor.clone());
         let active_instance_id = connection.descriptor.instance_id;
         let active_build_identity = connection.health.build_identity.clone();
         if events

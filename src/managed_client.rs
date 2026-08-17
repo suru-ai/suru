@@ -6,12 +6,17 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 
 use crate::{
     RuntimeConfig,
     protocol::{
-        CounterSnapshot, CounterUpdate, Health, LifecycleState, ServerShutdown, ShutdownReason,
+        CounterSnapshot, CounterUpdate, CreateSessionRequest, Health, LifecycleState,
+        RuntimeDescriptor, ServerShutdown, SessionError, SessionId, SessionSnapshot,
+        ShutdownReason,
     },
 };
 
@@ -19,6 +24,9 @@ mod event_stream;
 mod launcher;
 mod lifecycle;
 mod recovery;
+mod session_stream;
+
+pub use session_stream::{SessionEvent, SessionSubscription};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -83,6 +91,8 @@ pub struct RecoveryStatus {
 
 pub struct ManagedClient {
     events: mpsc::Receiver<ManagedEvent>,
+    http: reqwest::Client,
+    descriptor: watch::Receiver<RuntimeDescriptor>,
     task: JoinHandle<()>,
 }
 
@@ -139,6 +149,35 @@ impl ManagedClient {
 
     pub async fn next(&mut self) -> Option<ManagedEvent> {
         self.events.recv().await
+    }
+
+    pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionSnapshot> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(format!("{}/v1/sessions", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .json(&request)
+            .send()
+            .await
+            .context("send Session creation command")?;
+        if response.status().is_success() {
+            return response
+                .json::<SessionSnapshot>()
+                .await
+                .context("decode created Session snapshot");
+        }
+        let status = response.status();
+        let error = response.json::<SessionError>().await.ok();
+        match error {
+            Some(error) => bail!(error.message),
+            None => bail!("Session creation failed with HTTP {status}"),
+        }
+    }
+
+    pub async fn subscribe_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
+        let descriptor = self.descriptor.borrow().clone();
+        SessionSubscription::open(&self.http, &descriptor, session_id).await
     }
 }
 
