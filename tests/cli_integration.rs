@@ -17,10 +17,11 @@ use axum::{
     routing::{get, post},
 };
 use chidori::{
+    build_identity,
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, start_server},
     protocol::{
-        BUILD_IDENTITY, CounterSnapshot, Health, LifecycleState, PROTOCOL_VERSION,
-        RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown, ShutdownReason,
+        CounterSnapshot, Health, LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor,
+        SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown, ShutdownReason,
     },
     server::{self, ServerConfig},
 };
@@ -37,6 +38,25 @@ use support::{
     read_runtime_descriptor, receive_initial_state, request_server_shutdown,
     write_runtime_descriptor,
 };
+
+fn chidori_binary_build_identity() -> String {
+    build_identity::for_executable(env!("CARGO_BIN_EXE_chidori"))
+        .expect("identify the tested Chidori executable")
+}
+
+fn inert_server_executable(state_dir: &std::path::Path) -> PathBuf {
+    let executable = state_dir.join("must-not-spawn");
+    if !executable.exists() {
+        std::fs::write(&executable, b"inert server fixture executable")
+            .expect("write inert server fixture executable");
+    }
+    executable
+}
+
+fn inert_server_build_identity(state_dir: &std::path::Path) -> String {
+    build_identity::for_executable(inert_server_executable(state_dir))
+        .expect("identify inert server fixture executable")
+}
 
 #[tokio::test]
 async fn launching_current_build_replaces_an_authenticated_mismatched_server() {
@@ -55,7 +75,7 @@ async fn launching_current_build_replaces_an_authenticated_mismatched_server() {
 
     assert_ne!(replacement.instance_id, previous.instance_id);
     assert_ne!(replacement.pid, previous.pid);
-    assert_eq!(replacement.build_identity, BUILD_IDENTITY);
+    assert_eq!(replacement.build_identity, chidori_binary_build_identity());
     let shutdown = fixture
         .shutdown_request()
         .expect("old server receives replacement request");
@@ -78,7 +98,9 @@ async fn launching_current_build_replaces_an_authenticated_mismatched_server() {
 async fn attached_client_reconnects_to_the_replacement_and_its_fresh_snapshot() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "attached-build-replacement-test";
-    let fixture = BuildReplacementFixture::spawn(state_dir.path(), channel, BUILD_IDENTITY).await;
+    let current_build_identity = chidori_binary_build_identity();
+    let fixture =
+        BuildReplacementFixture::spawn(state_dir.path(), channel, &current_build_identity).await;
     let previous = fixture.descriptor();
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure managed client")
@@ -125,42 +147,30 @@ async fn attached_client_reconnects_to_the_replacement_and_its_fresh_snapshot() 
     );
 
     stop_test_server(state_dir.path(), channel);
-    timeout(Duration::from_secs(2), async {
-        loop {
-            match attached.next().await.expect("managed client remains open") {
-                ManagedEvent::Recovering(_) => break,
-                ManagedEvent::CounterUpdated(_) => {}
-                ManagedEvent::Fatal(error) => panic!("managed client failed: {error}"),
-                event => panic!("expected passive recovery after replacement, got {event:?}"),
-            }
-        }
-    })
-    .await
-    .expect("replacement follower notices the later disconnect");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let after_disconnect = read_runtime_descriptor(&fixture.descriptor_path);
-    if after_disconnect.instance_id != replacement.instance_id {
-        stop_test_server(state_dir.path(), channel);
-    }
-    assert_eq!(
-        after_disconnect.instance_id, replacement.instance_id,
-        "a client that followed replacement must not launch its own build"
-    );
+    let (restarted, restarted_snapshot) =
+        receive_recovered_state(&mut attached, replacement.instance_id).await;
+    assert_ne!(restarted.instance_id, replacement.instance_id);
+    assert_eq!(restarted.build_identity, replacement.build_identity);
+    assert_eq!(restarted_snapshot.instance_id, restarted.instance_id);
+    assert!(restarted_snapshot.revision < 41);
 
     drop(attached);
     drop(also_attached);
+    stop_test_server(state_dir.path(), channel);
 }
 
 #[tokio::test]
 async fn incompatible_replacement_protocol_is_a_strict_fatal_error() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "incompatible-build-replacement-test";
-    let original = BuildReplacementFixture::spawn(state_dir.path(), channel, BUILD_IDENTITY).await;
+    let inert_build_identity = inert_server_build_identity(state_dir.path());
+    let original =
+        BuildReplacementFixture::spawn(state_dir.path(), channel, &inert_build_identity).await;
     let descriptor = original.descriptor();
     let mut attached = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
             .expect("configure attached client")
-            .with_server_executable(state_dir.path().join("must-not-spawn")),
+            .with_server_executable(inert_server_executable(state_dir.path())),
     )
     .await
     .expect("attach to original server");
@@ -265,16 +275,7 @@ async fn launcher_retries_after_losing_election_to_a_mismatched_build() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "mixed-build-election-race-test";
     let runtime_dir = state_dir.path().join(channel);
-    std::fs::create_dir_all(&runtime_dir).expect("create race runtime directory");
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(runtime_dir.join("server.lock"))
-        .expect("open race election lock");
-    lock.try_lock_exclusive()
-        .expect("hold election while current child launches");
+    let lock = BuildReplacementFixture::acquire_channel_lock(state_dir.path(), channel);
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure current launcher")
         .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
@@ -311,7 +312,7 @@ async fn launcher_retries_after_losing_election_to_a_mismatched_build() {
         .expect("launcher retries its current build after the transition");
 
     assert_ne!(replacement.instance_id, mismatched.descriptor().instance_id);
-    assert_eq!(replacement.build_identity, BUILD_IDENTITY);
+    assert_eq!(replacement.build_identity, chidori_binary_build_identity());
     assert_eq!(
         mismatched
             .shutdown_request()
@@ -338,7 +339,7 @@ async fn mismatched_build_in_another_channel_is_not_replaced() {
     .await
     .expect("start current build in another channel");
 
-    assert_eq!(current.build_identity, BUILD_IDENTITY);
+    assert_eq!(current.build_identity, chidori_binary_build_identity());
     assert!(old.shutdown_request().is_none());
     let old_health = reqwest::Client::new()
         .get(format!("{}/health", old.descriptor().base_url))
@@ -513,7 +514,7 @@ async fn recovery_backoff_is_exponential_and_capped_at_five_seconds() {
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
             .expect("configure managed client")
-            .with_server_executable(state_dir.path().join("must-not-spawn")),
+            .with_server_executable(inert_server_executable(state_dir.path())),
     )
     .await
     .expect("connect managed client");
@@ -567,7 +568,7 @@ async fn dropping_a_recovering_client_cancels_its_next_network_attempt_promptly(
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
             .expect("configure managed client")
-            .with_server_executable(state_dir.path().join("must-not-spawn")),
+            .with_server_executable(inert_server_executable(state_dir.path())),
     )
     .await
     .expect("connect managed client");
@@ -609,7 +610,7 @@ async fn authenticated_shutdown_intent_does_not_trigger_crash_recovery() {
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
             .expect("configure managed client")
-            .with_server_executable(state_dir.path().join("must-not-spawn")),
+            .with_server_executable(inert_server_executable(state_dir.path())),
     )
     .await
     .expect("connect managed client");
@@ -671,7 +672,7 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
             instance_id: Uuid::new_v4(),
             pid: unrelated.0.id(),
             protocol_version: PROTOCOL_VERSION,
-            build_identity: BUILD_IDENTITY.to_owned(),
+            build_identity: "stale-build".to_owned(),
         },
     );
 
@@ -889,7 +890,7 @@ async fn server_status_distinguishes_lifecycle_stale_and_unreachable_registratio
             instance_id: Uuid::new_v4(),
             pid: u32::MAX,
             protocol_version: PROTOCOL_VERSION,
-            build_identity: BUILD_IDENTITY.to_owned(),
+            build_identity: "unreachable-build".to_owned(),
         },
     );
     let unreachable_output =
@@ -916,7 +917,8 @@ async fn server_stop_notifies_attached_clients_and_remains_stopped() {
     let descriptor = read_runtime_descriptor(&descriptor_path);
     let mut managed = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
-            .expect("configure attached managed client"),
+            .expect("configure attached managed client")
+            .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
     )
     .await
     .expect("attach managed client before manual stop");
@@ -1117,7 +1119,9 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
     );
 
     let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir.path(), channel).expect("configure managed client"),
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
     )
     .await
     .expect("connect after start command has exited");
@@ -1221,7 +1225,7 @@ async fn managed_client_waits_through_transitional_lifecycle_before_opening_even
         let fixture = ReadinessFixture::spawn(state_dir.path(), channel, initial_lifecycle).await;
         let config = ManagedClientConfig::new(state_dir.path(), channel)
             .expect("configure managed client")
-            .with_server_executable(state_dir.path().join("must-not-spawn"));
+            .with_server_executable(inert_server_executable(state_dir.path()));
 
         let connecting = tokio::spawn(ManagedClient::connect(config));
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1249,7 +1253,7 @@ async fn managed_client_reports_a_registered_failed_lifecycle() {
     let fixture = ReadinessFixture::spawn(state_dir.path(), channel, LifecycleState::Failed).await;
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure managed client")
-        .with_server_executable(state_dir.path().join("must-not-spawn"));
+        .with_server_executable(inert_server_executable(state_dir.path()));
 
     let result = timeout(Duration::from_secs(1), ManagedClient::connect(config))
         .await
@@ -1307,7 +1311,7 @@ async fn managed_client_bounds_the_initial_event_stream_handshake() {
     .expect("write fixture server log");
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure managed client")
-        .with_server_executable(state_dir.path().join("must-not-spawn"));
+        .with_server_executable(inert_server_executable(state_dir.path()));
 
     let result = timeout(Duration::from_secs(17), ManagedClient::connect(config))
         .await
@@ -1401,7 +1405,7 @@ impl ReadinessFixture {
             instance_id,
             pid: std::process::id(),
             protocol_version: PROTOCOL_VERSION,
-            build_identity: BUILD_IDENTITY.to_owned(),
+            build_identity: inert_server_build_identity(state_dir),
         };
         let runtime_dir = state_dir.join(channel);
         std::fs::create_dir_all(&runtime_dir).expect("create fixture runtime directory");
@@ -1555,8 +1559,13 @@ impl BuildReplacementFixture {
         build_identity: &str,
         protocol_version: u32,
     ) -> Self {
+        let lock = Self::acquire_channel_lock(state_dir, channel);
+        Self::spawn_with_lock(state_dir, channel, build_identity, protocol_version, lock).await
+    }
+
+    fn acquire_channel_lock(state_dir: &std::path::Path, channel: &str) -> File {
         let runtime_dir = state_dir.join(channel);
-        std::fs::create_dir_all(&runtime_dir).expect("create old-build runtime directory");
+        std::fs::create_dir_all(&runtime_dir).expect("create fixture runtime directory");
         let lock = OpenOptions::new()
             .create(true)
             .read(true)
@@ -1566,7 +1575,7 @@ impl BuildReplacementFixture {
             .expect("open old-build channel lock");
         lock.try_lock_exclusive()
             .expect("old-build fixture owns the channel");
-        Self::spawn_with_lock(state_dir, channel, build_identity, protocol_version, lock).await
+        lock
     }
 
     async fn spawn_with_lock(

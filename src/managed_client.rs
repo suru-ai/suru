@@ -15,11 +15,11 @@ use futures_util::StreamExt;
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
-    RuntimeConfig,
+    RuntimeConfig, build_identity,
     protocol::{
-        BUILD_IDENTITY, COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health,
-        LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT,
-        ServerShutdown, ShutdownReason,
+        COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
+        PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown,
+        ShutdownReason,
     },
     runtime::protect_current_user_file,
 };
@@ -176,38 +176,44 @@ async fn establish_connection(
     deadline: tokio::time::Instant,
 ) -> Result<ActiveConnection> {
     let (descriptor, health) = ensure_server(config, deadline).await?;
-    let response = match tokio::time::timeout_at(
-        deadline,
-        http.get(format!("{}/v1/events", descriptor.base_url))
-            .bearer_auth(&descriptor.token)
-            .send(),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response.error_for_status().map_err(|error| {
-            startup_error(
-                config,
-                &format!("server rejected the initial event stream: {error}"),
-            )
-        })?,
-        Ok(Err(error)) => {
-            return Err(startup_error(
-                config,
-                &format!("could not open the initial event stream: {error}"),
-            ));
-        }
-        Err(_) => {
-            return Err(startup_error(
-                config,
-                "initial event stream did not open within 15s",
-            ));
-        }
-    };
+    let response =
+        match tokio::time::timeout_at(deadline, open_event_stream(http, &descriptor)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) if error.status().is_some() => {
+                return Err(startup_error(
+                    config,
+                    &format!("server rejected the initial event stream: {error}"),
+                ));
+            }
+            Ok(Err(error)) => {
+                return Err(startup_error(
+                    config,
+                    &format!("could not open the initial event stream: {error}"),
+                ));
+            }
+            Err(_) => {
+                return Err(startup_error(
+                    config,
+                    "initial event stream did not open within 15s",
+                ));
+            }
+        };
     Ok(ActiveConnection {
         descriptor,
         health,
         response,
     })
+}
+
+async fn open_event_stream(
+    http: &reqwest::Client,
+    descriptor: &RuntimeDescriptor,
+) -> reqwest::Result<reqwest::Response> {
+    http.get(format!("{}/v1/events", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await?
+        .error_for_status()
 }
 
 pub async fn start_server(config: &ManagedClientConfig) -> Result<Health> {
@@ -336,8 +342,7 @@ async fn shutdown_registered_instance(
             Ok(current) => current.instance_id != instance_id,
             Err(_) => !config.descriptor_path().exists(),
         };
-        let channel_released =
-            !policy.wait_for_channel_release || channel_lock_is_released(config)?;
+        let channel_released = !policy.wait_for_channel_release || !channel_is_owned(config)?;
         if target_stopped && registration_released && channel_released {
             return Ok(());
         }
@@ -434,6 +439,13 @@ async fn ensure_server(
     config: &ManagedClientConfig,
     deadline: tokio::time::Instant,
 ) -> Result<(RuntimeDescriptor, Health)> {
+    let launching_build_identity = build_identity::for_executable(&config.server_executable)
+        .map_err(|error| {
+            startup_error(
+                config,
+                &format!("could not identify the Chidori server executable: {error:#}"),
+            )
+        })?;
     let mut spawned = None;
     loop {
         let probe_result = match tokio::time::timeout_at(deadline, probe(config)).await {
@@ -456,7 +468,7 @@ async fn ensure_server(
                         ),
                     ));
                 }
-                LifecycleState::Ready if health.build_identity != BUILD_IDENTITY => {
+                LifecycleState::Ready if health.build_identity != launching_build_identity => {
                     spawned = None;
                     shutdown_registered_instance(
                         config,
@@ -503,7 +515,7 @@ async fn ensure_server(
             None => None,
         };
         if let Some(status) = spawned_exit {
-            if another_server_owns_channel(config) {
+            if channel_is_owned(config).unwrap_or(false) {
                 spawned = None;
             } else {
                 return Err(startup_error(
@@ -525,17 +537,17 @@ async fn ensure_server(
     }
 }
 
-fn channel_lock_is_released(config: &ManagedClientConfig) -> Result<bool> {
+fn channel_is_owned(config: &ManagedClientConfig) -> Result<bool> {
     let lock = match OpenOptions::new()
         .read(true)
         .write(true)
         .open(config.lock_path())
     {
         Ok(lock) => lock,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error).context("inspect server election lock"),
     };
-    Ok(lock.try_lock_exclusive().is_ok())
+    Ok(lock.try_lock_exclusive().is_err())
 }
 
 async fn probe(config: &ManagedClientConfig) -> Result<(RuntimeDescriptor, Health)> {
@@ -576,17 +588,6 @@ fn spawn_detached(config: &ManagedClientConfig) -> Result<Child> {
         .stderr(Stdio::from(stderr));
     configure_detached_process(&mut command);
     command.spawn().context("spawn detached Chidori server")
-}
-
-fn another_server_owns_channel(config: &ManagedClientConfig) -> bool {
-    let Ok(lock) = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(config.lock_path())
-    else {
-        return false;
-    };
-    lock.try_lock_exclusive().is_err()
 }
 
 fn describe_exit(status: ExitStatus) -> String {
@@ -639,12 +640,6 @@ impl Drop for ManagedClient {
     }
 }
 
-#[derive(Clone, Copy)]
-enum RecoveryStrategy {
-    EnsureOwnBuild,
-    FollowReplacement,
-}
-
 async fn run_managed_client(
     config: ManagedClientConfig,
     http: reqwest::Client,
@@ -655,7 +650,6 @@ async fn run_managed_client(
         return;
     }
 
-    let mut recovery_strategy = RecoveryStrategy::EnsureOwnBuild;
     loop {
         if events
             .send(ManagedEvent::Connected(connection.health))
@@ -664,28 +658,24 @@ async fn run_managed_client(
         {
             return;
         }
-        let mut replaced_instance_id = None;
-        match stream_events(
+        let replaced_instance_id = match stream_events(
             connection.response,
             &events,
             connection.descriptor.instance_id,
         )
         .await
         {
-            Ok(StreamOutcome::Disconnected) => {}
+            Ok(StreamOutcome::Disconnected) => None,
             Ok(StreamOutcome::ManualShutdown) => return,
-            Ok(StreamOutcome::Replacement { instance_id }) => {
-                recovery_strategy = RecoveryStrategy::FollowReplacement;
-                replaced_instance_id = Some(instance_id);
-            }
+            Ok(StreamOutcome::Replacement { instance_id }) => Some(instance_id),
             Ok(StreamOutcome::ReceiverClosed) => return,
             Err(error) => {
                 let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
                 return;
             }
-        }
+        };
 
-        if matches!(recovery_strategy, RecoveryStrategy::FollowReplacement) {
+        if let Some(replaced_instance_id) = replaced_instance_id {
             if events
                 .send(ManagedEvent::Recovering(RecoveryStatus {
                     attempt: 1,
@@ -808,7 +798,7 @@ enum ReplacementProbe {
 async fn establish_replacement_connection(
     config: &ManagedClientConfig,
     http: &reqwest::Client,
-    replaced_instance_id: Option<uuid::Uuid>,
+    replaced_instance_id: uuid::Uuid,
     deadline: tokio::time::Instant,
 ) -> Result<ActiveConnection> {
     loop {
@@ -832,39 +822,25 @@ async fn establish_replacement_connection(
 async fn probe_replacement_connection(
     config: &ManagedClientConfig,
     http: &reqwest::Client,
-    replaced_instance_id: Option<uuid::Uuid>,
+    replaced_instance_id: uuid::Uuid,
     deadline: tokio::time::Instant,
 ) -> ReplacementProbe {
-    let Ok(descriptor) = read_descriptor(&config.descriptor_path()) else {
-        return ReplacementProbe::Pending;
-    };
-    if replaced_instance_id == Some(descriptor.instance_id)
-        || validate_loopback_url(&descriptor.base_url).is_err()
-    {
-        return ReplacementProbe::Pending;
-    }
-    let Ok(Ok(health)) = tokio::time::timeout_at(deadline, inspect_health(&descriptor)).await
+    let Ok(Ok((descriptor, health))) = tokio::time::timeout_at(deadline, probe(config)).await
     else {
         return ReplacementProbe::Pending;
     };
-    if replaced_instance_id == Some(health.instance_id) || health.lifecycle != LifecycleState::Ready
-    {
+    if replaced_instance_id == descriptor.instance_id {
+        return ReplacementProbe::Pending;
+    }
+    if replaced_instance_id == health.instance_id || health.lifecycle != LifecycleState::Ready {
         return ReplacementProbe::Pending;
     }
     if health.protocol_version != PROTOCOL_VERSION {
         return ReplacementProbe::Incompatible(health.protocol_version);
     }
-    let Ok(Ok(response)) = tokio::time::timeout_at(
-        deadline,
-        http.get(format!("{}/v1/events", descriptor.base_url))
-            .bearer_auth(&descriptor.token)
-            .send(),
-    )
-    .await
+    let Ok(Ok(response)) =
+        tokio::time::timeout_at(deadline, open_event_stream(http, &descriptor)).await
     else {
-        return ReplacementProbe::Pending;
-    };
-    let Ok(response) = response.error_for_status() else {
         return ReplacementProbe::Pending;
     };
     ReplacementProbe::Ready(Box::new(ActiveConnection {

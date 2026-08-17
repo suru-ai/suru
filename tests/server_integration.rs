@@ -1,9 +1,7 @@
 use chidori::{
+    build_identity,
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, stop_server},
-    protocol::{
-        BUILD_IDENTITY, Health, LifecycleState, SERVER_SHUTDOWN_EVENT, ServerShutdown,
-        ShutdownReason,
-    },
+    protocol::{Health, LifecycleState, SERVER_SHUTDOWN_EVENT, ServerShutdown, ShutdownReason},
     server::{self, ServerConfig},
 };
 use eventsource_stream::Eventsource;
@@ -16,6 +14,28 @@ use support::{
     read_runtime_descriptor, receive_initial_state, request_server_shutdown,
     write_runtime_descriptor,
 };
+
+#[test]
+fn build_identity_changes_with_executable_contents() {
+    let directory = tempfile::tempdir().expect("create build identity fixture directory");
+    let executable = directory.path().join("chidori-fixture");
+    std::fs::write(&executable, b"first compiled executable")
+        .expect("write first executable contents");
+    let first = chidori::build_identity::for_executable(&executable)
+        .expect("identify first executable contents");
+
+    std::fs::write(&executable, b"rebuilt executable").expect("write rebuilt executable contents");
+    let rebuilt = chidori::build_identity::for_executable(&executable)
+        .expect("identify rebuilt executable contents");
+
+    assert_ne!(first, rebuilt);
+    assert!(first.starts_with(concat!(
+        env!("CARGO_PKG_NAME"),
+        "@",
+        env!("CARGO_PKG_VERSION"),
+        "+blake3:"
+    )));
+}
 
 #[tokio::test]
 async fn authenticated_health_describes_the_ready_server() {
@@ -64,18 +84,22 @@ async fn authenticated_health_describes_the_ready_server() {
     assert_eq!(health.protocol_version, descriptor.protocol_version);
     assert_eq!(health.build_identity, descriptor.build_identity);
     assert!(
-        BUILD_IDENTITY.starts_with(concat!(
+        descriptor.build_identity.starts_with(concat!(
             env!("CARGO_PKG_NAME"),
             "@",
             env!("CARGO_PKG_VERSION"),
-            "+"
+            "+blake3:"
         )),
-        "build identity should include the package version and a compilation identity"
+        "build identity should include the package version and executable digest"
     );
     assert_ne!(
-        BUILD_IDENTITY,
+        descriptor.build_identity,
         concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")),
-        "package version alone cannot identify a rebuilt executable"
+        "package version alone cannot identify executable contents"
+    );
+    assert_eq!(
+        descriptor.build_identity,
+        build_identity::for_current_executable().expect("identify current test executable")
     );
 
     let missing_event_auth = client
@@ -573,7 +597,7 @@ async fn descriptor_replacement_never_exposes_a_partial_publication() {
         instance_id: uuid::Uuid::new_v4(),
         pid: 1,
         protocol_version: chidori::protocol::PROTOCOL_VERSION,
-        build_identity: chidori::protocol::BUILD_IDENTITY.to_owned(),
+        build_identity: "stale-build".to_owned(),
     };
     write_runtime_descriptor(&descriptor_path, &stale);
 

@@ -25,8 +25,9 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::RuntimeConfig;
+use crate::build_identity;
 use crate::protocol::{
-    BUILD_IDENTITY, COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
+    COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
     PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown,
     ShutdownReason,
 };
@@ -141,7 +142,7 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
         instance_id: Uuid::new_v4(),
         pid: std::process::id(),
         protocol_version: PROTOCOL_VERSION,
-        build_identity: BUILD_IDENTITY.to_owned(),
+        build_identity: build_identity::for_current_executable()?,
     };
     write_descriptor(&config.descriptor_path(), &descriptor)?;
 
