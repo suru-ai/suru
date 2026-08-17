@@ -1281,17 +1281,7 @@ async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
         String::from_utf8_lossy(&started.stderr)
     );
 
-    let mut tui = AttachedTuiGuard(Some(
-        Command::new("script")
-            .args(["-qef", "/dev/null", "--", env!("CARGO_BIN_EXE_chidori")])
-            .env("CHIDORI_STATE_DIR", state_dir.path())
-            .env("CHIDORI_CHANNEL", channel)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("launch attached TUI in a pseudo-terminal"),
-    ));
+    let mut tui = AttachedTuiGuard::spawn(state_dir.path(), channel);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         tui.is_running(),
@@ -1320,6 +1310,10 @@ async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
     );
     let screen = String::from_utf8_lossy(&output.stdout);
     assert!(
+        screen.contains("Shared server stopped intentionally"),
+        "attached TUI did not render the manual-stop state: {screen:?}"
+    );
+    assert!(
         screen.contains("\u{1b}[?1049l"),
         "attached TUI did not leave the alternate screen"
     );
@@ -1334,6 +1328,22 @@ struct AttachedTuiGuard(Option<Child>);
 
 #[cfg(target_os = "linux")]
 impl AttachedTuiGuard {
+    fn spawn(state_dir: &std::path::Path, channel: &str) -> Self {
+        let binary = env!("CARGO_BIN_EXE_chidori").replace('\'', "'\\''");
+        let tui_command = format!("stty rows 24 cols 80; exec '{binary}'");
+        Self(Some(
+            Command::new("script")
+                .args(["-qef", "/dev/null", "-c", &tui_command])
+                .env("CHIDORI_STATE_DIR", state_dir)
+                .env("CHIDORI_CHANNEL", channel)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("launch attached TUI in a pseudo-terminal"),
+        ))
+    }
+
     fn child_mut(&mut self) -> &mut Child {
         self.0.as_mut().expect("attached TUI process")
     }

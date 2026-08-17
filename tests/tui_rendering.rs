@@ -1,6 +1,6 @@
 use chidori::{
     managed_client::{ManagedEvent, RecoveryStatus},
-    protocol::{CounterSnapshot, Health, LifecycleState},
+    protocol::{CounterSnapshot, Health, LifecycleState, ServerShutdown, ShutdownReason},
     tui::{TuiState, render},
 };
 use ratatui::{Terminal, backend::TestBackend};
@@ -20,6 +20,23 @@ fn rendered_rows(state: &TuiState) -> Vec<String> {
         .collect()
 }
 
+fn connected_state(instance_id: Uuid, pid: u32, value: u64) -> TuiState {
+    let mut state = TuiState::default();
+    state.apply(ManagedEvent::Connected(Health {
+        instance_id,
+        pid,
+        lifecycle: LifecycleState::Ready,
+        protocol_version: 1,
+        build_identity: "chidori@test".to_owned(),
+    }));
+    state.apply(ManagedEvent::Snapshot(CounterSnapshot {
+        instance_id,
+        value,
+        revision: value,
+    }));
+    state
+}
+
 #[test]
 fn connecting_view_exposes_connection_state_before_a_snapshot_arrives() {
     let screen = rendered_rows(&TuiState::default()).join("\n");
@@ -32,19 +49,7 @@ fn connecting_view_exposes_connection_state_before_a_snapshot_arrives() {
 fn connected_view_centers_the_counter_and_shows_server_identity() {
     let instance_id =
         Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
-    let mut state = TuiState::default();
-    state.apply(ManagedEvent::Connected(Health {
-        instance_id,
-        pid: 42_424,
-        lifecycle: LifecycleState::Ready,
-        protocol_version: 1,
-        build_identity: "chidori@test".to_owned(),
-    }));
-    state.apply(ManagedEvent::Snapshot(CounterSnapshot {
-        instance_id,
-        value: 17,
-        revision: 17,
-    }));
+    let state = connected_state(instance_id, 42_424, 17);
 
     let rendered = rendered_rows(&state);
 
@@ -72,19 +77,7 @@ fn connected_view_centers_the_counter_and_shows_server_identity() {
 fn recovering_view_retains_the_last_known_counter_and_server_identity() {
     let instance_id =
         Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
-    let mut state = TuiState::default();
-    state.apply(ManagedEvent::Connected(Health {
-        instance_id,
-        pid: 42_424,
-        lifecycle: LifecycleState::Ready,
-        protocol_version: 1,
-        build_identity: "chidori@test".to_owned(),
-    }));
-    state.apply(ManagedEvent::Snapshot(CounterSnapshot {
-        instance_id,
-        value: 17,
-        revision: 17,
-    }));
+    let mut state = connected_state(instance_id, 42_424, 17);
 
     state.apply(ManagedEvent::Recovering(RecoveryStatus {
         attempt: 2,
@@ -104,19 +97,7 @@ fn recovered_view_switches_identity_and_counter_together_on_the_fresh_snapshot()
         .expect("parse previous instance ID");
     let recovered_instance_id = Uuid::parse_str("a4cc72ad-5507-4d4f-89f4-a3f7f1119d41")
         .expect("parse recovered instance ID");
-    let mut state = TuiState::default();
-    state.apply(ManagedEvent::Connected(Health {
-        instance_id: previous_instance_id,
-        pid: 42_424,
-        lifecycle: LifecycleState::Ready,
-        protocol_version: 1,
-        build_identity: "chidori@test".to_owned(),
-    }));
-    state.apply(ManagedEvent::Snapshot(CounterSnapshot {
-        instance_id: previous_instance_id,
-        value: 17,
-        revision: 17,
-    }));
+    let mut state = connected_state(previous_instance_id, 42_424, 17);
     state.apply(ManagedEvent::Recovering(RecoveryStatus {
         attempt: 1,
         retry_in: Duration::ZERO,
@@ -148,22 +129,28 @@ fn recovered_view_switches_identity_and_counter_together_on_the_fresh_snapshot()
 }
 
 #[test]
+fn manual_stop_view_retains_the_last_known_counter_and_server_identity() {
+    let instance_id =
+        Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
+    let mut state = connected_state(instance_id, 42_424, 17);
+
+    state.apply(ManagedEvent::ServerShutdown(ServerShutdown {
+        instance_id,
+        reason: ShutdownReason::Manual,
+    }));
+
+    let screen = rendered_rows(&state).join("\n");
+    assert!(screen.contains("17"));
+    assert!(screen.contains("Shared server stopped intentionally"));
+    assert!(screen.contains("pid 42424"));
+    assert!(screen.contains("c2f03bd2"));
+}
+
+#[test]
 fn fatal_protocol_error_is_rendered_visibly_with_the_last_known_state() {
     let instance_id =
         Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
-    let mut state = TuiState::default();
-    state.apply(ManagedEvent::Connected(Health {
-        instance_id,
-        pid: 42_424,
-        lifecycle: LifecycleState::Ready,
-        protocol_version: 1,
-        build_identity: "chidori@test".to_owned(),
-    }));
-    state.apply(ManagedEvent::Snapshot(CounterSnapshot {
-        instance_id,
-        value: 17,
-        revision: 17,
-    }));
+    let mut state = connected_state(instance_id, 42_424, 17);
 
     state.apply(ManagedEvent::Fatal(
         "server sent unknown event type 'future_event'".to_owned(),

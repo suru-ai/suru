@@ -21,7 +21,7 @@ use ratatui::{
 
 use crate::{
     managed_client::{ManagedClient, ManagedEvent, RecoveryStatus},
-    protocol::Health,
+    protocol::{Health, ShutdownReason},
 };
 
 #[derive(Clone, Debug, Default)]
@@ -30,6 +30,8 @@ pub struct TuiState {
     pending_identity: Option<Health>,
     counter: Option<u64>,
     recovery: Option<RecoveryStatus>,
+    /// Manual stop preserves the last confirmed identity and counter as useful final context.
+    manually_stopped: bool,
     fatal_error: Option<String>,
 }
 
@@ -41,10 +43,12 @@ impl TuiState {
                 self.pending_identity = None;
                 self.counter = None;
                 self.recovery = None;
+                self.manually_stopped = false;
                 self.fatal_error = None;
             }
             ManagedEvent::Connected(identity) => {
                 self.pending_identity = Some(identity);
+                self.manually_stopped = false;
                 self.fatal_error = None;
             }
             ManagedEvent::Snapshot(snapshot) => {
@@ -61,9 +65,17 @@ impl TuiState {
             ManagedEvent::CounterUpdated(update) => self.counter = Some(update.value),
             ManagedEvent::Recovering(status) => {
                 self.recovery = Some(status);
+                self.manually_stopped = false;
                 self.fatal_error = None;
             }
-            ManagedEvent::ServerShutdown(_) => self.recovery = None,
+            ManagedEvent::ServerShutdown(shutdown) => {
+                if shutdown.reason == ShutdownReason::Manual {
+                    self.pending_identity = None;
+                    self.recovery = None;
+                    self.manually_stopped = true;
+                    self.fatal_error = None;
+                }
+            }
             ManagedEvent::Fatal(error) => self.fatal_error = Some(error),
         }
     }
@@ -118,7 +130,11 @@ async fn run_loop(
             managed_event = client.next() => {
                 match managed_event {
                     Some(ManagedEvent::Fatal(error)) => return Err(anyhow!(error)),
-                    Some(ManagedEvent::ServerShutdown(_)) => return Ok(()),
+                    Some(event @ ManagedEvent::ServerShutdown(_)) => {
+                        state.apply(event);
+                        terminal.draw(|frame| render(frame, &state))?;
+                        return Ok(());
+                    }
                     Some(event) => state.apply(event),
                     None => return Err(anyhow!("managed client stopped unexpectedly")),
                 }
@@ -160,6 +176,17 @@ fn status_text(state: &TuiState) -> String {
     if let Some(error) = &state.fatal_error {
         return format!("Connection failed: {error}");
     }
+    if state.manually_stopped {
+        return state.identity.as_ref().map_or_else(
+            || "Shared server stopped intentionally".to_owned(),
+            |identity| {
+                format!(
+                    "Shared server stopped intentionally | {}",
+                    server_identity_text(identity)
+                )
+            },
+        );
+    }
     if let Some(recovery) = state.recovery {
         let last_server = state.identity.as_ref().map_or_else(
             || "no previous server".to_owned(),
@@ -171,19 +198,23 @@ fn status_text(state: &TuiState) -> String {
         );
     }
     match &state.identity {
-        Some(identity) => format!(
-            "Connected | pid {} | server {}",
-            identity.pid,
-            &identity.instance_id.to_string()[..8]
-        ),
+        Some(identity) => format!("Connected | {}", server_identity_text(identity)),
         None => "Connecting to Chidori server...".to_owned(),
     }
+}
+
+fn server_identity_text(identity: &Health) -> String {
+    format!(
+        "pid {} | server {}",
+        identity.pid,
+        &identity.instance_id.to_string()[..8]
+    )
 }
 
 fn status_style(state: &TuiState) -> Style {
     if state.fatal_error.is_some() {
         Style::default().fg(Color::Red)
-    } else if state.identity.is_some() && state.recovery.is_none() {
+    } else if state.identity.is_some() && state.recovery.is_none() && !state.manually_stopped {
         Style::default().fg(Color::Green)
     } else {
         Style::default().fg(Color::Yellow)
