@@ -649,10 +649,12 @@ async fn run_managed_client(
     if events.send(ManagedEvent::Connecting).await.is_err() {
         return;
     }
+    let mut protocol_state = StreamProtocolState::default();
 
     loop {
         let active_instance_id = connection.descriptor.instance_id;
         let active_build_identity = connection.health.build_identity.clone();
+        protocol_state.begin_stream(active_instance_id);
         if events
             .send(ManagedEvent::Connected(connection.health))
             .await
@@ -660,17 +662,23 @@ async fn run_managed_client(
         {
             return;
         }
-        let replaced_instance_id =
-            match stream_events(connection.response, &events, active_instance_id).await {
-                Ok(StreamOutcome::Disconnected) => None,
-                Ok(StreamOutcome::ManualShutdown) => return,
-                Ok(StreamOutcome::Replacement { instance_id }) => Some(instance_id),
-                Ok(StreamOutcome::ReceiverClosed) => return,
-                Err(error) => {
-                    let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
-                    return;
-                }
-            };
+        let replaced_instance_id = match stream_events(
+            connection.response,
+            &events,
+            active_instance_id,
+            &mut protocol_state.last_revision,
+        )
+        .await
+        {
+            Ok(StreamOutcome::Disconnected | StreamOutcome::Lagged) => None,
+            Ok(StreamOutcome::ManualShutdown) => return,
+            Ok(StreamOutcome::Replacement { instance_id }) => Some(instance_id),
+            Ok(StreamOutcome::ReceiverClosed) => return,
+            Err(error) => {
+                let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
+                return;
+            }
+        };
 
         if let Some(replaced_instance_id) = replaced_instance_id {
             if events
@@ -777,18 +785,34 @@ fn next_recovery_backoff(previous: Duration) -> Duration {
 
 enum StreamOutcome {
     Disconnected,
+    Lagged,
     ManualShutdown,
     Replacement { instance_id: uuid::Uuid },
     ReceiverClosed,
+}
+
+#[derive(Default)]
+struct StreamProtocolState {
+    instance_id: Option<uuid::Uuid>,
+    last_revision: Option<u64>,
+}
+
+impl StreamProtocolState {
+    fn begin_stream(&mut self, instance_id: uuid::Uuid) {
+        if self.instance_id != Some(instance_id) {
+            self.instance_id = Some(instance_id);
+            self.last_revision = None;
+        }
+    }
 }
 
 async fn stream_events(
     response: reqwest::Response,
     events: &mpsc::Sender<ManagedEvent>,
     expected_instance_id: uuid::Uuid,
+    last_revision: &mut Option<u64>,
 ) -> Result<StreamOutcome> {
     let mut stream = response.bytes_stream().eventsource();
-    let mut last_revision = None;
     let mut saw_snapshot = false;
     while let Some(next) = stream.next().await {
         let event = match next {
@@ -800,7 +824,7 @@ async fn stream_events(
             event,
             expected_instance_id,
             &mut saw_snapshot,
-            &mut last_revision,
+            last_revision,
         ) {
             Ok(event) => event,
             Err(error) => {
@@ -815,7 +839,15 @@ async fn stream_events(
             });
         }
         let manual_shutdown = matches!(managed_event, ManagedEvent::ServerShutdown(_));
-        if events.send(managed_event).await.is_err() {
+        if matches!(managed_event, ManagedEvent::CounterUpdated(_)) {
+            match events.try_send(managed_event) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => return Ok(StreamOutcome::Lagged),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Ok(StreamOutcome::ReceiverClosed);
+                }
+            }
+        } else if events.send(managed_event).await.is_err() {
             return Ok(StreamOutcome::ReceiverClosed);
         }
         if manual_shutdown {
@@ -915,6 +947,9 @@ fn decode_event(
             }
             if snapshot.revision != event_revision {
                 bail!("counter snapshot revision does not match its SSE ID");
+            }
+            if last_revision.is_some_and(|previous| snapshot.revision < previous) {
+                bail!("counter snapshot revision is not monotonic across recovery");
             }
             *saw_snapshot = true;
             *last_revision = Some(snapshot.revision);

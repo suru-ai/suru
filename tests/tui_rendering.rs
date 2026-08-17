@@ -146,3 +146,31 @@ fn recovered_view_switches_identity_and_counter_together_on_the_fresh_snapshot()
     assert!(recovered.contains("a4cc72ad"));
     assert!(!recovered.contains("17"));
 }
+
+#[test]
+fn fatal_protocol_error_is_rendered_visibly_with_the_last_known_state() {
+    let instance_id =
+        Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
+    let mut state = TuiState::default();
+    state.apply(ManagedEvent::Connected(Health {
+        instance_id,
+        pid: 42_424,
+        lifecycle: LifecycleState::Ready,
+        protocol_version: 1,
+        build_identity: "chidori@test".to_owned(),
+    }));
+    state.apply(ManagedEvent::Snapshot(CounterSnapshot {
+        instance_id,
+        value: 17,
+        revision: 17,
+    }));
+
+    state.apply(ManagedEvent::Fatal(
+        "server sent unknown event type 'future_event'".to_owned(),
+    ));
+
+    let screen = rendered_rows(&state).join("\n");
+    assert!(screen.contains("17"));
+    assert!(screen.contains("Connection failed"));
+    assert!(screen.contains("unknown event type 'future_event'"));
+}

@@ -687,6 +687,129 @@ async fn managed_client_receives_snapshot_before_absolute_counter_updates() {
 }
 
 #[tokio::test]
+async fn stalled_subscriber_does_not_delay_the_counter_or_a_healthy_subscriber() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "stalled-subscriber-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let stalled_response = reqwest::Client::new()
+        .get(format!("{}/v1/events", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("open stalled subscriber")
+        .error_for_status()
+        .expect("stalled subscriber authenticates");
+    let mut healthy = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "stalled-subscriber-test")
+            .expect("configure healthy managed client"),
+    )
+    .await
+    .expect("connect healthy managed client");
+    let (_, snapshot) = receive_initial_state(&mut healthy).await;
+
+    let first = timeout(Duration::from_secs(2), healthy.next())
+        .await
+        .expect("healthy subscriber receives first update")
+        .expect("healthy subscriber remains connected");
+    let ManagedEvent::CounterUpdated(first) = first else {
+        panic!("expected first counter update, got {first:?}");
+    };
+    let second = timeout(Duration::from_secs(2), healthy.next())
+        .await
+        .expect("healthy subscriber receives second update")
+        .expect("healthy subscriber remains connected");
+    let ManagedEvent::CounterUpdated(second) = second else {
+        panic!("expected second counter update, got {second:?}");
+    };
+
+    assert!(first.revision > snapshot.revision);
+    assert_eq!(second.revision, first.revision + 1);
+    assert_eq!(first.value, first.revision);
+    assert_eq!(second.value, second.revision);
+
+    drop(stalled_response);
+    drop(healthy);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn sse_keepalive_comments_are_periodic_and_revision_neutral() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "keepalive-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/events", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("open event stream")
+        .error_for_status()
+        .expect("event stream authenticates");
+    let mut chunks = response.bytes_stream();
+    let mut raw = Vec::new();
+
+    timeout(Duration::from_secs(12), async {
+        loop {
+            let chunk = chunks
+                .next()
+                .await
+                .expect("event stream remains open")
+                .expect("read event stream bytes");
+            raw.extend_from_slice(&chunk);
+            let text = String::from_utf8_lossy(&raw);
+            let Some(comment_position) = text.find(": keep-alive\n\n") else {
+                continue;
+            };
+            if text[comment_position + ": keep-alive\n\n".len()..].contains("id: ") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("keepalive comment arrives independently of counter updates");
+
+    let text = String::from_utf8(raw).expect("SSE response is UTF-8");
+    let records = text.split("\n\n").collect::<Vec<_>>();
+    let comment_index = records
+        .iter()
+        .position(|record| *record == ": keep-alive")
+        .expect("keepalive is an SSE comment without event metadata");
+    let revisions = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .lines()
+                .find_map(|line| line.strip_prefix("id: "))
+                .map(|revision| revision.parse::<u64>().expect("revision ID is numeric"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        records[..comment_index]
+            .iter()
+            .any(|record| record.contains("id: "))
+    );
+    assert!(
+        records[comment_index + 1..]
+            .iter()
+            .any(|record| record.contains("id: "))
+    );
+    assert!(
+        revisions.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "keepalives must not consume counter revisions: {revisions:?}"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn graceful_server_shutdown_emits_intent_without_starting_crash_recovery() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let server = server::spawn(

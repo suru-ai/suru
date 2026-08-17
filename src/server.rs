@@ -11,7 +11,7 @@ use axum::{
     body::to_bytes,
     extract::{Request, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
-    response::{IntoResponse, Response, sse::Event, sse::KeepAlive, sse::Sse},
+    response::{IntoResponse, Response, sse::Event, sse::Sse},
     routing::{get, post},
 };
 use fs2::FileExt;
@@ -211,11 +211,32 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
 
-    let mut receiver = state.counter.subscribe();
-    let shutdown_receiver = state.shutdown.subscribe_to_intent();
-    let current = *receiver.borrow_and_update();
+    Sse::new(event_stream(
+        state.descriptor.instance_id,
+        state.counter.subscribe(),
+        state.shutdown.subscribe_to_intent(),
+        Duration::from_secs(10),
+    ))
+    .into_response()
+}
+
+struct EventStreamState {
+    counter: watch::Receiver<CounterState>,
+    shutdown: watch::Receiver<Option<ServerShutdown>>,
+    keepalive: tokio::time::Interval,
+    delivered_revision: u64,
+    finished: bool,
+}
+
+fn event_stream(
+    instance_id: Uuid,
+    mut counter: watch::Receiver<CounterState>,
+    shutdown: watch::Receiver<Option<ServerShutdown>>,
+    keepalive_interval: Duration,
+) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
+    let current = *counter.borrow_and_update();
     let snapshot = CounterSnapshot {
-        instance_id: state.descriptor.instance_id,
+        instance_id,
         value: current.value,
         revision: current.revision,
     };
@@ -225,60 +246,66 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
         .json_data(snapshot)
         .expect("counter snapshots always serialize");
     let first = stream::once(async move { Ok::<_, std::convert::Infallible>(snapshot_event) });
-    let updates = stream::unfold(
-        (receiver, shutdown_receiver, false),
-        |(mut receiver, mut shutdown_receiver, finished)| async move {
-            if finished {
-                return None;
-            }
-            tokio::select! {
-                biased;
-                changed = shutdown_receiver.changed() => {
-                    if changed.is_err() {
-                        return None;
-                    }
-                    let shutdown = shutdown_receiver.borrow_and_update().clone()?;
-                    let revision = receiver.borrow().revision;
-                    let event = Event::default()
-                        .event(SERVER_SHUTDOWN_EVENT)
-                        .id(revision.to_string())
-                        .json_data(shutdown)
-                        .expect("server shutdown intents always serialize");
-                    Some((
-                        Ok::<_, std::convert::Infallible>(event),
-                        (receiver, shutdown_receiver, true),
-                    ))
+    let state = EventStreamState {
+        counter,
+        shutdown,
+        keepalive: tokio::time::interval_at(
+            Instant::now() + keepalive_interval,
+            keepalive_interval,
+        ),
+        delivered_revision: current.revision,
+        finished: false,
+    };
+    let updates = stream::unfold(state, |mut state| async move {
+        if state.finished {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            changed = state.shutdown.changed() => {
+                if changed.is_err() {
+                    return None;
                 }
-                changed = receiver.changed() => {
-                    if changed.is_err() {
-                        return None;
-                    }
-                    let current = *receiver.borrow_and_update();
-                    let update = CounterUpdate {
-                        value: current.value,
-                        revision: current.revision,
-                    };
-                    let event = Event::default()
-                        .event(COUNTER_UPDATED_EVENT)
-                        .id(update.revision.to_string())
-                        .json_data(update)
-                        .expect("counter updates always serialize");
-                    Some((
-                        Ok::<_, std::convert::Infallible>(event),
-                        (receiver, shutdown_receiver, false),
-                    ))
-                }
+                let shutdown = state.shutdown.borrow_and_update().clone()?;
+                let revision = state.counter.borrow().revision;
+                let event = Event::default()
+                    .event(SERVER_SHUTDOWN_EVENT)
+                    .id(revision.to_string())
+                    .json_data(shutdown)
+                    .expect("server shutdown intents always serialize");
+                state.finished = true;
+                Some((Ok::<_, std::convert::Infallible>(event), state))
             }
-        },
-    );
+            changed = state.counter.changed() => {
+                if changed.is_err() {
+                    return None;
+                }
+                let current = *state.counter.borrow_and_update();
+                if current.revision != state.delivered_revision.saturating_add(1) {
+                    return None;
+                }
+                let update = CounterUpdate {
+                    value: current.value,
+                    revision: current.revision,
+                };
+                let event = Event::default()
+                    .event(COUNTER_UPDATED_EVENT)
+                    .id(update.revision.to_string())
+                    .json_data(update)
+                    .expect("counter updates always serialize");
+                state.delivered_revision = current.revision;
+                Some((Ok::<_, std::convert::Infallible>(event), state))
+            }
+            _ = state.keepalive.tick() => Some((
+                Ok::<_, std::convert::Infallible>(
+                    Event::default().comment("keep-alive"),
+                ),
+                state,
+            )),
+        }
+    });
 
-    Sse::new(first.chain(updates))
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(10))
-                .text("keep-alive"),
-        )
-        .into_response()
+    first.chain(updates)
 }
 
 async fn run_counter(counter: watch::Sender<CounterState>) {
@@ -419,5 +446,72 @@ fn remove_own_descriptor(path: &Path, instance_id: Uuid) {
 
     if fs::hard_link(&quarantine_path, path).is_ok() {
         let _ = fs::remove_file(&quarantine_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::{StreamExt, pin_mut};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn lagging_event_stream_closes_without_affecting_counter_or_healthy_stream() {
+        let instance_id = Uuid::new_v4();
+        let (counter, _) = watch::channel(CounterState {
+            value: 0,
+            revision: 0,
+        });
+        let (shutdown, _) = watch::channel(None);
+        let healthy = event_stream(
+            instance_id,
+            counter.subscribe(),
+            shutdown.subscribe(),
+            Duration::from_secs(60),
+        );
+        let lagging = event_stream(
+            instance_id,
+            counter.subscribe(),
+            shutdown.subscribe(),
+            Duration::from_secs(60),
+        );
+        pin_mut!(healthy);
+        pin_mut!(lagging);
+
+        assert!(healthy.next().await.is_some(), "healthy snapshot arrives");
+        assert!(lagging.next().await.is_some(), "lagging snapshot arrives");
+
+        counter.send_modify(|state| {
+            state.value = 1;
+            state.revision = 1;
+        });
+        assert!(
+            healthy.next().await.is_some(),
+            "healthy subscriber receives revision 1"
+        );
+        counter.send_modify(|state| {
+            state.value = 2;
+            state.revision = 2;
+        });
+        assert!(
+            healthy.next().await.is_some(),
+            "healthy subscriber receives revision 2"
+        );
+
+        assert_eq!(counter.borrow().revision, 2);
+        assert!(
+            lagging.next().await.is_none(),
+            "subscriber that missed bounded latest-state delivery is disconnected"
+        );
+
+        counter.send_modify(|state| {
+            state.value = 3;
+            state.revision = 3;
+        });
+        assert!(
+            healthy.next().await.is_some(),
+            "healthy subscriber continues after lagging stream closes"
+        );
+        assert_eq!(counter.borrow().revision, 3);
     }
 }

@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
     fs::{File, OpenOptions},
+    io::Write,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -20,8 +21,9 @@ use chidori::{
     build_identity,
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, start_server},
     protocol::{
-        CounterSnapshot, Health, LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor,
-        SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown, ShutdownReason,
+        COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
+        PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown,
+        ShutdownReason,
     },
     server::{self, ServerConfig},
 };
@@ -618,6 +620,168 @@ async fn dropping_a_recovering_client_cancels_its_next_network_attempt_promptly(
 }
 
 #[tokio::test]
+async fn lagging_managed_client_recovers_and_converges_on_a_fresh_snapshot() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "lagging-managed-client-test";
+    let fixture = ReadinessFixture::spawn_rapid_updates(state_dir.path(), channel).await;
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_server_executable(inert_server_executable(state_dir.path())),
+    )
+    .await
+    .expect("connect managed client");
+    let (identity, initial_snapshot) = receive_initial_state(&mut client).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let recovered_snapshot = timeout(Duration::from_secs(2), async {
+        let mut saw_recovering = false;
+        let mut saw_reconnected_identity = false;
+        let mut last_update_revision = initial_snapshot.revision;
+        loop {
+            match client.next().await.expect("managed client remains open") {
+                ManagedEvent::CounterUpdated(update) if !saw_recovering => {
+                    assert!(update.revision > last_update_revision);
+                    last_update_revision = update.revision;
+                }
+                ManagedEvent::Recovering(_) => saw_recovering = true,
+                ManagedEvent::Connected(reconnected) if saw_recovering => {
+                    assert_eq!(reconnected.instance_id, identity.instance_id);
+                    saw_reconnected_identity = true;
+                }
+                ManagedEvent::Snapshot(snapshot) if saw_reconnected_identity => {
+                    assert!(snapshot.revision > last_update_revision);
+                    break snapshot;
+                }
+                ManagedEvent::Fatal(error) => panic!("lag recovery failed: {error}"),
+                event => panic!("unexpected event during lag recovery: {event:?}"),
+            }
+        }
+    })
+    .await
+    .expect("lagging client abandons its incomplete stream and recovers");
+
+    assert_eq!(recovered_snapshot.instance_id, identity.instance_id);
+    assert!(fixture.event_requests() >= 2);
+}
+
+#[tokio::test]
+async fn managed_client_surfaces_protocol_corruption_as_ordered_fatal_events() {
+    for (channel, violation, expected_error) in [
+        (
+            "malformed-event-json-test",
+            ProtocolViolation::MalformedJson,
+            "decode counter snapshot",
+        ),
+        (
+            "unknown-event-tag-test",
+            ProtocolViolation::UnknownEvent,
+            "unknown event type 'future_event'",
+        ),
+        (
+            "event-instance-identity-test",
+            ProtocolViolation::UnexpectedInstance,
+            "unexpected server instance",
+        ),
+        (
+            "update-before-snapshot-test",
+            ProtocolViolation::UpdateBeforeSnapshot,
+            "counter update before its snapshot",
+        ),
+        (
+            "duplicate-snapshot-test",
+            ProtocolViolation::DuplicateSnapshot,
+            "more than one snapshot",
+        ),
+        (
+            "non-monotonic-revision-test",
+            ProtocolViolation::NonMonotonicRevision,
+            "revision is not monotonic",
+        ),
+    ] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let _fixture =
+            ReadinessFixture::spawn_protocol_violation(state_dir.path(), channel, violation).await;
+        let mut client = ManagedClient::connect(
+            ManagedClientConfig::new(state_dir.path(), channel)
+                .expect("configure managed client")
+                .with_server_executable(inert_server_executable(state_dir.path())),
+        )
+        .await
+        .expect("connect managed client before fixture corruption is decoded");
+
+        assert!(matches!(
+            client.next().await,
+            Some(ManagedEvent::Connecting)
+        ));
+        assert!(matches!(
+            client.next().await,
+            Some(ManagedEvent::Connected(_))
+        ));
+        let fatal = timeout(Duration::from_secs(1), async {
+            loop {
+                match client.next().await.expect("managed client remains open") {
+                    ManagedEvent::Snapshot(_) => {}
+                    ManagedEvent::Fatal(error) => break error,
+                    ManagedEvent::Recovering(status) => {
+                        panic!("protocol corruption was retried: {status:?}")
+                    }
+                    event => panic!("unexpected event before fatal failure: {event:?}"),
+                }
+            }
+        })
+        .await
+        .expect("protocol corruption becomes a prompt fatal event");
+
+        assert!(
+            fatal.contains(expected_error),
+            "expected {expected_error:?} in fatal error, got {fatal:?}"
+        );
+        assert!(client.next().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn managed_client_rejects_revision_regression_across_same_instance_recovery() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "recovered-revision-regression-test";
+    let _fixture =
+        ReadinessFixture::spawn_recovered_revision_regression(state_dir.path(), channel).await;
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_server_executable(inert_server_executable(state_dir.path())),
+    )
+    .await
+    .expect("connect managed client");
+    let (identity, snapshot) = receive_initial_state(&mut client).await;
+    assert_eq!(snapshot.revision, 5);
+
+    let fatal = timeout(Duration::from_secs(1), async {
+        let mut saw_recovering = false;
+        loop {
+            match client.next().await.expect("managed client remains open") {
+                ManagedEvent::Recovering(_) => saw_recovering = true,
+                ManagedEvent::Connected(reconnected) if saw_recovering => {
+                    assert_eq!(reconnected.instance_id, identity.instance_id);
+                }
+                ManagedEvent::Fatal(error) => break error,
+                ManagedEvent::Snapshot(regressed) => {
+                    panic!("accepted regressed snapshot after recovery: {regressed:?}")
+                }
+                event => panic!("unexpected event during recovery: {event:?}"),
+            }
+        }
+    })
+    .await
+    .expect("same-instance revision regression becomes a fatal error");
+
+    assert!(fatal.contains("snapshot revision is not monotonic across recovery"));
+    assert!(client.next().await.is_none());
+}
+
+#[tokio::test]
 async fn authenticated_shutdown_intent_does_not_trigger_crash_recovery() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "shutdown-intent-test";
@@ -985,6 +1149,68 @@ async fn server_stop_notifies_attached_clients_and_remains_stopped() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn fatal_protocol_error_remains_visible_until_the_user_exits_the_tui() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "fatal-tui-protocol-test";
+    let fixture = ReadinessFixture::spawn_binary_protocol_violation(
+        state_dir.path(),
+        channel,
+        ProtocolViolation::UnknownEvent,
+    )
+    .await;
+    let binary = env!("CARGO_BIN_EXE_chidori").replace('\'', "'\\''");
+    let tui_command = format!("stty rows 24 cols 80; exec '{binary}'");
+    let mut tui = AttachedTuiGuard(Some(
+        Command::new("script")
+            .args(["-qef", "/dev/null", "-c", &tui_command])
+            .env("CHIDORI_STATE_DIR", state_dir.path())
+            .env("CHIDORI_CHANNEL", channel)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch attached TUI in a pseudo-terminal"),
+    ));
+
+    timeout(Duration::from_secs(2), async {
+        while !fixture.events_opened.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("TUI opens the corrupt event stream");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        tui.is_running(),
+        "fatal TUI exited before the user could inspect the error"
+    );
+
+    tui.send_input(b"q");
+    timeout(Duration::from_secs(2), async {
+        while tui.is_running() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fatal TUI exits after user acknowledgement");
+
+    let output = tui.wait_with_output();
+    assert!(!output.status.success(), "fatal TUI reports failure");
+    let screen = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        screen.contains("Connection failed"),
+        "fatal TUI frame was not rendered: {screen:?}"
+    );
+    assert!(
+        screen.contains("unknown event type 'future_event'"),
+        "fatal protocol detail was not rendered: {screen:?}"
+    );
+    assert!(screen.contains("\u{1b}[?1049l"));
+    assert!(screen.contains("\u{1b}[?25h"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "attached-tui-manual-stop-test";
@@ -1008,12 +1234,7 @@ async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
     ));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        tui.0
-            .as_mut()
-            .expect("attached TUI process")
-            .try_wait()
-            .expect("inspect attached TUI")
-            .is_none(),
+        tui.is_running(),
         "attached TUI exited before the manual stop"
     );
 
@@ -1024,29 +1245,14 @@ async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
         String::from_utf8_lossy(&stopped.stderr)
     );
     timeout(Duration::from_secs(2), async {
-        loop {
-            if tui
-                .0
-                .as_mut()
-                .expect("attached TUI process")
-                .try_wait()
-                .expect("inspect attached TUI exit")
-                .is_some()
-            {
-                break;
-            }
+        while tui.is_running() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("attached TUI exits after manual stop");
 
-    let output = tui
-        .0
-        .take()
-        .expect("attached TUI process")
-        .wait_with_output()
-        .expect("collect attached TUI output");
+    let output = tui.wait_with_output();
     assert!(
         output.status.success(),
         "attached TUI failed: {}",
@@ -1065,6 +1271,37 @@ async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
 
 #[cfg(target_os = "linux")]
 struct AttachedTuiGuard(Option<Child>);
+
+#[cfg(target_os = "linux")]
+impl AttachedTuiGuard {
+    fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("attached TUI process")
+    }
+
+    fn is_running(&mut self) -> bool {
+        self.child_mut()
+            .try_wait()
+            .expect("inspect attached TUI")
+            .is_none()
+    }
+
+    fn send_input(&mut self, input: &[u8]) {
+        self.child_mut()
+            .stdin
+            .as_mut()
+            .expect("attached TUI stdin")
+            .write_all(input)
+            .expect("send input to attached TUI");
+    }
+
+    fn wait_with_output(&mut self) -> std::process::Output {
+        self.0
+            .take()
+            .expect("attached TUI process")
+            .wait_with_output()
+            .expect("collect attached TUI output")
+    }
+}
 
 #[cfg(target_os = "linux")]
 impl Drop for AttachedTuiGuard {
@@ -1348,6 +1585,7 @@ struct ReadinessState {
     events_opened: Arc<AtomicBool>,
     events_ready: Arc<AtomicBool>,
     event_requests: Arc<AtomicUsize>,
+    counter: Arc<AtomicUsize>,
     event_behavior: FixtureEventBehavior,
 }
 
@@ -1356,6 +1594,19 @@ enum FixtureEventBehavior {
     StayConnected,
     DisconnectAfterSnapshot,
     ShutdownAfterSnapshot,
+    RapidUpdates,
+    ProtocolViolation(ProtocolViolation),
+    RegressingRecoverySnapshot,
+}
+
+#[derive(Clone, Copy)]
+enum ProtocolViolation {
+    MalformedJson,
+    UnknownEvent,
+    UnexpectedInstance,
+    UpdateBeforeSnapshot,
+    DuplicateSnapshot,
+    NonMonotonicRevision,
 }
 
 struct ReadinessFixture {
@@ -1401,11 +1652,80 @@ impl ReadinessFixture {
         .await
     }
 
+    async fn spawn_rapid_updates(state_dir: &std::path::Path, channel: &str) -> Self {
+        Self::spawn_with_event_behavior(
+            state_dir,
+            channel,
+            LifecycleState::Ready,
+            FixtureEventBehavior::RapidUpdates,
+        )
+        .await
+    }
+
+    async fn spawn_protocol_violation(
+        state_dir: &std::path::Path,
+        channel: &str,
+        violation: ProtocolViolation,
+    ) -> Self {
+        Self::spawn_with_event_behavior(
+            state_dir,
+            channel,
+            LifecycleState::Ready,
+            FixtureEventBehavior::ProtocolViolation(violation),
+        )
+        .await
+    }
+
+    async fn spawn_binary_protocol_violation(
+        state_dir: &std::path::Path,
+        channel: &str,
+        violation: ProtocolViolation,
+    ) -> Self {
+        Self::spawn_with_event_behavior_and_build(
+            state_dir,
+            channel,
+            LifecycleState::Ready,
+            FixtureEventBehavior::ProtocolViolation(violation),
+            chidori_binary_build_identity(),
+        )
+        .await
+    }
+
+    async fn spawn_recovered_revision_regression(
+        state_dir: &std::path::Path,
+        channel: &str,
+    ) -> Self {
+        Self::spawn_with_event_behavior(
+            state_dir,
+            channel,
+            LifecycleState::Ready,
+            FixtureEventBehavior::RegressingRecoverySnapshot,
+        )
+        .await
+    }
+
     async fn spawn_with_event_behavior(
         state_dir: &std::path::Path,
         channel: &str,
         initial_lifecycle: LifecycleState,
         event_behavior: FixtureEventBehavior,
+    ) -> Self {
+        Self::spawn_with_event_behavior_and_build(
+            state_dir,
+            channel,
+            initial_lifecycle,
+            event_behavior,
+            inert_server_build_identity(state_dir),
+        )
+        .await
+    }
+
+    async fn spawn_with_event_behavior_and_build(
+        state_dir: &std::path::Path,
+        channel: &str,
+        initial_lifecycle: LifecycleState,
+        event_behavior: FixtureEventBehavior,
+        build_identity: String,
     ) -> Self {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1420,7 +1740,7 @@ impl ReadinessFixture {
             instance_id,
             pid: std::process::id(),
             protocol_version: PROTOCOL_VERSION,
-            build_identity: inert_server_build_identity(state_dir),
+            build_identity,
         };
         let runtime_dir = state_dir.join(channel);
         std::fs::create_dir_all(&runtime_dir).expect("create fixture runtime directory");
@@ -1430,12 +1750,14 @@ impl ReadinessFixture {
         let events_opened = Arc::new(AtomicBool::new(false));
         let events_ready = Arc::new(AtomicBool::new(true));
         let event_requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::new(AtomicUsize::new(0));
         let state = ReadinessState {
             descriptor,
             lifecycle: lifecycle.clone(),
             events_opened: events_opened.clone(),
             events_ready: events_ready.clone(),
             event_requests: event_requests.clone(),
+            counter,
             event_behavior,
         };
         let app = Router::new()
@@ -1489,53 +1811,128 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
     }
     state.events_opened.store(true, Ordering::SeqCst);
     let request_index = state.event_requests.fetch_add(1, Ordering::SeqCst);
-    if matches!(
-        state.event_behavior,
-        FixtureEventBehavior::DisconnectAfterSnapshot
-    ) && request_index > 0
-    {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
     if !state.events_ready.load(Ordering::SeqCst) {
         return std::future::pending().await;
     }
     if *state.lifecycle.lock().expect("lock lifecycle") != LifecycleState::Ready {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    let snapshot = CounterSnapshot {
-        instance_id: state.descriptor.instance_id,
-        value: 0,
-        revision: 0,
-    };
-    let first = stream::once(async move {
-        Ok::<_, Infallible>(
-            Event::default()
-                .event(SNAPSHOT_EVENT)
-                .id("0")
-                .json_data(snapshot)
-                .expect("serialize fixture snapshot"),
-        )
-    });
+    let instance_id = state.descriptor.instance_id;
+    let current = state.counter.load(Ordering::SeqCst) as u64;
     match state.event_behavior {
         FixtureEventBehavior::StayConnected => {
-            Sse::new(first.chain(stream::pending())).into_response()
+            Sse::new(fixture_snapshot_stream(instance_id, current).chain(stream::pending()))
+                .into_response()
         }
-        FixtureEventBehavior::DisconnectAfterSnapshot => Sse::new(first).into_response(),
+        FixtureEventBehavior::DisconnectAfterSnapshot if request_index > 0 => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        FixtureEventBehavior::DisconnectAfterSnapshot => {
+            Sse::new(fixture_snapshot_stream(instance_id, current)).into_response()
+        }
         FixtureEventBehavior::ShutdownAfterSnapshot => {
             let shutdown = ServerShutdown {
-                instance_id: state.descriptor.instance_id,
+                instance_id,
                 reason: ShutdownReason::Manual,
             };
             let shutdown_event = stream::once(async move {
                 Ok::<_, Infallible>(
                     Event::default()
                         .event(SERVER_SHUTDOWN_EVENT)
-                        .id("0")
+                        .id(current.to_string())
                         .json_data(shutdown)
                         .expect("serialize shutdown intent"),
                 )
             });
-            Sse::new(first.chain(shutdown_event)).into_response()
+            Sse::new(fixture_snapshot_stream(instance_id, current).chain(shutdown_event))
+                .into_response()
+        }
+        FixtureEventBehavior::RapidUpdates => {
+            let updates = stream::unfold(
+                (
+                    tokio::time::interval(Duration::from_millis(1)),
+                    state.counter.clone(),
+                ),
+                |(mut interval, counter)| async move {
+                    interval.tick().await;
+                    let revision = counter.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+                    let update = CounterUpdate {
+                        value: revision,
+                        revision,
+                    };
+                    let event = Event::default()
+                        .event(COUNTER_UPDATED_EVENT)
+                        .id(revision.to_string())
+                        .json_data(update)
+                        .expect("serialize fixture counter update");
+                    Some((Ok::<_, Infallible>(event), (interval, counter)))
+                },
+            );
+            Sse::new(fixture_snapshot_stream(instance_id, current).chain(updates)).into_response()
+        }
+        FixtureEventBehavior::ProtocolViolation(violation) => {
+            let events = protocol_violation_events(&state, violation)
+                .into_iter()
+                .map(Ok::<_, Infallible>);
+            Sse::new(stream::iter(events)).into_response()
+        }
+        FixtureEventBehavior::RegressingRecoverySnapshot => {
+            let revision = if request_index == 0 { 5 } else { 4 };
+            Sse::new(fixture_snapshot_stream(instance_id, revision)).into_response()
+        }
+    }
+}
+
+fn fixture_snapshot_stream(
+    instance_id: Uuid,
+    revision: u64,
+) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
+    stream::once(std::future::ready(Ok(fixture_snapshot_event(
+        instance_id,
+        revision,
+    ))))
+}
+
+fn fixture_snapshot_event(instance_id: Uuid, revision: u64) -> Event {
+    Event::default()
+        .event(SNAPSHOT_EVENT)
+        .id(revision.to_string())
+        .json_data(CounterSnapshot {
+            instance_id,
+            value: revision,
+            revision,
+        })
+        .expect("serialize fixture snapshot")
+}
+
+fn protocol_violation_events(state: &ReadinessState, violation: ProtocolViolation) -> Vec<Event> {
+    let update = |value: u64, revision: u64| {
+        Event::default()
+            .event(COUNTER_UPDATED_EVENT)
+            .id(revision.to_string())
+            .json_data(CounterUpdate { value, revision })
+            .expect("serialize fixture counter update")
+    };
+    match violation {
+        ProtocolViolation::MalformedJson => {
+            vec![Event::default().event(SNAPSHOT_EVENT).id("0").data("{")]
+        }
+        ProtocolViolation::UnknownEvent => {
+            vec![Event::default().event("future_event").id("0").data("{}")]
+        }
+        ProtocolViolation::UnexpectedInstance => {
+            vec![fixture_snapshot_event(Uuid::new_v4(), 0)]
+        }
+        ProtocolViolation::UpdateBeforeSnapshot => vec![update(1, 1)],
+        ProtocolViolation::DuplicateSnapshot => vec![
+            fixture_snapshot_event(state.descriptor.instance_id, 0),
+            fixture_snapshot_event(state.descriptor.instance_id, 0),
+        ],
+        ProtocolViolation::NonMonotonicRevision => {
+            vec![
+                fixture_snapshot_event(state.descriptor.instance_id, 2),
+                update(3, 2),
+            ]
         }
     }
 }
