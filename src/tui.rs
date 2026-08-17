@@ -111,19 +111,13 @@ async fn run_loop(
 ) -> Result<()> {
     let mut state = TuiState::default();
     let mut input = EventStream::new();
-    let mut receive_managed_events = true;
-    let mut fatal_exit_error = None;
 
     loop {
         terminal.draw(|frame| render(frame, &state))?;
         tokio::select! {
-            managed_event = client.next(), if receive_managed_events => {
+            managed_event = client.next() => {
                 match managed_event {
-                    Some(ManagedEvent::Fatal(error)) => {
-                        state.apply(ManagedEvent::Fatal(error.clone()));
-                        fatal_exit_error = Some(error);
-                        receive_managed_events = false;
-                    }
+                    Some(ManagedEvent::Fatal(error)) => return Err(anyhow!(error)),
                     Some(ManagedEvent::ServerShutdown(_)) => return Ok(()),
                     Some(event) => state.apply(event),
                     None => return Err(anyhow!("managed client stopped unexpectedly")),
@@ -132,21 +126,14 @@ async fn run_loop(
             input_event = input.next() => {
                 match input_event {
                     Some(Ok(InputEvent::Key(key))) if is_quit(key) => {
-                        return user_exit(fatal_exit_error.take());
+                        return Ok(());
                     }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(error.into()),
-                    None => return user_exit(fatal_exit_error.take()),
+                    None => return Ok(()),
                 }
             }
         }
-    }
-}
-
-fn user_exit(fatal_error: Option<String>) -> Result<()> {
-    match fatal_error {
-        Some(error) => Err(anyhow!(error)),
-        None => Ok(()),
     }
 }
 

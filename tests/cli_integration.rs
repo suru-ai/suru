@@ -1,7 +1,6 @@
 use std::{
     convert::Infallible,
     fs::{File, OpenOptions},
-    io::Write,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -1204,7 +1203,7 @@ async fn server_stop_notifies_attached_clients_and_remains_stopped() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn fatal_protocol_error_remains_visible_until_the_user_exits_the_tui() {
+async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "fatal-tui-protocol-test";
     let fixture = ReadinessFixture::spawn_binary_protocol_violation(
@@ -1214,7 +1213,9 @@ async fn fatal_protocol_error_remains_visible_until_the_user_exits_the_tui() {
     )
     .await;
     let binary = env!("CARGO_BIN_EXE_chidori").replace('\'', "'\\''");
-    let tui_command = format!("stty rows 24 cols 80; exec '{binary}'");
+    let tui_command = format!(
+        "stty rows 24 cols 80; original_stty=$(stty -g); '{binary}'; chidori_status=$?; restored_stty=$(stty -g); if [ \"$original_stty\" = \"$restored_stty\" ]; then printf '\\n__CHIDORI_STTY_RESTORED__\\n'; else printf '\\n__CHIDORI_STTY_CHANGED__:%s:%s\\n' \"$original_stty\" \"$restored_stty\"; fi; exit $chidori_status"
+    );
     let mut tui = AttachedTuiGuard(Some(
         Command::new("script")
             .args(["-qef", "/dev/null", "-c", &tui_command])
@@ -1234,34 +1235,38 @@ async fn fatal_protocol_error_remains_visible_until_the_user_exits_the_tui() {
     })
     .await
     .expect("TUI opens the corrupt event stream");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        tui.is_running(),
-        "fatal TUI exited before the user could inspect the error"
-    );
-
-    tui.send_input(b"q");
     timeout(Duration::from_secs(2), async {
         while tui.is_running() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("fatal TUI exits after user acknowledgement");
+    .expect("fatal TUI exits promptly without user input");
 
     let output = tui.wait_with_output();
     assert!(!output.status.success(), "fatal TUI reports failure");
     let screen = String::from_utf8_lossy(&output.stdout);
+    let alternate_screen_exit_position = screen
+        .find("\u{1b}[?1049l")
+        .expect("fatal TUI leaves the alternate screen");
+    let cursor_restore_position = screen
+        .find("\u{1b}[?25h")
+        .expect("fatal TUI restores the cursor");
+    let error_detail_position = screen
+        .find("unknown event type 'future_event'")
+        .expect("fatal protocol detail remains visible");
     assert!(
-        screen.contains("Connection failed"),
-        "fatal TUI frame was not rendered: {screen:?}"
+        alternate_screen_exit_position < error_detail_position,
+        "fatal error was reported before leaving the alternate screen: {screen:?}"
     );
     assert!(
-        screen.contains("unknown event type 'future_event'"),
-        "fatal protocol detail was not rendered: {screen:?}"
+        cursor_restore_position < error_detail_position,
+        "fatal error was reported before restoring the cursor: {screen:?}"
     );
-    assert!(screen.contains("\u{1b}[?1049l"));
-    assert!(screen.contains("\u{1b}[?25h"));
+    assert!(
+        screen.contains("__CHIDORI_STTY_RESTORED__"),
+        "fatal TUI did not restore its original terminal mode: {screen:?}"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1338,15 +1343,6 @@ impl AttachedTuiGuard {
             .try_wait()
             .expect("inspect attached TUI")
             .is_none()
-    }
-
-    fn send_input(&mut self, input: &[u8]) {
-        self.child_mut()
-            .stdin
-            .as_mut()
-            .expect("attached TUI stdin")
-            .write_all(input)
-            .expect("send input to attached TUI");
     }
 
     fn wait_with_output(&mut self) -> std::process::Output {
