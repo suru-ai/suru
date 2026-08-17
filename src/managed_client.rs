@@ -24,8 +24,10 @@ mod event_stream;
 mod launcher;
 mod lifecycle;
 mod recovery;
+mod session_projection;
 mod session_stream;
 
+pub(crate) use session_projection::SessionProjection;
 pub use session_stream::{SessionEvent, SessionSubscription};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);

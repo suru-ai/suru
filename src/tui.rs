@@ -25,11 +25,12 @@ use ratatui::{
 
 use crate::{
     managed_client::{
-        ManagedClient, ManagedEvent, RecoveryStatus, SessionEvent, SessionSubscription,
+        ManagedClient, ManagedEvent, RecoveryStatus, SessionEvent, SessionProjection,
+        SessionSubscription,
     },
     protocol::{
         ActivityKind, CreateSessionRequest, InitialPrompt, MessageRole, PromptId, ServerIdentity,
-        SessionChange, SessionSnapshot, ShutdownReason, Workspace,
+        SessionSnapshot, ShutdownReason, Workspace,
     },
 };
 
@@ -45,7 +46,7 @@ pub struct TuiState {
     workspace: PathBuf,
     composer: String,
     submission_error: Option<String>,
-    session: Option<SessionSnapshot>,
+    session: Option<SessionProjection>,
 }
 
 impl Default for TuiState {
@@ -128,40 +129,13 @@ impl TuiState {
             SessionEvent::Snapshot(snapshot) => {
                 self.composer.clear();
                 self.submission_error = None;
-                self.session = Some(snapshot);
+                self.session = Some(SessionProjection::new(snapshot));
             }
             SessionEvent::Updated(update) => {
-                let Some(snapshot) = self.session.as_mut() else {
+                let Some(session) = self.session.as_mut() else {
                     return Err(anyhow!("Session update arrived before its snapshot"));
                 };
-                if snapshot.session.id != update.session_id {
-                    return Err(anyhow!("Session update targeted a different Session"));
-                }
-                if !update.revision.immediately_follows(snapshot.revision) {
-                    return Err(anyhow!("Session update revision is not monotonic"));
-                }
-                for change in update.changes {
-                    match change {
-                        SessionChange::PromptAdded { prompt } => snapshot.prompts.push(prompt),
-                        SessionChange::TurnAdded { turn } => snapshot.turns.push(turn),
-                        SessionChange::MessageAdded { message } => snapshot.messages.push(message),
-                        SessionChange::ActivityAdded { activity } => {
-                            snapshot.activities.push(activity);
-                        }
-                        SessionChange::TurnStatusChanged { turn_id, status } => {
-                            let Some(turn) =
-                                snapshot.turns.iter_mut().find(|turn| turn.id == turn_id)
-                            else {
-                                return Err(anyhow!("Session update referenced an unknown Turn"));
-                            };
-                            turn.status = status;
-                        }
-                        SessionChange::SessionStatusChanged { status } => {
-                            snapshot.session.status = status;
-                        }
-                    }
-                }
-                snapshot.revision = update.revision;
+                session.apply(update)?;
             }
         }
         Ok(())
@@ -293,8 +267,8 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
-    if let Some(snapshot) = &state.session {
-        render_session(frame, state, snapshot);
+    if let Some(session) = &state.session {
+        render_session(frame, state, session.snapshot());
     } else {
         render_landing(frame, state);
     }
@@ -351,12 +325,7 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState) {
         composer_area,
     );
 
-    frame.render_widget(
-        Paragraph::new(Line::from(status_text(state)))
-            .alignment(Alignment::Center)
-            .style(status_style(state)),
-        status_area,
-    );
+    render_status(frame, state, status_area);
 }
 
 fn render_session(frame: &mut Frame<'_>, state: &TuiState, snapshot: &SessionSnapshot) {
@@ -410,13 +379,9 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, snapshot: &SessionSna
             .iter()
             .filter(|activity| activity.turn_id == turn.id)
         {
-            let style = match activity.kind {
-                ActivityKind::Status => Style::default().fg(Color::DarkGray),
-                ActivityKind::Error => Style::default().fg(Color::Red),
-            };
-            let prefix = match activity.kind {
-                ActivityKind::Status => "  ",
-                ActivityKind::Error => "  Error: ",
+            let (prefix, style) = match activity.kind {
+                ActivityKind::Status => ("  ", Style::default().fg(Color::DarkGray)),
+                ActivityKind::Error => ("  Error: ", Style::default().fg(Color::Red)),
             };
             push_prefixed_lines(&mut lines, prefix, &activity.text, style);
         }
@@ -426,11 +391,15 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, snapshot: &SessionSna
         Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::TOP)),
         transcript_area,
     );
+    render_status(frame, state, status_area);
+}
+
+fn render_status(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::from(status_text(state)))
             .alignment(Alignment::Center)
             .style(status_style(state)),
-        status_area,
+        area,
     );
 }
 

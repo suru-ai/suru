@@ -380,7 +380,9 @@ async fn session_events(
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if state.shutdown.lifecycle() != LifecycleState::Ready {
+    let shutdown = state.shutdown.subscribe_to_intent();
+    let shutdown_requested = shutdown.borrow().is_some();
+    if state.shutdown.lifecycle() != LifecycleState::Ready || shutdown_requested {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let Some(snapshot) = state.sessions.snapshot(session_id) else {
@@ -393,7 +395,7 @@ async fn session_events(
 
     Sse::new(session_event_stream(
         snapshot,
-        state.shutdown.subscribe_to_intent(),
+        shutdown,
         Duration::from_secs(10),
     ))
     .into_response()
@@ -416,6 +418,9 @@ fn session_event_stream(
                 shutdown,
             ),
             |(mut keepalive, mut shutdown)| async move {
+                if shutdown.borrow().is_some() {
+                    return None;
+                }
                 tokio::select! {
                     changed = shutdown.changed() => {
                         let _ = changed;
