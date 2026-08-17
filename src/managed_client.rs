@@ -684,7 +684,7 @@ async fn run_managed_client(
                 return;
             }
             let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
-            match wait_for_compatible_connection(
+            match wait_for_protocol_compatible_connection(
                 &config,
                 &http,
                 Some(replaced_instance_id),
@@ -737,7 +737,8 @@ async fn run_managed_client(
             let recovery = if configured_build_can_restore {
                 establish_connection(&config, &http, deadline).await
             } else {
-                match wait_for_compatible_connection(&config, &http, None, deadline).await {
+                match wait_for_protocol_compatible_connection(&config, &http, None, deadline).await
+                {
                     ConnectionWait::Ready(replacement) => Ok(*replacement),
                     ConnectionWait::Incompatible(protocol_version) => {
                         let _ = events
@@ -836,14 +837,16 @@ enum ConnectionWait {
     TimedOut,
 }
 
-async fn wait_for_compatible_connection(
+async fn wait_for_protocol_compatible_connection(
     config: &ManagedClientConfig,
     http: &reqwest::Client,
     excluded_instance_id: Option<uuid::Uuid>,
     deadline: tokio::time::Instant,
 ) -> ConnectionWait {
     loop {
-        match probe_compatible_connection(config, http, excluded_instance_id, deadline).await {
+        match probe_protocol_compatible_connection(config, http, excluded_instance_id, deadline)
+            .await
+        {
             ConnectionProbe::Ready(connection) => return ConnectionWait::Ready(connection),
             ConnectionProbe::Incompatible(protocol_version) => {
                 return ConnectionWait::Incompatible(protocol_version);
@@ -858,7 +861,7 @@ async fn wait_for_compatible_connection(
     }
 }
 
-async fn probe_compatible_connection(
+async fn probe_protocol_compatible_connection(
     config: &ManagedClientConfig,
     http: &reqwest::Client,
     excluded_instance_id: Option<uuid::Uuid>,
