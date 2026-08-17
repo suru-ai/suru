@@ -257,9 +257,10 @@ async fn launcher_replaces_a_build_and_protocol_mismatch_before_connecting() {
         .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
 
     let previous = mismatched.descriptor();
-    let replacement = start_server(&config)
+    let mut client = ManagedClient::connect(config)
         .await
-        .expect("replace the stale build despite its incompatible event protocol");
+        .expect("replace the stale build and connect the launching client");
+    let (replacement, snapshot) = receive_initial_state(&mut client).await;
 
     assert_ne!(replacement.instance_id, previous.instance_id);
     assert_ne!(replacement.pid, previous.pid);
@@ -274,12 +275,6 @@ async fn launcher_replaces_a_build_and_protocol_mismatch_before_connecting() {
         mismatched.is_stopped(),
         "launcher returned before the exact stale instance released its channel lock"
     );
-
-    let mut client = ManagedClient::connect(config)
-        .await
-        .expect("connect launching client to replacement server");
-    let (identity, snapshot) = receive_initial_state(&mut client).await;
-    assert_eq!(identity.instance_id, replacement.instance_id);
     assert_eq!(snapshot.instance_id, replacement.instance_id);
     assert!(snapshot.revision < 41, "replacement snapshot must be fresh");
 
