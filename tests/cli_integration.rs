@@ -98,17 +98,18 @@ async fn launching_current_build_replaces_an_authenticated_mismatched_server() {
 async fn attached_client_reconnects_to_the_replacement_and_its_fresh_snapshot() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "attached-build-replacement-test";
-    let current_build_identity = chidori_binary_build_identity();
+    let old_executable = inert_server_executable(state_dir.path());
+    let old_build_identity = inert_server_build_identity(state_dir.path());
     let fixture =
-        BuildReplacementFixture::spawn(state_dir.path(), channel, &current_build_identity).await;
+        BuildReplacementFixture::spawn(state_dir.path(), channel, &old_build_identity).await;
     let previous = fixture.descriptor();
-    let config = ManagedClientConfig::new(state_dir.path(), channel)
-        .expect("configure managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
-    let mut attached = ManagedClient::connect(config.clone())
+    let old_config = ManagedClientConfig::new(state_dir.path(), channel)
+        .expect("configure old-build managed client")
+        .with_server_executable(&old_executable);
+    let mut attached = ManagedClient::connect(old_config.clone())
         .await
         .expect("attach to the original server");
-    let mut also_attached = ManagedClient::connect(config.clone())
+    let mut also_attached = ManagedClient::connect(old_config)
         .await
         .expect("attach another client to the original server");
     let (original_identity, original_snapshot) = receive_initial_state(&mut attached).await;
@@ -118,9 +119,11 @@ async fn attached_client_reconnects_to_the_replacement_and_its_fresh_snapshot() 
     assert_eq!(also_original_identity.instance_id, previous.instance_id);
     assert_eq!(original_snapshot.value, 41);
     assert_eq!(also_original_snapshot.value, 41);
-    fixture.set_build_identity("chidori@old-build");
 
-    let replacement = start_server(&config)
+    let current_config = ManagedClientConfig::new(state_dir.path(), channel)
+        .expect("configure current-build managed client")
+        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+    let replacement = start_server(&current_config)
         .await
         .expect("launch current build replacement");
     let (first_reconnected, second_reconnected) = tokio::join!(
@@ -146,16 +149,28 @@ async fn attached_client_reconnects_to_the_replacement_and_its_fresh_snapshot() 
         ShutdownReason::Replacement
     );
 
+    let mut current = ManagedClient::connect(current_config)
+        .await
+        .expect("attach a current-build client to the replacement");
+    let (current_identity, _) = receive_initial_state(&mut current).await;
+    assert_eq!(current_identity.instance_id, replacement.instance_id);
+    drop(also_attached);
+
     stop_test_server(state_dir.path(), channel);
-    let (restarted, restarted_snapshot) =
-        receive_recovered_state(&mut attached, replacement.instance_id).await;
+    let (old_recovery, current_recovery) = tokio::join!(
+        receive_recovered_state(&mut attached, replacement.instance_id),
+        receive_recovered_state(&mut current, replacement.instance_id),
+    );
+    let (restarted, restarted_snapshot) = old_recovery;
+    let (current_restarted, _) = current_recovery;
     assert_ne!(restarted.instance_id, replacement.instance_id);
+    assert_eq!(restarted.instance_id, current_restarted.instance_id);
     assert_eq!(restarted.build_identity, replacement.build_identity);
     assert_eq!(restarted_snapshot.instance_id, restarted.instance_id);
     assert!(restarted_snapshot.revision < 41);
 
     drop(attached);
-    drop(also_attached);
+    drop(current);
     stop_test_server(state_dir.path(), channel);
 }
 
@@ -1543,7 +1558,6 @@ struct BuildReplacementState {
 
 struct BuildReplacementFixture {
     descriptor: Arc<Mutex<RuntimeDescriptor>>,
-    descriptor_path: PathBuf,
     shutdown_request: Arc<Mutex<Option<ServerShutdown>>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -1645,7 +1659,6 @@ impl BuildReplacementFixture {
 
         Self {
             descriptor,
-            descriptor_path,
             shutdown_request,
             task,
         }
@@ -1656,12 +1669,6 @@ impl BuildReplacementFixture {
             .lock()
             .expect("lock old-build descriptor")
             .clone()
-    }
-
-    fn set_build_identity(&self, build_identity: &str) {
-        let mut descriptor = self.descriptor.lock().expect("lock old-build descriptor");
-        descriptor.build_identity = build_identity.to_owned();
-        write_runtime_descriptor(&self.descriptor_path, &descriptor);
     }
 
     fn shutdown_request(&self) -> Option<ServerShutdown> {

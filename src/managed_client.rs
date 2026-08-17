@@ -651,6 +651,8 @@ async fn run_managed_client(
     }
 
     loop {
+        let active_instance_id = connection.descriptor.instance_id;
+        let active_build_identity = connection.health.build_identity.clone();
         if events
             .send(ManagedEvent::Connected(connection.health))
             .await
@@ -658,22 +660,17 @@ async fn run_managed_client(
         {
             return;
         }
-        let replaced_instance_id = match stream_events(
-            connection.response,
-            &events,
-            connection.descriptor.instance_id,
-        )
-        .await
-        {
-            Ok(StreamOutcome::Disconnected) => None,
-            Ok(StreamOutcome::ManualShutdown) => return,
-            Ok(StreamOutcome::Replacement { instance_id }) => Some(instance_id),
-            Ok(StreamOutcome::ReceiverClosed) => return,
-            Err(error) => {
-                let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
-                return;
-            }
-        };
+        let replaced_instance_id =
+            match stream_events(connection.response, &events, active_instance_id).await {
+                Ok(StreamOutcome::Disconnected) => None,
+                Ok(StreamOutcome::ManualShutdown) => return,
+                Ok(StreamOutcome::Replacement { instance_id }) => Some(instance_id),
+                Ok(StreamOutcome::ReceiverClosed) => return,
+                Err(error) => {
+                    let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
+                    return;
+                }
+            };
 
         if let Some(replaced_instance_id) = replaced_instance_id {
             if events
@@ -687,20 +684,40 @@ async fn run_managed_client(
                 return;
             }
             let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
-            match establish_replacement_connection(&config, &http, replaced_instance_id, deadline)
-                .await
+            match wait_for_compatible_connection(
+                &config,
+                &http,
+                Some(replaced_instance_id),
+                deadline,
+            )
+            .await
             {
-                Ok(replacement) => {
-                    connection = replacement;
+                ConnectionWait::Ready(replacement) => {
+                    connection = *replacement;
                     continue;
                 }
-                Err(error) => {
-                    let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
+                ConnectionWait::Incompatible(protocol_version) => {
+                    let _ = events
+                        .send(ManagedEvent::Fatal(format!(
+                            "replacement server protocol version {protocol_version} is incompatible with client protocol version {PROTOCOL_VERSION}"
+                        )))
+                        .await;
+                    return;
+                }
+                ConnectionWait::TimedOut => {
+                    let _ = events
+                        .send(ManagedEvent::Fatal(
+                            "replacement Chidori server did not become ready within 15s".to_owned(),
+                        ))
+                        .await;
                     return;
                 }
             }
         }
 
+        let configured_build_can_restore =
+            build_identity::for_executable(&config.server_executable)
+                .is_ok_and(|identity| identity == active_build_identity);
         let mut attempt = 1;
         let mut retry_in = Duration::ZERO;
         loop {
@@ -717,7 +734,25 @@ async fn run_managed_client(
             tokio::time::sleep(retry_in).await;
 
             let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
-            match establish_connection(&config, &http, deadline).await {
+            let recovery = if configured_build_can_restore {
+                establish_connection(&config, &http, deadline).await
+            } else {
+                match wait_for_compatible_connection(&config, &http, None, deadline).await {
+                    ConnectionWait::Ready(replacement) => Ok(*replacement),
+                    ConnectionWait::Incompatible(protocol_version) => {
+                        let _ = events
+                            .send(ManagedEvent::Fatal(format!(
+                                "recovery server protocol version {protocol_version} is incompatible with client protocol version {PROTOCOL_VERSION}"
+                            )))
+                            .await;
+                        return;
+                    }
+                    ConnectionWait::TimedOut => {
+                        Err(anyhow!("compatible Chidori server is not ready"))
+                    }
+                }
+            };
+            match recovery {
                 Ok(recovered) => {
                     connection = recovered;
                     break;
@@ -789,61 +824,66 @@ async fn stream_events(
     Ok(StreamOutcome::Disconnected)
 }
 
-enum ReplacementProbe {
+enum ConnectionProbe {
     Pending,
     Ready(Box<ActiveConnection>),
     Incompatible(u32),
 }
 
-async fn establish_replacement_connection(
+enum ConnectionWait {
+    Ready(Box<ActiveConnection>),
+    Incompatible(u32),
+    TimedOut,
+}
+
+async fn wait_for_compatible_connection(
     config: &ManagedClientConfig,
     http: &reqwest::Client,
-    replaced_instance_id: uuid::Uuid,
+    excluded_instance_id: Option<uuid::Uuid>,
     deadline: tokio::time::Instant,
-) -> Result<ActiveConnection> {
+) -> ConnectionWait {
     loop {
-        match probe_replacement_connection(config, http, replaced_instance_id, deadline).await {
-            ReplacementProbe::Ready(connection) => return Ok(*connection),
-            ReplacementProbe::Incompatible(protocol_version) => {
-                bail!(
-                    "replacement server protocol version {protocol_version} is incompatible with client protocol version {PROTOCOL_VERSION}"
-                )
+        match probe_compatible_connection(config, http, excluded_instance_id, deadline).await {
+            ConnectionProbe::Ready(connection) => return ConnectionWait::Ready(connection),
+            ConnectionProbe::Incompatible(protocol_version) => {
+                return ConnectionWait::Incompatible(protocol_version);
             }
-            ReplacementProbe::Pending => {}
+            ConnectionProbe::Pending => {}
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            bail!("replacement Chidori server did not become ready within 15s")
+            return ConnectionWait::TimedOut;
         }
         tokio::time::sleep_until((now + Duration::from_millis(50)).min(deadline)).await;
     }
 }
 
-async fn probe_replacement_connection(
+async fn probe_compatible_connection(
     config: &ManagedClientConfig,
     http: &reqwest::Client,
-    replaced_instance_id: uuid::Uuid,
+    excluded_instance_id: Option<uuid::Uuid>,
     deadline: tokio::time::Instant,
-) -> ReplacementProbe {
+) -> ConnectionProbe {
     let Ok(Ok((descriptor, health))) = tokio::time::timeout_at(deadline, probe(config)).await
     else {
-        return ReplacementProbe::Pending;
+        return ConnectionProbe::Pending;
     };
-    if replaced_instance_id == descriptor.instance_id {
-        return ReplacementProbe::Pending;
+    if excluded_instance_id == Some(descriptor.instance_id) {
+        return ConnectionProbe::Pending;
     }
-    if replaced_instance_id == health.instance_id || health.lifecycle != LifecycleState::Ready {
-        return ReplacementProbe::Pending;
+    if excluded_instance_id == Some(health.instance_id) || health.lifecycle != LifecycleState::Ready
+    {
+        return ConnectionProbe::Pending;
     }
     if health.protocol_version != PROTOCOL_VERSION {
-        return ReplacementProbe::Incompatible(health.protocol_version);
+        return ConnectionProbe::Incompatible(health.protocol_version);
     }
     let Ok(Ok(response)) =
         tokio::time::timeout_at(deadline, open_event_stream(http, &descriptor)).await
     else {
-        return ReplacementProbe::Pending;
+        return ConnectionProbe::Pending;
     };
-    ReplacementProbe::Ready(Box::new(ActiveConnection {
+    ConnectionProbe::Ready(Box::new(ActiveConnection {
         descriptor,
         health,
         response,
