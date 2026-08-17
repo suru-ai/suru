@@ -8,6 +8,15 @@ To start we will only support the Codex and Copilot providers, but additional pr
 Try to build all functionality supporting both providers to avoid building interfaces that are not generic enough to
 support others down the line.
 
+## Plugins
+
+Use OpenCode's TUI plugin architecture as the reference when designing core UI extension seams. For now, keep named
+render slots crate-private with typed context, built-in defaults, deterministic prepend/replace/append composition, and
+failure isolation; slots contribute rendered content only, while commands and Session mutation use separate typed
+interfaces. Keep transcript projection typed rather than adding a generic row slot so future tool renderers can target
+understood Activity types. A plugin loader and public plugin API are deferred, but visual actions should use semantic
+command IDs so future plugins and mouse input can invoke the same behavior.
+
 ## Agent skills
 
 Skills are present under the .agents/skills directory. Read from there if a skill trigger fails.
