@@ -2,7 +2,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const BUILD_IDENTITY: &str = concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION"));
+pub const BUILD_IDENTITY: &str = concat!(
+    env!("CARGO_PKG_NAME"),
+    "@",
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("CHIDORI_COMPILE_ID")
+);
 pub const SNAPSHOT_EVENT: &str = "snapshot";
 pub const COUNTER_UPDATED_EVENT: &str = "counter_updated";
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
@@ -56,6 +62,7 @@ pub struct CounterUpdate {
 #[serde(rename_all = "snake_case")]
 pub enum ShutdownReason {
     Manual,
+    Replacement,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -17,8 +17,9 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use crate::{
     RuntimeConfig,
     protocol::{
-        COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
-        RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown, ShutdownReason,
+        BUILD_IDENTITY, COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health,
+        LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT,
+        ServerShutdown, ShutdownReason,
     },
     runtime::protect_current_user_file,
 };
@@ -389,6 +390,10 @@ async fn ensure_server(
         };
         let error = match probe_result {
             Ok((descriptor, health)) => match health.lifecycle {
+                LifecycleState::Ready if health.build_identity != BUILD_IDENTITY => {
+                    replace_server(config, &descriptor, &health, deadline).await?;
+                    anyhow::anyhow!("registered Chidori server is being replaced")
+                }
                 LifecycleState::Ready => return Ok((descriptor, health)),
                 LifecycleState::Starting => {
                     anyhow::anyhow!("registered Chidori server is still starting")
@@ -439,6 +444,69 @@ async fn ensure_server(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+async fn replace_server(
+    config: &ManagedClientConfig,
+    descriptor: &RuntimeDescriptor,
+    health: &Health,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    let request = ServerShutdown {
+        instance_id: health.instance_id,
+        reason: ShutdownReason::Replacement,
+    };
+    let response = tokio::time::timeout_at(
+        deadline,
+        reqwest::Client::new()
+            .post(format!("{}/v1/server/stop", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .json(&request)
+            .send(),
+    )
+    .await
+    .context("replacement stop request timed out")?
+    .context("send replacement stop request")?;
+    if response.status() != reqwest::StatusCode::CONFLICT {
+        response
+            .error_for_status()
+            .context("server rejected replacement stop request")?;
+    }
+
+    let mut target_stopped = false;
+    loop {
+        if !target_stopped {
+            target_stopped = matches!(
+                tokio::time::timeout_at(deadline, inspect_health(descriptor)).await,
+                Ok(Err(HealthInspectionError::Unreachable(_)))
+            );
+        }
+        let registration_released = match read_descriptor(&config.descriptor_path()) {
+            Ok(current) => current.instance_id != request.instance_id,
+            Err(_) => !config.descriptor_path().exists(),
+        };
+        if target_stopped && registration_released && channel_lock_is_released(config)? {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!("mismatched Chidori server did not release the channel before startup timed out")
+        }
+        tokio::time::sleep_until((now + Duration::from_millis(25)).min(deadline)).await;
+    }
+}
+
+fn channel_lock_is_released(config: &ManagedClientConfig) -> Result<bool> {
+    let lock = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(config.lock_path())
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error).context("inspect server election lock"),
+    };
+    Ok(lock.try_lock_exclusive().is_ok())
 }
 
 async fn probe(config: &ManagedClientConfig) -> Result<(RuntimeDescriptor, Health)> {
@@ -552,6 +620,7 @@ async fn run_managed_client(
         return;
     }
 
+    let mut follows_replacement = false;
     loop {
         if events
             .send(ManagedEvent::Connected(connection.health))
@@ -560,6 +629,7 @@ async fn run_managed_client(
         {
             return;
         }
+        let mut replaced_instance_id = None;
         match stream_events(
             connection.response,
             &events,
@@ -568,11 +638,41 @@ async fn run_managed_client(
         .await
         {
             Ok(StreamOutcome::Disconnected) => {}
-            Ok(StreamOutcome::ServerShutdown) => return,
+            Ok(StreamOutcome::ManualShutdown) => return,
+            Ok(StreamOutcome::Replacement { instance_id }) => {
+                follows_replacement = true;
+                replaced_instance_id = Some(instance_id);
+            }
             Ok(StreamOutcome::ReceiverClosed) => return,
             Err(error) => {
                 let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
                 return;
+            }
+        }
+
+        if follows_replacement {
+            if events
+                .send(ManagedEvent::Recovering(RecoveryStatus {
+                    attempt: 1,
+                    retry_in: Duration::ZERO,
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+            match establish_replacement_connection(&config, &http, replaced_instance_id, deadline)
+                .await
+            {
+                Ok(replacement) => {
+                    connection = replacement;
+                    continue;
+                }
+                Err(error) => {
+                    let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
+                    return;
+                }
             }
         }
 
@@ -616,7 +716,8 @@ fn next_recovery_backoff(previous: Duration) -> Duration {
 
 enum StreamOutcome {
     Disconnected,
-    ServerShutdown,
+    ManualShutdown,
+    Replacement { instance_id: uuid::Uuid },
     ReceiverClosed,
 }
 
@@ -645,15 +746,97 @@ async fn stream_events(
                 return Err(error);
             }
         };
-        let server_shutdown = matches!(managed_event, ManagedEvent::ServerShutdown(_));
+        if let ManagedEvent::ServerShutdown(shutdown) = &managed_event
+            && shutdown.reason == ShutdownReason::Replacement
+        {
+            return Ok(StreamOutcome::Replacement {
+                instance_id: shutdown.instance_id,
+            });
+        }
+        let manual_shutdown = matches!(managed_event, ManagedEvent::ServerShutdown(_));
         if events.send(managed_event).await.is_err() {
             return Ok(StreamOutcome::ReceiverClosed);
         }
-        if server_shutdown {
-            return Ok(StreamOutcome::ServerShutdown);
+        if manual_shutdown {
+            return Ok(StreamOutcome::ManualShutdown);
         }
     }
     Ok(StreamOutcome::Disconnected)
+}
+
+enum ReplacementProbe {
+    Pending,
+    Ready(Box<ActiveConnection>),
+    Incompatible(u32),
+}
+
+async fn establish_replacement_connection(
+    config: &ManagedClientConfig,
+    http: &reqwest::Client,
+    replaced_instance_id: Option<uuid::Uuid>,
+    deadline: tokio::time::Instant,
+) -> Result<ActiveConnection> {
+    loop {
+        match probe_replacement_connection(config, http, replaced_instance_id, deadline).await {
+            ReplacementProbe::Ready(connection) => return Ok(*connection),
+            ReplacementProbe::Incompatible(protocol_version) => {
+                bail!(
+                    "replacement server protocol version {protocol_version} is incompatible with client protocol version {PROTOCOL_VERSION}"
+                )
+            }
+            ReplacementProbe::Pending => {}
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!("replacement Chidori server did not become ready within 15s")
+        }
+        tokio::time::sleep_until((now + Duration::from_millis(50)).min(deadline)).await;
+    }
+}
+
+async fn probe_replacement_connection(
+    config: &ManagedClientConfig,
+    http: &reqwest::Client,
+    replaced_instance_id: Option<uuid::Uuid>,
+    deadline: tokio::time::Instant,
+) -> ReplacementProbe {
+    let Ok(descriptor) = read_descriptor(&config.descriptor_path()) else {
+        return ReplacementProbe::Pending;
+    };
+    if replaced_instance_id == Some(descriptor.instance_id)
+        || validate_loopback_url(&descriptor.base_url).is_err()
+    {
+        return ReplacementProbe::Pending;
+    }
+    let Ok(Ok(health)) = tokio::time::timeout_at(deadline, inspect_health(&descriptor)).await
+    else {
+        return ReplacementProbe::Pending;
+    };
+    if replaced_instance_id == Some(health.instance_id) || health.lifecycle != LifecycleState::Ready
+    {
+        return ReplacementProbe::Pending;
+    }
+    if health.protocol_version != PROTOCOL_VERSION {
+        return ReplacementProbe::Incompatible(health.protocol_version);
+    }
+    let Ok(Ok(response)) = tokio::time::timeout_at(
+        deadline,
+        http.get(format!("{}/v1/events", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .send(),
+    )
+    .await
+    else {
+        return ReplacementProbe::Pending;
+    };
+    let Ok(response) = response.error_for_status() else {
+        return ReplacementProbe::Pending;
+    };
+    ReplacementProbe::Ready(Box::new(ActiveConnection {
+        descriptor,
+        health,
+        response,
+    }))
 }
 
 fn decode_event(

@@ -1,5 +1,7 @@
 use std::{
     convert::Infallible,
+    fs::OpenOptions,
+    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -12,24 +14,260 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response, sse::Event, sse::Sse},
-    routing::get,
+    routing::{get, post},
 };
 use chidori::{
-    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
+    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, start_server},
     protocol::{
         BUILD_IDENTITY, CounterSnapshot, Health, LifecycleState, PROTOCOL_VERSION,
         RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerShutdown, ShutdownReason,
     },
     server::{self, ServerConfig},
 };
+use fs2::FileExt;
 use futures_util::{StreamExt, stream};
 use sysinfo::{Pid, System};
+use tokio::sync::{oneshot, watch};
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 mod support;
 
 use support::{read_runtime_descriptor, receive_initial_state, write_runtime_descriptor};
+
+#[tokio::test]
+async fn launching_current_build_replaces_an_authenticated_mismatched_server() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "build-replacement-test";
+    let fixture =
+        BuildReplacementFixture::spawn(state_dir.path(), channel, "chidori@old-build").await;
+    let previous = fixture.descriptor();
+    let config = ManagedClientConfig::new(state_dir.path(), channel)
+        .expect("configure replacement launcher")
+        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+
+    let replacement = start_server(&config)
+        .await
+        .expect("replace mismatched server build");
+
+    assert_ne!(replacement.instance_id, previous.instance_id);
+    assert_ne!(replacement.pid, previous.pid);
+    assert_eq!(replacement.build_identity, BUILD_IDENTITY);
+    let shutdown = fixture
+        .shutdown_request()
+        .expect("old server receives replacement request");
+    assert_eq!(shutdown.instance_id, previous.instance_id);
+    assert_eq!(shutdown.reason, ShutdownReason::Replacement);
+
+    let mut client = ManagedClient::connect(config)
+        .await
+        .expect("connect to replacement server");
+    let (identity, snapshot) = receive_initial_state(&mut client).await;
+    assert_eq!(identity.instance_id, replacement.instance_id);
+    assert_eq!(snapshot.instance_id, replacement.instance_id);
+    assert!(snapshot.revision < 41, "replacement counter should reset");
+
+    drop(client);
+    stop_test_server(state_dir.path(), channel);
+}
+
+#[tokio::test]
+async fn attached_client_reconnects_to_the_replacement_and_its_fresh_snapshot() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "attached-build-replacement-test";
+    let fixture = BuildReplacementFixture::spawn(state_dir.path(), channel, BUILD_IDENTITY).await;
+    let previous = fixture.descriptor();
+    let config = ManagedClientConfig::new(state_dir.path(), channel)
+        .expect("configure managed client")
+        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+    let mut attached = ManagedClient::connect(config.clone())
+        .await
+        .expect("attach to the original server");
+    let mut also_attached = ManagedClient::connect(config.clone())
+        .await
+        .expect("attach another client to the original server");
+    let (original_identity, original_snapshot) = receive_initial_state(&mut attached).await;
+    let (also_original_identity, also_original_snapshot) =
+        receive_initial_state(&mut also_attached).await;
+    assert_eq!(original_identity.instance_id, previous.instance_id);
+    assert_eq!(also_original_identity.instance_id, previous.instance_id);
+    assert_eq!(original_snapshot.value, 41);
+    assert_eq!(also_original_snapshot.value, 41);
+    fixture.set_build_identity("chidori@old-build");
+
+    let replacement = start_server(&config)
+        .await
+        .expect("launch current build replacement");
+    let (first_reconnected, second_reconnected) = tokio::join!(
+        receive_recovered_state(&mut attached, previous.instance_id),
+        receive_recovered_state(&mut also_attached, previous.instance_id),
+    );
+    let (reconnected, fresh_snapshot) = first_reconnected;
+    let (also_reconnected, also_fresh_snapshot) = second_reconnected;
+
+    assert_eq!(reconnected.instance_id, replacement.instance_id);
+    assert_eq!(also_reconnected.instance_id, replacement.instance_id);
+    assert_eq!(fresh_snapshot.instance_id, replacement.instance_id);
+    assert_eq!(also_fresh_snapshot.instance_id, replacement.instance_id);
+    assert!(fresh_snapshot.value < original_snapshot.value);
+    assert!(fresh_snapshot.revision < original_snapshot.revision);
+    assert!(also_fresh_snapshot.value < also_original_snapshot.value);
+    assert!(also_fresh_snapshot.revision < also_original_snapshot.revision);
+    assert_eq!(
+        fixture
+            .shutdown_request()
+            .expect("old server receives shutdown")
+            .reason,
+        ShutdownReason::Replacement
+    );
+
+    stop_test_server(state_dir.path(), channel);
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match attached.next().await.expect("managed client remains open") {
+                ManagedEvent::Recovering(_) => break,
+                ManagedEvent::CounterUpdated(_) => {}
+                ManagedEvent::Fatal(error) => panic!("managed client failed: {error}"),
+                event => panic!("expected passive recovery after replacement, got {event:?}"),
+            }
+        }
+    })
+    .await
+    .expect("replacement follower notices the later disconnect");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after_disconnect = read_runtime_descriptor(&fixture.descriptor_path);
+    if after_disconnect.instance_id != replacement.instance_id {
+        stop_test_server(state_dir.path(), channel);
+    }
+    assert_eq!(
+        after_disconnect.instance_id, replacement.instance_id,
+        "a client that followed replacement must not launch its own build"
+    );
+
+    drop(attached);
+    drop(also_attached);
+}
+
+#[tokio::test]
+async fn incompatible_replacement_protocol_is_a_strict_fatal_error() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "incompatible-build-replacement-test";
+    let original = BuildReplacementFixture::spawn(state_dir.path(), channel, BUILD_IDENTITY).await;
+    let descriptor = original.descriptor();
+    let mut attached = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure attached client")
+            .with_server_executable(state_dir.path().join("must-not-spawn")),
+    )
+    .await
+    .expect("attach to original server");
+    receive_initial_state(&mut attached).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/server/stop", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&ServerShutdown {
+            instance_id: descriptor.instance_id,
+            reason: ShutdownReason::Replacement,
+        })
+        .send()
+        .await
+        .expect("request replacement transition");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    timeout(Duration::from_secs(1), async {
+        while !original.is_stopped() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("original server releases the channel");
+    let incompatible = BuildReplacementFixture::spawn_with_protocol(
+        state_dir.path(),
+        channel,
+        "chidori@incompatible-build",
+        PROTOCOL_VERSION + 1,
+    )
+    .await;
+
+    let fatal = timeout(Duration::from_secs(2), async {
+        loop {
+            match attached.next().await.expect("managed client remains open") {
+                ManagedEvent::Recovering(_) => {}
+                ManagedEvent::Fatal(error) => break error,
+                event => panic!("expected replacement recovery or fatal error, got {event:?}"),
+            }
+        }
+    })
+    .await
+    .expect("incompatible replacement is rejected promptly");
+    assert!(fatal.contains("replacement server protocol version"));
+    assert!(fatal.contains("incompatible"));
+
+    drop(incompatible);
+}
+
+#[tokio::test]
+async fn simultaneous_replacement_launchers_converge_on_one_new_instance() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "replacement-race-test";
+    let fixture =
+        BuildReplacementFixture::spawn(state_dir.path(), channel, "chidori@old-build").await;
+    let previous_instance_id = fixture.descriptor().instance_id;
+    let config = ManagedClientConfig::new(state_dir.path(), channel)
+        .expect("configure replacement launchers")
+        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+    let launchers = (0..8)
+        .map(|_| {
+            let config = config.clone();
+            tokio::spawn(async move { start_server(&config).await })
+        })
+        .collect::<Vec<_>>();
+
+    let mut replacements = Vec::new();
+    for launcher in launchers {
+        replacements.push(
+            launcher
+                .await
+                .expect("replacement launcher does not panic")
+                .expect("replacement launcher succeeds"),
+        );
+    }
+    let winner = replacements.first().expect("at least one replacement");
+    assert_ne!(winner.instance_id, previous_instance_id);
+    assert!(replacements.iter().all(|replacement| {
+        replacement.instance_id == winner.instance_id && replacement.pid == winner.pid
+    }));
+
+    stop_test_server(state_dir.path(), channel);
+}
+
+#[tokio::test]
+async fn mismatched_build_in_another_channel_is_not_replaced() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let old_channel = "isolated-old-build";
+    let current_channel = "isolated-current-build";
+    let old =
+        BuildReplacementFixture::spawn(state_dir.path(), old_channel, "chidori@old-build").await;
+    let current = start_server(
+        &ManagedClientConfig::new(state_dir.path(), current_channel)
+            .expect("configure isolated channel")
+            .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+    )
+    .await
+    .expect("start current build in another channel");
+
+    assert_eq!(current.build_identity, BUILD_IDENTITY);
+    assert!(old.shutdown_request().is_none());
+    let old_health = reqwest::Client::new()
+        .get(format!("{}/health", old.descriptor().base_url))
+        .bearer_auth(&old.descriptor().token)
+        .send()
+        .await
+        .expect("old channel remains reachable");
+    assert_eq!(old_health.status(), reqwest::StatusCode::OK);
+
+    stop_test_server(state_dir.path(), current_channel);
+}
 
 #[tokio::test]
 async fn simultaneous_launchers_converge_on_one_authenticated_server() {
@@ -810,6 +1048,38 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
     stop_test_server(state_dir.path(), channel);
 }
 
+#[test]
+fn build_profile_selects_an_isolated_default_channel() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let (expected_channel, other_channel) = if cfg!(debug_assertions) {
+        ("debug", "release")
+    } else {
+        ("release", "debug")
+    };
+    let output = Command::new(env!("CARGO_BIN_EXE_chidori"))
+        .args(["server", "start"])
+        .env("CHIDORI_STATE_DIR", state_dir.path())
+        .env_remove("CHIDORI_CHANNEL")
+        .output()
+        .expect("start server on the build profile's default channel");
+
+    assert!(
+        output.status.success(),
+        "server start failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        state_dir
+            .path()
+            .join(expected_channel)
+            .join("runtime.json")
+            .exists()
+    );
+    assert!(!state_dir.path().join(other_channel).exists());
+
+    stop_test_server(state_dir.path(), expected_channel);
+}
+
 #[tokio::test]
 async fn managed_client_starts_a_missing_server_before_streaming_initial_state() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -1174,6 +1444,240 @@ fn fixture_authenticated(headers: &HeaderMap, token: &str) -> bool {
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value == format!("Bearer {token}"))
+}
+
+#[derive(Clone)]
+struct BuildReplacementState {
+    descriptor: Arc<Mutex<RuntimeDescriptor>>,
+    lifecycle: Arc<Mutex<LifecycleState>>,
+    shutdown_intent: watch::Sender<Option<ServerShutdown>>,
+    shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    shutdown_request: Arc<Mutex<Option<ServerShutdown>>>,
+}
+
+struct BuildReplacementFixture {
+    descriptor: Arc<Mutex<RuntimeDescriptor>>,
+    descriptor_path: PathBuf,
+    shutdown_request: Arc<Mutex<Option<ServerShutdown>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl BuildReplacementFixture {
+    async fn spawn(state_dir: &std::path::Path, channel: &str, build_identity: &str) -> Self {
+        Self::spawn_with_protocol(state_dir, channel, build_identity, PROTOCOL_VERSION).await
+    }
+
+    async fn spawn_with_protocol(
+        state_dir: &std::path::Path,
+        channel: &str,
+        build_identity: &str,
+        protocol_version: u32,
+    ) -> Self {
+        let runtime_dir = state_dir.join(channel);
+        std::fs::create_dir_all(&runtime_dir).expect("create old-build runtime directory");
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(runtime_dir.join("server.lock"))
+            .expect("open old-build channel lock");
+        lock.try_lock_exclusive()
+            .expect("old-build fixture owns the channel");
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind old-build fixture");
+        let descriptor = RuntimeDescriptor {
+            base_url: format!(
+                "http://{}",
+                listener.local_addr().expect("read old-build address")
+            ),
+            token: "old-build-fixture-token".to_owned(),
+            instance_id: Uuid::new_v4(),
+            pid: u32::MAX - 1,
+            protocol_version,
+            build_identity: build_identity.to_owned(),
+        };
+        let descriptor_path = runtime_dir.join("runtime.json");
+        write_runtime_descriptor(&descriptor_path, &descriptor);
+
+        let descriptor = Arc::new(Mutex::new(descriptor));
+        let lifecycle = Arc::new(Mutex::new(LifecycleState::Ready));
+        let (shutdown_intent, _) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let shutdown = Arc::new(Mutex::new(Some(shutdown_tx)));
+        let shutdown_request = Arc::new(Mutex::new(None));
+        let state = BuildReplacementState {
+            descriptor: descriptor.clone(),
+            lifecycle,
+            shutdown_intent,
+            shutdown,
+            shutdown_request: shutdown_request.clone(),
+        };
+        let app = Router::new()
+            .route("/health", get(build_replacement_health))
+            .route("/v1/events", get(build_replacement_events))
+            .route("/v1/server/stop", post(build_replacement_stop))
+            .with_state(state);
+        let instance_id = descriptor
+            .lock()
+            .expect("lock old-build descriptor")
+            .instance_id;
+        let task_descriptor_path = descriptor_path.clone();
+        let task = tokio::spawn(async move {
+            let _lock = lock;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve old-build fixture");
+            if task_descriptor_path.exists()
+                && read_runtime_descriptor(&task_descriptor_path).instance_id == instance_id
+            {
+                std::fs::remove_file(task_descriptor_path)
+                    .expect("remove old-build runtime descriptor");
+            }
+            tokio::time::sleep(Duration::from_millis(75)).await;
+        });
+
+        Self {
+            descriptor,
+            descriptor_path,
+            shutdown_request,
+            task,
+        }
+    }
+
+    fn descriptor(&self) -> RuntimeDescriptor {
+        self.descriptor
+            .lock()
+            .expect("lock old-build descriptor")
+            .clone()
+    }
+
+    fn set_build_identity(&self, build_identity: &str) {
+        let mut descriptor = self.descriptor.lock().expect("lock old-build descriptor");
+        descriptor.build_identity = build_identity.to_owned();
+        write_runtime_descriptor(&self.descriptor_path, &descriptor);
+    }
+
+    fn shutdown_request(&self) -> Option<ServerShutdown> {
+        self.shutdown_request
+            .lock()
+            .expect("lock old-build shutdown request")
+            .clone()
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.task.is_finished()
+    }
+}
+
+impl Drop for BuildReplacementFixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn build_replacement_health(
+    State(state): State<BuildReplacementState>,
+    headers: HeaderMap,
+) -> Response {
+    let descriptor = state
+        .descriptor
+        .lock()
+        .expect("lock old-build descriptor")
+        .clone();
+    if !fixture_authenticated(&headers, &descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(Health {
+        instance_id: descriptor.instance_id,
+        pid: descriptor.pid,
+        lifecycle: state.lifecycle.lock().expect("lock lifecycle").clone(),
+        protocol_version: descriptor.protocol_version,
+        build_identity: descriptor.build_identity,
+    })
+    .into_response()
+}
+
+async fn build_replacement_events(
+    State(state): State<BuildReplacementState>,
+    headers: HeaderMap,
+) -> Response {
+    let descriptor = state
+        .descriptor
+        .lock()
+        .expect("lock old-build descriptor")
+        .clone();
+    if !fixture_authenticated(&headers, &descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let snapshot = CounterSnapshot {
+        instance_id: descriptor.instance_id,
+        value: 41,
+        revision: 41,
+    };
+    let first = stream::once(async move {
+        Ok::<_, Infallible>(
+            Event::default()
+                .event(SNAPSHOT_EVENT)
+                .id("41")
+                .json_data(snapshot)
+                .expect("serialize old-build snapshot"),
+        )
+    });
+    let shutdowns = stream::unfold(
+        state.shutdown_intent.subscribe(),
+        |mut shutdown_intent| async move {
+            shutdown_intent.changed().await.ok()?;
+            let shutdown = shutdown_intent.borrow_and_update().clone()?;
+            let event = Event::default()
+                .event(SERVER_SHUTDOWN_EVENT)
+                .id("41")
+                .json_data(shutdown)
+                .expect("serialize old-build shutdown intent");
+            Some((Ok::<_, Infallible>(event), shutdown_intent))
+        },
+    );
+    Sse::new(first.chain(shutdowns)).into_response()
+}
+
+async fn build_replacement_stop(
+    State(state): State<BuildReplacementState>,
+    headers: HeaderMap,
+    Json(request): Json<ServerShutdown>,
+) -> StatusCode {
+    let descriptor = state
+        .descriptor
+        .lock()
+        .expect("lock old-build descriptor")
+        .clone();
+    if !fixture_authenticated(&headers, &descriptor.token) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    if request.instance_id != descriptor.instance_id {
+        return StatusCode::CONFLICT;
+    }
+    *state
+        .shutdown_request
+        .lock()
+        .expect("lock old-build shutdown request") = Some(request.clone());
+    *state.lifecycle.lock().expect("lock lifecycle") = LifecycleState::Stopping;
+    state.shutdown_intent.send_replace(Some(request));
+    if let Some(shutdown) = state
+        .shutdown
+        .lock()
+        .expect("lock old-build shutdown sender")
+        .take()
+    {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = shutdown.send(());
+        });
+    }
+    StatusCode::ACCEPTED
 }
 
 fn stop_test_server(state_dir: &std::path::Path, channel: &str) {

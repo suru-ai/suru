@@ -1,8 +1,13 @@
 use chidori::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, stop_server},
-    protocol::{Health, LifecycleState, ServerShutdown, ShutdownReason},
+    protocol::{
+        BUILD_IDENTITY, Health, LifecycleState, SERVER_SHUTDOWN_EVENT, ServerShutdown,
+        ShutdownReason,
+    },
     server::{self, ServerConfig},
 };
+use eventsource_stream::Eventsource;
+use futures_util::StreamExt;
 use tokio::time::{Duration, timeout};
 
 mod support;
@@ -55,6 +60,20 @@ async fn authenticated_health_describes_the_ready_server() {
     assert_eq!(health.lifecycle, LifecycleState::Ready);
     assert_eq!(health.protocol_version, descriptor.protocol_version);
     assert_eq!(health.build_identity, descriptor.build_identity);
+    assert!(
+        BUILD_IDENTITY.starts_with(concat!(
+            env!("CARGO_PKG_NAME"),
+            "@",
+            env!("CARGO_PKG_VERSION"),
+            "+"
+        )),
+        "build identity should include the package version and a compilation identity"
+    );
+    assert_ne!(
+        BUILD_IDENTITY,
+        concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")),
+        "package version alone cannot identify a rebuilt executable"
+    );
 
     let missing_event_auth = client
         .get(format!("{}/v1/events", descriptor.base_url))
@@ -683,6 +702,68 @@ async fn graceful_server_shutdown_emits_intent_without_starting_crash_recovery()
     };
     let (shutdown_result, ()) = tokio::join!(server.shutdown(), observe_shutdown);
     shutdown_result.expect("shut down server gracefully");
+}
+
+#[tokio::test]
+async fn authenticated_replacement_stop_emits_replacement_intent() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "replacement-intent-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let http = reqwest::Client::new();
+    let response = http
+        .get(format!("{}/v1/events", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("open authenticated event stream")
+        .error_for_status()
+        .expect("event stream opens");
+    let mut events = response.bytes_stream().eventsource();
+    events
+        .next()
+        .await
+        .expect("snapshot arrives")
+        .expect("snapshot is valid");
+
+    let response = http
+        .post(format!("{}/v1/server/stop", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&ServerShutdown {
+            instance_id: descriptor.instance_id,
+            reason: ShutdownReason::Replacement,
+        })
+        .send()
+        .await
+        .expect("request replacement shutdown");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+
+    let event = timeout(Duration::from_secs(1), async {
+        loop {
+            let event = events
+                .next()
+                .await
+                .expect("event stream remains open")
+                .expect("shutdown event is valid");
+            if event.event == SERVER_SHUTDOWN_EVENT {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("replacement intent arrives before transport closure");
+    let shutdown: ServerShutdown =
+        serde_json::from_str(&event.data).expect("decode replacement intent");
+    assert_eq!(shutdown.instance_id, descriptor.instance_id);
+    assert_eq!(shutdown.reason, ShutdownReason::Replacement);
+
+    server
+        .run_until_ctrl_c()
+        .await
+        .expect("join replaced server");
 }
 
 #[tokio::test]
