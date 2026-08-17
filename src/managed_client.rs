@@ -217,34 +217,12 @@ pub async fn start_server(config: &ManagedClientConfig) -> Result<Health> {
 }
 
 pub async fn server_status(config: &ManagedClientConfig) -> Result<ServerStatus> {
-    if !config
-        .descriptor_path()
-        .try_exists()
-        .context("inspect runtime descriptor")?
-    {
-        return Ok(ServerStatus::Missing);
-    }
-
-    let descriptor = match read_descriptor(&config.descriptor_path()) {
-        Ok(descriptor) => descriptor,
-        Err(error) => return Ok(ServerStatus::Stale(format!("{error:#}"))),
-    };
-    if let Err(error) = validate_loopback_url(&descriptor.base_url) {
-        return Ok(ServerStatus::Stale(format!("{error:#}")));
-    }
-
-    let health = match tokio::time::timeout(STATUS_TIMEOUT, inspect_health(&descriptor)).await {
-        Ok(Ok(health)) => health,
-        Ok(Err(HealthInspectionError::Stale(reason))) => {
-            return Ok(ServerStatus::Stale(reason));
-        }
-        Ok(Err(HealthInspectionError::Unreachable(reason))) => {
+    let health = match inspect_registration(config).await? {
+        RegistrationInspection::Missing => return Ok(ServerStatus::Missing),
+        RegistrationInspection::Live { health, .. } => health,
+        RegistrationInspection::Stale(reason) => return Ok(ServerStatus::Stale(reason)),
+        RegistrationInspection::Unreachable(reason) => {
             return Ok(ServerStatus::Unreachable(reason));
-        }
-        Err(_) => {
-            return Ok(ServerStatus::Unreachable(
-                "authenticated health check timed out".to_owned(),
-            ));
         }
     };
     Ok(match health.lifecycle {
@@ -256,17 +234,15 @@ pub async fn server_status(config: &ManagedClientConfig) -> Result<ServerStatus>
 }
 
 pub async fn stop_server(config: &ManagedClientConfig) -> Result<Health> {
-    let descriptor = read_descriptor(&config.descriptor_path())?;
-    validate_loopback_url(&descriptor.base_url)?;
-    let health = match tokio::time::timeout(STATUS_TIMEOUT, inspect_health(&descriptor)).await {
-        Ok(Ok(health)) => health,
-        Ok(Err(HealthInspectionError::Stale(reason))) => {
+    let (descriptor, health) = match inspect_registration(config).await? {
+        RegistrationInspection::Missing => bail!("cannot stop missing Chidori server"),
+        RegistrationInspection::Live { descriptor, health } => (descriptor, health),
+        RegistrationInspection::Stale(reason) => {
             bail!("cannot stop stale Chidori server registration: {reason}")
         }
-        Ok(Err(HealthInspectionError::Unreachable(reason))) => {
+        RegistrationInspection::Unreachable(reason) => {
             bail!("cannot stop unreachable Chidori server: {reason}")
         }
-        Err(_) => bail!("cannot stop unreachable Chidori server: health check timed out"),
     };
     let request = ServerShutdown {
         instance_id: health.instance_id,
@@ -291,22 +267,86 @@ pub async fn stop_server(config: &ManagedClientConfig) -> Result<Health> {
         .context("server rejected manual stop request")?;
 
     let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
+    let mut target_stopped = false;
     loop {
-        match read_descriptor(&config.descriptor_path()) {
-            Ok(current) if current.instance_id != request.instance_id => break,
-            Err(_) if !config.descriptor_path().exists() => break,
-            _ if tokio::time::Instant::now() >= deadline => {
-                bail!("Chidori server did not stop within 5s")
-            }
-            _ => tokio::time::sleep(Duration::from_millis(25)).await,
+        if !target_stopped {
+            target_stopped = matches!(
+                tokio::time::timeout_at(deadline, inspect_health(&descriptor)).await,
+                Ok(Err(HealthInspectionError::Unreachable(_)))
+            );
         }
+        let registration_released = match read_descriptor(&config.descriptor_path()) {
+            Ok(current) => current.instance_id != request.instance_id,
+            Err(_) => !config.descriptor_path().exists(),
+        };
+        if target_stopped && registration_released {
+            break;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!("Chidori server did not stop within 5s")
+        }
+        tokio::time::sleep_until((now + Duration::from_millis(25)).min(deadline)).await;
     }
     Ok(health)
+}
+
+enum RegistrationInspection {
+    Missing,
+    Live {
+        descriptor: RuntimeDescriptor,
+        health: Health,
+    },
+    Stale(String),
+    Unreachable(String),
+}
+
+async fn inspect_registration(config: &ManagedClientConfig) -> Result<RegistrationInspection> {
+    let descriptor_path = config.descriptor_path();
+    if !descriptor_path
+        .try_exists()
+        .context("inspect runtime descriptor")?
+    {
+        return Ok(RegistrationInspection::Missing);
+    }
+    let descriptor = match read_descriptor(&descriptor_path) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            if !descriptor_path
+                .try_exists()
+                .context("reinspect runtime descriptor")?
+            {
+                return Ok(RegistrationInspection::Missing);
+            }
+            return Ok(RegistrationInspection::Stale(format!("{error:#}")));
+        }
+    };
+    if let Err(error) = validate_loopback_url(&descriptor.base_url) {
+        return Ok(RegistrationInspection::Stale(format!("{error:#}")));
+    }
+    match tokio::time::timeout(STATUS_TIMEOUT, inspect_health(&descriptor)).await {
+        Ok(Ok(health)) => Ok(RegistrationInspection::Live { descriptor, health }),
+        Ok(Err(HealthInspectionError::Stale(reason))) => Ok(RegistrationInspection::Stale(reason)),
+        Ok(Err(HealthInspectionError::Unreachable(reason))) => {
+            Ok(RegistrationInspection::Unreachable(reason))
+        }
+        Err(_) => Ok(RegistrationInspection::Unreachable(
+            "authenticated health check timed out".to_owned(),
+        )),
+    }
 }
 
 enum HealthInspectionError {
     Stale(String),
     Unreachable(String),
+}
+
+impl HealthInspectionError {
+    fn reason(self) -> String {
+        match self {
+            Self::Stale(reason) | Self::Unreachable(reason) => reason,
+        }
+    }
 }
 
 async fn inspect_health(
@@ -404,18 +444,9 @@ async fn ensure_server(
 async fn probe(config: &ManagedClientConfig) -> Result<(RuntimeDescriptor, Health)> {
     let descriptor = read_descriptor(&config.descriptor_path())?;
     validate_loopback_url(&descriptor.base_url)?;
-    let health = reqwest::Client::new()
-        .get(format!("{}/health", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .send()
+    let health = inspect_health(&descriptor)
         .await
-        .context("request server health")?
-        .error_for_status()
-        .context("server rejected health request")?
-        .json::<Health>()
-        .await
-        .context("decode server health")?;
-    validate_identity(&descriptor, &health)?;
+        .map_err(|error| anyhow!(error.reason()))?;
     Ok((descriptor, health))
 }
 

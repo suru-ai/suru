@@ -1,5 +1,5 @@
 use chidori::{
-    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
+    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, stop_server},
     protocol::{Health, LifecycleState, ServerShutdown, ShutdownReason},
     server::{self, ServerConfig},
 };
@@ -253,6 +253,63 @@ async fn authenticated_manual_stop_notifies_clients_and_removes_its_registration
     })
     .await
     .expect("stopping server removes its own registration");
+    server.shutdown().await.expect("join stopped server");
+}
+
+#[tokio::test]
+async fn stop_waits_for_its_target_when_the_registration_is_replaced() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config =
+        ServerConfig::new(state_dir.path(), "stop-target-wait-test").expect("configure server");
+    let server = server::spawn(config.clone()).await.expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let stop_config = ManagedClientConfig::new(state_dir.path(), "stop-target-wait-test")
+        .expect("configure stop client");
+    let stopping = tokio::spawn(async move { stop_server(&stop_config).await });
+    let client = reqwest::Client::new();
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let health = client
+                .get(format!("{}/health", descriptor.base_url))
+                .bearer_auth(&descriptor.token)
+                .send()
+                .await
+                .expect("request health while stop begins")
+                .error_for_status()
+                .expect("health remains available while stop begins")
+                .json::<Health>()
+                .await
+                .expect("decode health while stop begins");
+            if health.lifecycle == LifecycleState::Stopping {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("server enters stopping before registration replacement");
+
+    let mut replacement = descriptor.clone();
+    replacement.instance_id = uuid::Uuid::new_v4();
+    write_runtime_descriptor(config.descriptor_path(), &replacement);
+
+    stopping
+        .await
+        .expect("stop task does not panic")
+        .expect("stop waits for the original instance");
+    assert!(
+        client
+            .get(format!("{}/health", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .is_err(),
+        "stop returned while the authenticated target was still reachable"
+    );
+    let remaining = read_runtime_descriptor(config.descriptor_path());
+    assert_eq!(remaining.instance_id, replacement.instance_id);
+
     server.shutdown().await.expect("join stopped server");
 }
 

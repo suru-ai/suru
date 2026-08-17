@@ -482,12 +482,7 @@ async fn server_status_reports_authenticated_ready_and_missing_states() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "status-ready-test";
 
-    let missing = Command::new(env!("CARGO_BIN_EXE_chidori"))
-        .args(["server", "status"])
-        .env("CHIDORI_STATE_DIR", state_dir.path())
-        .env("CHIDORI_CHANNEL", channel)
-        .output()
-        .expect("inspect missing server status");
+    let missing = run_server_cli(state_dir.path(), channel, "status").await;
     assert!(!missing.status.success());
     assert!(
         String::from_utf8_lossy(&missing.stderr).contains("missing"),
@@ -495,12 +490,7 @@ async fn server_status_reports_authenticated_ready_and_missing_states() {
         String::from_utf8_lossy(&missing.stderr)
     );
 
-    let started = Command::new(env!("CARGO_BIN_EXE_chidori"))
-        .args(["server", "start"])
-        .env("CHIDORI_STATE_DIR", state_dir.path())
-        .env("CHIDORI_CHANNEL", channel)
-        .output()
-        .expect("start server for status command");
+    let started = run_server_cli(state_dir.path(), channel, "start").await;
     assert!(
         started.status.success(),
         "server start failed: {}",
@@ -508,12 +498,7 @@ async fn server_status_reports_authenticated_ready_and_missing_states() {
     );
     let descriptor = read_runtime_descriptor(state_dir.path().join(channel).join("runtime.json"));
 
-    let ready = Command::new(env!("CARGO_BIN_EXE_chidori"))
-        .args(["server", "status"])
-        .env("CHIDORI_STATE_DIR", state_dir.path())
-        .env("CHIDORI_CHANNEL", channel)
-        .output()
-        .expect("inspect ready server status");
+    let ready = run_server_cli(state_dir.path(), channel, "status").await;
     assert!(
         ready.status.success(),
         "ready status failed: {}",

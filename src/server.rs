@@ -45,8 +45,8 @@ impl RunningServer {
         &self.descriptor
     }
 
-    pub async fn shutdown(mut self) -> Result<()> {
-        self.request_shutdown().await;
+    pub async fn shutdown(self) -> Result<()> {
+        self.request_shutdown();
         self.task.await.context("server task panicked")?
     }
 
@@ -55,13 +55,13 @@ impl RunningServer {
             task = &mut self.task => task.context("server task panicked")?,
             signal = tokio::signal::ctrl_c() => {
                 signal.context("listen for Ctrl-C")?;
-                self.request_shutdown().await;
+                self.request_shutdown();
                 self.task.await.context("server task panicked")?
             }
         }
     }
 
-    async fn request_shutdown(&mut self) {
+    fn request_shutdown(&self) {
         self.shutdown.request(ServerShutdown {
             instance_id: self.descriptor.instance_id,
             reason: ShutdownReason::Manual,
@@ -77,6 +77,14 @@ struct ShutdownController {
 }
 
 impl ShutdownController {
+    fn lifecycle(&self) -> LifecycleState {
+        self.lifecycle.borrow().clone()
+    }
+
+    fn subscribe_to_intent(&self) -> watch::Receiver<Option<ServerShutdown>> {
+        self.shutdown_intent.subscribe()
+    }
+
     fn request(&self, request: ServerShutdown) {
         self.lifecycle.send_replace(LifecycleState::Stopping);
         self.shutdown_intent.send_replace(Some(request));
@@ -99,9 +107,7 @@ impl ShutdownController {
 #[derive(Clone)]
 struct AppState {
     descriptor: Arc<RuntimeDescriptor>,
-    lifecycle: watch::Sender<LifecycleState>,
     counter: watch::Sender<CounterState>,
-    shutdown_intent: watch::Sender<Option<ServerShutdown>>,
     shutdown: ShutdownController,
 }
 
@@ -153,9 +159,7 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
     };
     let state = AppState {
         descriptor: Arc::new(descriptor.clone()),
-        lifecycle: lifecycle.clone(),
         counter: counter.clone(),
-        shutdown_intent: shutdown_intent.clone(),
         shutdown: shutdown.clone(),
     };
     let app = Router::new()
@@ -202,12 +206,12 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if *state.lifecycle.borrow() != LifecycleState::Ready {
+    if state.shutdown.lifecycle() != LifecycleState::Ready {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
 
     let mut receiver = state.counter.subscribe();
-    let shutdown_receiver = state.shutdown_intent.subscribe();
+    let shutdown_receiver = state.shutdown.subscribe_to_intent();
     let current = *receiver.borrow_and_update();
     let snapshot = CounterSnapshot {
         instance_id: state.descriptor.instance_id,
@@ -298,7 +302,7 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
     Json(Health {
         instance_id: state.descriptor.instance_id,
         pid: state.descriptor.pid,
-        lifecycle: state.lifecycle.borrow().clone(),
+        lifecycle: state.shutdown.lifecycle(),
         protocol_version: state.descriptor.protocol_version,
         build_identity: state.descriptor.build_identity.clone(),
     })
