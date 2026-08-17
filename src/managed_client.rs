@@ -457,7 +457,15 @@ async fn ensure_server(
                     ));
                 }
                 LifecycleState::Ready if health.build_identity != BUILD_IDENTITY => {
-                    replace_server(config, &descriptor, &health, deadline).await?;
+                    spawned = None;
+                    shutdown_registered_instance(
+                        config,
+                        &descriptor,
+                        health.instance_id,
+                        ShutdownReason::Replacement,
+                        deadline,
+                    )
+                    .await?;
                     anyhow::anyhow!("registered Chidori server is being replaced")
                 }
                 LifecycleState::Ready => return Ok((descriptor, health)),
@@ -488,19 +496,24 @@ async fn ensure_server(
                 error
             }
         };
-        if let Some(process) = spawned.as_mut()
-            && let Some(status) = process
+        let spawned_exit = match spawned.as_mut() {
+            Some(process) => process
                 .try_wait()
-                .context("inspect detached server process")?
-            && !another_server_owns_channel(config)
-        {
-            return Err(startup_error(
-                config,
-                &format!(
-                    "detached Chidori server exited before becoming ready ({})",
-                    describe_exit(status)
-                ),
-            ));
+                .context("inspect detached server process")?,
+            None => None,
+        };
+        if let Some(status) = spawned_exit {
+            if another_server_owns_channel(config) {
+                spawned = None;
+            } else {
+                return Err(startup_error(
+                    config,
+                    &format!(
+                        "detached Chidori server exited before becoming ready ({})",
+                        describe_exit(status)
+                    ),
+                ));
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(startup_error(
@@ -510,22 +523,6 @@ async fn ensure_server(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-}
-
-async fn replace_server(
-    config: &ManagedClientConfig,
-    descriptor: &RuntimeDescriptor,
-    health: &Health,
-    deadline: tokio::time::Instant,
-) -> Result<()> {
-    shutdown_registered_instance(
-        config,
-        descriptor,
-        health.instance_id,
-        ShutdownReason::Replacement,
-        deadline,
-    )
-    .await
 }
 
 fn channel_lock_is_released(config: &ManagedClientConfig) -> Result<bool> {

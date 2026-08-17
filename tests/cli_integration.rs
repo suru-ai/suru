@@ -1,6 +1,6 @@
 use std::{
     convert::Infallible,
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -256,6 +256,69 @@ async fn simultaneous_replacement_launchers_converge_on_one_new_instance() {
     assert!(replacements.iter().all(|replacement| {
         replacement.instance_id == winner.instance_id && replacement.pid == winner.pid
     }));
+
+    stop_test_server(state_dir.path(), channel);
+}
+
+#[tokio::test]
+async fn launcher_retries_after_losing_election_to_a_mismatched_build() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "mixed-build-election-race-test";
+    let runtime_dir = state_dir.path().join(channel);
+    std::fs::create_dir_all(&runtime_dir).expect("create race runtime directory");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(runtime_dir.join("server.lock"))
+        .expect("open race election lock");
+    lock.try_lock_exclusive()
+        .expect("hold election while current child launches");
+    let config = ManagedClientConfig::new(state_dir.path(), channel)
+        .expect("configure current launcher")
+        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+    let launching = tokio::spawn({
+        let config = config.clone();
+        async move { start_server(&config).await }
+    });
+    let log_path = runtime_dir.join("server.log");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if std::fs::read_to_string(&log_path)
+                .is_ok_and(|log| log.contains("another server already owns this channel"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("current child loses the first election");
+
+    let mismatched = BuildReplacementFixture::spawn_with_lock(
+        state_dir.path(),
+        channel,
+        "chidori@other-racing-build",
+        PROTOCOL_VERSION,
+        lock,
+    )
+    .await;
+    let replacement = timeout(Duration::from_secs(3), launching)
+        .await
+        .expect("launcher completes after replacing election winner")
+        .expect("launcher task does not panic")
+        .expect("launcher retries its current build after the transition");
+
+    assert_ne!(replacement.instance_id, mismatched.descriptor().instance_id);
+    assert_eq!(replacement.build_identity, BUILD_IDENTITY);
+    assert_eq!(
+        mismatched
+            .shutdown_request()
+            .expect("mismatched election winner is replaced")
+            .reason,
+        ShutdownReason::Replacement
+    );
 
     stop_test_server(state_dir.path(), channel);
 }
@@ -1503,6 +1566,17 @@ impl BuildReplacementFixture {
             .expect("open old-build channel lock");
         lock.try_lock_exclusive()
             .expect("old-build fixture owns the channel");
+        Self::spawn_with_lock(state_dir, channel, build_identity, protocol_version, lock).await
+    }
+
+    async fn spawn_with_lock(
+        state_dir: &std::path::Path,
+        channel: &str,
+        build_identity: &str,
+        protocol_version: u32,
+        lock: File,
+    ) -> Self {
+        let runtime_dir = state_dir.join(channel);
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind old-build fixture");
