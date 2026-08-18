@@ -22,6 +22,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph},
 };
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     managed_client::{
@@ -29,10 +30,14 @@ use crate::{
         SessionSubscription,
     },
     protocol::{
-        ActivityKind, CreateSessionRequest, InitialPrompt, MessageRole, PromptId, ServerIdentity,
-        SessionSnapshot, ShutdownReason, Workspace,
+        ActivityKind, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, MessageRole,
+        PromptId, ServerIdentity, SessionId, SessionSnapshot, ShutdownReason, Workspace,
     },
 };
+
+mod composer;
+
+use composer::{ComposerKey, ComposerMemory};
 
 #[derive(Clone, Debug)]
 pub struct TuiState {
@@ -44,9 +49,23 @@ pub struct TuiState {
     manually_stopped: bool,
     fatal_error: Option<String>,
     workspace: PathBuf,
-    composer: String,
+    composers: ComposerMemory,
     submission_error: Option<String>,
     session: Option<SessionProjection>,
+    pending_submission: Option<PendingSubmission>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingSubmission {
+    source: ComposerKey,
+    target: SubmissionTarget,
+    prompt: InitialPrompt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubmissionTarget {
+    CreateSession,
+    AdmitPrompt(SessionId),
 }
 
 impl Default for TuiState {
@@ -65,9 +84,10 @@ impl TuiState {
             manually_stopped: false,
             fatal_error: None,
             workspace: workspace.as_ref().to_owned(),
-            composer: String::new(),
+            composers: ComposerMemory::default(),
             submission_error: None,
             session: None,
+            pending_submission: None,
         }
     }
 
@@ -98,7 +118,6 @@ impl TuiState {
                         .is_some_and(|identity| identity.instance_id != snapshot.instance_id);
                     if replaced_server {
                         self.session = None;
-                        self.composer.clear();
                         self.submission_error = None;
                     }
                     self.identity = self.pending_identity.take();
@@ -127,7 +146,6 @@ impl TuiState {
     fn apply_session(&mut self, event: SessionEvent) -> Result<()> {
         match event {
             SessionEvent::Snapshot(snapshot) => {
-                self.composer.clear();
                 self.submission_error = None;
                 self.session = Some(SessionProjection::new(snapshot));
             }
@@ -138,7 +156,74 @@ impl TuiState {
                 session.apply(update)?;
             }
         }
+        self.reconcile_pending_submission();
         Ok(())
+    }
+
+    fn composer_key(&self) -> ComposerKey {
+        self.session
+            .as_ref()
+            .map_or(ComposerKey::Landing, |session| {
+                ComposerKey::Session(session.snapshot().session.id)
+            })
+    }
+
+    fn reconcile_pending_submission(&mut self) {
+        let Some(pending) = self.pending_submission.as_ref() else {
+            return;
+        };
+        let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
+            return;
+        };
+        if !snapshot
+            .prompts
+            .iter()
+            .any(|prompt| prompt.id == pending.prompt.id)
+        {
+            return;
+        }
+        let pending = self
+            .pending_submission
+            .take()
+            .expect("pending submission was just observed");
+        self.composers.admission_reconciled(
+            pending.source,
+            ComposerKey::Session(snapshot.session.id),
+            &pending.prompt,
+        );
+        self.submission_error = None;
+    }
+
+    fn fail_pending_submission(&mut self, prompt_id: PromptId, error: String) {
+        let matches = self
+            .pending_submission
+            .as_ref()
+            .is_some_and(|pending| pending.prompt.id == prompt_id);
+        if !matches {
+            return;
+        }
+        let pending = self
+            .pending_submission
+            .take()
+            .expect("matching pending submission exists");
+        self.composers
+            .admission_failed(pending.source, &pending.prompt);
+        self.submission_error = Some(error);
+    }
+
+    fn provisional_prompt(&self, session_id: SessionId) -> Option<&InitialPrompt> {
+        let pending = self.pending_submission.as_ref()?;
+        if pending.target != SubmissionTarget::AdmitPrompt(session_id) {
+            return None;
+        }
+        let authoritative = self.session.as_ref().is_some_and(|session| {
+            session
+                .snapshot()
+                .prompts
+                .iter()
+                .any(|prompt| prompt.id == pending.prompt.id)
+        });
+        (!authoritative).then_some(&pending.prompt)
     }
 }
 
@@ -152,14 +237,22 @@ pub enum ApplicationEvent {
     Command(CommandId),
     Managed(ManagedEvent),
     Session(SessionEvent),
-    SessionCreationFailed(String),
+    PromptAdmissionSucceeded(PromptId),
+    PromptAdmissionFailed { prompt_id: PromptId, error: String },
+    SessionSubscriptionFailed(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandId {
-    Quit,
-    SubmitPrompt,
+    ClearOrExit,
+    SubmitSteer,
+    InsertNewline,
     DeleteBackward,
+    DeleteForward,
+    MoveCursorLeft,
+    MoveCursorRight,
+    HistoryPrevious,
+    HistoryNext,
     InsertText(String),
 }
 
@@ -168,6 +261,10 @@ pub enum ApplicationTransition {
     Continue,
     Exit,
     CreateSession(CreateSessionRequest),
+    AdmitPrompt {
+        session_id: SessionId,
+        request: AdmitPromptRequest,
+    },
 }
 
 impl Application {
@@ -179,38 +276,94 @@ impl Application {
 
     pub fn handle_event(&mut self, event: ApplicationEvent) -> Result<ApplicationTransition> {
         match event {
-            ApplicationEvent::Command(CommandId::Quit) => Ok(ApplicationTransition::Exit),
-            ApplicationEvent::Command(CommandId::InsertText(text)) => {
-                if self.state.session.is_none() {
-                    self.state.composer.push_str(&text);
-                    self.state.submission_error = None;
+            ApplicationEvent::Command(CommandId::ClearOrExit) => {
+                let key = self.state.composer_key();
+                if self.state.composers.is_empty(key) {
+                    return Ok(ApplicationTransition::Exit);
                 }
+                self.state.composers.clear(key);
+                self.state.submission_error = None;
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::InsertText(text)) => {
+                let key = self.state.composer_key();
+                self.state.composers.insert(key, &text);
+                self.state.submission_error = None;
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::InsertNewline) => {
+                let key = self.state.composer_key();
+                self.state.composers.insert(key, "\n");
+                self.state.submission_error = None;
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::DeleteBackward) => {
-                if self.state.session.is_none() {
-                    self.state.composer.pop();
-                    self.state.submission_error = None;
-                }
+                let key = self.state.composer_key();
+                self.state.composers.delete_backward(key);
+                self.state.submission_error = None;
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::Command(CommandId::SubmitPrompt) => {
-                if self.state.session.is_some() {
+            ApplicationEvent::Command(CommandId::DeleteForward) => {
+                let key = self.state.composer_key();
+                self.state.composers.delete_forward(key);
+                self.state.submission_error = None;
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::MoveCursorLeft) => {
+                let key = self.state.composer_key();
+                self.state.composers.move_left(key);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::MoveCursorRight) => {
+                let key = self.state.composer_key();
+                self.state.composers.move_right(key);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::HistoryPrevious) => {
+                let key = self.state.composer_key();
+                self.state.composers.history_previous(key);
+                self.state.submission_error = None;
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::HistoryNext) => {
+                let key = self.state.composer_key();
+                self.state.composers.history_next(key);
+                self.state.submission_error = None;
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::SubmitSteer) => {
+                if self.state.pending_submission.is_some() {
                     return Ok(ApplicationTransition::Continue);
                 }
-                if self.state.composer.trim().is_empty() {
+                let key = self.state.composer_key();
+                if self.state.composers.text(key).trim().is_empty() {
                     self.state.submission_error =
                         Some("Prompt must contain non-whitespace text".to_owned());
                     return Ok(ApplicationTransition::Continue);
                 }
+                let prompt = self.state.composers.begin_submission(key);
+                self.state.submission_error = None;
+                if let ComposerKey::Session(session_id) = key {
+                    self.state.pending_submission = Some(PendingSubmission {
+                        source: key,
+                        target: SubmissionTarget::AdmitPrompt(session_id),
+                        prompt: prompt.clone(),
+                    });
+                    return Ok(ApplicationTransition::AdmitPrompt {
+                        session_id,
+                        request: AdmitPromptRequest { prompt },
+                    });
+                }
+                self.state.pending_submission = Some(PendingSubmission {
+                    source: key,
+                    target: SubmissionTarget::CreateSession,
+                    prompt: prompt.clone(),
+                });
                 Ok(ApplicationTransition::CreateSession(CreateSessionRequest {
                     workspace: Workspace {
                         path: self.state.workspace.clone(),
                     },
-                    prompt: InitialPrompt {
-                        id: PromptId::new(),
-                        text: self.state.composer.clone(),
-                    },
+                    prompt,
                 }))
             }
             ApplicationEvent::Managed(ManagedEvent::Fatal(error)) => Err(anyhow!(error)),
@@ -226,7 +379,15 @@ impl Application {
                 self.state.apply_session(event)?;
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::SessionCreationFailed(error) => {
+            ApplicationEvent::PromptAdmissionSucceeded(_prompt_id) => {
+                self.state.reconcile_pending_submission();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::PromptAdmissionFailed { prompt_id, error } => {
+                self.state.fail_pending_submission(prompt_id, error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SessionSubscriptionFailed(error) => {
                 self.state.submission_error = Some(error);
                 Ok(ApplicationTransition::Continue)
             }
@@ -241,16 +402,9 @@ impl Application {
 pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
     match event {
         InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,
-        InputEvent::Key(key) if is_quit(key) => Some(CommandId::Quit),
-        InputEvent::Key(key)
-            if key.code == KeyCode::Enter
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
-        {
-            Some(CommandId::SubmitPrompt)
+        InputEvent::Key(key) if binding_for(key).is_some() => {
+            binding_for(key).map(|binding| binding.command.into_command())
         }
-        InputEvent::Key(key) if key.code == KeyCode::Backspace => Some(CommandId::DeleteBackward),
         InputEvent::Key(key)
             if !key
                 .modifiers
@@ -266,6 +420,125 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundCommand {
+    ClearOrExit,
+    SubmitSteer,
+    InsertNewline,
+    DeleteBackward,
+    DeleteForward,
+    MoveCursorLeft,
+    MoveCursorRight,
+    HistoryPrevious,
+    HistoryNext,
+}
+
+impl BoundCommand {
+    fn into_command(self) -> CommandId {
+        match self {
+            Self::ClearOrExit => CommandId::ClearOrExit,
+            Self::SubmitSteer => CommandId::SubmitSteer,
+            Self::InsertNewline => CommandId::InsertNewline,
+            Self::DeleteBackward => CommandId::DeleteBackward,
+            Self::DeleteForward => CommandId::DeleteForward,
+            Self::MoveCursorLeft => CommandId::MoveCursorLeft,
+            Self::MoveCursorRight => CommandId::MoveCursorRight,
+            Self::HistoryPrevious => CommandId::HistoryPrevious,
+            Self::HistoryNext => CommandId::HistoryNext,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CommandBinding {
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    command: BoundCommand,
+    label: &'static str,
+}
+
+const COMMAND_BINDINGS: &[CommandBinding] = &[
+    CommandBinding {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        command: BoundCommand::SubmitSteer,
+        label: "Enter",
+    },
+    CommandBinding {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::SHIFT,
+        command: BoundCommand::InsertNewline,
+        label: "Shift+Enter",
+    },
+    CommandBinding {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::CONTROL,
+        command: BoundCommand::InsertNewline,
+        label: "Ctrl+Enter",
+    },
+    CommandBinding {
+        code: KeyCode::Char('j'),
+        modifiers: KeyModifiers::CONTROL,
+        command: BoundCommand::InsertNewline,
+        label: "Ctrl+J",
+    },
+    CommandBinding {
+        code: KeyCode::Char('c'),
+        modifiers: KeyModifiers::CONTROL,
+        command: BoundCommand::ClearOrExit,
+        label: "Ctrl+C",
+    },
+    CommandBinding {
+        code: KeyCode::Backspace,
+        modifiers: KeyModifiers::NONE,
+        command: BoundCommand::DeleteBackward,
+        label: "Backspace",
+    },
+    CommandBinding {
+        code: KeyCode::Delete,
+        modifiers: KeyModifiers::NONE,
+        command: BoundCommand::DeleteForward,
+        label: "Delete",
+    },
+    CommandBinding {
+        code: KeyCode::Left,
+        modifiers: KeyModifiers::NONE,
+        command: BoundCommand::MoveCursorLeft,
+        label: "Left",
+    },
+    CommandBinding {
+        code: KeyCode::Right,
+        modifiers: KeyModifiers::NONE,
+        command: BoundCommand::MoveCursorRight,
+        label: "Right",
+    },
+    CommandBinding {
+        code: KeyCode::Up,
+        modifiers: KeyModifiers::NONE,
+        command: BoundCommand::HistoryPrevious,
+        label: "Up",
+    },
+    CommandBinding {
+        code: KeyCode::Down,
+        modifiers: KeyModifiers::NONE,
+        command: BoundCommand::HistoryNext,
+        label: "Down",
+    },
+];
+
+fn binding_for(key: KeyEvent) -> Option<&'static CommandBinding> {
+    COMMAND_BINDINGS
+        .iter()
+        .find(|binding| binding.code == key.code && binding.modifiers == key.modifiers)
+}
+
+fn binding_label(command: BoundCommand) -> &'static str {
+    COMMAND_BINDINGS
+        .iter()
+        .find(|binding| binding.command == command)
+        .map_or("", |binding| binding.label)
+}
+
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     if let Some(session) = &state.session {
         render_session(frame, state, session.snapshot());
@@ -277,12 +550,18 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
 fn render_landing(frame: &mut Frame<'_>, state: &TuiState) {
     let [main, status_area] =
         Layout::vertical([Constraint::Min(7), Constraint::Length(1)]).areas(frame.area());
-    let panel = centered_rect(main, 72, 8);
+    let key = ComposerKey::Landing;
+    let composer_height = composer_block_height(
+        frame.area().height,
+        72_u16.min(frame.area().width),
+        state.composers.text(key),
+    );
+    let panel = centered_rect(main, 72, composer_height.saturating_add(3));
     let [brand_area, question_area, error_area, composer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(3),
+        Constraint::Length(composer_height),
     ])
     .areas(panel);
     frame.render_widget(
@@ -307,31 +586,27 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState) {
             error_area,
         );
     }
-    let content = if state.composer.is_empty() {
-        Span::styled(
-            "Type a Prompt and press Enter",
-            Style::default().fg(Color::DarkGray),
-        )
-    } else {
-        Span::raw(state.composer.clone())
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(content)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Prompt ")
-                .border_style(Style::default().fg(Color::Cyan)),
-        ),
+    render_composer(
+        frame,
         composer_area,
+        state.composers.text(key),
+        state.composers.cursor(key),
     );
 
     render_status(frame, state, status_area);
 }
 
 fn render_session(frame: &mut Frame<'_>, state: &TuiState, snapshot: &SessionSnapshot) {
-    let [header_area, transcript_area, status_area] = Layout::vertical([
+    let key = ComposerKey::Session(snapshot.session.id);
+    let composer_height = composer_block_height(
+        frame.area().height,
+        frame.area().width,
+        state.composers.text(key),
+    );
+    let [header_area, transcript_area, composer_area, status_area] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
+        Constraint::Length(composer_height),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -387,11 +662,85 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, snapshot: &SessionSna
         }
         lines.push(Line::default());
     }
+    if let Some(provisional) = state.provisional_prompt(snapshot.session.id) {
+        push_prefixed_lines(
+            &mut lines,
+            "┃ ",
+            &provisional.text,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+        lines.push(Line::default());
+    }
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::TOP)),
         transcript_area,
     );
+    render_composer(
+        frame,
+        composer_area,
+        state.composers.text(key),
+        state.composers.cursor(key),
+    );
     render_status(frame, state, status_area);
+}
+
+fn render_composer(frame: &mut Frame<'_>, area: Rect, text: &str, cursor: usize) {
+    let submit = binding_label(BoundCommand::SubmitSteer);
+    let newline = binding_label(BoundCommand::InsertNewline);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Prompt · {submit} submit · {newline} newline "))
+        .border_style(Style::default().fg(Color::Cyan));
+    let content_width = area.width.saturating_sub(2).max(1);
+    let content_height = area.height.saturating_sub(2).max(1);
+    let cursor_row = visual_cursor_row(text, cursor, content_width);
+    let scroll = cursor_row.saturating_sub(content_height.saturating_sub(1));
+    let paragraph = if text.is_empty() {
+        Paragraph::new(Span::styled(
+            "Type a Prompt and press Enter",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Paragraph::new(text.to_owned())
+    };
+    frame.render_widget(paragraph.block(block).scroll((scroll, 0)), area);
+}
+
+fn composer_block_height(terminal_height: u16, width: u16, text: &str) -> u16 {
+    let content_width = width.saturating_sub(2).max(1);
+    let desired = visual_row_count(text, content_width).max(1);
+    let cap = (terminal_height / 3).max(1);
+    desired.min(cap).saturating_add(2)
+}
+
+fn visual_row_count(text: &str, width: u16) -> u16 {
+    text.split('\n')
+        .map(|line| wrapped_line_rows(line, width))
+        .fold(0_u16, u16::saturating_add)
+}
+
+fn wrapped_line_rows(line: &str, width: u16) -> u16 {
+    let cells = line.chars().fold(0_u16, |total, character| {
+        total.saturating_add(UnicodeWidthChar::width(character).unwrap_or(0) as u16)
+    });
+    cells.max(1).saturating_add(width - 1) / width
+}
+
+fn visual_cursor_row(text: &str, cursor: usize, width: u16) -> u16 {
+    let prefix = &text[..cursor];
+    let mut lines = prefix.split('\n');
+    let Some(last) = lines.next_back() else {
+        return 0;
+    };
+    let previous_rows = lines
+        .map(|line| wrapped_line_rows(line, width))
+        .fold(0_u16, u16::saturating_add);
+    let last_cells = last.chars().fold(0_u16, |total, character| {
+        total.saturating_add(UnicodeWidthChar::width(character).unwrap_or(0) as u16)
+    });
+    previous_rows.saturating_add(last_cells / width)
 }
 
 fn render_status(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
@@ -427,6 +776,7 @@ async fn run_loop(
     let mut application = Application::new(workspace);
     let mut input = EventStream::new();
     let mut session_subscription: Option<SessionSubscription> = None;
+    let (submission_tx, mut submission_rx) = tokio::sync::mpsc::unbounded_channel();
 
     loop {
         terminal.draw(|frame| application.render(frame))?;
@@ -453,6 +803,38 @@ async fn run_loop(
                     None => session_subscription = None,
                 }
             }
+            submission = submission_rx.recv() => {
+                let Some(submission) = submission else {
+                    return Err(anyhow!("Prompt admission task channel stopped unexpectedly"));
+                };
+                match submission {
+                    SubmissionResult::SessionCreated(created) => {
+                        let session_id = created.session.id;
+                        application.handle_event(ApplicationEvent::Session(
+                            SessionEvent::Snapshot(created),
+                        ))?;
+                        match client.subscribe_session(session_id).await {
+                            Ok(subscription) => session_subscription = Some(subscription),
+                            Err(error) => {
+                                application.handle_event(
+                                    ApplicationEvent::SessionSubscriptionFailed(error.to_string()),
+                                )?;
+                            }
+                        }
+                    }
+                    SubmissionResult::PromptAdmitted(prompt_id) => {
+                        application.handle_event(
+                            ApplicationEvent::PromptAdmissionSucceeded(prompt_id),
+                        )?;
+                    }
+                    SubmissionResult::Failed { prompt_id, error } => {
+                        application.handle_event(ApplicationEvent::PromptAdmissionFailed {
+                            prompt_id,
+                            error,
+                        })?;
+                    }
+                }
+            }
             input_event = input.next() => {
                 match input_event {
                     Some(Ok(event)) => {
@@ -463,33 +845,34 @@ async fn run_loop(
                                 ApplicationTransition::Continue => {}
                                 ApplicationTransition::Exit => return Ok(()),
                                 ApplicationTransition::CreateSession(request) => {
-                                    match client.create_session(request).await {
-                                        Ok(created) => {
-                                            let session_id = created.session.id;
-                                            application.handle_event(ApplicationEvent::Session(
-                                                SessionEvent::Snapshot(created),
-                                            ))?;
-                                            match client.subscribe_session(session_id).await {
-                                                Ok(subscription) => {
-                                                    session_subscription = Some(subscription);
-                                                }
-                                                Err(error) => {
-                                                    application.handle_event(
-                                                        ApplicationEvent::SessionCreationFailed(
-                                                            error.to_string(),
-                                                        ),
-                                                    )?;
-                                                }
-                                            }
-                                        }
-                                        Err(error) => {
-                                            application.handle_event(
-                                                ApplicationEvent::SessionCreationFailed(
-                                                    error.to_string(),
-                                                ),
-                                            )?;
-                                        }
-                                    }
+                                    let prompt_id = request.prompt.id;
+                                    let commands = client.session_commands();
+                                    let results = submission_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = match commands.create_session(request).await {
+                                            Ok(created) => SubmissionResult::SessionCreated(created),
+                                            Err(error) => SubmissionResult::Failed {
+                                                prompt_id,
+                                                error: error.to_string(),
+                                            },
+                                        };
+                                        let _ = results.send(result);
+                                    });
+                                }
+                                ApplicationTransition::AdmitPrompt { session_id, request } => {
+                                    let prompt_id = request.prompt.id;
+                                    let commands = client.session_commands();
+                                    let results = submission_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = match commands.admit_prompt(session_id, request).await {
+                                            Ok(prompt) => SubmissionResult::PromptAdmitted(prompt.id),
+                                            Err(error) => SubmissionResult::Failed {
+                                                prompt_id,
+                                                error: error.to_string(),
+                                            },
+                                        };
+                                        let _ = results.send(result);
+                                    });
                                 }
                             }
                         }
@@ -502,6 +885,12 @@ async fn run_loop(
     }
 }
 
+enum SubmissionResult {
+    SessionCreated(SessionSnapshot),
+    PromptAdmitted(PromptId),
+    Failed { prompt_id: PromptId, error: String },
+}
+
 async fn next_session_event(
     subscription: &mut Option<SessionSubscription>,
 ) -> Option<std::result::Result<SessionEvent, String>> {
@@ -509,13 +898,6 @@ async fn next_session_event(
         Some(subscription) => subscription.next().await,
         None => pending().await,
     }
-}
-
-fn is_quit(key: KeyEvent) -> bool {
-    if key.kind != KeyEventKind::Press {
-        return false;
-    }
-    matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {

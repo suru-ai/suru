@@ -3,7 +3,10 @@ use chidori::{
         ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus, SessionEvent,
     },
     protocol::{
-        CounterSnapshot, Health, LifecycleState, ServerIdentity, ServerShutdown, ShutdownReason,
+        Activity, ActivityId, ActivityKind, CounterSnapshot, Health, LifecycleState, Message,
+        MessageId, MessageRole, Prompt, PromptId, PromptStatus, ServerIdentity, ServerShutdown,
+        Session, SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
+        SessionUpdate, ShutdownReason, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{self, ServerConfig},
     tui::{
@@ -17,7 +20,12 @@ use std::time::Duration;
 use uuid::Uuid;
 
 fn rendered_rows(render: impl FnOnce(&mut Frame<'_>)) -> Vec<String> {
-    let mut terminal = Terminal::new(TestBackend::new(80, 15)).expect("create test terminal");
+    rendered_rows_at(80, 15, render)
+}
+
+fn rendered_rows_at(width: u16, height: u16, render: impl FnOnce(&mut Frame<'_>)) -> Vec<String> {
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("create test terminal");
     terminal
         .draw(render)
         .expect("render headless TUI application");
@@ -35,6 +43,10 @@ fn rendered_state_rows(state: &TuiState) -> Vec<String> {
 
 fn rendered_application_rows(application: &Application) -> Vec<String> {
     rendered_rows(|frame| application.render(frame))
+}
+
+fn rendered_application_rows_at(application: &Application, width: u16, height: u16) -> Vec<String> {
+    rendered_rows_at(width, height, |frame| application.render(frame))
 }
 
 fn ready_health(instance_id: Uuid, pid: u32) -> Health {
@@ -107,10 +119,14 @@ fn headless_application_handles_terminal_and_managed_events_through_the_producti
         KeyModifiers::CONTROL,
     )))
     .expect("map Ctrl+C to a semantic command");
-    assert_eq!(quit, CommandId::Quit);
-    let terminal_transition = application
+    assert_eq!(quit, CommandId::ClearOrExit);
+    let clear_transition = application
         .handle_event(ApplicationEvent::Command(quit))
         .expect("handle terminal command");
+    assert_eq!(clear_transition, ApplicationTransition::Continue);
+    let terminal_transition = application
+        .handle_event(ApplicationEvent::Command(CommandId::ClearOrExit))
+        .expect("handle terminal command after clearing the composer");
     assert_eq!(terminal_transition, ApplicationTransition::Exit);
 }
 
@@ -339,4 +355,519 @@ fn fatal_protocol_error_is_rendered_visibly_with_the_last_known_state() {
     assert!(screen.contains("What would you like to work on?"));
     assert!(screen.contains("Connection failed"));
     assert!(screen.contains("unknown event type 'future_event'"));
+}
+
+#[test]
+fn semantic_bindings_preserve_multiline_unicode_input_and_clear_before_exit() {
+    let mut application = Application::default();
+    let paste = command_for_terminal_event(InputEvent::Paste("a🙂β".to_owned()))
+        .expect("map bracketed paste to editor input");
+    application
+        .handle_event(ApplicationEvent::Command(paste))
+        .expect("paste Unicode text");
+    application
+        .handle_event(ApplicationEvent::Command(
+            command_for_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE,
+            )))
+            .expect("map left cursor movement"),
+        ))
+        .expect("move over one Unicode character");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::DeleteBackward))
+        .expect("delete the preceding Unicode character");
+
+    for event in [
+        InputEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+        InputEvent::Paste("x\ny".to_owned()),
+    ] {
+        application
+            .handle_event(ApplicationEvent::Command(
+                command_for_terminal_event(event).expect("map multiline editor input"),
+            ))
+            .expect("edit multiline Prompt");
+    }
+    let screen = rendered_application_rows(&application).join("\n");
+    assert!(screen.contains("a"));
+    assert!(screen.contains("x"));
+    assert!(screen.contains("yβ"));
+    assert!(!screen.contains('🙂'));
+    assert!(screen.contains("Enter submit"));
+    assert!(screen.contains("Shift+Enter newline"));
+
+    assert_eq!(
+        command_for_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))),
+        Some(CommandId::SubmitSteer)
+    );
+    assert_eq!(
+        command_for_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+        ))),
+        Some(CommandId::InsertNewline)
+    );
+    assert_eq!(
+        command_for_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL,
+        ))),
+        Some(CommandId::InsertNewline)
+    );
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::ClearOrExit))
+            .expect("clear non-empty composer"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Type a Prompt")
+    );
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::ClearOrExit))
+            .expect("exit with an empty composer"),
+        ApplicationTransition::Exit
+    );
+}
+
+#[test]
+fn composer_grows_to_one_third_of_the_terminal_then_scrolls_internally() {
+    let mut one_line = Application::default();
+    one_line
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "one line".to_owned(),
+        )))
+        .expect("type short Prompt");
+    let one_line_rows = rendered_application_rows_at(&one_line, 80, 30);
+    assert_eq!(prompt_block_height(&one_line_rows), 3);
+
+    let mut four_lines = Application::default();
+    four_lines
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "one\ntwo\nthree\nfour".to_owned(),
+        )))
+        .expect("type multiline Prompt");
+    let four_line_rows = rendered_application_rows_at(&four_lines, 80, 30);
+    assert_eq!(prompt_block_height(&four_line_rows), 6);
+
+    let mut long = Application::default();
+    long.handle_event(ApplicationEvent::Command(CommandId::InsertText(
+        (1..=20)
+            .map(|line| format!("line{line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )))
+    .expect("type long Prompt");
+    let long_rows = rendered_application_rows_at(&long, 80, 30);
+    let long_screen = long_rows.join("\n");
+    assert_eq!(prompt_block_height(&long_rows), 12);
+    assert!(long_screen.contains("line20"));
+    assert!(!long_screen.contains("line01"));
+}
+
+#[test]
+fn provisional_steer_is_immediate_single_and_reconciles_in_place() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (session_id, initial_snapshot) = enter_session(&mut application, workspace.path());
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Use the smaller interface".to_owned(),
+        )))
+        .expect("type steer");
+    let ApplicationTransition::AdmitPrompt {
+        session_id: admitted_to,
+        request,
+    } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit steer")
+    else {
+        panic!("a Session steer should request Prompt admission");
+    };
+    assert_eq!(admitted_to, session_id);
+    let prompt_id = request.prompt.id;
+    let provisional = rendered_application_rows(&application).join("\n");
+    assert_eq!(provisional.matches("Use the smaller interface").count(), 1);
+    assert!(provisional.contains("Type a Prompt"));
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("ignore overlapping submit key event"),
+        ApplicationTransition::Continue
+    );
+    application
+        .handle_event(ApplicationEvent::PromptAdmissionSucceeded(prompt_id))
+        .expect("handle Prompt admission acknowledgement");
+    assert_eq!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .matches("Use the smaller interface")
+            .count(),
+        1
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            delivered_update(
+                session_id,
+                SessionRevision(initial_snapshot.revision.0 + 1),
+                prompt_id,
+                &request.prompt.text,
+            ),
+        )))
+        .expect("apply authoritative Prompt delivery");
+    let reconciled = rendered_application_rows(&application).join("\n");
+    assert_eq!(reconciled.matches("Use the smaller interface").count(), 1);
+}
+
+#[test]
+fn text_entered_while_the_first_session_is_created_becomes_its_draft() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Initial Prompt".to_owned(),
+        )))
+        .expect("type initial Prompt");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit initial Prompt")
+    else {
+        panic!("landing submission should create a Session");
+    };
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "next Prompt".to_owned(),
+        )))
+        .expect("begin the next Prompt while creation is pending");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::MoveCursorLeft))
+        .expect("move the pending landing draft cursor");
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+            failed_session_snapshot(
+                SessionId::new(),
+                request.prompt.id,
+                &request.prompt.text,
+                workspace.path(),
+            ),
+        )))
+        .expect("enter created Session");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "!".to_owned(),
+        )))
+        .expect("edit the migrated Session draft at its preserved cursor");
+
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("next Promp!t")
+    );
+}
+
+#[test]
+fn failed_admission_restores_stable_prompt_and_saves_intervening_input_to_history() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    enter_session(&mut application, workspace.path());
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Do not lose this Prompt".to_owned(),
+        )))
+        .expect("type steer");
+    let ApplicationTransition::AdmitPrompt { request, .. } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit steer")
+    else {
+        panic!("a Session steer should request Prompt admission");
+    };
+    let prompt_id = request.prompt.id;
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "newer local text".to_owned(),
+        )))
+        .expect("type while admission is pending");
+    application
+        .handle_event(ApplicationEvent::PromptAdmissionFailed {
+            prompt_id,
+            error: "server unavailable".to_owned(),
+        })
+        .expect("roll back failed admission");
+    let restored = rendered_application_rows(&application).join("\n");
+    assert_eq!(restored.matches("Do not lose this Prompt").count(), 1);
+    assert!(!restored.contains("newer local text"));
+    assert!(!restored.contains("Use the smaller interface"));
+
+    let ApplicationTransition::AdmitPrompt {
+        request: exact_retry,
+        ..
+    } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("retry restored Prompt")
+    else {
+        panic!("restored Prompt should be retryable");
+    };
+    assert_eq!(exact_retry.prompt.id, prompt_id);
+    application
+        .handle_event(ApplicationEvent::PromptAdmissionFailed {
+            prompt_id,
+            error: "still unavailable".to_owned(),
+        })
+        .expect("restore the exact retry");
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::HistoryPrevious))
+        .expect("navigate to displaced local input");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("newer local text")
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::HistoryNext))
+        .expect("return to restored failed Prompt");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Do not lose this Prompt")
+    );
+}
+
+#[test]
+fn multiline_history_is_boundary_aware_and_session_drafts_keep_their_cursor() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (first_session, first_snapshot) = enter_session(&mut application, workspace.path());
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "top\nbottom".to_owned(),
+        )))
+        .expect("type multiline draft");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::HistoryPrevious))
+        .expect("move within multiline draft before navigating history");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("bottom")
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::HistoryPrevious))
+        .expect("navigate history at first-line boundary");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Initial Prompt")
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::HistoryNext))
+        .expect("restore multiline draft from history navigation");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("bottom")
+    );
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::ClearOrExit))
+        .expect("clear first Session draft");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "ac".to_owned(),
+        )))
+        .expect("type first Session draft");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::MoveCursorLeft))
+        .expect("place first Session cursor between characters");
+
+    let second_session = SessionId::new();
+    let second_snapshot = failed_session_snapshot(
+        second_session,
+        PromptId::new(),
+        "Second Session Prompt",
+        workspace.path(),
+    );
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+            second_snapshot,
+        )))
+        .expect("switch to second Session");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "second draft".to_owned(),
+        )))
+        .expect("type second Session draft");
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+            first_snapshot,
+        )))
+        .expect("switch back to first Session");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "b".to_owned(),
+        )))
+        .expect("insert at restored first Session cursor");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("abc")
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+            failed_session_snapshot(
+                second_session,
+                PromptId::new(),
+                "Second Session Prompt",
+                workspace.path(),
+            ),
+        )))
+        .expect("return to second Session");
+    let second_screen = rendered_application_rows(&application).join("\n");
+    assert!(second_screen.contains("second draft"));
+    assert!(!second_screen.contains("abc"));
+    assert_ne!(first_session, second_session);
+}
+
+fn prompt_block_height(rows: &[String]) -> usize {
+    let top = rows
+        .iter()
+        .position(|row| row.contains('┌') && row.contains("Prompt"))
+        .expect("Prompt block top border is rendered");
+    let bottom = rows
+        .iter()
+        .enumerate()
+        .skip(top + 1)
+        .find_map(|(index, row)| row.contains('└').then_some(index))
+        .expect("Prompt block bottom border is rendered");
+    bottom - top + 1
+}
+
+fn enter_session(
+    application: &mut Application,
+    workspace: &std::path::Path,
+) -> (SessionId, SessionSnapshot) {
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Initial Prompt".to_owned(),
+        )))
+        .expect("type initial Prompt");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit initial Prompt")
+    else {
+        panic!("landing submission should create a Session");
+    };
+    let session_id = SessionId::new();
+    let snapshot = failed_session_snapshot(
+        session_id,
+        request.prompt.id,
+        &request.prompt.text,
+        workspace,
+    );
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+            snapshot.clone(),
+        )))
+        .expect("enter created Session");
+    (session_id, snapshot)
+}
+
+fn failed_session_snapshot(
+    session_id: SessionId,
+    prompt_id: PromptId,
+    text: &str,
+    workspace: &std::path::Path,
+) -> SessionSnapshot {
+    let turn_id = TurnId::new();
+    SessionSnapshot {
+        session: Session {
+            id: session_id,
+            workspace: Workspace {
+                path: workspace.to_owned(),
+            },
+            agent: None,
+            status: SessionStatus::Idle,
+        },
+        revision: SessionRevision::INITIAL,
+        prompts: vec![Prompt {
+            id: prompt_id,
+            text: text.to_owned(),
+            status: PromptStatus::Delivered,
+        }],
+        turns: vec![Turn {
+            id: turn_id,
+            prompt_id,
+            status: TurnStatus::Failed,
+        }],
+        messages: vec![Message {
+            id: MessageId::new(),
+            turn_id,
+            role: MessageRole::User,
+            content: text.to_owned(),
+        }],
+        activities: vec![Activity {
+            id: ActivityId::new(),
+            turn_id,
+            kind: ActivityKind::Error,
+            text: "No Agent is selected".to_owned(),
+        }],
+    }
+}
+
+fn delivered_update(
+    session_id: SessionId,
+    revision: SessionRevision,
+    prompt_id: PromptId,
+    text: &str,
+) -> SessionUpdate {
+    let turn_id = TurnId::new();
+    SessionUpdate {
+        session_id,
+        revision,
+        changes: vec![
+            SessionChange::PromptAdded {
+                prompt: Prompt {
+                    id: prompt_id,
+                    text: text.to_owned(),
+                    status: PromptStatus::Delivered,
+                },
+            },
+            SessionChange::TurnAdded {
+                turn: Turn {
+                    id: turn_id,
+                    prompt_id,
+                    status: TurnStatus::Failed,
+                },
+            },
+            SessionChange::MessageAdded {
+                message: Message {
+                    id: MessageId::new(),
+                    turn_id,
+                    role: MessageRole::User,
+                    content: text.to_owned(),
+                },
+            },
+            SessionChange::ActivityAdded {
+                activity: Activity {
+                    id: ActivityId::new(),
+                    turn_id,
+                    kind: ActivityKind::Error,
+                    text: "No Agent is selected".to_owned(),
+                },
+            },
+        ],
+    }
 }

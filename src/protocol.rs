@@ -229,6 +229,12 @@ pub struct CreateSessionRequest {
     pub prompt: InitialPrompt,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmitPromptRequest {
+    pub prompt: InitialPrompt,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionErrorCode {
@@ -236,6 +242,7 @@ pub enum SessionErrorCode {
     EmptyPrompt,
     InvalidWorkspace,
     SessionNotFound,
+    PromptConflict,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

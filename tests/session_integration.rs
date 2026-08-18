@@ -11,12 +11,12 @@ use chidori::{
     build_identity,
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
-        Activity, ActivityId, ActivityKind, CounterSnapshot, CreateSessionRequest, InitialPrompt,
-        LifecycleState, Message, MessageId, MessageRole, PROTOCOL_VERSION, Prompt, PromptId,
-        PromptStatus, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
-        SNAPSHOT_EVENT, ServerIdentity, Session, SessionError, SessionErrorCode, SessionId,
-        SessionRevision, SessionSnapshot, SessionStatus, SessionUpdate, Turn, TurnId, TurnStatus,
-        Workspace,
+        Activity, ActivityId, ActivityKind, AdmitPromptRequest, CounterSnapshot,
+        CreateSessionRequest, InitialPrompt, LifecycleState, Message, MessageId, MessageRole,
+        PROTOCOL_VERSION, Prompt, PromptId, PromptStatus, RuntimeDescriptor,
+        SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SNAPSHOT_EVENT, ServerIdentity, Session,
+        SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
+        SessionStatus, SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{self, ServerConfig},
 };
@@ -85,6 +85,249 @@ async fn authenticated_first_prompt_atomically_creates_a_failed_session_turn() {
         "an unavailable Agent must not be represented by a synthetic Agent Message"
     );
 
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid workspace");
+    let other_workspace = tempfile::tempdir().expect("create second workspace");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "session-create-idempotency-test")
+            .expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let client = reqwest::Client::new();
+    let prompt_id = PromptId::new();
+    let request = CreateSessionRequest {
+        workspace: Workspace {
+            path: workspace.path().to_owned(),
+        },
+        prompt: InitialPrompt {
+            id: prompt_id,
+            text: "Explain this workspace".to_owned(),
+        },
+    };
+
+    let first = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&request)
+        .send()
+        .await
+        .expect("create Session");
+    assert_eq!(first.status(), reqwest::StatusCode::CREATED);
+    let first = first
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+
+    let exact_retry = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&request)
+        .send()
+        .await
+        .expect("retry Session creation");
+    assert_eq!(exact_retry.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        exact_retry
+            .json::<SessionSnapshot>()
+            .await
+            .expect("decode retried Session"),
+        first
+    );
+
+    for conflicting in [
+        CreateSessionRequest {
+            workspace: request.workspace.clone(),
+            prompt: InitialPrompt {
+                id: prompt_id,
+                text: "Different content".to_owned(),
+            },
+        },
+        CreateSessionRequest {
+            workspace: Workspace {
+                path: other_workspace.path().to_owned(),
+            },
+            prompt: request.prompt.clone(),
+        },
+    ] {
+        let response = client
+            .post(format!("{}/v1/sessions", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .json(&conflicting)
+            .send()
+            .await
+            .expect("reuse Prompt identity with conflicting creation metadata");
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+        assert_eq!(
+            response
+                .json::<SessionError>()
+                .await
+                .expect("decode Prompt conflict")
+                .code,
+            SessionErrorCode::PromptConflict
+        );
+    }
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid workspace");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "prompt-admission-idempotency-test")
+            .expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Initial Prompt".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode Session");
+    let response = client
+        .get(format!(
+            "{}/v1/sessions/{}/events",
+            descriptor.base_url, created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("open Session stream")
+        .error_for_status()
+        .expect("Session stream authenticates");
+    let mut events = response.bytes_stream().eventsource();
+    timeout(Duration::from_secs(1), events.next())
+        .await
+        .expect("Session snapshot arrives")
+        .expect("Session stream remains open")
+        .expect("decode Session snapshot event");
+
+    let prompt_id = PromptId::new();
+    let command = AdmitPromptRequest {
+        prompt: InitialPrompt {
+            id: prompt_id,
+            text: "Use the smaller interface".to_owned(),
+        },
+    };
+    let admitted = client
+        .post(format!(
+            "{}/v1/sessions/{}/prompts",
+            descriptor.base_url, created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&command)
+        .send()
+        .await
+        .expect("admit steer");
+    assert_eq!(admitted.status(), reqwest::StatusCode::CREATED);
+    let admitted = admitted
+        .json::<Prompt>()
+        .await
+        .expect("decode admitted Prompt");
+    assert_eq!(admitted.id, prompt_id);
+    assert_eq!(admitted.status, PromptStatus::Delivered);
+
+    let update_event = timeout(Duration::from_secs(1), events.next())
+        .await
+        .expect("Session update arrives")
+        .expect("Session stream remains open")
+        .expect("decode Session update event");
+    assert_eq!(update_event.event, SESSION_UPDATED_EVENT);
+    let update = serde_json::from_str::<SessionUpdate>(&update_event.data)
+        .expect("decode streamed Session update");
+    assert_eq!(update.revision, SessionRevision(2));
+    assert!(update.changes.iter().any(
+        |change| matches!(change, SessionChange::PromptAdded { prompt } if prompt.id == prompt_id)
+    ));
+    let turn_id = update
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            SessionChange::TurnAdded { turn } if turn.prompt_id == prompt_id => Some(turn.id),
+            _ => None,
+        })
+        .expect("delivered steer creates a Turn");
+    assert!(update.changes.iter().any(|change| {
+        matches!(change, SessionChange::MessageAdded { message }
+            if message.turn_id == turn_id && message.content == command.prompt.text)
+    }));
+
+    let exact_retry = client
+        .post(format!(
+            "{}/v1/sessions/{}/prompts",
+            descriptor.base_url, created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&command)
+        .send()
+        .await
+        .expect("retry steer admission");
+    assert_eq!(exact_retry.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        exact_retry
+            .json::<Prompt>()
+            .await
+            .expect("decode retried Prompt"),
+        admitted
+    );
+    assert!(
+        timeout(Duration::from_millis(100), events.next())
+            .await
+            .is_err(),
+        "an exact retry must not emit a duplicate Session update"
+    );
+
+    let conflicting = client
+        .post(format!(
+            "{}/v1/sessions/{}/prompts",
+            descriptor.base_url, created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&AdmitPromptRequest {
+            prompt: InitialPrompt {
+                id: prompt_id,
+                text: "Conflicting content".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("reuse Prompt identity with conflicting content");
+    assert_eq!(conflicting.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        conflicting
+            .json::<SessionError>()
+            .await
+            .expect("decode Prompt conflict")
+            .code,
+        SessionErrorCode::PromptConflict
+    );
+
+    drop(events);
     server.shutdown().await.expect("shut down server");
 }
 

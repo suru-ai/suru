@@ -14,9 +14,9 @@ use tokio::{
 use crate::{
     RuntimeConfig,
     protocol::{
-        CounterSnapshot, CounterUpdate, CreateSessionRequest, Health, LifecycleState,
-        RuntimeDescriptor, ServerShutdown, SessionError, SessionId, SessionSnapshot,
-        ShutdownReason,
+        AdmitPromptRequest, CounterSnapshot, CounterUpdate, CreateSessionRequest, Health,
+        LifecycleState, Prompt, RuntimeDescriptor, ServerShutdown, SessionError, SessionId,
+        SessionSnapshot, ShutdownReason,
     },
 };
 
@@ -98,6 +98,12 @@ pub struct ManagedClient {
     task: JoinHandle<()>,
 }
 
+#[derive(Clone)]
+pub(crate) struct SessionCommandClient {
+    http: reqwest::Client,
+    descriptor: watch::Receiver<RuntimeDescriptor>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServerStatus {
     Missing,
@@ -154,6 +160,36 @@ impl ManagedClient {
     }
 
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionSnapshot> {
+        self.session_commands().create_session(request).await
+    }
+
+    pub async fn admit_prompt(
+        &self,
+        session_id: SessionId,
+        request: AdmitPromptRequest,
+    ) -> Result<Prompt> {
+        self.session_commands()
+            .admit_prompt(session_id, request)
+            .await
+    }
+
+    pub async fn subscribe_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
+        self.session_commands().subscribe_session(session_id).await
+    }
+
+    pub(crate) fn session_commands(&self) -> SessionCommandClient {
+        SessionCommandClient {
+            http: self.http.clone(),
+            descriptor: self.descriptor.clone(),
+        }
+    }
+}
+
+impl SessionCommandClient {
+    pub(crate) async fn create_session(
+        &self,
+        request: CreateSessionRequest,
+    ) -> Result<SessionSnapshot> {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
@@ -177,7 +213,38 @@ impl ManagedClient {
         }
     }
 
-    pub async fn subscribe_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
+    pub(crate) async fn admit_prompt(
+        &self,
+        session_id: SessionId,
+        request: AdmitPromptRequest,
+    ) -> Result<Prompt> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(format!(
+                "{}/v1/sessions/{session_id}/prompts",
+                descriptor.base_url
+            ))
+            .bearer_auth(&descriptor.token)
+            .json(&request)
+            .send()
+            .await
+            .context("send Prompt admission command")?;
+        if response.status().is_success() {
+            return response
+                .json::<Prompt>()
+                .await
+                .context("decode admitted Prompt");
+        }
+        let status = response.status();
+        let error = response.json::<SessionError>().await.ok();
+        match error {
+            Some(error) => bail!(error.message),
+            None => bail!("Prompt admission failed with HTTP {status}"),
+        }
+    }
+
+    async fn subscribe_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
         let descriptor = self.descriptor.borrow().clone();
         SessionSubscription::open(&self.http, &descriptor, session_id).await
     }

@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
 use chidori::protocol::{
-    Activity, ActivityId, ActivityKind, AgentId, AgentIdentity, CreateSessionRequest,
-    InitialPrompt, Message, MessageId, MessageRole, ModelId, Prompt, PromptId, PromptStatus,
-    ProviderId, Session, SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision,
-    SessionSnapshot, SessionStatus, SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
+    Activity, ActivityId, ActivityKind, AdmitPromptRequest, AgentId, AgentIdentity,
+    CreateSessionRequest, InitialPrompt, Message, MessageId, MessageRole, ModelId, Prompt,
+    PromptId, PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode,
+    SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionUpdate, Turn, TurnId,
+    TurnStatus, Workspace,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -123,6 +124,31 @@ fn initial_session_command_round_trips_through_json() {
     );
     assert_eq!(
         serde_json::from_value::<CreateSessionRequest>(expected).expect("decode command"),
+        command
+    );
+}
+
+#[test]
+fn prompt_admission_command_round_trips_with_its_client_generated_identity() {
+    let command = AdmitPromptRequest {
+        prompt: InitialPrompt {
+            id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
+            text: "Steer the current Session".to_owned(),
+        },
+    };
+    let expected = json!({
+        "prompt": {
+            "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
+            "text": "Steer the current Session"
+        }
+    });
+
+    assert_eq!(
+        serde_json::to_value(&command).expect("encode command"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<AdmitPromptRequest>(expected).expect("decode command"),
         command
     );
 }

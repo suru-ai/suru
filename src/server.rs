@@ -27,13 +27,13 @@ use uuid::Uuid;
 use crate::RuntimeConfig;
 use crate::build_identity;
 use crate::protocol::{
-    COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, CreateSessionRequest, LifecycleState,
-    PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT,
-    SNAPSHOT_EVENT, ServerIdentity, ServerShutdown, SessionError, SessionErrorCode, SessionId,
-    SessionSnapshot, ShutdownReason,
+    AdmitPromptRequest, COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate,
+    CreateSessionRequest, LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor,
+    SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SNAPSHOT_EVENT,
+    ServerIdentity, ServerShutdown, SessionError, SessionErrorCode, SessionId, ShutdownReason,
 };
 use crate::runtime::protect_current_user_file;
-use crate::sessions::{CreateSessionError, SessionStore};
+use crate::sessions::{SessionCommandError, SessionFeed, SessionStore, StoreOutcome};
 
 pub type ServerConfig = RuntimeConfig;
 
@@ -173,6 +173,7 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
         .route("/health", get(health))
         .route("/v1/events", get(events))
         .route("/v1/sessions", post(create_session))
+        .route("/v1/sessions/{session_id}/prompts", post(admit_prompt))
         .route("/v1/sessions/{session_id}/events", get(session_events))
         .route("/v1/server/stop", post(stop_server))
         .with_state(state);
@@ -358,17 +359,67 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
     };
 
     match state.sessions.create(request) {
-        Ok(snapshot) => (StatusCode::CREATED, Json(snapshot)).into_response(),
-        Err(CreateSessionError::EmptyPrompt) => session_error_response(
+        Ok(StoreOutcome::Created(snapshot)) => {
+            (StatusCode::CREATED, Json(snapshot)).into_response()
+        }
+        Ok(StoreOutcome::Existing(snapshot)) => (StatusCode::OK, Json(snapshot)).into_response(),
+        Err(SessionCommandError::EmptyPrompt) => session_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             SessionErrorCode::EmptyPrompt,
             "Prompt must contain non-whitespace text",
         ),
-        Err(CreateSessionError::InvalidWorkspace) => session_error_response(
+        Err(SessionCommandError::InvalidWorkspace) => session_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             SessionErrorCode::InvalidWorkspace,
             "Workspace must be an existing local directory",
         ),
+        Err(SessionCommandError::PromptConflict) => prompt_conflict_response(),
+        Err(SessionCommandError::SessionNotFound) => {
+            unreachable!("Session creation does not address an existing Session")
+        }
+    }
+}
+
+async fn admit_prompt(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    request: Request,
+) -> Response {
+    if !is_authenticated(request.headers(), &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(body) = to_bytes(request.into_body(), 64 * 1024).await else {
+        return session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidCommand,
+            "Prompt admission command body is too large",
+        );
+    };
+    let Ok(request) = serde_json::from_slice::<AdmitPromptRequest>(&body) else {
+        return session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidCommand,
+            "Prompt admission command is not valid JSON",
+        );
+    };
+
+    match state.sessions.admit(session_id, request) {
+        Ok(StoreOutcome::Created(prompt)) => (StatusCode::CREATED, Json(prompt)).into_response(),
+        Ok(StoreOutcome::Existing(prompt)) => (StatusCode::OK, Json(prompt)).into_response(),
+        Err(SessionCommandError::EmptyPrompt) => session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::EmptyPrompt,
+            "Prompt must contain non-whitespace text",
+        ),
+        Err(SessionCommandError::SessionNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        Err(SessionCommandError::PromptConflict) => prompt_conflict_response(),
+        Err(SessionCommandError::InvalidWorkspace) => {
+            unreachable!("Prompt admission does not accept a Workspace")
+        }
     }
 }
 
@@ -385,7 +436,7 @@ async fn session_events(
     if state.shutdown.lifecycle() != LifecycleState::Ready || shutdown_requested {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    let Some(snapshot) = state.sessions.snapshot(session_id) else {
+    let Some(feed) = state.sessions.subscribe(session_id) else {
         return session_error_response(
             StatusCode::NOT_FOUND,
             SessionErrorCode::SessionNotFound,
@@ -394,7 +445,7 @@ async fn session_events(
     };
 
     Sse::new(session_event_stream(
-        snapshot,
+        feed,
         shutdown,
         Duration::from_secs(10),
     ))
@@ -402,10 +453,12 @@ async fn session_events(
 }
 
 fn session_event_stream(
-    snapshot: SessionSnapshot,
+    feed: SessionFeed,
     shutdown: watch::Receiver<Option<ServerShutdown>>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
+    let snapshot = feed.snapshot;
+    let delivered_revision = snapshot.revision;
     let snapshot_event = Event::default()
         .event(SESSION_SNAPSHOT_EVENT)
         .id(snapshot.revision.0.to_string())
@@ -416,25 +469,55 @@ fn session_event_stream(
             (
                 tokio::time::interval_at(Instant::now() + keepalive_interval, keepalive_interval),
                 shutdown,
+                feed.updates,
+                delivered_revision,
             ),
-            |(mut keepalive, mut shutdown)| async move {
+            |(mut keepalive, mut shutdown, mut updates, delivered_revision)| async move {
                 if shutdown.borrow().is_some() {
                     return None;
                 }
                 tokio::select! {
+                    biased;
                     changed = shutdown.changed() => {
                         let _ = changed;
                         None
+                    }
+                    changed = updates.changed() => {
+                        if changed.is_err() {
+                            return None;
+                        }
+                        let update = updates.borrow_and_update().clone()?;
+                        if !update.revision.immediately_follows(delivered_revision) {
+                            return None;
+                        }
+                        let next_revision = update.revision;
+                        let event = Event::default()
+                            .event(SESSION_UPDATED_EVENT)
+                            .id(update.revision.0.to_string())
+                            .json_data(update)
+                            .expect("Session updates always serialize");
+                        Some((
+                            Ok::<_, std::convert::Infallible>(event),
+                            (keepalive, shutdown, updates, next_revision),
+                        ))
                     }
                     _ = keepalive.tick() => Some((
                         Ok::<_, std::convert::Infallible>(
                             Event::default().comment("keep-alive"),
                         ),
-                        (keepalive, shutdown),
+                        (keepalive, shutdown, updates, delivered_revision),
                     )),
                 }
             },
         ),
+    )
+}
+
+fn prompt_conflict_response() -> Response {
+    session_error_response(
+        StatusCode::CONFLICT,
+        SessionErrorCode::PromptConflict,
+        "Prompt ID is already associated with different content or admission metadata",
     )
 }
 

@@ -20,6 +20,7 @@ serde_json = "1.0.143"
 tempfile = "3.21.0"
 tokio = { version = "1.47.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
+unicode-width = "=0.2.0"
 
 [dev-dependencies]
 sysinfo = "0.37.2"
