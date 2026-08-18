@@ -57,6 +57,30 @@ const LANDING_BRAND_MINIMUM_HEIGHT: u16 = 9;
 const SESSION_HEADER_MINIMUM_HEIGHT: u16 = 8;
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponsiveDetail {
+    CoreOnly,
+    Secondary,
+}
+
+impl ResponsiveDetail {
+    fn for_width(width: u16) -> Self {
+        if width < NARROW_TERMINAL_WIDTH {
+            Self::CoreOnly
+        } else {
+            Self::Secondary
+        }
+    }
+
+    fn secondary_only_when(self, visible: bool) -> Self {
+        if visible { self } else { Self::CoreOnly }
+    }
+
+    fn shows_secondary(self) -> bool {
+        self == Self::Secondary
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SessionInteraction {
     scroll_position: usize,
@@ -1072,7 +1096,7 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
 fn render_landing(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     let [main, footer_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
-    let narrow = frame.area().width < NARROW_TERMINAL_WIDTH;
+    let detail = ResponsiveDetail::for_width(frame.area().width);
     let content = horizontally_inset(main, horizontal_padding(frame.area().width));
     let key = ComposerKey::Landing;
     let composer_height = composer_block_height(
@@ -1124,7 +1148,7 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
         state.composers.text(key),
         state.composers.cursor(key),
         state.composer_border_style(theme),
-        !narrow,
+        detail,
         theme,
     );
 
@@ -1132,7 +1156,7 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
         frame,
         state,
         horizontally_inset(footer_area, horizontal_padding(frame.area().width)),
-        !narrow && show_brand,
+        detail.secondary_only_when(show_brand),
         theme,
     );
 }
@@ -1143,7 +1167,7 @@ fn render_session(
     snapshot: &SessionSnapshot,
     theme: &Theme,
 ) {
-    let narrow = frame.area().width < NARROW_TERMINAL_WIDTH;
+    let detail = ResponsiveDetail::for_width(frame.area().width);
     let padding = horizontal_padding(frame.area().width);
     let show_header = frame.area().height >= SESSION_HEADER_MINIMUM_HEIGHT;
     let key = ComposerKey::Session(snapshot.session.id);
@@ -1194,7 +1218,7 @@ fn render_session(
             state,
             snapshot,
             horizontally_inset(header_area, padding),
-            !narrow,
+            detail,
             theme,
         );
     }
@@ -1224,7 +1248,7 @@ fn render_session(
     };
     frame.render_widget(transcript.scroll((scroll_position, 0)), transcript_area);
     if pending_height > 0 {
-        render_pending_prompts(frame, pending_area, state, &queued_prompts, !narrow, theme);
+        render_pending_prompts(frame, pending_area, state, &queued_prompts, detail, theme);
     }
     render_composer(
         frame,
@@ -1232,10 +1256,10 @@ fn render_session(
         state.composers.text(key),
         state.composers.cursor(key),
         state.composer_border_style(theme),
-        !narrow,
+        detail,
         theme,
     );
-    render_session_footer(frame, state, snapshot, footer_area, !narrow, theme);
+    render_session_footer(frame, state, snapshot, footer_area, detail, theme);
 }
 
 fn render_session_header(
@@ -1243,15 +1267,15 @@ fn render_session_header(
     state: &TuiState,
     snapshot: &SessionSnapshot,
     area: Rect,
-    detailed: bool,
+    detail: ResponsiveDetail,
     theme: &Theme,
 ) {
-    let connection = connection_status_text(state, false);
+    let connection = connection_status_text(state, ResponsiveDetail::CoreOnly);
     let connection_width = connection.width().min(usize::from(area.width));
     let left_width = usize::from(area.width).saturating_sub(connection_width.saturating_add(2));
     let brand = truncate_to_width("Chidori", left_width);
     let orientation_width = left_width.saturating_sub(brand.width());
-    let orientation = if detailed {
+    let orientation = if detail.shows_secondary() {
         truncate_to_width(
             &format!(
                 " · Workspace {}",
@@ -1282,7 +1306,7 @@ fn render_session_footer(
     state: &TuiState,
     snapshot: &SessionSnapshot,
     area: Rect,
-    detailed: bool,
+    detail: ResponsiveDetail,
     theme: &Theme,
 ) {
     let status = match snapshot.session.status {
@@ -1299,8 +1323,8 @@ fn render_session_footer(
             }
         }
     };
-    let context = agent_context(snapshot.session.agent.as_ref(), detailed);
-    let left = if snapshot.session.status == SessionStatus::Active && !detailed {
+    let context = agent_context(snapshot.session.agent.as_ref(), detail);
+    let left = if snapshot.session.status == SessionStatus::Active && !detail.shows_secondary() {
         status
     } else {
         format!("{status} · {context}")
@@ -1315,16 +1339,16 @@ fn render_session_footer(
         area,
         &left,
         activity_style,
-        &connection_status_text(state, false),
+        &connection_status_text(state, ResponsiveDetail::CoreOnly),
         status_style(state, theme),
     );
 }
 
-fn agent_context(agent: Option<&AgentIdentity>, detailed: bool) -> String {
-    match (agent, detailed) {
+fn agent_context(agent: Option<&AgentIdentity>, detail: ResponsiveDetail) -> String {
+    match (agent, detail) {
         (None, _) => "Agent unavailable".to_owned(),
-        (Some(agent), false) => format!("Agent {}", agent.agent),
-        (Some(agent), true) => format!(
+        (Some(agent), ResponsiveDetail::CoreOnly) => format!("Agent {}", agent.agent),
+        (Some(agent), ResponsiveDetail::Secondary) => format!(
             "Agent {} · Provider {} · Model {}",
             agent.agent, agent.provider, agent.model
         ),
@@ -1337,13 +1361,13 @@ fn render_composer(
     text: &str,
     cursor: usize,
     style: Style,
-    show_shortcuts: bool,
+    detail: ResponsiveDetail,
     theme: &Theme,
 ) {
     let submit = binding_label(&CommandId::SubmitSteer);
     let queue = binding_label(&CommandId::SubmitQueue);
     let newline = binding_label(&CommandId::InsertNewline);
-    let title = if show_shortcuts {
+    let title = if detail.shows_secondary() {
         format!(" Prompt · {submit} submit · {queue} queue · {newline} newline ")
     } else {
         " Prompt ".to_owned()
@@ -1372,13 +1396,13 @@ fn render_pending_prompts(
     area: Rect,
     state: &TuiState,
     prompts: &[QueuedPrompt<'_>],
-    show_shortcuts: bool,
+    detail: ResponsiveDetail,
     theme: &Theme,
 ) {
     let leader = binding_label(&CommandId::BeginLeader);
     let queue = binding_label(&CommandId::OpenQueuedPrompts);
     let managing = matches!(state.command_mode, CommandMode::QueuedPrompts { .. });
-    let title = if !show_shortcuts {
+    let title = if !detail.shows_secondary() {
         " Pending ".to_owned()
     } else if managing {
         format!(
@@ -1989,10 +2013,10 @@ fn render_landing_footer(
     frame: &mut Frame<'_>,
     state: &TuiState,
     area: Rect,
-    detailed: bool,
+    detail: ResponsiveDetail,
     theme: &Theme,
 ) {
-    let context = if detailed {
+    let context = if detail.shows_secondary() {
         format!(
             "Agent unavailable · Workspace {}",
             state.workspace.to_string_lossy()
@@ -2005,7 +2029,7 @@ fn render_landing_footer(
         area,
         &context,
         theme.text.subdued,
-        &connection_status_text(state, detailed),
+        &connection_status_text(state, detail),
         status_style(state, theme),
     );
 }
@@ -2061,8 +2085,8 @@ fn truncate_to_width(value: &str, width: usize) -> String {
     result
 }
 
-fn connection_status_text(state: &TuiState, detailed: bool) -> String {
-    if detailed {
+fn connection_status_text(state: &TuiState, detail: ResponsiveDetail) -> String {
+    if detail.shows_secondary() {
         return status_text(state);
     }
     if state.fatal_error.is_some() {

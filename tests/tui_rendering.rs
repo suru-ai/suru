@@ -119,6 +119,30 @@ fn ready_health(instance_id: Uuid, pid: u32) -> Health {
     )
 }
 
+fn fixture_instance_id() -> Uuid {
+    Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID")
+}
+
+fn connected_application(workspace: &std::path::Path) -> Application {
+    let instance_id = fixture_instance_id();
+    let mut application = Application::new(workspace);
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(instance_id, 42_424),
+        )))
+        .expect("connect application");
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
+            CounterSnapshot {
+                instance_id,
+                value: 17,
+                revision: 17,
+            },
+        )))
+        .expect("confirm connected application");
+    application
+}
+
 fn connected_state(instance_id: Uuid, pid: u32, value: u64) -> TuiState {
     let mut state = TuiState::default();
     state.apply(ManagedEvent::Connected(ready_health(instance_id, pid)));
@@ -675,23 +699,7 @@ fn connected_view_centers_the_landing_composer_and_shows_server_identity() {
 #[test]
 fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let instance_id =
-        Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
-    let mut application = Application::new(workspace.path());
-    application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
-            ready_health(instance_id, 42_424),
-        )))
-        .expect("connect application");
-    application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
-            CounterSnapshot {
-                instance_id,
-                value: 17,
-                revision: 17,
-            },
-        )))
-        .expect("confirm connected application");
+    let mut application = connected_application(workspace.path());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
             "Keep the composer usable".to_owned(),
@@ -749,8 +757,6 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
 #[test]
 fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let instance_id =
-        Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
     let mut active_snapshot = failed_session_snapshot(
         SessionId::new(),
         PromptId::new(),
@@ -767,21 +773,7 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
     active_snapshot.activities[0].kind = ActivityKind::Status;
     active_snapshot.activities[0].text = "Working".to_owned();
 
-    let mut application = Application::new(workspace.path());
-    application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
-            ready_health(instance_id, 42_424),
-        )))
-        .expect("connect application");
-    application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
-            CounterSnapshot {
-                instance_id,
-                value: 17,
-                revision: 17,
-            },
-        )))
-        .expect("confirm connected application");
+    let mut application = connected_application(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(active_snapshot.clone()))
         .expect("attach active Session");
@@ -881,23 +873,8 @@ fn recovering_view_retains_the_landing_composer_and_last_server_identity() {
 #[test]
 fn reconnect_overlay_waits_for_the_grace_period_and_blocks_composer_input() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let instance_id =
-        Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
-    let mut application = Application::new(workspace.path());
-    application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
-            ready_health(instance_id, 42_424),
-        )))
-        .expect("connect application");
-    application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
-            CounterSnapshot {
-                instance_id,
-                value: 17,
-                revision: 17,
-            },
-        )))
-        .expect("confirm connected application");
+    let instance_id = fixture_instance_id();
+    let mut application = connected_application(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
             SessionId::new(),
