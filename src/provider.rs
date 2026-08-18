@@ -6,6 +6,10 @@ use futures_util::Stream;
 
 use crate::protocol::AgentIdentity;
 
+mod orchestration;
+
+pub(crate) use orchestration::ProviderOrchestrator;
+
 pub type ProviderFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ProviderError>> + Send + 'a>>;
 pub type ProviderEventStream =
@@ -38,7 +42,7 @@ pub struct ProviderSessionRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProviderTurnRequest {
+pub struct ProviderTurnInput {
     pub prompt: String,
 }
 
@@ -59,7 +63,7 @@ pub trait ProviderRuntime: Send + Sync + 'static {
 }
 
 pub trait ProviderSession: Send + Sync + 'static {
-    fn start_turn(&self, request: ProviderTurnRequest) -> ProviderFuture<'_, ()>;
+    fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()>;
 }
 
 pub struct ProviderSessionConnection {

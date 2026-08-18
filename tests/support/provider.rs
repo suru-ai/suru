@@ -3,7 +3,7 @@ use std::sync::Arc;
 use chidori::protocol::AgentIdentity;
 use chidori::provider::{
     ProviderError, ProviderEvent, ProviderEventStream, ProviderFuture, ProviderRuntime,
-    ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderTurnRequest,
+    ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderTurnInput,
 };
 use futures_util::stream;
 use tokio::sync::{mpsc, oneshot};
@@ -23,17 +23,17 @@ pub struct StartRequest {
 }
 
 pub struct ControlledProviderSession {
-    turns: mpsc::UnboundedReceiver<TurnRequest>,
+    turns: mpsc::UnboundedReceiver<TurnStart>,
     events: mpsc::UnboundedSender<Result<ProviderEvent, ProviderError>>,
 }
 
-pub struct TurnRequest {
-    request: ProviderTurnRequest,
+pub struct TurnStart {
+    input: ProviderTurnInput,
     response: oneshot::Sender<Result<(), ProviderError>>,
 }
 
 struct ControlledSessionHandle {
-    turns: mpsc::UnboundedSender<TurnRequest>,
+    turns: mpsc::UnboundedSender<TurnStart>,
 }
 
 impl ControlledProvider {
@@ -85,7 +85,7 @@ impl StartRequest {
 }
 
 impl ControlledProviderSession {
-    pub async fn next_turn(&mut self) -> TurnRequest {
+    pub async fn next_turn(&mut self) -> TurnStart {
         self.turns
             .recv()
             .await
@@ -99,9 +99,9 @@ impl ControlledProviderSession {
     }
 }
 
-impl TurnRequest {
+impl TurnStart {
     pub fn prompt(&self) -> &str {
-        &self.request.prompt
+        &self.input.prompt
     }
 
     pub fn succeed(self) {
@@ -139,13 +139,13 @@ impl ProviderRuntime for ControlledProviderRuntime {
 }
 
 impl ProviderSession for ControlledSessionHandle {
-    fn start_turn(&self, request: ProviderTurnRequest) -> ProviderFuture<'_, ()> {
+    fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         let turns = self.turns.clone();
         Box::pin(async move {
             let (response_tx, response_rx) = oneshot::channel();
             turns
-                .send(TurnRequest {
-                    request,
+                .send(TurnStart {
+                    input,
                     response: response_tx,
                 })
                 .map_err(|_| ProviderError::new("test Provider Session disconnected"))?;
