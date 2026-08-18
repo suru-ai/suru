@@ -9,7 +9,7 @@ The configured participant the user addresses, backed by a provider and model.
 _Avoid_: Assistant, bot
 
 **Provider**:
-The external service through which an agent operates, such as Codex or Copilot.
+The external product through which an agent operates, such as Codex or Copilot. A Provider identifies that product rather than its underlying model vendor.
 _Avoid_: Backend
 
 **Model**:
@@ -39,3 +39,7 @@ _Avoid_: Event, item
 **Activity**:
 User-visible progress, operational detail, or failure associated with a turn but not authored by the user or agent.
 _Avoid_: Message, notification
+
+**Tool**:
+A provider-operated capability that performs work for an agent. User-visible Tool execution is represented as Activity.
+_Avoid_: Function, action
