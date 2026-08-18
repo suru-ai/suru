@@ -5,6 +5,7 @@ mod runtime;
 pub mod server;
 mod session_projection;
 mod sessions;
+mod theme;
 pub mod tui;
 
 pub use runtime::RuntimeConfig;

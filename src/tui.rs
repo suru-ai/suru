@@ -1,5 +1,7 @@
 //! Ratatui view state and terminal lifecycle.
 
+mod markdown;
+
 use std::{
     collections::HashMap,
     future::pending,
@@ -22,11 +24,11 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     managed_client::{
@@ -35,8 +37,10 @@ use crate::{
     },
     protocol::{
         ActivityKind, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, MessageRole,
-        PromptId, ServerIdentity, SessionId, SessionSnapshot, ShutdownReason, Workspace,
+        PromptId, ServerIdentity, SessionId, SessionSnapshot, ShutdownReason, TranscriptItem,
+        Workspace,
     },
+    theme::Theme,
 };
 
 mod composer;
@@ -258,11 +262,11 @@ impl TuiState {
         self.session_interactions.get(&session_id)
     }
 
-    fn composer_border_style(&self) -> Style {
+    fn composer_border_style(&self, theme: &Theme) -> Style {
         if self.composer_focused {
-            Style::default().fg(Color::Cyan)
+            theme.form_field.border
         } else {
-            Style::default().fg(Color::DarkGray)
+            theme.border.subdued
         }
     }
 
@@ -680,14 +684,15 @@ fn binding_label(command: BoundCommand) -> &'static str {
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
+    let theme = Theme::system();
     if let Some(session) = &state.session {
-        render_session(frame, state, session.snapshot());
+        render_session(frame, state, session.snapshot(), &theme);
     } else {
-        render_landing(frame, state);
+        render_landing(frame, state, &theme);
     }
 }
 
-fn render_landing(frame: &mut Frame<'_>, state: &TuiState) {
+fn render_landing(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     let [main, status_area] =
         Layout::vertical([Constraint::Min(7), Constraint::Length(1)]).areas(frame.area());
     let key = ComposerKey::Landing;
@@ -707,11 +712,7 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState) {
     frame.render_widget(
         Paragraph::new("Chidori")
             .alignment(Alignment::Center)
-            .style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            .style(theme.accent.primary.add_modifier(Modifier::BOLD)),
         brand_area,
     );
     frame.render_widget(
@@ -722,7 +723,7 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState) {
         frame.render_widget(
             Paragraph::new(error.as_str())
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::Red)),
+                .style(theme.form_field.invalid),
             error_area,
         );
     }
@@ -731,13 +732,19 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState) {
         composer_area,
         state.composers.text(key),
         state.composers.cursor(key),
-        state.composer_border_style(),
+        state.composer_border_style(theme),
+        theme,
     );
 
-    render_status(frame, state, status_area);
+    render_status(frame, state, status_area, theme);
 }
 
-fn render_session(frame: &mut Frame<'_>, state: &TuiState, snapshot: &SessionSnapshot) {
+fn render_session(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    snapshot: &SessionSnapshot,
+    theme: &Theme,
+) {
     let key = ComposerKey::Session(snapshot.session.id);
     let composer_height = composer_block_height(
         frame.area().height,
@@ -753,12 +760,7 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, snapshot: &SessionSna
     .areas(frame.area());
     frame.render_widget(
         Paragraph::new(Text::from(vec![
-            Line::styled(
-                "Chidori",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Line::styled("Chidori", theme.accent.primary.add_modifier(Modifier::BOLD)),
             Line::styled(
                 snapshot
                     .session
@@ -766,53 +768,15 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, snapshot: &SessionSna
                     .path
                     .to_string_lossy()
                     .into_owned(),
-                Style::default().fg(Color::DarkGray),
+                theme.text.subdued,
             ),
         ])),
         header_area,
     );
 
-    let mut lines = Vec::new();
-    for turn in &snapshot.turns {
-        for message in snapshot
-            .messages
-            .iter()
-            .filter(|message| message.turn_id == turn.id)
-        {
-            let (prefix, style) = match message.role {
-                MessageRole::User => (
-                    "┃ ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                MessageRole::Agent => ("  ", Style::default()),
-            };
-            push_prefixed_lines(&mut lines, prefix, &message.content, style);
-        }
-        for activity in snapshot
-            .activities
-            .iter()
-            .filter(|activity| activity.turn_id == turn.id)
-        {
-            let (prefix, style) = match activity.kind {
-                ActivityKind::Status => ("  ", Style::default().fg(Color::DarkGray)),
-                ActivityKind::Error => ("  Error: ", Style::default().fg(Color::Red)),
-            };
-            push_prefixed_lines(&mut lines, prefix, &activity.text, style);
-        }
-        lines.push(Line::default());
-    }
+    let mut lines = transcript_lines(snapshot, theme, transcript_area.width);
     if let Some(provisional) = state.provisional_prompt(snapshot.session.id) {
-        push_prefixed_lines(
-            &mut lines,
-            "┃ ",
-            &provisional.text,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
-        lines.push(Line::default());
+        push_user_message(&mut lines, &provisional.text, theme, transcript_area.width);
     }
     let scroll_position = state
         .session_interaction(snapshot.session.id)
@@ -821,7 +785,12 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, snapshot: &SessionSna
         .min(usize::from(u16::MAX)) as u16;
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::TOP))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(theme.border.subdued),
+            )
             .scroll((scroll_position, 0)),
         transcript_area,
     );
@@ -830,12 +799,20 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, snapshot: &SessionSna
         composer_area,
         state.composers.text(key),
         state.composers.cursor(key),
-        state.composer_border_style(),
+        state.composer_border_style(theme),
+        theme,
     );
-    render_status(frame, state, status_area);
+    render_status(frame, state, status_area, theme);
 }
 
-fn render_composer(frame: &mut Frame<'_>, area: Rect, text: &str, cursor: usize, style: Style) {
+fn render_composer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    text: &str,
+    cursor: usize,
+    style: Style,
+    theme: &Theme,
+) {
     let submit = binding_label(BoundCommand::SubmitSteer);
     let newline = binding_label(BoundCommand::InsertNewline);
     let block = Block::default()
@@ -846,15 +823,18 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, text: &str, cursor: usize,
     let content_height = area.height.saturating_sub(2).max(1);
     let cursor_row = visual_cursor_row(text, cursor, content_width);
     let scroll = cursor_row.saturating_sub(content_height.saturating_sub(1));
-    let paragraph = if text.is_empty() {
-        Paragraph::new(Span::styled(
+    let content = if text.is_empty() {
+        Span::styled(
             "Type a Prompt and press Enter",
-            Style::default().fg(Color::DarkGray),
-        ))
+            theme.form_field.placeholder,
+        )
     } else {
-        Paragraph::new(text.to_owned())
+        Span::styled(text.to_owned(), theme.form_field.text)
     };
-    frame.render_widget(paragraph.block(block).scroll((scroll, 0)), area);
+    frame.render_widget(
+        Paragraph::new(content).block(block).scroll((scroll, 0)),
+        area,
+    );
 }
 
 fn composer_block_height(terminal_height: u16, width: u16, text: &str) -> u16 {
@@ -892,11 +872,109 @@ fn visual_cursor_row(text: &str, cursor: usize, width: u16) -> u16 {
     previous_rows.saturating_add(last_cells / width)
 }
 
-fn render_status(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
+fn transcript_lines(
+    snapshot: &SessionSnapshot,
+    theme: &Theme,
+    available_width: u16,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for item in &snapshot.transcript {
+        match item {
+            TranscriptItem::Message { message_id } => {
+                let Some(message) = snapshot
+                    .messages
+                    .iter()
+                    .find(|message| message.id == *message_id)
+                else {
+                    continue;
+                };
+                match message.role {
+                    MessageRole::User => {
+                        push_user_message(&mut lines, &message.content, theme, available_width)
+                    }
+                    MessageRole::Agent => push_agent_message(&mut lines, &message.content, theme),
+                }
+            }
+            TranscriptItem::Activity { activity_id } => {
+                let Some(activity) = snapshot
+                    .activities
+                    .iter()
+                    .find(|activity| activity.id == *activity_id)
+                else {
+                    continue;
+                };
+                let (prefix, style) = match activity.kind {
+                    ActivityKind::Status => ("  ", theme.text.subdued),
+                    ActivityKind::Error => ("  Error: ", theme.feedback.error),
+                };
+                push_prefixed_lines(&mut lines, prefix, &activity.text, style);
+            }
+        }
+    }
+    lines
+}
+
+fn push_user_message(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    theme: &Theme,
+    available_width: u16,
+) {
+    let surface = theme.surface.elevated.patch(theme.text.primary);
+    let accent = theme.surface.elevated.patch(theme.accent.primary);
+    let available_width = usize::from(available_width);
+    let content_width = available_width.saturating_sub(2).max(1);
+    for content_line in wrapped_content_lines(content, content_width) {
+        let padding = available_width.saturating_sub(2 + content_line.width());
+        lines.push(Line::from(vec![
+            Span::styled("┃ ", accent),
+            Span::styled(content_line, surface),
+            Span::styled(" ".repeat(padding), surface),
+        ]));
+    }
+    lines.push(Line::default());
+}
+
+fn wrapped_content_lines(content: &str, width: usize) -> Vec<String> {
+    let mut wrapped = Vec::new();
+    for source_line in content.split('\n') {
+        if source_line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        let mut line_width = 0;
+        for character in source_line.chars() {
+            let character_width = character.width().unwrap_or(1);
+            if line_width > 0 && line_width + character_width > width {
+                wrapped.push(std::mem::take(&mut line));
+                line_width = 0;
+            }
+            line.push(character);
+            line_width += character_width;
+        }
+        wrapped.push(line);
+    }
+    wrapped
+}
+
+fn push_agent_message(lines: &mut Vec<Line<'static>>, content: &str, theme: &Theme) {
+    for mut line in markdown::render(content, theme) {
+        if !line.spans.is_empty() {
+            line.spans.insert(0, Span::styled("  ", theme.text.primary));
+        }
+        lines.push(line);
+    }
+    if !content.is_empty() {
+        lines.push(Line::default());
+    }
+}
+
+fn render_status(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: &Theme) {
     frame.render_widget(
         Paragraph::new(Line::from(status_text(state)))
             .alignment(Alignment::Center)
-            .style(status_style(state)),
+            .style(status_style(state, theme)),
         area,
     );
 }
@@ -1202,13 +1280,13 @@ fn server_identity_text(identity: &ServerIdentity) -> String {
     )
 }
 
-fn status_style(state: &TuiState) -> Style {
+fn status_style(state: &TuiState, theme: &Theme) -> Style {
     if state.fatal_error.is_some() {
-        Style::default().fg(Color::Red)
+        theme.feedback.error
     } else if state.identity.is_some() && state.recovery.is_none() && !state.manually_stopped {
-        Style::default().fg(Color::Green)
+        theme.feedback.success
     } else {
-        Style::default().fg(Color::Yellow)
+        theme.feedback.warning
     }
 }
 

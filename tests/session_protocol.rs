@@ -2,10 +2,10 @@ use std::path::PathBuf;
 
 use chidori::protocol::{
     Activity, ActivityId, ActivityKind, AdmitPromptRequest, AgentId, AgentIdentity,
-    CreateSessionRequest, InitialPrompt, Message, MessageId, MessageRole, ModelId, Prompt,
-    PromptId, PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode,
-    SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-    SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
+    CreateSessionRequest, InitialPrompt, Message, MessageId, MessageRole, MessageStatus, ModelId,
+    Prompt, PromptId, PromptStatus, ProviderId, Session, SessionChange, SessionError,
+    SessionErrorCode, SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary,
+    SessionTimestamp, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -87,6 +87,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             id: MessageId::from_uuid(fixture_id("0198b27e-310d-763a-9825-51cc8b2bef81")),
             turn_id: TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d")),
             role: MessageRole::User,
+            status: MessageStatus::Completed,
             content: "Explain this workspace".to_owned(),
         }],
         activities: vec![Activity {
@@ -95,6 +96,18 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             kind: ActivityKind::Error,
             text: "No Agent is selected".to_owned(),
         }],
+        transcript: vec![
+            TranscriptItem::Message {
+                message_id: MessageId::from_uuid(fixture_id(
+                    "0198b27e-310d-763a-9825-51cc8b2bef81",
+                )),
+            },
+            TranscriptItem::Activity {
+                activity_id: ActivityId::from_uuid(fixture_id(
+                    "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                )),
+            },
+        ],
     };
     let expected = json!({
         "session": {
@@ -122,6 +135,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             "id": "0198b27e-310d-763a-9825-51cc8b2bef81",
             "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
             "role": "user",
+            "status": "completed",
             "content": "Explain this workspace"
         }],
         "activities": [{
@@ -129,7 +143,17 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
             "kind": "error",
             "text": "No Agent is selected"
-        }]
+        }],
+        "transcript": [
+            {
+                "type": "message",
+                "message_id": "0198b27e-310d-763a-9825-51cc8b2bef81"
+            },
+            {
+                "type": "activity",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87"
+            }
+        ]
     });
 
     assert_eq!(
@@ -139,6 +163,84 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
     assert_eq!(
         serde_json::from_value::<SessionSnapshot>(expected).expect("decode snapshot"),
         snapshot
+    );
+}
+
+#[test]
+fn agent_message_streaming_uses_one_stable_provider_neutral_identity() {
+    let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));
+    let message_id = MessageId::from_uuid(fixture_id("0198b27e-310d-763a-9825-51cc8b2bef81"));
+    let updates = [
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(8),
+            changes: vec![SessionChange::MessageAdded {
+                message: Message {
+                    id: message_id,
+                    turn_id,
+                    role: MessageRole::Agent,
+                    status: MessageStatus::Streaming,
+                    content: String::new(),
+                },
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(9),
+            changes: vec![SessionChange::MessageContentAppended {
+                message_id,
+                content: "Hello".to_owned(),
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(10),
+            changes: vec![SessionChange::MessageCompleted { message_id }],
+        },
+    ];
+    let expected = json!([
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 8,
+            "changes": [{
+                "type": "message_added",
+                "message": {
+                    "id": "0198b27e-310d-763a-9825-51cc8b2bef81",
+                    "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+                    "role": "agent",
+                    "status": "streaming",
+                    "content": ""
+                }
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 9,
+            "changes": [{
+                "type": "message_content_appended",
+                "message_id": "0198b27e-310d-763a-9825-51cc8b2bef81",
+                "content": "Hello"
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 10,
+            "changes": [{
+                "type": "message_completed",
+                "message_id": "0198b27e-310d-763a-9825-51cc8b2bef81"
+            }]
+        }
+    ]);
+
+    assert_eq!(
+        serde_json::to_value(&updates).expect("encode Agent Message updates"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<[SessionUpdate; 3]>(expected)
+            .expect("decode Agent Message updates"),
+        updates
     );
 }
 

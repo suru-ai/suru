@@ -23,12 +23,13 @@ use chidori::{
     protocol::{
         Activity, ActivityId, ActivityKind, AdmitPromptRequest, CounterSnapshot,
         CreateSessionRequest, InitialPrompt, LifecycleState, Message, MessageId, MessageRole,
-        PROTOCOL_VERSION, Prompt, PromptId, PromptStatus, RuntimeDescriptor,
+        MessageStatus, PROTOCOL_VERSION, Prompt, PromptId, PromptStatus, RuntimeDescriptor,
         SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SNAPSHOT_EVENT, ServerIdentity, Session,
         SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
-        SessionStatus, SessionSummary, SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
+        SessionStatus, SessionSummary, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
+        Workspace,
     },
-    server::{self, ServerConfig},
+    server::{self, AgentOutput, ServerConfig},
 };
 use eventsource_stream::Eventsource;
 use futures_util::{StreamExt, future::join_all, stream};
@@ -871,6 +872,116 @@ async fn authenticated_session_stream_starts_with_a_complete_revisioned_snapshot
 }
 
 #[tokio::test]
+async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "agent-output-stream-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "agent-output-stream-test")
+            .expect("configure managed client"),
+    )
+    .await
+    .expect("connect managed client");
+    receive_managed_client_initial_state(&mut client).await;
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Explain the stream".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let session_id = created.session.id;
+    let turn_id = created.turns[0].id;
+    let message_id = MessageId::new();
+    let mut subscription = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to Session");
+    assert_eq!(
+        timeout(Duration::from_secs(1), subscription.next())
+            .await
+            .expect("Session snapshot arrives")
+            .expect("Session stream remains open")
+            .expect("Session snapshot is valid"),
+        SessionEvent::Snapshot(created)
+    );
+
+    let output = server.agent_output();
+    let expected = [
+        AgentOutput::MessageStarted {
+            message_id,
+            turn_id,
+        },
+        AgentOutput::MessageDelta {
+            message_id,
+            content: "Hello".to_owned(),
+        },
+        AgentOutput::MessageDelta {
+            message_id,
+            content: " world".to_owned(),
+        },
+        AgentOutput::MessageCompleted { message_id },
+    ];
+    for (index, event) in expected.into_iter().enumerate() {
+        let published = output
+            .emit(session_id, event)
+            .expect("publish provider-neutral Agent output");
+        assert_eq!(published.revision, SessionRevision(index as u64 + 2));
+        assert_eq!(
+            timeout(Duration::from_secs(1), subscription.next())
+                .await
+                .expect("Session update arrives")
+                .expect("Session stream remains open")
+                .expect("Session update is valid"),
+            SessionEvent::Updated(published)
+        );
+    }
+
+    let mut reconnected = client
+        .subscribe_session(session_id)
+        .await
+        .expect("reconnect to completed Session");
+    let SessionEvent::Snapshot(completed) = timeout(Duration::from_secs(1), reconnected.next())
+        .await
+        .expect("fresh completed snapshot arrives")
+        .expect("reconnected Session stream remains open")
+        .expect("completed Session snapshot is valid")
+    else {
+        panic!("reconnected Session must begin with a snapshot");
+    };
+    let agent_messages = completed
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Agent)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        agent_messages.len(),
+        1,
+        "chunks must not create Message rows"
+    );
+    assert_eq!(agent_messages[0].id, message_id);
+    assert_eq!(agent_messages[0].content, "Hello world");
+    assert_eq!(agent_messages[0].status, MessageStatus::Completed);
+    assert_eq!(completed.revision, SessionRevision(5));
+
+    drop(reconnected);
+    drop(subscription);
+    drop(client);
+    drop(output);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn active_session_stream_does_not_delay_graceful_server_shutdown() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid workspace");
@@ -1177,6 +1288,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
                         id: MessageId::new(),
                         turn_id,
                         role: MessageRole::User,
+                        status: MessageStatus::Completed,
                         content: "Observe this change".to_owned(),
                     },
                 },
@@ -1419,6 +1531,8 @@ async fn managed_attachment_rehydrates_before_live_deltas_after_same_server_disc
 fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -> SessionSnapshot {
     let prompt_id = PromptId::new();
     let turn_id = TurnId::new();
+    let message_id = MessageId::new();
+    let activity_id = ActivityId::new();
     SessionSnapshot {
         session: Session {
             id: session_id,
@@ -1440,17 +1554,22 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             status: TurnStatus::Failed,
         }],
         messages: vec![Message {
-            id: MessageId::new(),
+            id: message_id,
             turn_id,
             role: MessageRole::User,
+            status: MessageStatus::Completed,
             content: "Explain this workspace".to_owned(),
         }],
         activities: vec![Activity {
-            id: ActivityId::new(),
+            id: activity_id,
             turn_id,
             kind: ActivityKind::Error,
             text: "No Agent is selected".to_owned(),
         }],
+        transcript: vec![
+            TranscriptItem::Message { message_id },
+            TranscriptItem::Activity { activity_id },
+        ],
     }
 }
 

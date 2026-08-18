@@ -1,21 +1,28 @@
 use chidori::{
     managed_client::{
         ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus, SessionEvent,
+        SessionSubscription,
     },
     protocol::{
-        Activity, ActivityId, ActivityKind, CounterSnapshot, Health, LifecycleState, Message,
-        MessageId, MessageRole, Prompt, PromptId, PromptStatus, ServerIdentity, ServerShutdown,
-        Session, SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
-        SessionUpdate, ShutdownReason, Turn, TurnId, TurnStatus, Workspace,
+        Activity, ActivityId, ActivityKind, CounterSnapshot, CreateSessionRequest, Health,
+        InitialPrompt, LifecycleState, Message, MessageId, MessageRole, MessageStatus, Prompt,
+        PromptId, PromptStatus, ServerIdentity, ServerShutdown, Session, SessionChange, SessionId,
+        SessionRevision, SessionSnapshot, SessionStatus, SessionUpdate, ShutdownReason,
+        TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
-    server::{self, ServerConfig},
+    server::{self, AgentOutput, ServerConfig},
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, TuiState,
         command_for_terminal_event, render,
     },
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{Frame, Terminal, backend::TestBackend};
+use ratatui::{
+    Frame, Terminal,
+    backend::TestBackend,
+    buffer::{Buffer, Cell},
+    style::{Color, Modifier},
+};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -47,6 +54,56 @@ fn rendered_application_rows(application: &Application) -> Vec<String> {
 
 fn rendered_application_rows_at(application: &Application, width: u16, height: u16) -> Vec<String> {
     rendered_rows_at(width, height, |frame| application.render(frame))
+}
+
+fn rendered_application_buffer(application: &Application, width: u16, height: u16) -> Buffer {
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("create test terminal");
+    terminal
+        .draw(|frame| application.render(frame))
+        .expect("render headless TUI application");
+    terminal.backend().buffer().clone()
+}
+
+fn buffer_rows(buffer: &Buffer) -> Vec<String> {
+    buffer
+        .content()
+        .chunks(buffer.area.width as usize)
+        .map(|row| row.iter().map(Cell::symbol).collect::<String>())
+        .collect()
+}
+
+fn text_position(buffer: &Buffer, needle: &str) -> (u16, u16) {
+    for (y, row) in buffer_rows(buffer).into_iter().enumerate() {
+        if let Some(byte_offset) = row.find(needle) {
+            return (
+                row[..byte_offset].chars().count() as u16,
+                y.try_into().expect("row fits terminal coordinates"),
+            );
+        }
+    }
+    panic!("rendered frame did not contain {needle:?}");
+}
+
+fn text_cell<'a>(buffer: &'a Buffer, needle: &str) -> &'a Cell {
+    buffer
+        .cell(text_position(buffer, needle))
+        .expect("rendered text position is inside the buffer")
+}
+
+async fn apply_next_session_event(
+    application: &mut Application,
+    subscription: &mut SessionSubscription,
+) -> SessionEvent {
+    let event = tokio::time::timeout(Duration::from_secs(1), subscription.next())
+        .await
+        .expect("Session event arrives")
+        .expect("Session stream remains open")
+        .expect("Session event is valid");
+    application
+        .handle_event(ApplicationEvent::Session(event.clone()))
+        .expect("apply Session event to headless application");
+    event
 }
 
 fn ready_health(instance_id: Uuid, pid: u32) -> Health {
@@ -340,6 +397,176 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
 
     drop(subscription);
     drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_session_stream() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "headless-agent-stream-test")
+            .expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "headless-agent-stream-test")
+            .expect("configure managed client"),
+    )
+    .await
+    .expect("connect managed client");
+    let mut application = Application::new(workspace.path());
+    for _ in 0..3 {
+        application
+            .handle_event(ApplicationEvent::Managed(
+                client.next().await.expect("managed event arrives"),
+            ))
+            .expect("handle managed event");
+    }
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Explain the stream".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let session_id = created.session.id;
+    let turn_id = created.turns[0].id;
+    let mut subscription = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to Session");
+    assert!(matches!(
+        apply_next_session_event(&mut application, &mut subscription).await,
+        SessionEvent::Snapshot(_)
+    ));
+
+    let output = server.agent_output();
+    output
+        .emit(
+            session_id,
+            AgentOutput::Activity {
+                activity_id: ActivityId::new(),
+                turn_id,
+                kind: ActivityKind::Status,
+                text: "Reading files".to_owned(),
+            },
+        )
+        .expect("publish status Activity");
+    apply_next_session_event(&mut application, &mut subscription).await;
+
+    let message_id = MessageId::new();
+    output
+        .emit(
+            session_id,
+            AgentOutput::MessageStarted {
+                message_id,
+                turn_id,
+            },
+        )
+        .expect("start Agent Message");
+    apply_next_session_event(&mut application, &mut subscription).await;
+    output
+        .emit(
+            session_id,
+            AgentOutput::MessageDelta {
+                message_id,
+                content: "# Streamed heading\n\nA *useful* [link](https://example.com) with `inline code`.\n\n- first item\n- second item\n\n```rust\nfn main() {"
+                    .to_owned(),
+            },
+        )
+        .expect("publish first Agent Message chunk");
+    apply_next_session_event(&mut application, &mut subscription).await;
+
+    let partial = rendered_application_buffer(&application, 100, 34);
+    assert_eq!(
+        buffer_rows(&partial)
+            .iter()
+            .filter(|row| row.contains("Streamed heading"))
+            .count(),
+        1,
+        "one streamed Message must render once rather than once per chunk"
+    );
+
+    output
+        .emit(
+            session_id,
+            AgentOutput::MessageDelta {
+                message_id,
+                content: "\n    println!(\"hi\");\n}\n```\n\n<future>Readable fallback</future>"
+                    .to_owned(),
+            },
+        )
+        .expect("publish final Agent Message chunk");
+    apply_next_session_event(&mut application, &mut subscription).await;
+    output
+        .emit(session_id, AgentOutput::MessageCompleted { message_id })
+        .expect("complete Agent Message");
+    apply_next_session_event(&mut application, &mut subscription).await;
+
+    let completed = rendered_application_buffer(&application, 100, 34);
+    let rows = buffer_rows(&completed);
+    let screen = rows.join("\n");
+    for readable in [
+        "Streamed heading",
+        "A useful link (https://example.com) with inline code.",
+        "• first item",
+        "• second item",
+        "fn main() {",
+        "println!(\"hi\");",
+        "Readable fallback",
+    ] {
+        assert!(
+            screen.contains(readable),
+            "missing rendered Markdown: {readable}"
+        );
+    }
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("Streamed heading"))
+            .count(),
+        1,
+        "completion must preserve the stable Message row"
+    );
+
+    let user_row = text_position(&completed, "Explain the stream").1;
+    let error_row = text_position(&completed, "Error:").1;
+    let status_row = text_position(&completed, "Reading files").1;
+    let agent_row = text_position(&completed, "Streamed heading").1;
+    assert!(user_row < error_row && error_row < status_row && status_row < agent_row);
+    assert_eq!(text_cell(&completed, "┃").fg, Color::Cyan);
+    assert_eq!(text_cell(&completed, "Explain the stream").bg, Color::Black);
+    assert_eq!(text_cell(&completed, "Error:").fg, Color::Red);
+    assert_eq!(text_cell(&completed, "Reading files").fg, Color::DarkGray);
+    assert_eq!(text_cell(&completed, "Streamed heading").fg, Color::Cyan);
+    assert!(
+        text_cell(&completed, "Streamed heading")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    assert!(
+        text_cell(&completed, "useful")
+            .modifier
+            .contains(Modifier::ITALIC)
+    );
+    assert_eq!(text_cell(&completed, "link").fg, Color::Blue);
+    assert!(
+        text_cell(&completed, "link")
+            .modifier
+            .contains(Modifier::UNDERLINED)
+    );
+    assert_eq!(text_cell(&completed, "inline code").fg, Color::Yellow);
+
+    drop(subscription);
+    drop(client);
+    drop(output);
     server.shutdown().await.expect("shut down server");
 }
 
@@ -952,6 +1179,7 @@ fn failed_session_snapshot(
     workspace: &std::path::Path,
 ) -> SessionSnapshot {
     let delivered = FailedTurnFixture::new(prompt_id, text);
+    let transcript = delivered.transcript();
     SessionSnapshot {
         session: Session {
             id: session_id,
@@ -966,6 +1194,7 @@ fn failed_session_snapshot(
         turns: vec![delivered.turn],
         messages: vec![delivered.message],
         activities: vec![delivered.activity],
+        transcript,
     }
 }
 
@@ -1008,6 +1237,7 @@ impl FailedTurnFixture {
                 id: MessageId::new(),
                 turn_id,
                 role: MessageRole::User,
+                status: MessageStatus::Completed,
                 content: text.to_owned(),
             },
             activity: Activity {
@@ -1017,6 +1247,17 @@ impl FailedTurnFixture {
                 text: "No Agent is selected".to_owned(),
             },
         }
+    }
+
+    fn transcript(&self) -> Vec<TranscriptItem> {
+        vec![
+            TranscriptItem::Message {
+                message_id: self.message.id,
+            },
+            TranscriptItem::Activity {
+                activity_id: self.activity.id,
+            },
+        ]
     }
 
     fn into_changes(self) -> Vec<SessionChange> {

@@ -28,11 +28,12 @@ use uuid::Uuid;
 use crate::RuntimeConfig;
 use crate::build_identity;
 use crate::protocol::{
-    AdmitPromptRequest, COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate,
-    CreateSessionRequest, LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor,
-    SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SNAPSHOT_EVENT,
-    ServerIdentity, ServerShutdown, SessionChange, SessionError, SessionErrorCode, SessionId,
-    SessionUpdate, ShutdownReason,
+    Activity, ActivityId, ActivityKind, AdmitPromptRequest, COUNTER_UPDATED_EVENT, CounterSnapshot,
+    CounterUpdate, CreateSessionRequest, LifecycleState, Message, MessageId, MessageRole,
+    MessageStatus, PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
+    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SNAPSHOT_EVENT, ServerIdentity, ServerShutdown,
+    SessionChange, SessionError, SessionErrorCode, SessionId, SessionUpdate, ShutdownReason,
+    TurnId,
 };
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
@@ -41,6 +42,75 @@ use crate::sessions::{
 };
 
 pub type ServerConfig = RuntimeConfig;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentOutput {
+    MessageStarted {
+        message_id: MessageId,
+        turn_id: TurnId,
+    },
+    MessageDelta {
+        message_id: MessageId,
+        content: String,
+    },
+    MessageCompleted {
+        message_id: MessageId,
+    },
+    Activity {
+        activity_id: ActivityId,
+        turn_id: TurnId,
+        kind: ActivityKind,
+        text: String,
+    },
+}
+
+#[derive(Clone)]
+pub struct AgentOutputSink {
+    session_events: SessionEventSink,
+}
+
+impl AgentOutputSink {
+    pub fn emit(&self, session_id: SessionId, output: AgentOutput) -> Result<SessionUpdate> {
+        let change = match output {
+            AgentOutput::MessageStarted {
+                message_id,
+                turn_id,
+            } => SessionChange::MessageAdded {
+                message: Message {
+                    id: message_id,
+                    turn_id,
+                    role: MessageRole::Agent,
+                    status: MessageStatus::Streaming,
+                    content: String::new(),
+                },
+            },
+            AgentOutput::MessageDelta {
+                message_id,
+                content,
+            } => SessionChange::MessageContentAppended {
+                message_id,
+                content,
+            },
+            AgentOutput::MessageCompleted { message_id } => {
+                SessionChange::MessageCompleted { message_id }
+            }
+            AgentOutput::Activity {
+                activity_id,
+                turn_id,
+                kind,
+                text,
+            } => SessionChange::ActivityAdded {
+                activity: Activity {
+                    id: activity_id,
+                    turn_id,
+                    kind,
+                    text,
+                },
+            },
+        };
+        self.session_events.publish(session_id, vec![change])
+    }
+}
 
 pub struct RunningServer {
     descriptor: RuntimeDescriptor,
@@ -75,6 +145,12 @@ impl RunningServer {
 
     pub fn session_event_sink(&self) -> SessionEventSink {
         self.session_events.clone()
+    }
+
+    pub fn agent_output(&self) -> AgentOutputSink {
+        AgentOutputSink {
+            session_events: self.session_events.clone(),
+        }
     }
 
     pub async fn shutdown(self) -> Result<()> {

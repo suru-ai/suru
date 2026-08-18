@@ -14,9 +14,9 @@ use tokio::sync::broadcast;
 
 use crate::protocol::{
     Activity, ActivityId, ActivityKind, AdmitPromptRequest, CreateSessionRequest, Message,
-    MessageId, MessageRole, Prompt, PromptId, PromptStatus, Session, SessionChange, SessionId,
-    SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-    SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
+    MessageId, MessageRole, MessageStatus, Prompt, PromptId, PromptStatus, Session, SessionChange,
+    SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
+    SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
 };
 use crate::session_projection::apply_update;
 
@@ -160,6 +160,7 @@ impl SessionStore {
         let title = request.prompt.text.trim().to_owned();
         let session_id = SessionId::new();
         let delivered = DeliveredTurn::new(request.prompt.id, request.prompt.text.clone());
+        let transcript = delivered.transcript();
         let snapshot = SessionSnapshot {
             session: Session {
                 id: session_id,
@@ -174,6 +175,7 @@ impl SessionStore {
             turns: vec![delivered.turn],
             messages: vec![delivered.message],
             activities: vec![delivered.activity],
+            transcript,
         };
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
         let timestamp = state.next_timestamp();
@@ -428,6 +430,7 @@ impl DeliveredTurn {
                 id: MessageId::new(),
                 turn_id,
                 role: MessageRole::User,
+                status: MessageStatus::Completed,
                 content: text,
             },
             activity: Activity {
@@ -457,10 +460,27 @@ impl DeliveredTurn {
     }
 
     fn append_to(self, snapshot: &mut SessionSnapshot) {
+        let message_id = self.message.id;
+        let activity_id = self.activity.id;
         snapshot.prompts.push(self.prompt);
         snapshot.turns.push(self.turn);
         snapshot.messages.push(self.message);
         snapshot.activities.push(self.activity);
+        snapshot.transcript.extend([
+            TranscriptItem::Message { message_id },
+            TranscriptItem::Activity { activity_id },
+        ]);
+    }
+
+    fn transcript(&self) -> Vec<TranscriptItem> {
+        vec![
+            TranscriptItem::Message {
+                message_id: self.message.id,
+            },
+            TranscriptItem::Activity {
+                activity_id: self.activity.id,
+            },
+        ]
     }
 }
 
