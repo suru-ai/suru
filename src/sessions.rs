@@ -13,8 +13,8 @@ use anyhow::anyhow;
 use tokio::sync::broadcast;
 
 use crate::protocol::{
-    Activity, ActivityId, AdmitPromptRequest, AgentIdentity, CreateSessionRequest, Message,
-    MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder,
+    Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentIdentity, CreateSessionRequest,
+    Message, MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder,
     PromptStatus, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
     SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, Turn, TurnId, TurnStatus,
     Workspace,
@@ -587,12 +587,10 @@ impl SessionStore {
         session_id: SessionId,
         turn_id: TurnId,
         streaming_message_id: Option<MessageId>,
+        active_command_ids: Vec<ActivityId>,
         message: String,
     ) -> anyhow::Result<SessionUpdate> {
-        let mut changes = Vec::with_capacity(if streaming_message_id.is_some() { 3 } else { 2 });
-        if let Some(message_id) = streaming_message_id {
-            changes.push(SessionChange::MessageCompleted { message_id });
-        }
+        let mut changes = terminal_output_changes(streaming_message_id, active_command_ids);
         changes.extend([
             SessionChange::ActivityAdded {
                 activity: Activity::Error {
@@ -628,11 +626,9 @@ impl SessionStore {
         session_id: SessionId,
         turn_id: TurnId,
         streaming_message_id: Option<MessageId>,
+        active_command_ids: Vec<ActivityId>,
     ) -> anyhow::Result<SessionUpdate> {
-        let mut changes = Vec::with_capacity(if streaming_message_id.is_some() { 2 } else { 1 });
-        if let Some(message_id) = streaming_message_id {
-            changes.push(SessionChange::MessageCompleted { message_id });
-        }
+        let mut changes = terminal_output_changes(streaming_message_id, active_command_ids);
         changes.push(SessionChange::TurnStatusChanged {
             turn_id,
             status: TurnStatus::Interrupted,
@@ -913,6 +909,25 @@ impl SessionStore {
         summaries.sort_unstable_by_key(|summary| Reverse(summary.updated_at));
         Ok(summaries)
     }
+}
+
+fn terminal_output_changes(
+    streaming_message_id: Option<MessageId>,
+    active_command_ids: Vec<ActivityId>,
+) -> Vec<SessionChange> {
+    let mut changes =
+        Vec::with_capacity(active_command_ids.len() + usize::from(streaming_message_id.is_some()));
+    if let Some(message_id) = streaming_message_id {
+        changes.push(SessionChange::MessageCompleted { message_id });
+    }
+    changes.extend(active_command_ids.into_iter().map(|activity_id| {
+        SessionChange::CommandStatusChanged {
+            activity_id,
+            status: ActivityStatus::Failed,
+            exit_status: None,
+        }
+    }));
+    changes
 }
 
 fn snapshot_for_owner(state: &SessionStoreState, owner: &PromptOwner) -> SessionSnapshot {

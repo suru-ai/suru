@@ -293,6 +293,74 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         "streaming command output must not duplicate transcript rows"
     );
 
+    let failing_prompt_id = PromptId::new();
+    let admitted = first
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: failing_prompt_id,
+                    text: "Fail while a command is active".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit a second Prompt");
+    assert_eq!(admitted.status, PromptStatus::Pending);
+    let first_admission = next_session_update(&mut first_feed).await;
+    let second_admission = next_session_update(&mut second_feed).await;
+    assert_eq!(first_admission, second_admission);
+
+    let failing_turn_request = provider_session.next_turn().await;
+    let first_delivery = next_session_update(&mut first_feed).await;
+    let second_delivery = next_session_update(&mut second_feed).await;
+    assert_eq!(first_delivery, second_delivery);
+    let failing_turn_id = first_delivery
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            SessionChange::TurnAdded { turn } => Some(turn.id),
+            _ => None,
+        })
+        .expect("second Prompt delivery creates a Turn");
+    failing_turn_request.succeed();
+
+    provider_session.emit(ProviderEvent::CommandStarted {
+        activity_id: ProviderActivityId::new("failed-command"),
+        command: "cargo test --all".to_owned(),
+        cwd: None,
+    });
+    let first_start = next_session_update(&mut first_feed).await;
+    let second_start = next_session_update(&mut second_feed).await;
+    assert_eq!(first_start, second_start);
+    provider_session.emit(ProviderEvent::TurnFailed {
+        message: "Provider stopped while the command was running".to_owned(),
+    });
+    let first_failure = next_session_update(&mut first_feed).await;
+    let second_failure = next_session_update(&mut second_feed).await;
+    assert_eq!(first_failure, second_failure);
+
+    let failed = first
+        .read_session(created.session.id)
+        .await
+        .expect("read Session after active command failure");
+    assert_eq!(
+        failed
+            .turns
+            .iter()
+            .find(|turn| turn.id == failing_turn_id)
+            .map(|turn| turn.status),
+        Some(TurnStatus::Failed)
+    );
+    assert!(failed.activities.iter().any(|activity| matches!(activity,
+        Activity::Command {
+            status: ActivityStatus::Failed,
+            command,
+            exit_status: None,
+            ..
+        } if command == "cargo test --all")));
+
     drop(provider_session);
     drop(first_feed);
     drop(second_feed);

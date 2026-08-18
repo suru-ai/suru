@@ -7,12 +7,14 @@ use chidori::{
         ManagedClient, ManagedClientConfig, ManagedEvent, SessionEvent, SessionSubscription,
     },
     protocol::{
-        Activity, ActivityStatus, AdmitPromptRequest, AgentId, CreateSessionRequest, InitialPrompt,
-        MessageRole, MessageStatus, ModelId, PromptDelivery, PromptId, PromptStatus, ProviderId,
-        SessionId, SessionSnapshot, SessionStatus, TranscriptItem, TurnId, TurnStatus, Workspace,
+        Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, CreateSessionRequest,
+        InitialPrompt, MessageRole, MessageStatus, ModelId, PromptDelivery, PromptId, PromptStatus,
+        ProviderId, SessionChange, SessionId, SessionSnapshot, SessionStatus, TranscriptItem,
+        TurnId, TurnStatus, Workspace,
     },
     provider::CodexRuntime,
     server::{self, RunningServer, ServerConfig},
+    tui::{Application, ApplicationEvent},
 };
 use serde_json::Value;
 use tokio::time::{Duration, timeout};
@@ -716,39 +718,82 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         .subscribe_session(created.session.id)
         .await
         .expect("subscribe to Session SSE");
-    assert!(matches!(
-        timeout(Duration::from_secs(2), feed.next())
-            .await
-            .expect("Session snapshot arrives")
-            .expect("Session feed remains open")
-            .expect("Session snapshot is valid"),
-        SessionEvent::Snapshot(_)
-    ));
+    let initial_event = timeout(Duration::from_secs(2), feed.next())
+        .await
+        .expect("Session snapshot arrives")
+        .expect("Session feed remains open")
+        .expect("Session snapshot is valid");
+    assert!(matches!(initial_event, SessionEvent::Snapshot(_)));
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::Session(initial_event))
+        .expect("initial SSE snapshot hydrates the client projection");
     fixture.wait_for_method("turn/start").await;
     fixture.release();
 
+    let mut streamed_command_id: Option<ActivityId> = None;
+    let mut streamed_command_output = String::new();
+    let mut saw_command_completion = false;
     timeout(Duration::from_secs(2), async {
         loop {
-            let snapshot = client
-                .read_session(created.session.id)
-                .await
-                .expect("read Session while Codex runs");
-            if snapshot.turns.first().is_some_and(|turn| {
-                matches!(
-                    turn.status,
-                    TurnStatus::Completed | TurnStatus::Failed | TurnStatus::Interrupted
-                )
-            }) {
-                break;
-            }
-            feed.next()
+            let event = feed
+                .next()
                 .await
                 .expect("Session feed remains open")
                 .expect("Session update is valid");
+            let mut turn_completed = false;
+            if let SessionEvent::Updated(update) = &event {
+                for change in &update.changes {
+                    match change {
+                        SessionChange::ActivityAdded {
+                            activity:
+                                Activity::Command {
+                                    id,
+                                    status: ActivityStatus::Active,
+                                    ..
+                                },
+                        } => {
+                            assert!(
+                                streamed_command_id.replace(*id).is_none(),
+                                "SSE must add exactly one command Activity"
+                            );
+                        }
+                        SessionChange::CommandOutputAppended {
+                            activity_id,
+                            content,
+                        } => {
+                            assert_eq!(Some(*activity_id), streamed_command_id);
+                            streamed_command_output.push_str(content);
+                        }
+                        SessionChange::CommandStatusChanged {
+                            activity_id,
+                            status: ActivityStatus::Completed,
+                            exit_status: Some(0),
+                        } => {
+                            assert_eq!(Some(*activity_id), streamed_command_id);
+                            saw_command_completion = true;
+                        }
+                        SessionChange::TurnStatusChanged {
+                            status: TurnStatus::Completed,
+                            ..
+                        } => turn_completed = true,
+                        _ => {}
+                    }
+                }
+            }
+            application
+                .handle_event(ApplicationEvent::Session(event))
+                .expect("SSE update applies through the client projection");
+            if turn_completed {
+                break;
+            }
         }
     })
     .await
     .expect("Codex Turn reaches a terminal Session state");
+    assert!(streamed_command_id.is_some());
+    assert_eq!(streamed_command_output, "running tests\nall green\n");
+    assert!(saw_command_completion);
 
     let completed = client
         .read_session(created.session.id)
