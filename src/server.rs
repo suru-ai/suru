@@ -108,7 +108,12 @@ impl AgentOutputSink {
                 },
             },
         };
-        self.session_events.publish(session_id, vec![change])
+        if *self.session_events.lifecycle.borrow() != LifecycleState::Ready {
+            anyhow::bail!("server is not accepting Session updates");
+        }
+        self.session_events
+            .sessions
+            .publish_agent_output(session_id, change)
     }
 
     pub fn continuation_boundary(

@@ -744,6 +744,10 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
         .expect("promote queued Prompt");
     assert_eq!(promoted.delivery, PromptDelivery::Steer);
     assert_eq!(promoted.status, PromptStatus::Pending);
+    assert!(
+        second.cancel_prompt(session_id, promoted.id).await.is_err(),
+        "a competing cancellation must not cancel a promoted steer"
+    );
     let cancelled = first
         .cancel_prompt(session_id, cancelled.id)
         .await
@@ -803,6 +807,40 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
         TurnStatus::Interrupted
     );
     assert_eq!(current.session.status, SessionStatus::Idle);
+
+    assert!(
+        server
+            .agent_output()
+            .emit(
+                session_id,
+                AgentOutput::Activity {
+                    activity_id: ActivityId::new(),
+                    turn_id: active_turn_id,
+                    kind: ActivityKind::Status,
+                    text: "Late provider output".to_owned(),
+                },
+            )
+            .is_err(),
+        "an interrupted Turn must reject later provider output"
+    );
+    assert!(
+        server
+            .session_event_sink()
+            .publish(
+                session_id,
+                vec![SessionChange::TurnStatusChanged {
+                    turn_id: active_turn_id,
+                    status: TurnStatus::Active,
+                }],
+            )
+            .is_err(),
+        "an interrupted Turn must not be reopened"
+    );
+    let after_rejected_updates = second
+        .read_session(session_id)
+        .await
+        .expect("read Session after rejected terminal Turn updates");
+    assert_eq!(after_rejected_updates, current);
     assert_eq!(
         current
             .prompts
@@ -1359,7 +1397,8 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
         .await
         .expect("create Session");
     let session_id = created.session.id;
-    let turn_id = created.turns[0].id;
+    let prompt_id = PromptId::new();
+    let turn_id = TurnId::new();
     let message_id = MessageId::new();
     let mut subscription = client
         .subscribe_session(session_id)
@@ -1372,6 +1411,49 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
             .expect("Session stream remains open")
             .expect("Session snapshot is valid"),
         SessionEvent::Snapshot(created)
+    );
+
+    let active_update = server
+        .session_event_sink()
+        .publish(
+            session_id,
+            vec![
+                SessionChange::PromptAdded {
+                    prompt: Prompt {
+                        id: prompt_id,
+                        text: "Continue with an active Agent".to_owned(),
+                        delivery: PromptDelivery::Steer,
+                        admission_order: PromptOrder(2),
+                        status: PromptStatus::Delivered,
+                    },
+                },
+                SessionChange::TurnAdded {
+                    turn: Turn {
+                        id: turn_id,
+                        prompt_id,
+                        status: TurnStatus::Active,
+                    },
+                },
+                SessionChange::MessageAdded {
+                    message: Message {
+                        id: MessageId::new(),
+                        turn_id,
+                        role: MessageRole::User,
+                        status: MessageStatus::Completed,
+                        content: "Continue with an active Agent".to_owned(),
+                    },
+                },
+            ],
+        )
+        .expect("start an active Turn for Agent output");
+    assert_eq!(active_update.revision, SessionRevision(2));
+    assert_eq!(
+        timeout(Duration::from_secs(1), subscription.next())
+            .await
+            .expect("active Turn update arrives")
+            .expect("Session stream remains open")
+            .expect("active Turn update is valid"),
+        SessionEvent::Updated(active_update)
     );
 
     let output = server.agent_output();
@@ -1397,7 +1479,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
             let update = output
                 .emit(session_id, event)
                 .expect("publish provider-neutral Agent output");
-            assert_eq!(update.revision, SessionRevision(index as u64 + 2));
+            assert_eq!(update.revision, SessionRevision(index as u64 + 3));
             update
         })
         .collect::<Vec<_>>();
@@ -1437,7 +1519,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
     assert_eq!(agent_messages[0].id, message_id);
     assert_eq!(agent_messages[0].content, "Hello world");
     assert_eq!(agent_messages[0].status, MessageStatus::Completed);
-    assert_eq!(completed.revision, SessionRevision(5));
+    assert_eq!(completed.revision, SessionRevision(6));
 
     drop(reconnected);
     drop(subscription);

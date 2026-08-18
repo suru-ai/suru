@@ -80,6 +80,7 @@ pub struct TuiState {
     session_events_blocked: bool,
     pending_submission: Option<PendingSubmission>,
     failed_submissions: HashMap<PromptId, FailedSubmission>,
+    pending_steers: Vec<PendingSteer>,
     command_mode: CommandMode,
 }
 
@@ -93,6 +94,13 @@ struct PendingSubmission {
 #[derive(Clone, Debug)]
 struct FailedSubmission {
     source: ComposerKey,
+    target: SubmissionTarget,
+    prompt: InitialPrompt,
+}
+
+#[derive(Clone, Debug)]
+struct PendingSteer {
+    session_id: SessionId,
     prompt: InitialPrompt,
 }
 
@@ -139,6 +147,7 @@ impl TuiState {
             session_events_blocked: false,
             pending_submission: None,
             failed_submissions: HashMap::new(),
+            pending_steers: Vec::new(),
             command_mode: CommandMode::Composer,
         }
     }
@@ -174,6 +183,8 @@ impl TuiState {
                         {
                             self.composers.recover_session_to_landing(session_id);
                             self.session_interactions.remove(&session_id);
+                            self.pending_steers
+                                .retain(|steer| steer.session_id != session_id);
                         }
                         self.session = None;
                         self.session_events_blocked = true;
@@ -218,6 +229,7 @@ impl TuiState {
         }
         self.reconcile_pending_submission();
         self.reconcile_failed_submissions();
+        self.reconcile_pending_steers();
         self.reconcile_command_mode();
         Ok(())
     }
@@ -255,22 +267,26 @@ impl TuiState {
         let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
             return;
         };
-        if !snapshot
+        let Some(authoritative) = snapshot
             .prompts
             .iter()
-            .any(|prompt| prompt.id == pending.prompt.id)
-        {
+            .find(|prompt| prompt.id == pending.prompt.id)
+            .cloned()
+        else {
             return;
-        }
+        };
+        let destination = ComposerKey::Session(snapshot.session.id);
         let pending = self
             .pending_submission
             .take()
             .expect("pending submission was just observed");
-        self.composers.admission_reconciled(
-            pending.source,
-            ComposerKey::Session(snapshot.session.id),
-            &pending.prompt,
-        );
+        if let SubmissionTarget::AdmitPrompt(session_id, PromptDelivery::Steer) = pending.target
+            && authoritative.status == PromptStatus::Pending
+        {
+            self.track_pending_steer(session_id, pending.prompt.clone());
+        }
+        self.composers
+            .admission_reconciled(pending.source, destination, &pending.prompt);
         self.submission_error = None;
     }
 
@@ -304,6 +320,7 @@ impl TuiState {
             pending.prompt.id,
             FailedSubmission {
                 source: pending.source,
+                target: pending.target,
                 prompt: pending.prompt,
             },
         );
@@ -319,18 +336,24 @@ impl TuiState {
             .failed_submissions
             .keys()
             .copied()
-            .filter(|prompt_id| {
+            .filter_map(|prompt_id| {
                 snapshot
                     .prompts
                     .iter()
-                    .any(|prompt| prompt.id == *prompt_id)
+                    .find(|prompt| prompt.id == prompt_id)
+                    .cloned()
             })
             .collect::<Vec<_>>();
-        for prompt_id in reconciled {
+        for authoritative in reconciled {
             let failed = self
                 .failed_submissions
-                .remove(&prompt_id)
+                .remove(&authoritative.id)
                 .expect("failed submission identity was just observed");
+            if let SubmissionTarget::AdmitPrompt(session_id, PromptDelivery::Steer) = failed.target
+                && authoritative.status == PromptStatus::Pending
+            {
+                self.track_pending_steer(session_id, failed.prompt.clone());
+            }
             if self
                 .composers
                 .late_admission_reconciled(failed.source, destination, &failed.prompt)
@@ -340,19 +363,42 @@ impl TuiState {
         }
     }
 
-    fn provisional_prompt(&self, session_id: SessionId) -> Option<&InitialPrompt> {
-        let pending = self.pending_submission.as_ref()?;
-        if pending.target != SubmissionTarget::AdmitPrompt(session_id, PromptDelivery::Steer) {
-            return None;
+    fn provisional_prompts(&self, session_id: SessionId) -> Vec<&InitialPrompt> {
+        let mut prompts = self
+            .pending_steers
+            .iter()
+            .filter(|steer| steer.session_id == session_id)
+            .map(|steer| &steer.prompt)
+            .collect::<Vec<_>>();
+        if let Some(pending) = self.pending_submission.as_ref().filter(|pending| {
+            pending.target == SubmissionTarget::AdmitPrompt(session_id, PromptDelivery::Steer)
+        }) {
+            prompts.push(&pending.prompt);
         }
-        let authoritative = self.session.as_ref().is_some_and(|session| {
-            session
-                .snapshot()
-                .prompts
-                .iter()
-                .any(|prompt| prompt.id == pending.prompt.id)
+        prompts
+    }
+
+    fn track_pending_steer(&mut self, session_id: SessionId, prompt: InitialPrompt) {
+        if !self
+            .pending_steers
+            .iter()
+            .any(|pending| pending.prompt.id == prompt.id)
+        {
+            self.pending_steers
+                .push(PendingSteer { session_id, prompt });
+        }
+    }
+
+    fn reconcile_pending_steers(&mut self) {
+        let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
+            return;
+        };
+        self.pending_steers.retain(|pending| {
+            pending.session_id != snapshot.session.id
+                || snapshot.prompts.iter().any(|prompt| {
+                    prompt.id == pending.prompt.id && prompt.status == PromptStatus::Pending
+                })
         });
-        (!authoritative).then_some(&pending.prompt)
     }
 
     fn queued_prompts(&self, session_id: SessionId) -> Vec<QueuedPrompt<'_>> {
@@ -361,7 +407,7 @@ impl TuiState {
             .as_ref()
             .filter(|session| session.session_id() == session_id)
             .map(|session| {
-                session
+                let mut prompts = session
                     .snapshot()
                     .prompts
                     .iter()
@@ -369,6 +415,10 @@ impl TuiState {
                         prompt.status == PromptStatus::Pending
                             && prompt.delivery == PromptDelivery::Queue
                     })
+                    .collect::<Vec<_>>();
+                prompts.sort_unstable_by_key(|prompt| prompt.admission_order);
+                prompts
+                    .into_iter()
                     .map(|prompt| QueuedPrompt {
                         id: prompt.id,
                         text: &prompt.text,
@@ -376,18 +426,6 @@ impl TuiState {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        queued.sort_unstable_by_key(|entry| {
-            self.session
-                .as_ref()
-                .and_then(|session| {
-                    session
-                        .snapshot()
-                        .prompts
-                        .iter()
-                        .find(|prompt| prompt.id == entry.id)
-                })
-                .map(|prompt| prompt.admission_order)
-        });
         if let Some(pending) = self.pending_submission.as_ref().filter(|pending| {
             pending.target == SubmissionTarget::AdmitPrompt(session_id, PromptDelivery::Queue)
                 && !queued.iter().any(|entry| entry.id == pending.prompt.id)
@@ -776,7 +814,7 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
     match event {
         InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,
         InputEvent::Key(key) if binding_for(key).is_some() => {
-            binding_for(key).map(|binding| binding.command.into_command())
+            binding_for(key).map(|binding| binding.command.clone())
         }
         InputEvent::Key(key)
             if !key
@@ -793,60 +831,11 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BoundCommand {
-    ClearOrExit,
-    SubmitSteer,
-    SubmitQueue,
-    InsertNewline,
-    DeleteBackward,
-    DeleteForward,
-    MoveCursorLeft,
-    MoveCursorRight,
-    HistoryPrevious,
-    HistoryNext,
-    BeginLeader,
-    OpenQueuedPrompts,
-    SelectPreviousQueuedPrompt,
-    SelectNextQueuedPrompt,
-    PromoteSelectedPrompt,
-    CancelSelectedPrompt,
-    RequestInterrupt,
-    ConfirmInterrupt,
-    CloseCommandMode,
-}
-
-impl BoundCommand {
-    fn into_command(self) -> CommandId {
-        match self {
-            Self::ClearOrExit => CommandId::ClearOrExit,
-            Self::SubmitSteer => CommandId::SubmitSteer,
-            Self::SubmitQueue => CommandId::SubmitQueue,
-            Self::InsertNewline => CommandId::InsertNewline,
-            Self::DeleteBackward => CommandId::DeleteBackward,
-            Self::DeleteForward => CommandId::DeleteForward,
-            Self::MoveCursorLeft => CommandId::MoveCursorLeft,
-            Self::MoveCursorRight => CommandId::MoveCursorRight,
-            Self::HistoryPrevious => CommandId::HistoryPrevious,
-            Self::HistoryNext => CommandId::HistoryNext,
-            Self::BeginLeader => CommandId::BeginLeader,
-            Self::OpenQueuedPrompts => CommandId::OpenQueuedPrompts,
-            Self::SelectPreviousQueuedPrompt => CommandId::SelectPreviousQueuedPrompt,
-            Self::SelectNextQueuedPrompt => CommandId::SelectNextQueuedPrompt,
-            Self::PromoteSelectedPrompt => CommandId::PromoteSelectedPrompt,
-            Self::CancelSelectedPrompt => CommandId::CancelSelectedPrompt,
-            Self::RequestInterrupt => CommandId::RequestInterrupt,
-            Self::ConfirmInterrupt => CommandId::ConfirmInterrupt,
-            Self::CloseCommandMode => CommandId::CloseCommandMode,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 struct CommandBinding {
     code: KeyCode,
     modifiers: KeyModifiers,
-    command: BoundCommand,
+    command: CommandId,
     label: &'static str,
 }
 
@@ -854,85 +843,85 @@ const COMMAND_BINDINGS: &[CommandBinding] = &[
     CommandBinding {
         code: KeyCode::Enter,
         modifiers: KeyModifiers::NONE,
-        command: BoundCommand::SubmitSteer,
+        command: CommandId::SubmitSteer,
         label: "Enter",
     },
     CommandBinding {
         code: KeyCode::Enter,
         modifiers: KeyModifiers::ALT,
-        command: BoundCommand::SubmitQueue,
+        command: CommandId::SubmitQueue,
         label: "Alt+Enter",
     },
     CommandBinding {
         code: KeyCode::Enter,
         modifiers: KeyModifiers::SHIFT,
-        command: BoundCommand::InsertNewline,
+        command: CommandId::InsertNewline,
         label: "Shift+Enter",
     },
     CommandBinding {
         code: KeyCode::Enter,
         modifiers: KeyModifiers::CONTROL,
-        command: BoundCommand::InsertNewline,
+        command: CommandId::InsertNewline,
         label: "Ctrl+Enter",
     },
     CommandBinding {
         code: KeyCode::Char('j'),
         modifiers: KeyModifiers::CONTROL,
-        command: BoundCommand::InsertNewline,
+        command: CommandId::InsertNewline,
         label: "Ctrl+J",
     },
     CommandBinding {
         code: KeyCode::Char('c'),
         modifiers: KeyModifiers::CONTROL,
-        command: BoundCommand::ClearOrExit,
+        command: CommandId::ClearOrExit,
         label: "Ctrl+C",
     },
     CommandBinding {
         code: KeyCode::Backspace,
         modifiers: KeyModifiers::NONE,
-        command: BoundCommand::DeleteBackward,
+        command: CommandId::DeleteBackward,
         label: "Backspace",
     },
     CommandBinding {
         code: KeyCode::Delete,
         modifiers: KeyModifiers::NONE,
-        command: BoundCommand::DeleteForward,
+        command: CommandId::DeleteForward,
         label: "Delete",
     },
     CommandBinding {
         code: KeyCode::Left,
         modifiers: KeyModifiers::NONE,
-        command: BoundCommand::MoveCursorLeft,
+        command: CommandId::MoveCursorLeft,
         label: "Left",
     },
     CommandBinding {
         code: KeyCode::Right,
         modifiers: KeyModifiers::NONE,
-        command: BoundCommand::MoveCursorRight,
+        command: CommandId::MoveCursorRight,
         label: "Right",
     },
     CommandBinding {
         code: KeyCode::Up,
         modifiers: KeyModifiers::NONE,
-        command: BoundCommand::HistoryPrevious,
+        command: CommandId::HistoryPrevious,
         label: "Up",
     },
     CommandBinding {
         code: KeyCode::Down,
         modifiers: KeyModifiers::NONE,
-        command: BoundCommand::HistoryNext,
+        command: CommandId::HistoryNext,
         label: "Down",
     },
     CommandBinding {
         code: KeyCode::Char('x'),
         modifiers: KeyModifiers::CONTROL,
-        command: BoundCommand::BeginLeader,
+        command: CommandId::BeginLeader,
         label: "Ctrl+X",
     },
     CommandBinding {
         code: KeyCode::Esc,
         modifiers: KeyModifiers::NONE,
-        command: BoundCommand::RequestInterrupt,
+        command: CommandId::RequestInterrupt,
         label: "Esc",
     },
 ];
@@ -940,7 +929,7 @@ const COMMAND_BINDINGS: &[CommandBinding] = &[
 const LEADER_BINDINGS: &[CommandBinding] = &[CommandBinding {
     code: KeyCode::Char('q'),
     modifiers: KeyModifiers::NONE,
-    command: BoundCommand::OpenQueuedPrompts,
+    command: CommandId::OpenQueuedPrompts,
     label: "q",
 }];
 
@@ -948,31 +937,31 @@ const QUEUED_PROMPT_BINDINGS: &[CommandBinding] = &[
     CommandBinding {
         code: KeyCode::Enter,
         modifiers: KeyModifiers::NONE,
-        command: BoundCommand::PromoteSelectedPrompt,
+        command: CommandId::PromoteSelectedPrompt,
         label: "Enter",
     },
     CommandBinding {
         code: KeyCode::Char('d'),
         modifiers: KeyModifiers::CONTROL,
-        command: BoundCommand::CancelSelectedPrompt,
+        command: CommandId::CancelSelectedPrompt,
         label: "Ctrl+D",
     },
     CommandBinding {
         code: KeyCode::Up,
         modifiers: KeyModifiers::NONE,
-        command: BoundCommand::SelectPreviousQueuedPrompt,
+        command: CommandId::SelectPreviousQueuedPrompt,
         label: "Up",
     },
     CommandBinding {
         code: KeyCode::Down,
         modifiers: KeyModifiers::NONE,
-        command: BoundCommand::SelectNextQueuedPrompt,
+        command: CommandId::SelectNextQueuedPrompt,
         label: "Down",
     },
     CommandBinding {
         code: KeyCode::Esc,
         modifiers: KeyModifiers::NONE,
-        command: BoundCommand::CloseCommandMode,
+        command: CommandId::CloseCommandMode,
         label: "Esc",
     },
 ];
@@ -980,7 +969,7 @@ const QUEUED_PROMPT_BINDINGS: &[CommandBinding] = &[
 const INTERRUPT_CONFIRMATION_BINDINGS: &[CommandBinding] = &[CommandBinding {
     code: KeyCode::Esc,
     modifiers: KeyModifiers::NONE,
-    command: BoundCommand::ConfirmInterrupt,
+    command: CommandId::ConfirmInterrupt,
     label: "Esc",
 }];
 
@@ -990,13 +979,13 @@ fn binding_for(key: KeyEvent) -> Option<&'static CommandBinding> {
         .find(|binding| binding.code == key.code && binding.modifiers == key.modifiers)
 }
 
-fn binding_label(command: BoundCommand) -> &'static str {
+fn binding_label(command: &CommandId) -> &'static str {
     COMMAND_BINDINGS
         .iter()
         .chain(LEADER_BINDINGS)
         .chain(QUEUED_PROMPT_BINDINGS)
         .chain(INTERRUPT_CONFIRMATION_BINDINGS)
-        .find(|binding| binding.command == command)
+        .find(|binding| &binding.command == command)
         .map_or("", |binding| binding.label)
 }
 
@@ -1026,7 +1015,7 @@ fn command_from_scoped_bindings(
     bindings
         .iter()
         .find(|binding| binding.code == key.code && binding.modifiers == key.modifiers)
-        .map(|binding| binding.command.into_command())
+        .map(|binding| binding.command.clone())
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
@@ -1134,7 +1123,7 @@ fn render_session(
     );
 
     let mut lines = transcript_lines(snapshot, theme, transcript_area.width);
-    if let Some(provisional) = state.provisional_prompt(snapshot.session.id) {
+    for provisional in state.provisional_prompts(snapshot.session.id) {
         push_user_message(&mut lines, &provisional.text, theme, transcript_area.width);
     }
     let scroll_position = state
@@ -1175,9 +1164,9 @@ fn render_composer(
     style: Style,
     theme: &Theme,
 ) {
-    let submit = binding_label(BoundCommand::SubmitSteer);
-    let queue = binding_label(BoundCommand::SubmitQueue);
-    let newline = binding_label(BoundCommand::InsertNewline);
+    let submit = binding_label(&CommandId::SubmitSteer);
+    let queue = binding_label(&CommandId::SubmitQueue);
+    let newline = binding_label(&CommandId::InsertNewline);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(
@@ -1206,14 +1195,14 @@ fn render_pending_prompts(
     prompts: &[QueuedPrompt<'_>],
     theme: &Theme,
 ) {
-    let leader = binding_label(BoundCommand::BeginLeader);
-    let queue = binding_label(BoundCommand::OpenQueuedPrompts);
+    let leader = binding_label(&CommandId::BeginLeader);
+    let queue = binding_label(&CommandId::OpenQueuedPrompts);
     let managing = matches!(state.command_mode, CommandMode::QueuedPrompts { .. });
     let title = if managing {
         format!(
             " Pending · {} steer · {} cancel ",
-            binding_label(BoundCommand::PromoteSelectedPrompt),
-            binding_label(BoundCommand::CancelSelectedPrompt)
+            binding_label(&CommandId::PromoteSelectedPrompt),
+            binding_label(&CommandId::CancelSelectedPrompt)
         )
     } else {
         format!(" Pending · {leader} {queue} manage ")
@@ -1576,46 +1565,25 @@ async fn run_loop(
                                     });
                                 }
                                 ApplicationTransition::PromotePrompt { session_id, prompt_id } => {
-                                    let commands = client.session_commands();
-                                    let results = submission_tx.clone();
-                                    tokio::spawn(async move {
-                                        let result = commands
-                                            .promote_prompt(session_id, prompt_id)
-                                            .await
-                                            .map(|_| SubmissionResult::OperationSucceeded)
-                                            .unwrap_or_else(|error| {
-                                                SubmissionResult::OperationFailed(error.to_string())
-                                            });
-                                        let _ = results.send(result);
-                                    });
+                                    spawn_session_operation(
+                                        client.session_commands(),
+                                        SessionOperation::PromotePrompt { session_id, prompt_id },
+                                        submission_tx.clone(),
+                                    );
                                 }
                                 ApplicationTransition::CancelPrompt { session_id, prompt_id } => {
-                                    let commands = client.session_commands();
-                                    let results = submission_tx.clone();
-                                    tokio::spawn(async move {
-                                        let result = commands
-                                            .cancel_prompt(session_id, prompt_id)
-                                            .await
-                                            .map(|_| SubmissionResult::OperationSucceeded)
-                                            .unwrap_or_else(|error| {
-                                                SubmissionResult::OperationFailed(error.to_string())
-                                            });
-                                        let _ = results.send(result);
-                                    });
+                                    spawn_session_operation(
+                                        client.session_commands(),
+                                        SessionOperation::CancelPrompt { session_id, prompt_id },
+                                        submission_tx.clone(),
+                                    );
                                 }
                                 ApplicationTransition::InterruptTurn { session_id, turn_id } => {
-                                    let commands = client.session_commands();
-                                    let results = submission_tx.clone();
-                                    tokio::spawn(async move {
-                                        let result = commands
-                                            .interrupt_turn(session_id, turn_id)
-                                            .await
-                                            .map(|_| SubmissionResult::OperationSucceeded)
-                                            .unwrap_or_else(|error| {
-                                                SubmissionResult::OperationFailed(error.to_string())
-                                            });
-                                        let _ = results.send(result);
-                                    });
+                                    spawn_session_operation(
+                                        client.session_commands(),
+                                        SessionOperation::InterruptTurn { session_id, turn_id },
+                                        submission_tx.clone(),
+                                    );
                                 }
                                 ApplicationTransition::SubscribeSession(_) => {
                                     unreachable!("terminal input cannot end a Session subscription")
@@ -1636,6 +1604,57 @@ enum SubmissionResult {
     Failed { prompt_id: PromptId, error: String },
     OperationSucceeded,
     OperationFailed(String),
+}
+
+enum SessionOperation {
+    PromotePrompt {
+        session_id: SessionId,
+        prompt_id: PromptId,
+    },
+    CancelPrompt {
+        session_id: SessionId,
+        prompt_id: PromptId,
+    },
+    InterruptTurn {
+        session_id: SessionId,
+        turn_id: TurnId,
+    },
+}
+
+fn spawn_session_operation(
+    commands: SessionCommandClient,
+    operation: SessionOperation,
+    results: tokio::sync::mpsc::UnboundedSender<SubmissionResult>,
+) {
+    tokio::spawn(async move {
+        let result = match operation {
+            SessionOperation::PromotePrompt {
+                session_id,
+                prompt_id,
+            } => commands
+                .promote_prompt(session_id, prompt_id)
+                .await
+                .map(|_| ()),
+            SessionOperation::CancelPrompt {
+                session_id,
+                prompt_id,
+            } => commands
+                .cancel_prompt(session_id, prompt_id)
+                .await
+                .map(|_| ()),
+            SessionOperation::InterruptTurn {
+                session_id,
+                turn_id,
+            } => commands
+                .interrupt_turn(session_id, turn_id)
+                .await
+                .map(|_| ()),
+        };
+        let result = result
+            .map(|()| SubmissionResult::OperationSucceeded)
+            .unwrap_or_else(|error| SubmissionResult::OperationFailed(error.to_string()));
+        let _ = results.send(result);
+    });
 }
 
 struct ConnectedSessionSubscription {
@@ -1749,7 +1768,7 @@ fn status_text(state: &TuiState) -> String {
             .map(|session| session.snapshot().session.status),
         Some(SessionStatus::Active)
     ) {
-        let interrupt = binding_label(BoundCommand::RequestInterrupt);
+        let interrupt = binding_label(&CommandId::RequestInterrupt);
         let active = if matches!(
             state.command_mode,
             CommandMode::InterruptConfirmation { .. }

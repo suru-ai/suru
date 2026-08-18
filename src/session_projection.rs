@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 
 use crate::protocol::{
     MessageRole, MessageStatus, PromptDelivery, PromptStatus, SessionChange, SessionSnapshot,
-    SessionUpdate, TranscriptItem,
+    SessionUpdate, TranscriptItem, TurnStatus,
 };
 
 pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdate) -> Result<()> {
@@ -149,6 +149,14 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {
                     bail!("Session update referenced an unknown Turn");
                 };
+                if turn.status != TurnStatus::Active
+                    || !matches!(
+                        status,
+                        TurnStatus::Completed | TurnStatus::Failed | TurnStatus::Interrupted
+                    )
+                {
+                    bail!("Session update contained an invalid Turn status transition");
+                }
                 turn.status = *status;
             }
             SessionChange::SessionStatusChanged { status } => next.session.status = *status,

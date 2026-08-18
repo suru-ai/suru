@@ -439,7 +439,8 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
         .await
         .expect("create Session");
     let session_id = created.session.id;
-    let turn_id = created.turns[0].id;
+    let prompt_id = PromptId::new();
+    let turn_id = TurnId::new();
     let mut subscription = client
         .subscribe_session(session_id)
         .await
@@ -448,6 +449,41 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
         apply_next_session_event(&mut application, &mut subscription).await,
         SessionEvent::Snapshot(_)
     ));
+
+    server
+        .session_event_sink()
+        .publish(
+            session_id,
+            vec![
+                SessionChange::PromptAdded {
+                    prompt: Prompt {
+                        id: prompt_id,
+                        text: "Continue with an active Agent".to_owned(),
+                        delivery: PromptDelivery::Steer,
+                        admission_order: PromptOrder(2),
+                        status: PromptStatus::Delivered,
+                    },
+                },
+                SessionChange::TurnAdded {
+                    turn: Turn {
+                        id: turn_id,
+                        prompt_id,
+                        status: TurnStatus::Active,
+                    },
+                },
+                SessionChange::MessageAdded {
+                    message: Message {
+                        id: MessageId::new(),
+                        turn_id,
+                        role: MessageRole::User,
+                        status: MessageStatus::Completed,
+                        content: "Continue with an active Agent".to_owned(),
+                    },
+                },
+            ],
+        )
+        .expect("start an active Turn for Agent output");
+    apply_next_session_event(&mut application, &mut subscription).await;
 
     let output = server.agent_output();
     output
@@ -879,6 +915,60 @@ fn provisional_steer_is_immediate_single_and_reconciles_in_place() {
         .expect("apply authoritative Prompt delivery");
     let reconciled = rendered_application_rows(&application).join("\n");
     assert_eq!(reconciled.matches("Use the smaller interface").count(), 1);
+}
+
+#[test]
+fn admitted_active_steer_stays_visible_while_the_composer_accepts_another_prompt() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (session_id, snapshot, _) = enter_active_session(&mut application, workspace.path());
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Keep this pending steer visible".to_owned(),
+        )))
+        .expect("type active steer");
+    let ApplicationTransition::AdmitPrompt { request, .. } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit active steer")
+    else {
+        panic!("active steer should request Prompt admission");
+    };
+    let prompt_id = request.prompt.id;
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(snapshot.revision.0 + 1),
+                changes: vec![SessionChange::PromptAdded {
+                    prompt: Prompt {
+                        id: prompt_id,
+                        text: request.prompt.text,
+                        delivery: PromptDelivery::Steer,
+                        admission_order: PromptOrder(3),
+                        status: PromptStatus::Pending,
+                    },
+                }],
+            },
+        )))
+        .expect("reconcile pending active steer");
+    let pending = rendered_application_rows(&application).join("\n");
+    assert_eq!(
+        pending.matches("Keep this pending steer visible").count(),
+        1
+    );
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "A second steer".to_owned(),
+        )))
+        .expect("type another steer while the first is pending");
+    assert!(matches!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("submit another steer"),
+        ApplicationTransition::AdmitPrompt { .. }
+    ));
 }
 
 #[test]

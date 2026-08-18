@@ -356,6 +356,41 @@ impl SessionStore {
         Ok(update)
     }
 
+    pub(crate) fn publish_agent_output(
+        &self,
+        session_id: SessionId,
+        change: SessionChange,
+    ) -> anyhow::Result<SessionUpdate> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        {
+            let record = state
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+            let turn_id = agent_output_turn_id(&record.snapshot, &change)?;
+            let turn = record
+                .snapshot
+                .turns
+                .iter()
+                .find(|turn| turn.id == turn_id)
+                .ok_or_else(|| anyhow!("Agent output referenced an unknown Turn"))?;
+            if turn.status != TurnStatus::Active {
+                return Err(anyhow!("Agent output referenced a terminal Turn"));
+            }
+        }
+        let updated_at = state.next_timestamp();
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
+        let update = record.publish(session_id, vec![change])?;
+        record.summary.updated_at = updated_at;
+        Ok(update)
+    }
+
     pub(crate) fn continuation_boundary(
         &self,
         session_id: SessionId,
@@ -499,7 +534,7 @@ impl SessionStore {
         if prompt.status == PromptStatus::Cancelled {
             return Ok(prompt);
         }
-        if prompt.status != PromptStatus::Pending {
+        if prompt.status != PromptStatus::Pending || prompt.delivery != PromptDelivery::Queue {
             return Err(PromptMutationError::PromptNotPending);
         }
         let updated_at = state.next_timestamp();
@@ -730,6 +765,26 @@ fn idle_boundary_delivery_changes(snapshot: &SessionSnapshot) -> Vec<SessionChan
         .min_by_key(|prompt| prompt.admission_order)
         .map(unavailable_prompt_delivery_changes)
         .unwrap_or_default()
+}
+
+fn agent_output_turn_id(
+    snapshot: &SessionSnapshot,
+    change: &SessionChange,
+) -> anyhow::Result<TurnId> {
+    match change {
+        SessionChange::MessageAdded { message } if message.role == MessageRole::Agent => {
+            Ok(message.turn_id)
+        }
+        SessionChange::MessageContentAppended { message_id, .. }
+        | SessionChange::MessageCompleted { message_id } => snapshot
+            .messages
+            .iter()
+            .find(|message| message.id == *message_id && message.role == MessageRole::Agent)
+            .map(|message| message.turn_id)
+            .ok_or_else(|| anyhow!("Agent output referenced an unknown Agent Message")),
+        SessionChange::ActivityAdded { activity } => Ok(activity.turn_id),
+        _ => Err(anyhow!("Session change is not Agent output")),
+    }
 }
 
 fn unavailable_prompt_delivery_changes(prompt: &Prompt) -> Vec<SessionChange> {
