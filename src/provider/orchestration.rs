@@ -292,6 +292,13 @@ fn project_provider_event(
                     .map(|_| true)
             }
         }
+        ProviderEvent::TurnInterrupted => sessions
+            .interrupt_provider_turn(
+                session_id,
+                active.turn_id,
+                active.streaming_message_id.take(),
+            )
+            .map(|_| true),
         ProviderEvent::TurnFailed { message } => sessions
             .fail_turn(
                 session_id,

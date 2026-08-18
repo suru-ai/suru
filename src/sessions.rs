@@ -500,6 +500,23 @@ impl SessionStore {
         )
     }
 
+    pub(crate) fn interrupt_provider_turn(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        streaming_message_id: Option<MessageId>,
+    ) -> anyhow::Result<SessionUpdate> {
+        let mut changes = Vec::with_capacity(if streaming_message_id.is_some() { 2 } else { 1 });
+        if let Some(message_id) = streaming_message_id {
+            changes.push(SessionChange::MessageCompleted { message_id });
+        }
+        changes.push(SessionChange::TurnStatusChanged {
+            turn_id,
+            status: TurnStatus::Interrupted,
+        });
+        self.publish(session_id, changes)
+    }
+
     pub(crate) fn publish(
         &self,
         session_id: SessionId,

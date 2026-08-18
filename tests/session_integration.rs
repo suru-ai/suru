@@ -36,9 +36,12 @@ use eventsource_stream::Eventsource;
 use futures_util::{StreamExt, future::join_all, stream};
 use tokio::time::{Duration, timeout};
 
+#[path = "support/failing_provider.rs"]
+mod failing_provider_support;
 #[path = "support/provider.rs"]
 mod provider_support;
 
+use failing_provider_support::spawn_with_failing_provider;
 use provider_support::ControlledProvider;
 
 async fn next_session_update(
@@ -429,7 +432,7 @@ async fn authenticated_creation_returns_pending_before_async_provider_failure() 
     let workspace_parent = tempfile::tempdir().expect("create workspace parent");
     let workspace = workspace_parent.path().join("workspace");
     std::fs::create_dir(&workspace).expect("create workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "session-create-test").expect("configure server"),
     )
     .await
@@ -509,7 +512,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid workspace");
     let other_workspace = tempfile::tempdir().expect("create second workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "session-create-idempotency-test")
             .expect("configure server"),
     )
@@ -620,7 +623,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
 async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "prompt-admission-idempotency-test")
             .expect("configure server"),
     )
@@ -816,7 +819,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
 async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "active-prompt-order-test").expect("configure server"),
     )
     .await
@@ -1062,7 +1065,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
 async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "prompt-mutation-test").expect("configure server"),
     )
     .await
@@ -1293,7 +1296,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
 async fn consecutive_prompt_admissions_and_failures_do_not_collapse_revisions() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "consecutive-prompt-admission-test")
             .expect("configure server"),
     )
@@ -1404,7 +1407,7 @@ async fn consecutive_prompt_admissions_and_failures_do_not_collapse_revisions() 
 async fn authenticated_clients_can_read_a_session_by_id() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "session-read-test").expect("configure server"),
     )
     .await
@@ -1489,7 +1492,7 @@ async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace
     let first_workspace = first_workspace_parent.path().join("workspace");
     std::fs::create_dir(&first_workspace).expect("create first Workspace");
     let second_workspace = tempfile::tempdir().expect("create second Workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "session-list-test").expect("configure server"),
     )
     .await
@@ -1593,7 +1596,7 @@ async fn a_new_server_instance_does_not_expose_the_replaced_instances_sessions()
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let channel = "ephemeral-session-replacement-test";
-    let original = server::spawn(
+    let original = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), channel).expect("configure original server"),
     )
     .await
@@ -1621,7 +1624,7 @@ async fn a_new_server_instance_does_not_expose_the_replaced_instances_sessions()
         .expect("decode created Session");
     original.shutdown().await.expect("stop original server");
 
-    let replacement = server::spawn(
+    let replacement = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), channel).expect("configure replacement server"),
     )
     .await
@@ -1648,7 +1651,7 @@ async fn a_new_server_instance_does_not_expose_the_replaced_instances_sessions()
 async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "session-validation-test").expect("configure server"),
     )
     .await
@@ -1732,7 +1735,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
 async fn authenticated_session_stream_starts_with_a_complete_revisioned_snapshot() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "session-events-test").expect("configure server"),
     )
     .await
@@ -1825,7 +1828,7 @@ async fn authenticated_session_stream_starts_with_a_complete_revisioned_snapshot
 async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "agent-output-stream-test").expect("configure server"),
     )
     .await
@@ -1999,7 +2002,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
 async fn active_session_stream_does_not_delay_graceful_server_shutdown() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "session-shutdown-test").expect("configure server"),
     )
     .await
@@ -2060,7 +2063,7 @@ async fn active_session_stream_does_not_delay_graceful_server_shutdown() {
 async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_client() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "managed-session-test").expect("configure server"),
     )
     .await
@@ -2137,7 +2140,7 @@ async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_clie
 async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "managed-session-attach-test")
             .expect("configure server"),
     )
@@ -2206,7 +2209,7 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
 async fn two_clients_converge_on_one_session_without_observing_another_session() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "shared-session-test").expect("configure server"),
     )
     .await

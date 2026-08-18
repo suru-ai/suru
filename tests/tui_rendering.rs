@@ -11,7 +11,7 @@ use chidori::{
         SessionStatus, SessionUpdate, ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus,
         Workspace,
     },
-    server::{self, AgentOutput, ServerConfig},
+    server::{AgentOutput, ServerConfig},
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, TuiState,
         command_for_terminal_event, render,
@@ -27,6 +27,11 @@ use ratatui::{
 };
 use std::time::Duration;
 use uuid::Uuid;
+
+#[path = "support/failing_provider.rs"]
+mod failing_provider_support;
+
+use failing_provider_support::spawn_with_failing_provider;
 
 fn rendered_rows(render: impl FnOnce(&mut Frame<'_>)) -> Vec<String> {
     rendered_rows_at(80, 15, render)
@@ -211,7 +216,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
  {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "headless-session-test").expect("configure server"),
     )
     .await
@@ -398,7 +403,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
 async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_session_stream() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn(
+    let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "headless-agent-stream-test")
             .expect("configure server"),
     )

@@ -6,8 +6,10 @@ use futures_util::Stream;
 
 use crate::protocol::AgentIdentity;
 
+mod codex;
 mod orchestration;
 
+pub use codex::CodexRuntime;
 pub(crate) use orchestration::ProviderOrchestrator;
 
 pub type ProviderFuture<'a, T> =
@@ -52,6 +54,7 @@ pub enum ProviderEvent {
     AgentMessageDelta { content: String },
     AgentMessageCompleted,
     TurnCompleted,
+    TurnInterrupted,
     TurnFailed { message: String },
 }
 
@@ -89,20 +92,5 @@ impl ProviderSessionConnection {
         self,
     ) -> (AgentIdentity, Arc<dyn ProviderSession>, ProviderEventStream) {
         (self.identity, self.session, self.events)
-    }
-}
-
-pub(crate) struct UnavailableProviderRuntime;
-
-impl ProviderRuntime for UnavailableProviderRuntime {
-    fn start_session(
-        &self,
-        _request: ProviderSessionRequest,
-    ) -> ProviderFuture<'_, ProviderSessionConnection> {
-        Box::pin(async {
-            Err(ProviderError::new(
-                "No Provider runtime is configured for this Chidori server.",
-            ))
-        })
     }
 }

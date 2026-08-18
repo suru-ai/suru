@@ -34,7 +34,7 @@ use crate::protocol::{
     ServerShutdown, SessionChange, SessionError, SessionErrorCode, SessionId, SessionUpdate,
     ShutdownReason, TurnId,
 };
-use crate::provider::{ProviderOrchestrator, ProviderRuntime, UnavailableProviderRuntime};
+use crate::provider::{CodexRuntime, ProviderOrchestrator, ProviderRuntime};
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
     AdmitPromptError, CreateSessionError, InterruptTurnError, ListSessionsError,
@@ -239,7 +239,7 @@ struct AppState {
 }
 
 pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
-    spawn_with_provider(config, Arc::new(UnavailableProviderRuntime)).await
+    spawn_with_provider(config, Arc::new(CodexRuntime::from_environment())).await
 }
 
 pub async fn spawn_with_provider(
