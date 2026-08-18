@@ -1,12 +1,16 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use anyhow::Result;
 use futures_util::StreamExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    task::JoinHandle,
+    time::{Duration, timeout},
+};
 
 use super::{
     ProviderCommandStatus, ProviderEvent, ProviderEventStream, ProviderRuntime, ProviderSession,
@@ -22,7 +26,48 @@ use crate::sessions::{DeliveredTurnStatus, InterruptTurnError, SessionStore};
 pub(crate) struct ProviderOrchestrator {
     runtime: Arc<dyn ProviderRuntime>,
     sessions: SessionStore,
-    actors: Arc<Mutex<HashMap<SessionId, mpsc::UnboundedSender<ProviderCommand>>>>,
+    actors: Arc<Mutex<ProviderActors>>,
+    shutdown: watch::Receiver<bool>,
+    updates: ProviderUpdateGate,
+    shutdown_complete: watch::Sender<bool>,
+}
+
+struct ProviderActors {
+    shutting_down: bool,
+    entries: HashMap<SessionId, ProviderActor>,
+}
+
+struct ProviderActor {
+    commands: mpsc::UnboundedSender<ProviderCommand>,
+    task: JoinHandle<()>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProviderUpdateGate {
+    accepting: Arc<RwLock<bool>>,
+}
+
+impl ProviderUpdateGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            accepting: Arc::new(RwLock::new(true)),
+        }
+    }
+
+    pub(crate) fn stop(&self) {
+        *self
+            .accepting
+            .write()
+            .expect("Provider update gate lock is not poisoned") = false;
+    }
+
+    fn apply<T>(&self, update: impl FnOnce() -> T) -> Option<T> {
+        let accepting = self
+            .accepting
+            .read()
+            .expect("Provider update gate lock is not poisoned");
+        (*accepting).then(update)
+    }
 }
 
 enum ProviderCommand {
@@ -63,11 +108,23 @@ enum ProviderInput {
 }
 
 impl ProviderOrchestrator {
-    pub(crate) fn new(runtime: Arc<dyn ProviderRuntime>, sessions: SessionStore) -> Self {
+    pub(crate) fn new(
+        runtime: Arc<dyn ProviderRuntime>,
+        sessions: SessionStore,
+        shutdown: watch::Receiver<bool>,
+        updates: ProviderUpdateGate,
+    ) -> Self {
+        let (shutdown_complete, _) = watch::channel(false);
         Self {
             runtime,
             sessions,
-            actors: Arc::new(Mutex::new(HashMap::new())),
+            actors: Arc::new(Mutex::new(ProviderActors {
+                shutting_down: false,
+                entries: HashMap::new(),
+            })),
+            shutdown,
+            updates,
+            shutdown_complete,
         }
     }
 
@@ -78,19 +135,32 @@ impl ProviderOrchestrator {
         prompt_id: PromptId,
     ) {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        self.actors
+        let mut actors = self
+            .actors
             .lock()
-            .expect("Provider actor registry lock is not poisoned")
-            .insert(session_id, commands_tx.clone());
+            .expect("Provider actor registry lock is not poisoned");
+        if actors.shutting_down || *self.shutdown.borrow() {
+            return;
+        }
         let runtime = self.runtime.clone();
         let sessions = self.sessions.clone();
-        tokio::spawn(run_provider_session(
+        let task = tokio::spawn(run_provider_session(
             runtime,
             sessions,
             session_id,
             workspace,
             commands_rx,
+            self.shutdown.clone(),
+            self.updates.clone(),
         ));
+        actors.entries.insert(
+            session_id,
+            ProviderActor {
+                commands: commands_tx.clone(),
+                task,
+            },
+        );
+        drop(actors);
         commands_tx
             .send(ProviderCommand::StartPrompt { prompt_id })
             .expect("new Provider actor accepts its initial Prompt");
@@ -109,8 +179,9 @@ impl ProviderOrchestrator {
             .actors
             .lock()
             .expect("Provider actor registry lock is not poisoned")
+            .entries
             .get(&session_id)
-            .cloned()
+            .map(|actor| actor.commands.clone())
             .ok_or_else(|| anyhow::anyhow!("Session has no Provider actor"))?;
         actor
             .send(command)
@@ -130,8 +201,9 @@ impl ProviderOrchestrator {
             .actors
             .lock()
             .expect("Provider actor registry lock is not poisoned")
+            .entries
             .get(&session_id)
-            .cloned()
+            .map(|actor| actor.commands.clone())
             .ok_or_else(|| {
                 self.fail_unavailable_interruption(
                     session_id,
@@ -167,10 +239,43 @@ impl ProviderOrchestrator {
         turn_id: TurnId,
         message: &str,
     ) -> InterruptTurnError {
-        let _ = self
-            .sessions
-            .fail_turn(session_id, turn_id, None, Vec::new(), message.to_owned());
+        let _ = self.updates.apply(|| {
+            self.sessions
+                .fail_turn(session_id, turn_id, None, Vec::new(), message.to_owned())
+        });
         InterruptTurnError::ProviderFailure(message.to_owned())
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        let actors = {
+            let mut registry = self
+                .actors
+                .lock()
+                .expect("Provider actor registry lock is not poisoned");
+            if registry.shutting_down {
+                None
+            } else {
+                registry.shutting_down = true;
+                Some(
+                    registry
+                        .entries
+                        .drain()
+                        .map(|(_, actor)| actor)
+                        .collect::<Vec<_>>(),
+                )
+            }
+        };
+
+        let Some(actors) = actors else {
+            let mut complete = self.shutdown_complete.subscribe();
+            while !*complete.borrow() && complete.changed().await.is_ok() {}
+            return;
+        };
+
+        for actor in actors {
+            let _ = actor.task.await;
+        }
+        self.shutdown_complete.send_replace(true);
     }
 }
 
@@ -180,79 +285,111 @@ async fn run_provider_session(
     session_id: SessionId,
     workspace: PathBuf,
     mut commands: mpsc::UnboundedReceiver<ProviderCommand>,
+    mut shutdown: watch::Receiver<bool>,
+    updates: ProviderUpdateGate,
 ) {
     let mut provider: Option<ConnectedProviderSession> = None;
     let mut active: Option<ActiveProviderTurn> = None;
 
-    loop {
+    'actor: loop {
+        if *shutdown.borrow() {
+            break;
+        }
         if active.is_none() {
-            let Some(command) = commands.recv().await else {
-                return;
+            let command = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => break,
+                command = commands.recv() => command,
             };
-            let ProviderCommand::StartPrompt { prompt_id } = command else {
-                if let ProviderCommand::InterruptTurn { turn_id, response } = command {
+            let Some(command) = command else { break };
+            let prompt_id = match command {
+                ProviderCommand::StartPrompt { prompt_id } => prompt_id,
+                ProviderCommand::InterruptTurn { turn_id, response } => {
                     let result = sessions.interrupt_target(session_id, turn_id);
                     let _ = response.send(result);
+                    continue;
                 }
-                continue;
+                ProviderCommand::SteerPrompt => continue,
             };
             if provider.is_none() {
-                let connection = runtime
-                    .start_session(ProviderSessionRequest {
+                let connection = tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut shutdown) => break 'actor,
+                    connection = runtime.start_session(ProviderSessionRequest {
                         workspace: workspace.clone(),
-                    })
-                    .await;
+                    }) => connection,
+                };
                 let connection = match connection {
                     Ok(connection) => connection,
                     Err(error) => {
-                        let _ = sessions.deliver_prompt(
+                        let Some(_) = updates.apply(|| {
+                            sessions.deliver_prompt(
+                                session_id,
+                                prompt_id,
+                                DeliveredTurnStatus::Failed {
+                                    message: format!("Provider startup failed: {error}"),
+                                },
+                            )
+                        }) else {
+                            break;
+                        };
+                        continue;
+                    }
+                };
+                let (identity, session, events) = connection.into_parts();
+                let Some(bound) = updates.apply(|| sessions.bind_agent(session_id, identity))
+                else {
+                    let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
+                    break;
+                };
+                if let Err(error) = bound {
+                    let _ = updates.apply(|| {
+                        sessions.deliver_prompt(
                             session_id,
                             prompt_id,
                             DeliveredTurnStatus::Failed {
                                 message: format!("Provider startup failed: {error}"),
                             },
-                        );
-                        continue;
-                    }
-                };
-                let (identity, session, events) = connection.into_parts();
-                if let Err(error) = sessions.bind_agent(session_id, identity) {
-                    let _ = sessions.deliver_prompt(
-                        session_id,
-                        prompt_id,
-                        DeliveredTurnStatus::Failed {
-                            message: format!("Provider startup failed: {error}"),
-                        },
-                    );
+                        )
+                    });
+                    let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
                     continue;
                 }
                 provider = Some(ConnectedProviderSession { session, events });
             }
 
-            let delivered =
-                match sessions.deliver_prompt(session_id, prompt_id, DeliveredTurnStatus::Active) {
-                    Ok(Some(delivered)) => delivered,
-                    Ok(None) => continue,
-                    Err(_) => continue,
-                };
+            let Some(delivered) = updates.apply(|| {
+                sessions.deliver_prompt(session_id, prompt_id, DeliveredTurnStatus::Active)
+            }) else {
+                break;
+            };
+            let delivered = match delivered {
+                Ok(Some(delivered)) => delivered,
+                Ok(None) => continue,
+                Err(_) => continue,
+            };
             let provider_session = provider
                 .as_ref()
                 .expect("Provider connection exists before Prompt delivery")
                 .session
                 .clone();
-            if let Err(error) = provider_session
-                .start_turn(ProviderTurnInput {
+            let started = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => break 'actor,
+                started = provider_session.start_turn(ProviderTurnInput {
                     prompt: delivered.prompt.text,
-                })
-                .await
-            {
-                let _ = sessions.fail_turn(
-                    session_id,
-                    delivered.turn.id,
-                    None,
-                    Vec::new(),
-                    format!("Provider execution failed: {error}"),
-                );
+                }) => started,
+            };
+            if let Err(error) = started {
+                let _ = updates.apply(|| {
+                    sessions.fail_turn(
+                        session_id,
+                        delivered.turn.id,
+                        None,
+                        Vec::new(),
+                        format!("Provider execution failed: {error}"),
+                    )
+                });
                 continue;
             }
             active = Some(ActiveProviderTurn {
@@ -278,12 +415,13 @@ async fn run_provider_session(
                 // Preserve the Provider's terminal boundary when both it and a later command
                 // became ready while an RPC was in flight.
                 biased;
+                _ = wait_for_shutdown(&mut shutdown) => break 'actor,
                 event = events.next() => ProviderInput::Event(event),
                 command = commands.recv() => ProviderInput::Command(command),
             }
         };
         match input {
-            ProviderInput::Command(None) => return,
+            ProviderInput::Command(None) => break,
             ProviderInput::Command(Some(ProviderCommand::StartPrompt { .. })) => {
                 // Prompts admitted while startup was still pending can already be queued here.
                 // Keep them pending until queued delivery and steering gain their own orchestration.
@@ -296,22 +434,28 @@ async fn run_provider_session(
                     Ok(Some(prompt)) => prompt,
                     Ok(None) | Err(_) => continue,
                 };
-                match provider_session
-                    .steer_turn(ProviderTurnInput {
+                let steered = tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut shutdown) => break 'actor,
+                    steered = provider_session.steer_turn(ProviderTurnInput {
                         prompt: prompt.text.clone(),
-                    })
-                    .await
-                {
+                    }) => steered,
+                };
+                match steered {
                     Ok(()) => {
-                        let _ = sessions.deliver_steer(session_id, current.turn_id, prompt.id);
+                        let _ = updates.apply(|| {
+                            sessions.deliver_steer(session_id, current.turn_id, prompt.id)
+                        });
                     }
                     Err(error) => {
-                        let _ = sessions.report_steer_failure(
-                            session_id,
-                            current.turn_id,
-                            prompt.id,
-                            format!("Provider steering failed: {error}"),
-                        );
+                        let _ = updates.apply(|| {
+                            sessions.report_steer_failure(
+                                session_id,
+                                current.turn_id,
+                                prompt.id,
+                                format!("Provider steering failed: {error}"),
+                            )
+                        });
                     }
                 }
             }
@@ -341,7 +485,12 @@ async fn run_provider_session(
                     let _ = response.send(Ok(target));
                     continue;
                 }
-                match provider_session.interrupt_turn().await {
+                let interrupted = tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut shutdown) => break 'actor,
+                    interrupted = provider_session.interrupt_turn() => interrupted,
+                };
+                match interrupted {
                     Ok(()) => {
                         current.interruption_acknowledged = true;
                         let _ = response.send(Ok(target));
@@ -350,13 +499,15 @@ async fn run_provider_session(
                         let message = format!("Provider interruption failed: {error}");
                         let streaming_message_id = current.streaming_message_id.take();
                         let active_command_ids = current.take_command_activity_ids();
-                        let _ = sessions.fail_turn(
-                            session_id,
-                            current.turn_id,
-                            streaming_message_id,
-                            active_command_ids,
-                            message.clone(),
-                        );
+                        let _ = updates.apply(|| {
+                            sessions.fail_turn(
+                                session_id,
+                                current.turn_id,
+                                streaming_message_id,
+                                active_command_ids,
+                                message.clone(),
+                            )
+                        });
                         active = None;
                         provider = None;
                         let _ = response.send(Err(InterruptTurnError::ProviderFailure(message)));
@@ -369,34 +520,38 @@ async fn run_provider_session(
                 };
                 match event {
                     Some(Ok(event)) => {
-                        if project_provider_event(&sessions, session_id, current, event) {
+                        if project_provider_event(&sessions, &updates, session_id, current, event) {
                             active = None;
                         }
                     }
                     Some(Err(error)) => {
                         let streaming_message_id = current.streaming_message_id.take();
                         let active_command_ids = current.take_command_activity_ids();
-                        let _ = sessions.fail_turn(
-                            session_id,
-                            current.turn_id,
-                            streaming_message_id,
-                            active_command_ids,
-                            format!("Provider execution failed: {error}"),
-                        );
+                        let _ = updates.apply(|| {
+                            sessions.fail_turn(
+                                session_id,
+                                current.turn_id,
+                                streaming_message_id,
+                                active_command_ids,
+                                format!("Provider execution failed: {error}"),
+                            )
+                        });
                         active = None;
                         provider = None;
                     }
                     None => {
                         let streaming_message_id = current.streaming_message_id.take();
                         let active_command_ids = current.take_command_activity_ids();
-                        let _ = sessions.fail_turn(
-                            session_id,
-                            current.turn_id,
-                            streaming_message_id,
-                            active_command_ids,
-                            "Provider execution failed: the Provider Session ended before the Turn completed."
-                                .to_owned(),
-                        );
+                        let _ = updates.apply(|| {
+                            sessions.fail_turn(
+                                session_id,
+                                current.turn_id,
+                                streaming_message_id,
+                                active_command_ids,
+                                "Provider execution failed: the Provider Session ended before the Turn completed."
+                                    .to_owned(),
+                            )
+                        });
                         active = None;
                         provider = None;
                     }
@@ -404,209 +559,232 @@ async fn run_provider_session(
             }
         }
     }
+
+    if let Some(connected) = provider {
+        let _ = timeout(Duration::from_secs(2), connected.session.shutdown()).await;
+    }
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
 }
 
 fn project_provider_event(
     sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
     session_id: SessionId,
     active: &mut ActiveProviderTurn,
     event: ProviderEvent,
 ) -> bool {
-    let projection = match event {
-        ProviderEvent::AgentMessageStarted => {
-            if active.streaming_message_id.is_some() {
-                Err(anyhow::anyhow!(
-                    "Provider started a second Agent Message before completing the first"
-                ))
-            } else {
-                let message_id = MessageId::new();
-                active.streaming_message_id = Some(message_id);
+    let Some(projected) = updates.apply(|| {
+        let projection = match event {
+            ProviderEvent::AgentMessageStarted => {
+                if active.streaming_message_id.is_some() {
+                    Err(anyhow::anyhow!(
+                        "Provider started a second Agent Message before completing the first"
+                    ))
+                } else {
+                    let message_id = MessageId::new();
+                    active.streaming_message_id = Some(message_id);
+                    sessions
+                        .publish_agent_output(
+                            session_id,
+                            SessionChange::MessageAdded {
+                                message: Message {
+                                    id: message_id,
+                                    turn_id: active.turn_id,
+                                    role: MessageRole::Agent,
+                                    status: MessageStatus::Streaming,
+                                    content: String::new(),
+                                },
+                            },
+                        )
+                        .map(|_| false)
+                }
+            }
+            ProviderEvent::AgentMessageDelta { content } => {
+                let Some(message_id) = active.streaming_message_id else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        "Provider sent Agent Message content before starting a Message",
+                    );
+                };
                 sessions
                     .publish_agent_output(
                         session_id,
-                        SessionChange::MessageAdded {
-                            message: Message {
-                                id: message_id,
-                                turn_id: active.turn_id,
-                                role: MessageRole::Agent,
-                                status: MessageStatus::Streaming,
-                                content: String::new(),
-                            },
+                        SessionChange::MessageContentAppended {
+                            message_id,
+                            content,
                         },
                     )
                     .map(|_| false)
             }
-        }
-        ProviderEvent::AgentMessageDelta { content } => {
-            let Some(message_id) = active.streaming_message_id else {
-                return fail_invalid_provider_event(
-                    sessions,
-                    session_id,
-                    active,
-                    "Provider sent Agent Message content before starting a Message",
-                );
-            };
-            sessions
-                .publish_agent_output(
-                    session_id,
-                    SessionChange::MessageContentAppended {
-                        message_id,
-                        content,
-                    },
-                )
-                .map(|_| false)
-        }
-        ProviderEvent::AgentMessageCompleted => {
-            let Some(message_id) = active.streaming_message_id.take() else {
-                return fail_invalid_provider_event(
-                    sessions,
-                    session_id,
-                    active,
-                    "Provider completed an Agent Message before starting one",
-                );
-            };
-            sessions
-                .publish_agent_output(session_id, SessionChange::MessageCompleted { message_id })
-                .map(|_| false)
-        }
-        ProviderEvent::CommandStarted {
-            activity_id,
-            command,
-            cwd,
-        } => {
-            if active.command_activities.contains_key(&activity_id) {
-                Err(anyhow::anyhow!(
-                    "Provider reused an active command Activity identity"
-                ))
-            } else {
-                let command_activity_id = ActivityId::new();
+            ProviderEvent::AgentMessageCompleted => {
+                let Some(message_id) = active.streaming_message_id.take() else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        "Provider completed an Agent Message before starting one",
+                    );
+                };
                 sessions
                     .publish_agent_output(
                         session_id,
-                        SessionChange::ActivityAdded {
-                            activity: Activity::Command {
-                                id: command_activity_id,
-                                turn_id: active.turn_id,
-                                status: ActivityStatus::Active,
-                                command,
-                                cwd,
-                                output: String::new(),
-                                exit_status: None,
+                        SessionChange::MessageCompleted { message_id },
+                    )
+                    .map(|_| false)
+            }
+            ProviderEvent::CommandStarted {
+                activity_id,
+                command,
+                cwd,
+            } => {
+                if active.command_activities.contains_key(&activity_id) {
+                    Err(anyhow::anyhow!(
+                        "Provider reused an active command Activity identity"
+                    ))
+                } else {
+                    let command_activity_id = ActivityId::new();
+                    sessions
+                        .publish_agent_output(
+                            session_id,
+                            SessionChange::ActivityAdded {
+                                activity: Activity::Command {
+                                    id: command_activity_id,
+                                    turn_id: active.turn_id,
+                                    status: ActivityStatus::Active,
+                                    command,
+                                    cwd,
+                                    output: String::new(),
+                                    exit_status: None,
+                                },
                             },
+                        )
+                        .map(|_| {
+                            active
+                                .command_activities
+                                .insert(activity_id, command_activity_id);
+                            false
+                        })
+                }
+            }
+            ProviderEvent::CommandOutputDelta {
+                activity_id,
+                content,
+            } => {
+                let Some(command_activity_id) =
+                    active.command_activities.get(&activity_id).copied()
+                else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        "Provider sent command output before starting the Activity",
+                    );
+                };
+                sessions
+                    .publish_agent_output(
+                        session_id,
+                        SessionChange::CommandOutputAppended {
+                            activity_id: command_activity_id,
+                            content,
+                        },
+                    )
+                    .map(|_| false)
+            }
+            ProviderEvent::CommandCompleted {
+                activity_id,
+                status,
+                exit_status,
+            } => {
+                let Some(command_activity_id) =
+                    active.command_activities.get(&activity_id).copied()
+                else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        "Provider completed a command before starting the Activity",
+                    );
+                };
+                sessions
+                    .publish_agent_output(
+                        session_id,
+                        SessionChange::CommandStatusChanged {
+                            activity_id: command_activity_id,
+                            status: match status {
+                                ProviderCommandStatus::Completed => ActivityStatus::Completed,
+                                ProviderCommandStatus::Failed => ActivityStatus::Failed,
+                            },
+                            exit_status,
                         },
                     )
                     .map(|_| {
-                        active
-                            .command_activities
-                            .insert(activity_id, command_activity_id);
+                        active.command_activities.remove(&activity_id);
                         false
                     })
             }
-        }
-        ProviderEvent::CommandOutputDelta {
-            activity_id,
-            content,
-        } => {
-            let Some(command_activity_id) = active.command_activities.get(&activity_id).copied()
-            else {
-                return fail_invalid_provider_event(
-                    sessions,
-                    session_id,
-                    active,
-                    "Provider sent command output before starting the Activity",
-                );
-            };
-            sessions
-                .publish_agent_output(
-                    session_id,
-                    SessionChange::CommandOutputAppended {
-                        activity_id: command_activity_id,
-                        content,
-                    },
-                )
-                .map(|_| false)
-        }
-        ProviderEvent::CommandCompleted {
-            activity_id,
-            status,
-            exit_status,
-        } => {
-            let Some(command_activity_id) = active.command_activities.get(&activity_id).copied()
-            else {
-                return fail_invalid_provider_event(
-                    sessions,
-                    session_id,
-                    active,
-                    "Provider completed a command before starting the Activity",
-                );
-            };
-            sessions
-                .publish_agent_output(
-                    session_id,
-                    SessionChange::CommandStatusChanged {
-                        activity_id: command_activity_id,
-                        status: match status {
-                            ProviderCommandStatus::Completed => ActivityStatus::Completed,
-                            ProviderCommandStatus::Failed => ActivityStatus::Failed,
-                        },
-                        exit_status,
-                    },
-                )
-                .map(|_| {
-                    active.command_activities.remove(&activity_id);
-                    false
-                })
-        }
-        ProviderEvent::TurnCompleted => {
-            if active.streaming_message_id.is_some() || !active.command_activities.is_empty() {
-                Err(anyhow::anyhow!(
-                    "Provider completed the Turn before completing its streamed output"
-                ))
-            } else {
+            ProviderEvent::TurnCompleted => {
+                if active.streaming_message_id.is_some() || !active.command_activities.is_empty() {
+                    Err(anyhow::anyhow!(
+                        "Provider completed the Turn before completing its streamed output"
+                    ))
+                } else {
+                    sessions
+                        .complete_turn(session_id, active.turn_id)
+                        .map(|_| true)
+                }
+            }
+            ProviderEvent::TurnInterrupted => {
+                let streaming_message_id = active.streaming_message_id.take();
+                let active_command_ids = active.take_command_activity_ids();
                 sessions
-                    .complete_turn(session_id, active.turn_id)
+                    .interrupt_provider_turn(
+                        session_id,
+                        active.turn_id,
+                        streaming_message_id,
+                        active_command_ids,
+                    )
                     .map(|_| true)
             }
-        }
-        ProviderEvent::TurnInterrupted => {
-            let streaming_message_id = active.streaming_message_id.take();
-            let active_command_ids = active.take_command_activity_ids();
-            sessions
-                .interrupt_provider_turn(
-                    session_id,
-                    active.turn_id,
-                    streaming_message_id,
-                    active_command_ids,
-                )
-                .map(|_| true)
-        }
-        ProviderEvent::TurnFailed { message } => {
-            let streaming_message_id = active.streaming_message_id.take();
-            let active_command_ids = active.take_command_activity_ids();
-            sessions
-                .fail_turn(
-                    session_id,
-                    active.turn_id,
-                    streaming_message_id,
-                    active_command_ids,
-                    message,
-                )
-                .map(|_| true)
-        }
-    };
+            ProviderEvent::TurnFailed { message } => {
+                let streaming_message_id = active.streaming_message_id.take();
+                let active_command_ids = active.take_command_activity_ids();
+                sessions
+                    .fail_turn(
+                        session_id,
+                        active.turn_id,
+                        streaming_message_id,
+                        active_command_ids,
+                        message,
+                    )
+                    .map(|_| true)
+            }
+        };
 
-    projection.unwrap_or_else(|error| {
-        let streaming_message_id = active.streaming_message_id.take();
-        let active_command_ids = active.take_command_activity_ids();
-        let _ = sessions.fail_turn(
-            session_id,
-            active.turn_id,
-            streaming_message_id,
-            active_command_ids,
-            format!("Provider execution failed: {error}"),
-        );
-        true
-    })
+        projection.unwrap_or_else(|error| {
+            let streaming_message_id = active.streaming_message_id.take();
+            let active_command_ids = active.take_command_activity_ids();
+            let _ = sessions.fail_turn(
+                session_id,
+                active.turn_id,
+                streaming_message_id,
+                active_command_ids,
+                format!("Provider execution failed: {error}"),
+            );
+            true
+        })
+    }) else {
+        return true;
+    };
+    projected
 }
 
 fn fail_invalid_provider_event(

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{ChildStdout, Command},
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::{Mutex, mpsc, oneshot, watch},
     time::{Duration, timeout},
 };
@@ -30,6 +30,9 @@ use crate::protocol::{AgentId, AgentIdentity, ModelId, ProviderId};
 const CODEX_PATH_ENV: &str = "CHIDORI_CODEX_PATH";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+const PROCESS_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(500);
+const PROCESS_KILL_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_REMOTE_ERROR_CHARS: usize = 384;
 
 #[derive(Serialize)]
@@ -220,11 +223,13 @@ async fn start_codex_session(
         events: events_tx,
         terminated: AtomicBool::new(false),
     });
-    let writer = Arc::new(Mutex::new(stdin));
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let writer = Arc::new(Mutex::new(Some(stdin)));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (stopped_tx, stopped_rx) = watch::channel(false);
     let (exit_tx, exit_rx) = watch::channel(None::<ProviderError>);
     let process = Arc::new(ProcessGuard {
         shutdown: shutdown_tx,
+        stopped: stopped_rx,
     });
 
     tokio::spawn(read_stdout(stdout, writer.clone(), state.clone(), exit_rx));
@@ -234,28 +239,14 @@ async fn start_codex_session(
         let mut sink = tokio::io::sink();
         let _ = tokio::io::copy(&mut stderr, &mut sink).await;
     });
-    tokio::spawn(async move {
-        tokio::select! {
-            status = child.wait() => {
-                let message = match status {
-                    Ok(status) if status.success() => {
-                        "Codex app-server exited unexpectedly".to_owned()
-                    }
-                    Ok(status) => format!("Codex app-server exited unexpectedly with {status}"),
-                    Err(error) => format!("could not wait for Codex app-server: {error}"),
-                };
-                let error = codex_error(message);
-                exit_tx.send_replace(Some(error.clone()));
-                terminate_transport(&process_state, error);
-            }
-            changed = shutdown_rx.changed() => {
-                if changed.is_ok() && *shutdown_rx.borrow() {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                }
-            }
-        }
-    });
+    tokio::spawn(supervise_child(
+        child,
+        shutdown_rx,
+        stopped_tx,
+        exit_tx,
+        writer.clone(),
+        process_state,
+    ));
 
     let transport = JsonRpcTransport {
         writer,
@@ -326,6 +317,8 @@ async fn start_codex_session(
         thread_id: started.thread.id,
         transport,
         correlation: correlation.clone(),
+        process: process.clone(),
+        shutdown_started: AtomicBool::new(false),
     });
     let events: ProviderEventStream = Box::pin(stream::unfold(
         GuardedEventReceiver {
@@ -362,6 +355,8 @@ struct CodexSession {
     thread_id: String,
     transport: JsonRpcTransport,
     correlation: Arc<StdMutex<NativeCorrelation>>,
+    process: Arc<ProcessGuard>,
+    shutdown_started: AtomicBool,
 }
 
 impl ProviderSession for CodexSession {
@@ -466,6 +461,38 @@ impl ProviderSession for CodexSession {
                 .await
                 .map_err(|error| codex_error(format!("Codex Turn interruption failed: {error}")))?;
             Ok(())
+        })
+    }
+
+    fn shutdown(&self) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            if self.shutdown_started.swap(true, Ordering::AcqRel) {
+                return self.process.wait_until_stopped().await;
+            }
+
+            let active_turn_id = self
+                .correlation
+                .lock()
+                .expect("Codex native correlation lock is not poisoned")
+                .active_turn_id
+                .clone();
+            if let Some(turn_id) = active_turn_id {
+                let _ = timeout(
+                    SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT,
+                    self.transport.request(
+                        "turn/interrupt",
+                        &TurnInterruptParams {
+                            thread_id: &self.thread_id,
+                            turn_id: &turn_id,
+                        },
+                    ),
+                )
+                .await;
+            }
+
+            self.process.begin_shutdown();
+            self.transport.close().await;
+            self.process.wait_until_stopped().await
         })
     }
 }
@@ -870,11 +897,91 @@ fn is_active_native_turn(correlation: &NativeCorrelation, thread_id: &str, turn_
 
 struct ProcessGuard {
     shutdown: watch::Sender<bool>,
+    stopped: watch::Receiver<bool>,
+}
+
+impl ProcessGuard {
+    fn begin_shutdown(&self) {
+        self.shutdown.send_replace(true);
+    }
+
+    async fn wait_until_stopped(&self) -> Result<(), ProviderError> {
+        let mut stopped = self.stopped.clone();
+        if *stopped.borrow() {
+            return Ok(());
+        }
+        let wait = async {
+            while !*stopped.borrow() {
+                stopped.changed().await.map_err(|_| {
+                    codex_error("Codex app-server process supervisor stopped unexpectedly")
+                })?;
+            }
+            Ok(())
+        };
+        timeout(
+            PROCESS_EXIT_GRACE_PERIOD + PROCESS_KILL_TIMEOUT + Duration::from_millis(250),
+            wait,
+        )
+        .await
+        .map_err(|_| codex_error("Codex app-server did not stop within the shutdown deadline"))?
+    }
 }
 
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
-        self.shutdown.send_replace(true);
+        self.begin_shutdown();
+    }
+}
+
+async fn supervise_child(
+    mut child: Child,
+    mut shutdown: watch::Receiver<bool>,
+    stopped: watch::Sender<bool>,
+    exit: watch::Sender<Option<ProviderError>>,
+    writer: Arc<Mutex<Option<ChildStdin>>>,
+    state: Arc<TransportState>,
+) {
+    let status = tokio::select! {
+        biased;
+        _ = wait_for_process_shutdown(&mut shutdown) => {
+            close_transport(
+                &state,
+                codex_error("Codex app-server transport closed during shutdown"),
+            );
+            close_stdin(&writer).await;
+            match timeout(PROCESS_EXIT_GRACE_PERIOD, child.wait()).await {
+                Ok(status) => status,
+                Err(_) => {
+                    let _ = child.start_kill();
+                    match timeout(PROCESS_KILL_TIMEOUT, child.wait()).await {
+                        Ok(status) => status,
+                        Err(_) => Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "forced Codex termination did not complete before the deadline",
+                        )),
+                    }
+                }
+            }
+        }
+        status = child.wait() => status,
+    };
+
+    let message = match status {
+        Ok(status) if status.success() => "Codex app-server exited unexpectedly".to_owned(),
+        Ok(status) => format!("Codex app-server exited unexpectedly with {status}"),
+        Err(error) => format!("could not wait for Codex app-server: {error}"),
+    };
+    let error = codex_error(message);
+    exit.send_replace(Some(error.clone()));
+    terminate_transport(&state, error);
+    stopped.send_replace(true);
+}
+
+async fn wait_for_process_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
     }
 }
 
@@ -888,7 +995,7 @@ struct TransportState {
 
 #[derive(Clone)]
 struct JsonRpcTransport {
-    writer: Arc<Mutex<tokio::process::ChildStdin>>,
+    writer: Arc<Mutex<Option<ChildStdin>>>,
     state: Arc<TransportState>,
     next_id: Arc<AtomicI64>,
     _process: Arc<ProcessGuard>,
@@ -962,10 +1069,25 @@ impl JsonRpcTransport {
         )
         .await
     }
+
+    async fn close(&self) {
+        close_transport(
+            &self.state,
+            codex_error("Codex app-server transport closed during shutdown"),
+        );
+        close_stdin(&self.writer).await;
+    }
+}
+
+async fn close_stdin(writer: &Arc<Mutex<Option<ChildStdin>>>) {
+    let stdin = writer.lock().await.take();
+    if let Some(mut stdin) = stdin {
+        let _ = stdin.shutdown().await;
+    }
 }
 
 async fn write_json_line<T: Serialize + ?Sized>(
-    writer: &Arc<Mutex<tokio::process::ChildStdin>>,
+    writer: &Arc<Mutex<Option<ChildStdin>>>,
     value: &T,
     operation: &str,
 ) -> Result<(), ProviderError> {
@@ -973,6 +1095,9 @@ async fn write_json_line<T: Serialize + ?Sized>(
         .map_err(|error| codex_error(format!("could not encode Codex message: {error}")))?;
     bytes.push(b'\n');
     let mut writer = writer.lock().await;
+    let writer = writer
+        .as_mut()
+        .ok_or_else(|| codex_error("Codex app-server transport has ended"))?;
     writer
         .write_all(&bytes)
         .await
@@ -985,7 +1110,7 @@ async fn write_json_line<T: Serialize + ?Sized>(
 
 async fn read_stdout(
     stdout: ChildStdout,
-    writer: Arc<Mutex<tokio::process::ChildStdin>>,
+    writer: Arc<Mutex<Option<ChildStdin>>>,
     state: Arc<TransportState>,
     mut exit: watch::Receiver<Option<ProviderError>>,
 ) {
@@ -1048,7 +1173,7 @@ async fn await_exit_error(
 
 async fn route_message(
     message: IncomingMessage,
-    writer: &Arc<Mutex<tokio::process::ChildStdin>>,
+    writer: &Arc<Mutex<Option<ChildStdin>>>,
     state: &Arc<TransportState>,
 ) -> Result<(), ProviderError> {
     if let Some(method) = message.method.as_deref() {
@@ -1093,7 +1218,7 @@ async fn route_message(
 }
 
 async fn reject_server_request(
-    writer: &Arc<Mutex<tokio::process::ChildStdin>>,
+    writer: &Arc<Mutex<Option<ChildStdin>>>,
     id: RequestId,
     method: &str,
 ) -> Result<(), ProviderError> {
@@ -1258,6 +1383,14 @@ fn codex_error(message: impl AsRef<str>) -> ProviderError {
 }
 
 fn terminate_transport(state: &TransportState, error: ProviderError) {
+    finish_transport(state, error, true);
+}
+
+fn close_transport(state: &TransportState, error: ProviderError) {
+    finish_transport(state, error, false);
+}
+
+fn finish_transport(state: &TransportState, error: ProviderError, publish_error: bool) {
     if state.terminated.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -1274,7 +1407,9 @@ fn terminate_transport(state: &TransportState, error: ProviderError) {
     for response in pending {
         let _ = response.send(Err(error.clone()));
     }
-    let _ = state.events.send(Err(error));
+    if publish_error {
+        let _ = state.events.send(Err(error));
+    }
 }
 
 #[cfg(test)]

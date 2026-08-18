@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+#[allow(dead_code)]
+mod support;
+
 use std::{os::unix::fs::PermissionsExt, sync::Arc};
 
 use chidori::{
@@ -9,15 +12,18 @@ use chidori::{
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, CreateSessionRequest,
         InitialPrompt, MessageRole, MessageStatus, ModelId, PromptDelivery, PromptId, PromptStatus,
-        ProviderId, SessionChange, SessionId, SessionSnapshot, SessionStatus, TranscriptItem,
-        TurnId, TurnStatus, Workspace,
+        ProviderId, SessionChange, SessionId, SessionSnapshot, SessionStatus, ShutdownReason,
+        TranscriptItem, TurnId, TurnStatus, Workspace,
     },
     provider::CodexRuntime,
     server::{self, RunningServer, ServerConfig},
     tui::{Application, ApplicationEvent},
 };
 use serde_json::Value;
+use sysinfo::{Pid, System};
 use tokio::time::{Duration, timeout};
+
+use support::request_server_shutdown;
 
 const SCRIPTED_CODEX: &str = r#"#!/bin/sh
 if [ "$1" != "app-server" ]; then
@@ -194,6 +200,59 @@ __TURN_START_ACTION__
       ;;
     *'"method":"turn/steer"'*)
 __STEER_ACTION__
+      ;;
+  esac
+done
+"#;
+
+const COOPERATIVE_SHUTDOWN: &str = r#"#!/bin/sh
+printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
+trap 'printf exited > "$CODEX_FIXTURE_EXITED"' EXIT
+
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"working-message","text":""}}}'
+      printf ready > "$CODEX_FIXTURE_READY"
+      ;;
+    *'"method":"turn/interrupt"'*)
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"late-message","text":""}}}'
+      printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"late-message","delta":"late shutdown output"}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"late-message","text":"late shutdown output"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"interrupted","items":[]}}}'
+      printf '%s\n' '{"id":4,"result":{}}'
+      ;;
+  esac
+done
+"#;
+
+const UNRESPONSIVE_SHUTDOWN: &str = r#"#!/bin/sh
+printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
+
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"working-message","text":""}}}'
+      printf ready > "$CODEX_FIXTURE_READY"
+      ;;
+    *'"method":"turn/interrupt"'*)
+      while :; do :; done
       ;;
   esac
 done
@@ -677,6 +736,14 @@ async fn assert_terminal_steering_race(
 
     fixture.shutdown().await;
 }
+const PENDING_INITIALIZE_SHUTDOWN: &str = r#"#!/bin/sh
+printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
+trap 'printf exited > "$CODEX_FIXTURE_EXITED"' EXIT
+
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+done
+"#;
 
 #[tokio::test]
 async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
@@ -1151,6 +1218,269 @@ async fn codex_launch_protocol_and_process_failures_settle_as_error_activities()
     .await;
 }
 
+#[tokio::test]
+async fn server_shutdown_interrupts_active_codex_and_allows_cooperative_exit() {
+    let fixture = ScriptedCodex::new(COOPERATIVE_SHUTDOWN);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-cooperative-shutdown")
+            .expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-cooperative-shutdown")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Keep working until Chidori shuts down".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    fixture.wait_for_method("turn/start").await;
+    fixture.wait_until_ready().await;
+    let before_shutdown = wait_for_agent_output(&client, created.session.id).await;
+    assert_eq!(before_shutdown.turns[0].status, TurnStatus::Active);
+
+    let response = request_server_shutdown(&descriptor, ShutdownReason::Manual).await;
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    fixture.wait_for_exit().await;
+
+    let after_shutdown = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{}",
+            descriptor.base_url, created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("read Session during graceful HTTP shutdown")
+        .error_for_status()
+        .expect("Session remains readable during graceful HTTP shutdown")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode Session after Provider shutdown");
+    assert_eq!(
+        after_shutdown.revision, before_shutdown.revision,
+        "Provider output after shutdown begins must not change the Session"
+    );
+    assert_eq!(after_shutdown.turns[0].status, TurnStatus::Active);
+
+    let methods = fixture
+        .requests()
+        .into_iter()
+        .filter_map(|request| {
+            request
+                .get("method")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        methods,
+        [
+            "initialize",
+            "initialized",
+            "thread/start",
+            "turn/start",
+            "turn/interrupt"
+        ]
+    );
+    assert_process_exited(fixture.pid());
+
+    drop(client);
+    timeout(Duration::from_secs(2), server.shutdown())
+        .await
+        .expect("repeated shutdown request remains bounded")
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn server_shutdown_releases_pending_rpc_and_forces_an_unresponsive_codex_to_exit() {
+    let fixture = ScriptedCodex::new(UNRESPONSIVE_SHUTDOWN);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-forced-shutdown").expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-forced-shutdown")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Remain unresponsive during shutdown".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    fixture.wait_for_method("turn/start").await;
+    fixture.wait_until_ready().await;
+    wait_for_agent_output(&client, created.session.id).await;
+
+    timeout(Duration::from_secs(2), server.shutdown())
+        .await
+        .expect("forced Provider termination bounds server shutdown")
+        .expect("shut down server");
+    assert!(
+        fixture
+            .requests()
+            .iter()
+            .any(|request| request.get("method").and_then(Value::as_str) == Some("turn/interrupt")),
+        "shutdown asks active Codex work to interrupt before forcing termination"
+    );
+    assert_process_exited(fixture.pid());
+}
+
+#[tokio::test]
+async fn server_shutdown_closes_transport_with_a_startup_request_pending() {
+    let fixture = ScriptedCodex::new(PENDING_INITIALIZE_SHUTDOWN);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-pending-startup-shutdown")
+            .expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-pending-startup-shutdown")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Shut down during Codex initialization".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session while Provider starts");
+    fixture.wait_for_method("initialize").await;
+
+    timeout(Duration::from_secs(2), server.shutdown())
+        .await
+        .expect("pending startup RPC does not delay server shutdown")
+        .expect("shut down server");
+    fixture.wait_for_exit().await;
+    assert_process_exited(fixture.pid());
+}
+
+#[tokio::test]
+#[ignore = "set CHIDORI_CODEX_SMOKE=1 to use the installed authenticated Codex binary"]
+async fn installed_codex_launches_runs_one_text_turn_and_shuts_down() {
+    if std::env::var_os("CHIDORI_CODEX_SMOKE").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        eprintln!("skipping: set CHIDORI_CODEX_SMOKE=1 to opt in");
+        return;
+    }
+
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-installed-smoke").expect("configure server"),
+        Arc::new(CodexRuntime::from_environment()),
+    )
+    .await
+    .expect("launch server with installed Codex");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-installed-smoke")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Reply with a short confirmation that the smoke test completed.".to_owned(),
+            },
+        })
+        .await
+        .expect("create live Codex Session");
+    let mut feed = client
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe to live Codex Session SSE");
+
+    let completed = timeout(Duration::from_secs(120), async {
+        loop {
+            let snapshot = client
+                .read_session(created.session.id)
+                .await
+                .expect("read live Codex Session");
+            if snapshot.turns.first().is_some_and(|turn| {
+                matches!(
+                    turn.status,
+                    TurnStatus::Completed | TurnStatus::Failed | TurnStatus::Interrupted
+                )
+            }) {
+                return snapshot;
+            }
+            feed.next()
+                .await
+                .expect("live Codex Session feed remains open")
+                .expect("live Codex Session event is valid");
+        }
+    })
+    .await
+    .expect("installed Codex completes one text Turn");
+
+    assert_eq!(completed.turns[0].status, TurnStatus::Completed);
+    let identity = completed
+        .session
+        .agent
+        .expect("Codex binds its effective Model");
+    assert_eq!(identity.agent, AgentId::new("codex"));
+    assert_eq!(identity.provider, ProviderId::new("codex"));
+    assert!(completed.messages.iter().any(|message| {
+        message.role == MessageRole::Agent
+            && message.status == MessageStatus::Completed
+            && !message.content.trim().is_empty()
+    }));
+
+    drop(feed);
+    drop(client);
+    timeout(Duration::from_secs(2), server.shutdown())
+        .await
+        .expect("live Codex shutdown remains bounded")
+        .expect("shut down live Codex server");
+}
+
 async fn assert_provider_failure(
     executable: impl AsRef<std::ffi::OsStr>,
     channel: &str,
@@ -1443,11 +1773,35 @@ async fn receive_initial_state(client: &mut ManagedClient) {
     ));
 }
 
+async fn wait_for_agent_output(client: &ManagedClient, session_id: SessionId) -> SessionSnapshot {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = client
+                .read_session(session_id)
+                .await
+                .expect("read Session while scripted Codex starts");
+            if snapshot
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Agent)
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("scripted Codex Agent output reaches the Session")
+}
+
 struct ScriptedCodex {
     _directory: tempfile::TempDir,
     executable: std::path::PathBuf,
     log: std::path::PathBuf,
     release: std::path::PathBuf,
+    pid: std::path::PathBuf,
+    exited: std::path::PathBuf,
+    ready: std::path::PathBuf,
 }
 
 impl ScriptedCodex {
@@ -1456,6 +1810,9 @@ impl ScriptedCodex {
         let executable = directory.path().join("codex");
         let log = directory.path().join("requests.jsonl");
         let release = directory.path().join("release");
+        let pid = directory.path().join("pid");
+        let exited = directory.path().join("exited");
+        let ready = directory.path().join("ready");
         let script = script
             .replace(
                 "$CODEX_FIXTURE_LOG",
@@ -1464,6 +1821,18 @@ impl ScriptedCodex {
             .replace(
                 "$CODEX_FIXTURE_RELEASE",
                 release.to_str().expect("fixture release path is UTF-8"),
+            )
+            .replace(
+                "$CODEX_FIXTURE_PID",
+                pid.to_str().expect("fixture PID path is UTF-8"),
+            )
+            .replace(
+                "$CODEX_FIXTURE_EXITED",
+                exited.to_str().expect("fixture exit path is UTF-8"),
+            )
+            .replace(
+                "$CODEX_FIXTURE_READY",
+                ready.to_str().expect("fixture ready path is UTF-8"),
             );
         std::fs::write(&executable, script).expect("write scripted Codex executable");
         let mut permissions = std::fs::metadata(&executable)
@@ -1476,6 +1845,9 @@ impl ScriptedCodex {
             executable,
             log,
             release,
+            pid,
+            exited,
+            ready,
         }
     }
 
@@ -1509,6 +1881,34 @@ impl ScriptedCodex {
         std::fs::write(&self.release, b"release").expect("release scripted Codex events");
     }
 
+    async fn wait_for_exit(&self) {
+        timeout(Duration::from_secs(2), async {
+            while !self.exited.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scripted Codex exits cooperatively");
+    }
+
+    async fn wait_until_ready(&self) {
+        timeout(Duration::from_secs(2), async {
+            while !self.ready.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scripted Codex reports its native Turn ready");
+    }
+
+    fn pid(&self) -> u32 {
+        std::fs::read_to_string(&self.pid)
+            .expect("read scripted Codex PID")
+            .trim()
+            .parse()
+            .expect("scripted Codex PID is numeric")
+    }
+
     fn requests(&self) -> Vec<Value> {
         std::fs::read_to_string(&self.log)
             .unwrap_or_default()
@@ -1516,4 +1916,12 @@ impl ScriptedCodex {
             .map(|line| serde_json::from_str(line).expect("decode captured Codex request"))
             .collect()
     }
+}
+
+fn assert_process_exited(pid: u32) {
+    let system = System::new_all();
+    assert!(
+        system.process(Pid::from_u32(pid)).is_none(),
+        "scripted Codex process {pid} survived server shutdown"
+    );
 }

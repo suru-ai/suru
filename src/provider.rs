@@ -10,7 +10,7 @@ mod codex;
 mod orchestration;
 
 pub use codex::CodexRuntime;
-pub(crate) use orchestration::ProviderOrchestrator;
+pub(crate) use orchestration::{ProviderOrchestrator, ProviderUpdateGate};
 
 pub type ProviderFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ProviderError>> + Send + 'a>>;
@@ -104,6 +104,9 @@ pub trait ProviderSession: Send + Sync + 'static {
     fn steer_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()>;
 
     fn interrupt_turn(&self) -> ProviderFuture<'_, ()>;
+
+    /// Stops accepting Provider work and releases the Session's resources within a bounded time.
+    fn shutdown(&self) -> ProviderFuture<'_, ()>;
 }
 
 pub struct ProviderSessionConnection {

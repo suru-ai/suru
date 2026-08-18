@@ -33,7 +33,7 @@ use crate::protocol::{
     SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionChange,
     SessionError, SessionErrorCode, SessionId, SessionUpdate, ShutdownReason, TurnId,
 };
-use crate::provider::{CodexRuntime, ProviderOrchestrator, ProviderRuntime};
+use crate::provider::{CodexRuntime, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate};
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
     AdmitPromptError, CreateSessionError, InterruptTurnError, ListSessionsError,
@@ -184,6 +184,8 @@ struct ShutdownController {
     lifecycle: watch::Sender<LifecycleState>,
     shutdown_intent: watch::Sender<Option<ServerShutdown>>,
     shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    provider_shutdown: watch::Sender<bool>,
+    provider_updates: ProviderUpdateGate,
 }
 
 impl ShutdownController {
@@ -196,21 +198,29 @@ impl ShutdownController {
     }
 
     fn request(&self, request: ServerShutdown) {
-        self.lifecycle.send_replace(LifecycleState::Stopping);
-        self.shutdown_intent.send_replace(Some(request));
         let shutdown = self
             .shutdown
             .lock()
             .expect("shutdown sender lock is not poisoned")
             .take();
-        if let Some(shutdown) = shutdown {
-            tokio::spawn(async move {
-                // Keep health and existing streams available briefly so the accepted response and
-                // final authenticated intent can reach clients before graceful transport closure.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let _ = shutdown.send(());
-            });
-        }
+        let Some(shutdown) = shutdown else {
+            return;
+        };
+        self.provider_updates.stop();
+        self.lifecycle.send_replace(LifecycleState::Stopping);
+        self.shutdown_intent.send_replace(Some(request));
+        self.provider_shutdown.send_replace(true);
+        tokio::spawn(async move {
+            // Keep health and existing streams available briefly so the accepted response and
+            // final authenticated intent can reach clients before graceful transport closure.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = shutdown.send(());
+        });
+    }
+
+    fn stop_providers(&self) {
+        self.provider_updates.stop();
+        self.provider_shutdown.send_replace(true);
     }
 }
 
@@ -262,17 +272,26 @@ pub async fn spawn_with_provider(
     let (lifecycle, _) = watch::channel(LifecycleState::Starting);
     let (shutdown_intent, _) = watch::channel(None);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (provider_shutdown, provider_shutdown_rx) = watch::channel(false);
+    let provider_updates = ProviderUpdateGate::new();
     let shutdown = ShutdownController {
         lifecycle: lifecycle.clone(),
         shutdown_intent: shutdown_intent.clone(),
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
+        provider_shutdown,
+        provider_updates: provider_updates.clone(),
     };
     let sessions = SessionStore::default();
-    let providers = ProviderOrchestrator::new(runtime, sessions.clone());
+    let providers = ProviderOrchestrator::new(
+        runtime,
+        sessions.clone(),
+        provider_shutdown_rx,
+        provider_updates,
+    );
     let state = AppState {
         descriptor: Arc::new(descriptor.clone()),
         sessions: sessions.clone(),
-        providers,
+        providers: providers.clone(),
         shutdown: shutdown.clone(),
     };
     let app = Router::new()
@@ -299,6 +318,17 @@ pub async fn spawn_with_provider(
     let descriptor_path = config.descriptor_path();
     let instance_id = descriptor.identity.instance_id;
     let task_lifecycle = lifecycle.clone();
+    let task_shutdown = shutdown.clone();
+    let providers_for_shutdown = providers.clone();
+    let mut provider_shutdown_requested = task_shutdown.provider_shutdown.subscribe();
+    let provider_shutdown_task = tokio::spawn(async move {
+        while !*provider_shutdown_requested.borrow() {
+            if provider_shutdown_requested.changed().await.is_err() {
+                break;
+            }
+        }
+        providers_for_shutdown.shutdown().await;
+    });
     let task = tokio::spawn(async move {
         let _lock = lock;
         let result = axum::serve(listener, app)
@@ -307,11 +337,15 @@ pub async fn spawn_with_provider(
             })
             .await
             .context("serve local HTTP API");
+        task_shutdown.stop_providers();
+        let provider_shutdown_result = provider_shutdown_task
+            .await
+            .context("Provider shutdown task panicked");
         if result.is_err() {
             task_lifecycle.send_replace(LifecycleState::Failed);
         }
         remove_own_descriptor(&descriptor_path, instance_id);
-        result
+        result.and(provider_shutdown_result)
     });
     lifecycle.send_if_modified(|state| {
         if *state == LifecycleState::Starting {

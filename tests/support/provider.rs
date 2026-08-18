@@ -229,4 +229,8 @@ impl ProviderSession for ControlledSessionHandle {
                 .map_err(|_| ProviderError::new("test Provider interruption was abandoned"))?
         })
     }
+
+    fn shutdown(&self) -> ProviderFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
