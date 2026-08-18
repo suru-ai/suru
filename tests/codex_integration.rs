@@ -207,6 +207,8 @@ done
 
 const COOPERATIVE_SHUTDOWN: &str = r#"#!/bin/sh
 printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
+sleep 30 &
+printf '%s\n' "$!" > "$CODEX_FIXTURE_CHILD_PID"
 trap 'printf exited > "$CODEX_FIXTURE_EXITED"' EXIT
 
 while IFS= read -r line; do
@@ -228,6 +230,35 @@ while IFS= read -r line; do
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"late-message","delta":"late shutdown output"}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"late-message","text":"late shutdown output"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"interrupted","items":[]}}}'
+      printf '%s\n' '{"id":4,"result":{}}'
+      ;;
+  esac
+done
+"#;
+
+const PENDING_TURN_START_SHUTDOWN: &str = r#"#!/bin/sh
+printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
+trap 'printf exited > "$CODEX_FIXTURE_EXITED"' EXIT
+
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf ready > "$CODEX_FIXTURE_READY"
+      (
+        while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
+          sleep 0.01
+        done
+        printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      ) &
+      ;;
+    *'"method":"turn/interrupt"'*)
       printf '%s\n' '{"id":4,"result":{}}'
       ;;
   esac
@@ -1302,12 +1333,65 @@ async fn server_shutdown_interrupts_active_codex_and_allows_cooperative_exit() {
         ]
     );
     assert_process_exited(fixture.pid()).await;
+    assert_process_exited(fixture.child_pid()).await;
 
     drop(client);
     timeout(Duration::from_secs(2), server.shutdown())
         .await
         .expect("repeated shutdown request remains bounded")
         .expect("shut down server");
+}
+
+#[tokio::test]
+async fn server_shutdown_interrupts_a_turn_whose_start_response_is_pending() {
+    let fixture = ScriptedCodex::new(PENDING_TURN_START_SHUTDOWN);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-pending-turn-shutdown")
+            .expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-pending-turn-shutdown")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Shut down while Codex accepts this Turn".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    fixture.wait_until_ready().await;
+
+    let response = request_server_shutdown(&descriptor, ShutdownReason::Manual).await;
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    fixture.release();
+    timeout(Duration::from_secs(2), server.shutdown())
+        .await
+        .expect("pending Turn startup keeps shutdown bounded")
+        .expect("shut down server");
+
+    assert!(
+        fixture
+            .requests()
+            .iter()
+            .any(|request| request.get("method").and_then(Value::as_str) == Some("turn/interrupt")),
+        "shutdown waits for the accepted native Turn ID and interrupts it before closing transport"
+    );
+    assert_process_exited(fixture.pid()).await;
 }
 
 #[tokio::test]

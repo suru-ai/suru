@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, mpsc, oneshot, watch},
+    sync::{Mutex, Notify, mpsc, oneshot, watch},
     time::{Duration, timeout},
 };
 
@@ -31,6 +31,7 @@ const CODEX_PATH_ENV: &str = "CHIDORI_CODEX_PATH";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+const PENDING_TURN_START_GRACE_PERIOD: Duration = Duration::from_millis(250);
 const PROCESS_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(500);
 const PROCESS_KILL_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_REMOTE_ERROR_CHARS: usize = 384;
@@ -208,9 +209,7 @@ async fn start_codex_session(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command.spawn().map_err(|error| {
+    let (mut child, process_tree) = spawn_codex_child(&mut command).map_err(|error| {
         codex_error(format!(
             "could not launch Codex app-server `{}`: {error}",
             executable.to_string_lossy()
@@ -244,10 +243,10 @@ async fn start_codex_session(
         shutdown: shutdown_tx,
         stopped: stopped_rx,
     };
-    let process_id = match processes.register(process_control.clone()) {
-        Ok(process_id) => process_id,
+    let registration_id = match processes.register(process_control.clone()) {
+        Ok(registration_id) => registration_id,
         Err(error) => {
-            let _ = terminate_process_tree(&mut child);
+            let _ = process_tree.terminate(&mut child);
             let _ = timeout(PROCESS_KILL_TIMEOUT, child.wait()).await;
             return Err(error);
         }
@@ -271,7 +270,8 @@ async fn start_codex_session(
         writer: writer.clone(),
         state: process_state,
         processes,
-        process_id,
+        registration_id,
+        process_tree,
     }));
 
     let transport = JsonRpcTransport {
@@ -335,14 +335,17 @@ async fn start_codex_session(
 
     let correlation = Arc::new(StdMutex::new(NativeCorrelation {
         thread_id: started.thread.id.clone(),
+        turn_starting: false,
         active_turn_id: None,
         active_agent_message: None,
         active_commands: HashMap::new(),
     }));
+    let turn_start_changed = Arc::new(Notify::new());
     let session = Arc::new(CodexSession {
         thread_id: started.thread.id,
         transport,
         correlation: correlation.clone(),
+        turn_start_changed,
         process: process.clone(),
         shutdown_started: AtomicBool::new(false),
     });
@@ -381,6 +384,7 @@ struct CodexSession {
     thread_id: String,
     transport: JsonRpcTransport,
     correlation: Arc<StdMutex<NativeCorrelation>>,
+    turn_start_changed: Arc<Notify>,
     process: Arc<ProcessGuard>,
     shutdown_started: AtomicBool,
 }
@@ -388,43 +392,30 @@ struct CodexSession {
 impl ProviderSession for CodexSession {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
-            let result = self
-                .transport
-                .request(
-                    "turn/start",
-                    &TurnStartParams {
-                        thread_id: &self.thread_id,
-                        input: [TextInput {
-                            kind: "text",
-                            text: &input.prompt,
-                        }],
-                    },
-                )
-                .await
-                .map_err(|error| codex_error(format!("Codex Turn startup failed: {error}")))?;
-            let started: TurnStartResult = serde_json::from_value(result).map_err(|error| {
-                codex_error(format!(
-                    "Codex returned an invalid turn/start response: {error}"
-                ))
-            })?;
-            if started.turn.id.is_empty() {
-                return Err(codex_error(
-                    "Codex returned an invalid turn/start response: Turn ID was empty",
-                ));
+            {
+                let mut correlation = self
+                    .correlation
+                    .lock()
+                    .expect("Codex native correlation lock is not poisoned");
+                if self.shutdown_started.load(Ordering::Acquire) {
+                    return Err(codex_error("Codex Session is shutting down"));
+                }
+                if correlation.turn_starting || correlation.active_turn_id.is_some() {
+                    return Err(codex_error(
+                        "Codex started a Turn while another native Turn was active",
+                    ));
+                }
+                correlation.turn_starting = true;
             }
-            let mut correlation = self
-                .correlation
-                .lock()
-                .expect("Codex native correlation lock is not poisoned");
-            if correlation.active_turn_id.is_some() {
-                return Err(codex_error(
-                    "Codex started a Turn while another native Turn was active",
-                ));
-            }
-            correlation.active_turn_id = Some(started.turn.id);
-            correlation.active_agent_message = None;
-            correlation.active_commands.clear();
-            Ok(())
+            let task = tokio::spawn(start_native_turn(
+                self.thread_id.clone(),
+                input.prompt,
+                self.transport.clone(),
+                self.correlation.clone(),
+                self.turn_start_changed.clone(),
+            ));
+            task.await
+                .map_err(|error| codex_error(format!("Codex Turn startup task failed: {error}")))?
         })
     }
 
@@ -496,12 +487,26 @@ impl ProviderSession for CodexSession {
                 return self.process.wait_until_stopped().await;
             }
 
-            let active_turn_id = self
-                .correlation
-                .lock()
-                .expect("Codex native correlation lock is not poisoned")
-                .active_turn_id
-                .clone();
+            let turn_start_changed = self.turn_start_changed.notified();
+            let (mut active_turn_id, turn_starting) = {
+                let correlation = self
+                    .correlation
+                    .lock()
+                    .expect("Codex native correlation lock is not poisoned");
+                (
+                    correlation.active_turn_id.clone(),
+                    correlation.turn_starting,
+                )
+            };
+            if active_turn_id.is_none() && turn_starting {
+                let _ = timeout(PENDING_TURN_START_GRACE_PERIOD, turn_start_changed).await;
+                active_turn_id = self
+                    .correlation
+                    .lock()
+                    .expect("Codex native correlation lock is not poisoned")
+                    .active_turn_id
+                    .clone();
+            }
             if let Some(turn_id) = active_turn_id {
                 let _ = timeout(
                     SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT,
@@ -523,6 +528,63 @@ impl ProviderSession for CodexSession {
     }
 }
 
+async fn start_native_turn(
+    thread_id: String,
+    prompt: String,
+    transport: JsonRpcTransport,
+    correlation: Arc<StdMutex<NativeCorrelation>>,
+    turn_start_changed: Arc<Notify>,
+) -> Result<(), ProviderError> {
+    let started = async {
+        let result = transport
+            .request(
+                "turn/start",
+                &TurnStartParams {
+                    thread_id: &thread_id,
+                    input: [TextInput {
+                        kind: "text",
+                        text: &prompt,
+                    }],
+                },
+            )
+            .await
+            .map_err(|error| codex_error(format!("Codex Turn startup failed: {error}")))?;
+        let started: TurnStartResult = serde_json::from_value(result).map_err(|error| {
+            codex_error(format!(
+                "Codex returned an invalid turn/start response: {error}"
+            ))
+        })?;
+        if started.turn.id.is_empty() {
+            return Err(codex_error(
+                "Codex returned an invalid turn/start response: Turn ID was empty",
+            ));
+        }
+        Ok(started.turn.id)
+    }
+    .await;
+
+    let result = {
+        let mut native = correlation
+            .lock()
+            .expect("Codex native correlation lock is not poisoned");
+        native.turn_starting = false;
+        match started {
+            Ok(turn_id) if native.active_turn_id.is_none() => {
+                native.active_turn_id = Some(turn_id);
+                native.active_agent_message = None;
+                native.active_commands.clear();
+                Ok(())
+            }
+            Ok(_) => Err(codex_error(
+                "Codex started a Turn while another native Turn was active",
+            )),
+            Err(error) => Err(error),
+        }
+    };
+    turn_start_changed.notify_one();
+    result
+}
+
 #[derive(Deserialize)]
 struct TurnStartResult {
     turn: NativeTurn,
@@ -541,6 +603,7 @@ struct NativeTurn {
 
 struct NativeCorrelation {
     thread_id: String,
+    turn_starting: bool,
     active_turn_id: Option<String>,
     active_agent_message: Option<ActiveNativeAgentMessage>,
     active_commands: HashMap<String, ActiveNativeCommand>,
@@ -1054,7 +1117,8 @@ struct ChildSupervisor {
     writer: Arc<Mutex<Option<ChildStdin>>>,
     state: Arc<TransportState>,
     processes: ProcessRegistry,
-    process_id: u64,
+    registration_id: u64,
+    process_tree: ProcessTree,
 }
 
 async fn supervise_child(supervisor: ChildSupervisor) {
@@ -1066,7 +1130,8 @@ async fn supervise_child(supervisor: ChildSupervisor) {
         writer,
         state,
         processes,
-        process_id,
+        registration_id,
+        process_tree,
     } = supervisor;
     let status = tokio::select! {
         biased;
@@ -1081,7 +1146,7 @@ async fn supervise_child(supervisor: ChildSupervisor) {
             }).await {
                 Ok(status) => status,
                 Err(_) => {
-                    let _ = terminate_process_tree(&mut child);
+                    let _ = process_tree.terminate(&mut child);
                     match timeout(PROCESS_KILL_TIMEOUT, child.wait()).await {
                         Ok(status) => status,
                         Err(_) => Err(std::io::Error::new(
@@ -1094,6 +1159,7 @@ async fn supervise_child(supervisor: ChildSupervisor) {
         }
         status = child.wait() => status,
     };
+    let _ = process_tree.terminate(&mut child);
 
     let message = match status {
         Ok(status) if status.success() => "Codex app-server exited unexpectedly".to_owned(),
@@ -1103,12 +1169,20 @@ async fn supervise_child(supervisor: ChildSupervisor) {
     let error = codex_error(message);
     exit.send_replace(Some(error.clone()));
     terminate_transport(&state, error);
+    processes.remove(registration_id);
+    process_tree.close();
     stopped.send_replace(true);
-    processes.remove(process_id);
 }
 
 #[cfg(unix)]
-fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
+struct ProcessTree {
+    process_group_id: libc::pid_t,
+}
+
+#[cfg(unix)]
+fn spawn_codex_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
+    command.process_group(0);
+    let child = command.spawn()?;
     let process_group_id = child
         .id()
         .and_then(|id| libc::pid_t::try_from(id).ok())
@@ -1119,19 +1193,128 @@ fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
                 "Codex app-server had no process group ID",
             )
         })?;
-    if unsafe { libc::killpg(process_group_id, libc::SIGKILL) } == -1 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
+    Ok((child, ProcessTree { process_group_id }))
+}
+
+#[cfg(unix)]
+impl ProcessTree {
+    fn terminate(&self, child: &mut Child) -> std::io::Result<()> {
+        if unsafe { libc::killpg(self.process_group_id, libc::SIGKILL) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                if child.id().is_some() {
+                    child.start_kill()?;
+                }
+                return Ok(());
+            }
             let _ = child.start_kill();
             return Err(error);
         }
+        Ok(())
     }
-    Ok(())
 }
 
-#[cfg(not(unix))]
-fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
-    child.start_kill()
+#[cfg(windows)]
+struct ProcessTree {
+    job: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+fn spawn_codex_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
+    use std::{mem, os::windows::io::FromRawHandle, ptr};
+    use windows_sys::Win32::System::{
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, TerminateJobObject,
+        },
+        Threading::CREATE_SUSPENDED,
+    };
+
+    unsafe extern "system" {
+        fn NtResumeProcess(process_handle: windows_sys::Win32::Foundation::HANDLE) -> i32;
+    }
+
+    let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+    if job.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let job = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(job) };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        use std::os::windows::io::AsRawHandle;
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            ptr::addr_of!(limits).cast(),
+            mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if configured == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    command.creation_flags(CREATE_SUSPENDED);
+    let mut child = command.spawn()?;
+    let process_handle = child
+        .raw_handle()
+        .ok_or_else(|| std::io::Error::other("Codex app-server had no process handle"))?;
+    let assigned = unsafe {
+        use std::os::windows::io::AsRawHandle;
+        AssignProcessToJobObject(job.as_raw_handle(), process_handle)
+    };
+    if assigned == 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = child.start_kill();
+        return Err(error);
+    }
+    let resumed = unsafe { NtResumeProcess(process_handle) };
+    if resumed < 0 {
+        unsafe {
+            use std::os::windows::io::AsRawHandle;
+            TerminateJobObject(job.as_raw_handle(), 1);
+        }
+        return Err(std::io::Error::other(format!(
+            "could not resume Codex app-server: NTSTATUS {resumed:#x}"
+        )));
+    }
+
+    Ok((child, ProcessTree { job }))
+}
+
+#[cfg(windows)]
+impl ProcessTree {
+    fn terminate(&self, _child: &mut Child) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        if unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct ProcessTree;
+
+#[cfg(not(any(unix, windows)))]
+fn spawn_codex_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
+    command.spawn().map(|child| (child, ProcessTree))
+}
+
+#[cfg(not(any(unix, windows)))]
+impl ProcessTree {
+    fn terminate(&self, child: &mut Child) -> std::io::Result<()> {
+        child.start_kill()
+    }
+}
+
+impl ProcessTree {
+    /// Releases the containment handle before shutdown observers are notified.
+    fn close(self) {}
 }
 
 type PendingResponse = oneshot::Sender<Result<Value, ProviderError>>;
