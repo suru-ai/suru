@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -91,30 +91,46 @@ impl SessionStore {
             return Err(CreateSessionError::EmptyPrompt);
         }
 
-        {
+        let retry_workspace = {
             let state = self
                 .state
                 .lock()
                 .expect("Session store lock is not poisoned");
             if let Some(owner) = state.prompts.get(&request.prompt.id) {
-                let PromptOrigin::SessionCreation {
-                    requested_workspace,
-                    ..
-                } = &owner.origin
-                else {
-                    return Err(CreateSessionError::PromptConflict);
-                };
-                if owner.text != request.prompt.text {
-                    return Err(CreateSessionError::PromptConflict);
-                }
-                if requested_workspace == &request.workspace.path {
+                if owner.matches_requested_creation(&request) {
                     return Ok(StoreOutcome::Existing(snapshot_for_owner(&state, owner)));
                 }
+                Some(
+                    owner
+                        .canonical_creation_workspace(&request)
+                        .ok_or(CreateSessionError::PromptConflict)?,
+                )
+            } else {
+                None
             }
-        }
+        };
 
-        let workspace_path = fs::canonicalize(&request.workspace.path)
-            .map_err(|_| CreateSessionError::InvalidWorkspace)?;
+        let workspace_path = fs::canonicalize(&request.workspace.path).map_err(|_| {
+            if retry_workspace.is_some() {
+                CreateSessionError::PromptConflict
+            } else {
+                CreateSessionError::InvalidWorkspace
+            }
+        })?;
+        if let Some(expected) = retry_workspace {
+            if workspace_path != expected {
+                return Err(CreateSessionError::PromptConflict);
+            }
+            let state = self
+                .state
+                .lock()
+                .expect("Session store lock is not poisoned");
+            let owner = state
+                .prompts
+                .get(&request.prompt.id)
+                .expect("Prompt owner remains indexed for the server lifetime");
+            return Ok(StoreOutcome::Existing(snapshot_for_owner(&state, owner)));
+        }
         if !workspace_path.is_dir() {
             return Err(CreateSessionError::InvalidWorkspace);
         }
@@ -124,13 +140,7 @@ impl SessionStore {
             .lock()
             .expect("Session store lock is not poisoned");
         if let Some(owner) = state.prompts.get(&request.prompt.id) {
-            if owner.text == request.prompt.text
-                && let PromptOrigin::SessionCreation {
-                    canonical_workspace,
-                    ..
-                } = &owner.origin
-                && canonical_workspace == &workspace_path
-            {
+            if owner.matches_canonical_creation(&request, &workspace_path) {
                 return Ok(StoreOutcome::Existing(snapshot_for_owner(&state, owner)));
             }
             return Err(CreateSessionError::PromptConflict);
@@ -189,10 +199,7 @@ impl SessionStore {
             .lock()
             .expect("Session store lock is not poisoned");
         if let Some(owner) = state.prompts.get(&request.prompt.id) {
-            if owner.session_id == session_id
-                && owner.text == request.prompt.text
-                && matches!(&owner.origin, PromptOrigin::Steer)
-            {
+            if owner.matches_steer(session_id, &request) {
                 let prompt = state
                     .sessions
                     .get(&session_id)
@@ -262,6 +269,43 @@ fn snapshot_for_owner(state: &SessionStoreState, owner: &PromptOwner) -> Session
         .expect("Prompt owner always references its Session")
         .snapshot
         .clone()
+}
+
+impl PromptOwner {
+    fn matches_requested_creation(&self, request: &CreateSessionRequest) -> bool {
+        self.text == request.prompt.text
+            && matches!(
+                &self.origin,
+                PromptOrigin::SessionCreation {
+                    requested_workspace,
+                    ..
+                } if requested_workspace == &request.workspace.path
+            )
+    }
+
+    fn canonical_creation_workspace(&self, request: &CreateSessionRequest) -> Option<PathBuf> {
+        if self.text != request.prompt.text {
+            return None;
+        }
+        match &self.origin {
+            PromptOrigin::SessionCreation {
+                canonical_workspace,
+                ..
+            } => Some(canonical_workspace.clone()),
+            PromptOrigin::Steer => None,
+        }
+    }
+
+    fn matches_canonical_creation(&self, request: &CreateSessionRequest, workspace: &Path) -> bool {
+        self.canonical_creation_workspace(request)
+            .is_some_and(|canonical| canonical == workspace)
+    }
+
+    fn matches_steer(&self, session_id: SessionId, request: &AdmitPromptRequest) -> bool {
+        self.session_id == session_id
+            && self.text == request.prompt.text
+            && matches!(&self.origin, PromptOrigin::Steer)
+    }
 }
 
 impl DeliveredTurn {

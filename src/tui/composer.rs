@@ -94,13 +94,9 @@ impl ComposerMemory {
         destination: ComposerKey,
         prompt: &InitialPrompt,
     ) {
-        if source != destination {
-            let mut composer = self.composers.remove(&source).unwrap_or_default();
+        self.with_migrated_composer(source, destination, |composer| {
             composer.admission_reconciled(prompt);
-            self.composers.insert(destination, composer);
-            return;
-        }
-        self.composer_mut(destination).admission_reconciled(prompt);
+        });
     }
 
     pub(super) fn late_admission_reconciled(
@@ -109,18 +105,28 @@ impl ComposerMemory {
         destination: ComposerKey,
         prompt: &InitialPrompt,
     ) -> bool {
-        if source != destination {
-            let mut composer = self.composers.remove(&source).unwrap_or_default();
-            let restored_was_current = composer.late_admission_reconciled(prompt);
-            self.composers.insert(destination, composer);
-            return restored_was_current;
-        }
-        self.composer_mut(destination)
-            .late_admission_reconciled(prompt)
+        self.with_migrated_composer(source, destination, |composer| {
+            composer.late_admission_reconciled(prompt)
+        })
     }
 
     fn composer_mut(&mut self, key: ComposerKey) -> &mut ComposerState {
         self.composers.entry(key).or_default()
+    }
+
+    fn with_migrated_composer<T>(
+        &mut self,
+        source: ComposerKey,
+        destination: ComposerKey,
+        operation: impl FnOnce(&mut ComposerState) -> T,
+    ) -> T {
+        if source == destination {
+            return operation(self.composer_mut(destination));
+        }
+        let mut composer = self.composers.remove(&source).unwrap_or_default();
+        let result = operation(&mut composer);
+        self.composers.insert(destination, composer);
+        result
     }
 }
 

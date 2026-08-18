@@ -30,8 +30,8 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     managed_client::{
-        ManagedClient, ManagedEvent, RecoveryStatus, SessionEvent, SessionProjection,
-        SessionSubscription,
+        ManagedClient, ManagedEvent, RecoveryStatus, SessionCommandClient, SessionEvent,
+        SessionProjection, SessionSubscription,
     },
     protocol::{
         ActivityKind, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, MessageRole,
@@ -287,9 +287,9 @@ pub enum ApplicationEvent {
     Command(CommandId),
     Managed(ManagedEvent),
     Session(SessionEvent),
+    SessionSubscriptionEnded,
     PromptAdmissionSucceeded(PromptId),
     PromptAdmissionFailed { prompt_id: PromptId, error: String },
-    SessionSubscriptionFailed(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -315,6 +315,7 @@ pub enum ApplicationTransition {
         session_id: SessionId,
         request: AdmitPromptRequest,
     },
+    SubscribeSession(SessionId),
 }
 
 impl Application {
@@ -430,6 +431,11 @@ impl Application {
                 self.state.apply_session(event)?;
                 Ok(ApplicationTransition::Continue)
             }
+            ApplicationEvent::SessionSubscriptionEnded => Ok(self
+                .session_id()
+                .map_or(ApplicationTransition::Continue, |session_id| {
+                    ApplicationTransition::SubscribeSession(session_id)
+                })),
             ApplicationEvent::PromptAdmissionSucceeded(_prompt_id) => {
                 self.state.reconcile_pending_submission();
                 Ok(ApplicationTransition::Continue)
@@ -438,15 +444,18 @@ impl Application {
                 self.state.fail_pending_submission(prompt_id, error);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::SessionSubscriptionFailed(error) => {
-                self.state.submission_error = Some(error);
-                Ok(ApplicationTransition::Continue)
-            }
         }
     }
 
     pub fn render(&self, frame: &mut Frame<'_>) {
         render(frame, &self.state);
+    }
+
+    fn session_id(&self) -> Option<SessionId> {
+        self.state
+            .session
+            .as_ref()
+            .map(|session| session.snapshot().session.id)
     }
 }
 
@@ -827,7 +836,9 @@ async fn run_loop(
     let mut application = Application::new(workspace);
     let mut input = EventStream::new();
     let mut session_subscription: Option<SessionSubscription> = None;
+    let mut session_subscription_task: Option<tokio::task::JoinHandle<()>> = None;
     let (submission_tx, mut submission_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (subscription_tx, mut subscription_rx) = tokio::sync::mpsc::unbounded_channel();
 
     loop {
         terminal.draw(|frame| application.render(frame))?;
@@ -841,6 +852,12 @@ async fn run_loop(
                             terminal.draw(|frame| application.render(frame))?;
                             return Ok(());
                         }
+                        if application.session_id().is_none() {
+                            session_subscription = None;
+                            if let Some(task) = session_subscription_task.take() {
+                                task.abort();
+                            }
+                        }
                     }
                     None => return Err(anyhow!("managed client stopped unexpectedly")),
                 }
@@ -851,7 +868,29 @@ async fn run_loop(
                         application.handle_event(ApplicationEvent::Session(event))?;
                     }
                     Some(Err(error)) => return Err(anyhow!(error)),
-                    None => session_subscription = None,
+                    None => {
+                        session_subscription = None;
+                        let transition = application.handle_event(
+                            ApplicationEvent::SessionSubscriptionEnded,
+                        )?;
+                        if let ApplicationTransition::SubscribeSession(session_id) = transition
+                            && session_subscription_task.is_none() {
+                            session_subscription_task = Some(spawn_session_subscription(
+                                client.session_commands(),
+                                session_id,
+                                subscription_tx.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            connected = subscription_rx.recv() => {
+                let Some(connected) = connected else {
+                    return Err(anyhow!("Session subscription task channel stopped unexpectedly"));
+                };
+                session_subscription_task = None;
+                if application.session_id() == Some(connected.session_id) {
+                    session_subscription = Some(connected.subscription);
                 }
             }
             submission = submission_rx.recv() => {
@@ -864,14 +903,11 @@ async fn run_loop(
                         application.handle_event(ApplicationEvent::Session(
                             SessionEvent::Snapshot(created),
                         ))?;
-                        match client.subscribe_session(session_id).await {
-                            Ok(subscription) => session_subscription = Some(subscription),
-                            Err(error) => {
-                                application.handle_event(
-                                    ApplicationEvent::SessionSubscriptionFailed(error.to_string()),
-                                )?;
-                            }
-                        }
+                        session_subscription_task = Some(spawn_session_subscription(
+                            client.session_commands(),
+                            session_id,
+                            subscription_tx.clone(),
+                        ));
                     }
                     SubmissionResult::PromptAdmitted(prompt_id) => {
                         application.handle_event(
@@ -925,6 +961,9 @@ async fn run_loop(
                                         let _ = results.send(result);
                                     });
                                 }
+                                ApplicationTransition::SubscribeSession(_) => {
+                                    unreachable!("terminal input cannot end a Session subscription")
+                                }
                             }
                         }
                     }
@@ -940,6 +979,41 @@ enum SubmissionResult {
     SessionCreated(SessionSnapshot),
     PromptAdmitted(PromptId),
     Failed { prompt_id: PromptId, error: String },
+}
+
+struct ConnectedSessionSubscription {
+    session_id: SessionId,
+    subscription: SessionSubscription,
+}
+
+fn spawn_session_subscription(
+    commands: SessionCommandClient,
+    session_id: SessionId,
+    connected: tokio::sync::mpsc::UnboundedSender<ConnectedSessionSubscription>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut retry_in = tokio::time::Duration::from_millis(50);
+        loop {
+            if connected.is_closed() {
+                return;
+            }
+            match commands.subscribe_session(session_id).await {
+                Ok(subscription) => {
+                    let _ = connected.send(ConnectedSessionSubscription {
+                        session_id,
+                        subscription,
+                    });
+                    return;
+                }
+                Err(_) => {
+                    tokio::time::sleep(retry_in).await;
+                    retry_in = retry_in
+                        .saturating_mul(2)
+                        .min(tokio::time::Duration::from_secs(1));
+                }
+            }
+        }
+    })
 }
 
 async fn next_session_event(
@@ -1020,6 +1094,7 @@ impl TerminalSession {
         enable_raw_mode()?;
         let mut output = stdout();
         if let Err(error) = execute!(output, EnterAlternateScreen, Hide, EnableBracketedPaste) {
+            let _ = execute!(output, DisableBracketedPaste, LeaveAlternateScreen, Show);
             let _ = disable_raw_mode();
             return Err(error.into());
         }

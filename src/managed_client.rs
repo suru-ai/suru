@@ -241,7 +241,10 @@ impl SessionCommandClient {
         }
     }
 
-    async fn subscribe_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
+    pub(crate) async fn subscribe_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionSubscription> {
         let descriptor = self.descriptor.borrow().clone();
         SessionSubscription::open(&self.http, &descriptor, session_id).await
     }

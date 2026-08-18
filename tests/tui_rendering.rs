@@ -529,6 +529,20 @@ fn provisional_steer_is_immediate_single_and_reconciles_in_place() {
 }
 
 #[test]
+fn ended_session_subscription_requests_a_fresh_snapshot_for_reconciliation() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (session_id, _) = enter_session(&mut application, workspace.path());
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::SessionSubscriptionEnded)
+            .expect("handle ended Session subscription"),
+        ApplicationTransition::SubscribeSession(session_id)
+    );
+}
+
+#[test]
 fn text_entered_while_the_first_session_is_created_becomes_its_draft() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = Application::new(workspace.path());
@@ -842,7 +856,7 @@ fn failed_session_snapshot(
     text: &str,
     workspace: &std::path::Path,
 ) -> SessionSnapshot {
-    let turn_id = TurnId::new();
+    let delivered = FailedTurnFixture::new(prompt_id, text);
     SessionSnapshot {
         session: Session {
             id: session_id,
@@ -853,28 +867,10 @@ fn failed_session_snapshot(
             status: SessionStatus::Idle,
         },
         revision: SessionRevision::INITIAL,
-        prompts: vec![Prompt {
-            id: prompt_id,
-            text: text.to_owned(),
-            status: PromptStatus::Delivered,
-        }],
-        turns: vec![Turn {
-            id: turn_id,
-            prompt_id,
-            status: TurnStatus::Failed,
-        }],
-        messages: vec![Message {
-            id: MessageId::new(),
-            turn_id,
-            role: MessageRole::User,
-            content: text.to_owned(),
-        }],
-        activities: vec![Activity {
-            id: ActivityId::new(),
-            turn_id,
-            kind: ActivityKind::Error,
-            text: "No Agent is selected".to_owned(),
-        }],
+        prompts: vec![delivered.prompt],
+        turns: vec![delivered.turn],
+        messages: vec![delivered.message],
+        activities: vec![delivered.activity],
     }
 }
 
@@ -884,41 +880,62 @@ fn delivered_update(
     prompt_id: PromptId,
     text: &str,
 ) -> SessionUpdate {
-    let turn_id = TurnId::new();
+    let delivered = FailedTurnFixture::new(prompt_id, text);
     SessionUpdate {
         session_id,
         revision,
-        changes: vec![
+        changes: delivered.into_changes(),
+    }
+}
+
+struct FailedTurnFixture {
+    prompt: Prompt,
+    turn: Turn,
+    message: Message,
+    activity: Activity,
+}
+
+impl FailedTurnFixture {
+    fn new(prompt_id: PromptId, text: &str) -> Self {
+        let turn_id = TurnId::new();
+        Self {
+            prompt: Prompt {
+                id: prompt_id,
+                text: text.to_owned(),
+                status: PromptStatus::Delivered,
+            },
+            turn: Turn {
+                id: turn_id,
+                prompt_id,
+                status: TurnStatus::Failed,
+            },
+            message: Message {
+                id: MessageId::new(),
+                turn_id,
+                role: MessageRole::User,
+                content: text.to_owned(),
+            },
+            activity: Activity {
+                id: ActivityId::new(),
+                turn_id,
+                kind: ActivityKind::Error,
+                text: "No Agent is selected".to_owned(),
+            },
+        }
+    }
+
+    fn into_changes(self) -> Vec<SessionChange> {
+        vec![
             SessionChange::PromptAdded {
-                prompt: Prompt {
-                    id: prompt_id,
-                    text: text.to_owned(),
-                    status: PromptStatus::Delivered,
-                },
+                prompt: self.prompt,
             },
-            SessionChange::TurnAdded {
-                turn: Turn {
-                    id: turn_id,
-                    prompt_id,
-                    status: TurnStatus::Failed,
-                },
-            },
+            SessionChange::TurnAdded { turn: self.turn },
             SessionChange::MessageAdded {
-                message: Message {
-                    id: MessageId::new(),
-                    turn_id,
-                    role: MessageRole::User,
-                    content: text.to_owned(),
-                },
+                message: self.message,
             },
             SessionChange::ActivityAdded {
-                activity: Activity {
-                    id: ActivityId::new(),
-                    turn_id,
-                    kind: ActivityKind::Error,
-                    text: "No Agent is selected".to_owned(),
-                },
+                activity: self.activity,
             },
-        ],
+        ]
     }
 }
