@@ -159,11 +159,9 @@ pub struct Session {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSummary {
-    pub id: SessionId,
+    #[serde(flatten)]
+    pub session: Session,
     pub title: String,
-    pub workspace: Workspace,
-    pub agent: Option<AgentIdentity>,
-    pub status: SessionStatus,
     pub created_at: SessionTimestamp,
     pub updated_at: SessionTimestamp,
 }

@@ -9,6 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::anyhow;
 use tokio::sync::broadcast;
 
 use crate::protocol::{
@@ -17,6 +18,7 @@ use crate::protocol::{
     SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
     SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
 };
+use crate::session_projection::apply_update;
 
 const AGENT_UNAVAILABLE: &str =
     "No Agent is selected for this Session; provider integrations are unavailable.";
@@ -176,11 +178,8 @@ impl SessionStore {
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
         let timestamp = state.next_timestamp();
         let summary = SessionSummary {
-            id: session_id,
+            session: snapshot.session.clone(),
             title,
-            workspace: snapshot.session.workspace.clone(),
-            agent: snapshot.session.agent.clone(),
-            status: snapshot.session.status,
             created_at: timestamp,
             updated_at: timestamp,
         };
@@ -263,7 +262,7 @@ impl SessionStore {
         record.snapshot.revision = revision;
         let prompt = delivered.prompt.clone();
         delivered.append_to(&mut record.snapshot);
-        record.summary.status = record.snapshot.session.status;
+        record.summary.session = record.snapshot.session.clone();
         record.summary.updated_at = updated_at;
         let _ = record.updates.send(update);
         state.prompts.insert(
@@ -298,6 +297,43 @@ impl SessionStore {
             .map(|record| record.snapshot.clone())
     }
 
+    pub(crate) fn publish(
+        &self,
+        session_id: SessionId,
+        changes: Vec<SessionChange>,
+    ) -> anyhow::Result<SessionUpdate> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        if !state.sessions.contains_key(&session_id) {
+            return Err(anyhow!("Session does not exist on this server instance"));
+        }
+        let updated_at = state.next_timestamp();
+        let stored = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
+        let revision = SessionRevision(
+            stored
+                .snapshot
+                .revision
+                .0
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("Session revision is exhausted"))?,
+        );
+        let update = SessionUpdate {
+            session_id,
+            revision,
+            changes,
+        };
+        apply_update(&mut stored.snapshot, &update)?;
+        stored.summary.session = stored.snapshot.session.clone();
+        stored.summary.updated_at = updated_at;
+        let _ = stored.updates.send(update.clone());
+        Ok(update)
+    }
+
     pub(crate) fn list(
         &self,
         workspace: Option<&Path>,
@@ -319,7 +355,7 @@ impl SessionStore {
             .filter(|record| {
                 workspace
                     .as_ref()
-                    .is_none_or(|path| record.summary.workspace.path == *path)
+                    .is_none_or(|path| record.summary.session.workspace.path == *path)
             })
             .map(|record| record.summary.clone())
             .collect::<Vec<_>>();

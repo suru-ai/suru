@@ -17,17 +17,19 @@ fn fixture_id(value: &str) -> Uuid {
 #[test]
 fn session_summary_round_trips_with_discovery_metadata() {
     let summary = SessionSummary {
-        id: SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
-        title: "Explain this workspace".to_owned(),
-        workspace: Workspace {
-            path: PathBuf::from("/work/chidori"),
+        session: Session {
+            id: SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
+            workspace: Workspace {
+                path: PathBuf::from("/work/chidori"),
+            },
+            agent: Some(AgentIdentity {
+                agent: AgentId::new("coding"),
+                provider: ProviderId::new("codex"),
+                model: ModelId::new("gpt-5"),
+            }),
+            status: SessionStatus::Active,
         },
-        agent: Some(AgentIdentity {
-            agent: AgentId::new("coding"),
-            provider: ProviderId::new("codex"),
-            model: ModelId::new("gpt-5"),
-        }),
-        status: SessionStatus::Active,
+        title: "Explain this workspace".to_owned(),
         created_at: SessionTimestamp(1_755_497_600_000),
         updated_at: SessionTimestamp(1_755_497_600_321),
     };

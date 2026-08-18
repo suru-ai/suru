@@ -115,11 +115,14 @@ impl ComposerMemory {
             return;
         };
         if recovered.text.is_empty() {
+            self.composers
+                .insert(ComposerKey::Session(session_id), recovered);
             return;
         }
-        if let Some(landing) = self.composers.remove(&ComposerKey::Landing)
-            && !landing.text.is_empty()
-        {
+        if let Some(landing) = self.composers.remove(&ComposerKey::Landing) {
+            for entry in landing.history {
+                recovered.push_history(entry);
+            }
             recovered.push_history(landing.text);
         }
         self.composers.insert(ComposerKey::Landing, recovered);

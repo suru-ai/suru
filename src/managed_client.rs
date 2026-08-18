@@ -239,18 +239,7 @@ impl SessionCommandClient {
             .send()
             .await
             .with_context(|| format!("send {operation} command"))?;
-        if response.status().is_success() {
-            return response
-                .json::<ResponseBody>()
-                .await
-                .with_context(|| format!("decode {operation} response"));
-        }
-        let status = response.status();
-        let error = response.json::<SessionError>().await.ok();
-        match error {
-            Some(error) => bail!(error.message),
-            None => bail!("{operation} failed with HTTP {status}"),
-        }
+        decode_session_response(response, operation).await
     }
 
     pub(crate) async fn subscribe_session(

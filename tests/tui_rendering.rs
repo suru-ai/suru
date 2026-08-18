@@ -192,7 +192,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         .handle_event(ApplicationEvent::SessionCreated(created.clone()))
         .expect("transition application after Session creation");
     let mut subscription = client
-        .subscribe_session(created.session.id)
+        .attach_session(created.session.id)
         .await
         .expect("subscribe to created Session");
     let session_event = subscription
@@ -247,6 +247,54 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
     assert!(!observer_with_draft.contains("Keep this unsent draft"));
 
     let replacement_instance = Uuid::new_v4();
+    let original_instance = server.descriptor().instance_id;
+    let mut attached_with_landing_draft = Application::new(workspace.path());
+    attached_with_landing_draft
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(original_instance, server.descriptor().pid),
+        )))
+        .expect("connect attached client to original server");
+    attached_with_landing_draft
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
+            CounterSnapshot {
+                instance_id: original_instance,
+                value: 0,
+                revision: 0,
+            },
+        )))
+        .expect("confirm original server identity");
+    attached_with_landing_draft
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Saved landing draft".to_owned(),
+        )))
+        .expect("edit separate landing draft");
+    attached_with_landing_draft
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+            created.clone(),
+        )))
+        .expect("attach while retaining the landing draft");
+    attached_with_landing_draft
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Recovered Session draft".to_owned(),
+        )))
+        .expect("edit attached Session draft");
+    attached_with_landing_draft
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(replacement_instance, 84_848),
+        )))
+        .expect("connect attached client to replacement");
+    attached_with_landing_draft
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
+            CounterSnapshot {
+                instance_id: replacement_instance,
+                value: 0,
+                revision: 0,
+            },
+        )))
+        .expect("confirm replacement for attached client");
+    let recovered_collision = rendered_application_rows(&attached_with_landing_draft).join("\n");
+    assert!(recovered_collision.contains("Recovered Session draft"));
+
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Recovering(
             RecoveryStatus {

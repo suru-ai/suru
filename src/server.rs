@@ -31,7 +31,8 @@ use crate::protocol::{
     AdmitPromptRequest, COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate,
     CreateSessionRequest, LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor,
     SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SNAPSHOT_EVENT,
-    ServerIdentity, ServerShutdown, SessionError, SessionErrorCode, SessionId, ShutdownReason,
+    ServerIdentity, ServerShutdown, SessionChange, SessionError, SessionErrorCode, SessionId,
+    SessionUpdate, ShutdownReason,
 };
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
@@ -43,13 +44,37 @@ pub type ServerConfig = RuntimeConfig;
 
 pub struct RunningServer {
     descriptor: RuntimeDescriptor,
+    session_events: SessionEventSink,
     shutdown: ShutdownController,
     task: JoinHandle<Result<()>>,
+}
+
+#[derive(Clone)]
+pub struct SessionEventSink {
+    sessions: SessionStore,
+    lifecycle: watch::Receiver<LifecycleState>,
+}
+
+impl SessionEventSink {
+    pub fn publish(
+        &self,
+        session_id: SessionId,
+        changes: Vec<SessionChange>,
+    ) -> Result<SessionUpdate> {
+        if *self.lifecycle.borrow() != LifecycleState::Ready {
+            anyhow::bail!("server is not accepting Session updates");
+        }
+        self.sessions.publish(session_id, changes)
+    }
 }
 
 impl RunningServer {
     pub fn descriptor(&self) -> &RuntimeDescriptor {
         &self.descriptor
+    }
+
+    pub fn session_event_sink(&self) -> SessionEventSink {
+        self.session_events.clone()
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -167,10 +192,11 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
         shutdown_intent: shutdown_intent.clone(),
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
     };
+    let sessions = SessionStore::default();
     let state = AppState {
         descriptor: Arc::new(descriptor.clone()),
         counter: counter.clone(),
-        sessions: SessionStore::default(),
+        sessions: sessions.clone(),
         shutdown: shutdown.clone(),
     };
     let app = Router::new()
@@ -212,6 +238,10 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
 
     Ok(RunningServer {
         descriptor,
+        session_events: SessionEventSink {
+            sessions,
+            lifecycle: lifecycle.subscribe(),
+        },
         shutdown,
         task,
     })

@@ -605,11 +605,15 @@ async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace
     assert_eq!(
         summaries
             .iter()
-            .map(|summary| summary.id)
+            .map(|summary| summary.session.id)
             .collect::<Vec<_>>(),
         vec![second.session.id, first.session.id]
     );
     assert_eq!(summaries[0].title, "Second Session");
+    assert_eq!(summaries[0].session.workspace, second.session.workspace);
+    assert_eq!(summaries[0].session.agent, None);
+    assert_eq!(summaries[0].session.status, SessionStatus::Idle);
+    assert!(summaries[0].created_at <= summaries[0].updated_at);
     assert!(summaries[0].updated_at > summaries[1].updated_at);
 
     let filtered = client
@@ -628,8 +632,12 @@ async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace
         .await
         .expect("decode filtered Session summaries");
     assert_eq!(filtered.len(), 1);
-    assert_eq!(filtered[0].id, first.session.id);
+    assert_eq!(filtered[0].session.id, first.session.id);
     assert_eq!(filtered[0].title, "First Session");
+    assert_eq!(
+        filtered[0].session.workspace.path,
+        std::fs::canonicalize(first_workspace).expect("canonicalize expected Workspace")
+    );
 
     server.shutdown().await.expect("shut down server");
 }
@@ -953,7 +961,7 @@ async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_clie
         .await
         .expect("create Session through managed client");
     let mut first_subscription = first_client
-        .subscribe_session(created.session.id)
+        .attach_session(created.session.id)
         .await
         .expect("subscribe through first managed client");
     assert_eq!(
@@ -976,7 +984,7 @@ async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_clie
     .expect("connect second managed client");
     receive_managed_client_initial_state(&mut second_client).await;
     let mut second_subscription = second_client
-        .subscribe_session(created.session.id)
+        .attach_session(created.session.id)
         .await
         .expect("reconnect to existing Session");
     assert_eq!(
@@ -1035,7 +1043,7 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
         .await
         .expect("discover Sessions through managed client");
     assert_eq!(summaries.len(), 1);
-    assert_eq!(summaries[0].id, created.session.id);
+    assert_eq!(summaries[0].session.id, created.session.id);
 
     let mut attachment = client
         .attach_session(created.session.id)
@@ -1064,6 +1072,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
     )
     .await
     .expect("spawn server");
+    let session_events = server.session_event_sink();
     let mut first_client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), "shared-session-test")
             .expect("configure first client"),
@@ -1135,8 +1144,94 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
             .await
             .expect("isolated Session snapshot arrives")
             .expect("isolated Session snapshot is valid"),
-        SessionEvent::Snapshot(isolated)
+        SessionEvent::Snapshot(isolated.clone())
     );
+
+    let before_update = first_client
+        .list_sessions(None)
+        .await
+        .expect("list Sessions before update");
+    assert_eq!(before_update[0].session.id, isolated.session.id);
+    let prompt_id = PromptId::new();
+    let turn_id = TurnId::new();
+    let update = session_events
+        .publish(
+            shared.session.id,
+            vec![
+                SessionChange::PromptAdded {
+                    prompt: Prompt {
+                        id: prompt_id,
+                        text: "Observe this change".to_owned(),
+                        status: PromptStatus::Delivered,
+                    },
+                },
+                SessionChange::TurnAdded {
+                    turn: Turn {
+                        id: turn_id,
+                        prompt_id,
+                        status: TurnStatus::Active,
+                    },
+                },
+                SessionChange::MessageAdded {
+                    message: Message {
+                        id: MessageId::new(),
+                        turn_id,
+                        role: MessageRole::User,
+                        content: "Observe this change".to_owned(),
+                    },
+                },
+                SessionChange::ActivityAdded {
+                    activity: Activity {
+                        id: ActivityId::new(),
+                        turn_id,
+                        kind: ActivityKind::Status,
+                        text: "Working".to_owned(),
+                    },
+                },
+                SessionChange::SessionStatusChanged {
+                    status: SessionStatus::Active,
+                },
+            ],
+        )
+        .expect("publish provider-neutral Session changes");
+    assert_eq!(update.revision, SessionRevision(2));
+
+    let first_update = first_attachment
+        .next()
+        .await
+        .expect("first client receives Session update")
+        .expect("first client Session update is valid");
+    let second_update = second_attachment
+        .next()
+        .await
+        .expect("second client receives Session update")
+        .expect("second client Session update is valid");
+    assert_eq!(first_update, SessionEvent::Updated(update.clone()));
+    assert_eq!(second_update, first_update);
+    assert!(
+        timeout(Duration::from_millis(100), isolated_attachment.next())
+            .await
+            .is_err(),
+        "an update for the shared Session must not appear on another Session stream"
+    );
+
+    let current = first_client
+        .read_session(shared.session.id)
+        .await
+        .expect("read updated shared Session");
+    assert_eq!(current.revision, update.revision);
+    assert_eq!(current.prompts.len(), 2);
+    assert_eq!(current.turns.len(), 2);
+    assert_eq!(current.messages.len(), 2);
+    assert_eq!(current.activities.len(), 2);
+    assert_eq!(current.session.status, SessionStatus::Active);
+    let after_update = first_client
+        .list_sessions(None)
+        .await
+        .expect("list Sessions after update");
+    assert_eq!(after_update[0].session.id, shared.session.id);
+    assert_eq!(after_update[0].session.status, SessionStatus::Active);
+    assert!(after_update[0].updated_at > after_update[0].created_at);
 
     drop(isolated_attachment);
     drop(second_attachment);
@@ -1181,7 +1276,7 @@ async fn managed_session_stream_rejects_a_non_monotonic_revision() {
     .expect("connect managed client to fixture server");
     receive_managed_client_initial_state(&mut client).await;
     let mut subscription = client
-        .subscribe_session(session_id)
+        .attach_session(session_id)
         .await
         .expect("subscribe to fixture Session");
 

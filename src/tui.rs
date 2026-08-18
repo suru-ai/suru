@@ -44,6 +44,21 @@ mod composer;
 use composer::{ComposerKey, ComposerMemory};
 
 #[derive(Clone, Debug)]
+struct SessionInteraction {
+    scroll_position: usize,
+    follow_latest: bool,
+}
+
+impl Default for SessionInteraction {
+    fn default() -> Self {
+        Self {
+            scroll_position: 0,
+            follow_latest: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct TuiState {
     identity: Option<ServerIdentity>,
     pending_identity: Option<ServerIdentity>,
@@ -54,6 +69,8 @@ pub struct TuiState {
     fatal_error: Option<String>,
     workspace: PathBuf,
     composers: ComposerMemory,
+    session_interactions: HashMap<SessionId, SessionInteraction>,
+    composer_focused: bool,
     submission_error: Option<String>,
     session: Option<SessionProjection>,
     pending_submission: Option<PendingSubmission>,
@@ -96,6 +113,8 @@ impl TuiState {
             fatal_error: None,
             workspace: workspace.as_ref().to_owned(),
             composers: ComposerMemory::default(),
+            session_interactions: HashMap::new(),
+            composer_focused: true,
             submission_error: None,
             session: None,
             pending_submission: None,
@@ -135,6 +154,7 @@ impl TuiState {
                             .map(|session| session.snapshot().session.id)
                         {
                             self.composers.recover_session_to_landing(session_id);
+                            self.session_interactions.remove(&session_id);
                         }
                         self.session = None;
                         self.submission_error =
@@ -165,10 +185,7 @@ impl TuiState {
 
     fn apply_session(&mut self, event: SessionEvent) -> Result<()> {
         match event {
-            SessionEvent::Snapshot(snapshot) => {
-                self.submission_error = None;
-                self.session = Some(SessionProjection::new(snapshot));
-            }
+            SessionEvent::Snapshot(snapshot) => self.hydrate_session(snapshot),
             SessionEvent::Updated(update) => {
                 let Some(session) = self.session.as_mut() else {
                     return Err(anyhow!("Session update arrived before its snapshot"));
@@ -179,6 +196,14 @@ impl TuiState {
         self.reconcile_pending_submission();
         self.reconcile_failed_submissions();
         Ok(())
+    }
+
+    fn hydrate_session(&mut self, snapshot: SessionSnapshot) {
+        self.session_interactions
+            .entry(snapshot.session.id)
+            .or_default();
+        self.submission_error = None;
+        self.session = Some(SessionProjection::new(snapshot));
     }
 
     fn composer_key(&self) -> ComposerKey {
@@ -213,6 +238,18 @@ impl TuiState {
             &pending.prompt,
         );
         self.submission_error = None;
+    }
+
+    fn session_interaction(&self, session_id: SessionId) -> Option<&SessionInteraction> {
+        self.session_interactions.get(&session_id)
+    }
+
+    fn composer_border_style(&self) -> Style {
+        if self.composer_focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
     }
 
     fn fail_pending_submission(&mut self, prompt_id: PromptId, error: String) {
@@ -669,6 +706,7 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState) {
         composer_area,
         state.composers.text(key),
         state.composers.cursor(key),
+        state.composer_border_style(),
     );
 
     render_status(frame, state, status_area);
@@ -751,8 +789,15 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, snapshot: &SessionSna
         );
         lines.push(Line::default());
     }
+    let scroll_position = state
+        .session_interaction(snapshot.session.id)
+        .filter(|interaction| !interaction.follow_latest)
+        .map_or(0, |interaction| interaction.scroll_position)
+        .min(usize::from(u16::MAX)) as u16;
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::TOP)),
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::TOP))
+            .scroll((scroll_position, 0)),
         transcript_area,
     );
     render_composer(
@@ -760,17 +805,18 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, snapshot: &SessionSna
         composer_area,
         state.composers.text(key),
         state.composers.cursor(key),
+        state.composer_border_style(),
     );
     render_status(frame, state, status_area);
 }
 
-fn render_composer(frame: &mut Frame<'_>, area: Rect, text: &str, cursor: usize) {
+fn render_composer(frame: &mut Frame<'_>, area: Rect, text: &str, cursor: usize, style: Style) {
     let submit = binding_label(BoundCommand::SubmitSteer);
     let newline = binding_label(BoundCommand::InsertNewline);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" Prompt · {submit} submit · {newline} newline "))
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(style);
     let content_width = area.width.saturating_sub(2).max(1);
     let content_height = area.height.saturating_sub(2).max(1);
     let cursor_row = visual_cursor_row(text, cursor, content_width);
