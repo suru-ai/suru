@@ -276,7 +276,7 @@ async fn start_codex_session(
             &ThreadStartParams {
                 cwd,
                 approval_policy: "never",
-                sandbox: "dangerFullAccess",
+                sandbox: "danger-full-access",
                 ephemeral: false,
             },
         )

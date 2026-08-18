@@ -244,7 +244,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         workspace.path().to_string_lossy().as_ref()
     );
     assert_eq!(requests[2]["params"]["approvalPolicy"], "never");
-    assert_eq!(requests[2]["params"]["sandbox"], "dangerFullAccess");
+    assert_eq!(requests[2]["params"]["sandbox"], "danger-full-access");
     assert_eq!(requests[2]["params"]["ephemeral"], false);
     assert!(requests[2]["params"].get("model").is_none());
     assert_eq!(requests[3]["params"]["threadId"], "native-thread");
