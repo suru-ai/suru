@@ -18,6 +18,12 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
     let mut next = snapshot.clone();
     for change in &update.changes {
         match change {
+            SessionChange::AgentBound { agent } => {
+                if next.session.agent.is_some() {
+                    bail!("Session update attempted to replace an Agent binding");
+                }
+                next.session.agent = Some(agent.clone());
+            }
             SessionChange::PromptAdded { prompt } => {
                 if next.prompts.iter().any(|existing| existing.id == prompt.id) {
                     bail!("Session update reused a Prompt identity");

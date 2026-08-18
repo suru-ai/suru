@@ -1,6 +1,7 @@
 pub mod build_identity;
 pub mod managed_client;
 pub mod protocol;
+pub mod provider;
 mod runtime;
 pub mod server;
 mod session_projection;

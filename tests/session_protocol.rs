@@ -250,6 +250,43 @@ fn agent_message_streaming_uses_one_stable_provider_neutral_identity() {
 }
 
 #[test]
+fn agent_binding_is_a_typed_session_change() {
+    let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let update = SessionUpdate {
+        session_id,
+        revision: SessionRevision(2),
+        changes: vec![SessionChange::AgentBound {
+            agent: AgentIdentity {
+                agent: AgentId::new("codex"),
+                provider: ProviderId::new("codex"),
+                model: ModelId::new("gpt-5.6-codex"),
+            },
+        }],
+    };
+    let expected = json!({
+        "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+        "revision": 2,
+        "changes": [{
+            "type": "agent_bound",
+            "agent": {
+                "agent": "codex",
+                "provider": "codex",
+                "model": "gpt-5.6-codex"
+            }
+        }]
+    });
+
+    assert_eq!(
+        serde_json::to_value(&update).expect("encode Agent-binding update"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionUpdate>(expected).expect("decode Agent-binding update"),
+        update
+    );
+}
+
+#[test]
 fn initial_session_command_round_trips_through_json() {
     let command = CreateSessionRequest {
         workspace: Workspace {

@@ -21,22 +21,410 @@ use chidori::{
     build_identity,
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
-        Activity, ActivityId, ActivityKind, AdmitPromptRequest, CreateSessionRequest,
-        InitialPrompt, LifecycleState, Message, MessageId, MessageRole, MessageStatus,
-        PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
-        RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity, Session,
-        SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
-        SessionStatus, SessionSummary, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
-        Workspace,
+        Activity, ActivityId, ActivityKind, AdmitPromptRequest, AgentId, AgentIdentity,
+        CreateSessionRequest, InitialPrompt, LifecycleState, Message, MessageId, MessageRole,
+        MessageStatus, ModelId, PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId, PromptOrder,
+        PromptStatus, ProviderId, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
+        ServerIdentity, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
+        SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionUpdate,
+        TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
+    provider::ProviderEvent,
     server::{self, AgentOutput, ServerConfig},
 };
 use eventsource_stream::Eventsource;
 use futures_util::{StreamExt, future::join_all, stream};
 use tokio::time::{Duration, timeout};
 
+#[path = "support/provider.rs"]
+mod provider_support;
+
+use provider_support::ControlledProvider;
+
+async fn next_session_update(
+    subscription: &mut chidori::managed_client::SessionSubscription,
+) -> SessionUpdate {
+    let SessionEvent::Updated(update) = timeout(Duration::from_secs(1), subscription.next())
+        .await
+        .expect("Session update arrives")
+        .expect("Session stream remains open")
+        .expect("Session update is valid")
+    else {
+        panic!("expected a Session update");
+    };
+    update
+}
+
+async fn read_session_at_least_revision(
+    client: &reqwest::Client,
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+    revision: SessionRevision,
+) -> SessionSnapshot {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = client
+                .get(format!("{}/v1/sessions/{session_id}", descriptor.base_url))
+                .bearer_auth(&descriptor.token)
+                .send()
+                .await
+                .expect("read Session while awaiting revision")
+                .error_for_status()
+                .expect("Session remains readable")
+                .json::<SessionSnapshot>()
+                .await
+                .expect("decode Session while awaiting revision");
+            if snapshot.revision >= revision {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Session reaches expected revision")
+}
+
 #[tokio::test]
-async fn authenticated_first_prompt_atomically_creates_a_failed_session_turn() {
+async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_multiple_clients() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "provider-session-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut first = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "provider-session-test")
+            .expect("configure first client"),
+    )
+    .await
+    .expect("connect first client");
+    let mut second = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "provider-session-test")
+            .expect("configure second client"),
+    )
+    .await
+    .expect("connect second client");
+    receive_managed_client_initial_state(&mut first).await;
+    receive_managed_client_initial_state(&mut second).await;
+
+    let prompt_id = PromptId::new();
+    let created = first
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: prompt_id,
+                text: "Explain the provider seam".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session without waiting for Provider startup");
+    assert_eq!(created.revision, SessionRevision::INITIAL);
+    assert_eq!(created.session.agent, None);
+    assert_eq!(created.session.status, SessionStatus::Idle);
+    assert_eq!(created.prompts.len(), 1);
+    assert_eq!(created.prompts[0].status, PromptStatus::Pending);
+    assert!(created.turns.is_empty());
+    assert!(created.messages.is_empty());
+    assert!(created.activities.is_empty());
+
+    let mut first_feed = first
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe first client");
+    let mut second_feed = second
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe second client");
+    for feed in [&mut first_feed, &mut second_feed] {
+        assert_eq!(
+            timeout(Duration::from_secs(1), feed.next())
+                .await
+                .expect("Session snapshot arrives")
+                .expect("Session stream remains open")
+                .expect("Session snapshot is valid"),
+            SessionEvent::Snapshot(created.clone())
+        );
+    }
+
+    let start = timeout(Duration::from_secs(1), provider.next_start())
+        .await
+        .expect("Provider startup begins asynchronously");
+    assert_eq!(start.workspace(), workspace.path());
+    let identity = AgentIdentity {
+        agent: AgentId::new("codex"),
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-5.6-codex"),
+    };
+    let mut provider_session = start.succeed(identity.clone());
+    let turn_request = timeout(Duration::from_secs(1), provider_session.next_turn())
+        .await
+        .expect("initial Prompt reaches the Provider Session");
+    assert_eq!(turn_request.prompt(), "Explain the provider seam");
+
+    let first_binding = next_session_update(&mut first_feed).await;
+    let second_binding = next_session_update(&mut second_feed).await;
+    assert_eq!(first_binding, second_binding);
+    assert_eq!(first_binding.revision, SessionRevision(2));
+    assert_eq!(
+        first_binding.changes,
+        vec![SessionChange::AgentBound {
+            agent: identity.clone(),
+        }]
+    );
+
+    let first_delivery = next_session_update(&mut first_feed).await;
+    let second_delivery = next_session_update(&mut second_feed).await;
+    assert_eq!(first_delivery, second_delivery);
+    assert_eq!(first_delivery.revision, SessionRevision(3));
+    let turn_id = first_delivery
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            SessionChange::TurnAdded { turn } => Some(turn.id),
+            _ => None,
+        })
+        .expect("Prompt delivery creates a Turn");
+    assert!(first_delivery.changes.iter().any(|change| {
+        matches!(change, SessionChange::PromptStatusChanged {
+            prompt_id: changed_prompt_id,
+            status: PromptStatus::Delivered,
+        } if *changed_prompt_id == prompt_id)
+    }));
+    assert!(first_delivery.changes.iter().any(|change| {
+        matches!(change, SessionChange::MessageAdded { message }
+            if message.turn_id == turn_id
+                && message.role == MessageRole::User
+                && message.content == "Explain the provider seam")
+    }));
+    assert!(first_delivery.changes.iter().any(|change| {
+        matches!(
+            change,
+            SessionChange::SessionStatusChanged {
+                status: SessionStatus::Active,
+            }
+        )
+    }));
+
+    turn_request.succeed();
+    for event in [
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: "Hello".to_owned(),
+        },
+        ProviderEvent::AgentMessageDelta {
+            content: " from the Provider".to_owned(),
+        },
+        ProviderEvent::AgentMessageCompleted,
+        ProviderEvent::TurnCompleted,
+    ] {
+        provider_session.emit(event);
+        let first_update = next_session_update(&mut first_feed).await;
+        let second_update = next_session_update(&mut second_feed).await;
+        assert_eq!(first_update, second_update);
+    }
+
+    let completed = first
+        .read_session(created.session.id)
+        .await
+        .expect("read completed Session");
+    assert_eq!(completed.revision, SessionRevision(8));
+    assert_eq!(completed.session.agent, Some(identity));
+    assert_eq!(completed.session.status, SessionStatus::Idle);
+    assert_eq!(completed.prompts[0].status, PromptStatus::Delivered);
+    assert_eq!(completed.turns.len(), 1);
+    assert_eq!(completed.turns[0].status, TurnStatus::Completed);
+    assert_eq!(completed.messages.len(), 2);
+    assert_eq!(completed.messages[0].role, MessageRole::User);
+    assert_eq!(completed.messages[1].role, MessageRole::Agent);
+    assert_eq!(completed.messages[1].status, MessageStatus::Completed);
+    assert_eq!(completed.messages[1].content, "Hello from the Provider");
+
+    drop(provider_session);
+    drop(first_feed);
+    drop(second_feed);
+    drop(first);
+    drop(second);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usable() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "provider-failure-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "provider-failure-test")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_managed_client_initial_state(&mut client).await;
+
+    let initial_prompt_id = PromptId::new();
+    let created = client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: initial_prompt_id,
+                text: "Fail during startup".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let mut feed = client
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe to Session");
+    assert_eq!(
+        timeout(Duration::from_secs(1), feed.next())
+            .await
+            .expect("initial snapshot arrives")
+            .expect("Session stream remains open")
+            .expect("initial snapshot is valid"),
+        SessionEvent::Snapshot(created.clone())
+    );
+
+    provider
+        .next_start()
+        .await
+        .fail("the deterministic runtime could not start");
+    let startup_failure = next_session_update(&mut feed).await;
+    assert_eq!(startup_failure.revision, SessionRevision(2));
+    assert!(startup_failure.changes.iter().any(|change| {
+        matches!(change, SessionChange::TurnAdded { turn }
+            if turn.prompt_id == initial_prompt_id && turn.status == TurnStatus::Failed)
+    }));
+    assert!(startup_failure.changes.iter().any(|change| {
+        matches!(change, SessionChange::ActivityAdded { activity }
+            if activity.kind == ActivityKind::Error
+                && activity.text.contains("deterministic runtime could not start"))
+    }));
+
+    let execution_prompt_id = PromptId::new();
+    let execution_prompt = client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: execution_prompt_id,
+                    text: "Fail while starting the Turn".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit a Prompt after startup failure");
+    assert_eq!(execution_prompt.status, PromptStatus::Pending);
+    let admitted = next_session_update(&mut feed).await;
+    assert_eq!(admitted.revision, SessionRevision(3));
+
+    let retry = provider.next_start().await;
+    let identity = AgentIdentity {
+        agent: AgentId::new("codex"),
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-5.6-codex"),
+    };
+    let mut provider_session = retry.succeed(identity.clone());
+    assert_eq!(
+        next_session_update(&mut feed).await.revision,
+        SessionRevision(4)
+    );
+    let delivery = next_session_update(&mut feed).await;
+    assert_eq!(delivery.revision, SessionRevision(5));
+    let execution_turn_id = delivery
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            SessionChange::TurnAdded { turn } => Some(turn.id),
+            _ => None,
+        })
+        .expect("Provider delivery creates the execution Turn");
+    provider_session
+        .next_turn()
+        .await
+        .fail("the deterministic Provider rejected the Turn");
+    let execution_failure = next_session_update(&mut feed).await;
+    assert_eq!(execution_failure.revision, SessionRevision(6));
+    assert!(execution_failure.changes.iter().any(|change| {
+        matches!(change, SessionChange::ActivityAdded { activity }
+            if activity.turn_id == execution_turn_id
+                && activity.text.contains("deterministic Provider rejected the Turn"))
+    }));
+    assert!(execution_failure.changes.iter().any(|change| {
+        matches!(change, SessionChange::TurnStatusChanged {
+            turn_id,
+            status: TurnStatus::Failed,
+        } if *turn_id == execution_turn_id)
+    }));
+
+    let recovery_prompt_id = PromptId::new();
+    let recovery_prompt = client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: recovery_prompt_id,
+                    text: "Succeed after both failures".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit a Prompt after execution failure");
+    assert_eq!(recovery_prompt.status, PromptStatus::Pending);
+    assert_eq!(
+        next_session_update(&mut feed).await.revision,
+        SessionRevision(7)
+    );
+    let recovery_delivery = next_session_update(&mut feed).await;
+    assert_eq!(recovery_delivery.revision, SessionRevision(8));
+    let recovery_turn_id = recovery_delivery
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            SessionChange::TurnAdded { turn } => Some(turn.id),
+            _ => None,
+        })
+        .expect("recovery Prompt creates a Turn");
+    provider_session.next_turn().await.succeed();
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    let recovered = next_session_update(&mut feed).await;
+    assert_eq!(recovered.revision, SessionRevision(9));
+
+    let snapshot = client
+        .read_session(created.session.id)
+        .await
+        .expect("read recovered Session");
+    assert_eq!(snapshot.session.agent, Some(identity));
+    assert_eq!(snapshot.session.status, SessionStatus::Idle);
+    assert_eq!(snapshot.turns.len(), 3);
+    assert_eq!(snapshot.turns[0].status, TurnStatus::Failed);
+    assert_eq!(snapshot.turns[1].status, TurnStatus::Failed);
+    assert_eq!(snapshot.turns[2].id, recovery_turn_id);
+    assert_eq!(snapshot.turns[2].status, TurnStatus::Completed);
+    assert_eq!(snapshot.activities.len(), 2);
+
+    drop(provider_session);
+    drop(feed);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn authenticated_creation_returns_pending_before_async_provider_failure() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace_parent = tempfile::tempdir().expect("create workspace parent");
     let workspace = workspace_parent.path().join("workspace");
@@ -49,7 +437,8 @@ async fn authenticated_first_prompt_atomically_creates_a_failed_session_turn() {
     let descriptor = server.descriptor().clone();
     let prompt_id = PromptId::new();
 
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::new();
+    let response = client
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
@@ -78,18 +467,34 @@ async fn authenticated_first_prompt_atomically_creates_a_failed_session_turn() {
     assert_eq!(snapshot.session.status, SessionStatus::Idle);
     assert_eq!(snapshot.prompts.len(), 1);
     assert_eq!(snapshot.prompts[0].id, prompt_id);
-    assert_eq!(snapshot.prompts[0].status, PromptStatus::Delivered);
-    assert_eq!(snapshot.turns.len(), 1);
-    assert_eq!(snapshot.turns[0].prompt_id, prompt_id);
-    assert_eq!(snapshot.turns[0].status, TurnStatus::Failed);
-    assert_eq!(snapshot.messages.len(), 1);
-    assert_eq!(snapshot.messages[0].role, MessageRole::User);
-    assert_eq!(snapshot.messages[0].content, "Explain this workspace");
-    assert_eq!(snapshot.activities.len(), 1);
-    assert_eq!(snapshot.activities[0].kind, ActivityKind::Error);
-    assert!(snapshot.activities[0].text.contains("No Agent"));
+    assert_eq!(snapshot.prompts[0].status, PromptStatus::Pending);
+    assert!(snapshot.turns.is_empty());
+    assert!(snapshot.messages.is_empty());
+    assert!(snapshot.activities.is_empty());
+
+    let failed = read_session_at_least_revision(
+        &client,
+        &descriptor,
+        snapshot.session.id,
+        SessionRevision(2),
+    )
+    .await;
+    assert_eq!(failed.prompts[0].status, PromptStatus::Delivered);
+    assert_eq!(failed.turns.len(), 1);
+    assert_eq!(failed.turns[0].prompt_id, prompt_id);
+    assert_eq!(failed.turns[0].status, TurnStatus::Failed);
+    assert_eq!(failed.messages.len(), 1);
+    assert_eq!(failed.messages[0].role, MessageRole::User);
+    assert_eq!(failed.messages[0].content, "Explain this workspace");
+    assert_eq!(failed.activities.len(), 1);
+    assert_eq!(failed.activities[0].kind, ActivityKind::Error);
     assert!(
-        snapshot
+        failed.activities[0]
+            .text
+            .contains("Provider startup failed")
+    );
+    assert!(
+        failed
             .messages
             .iter()
             .all(|message| message.role != MessageRole::Agent),
@@ -135,6 +540,9 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
         .json::<SessionSnapshot>()
         .await
         .expect("decode created Session");
+    let settled =
+        read_session_at_least_revision(&client, &descriptor, first.session.id, SessionRevision(2))
+            .await;
 
     let exact_retry = client
         .post(format!("{}/v1/sessions", descriptor.base_url))
@@ -149,7 +557,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
             .json::<SessionSnapshot>()
             .await
             .expect("decode retried Session"),
-        first
+        settled
     );
 
     for conflicting in [
@@ -202,7 +610,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
             .json::<SessionSnapshot>()
             .await
             .expect("decode retry after Workspace disappears"),
-        first
+        settled
     );
 
     server.shutdown().await.expect("shut down server");
@@ -240,6 +648,13 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         .json::<SessionSnapshot>()
         .await
         .expect("decode Session");
+    let settled = read_session_at_least_revision(
+        &client,
+        &descriptor,
+        created.session.id,
+        SessionRevision(2),
+    )
+    .await;
     let response = client
         .get(format!(
             "{}/v1/sessions/{}/events",
@@ -282,7 +697,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         .await
         .expect("decode admitted Prompt");
     assert_eq!(admitted.id, prompt_id);
-    assert_eq!(admitted.status, PromptStatus::Delivered);
+    assert_eq!(admitted.status, PromptStatus::Pending);
 
     let update_event = timeout(Duration::from_secs(1), events.next())
         .await
@@ -292,11 +707,20 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
     assert_eq!(update_event.event, SESSION_UPDATED_EVENT);
     let update = serde_json::from_str::<SessionUpdate>(&update_event.data)
         .expect("decode streamed Session update");
-    assert_eq!(update.revision, SessionRevision(2));
+    assert_eq!(update.revision, SessionRevision(settled.revision.0 + 1));
     assert!(update.changes.iter().any(
         |change| matches!(change, SessionChange::PromptAdded { prompt } if prompt.id == prompt_id)
     ));
-    let turn_id = update
+
+    let failure_event = timeout(Duration::from_secs(1), events.next())
+        .await
+        .expect("Provider failure update arrives")
+        .expect("Session stream remains open")
+        .expect("decode Provider failure update");
+    let failure = serde_json::from_str::<SessionUpdate>(&failure_event.data)
+        .expect("decode Provider failure Session update");
+    assert_eq!(failure.revision, SessionRevision(update.revision.0 + 1));
+    let turn_id = failure
         .changes
         .iter()
         .find_map(|change| match change {
@@ -304,7 +728,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
             _ => None,
         })
         .expect("delivered steer creates a Turn");
-    assert!(update.changes.iter().any(|change| {
+    assert!(failure.changes.iter().any(|change| {
         matches!(change, SessionChange::MessageAdded { message }
             if message.turn_id == turn_id && message.content == command.prompt.text)
     }));
@@ -320,13 +744,14 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         .await
         .expect("retry steer admission");
     assert_eq!(exact_retry.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        exact_retry
-            .json::<Prompt>()
-            .await
-            .expect("decode retried Prompt"),
-        admitted
-    );
+    let retried = exact_retry
+        .json::<Prompt>()
+        .await
+        .expect("decode retried Prompt");
+    assert_eq!(retried.id, admitted.id);
+    assert_eq!(retried.text, admitted.text);
+    assert_eq!(retried.delivery, admitted.delivery);
+    assert_eq!(retried.status, PromptStatus::Delivered);
     assert!(
         timeout(Duration::from_millis(100), events.next())
             .await
@@ -388,7 +813,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
 }
 
 #[tokio::test]
-async fn active_turn_admission_orders_queue_and_steer_before_safe_delivery() {
+async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let server = server::spawn(
@@ -417,6 +842,13 @@ async fn active_turn_admission_orders_queue_and_steer_before_safe_delivery() {
         .await
         .expect("create Session");
     let session_id = created.session.id;
+    let _settled = read_session_at_least_revision(
+        &reqwest::Client::new(),
+        server.descriptor(),
+        session_id,
+        SessionRevision(2),
+    )
+    .await;
     let active_prompt_id = PromptId::new();
     let active_turn_id = TurnId::new();
     server
@@ -610,7 +1042,7 @@ async fn active_turn_admission_orders_queue_and_steer_before_safe_delivery() {
             .find(|prompt| prompt.id == queued.id)
             .expect("queued Prompt remains authoritative")
             .status,
-        PromptStatus::Delivered
+        PromptStatus::Pending
     );
     assert_eq!(
         completed
@@ -858,7 +1290,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
 }
 
 #[tokio::test]
-async fn consecutive_prompt_admissions_are_delivered_without_collapsing_revisions() {
+async fn consecutive_prompt_admissions_and_failures_do_not_collapse_revisions() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid workspace");
     let server = server::spawn(
@@ -889,6 +1321,13 @@ async fn consecutive_prompt_admissions_are_delivered_without_collapsing_revision
         .json::<SessionSnapshot>()
         .await
         .expect("decode Session");
+    let settled = read_session_at_least_revision(
+        &client,
+        &descriptor,
+        created.session.id,
+        SessionRevision(2),
+    )
+    .await;
     let response = client
         .get(format!(
             "{}/v1/sessions/{}/events",
@@ -935,8 +1374,8 @@ async fn consecutive_prompt_admissions_are_delivered_without_collapsing_revision
             .expect("consecutive steer is accepted");
     }
 
-    let mut delivered_prompts = Vec::new();
-    for expected_revision in 2..=33 {
+    let mut admitted_prompts = Vec::new();
+    for offset in 1..=64 {
         let event = timeout(Duration::from_secs(1), events.next())
             .await
             .expect("every consecutive Session update arrives")
@@ -944,15 +1383,18 @@ async fn consecutive_prompt_admissions_are_delivered_without_collapsing_revision
             .expect("decode consecutive Session update");
         let update = serde_json::from_str::<SessionUpdate>(&event.data)
             .expect("decode consecutive Session update body");
-        assert_eq!(update.revision, SessionRevision(expected_revision));
-        delivered_prompts.extend(update.changes.iter().filter_map(|change| match change {
+        assert_eq!(
+            update.revision,
+            SessionRevision(settled.revision.0 + offset)
+        );
+        admitted_prompts.extend(update.changes.iter().filter_map(|change| match change {
             SessionChange::PromptAdded { prompt } => Some(prompt.id),
             _ => None,
         }));
     }
-    delivered_prompts.sort_by_key(|prompt_id| prompt_id.as_uuid());
+    admitted_prompts.sort_by_key(|prompt_id| prompt_id.as_uuid());
     prompt_ids.sort_by_key(|prompt_id| prompt_id.as_uuid());
-    assert_eq!(delivered_prompts, prompt_ids);
+    assert_eq!(admitted_prompts, prompt_ids);
 
     drop(events);
     server.shutdown().await.expect("shut down server");
@@ -997,6 +1439,13 @@ async fn authenticated_clients_can_read_a_session_by_id() {
         .await
         .expect("read Session without authentication");
     assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let settled = read_session_at_least_revision(
+        &client,
+        &descriptor,
+        created.session.id,
+        SessionRevision(2),
+    )
+    .await;
     let read = client
         .get(&session_url)
         .bearer_auth(&descriptor.token)
@@ -1008,7 +1457,7 @@ async fn authenticated_clients_can_read_a_session_by_id() {
         .json::<SessionSnapshot>()
         .await
         .expect("decode Session read");
-    assert_eq!(read, created);
+    assert_eq!(read, settled);
 
     let missing = client
         .get(format!(
@@ -1338,12 +1787,10 @@ async fn authenticated_session_stream_starts_with_a_complete_revisioned_snapshot
         .expect("decode Session SSE event");
 
     assert_eq!(first.event, SESSION_SNAPSHOT_EVENT);
-    assert_eq!(first.id, created.revision.0.to_string());
-    assert_eq!(
-        serde_json::from_str::<SessionSnapshot>(&first.data)
-            .expect("decode Session snapshot event"),
-        created
-    );
+    let first_snapshot = serde_json::from_str::<SessionSnapshot>(&first.data)
+        .expect("decode Session snapshot event");
+    assert_eq!(first_snapshot.session.id, created.session.id);
+    assert_eq!(first.id, first_snapshot.revision.0.to_string());
 
     drop(events);
     let reconnected = client
@@ -1361,7 +1808,14 @@ async fn authenticated_session_stream_starts_with_a_complete_revisioned_snapshot
         .expect("reconnected Session stream remains open")
         .expect("decode reconnected Session SSE event");
     assert_eq!(fresh_snapshot.event, SESSION_SNAPSHOT_EVENT);
-    assert_eq!(fresh_snapshot.id, created.revision.0.to_string());
+    let fresh_snapshot_body = serde_json::from_str::<SessionSnapshot>(&fresh_snapshot.data)
+        .expect("decode fresh Session snapshot event");
+    assert_eq!(fresh_snapshot_body.session.id, created.session.id);
+    assert_eq!(
+        fresh_snapshot.id,
+        fresh_snapshot_body.revision.0.to_string()
+    );
+    assert!(fresh_snapshot_body.revision >= first_snapshot.revision);
 
     drop(reconnected_events);
     server.shutdown().await.expect("shut down server");
@@ -1397,6 +1851,13 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
         .await
         .expect("create Session");
     let session_id = created.session.id;
+    let settled = read_session_at_least_revision(
+        &reqwest::Client::new(),
+        server.descriptor(),
+        session_id,
+        SessionRevision(2),
+    )
+    .await;
     let prompt_id = PromptId::new();
     let turn_id = TurnId::new();
     let message_id = MessageId::new();
@@ -1410,7 +1871,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
             .expect("Session snapshot arrives")
             .expect("Session stream remains open")
             .expect("Session snapshot is valid"),
-        SessionEvent::Snapshot(created)
+        SessionEvent::Snapshot(settled.clone())
     );
 
     let active_update = server
@@ -1446,7 +1907,10 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
             ],
         )
         .expect("start an active Turn for Agent output");
-    assert_eq!(active_update.revision, SessionRevision(2));
+    assert_eq!(
+        active_update.revision,
+        SessionRevision(settled.revision.0 + 1)
+    );
     assert_eq!(
         timeout(Duration::from_secs(1), subscription.next())
             .await
@@ -1479,7 +1943,10 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
             let update = output
                 .emit(session_id, event)
                 .expect("publish provider-neutral Agent output");
-            assert_eq!(update.revision, SessionRevision(index as u64 + 3));
+            assert_eq!(
+                update.revision,
+                SessionRevision(settled.revision.0 + index as u64 + 2)
+            );
             update
         })
         .collect::<Vec<_>>();
@@ -1519,7 +1986,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
     assert_eq!(agent_messages[0].id, message_id);
     assert_eq!(agent_messages[0].content, "Hello world");
     assert_eq!(agent_messages[0].status, MessageStatus::Completed);
-    assert_eq!(completed.revision, SessionRevision(6));
+    assert_eq!(completed.revision, SessionRevision(settled.revision.0 + 5));
 
     drop(reconnected);
     drop(subscription);
@@ -1618,6 +2085,13 @@ async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_clie
         })
         .await
         .expect("create Session through managed client");
+    let settled = read_session_at_least_revision(
+        &reqwest::Client::new(),
+        server.descriptor(),
+        created.session.id,
+        SessionRevision(2),
+    )
+    .await;
     let mut first_subscription = first_client
         .attach_session(created.session.id)
         .await
@@ -1628,7 +2102,7 @@ async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_clie
             .await
             .expect("first Session event arrives")
             .expect("first Session event is valid"),
-        SessionEvent::Snapshot(created.clone())
+        SessionEvent::Snapshot(settled.clone())
     );
 
     drop(first_subscription);
@@ -1651,7 +2125,7 @@ async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_clie
             .await
             .expect("reconnected Session event arrives")
             .expect("reconnected Session event is valid"),
-        SessionEvent::Snapshot(created)
+        SessionEvent::Snapshot(settled)
     );
 
     drop(second_subscription);
@@ -1688,13 +2162,20 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
         })
         .await
         .expect("create Session");
+    let settled = read_session_at_least_revision(
+        &reqwest::Client::new(),
+        server.descriptor(),
+        created.session.id,
+        SessionRevision(2),
+    )
+    .await;
 
     assert_eq!(
         client
             .read_session(created.session.id)
             .await
             .expect("read Session through managed client"),
-        created
+        settled
     );
     let summaries = client
         .list_sessions(Some(workspace.path()))
@@ -1713,7 +2194,7 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
             .await
             .expect("attached Session event arrives")
             .expect("attached Session event is valid"),
-        SessionEvent::Snapshot(created)
+        SessionEvent::Snapshot(settled)
     );
 
     drop(attachment);
@@ -1770,6 +2251,20 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
         })
         .await
         .expect("create isolated Session");
+    let shared_settled = read_session_at_least_revision(
+        &reqwest::Client::new(),
+        server.descriptor(),
+        shared.session.id,
+        SessionRevision(2),
+    )
+    .await;
+    let isolated_settled = read_session_at_least_revision(
+        &reqwest::Client::new(),
+        server.descriptor(),
+        isolated.session.id,
+        SessionRevision(2),
+    )
+    .await;
     let mut first_attachment = first_client
         .attach_session(shared.session.id)
         .await
@@ -1789,7 +2284,10 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
         .await
         .expect("second client receives shared Session")
         .expect("second shared Session snapshot is valid");
-    assert_eq!(first_projection, SessionEvent::Snapshot(shared.clone()));
+    assert_eq!(
+        first_projection,
+        SessionEvent::Snapshot(shared_settled.clone())
+    );
     assert_eq!(second_projection, first_projection);
 
     let mut isolated_attachment = second_client
@@ -1802,7 +2300,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
             .await
             .expect("isolated Session snapshot arrives")
             .expect("isolated Session snapshot is valid"),
-        SessionEvent::Snapshot(isolated.clone())
+        SessionEvent::Snapshot(isolated_settled)
     );
 
     let before_update = first_client
@@ -1855,7 +2353,10 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
             ],
         )
         .expect("publish provider-neutral Session changes");
-    assert_eq!(update.revision, SessionRevision(2));
+    assert_eq!(
+        update.revision,
+        SessionRevision(shared_settled.revision.0 + 1)
+    );
 
     let first_update = first_attachment
         .next()

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -16,10 +17,10 @@ use axum::{
 };
 use fs2::FileExt;
 use futures_util::{StreamExt, stream};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, de::DeserializeOwned};
 use tokio::{
     net::TcpListener,
-    sync::{broadcast, oneshot, watch},
+    sync::{broadcast, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Duration, Instant},
 };
@@ -33,6 +34,10 @@ use crate::protocol::{
     SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity,
     ServerShutdown, SessionChange, SessionError, SessionErrorCode, SessionId, SessionUpdate,
     ShutdownReason, TurnId,
+};
+use crate::provider::{
+    ProviderEvent, ProviderEventStream, ProviderRuntime, ProviderSession, ProviderSessionRequest,
+    ProviderTurnRequest, UnavailableProviderRuntime,
 };
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
@@ -233,10 +238,321 @@ impl ShutdownController {
 struct AppState {
     descriptor: Arc<RuntimeDescriptor>,
     sessions: SessionStore,
+    providers: ProviderOrchestrator,
     shutdown: ShutdownController,
 }
 
+#[derive(Clone)]
+struct ProviderOrchestrator {
+    runtime: Arc<dyn ProviderRuntime>,
+    sessions: SessionStore,
+    actors: Arc<Mutex<HashMap<SessionId, mpsc::UnboundedSender<ProviderCommand>>>>,
+}
+
+#[derive(Clone, Copy)]
+struct ProviderCommand {
+    prompt_id: crate::protocol::PromptId,
+}
+
+struct ConnectedProviderSession {
+    session: Arc<dyn ProviderSession>,
+    events: ProviderEventStream,
+}
+
+struct ActiveProviderTurn {
+    turn_id: TurnId,
+    streaming_message_id: Option<MessageId>,
+}
+
+impl ProviderOrchestrator {
+    fn new(runtime: Arc<dyn ProviderRuntime>, sessions: SessionStore) -> Self {
+        Self {
+            runtime,
+            sessions,
+            actors: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn open_session(
+        &self,
+        session_id: SessionId,
+        workspace: PathBuf,
+        prompt_id: crate::protocol::PromptId,
+    ) {
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        self.actors
+            .lock()
+            .expect("Provider actor registry lock is not poisoned")
+            .insert(session_id, commands_tx.clone());
+        let runtime = self.runtime.clone();
+        let sessions = self.sessions.clone();
+        tokio::spawn(run_provider_session(
+            runtime,
+            sessions,
+            session_id,
+            workspace,
+            commands_rx,
+        ));
+        commands_tx
+            .send(ProviderCommand { prompt_id })
+            .expect("new Provider actor accepts its initial Prompt");
+    }
+
+    fn deliver(&self, session_id: SessionId, prompt_id: crate::protocol::PromptId) -> Result<()> {
+        let actor = self
+            .actors
+            .lock()
+            .expect("Provider actor registry lock is not poisoned")
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Session has no Provider actor"))?;
+        actor
+            .send(ProviderCommand { prompt_id })
+            .map_err(|_| anyhow::anyhow!("Session Provider actor stopped unexpectedly"))
+    }
+}
+
+async fn run_provider_session(
+    runtime: Arc<dyn ProviderRuntime>,
+    sessions: SessionStore,
+    session_id: SessionId,
+    workspace: PathBuf,
+    mut commands: mpsc::UnboundedReceiver<ProviderCommand>,
+) {
+    let mut provider: Option<ConnectedProviderSession> = None;
+    let mut active: Option<ActiveProviderTurn> = None;
+
+    loop {
+        if active.is_none() {
+            let Some(command) = commands.recv().await else {
+                return;
+            };
+            if provider.is_none() {
+                let connection = runtime
+                    .start_session(ProviderSessionRequest {
+                        workspace: workspace.clone(),
+                    })
+                    .await;
+                let connection = match connection {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        let _ = sessions.fail_pending_prompt(
+                            session_id,
+                            command.prompt_id,
+                            format!("Provider startup failed: {error}"),
+                        );
+                        continue;
+                    }
+                };
+                let (identity, session, events) = connection.into_parts();
+                if let Err(error) = sessions.bind_agent(session_id, identity) {
+                    let _ = sessions.fail_pending_prompt(
+                        session_id,
+                        command.prompt_id,
+                        format!("Provider startup failed: {error}"),
+                    );
+                    continue;
+                }
+                provider = Some(ConnectedProviderSession { session, events });
+            }
+
+            let started = match sessions.start_prompt(session_id, command.prompt_id) {
+                Ok(Some(started)) => started,
+                Ok(None) => continue,
+                Err(_) => continue,
+            };
+            let provider_session = provider
+                .as_ref()
+                .expect("Provider connection exists before Prompt delivery")
+                .session
+                .clone();
+            if let Err(error) = provider_session
+                .start_turn(ProviderTurnRequest {
+                    prompt: started.prompt.text,
+                })
+                .await
+            {
+                let _ = sessions.fail_turn(
+                    session_id,
+                    started.turn.id,
+                    None,
+                    format!("Provider execution failed: {error}"),
+                );
+                continue;
+            }
+            active = Some(ActiveProviderTurn {
+                turn_id: started.turn.id,
+                streaming_message_id: None,
+            });
+            continue;
+        }
+
+        let connected = provider
+            .as_mut()
+            .expect("an active Provider Turn has a Provider Session");
+        tokio::select! {
+            command = commands.recv() => {
+                if command.is_none() {
+                    return;
+                }
+                // Commands admitted while work is active remain pending. Steering and queued
+                // delivery are added at their dedicated orchestration seams.
+            }
+            event = connected.events.next() => {
+                let Some(current) = active.as_mut() else {
+                    continue;
+                };
+                match event {
+                    Some(Ok(event)) => {
+                        if project_provider_event(&sessions, session_id, current, event) {
+                            active = None;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        let _ = sessions.fail_turn(
+                            session_id,
+                            current.turn_id,
+                            current.streaming_message_id,
+                            format!("Provider execution failed: {error}"),
+                        );
+                        active = None;
+                        provider = None;
+                    }
+                    None => {
+                        let _ = sessions.fail_turn(
+                            session_id,
+                            current.turn_id,
+                            current.streaming_message_id,
+                            "Provider execution failed: the Provider Session ended before the Turn completed."
+                                .to_owned(),
+                        );
+                        active = None;
+                        provider = None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn project_provider_event(
+    sessions: &SessionStore,
+    session_id: SessionId,
+    active: &mut ActiveProviderTurn,
+    event: ProviderEvent,
+) -> bool {
+    let projection = match event {
+        ProviderEvent::AgentMessageStarted => {
+            if active.streaming_message_id.is_some() {
+                Err(anyhow::anyhow!(
+                    "Provider started a second Agent Message before completing the first"
+                ))
+            } else {
+                let message_id = MessageId::new();
+                active.streaming_message_id = Some(message_id);
+                sessions
+                    .publish_agent_output(
+                        session_id,
+                        SessionChange::MessageAdded {
+                            message: Message {
+                                id: message_id,
+                                turn_id: active.turn_id,
+                                role: MessageRole::Agent,
+                                status: MessageStatus::Streaming,
+                                content: String::new(),
+                            },
+                        },
+                    )
+                    .map(|_| false)
+            }
+        }
+        ProviderEvent::AgentMessageDelta { content } => {
+            let Some(message_id) = active.streaming_message_id else {
+                return fail_invalid_provider_event(
+                    sessions,
+                    session_id,
+                    active,
+                    "Provider sent Agent Message content before starting a Message",
+                );
+            };
+            sessions
+                .publish_agent_output(
+                    session_id,
+                    SessionChange::MessageContentAppended {
+                        message_id,
+                        content,
+                    },
+                )
+                .map(|_| false)
+        }
+        ProviderEvent::AgentMessageCompleted => {
+            let Some(message_id) = active.streaming_message_id.take() else {
+                return fail_invalid_provider_event(
+                    sessions,
+                    session_id,
+                    active,
+                    "Provider completed an Agent Message before starting one",
+                );
+            };
+            sessions
+                .publish_agent_output(session_id, SessionChange::MessageCompleted { message_id })
+                .map(|_| false)
+        }
+        ProviderEvent::TurnCompleted => {
+            if active.streaming_message_id.is_some() {
+                Err(anyhow::anyhow!(
+                    "Provider completed the Turn before completing its Agent Message"
+                ))
+            } else {
+                sessions
+                    .complete_turn(session_id, active.turn_id)
+                    .map(|_| true)
+            }
+        }
+        ProviderEvent::TurnFailed { message } => sessions
+            .fail_turn(
+                session_id,
+                active.turn_id,
+                active.streaming_message_id.take(),
+                message,
+            )
+            .map(|_| true),
+    };
+
+    projection.unwrap_or_else(|error| {
+        let _ = sessions.fail_turn(
+            session_id,
+            active.turn_id,
+            active.streaming_message_id.take(),
+            format!("Provider execution failed: {error}"),
+        );
+        true
+    })
+}
+
+fn fail_invalid_provider_event(
+    sessions: &SessionStore,
+    session_id: SessionId,
+    active: &mut ActiveProviderTurn,
+    message: &str,
+) -> bool {
+    let _ = sessions.fail_turn(
+        session_id,
+        active.turn_id,
+        active.streaming_message_id.take(),
+        format!("Provider execution failed: {message}"),
+    );
+    true
+}
+
 pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
+    spawn_with_provider(config, Arc::new(UnavailableProviderRuntime)).await
+}
+
+pub async fn spawn_with_provider(
+    config: ServerConfig,
+    runtime: Arc<dyn ProviderRuntime>,
+) -> Result<RunningServer> {
     config.create_private_runtime_dir()?;
 
     let lock = OpenOptions::new()
@@ -275,9 +591,11 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
     };
     let sessions = SessionStore::default();
+    let providers = ProviderOrchestrator::new(runtime, sessions.clone());
     let state = AppState {
         descriptor: Arc::new(descriptor.clone()),
         sessions: sessions.clone(),
+        providers,
         shutdown: shutdown.clone(),
     };
     let app = Router::new()
@@ -422,7 +740,15 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         };
 
     match state.sessions.create(request) {
-        Ok(outcome) => store_outcome_response(outcome),
+        Ok(StoreOutcome::Created(snapshot)) => {
+            state.providers.open_session(
+                snapshot.session.id,
+                snapshot.session.workspace.path.clone(),
+                snapshot.prompts[0].id,
+            );
+            (StatusCode::CREATED, Json(snapshot)).into_response()
+        }
+        Ok(StoreOutcome::Existing(snapshot)) => (StatusCode::OK, Json(snapshot)).into_response(),
         Err(CreateSessionError::EmptyPrompt) => session_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             SessionErrorCode::EmptyPrompt,
@@ -451,7 +777,18 @@ async fn admit_prompt(
         };
 
     match state.sessions.admit(session_id, request) {
-        Ok(outcome) => store_outcome_response(outcome),
+        Ok(StoreOutcome::Created(admission)) => {
+            if admission.deliver {
+                state
+                    .providers
+                    .deliver(session_id, admission.prompt.id)
+                    .expect("stored Sessions retain their Provider actor");
+            }
+            (StatusCode::CREATED, Json(admission.prompt)).into_response()
+        }
+        Ok(StoreOutcome::Existing(admission)) => {
+            (StatusCode::OK, Json(admission.prompt)).into_response()
+        }
         Err(AdmitPromptError::EmptyPrompt) => session_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             SessionErrorCode::EmptyPrompt,
@@ -563,13 +900,6 @@ async fn decode_session_command<T: DeserializeOwned>(
             format!("{command_name} command is not valid JSON"),
         )
     })
-}
-
-fn store_outcome_response<T: Serialize>(outcome: StoreOutcome<T>) -> Response {
-    match outcome {
-        StoreOutcome::Created(value) => (StatusCode::CREATED, Json(value)).into_response(),
-        StoreOutcome::Existing(value) => (StatusCode::OK, Json(value)).into_response(),
-    }
 }
 
 #[derive(Deserialize)]

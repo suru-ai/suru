@@ -13,16 +13,14 @@ use anyhow::anyhow;
 use tokio::sync::broadcast;
 
 use crate::protocol::{
-    Activity, ActivityId, ActivityKind, AdmitPromptRequest, CreateSessionRequest, Message,
-    MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder,
+    Activity, ActivityId, ActivityKind, AdmitPromptRequest, AgentIdentity, CreateSessionRequest,
+    Message, MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder,
     PromptStatus, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
-    SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, TranscriptItem, Turn, TurnId,
-    TurnStatus, Workspace,
+    SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, Turn, TurnId, TurnStatus,
+    Workspace,
 };
 use crate::session_projection::apply_update;
 
-const AGENT_UNAVAILABLE: &str =
-    "No Agent is selected for this Session; provider integrations are unavailable.";
 const SESSION_UPDATE_CAPACITY: usize = 256;
 
 #[derive(Clone, Default)]
@@ -97,11 +95,14 @@ pub(crate) struct SessionFeed {
     pub(crate) updates: broadcast::Receiver<SessionUpdate>,
 }
 
-struct DeliveredTurn {
-    prompt: Prompt,
-    turn: Turn,
-    message: Message,
-    activity: Activity,
+pub(crate) struct PromptAdmission {
+    pub(crate) prompt: Prompt,
+    pub(crate) deliver: bool,
+}
+
+pub(crate) struct StartedTurn {
+    pub(crate) prompt: Prompt,
+    pub(crate) turn: Turn,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,13 +176,13 @@ impl SessionStore {
 
         let title = request.prompt.text.trim().to_owned();
         let session_id = SessionId::new();
-        let delivered = DeliveredTurn::new(
-            request.prompt.id,
-            request.prompt.text.clone(),
-            PromptDelivery::Steer,
-            PromptOrder::INITIAL,
-        );
-        let transcript = delivered.transcript();
+        let prompt = Prompt {
+            id: request.prompt.id,
+            text: request.prompt.text.clone(),
+            delivery: PromptDelivery::Steer,
+            admission_order: PromptOrder::INITIAL,
+            status: PromptStatus::Pending,
+        };
         let snapshot = SessionSnapshot {
             session: Session {
                 id: session_id,
@@ -192,11 +193,11 @@ impl SessionStore {
                 status: SessionStatus::Idle,
             },
             revision: SessionRevision::INITIAL,
-            prompts: vec![delivered.prompt],
-            turns: vec![delivered.turn],
-            messages: vec![delivered.message],
-            activities: vec![delivered.activity],
-            transcript,
+            prompts: vec![prompt],
+            turns: Vec::new(),
+            messages: Vec::new(),
+            activities: Vec::new(),
+            transcript: Vec::new(),
         };
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
         let timestamp = state.next_timestamp();
@@ -233,7 +234,7 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         request: AdmitPromptRequest,
-    ) -> Result<StoreOutcome<Prompt>, AdmitPromptError> {
+    ) -> Result<StoreOutcome<PromptAdmission>, AdmitPromptError> {
         if request.prompt.text.trim().is_empty() {
             return Err(AdmitPromptError::EmptyPrompt);
         }
@@ -256,7 +257,10 @@ impl SessionStore {
                     })
                     .expect("Prompt owner always references its Prompt")
                     .clone();
-                return Ok(StoreOutcome::Existing(prompt));
+                return Ok(StoreOutcome::Existing(PromptAdmission {
+                    prompt,
+                    deliver: false,
+                }));
             }
             return Err(AdmitPromptError::PromptConflict);
         }
@@ -276,29 +280,23 @@ impl SessionStore {
                 .checked_add(1)
                 .expect("Prompt admission order space is not exhausted"),
         );
-        let (prompt, changes) = if active_turn_id(&record.snapshot)
+        let deliver = active_turn_id(&record.snapshot)
             .expect("stored Sessions preserve the one-active-Turn invariant")
-            .is_some()
-        {
-            let prompt = Prompt {
-                id: request.prompt.id,
-                text: request.prompt.text.clone(),
-                delivery: request.delivery,
-                admission_order,
-                status: PromptStatus::Pending,
-            };
-            (prompt.clone(), vec![SessionChange::PromptAdded { prompt }])
-        } else {
-            let delivered = DeliveredTurn::new(
-                request.prompt.id,
-                request.prompt.text.clone(),
-                request.delivery,
-                admission_order,
-            );
-            (delivered.prompt.clone(), delivered.changes())
+            .is_none();
+        let prompt = Prompt {
+            id: request.prompt.id,
+            text: request.prompt.text.clone(),
+            delivery: request.delivery,
+            admission_order,
+            status: PromptStatus::Pending,
         };
         record
-            .publish(session_id, changes)
+            .publish(
+                session_id,
+                vec![SessionChange::PromptAdded {
+                    prompt: prompt.clone(),
+                }],
+            )
             .expect("admission changes preserve Session invariants");
         record.next_prompt_order = next_prompt_order;
         record.summary.updated_at = updated_at;
@@ -310,7 +308,7 @@ impl SessionStore {
                 origin: PromptOrigin::Admission(request.delivery),
             },
         );
-        Ok(StoreOutcome::Created(prompt))
+        Ok(StoreOutcome::Created(PromptAdmission { prompt, deliver }))
     }
 
     pub(crate) fn subscribe(&self, session_id: SessionId) -> Option<SessionFeed> {
@@ -332,6 +330,212 @@ impl SessionStore {
             .sessions
             .get(&session_id)
             .map(|record| record.snapshot.clone())
+    }
+
+    pub(crate) fn bind_agent(
+        &self,
+        session_id: SessionId,
+        agent: AgentIdentity,
+    ) -> anyhow::Result<Option<SessionUpdate>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let current = state
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?
+            .snapshot
+            .session
+            .agent
+            .clone();
+        if current.as_ref() == Some(&agent) {
+            return Ok(None);
+        }
+        if current.is_some() {
+            return Err(anyhow!("Session already has a different Agent binding"));
+        }
+        let updated_at = state.next_timestamp();
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
+        let update = record.publish(session_id, vec![SessionChange::AgentBound { agent }])?;
+        record.summary.updated_at = updated_at;
+        Ok(Some(update))
+    }
+
+    pub(crate) fn start_prompt(
+        &self,
+        session_id: SessionId,
+        prompt_id: PromptId,
+    ) -> anyhow::Result<Option<StartedTurn>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let prompt = {
+            let record = state
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+            if active_turn_id(&record.snapshot)?.is_some() {
+                return Ok(None);
+            }
+            let prompt = record
+                .snapshot
+                .prompts
+                .iter()
+                .find(|prompt| prompt.id == prompt_id)
+                .ok_or_else(|| anyhow!("Provider delivery referenced an unknown Prompt"))?;
+            if prompt.status != PromptStatus::Pending {
+                return Ok(None);
+            }
+            prompt.clone()
+        };
+        let updated_at = state.next_timestamp();
+        let turn = Turn {
+            id: TurnId::new(),
+            prompt_id,
+            status: TurnStatus::Active,
+        };
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
+        record.publish(
+            session_id,
+            vec![
+                SessionChange::PromptStatusChanged {
+                    prompt_id,
+                    status: PromptStatus::Delivered,
+                },
+                SessionChange::TurnAdded { turn: turn.clone() },
+                SessionChange::MessageAdded {
+                    message: Message {
+                        id: MessageId::new(),
+                        turn_id: turn.id,
+                        role: MessageRole::User,
+                        status: MessageStatus::Completed,
+                        content: prompt.text.clone(),
+                    },
+                },
+            ],
+        )?;
+        record.summary.updated_at = updated_at;
+        Ok(Some(StartedTurn { prompt, turn }))
+    }
+
+    pub(crate) fn fail_pending_prompt(
+        &self,
+        session_id: SessionId,
+        prompt_id: PromptId,
+        message: String,
+    ) -> anyhow::Result<Option<Turn>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let prompt = {
+            let record = state
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+            if active_turn_id(&record.snapshot)?.is_some() {
+                return Ok(None);
+            }
+            let prompt = record
+                .snapshot
+                .prompts
+                .iter()
+                .find(|prompt| prompt.id == prompt_id)
+                .ok_or_else(|| anyhow!("Provider failure referenced an unknown Prompt"))?;
+            if prompt.status != PromptStatus::Pending {
+                return Ok(None);
+            }
+            prompt.clone()
+        };
+        let updated_at = state.next_timestamp();
+        let turn = Turn {
+            id: TurnId::new(),
+            prompt_id,
+            status: TurnStatus::Failed,
+        };
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
+        record.publish(
+            session_id,
+            vec![
+                SessionChange::PromptStatusChanged {
+                    prompt_id,
+                    status: PromptStatus::Delivered,
+                },
+                SessionChange::TurnAdded { turn: turn.clone() },
+                SessionChange::MessageAdded {
+                    message: Message {
+                        id: MessageId::new(),
+                        turn_id: turn.id,
+                        role: MessageRole::User,
+                        status: MessageStatus::Completed,
+                        content: prompt.text,
+                    },
+                },
+                SessionChange::ActivityAdded {
+                    activity: Activity {
+                        id: ActivityId::new(),
+                        turn_id: turn.id,
+                        kind: ActivityKind::Error,
+                        text: message,
+                    },
+                },
+            ],
+        )?;
+        record.summary.updated_at = updated_at;
+        Ok(Some(turn))
+    }
+
+    pub(crate) fn fail_turn(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        streaming_message_id: Option<MessageId>,
+        message: String,
+    ) -> anyhow::Result<SessionUpdate> {
+        let mut changes = Vec::with_capacity(if streaming_message_id.is_some() { 3 } else { 2 });
+        if let Some(message_id) = streaming_message_id {
+            changes.push(SessionChange::MessageCompleted { message_id });
+        }
+        changes.extend([
+            SessionChange::ActivityAdded {
+                activity: Activity {
+                    id: ActivityId::new(),
+                    turn_id,
+                    kind: ActivityKind::Error,
+                    text: message,
+                },
+            },
+            SessionChange::TurnStatusChanged {
+                turn_id,
+                status: TurnStatus::Failed,
+            },
+        ]);
+        self.publish(session_id, changes)
+    }
+
+    pub(crate) fn complete_turn(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> anyhow::Result<SessionUpdate> {
+        self.publish(
+            session_id,
+            vec![SessionChange::TurnStatusChanged {
+                turn_id,
+                status: TurnStatus::Completed,
+            }],
+        )
     }
 
     pub(crate) fn publish(
@@ -468,7 +672,7 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let (mut prompt, active) = {
+        let mut prompt = {
             let record = state
                 .sessions
                 .get(&session_id)
@@ -486,27 +690,22 @@ impl SessionStore {
             if prompt.delivery == PromptDelivery::Steer {
                 return Ok(prompt);
             }
-            let active = active_turn_id(&record.snapshot)
-                .expect("stored Sessions preserve the one-active-Turn invariant")
-                .is_some();
-            (prompt, active)
+            prompt
         };
         let updated_at = state.next_timestamp();
         let record = state
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        let mut changes = vec![SessionChange::PromptDeliveryChanged {
-            prompt_id,
-            delivery: PromptDelivery::Steer,
-        }];
         prompt.delivery = PromptDelivery::Steer;
-        if !active {
-            changes.extend(unavailable_prompt_delivery_changes(&prompt));
-            prompt.status = PromptStatus::Delivered;
-        }
         record
-            .publish(session_id, changes)
+            .publish(
+                session_id,
+                vec![SessionChange::PromptDeliveryChanged {
+                    prompt_id,
+                    delivery: PromptDelivery::Steer,
+                }],
+            )
             .expect("Prompt promotion preserves Session invariants");
         record.summary.updated_at = updated_at;
         Ok(prompt)
@@ -693,16 +892,6 @@ impl SessionRecord {
             .into_iter()
             .filter(|change| !matches!(change, SessionChange::SessionStatusChanged { .. }))
             .collect::<Vec<_>>();
-        let active_before = active_turn_id(&self.snapshot)?;
-        let idle_boundary = active_before.and_then(|turn_id| {
-            changes.iter().find_map(|change| match change {
-                SessionChange::TurnStatusChanged {
-                    turn_id: changed_turn,
-                    status: TurnStatus::Completed | TurnStatus::Failed,
-                } if *changed_turn == turn_id => Some(()),
-                _ => None,
-            })
-        });
         let mut update = SessionUpdate {
             session_id,
             revision,
@@ -710,15 +899,6 @@ impl SessionRecord {
         };
         let mut next = self.snapshot.clone();
         apply_update(&mut next, &update)?;
-        if idle_boundary.is_some() && active_turn_id(&next)?.is_none() {
-            let delivery_changes = idle_boundary_delivery_changes(&next);
-            if !delivery_changes.is_empty() {
-                changes.extend(delivery_changes);
-                update.changes = changes.clone();
-                next = self.snapshot.clone();
-                apply_update(&mut next, &update)?;
-            }
-        }
         let status = derived_session_status(&next)?;
         if next.session.status != status {
             next.session.status = status;
@@ -741,32 +921,6 @@ impl SessionRecord {
     }
 }
 
-fn idle_boundary_delivery_changes(snapshot: &SessionSnapshot) -> Vec<SessionChange> {
-    let mut steers = snapshot
-        .prompts
-        .iter()
-        .filter(|prompt| {
-            prompt.status == PromptStatus::Pending && prompt.delivery == PromptDelivery::Steer
-        })
-        .collect::<Vec<_>>();
-    steers.sort_unstable_by_key(|prompt| prompt.admission_order);
-    if !steers.is_empty() {
-        return steers
-            .into_iter()
-            .flat_map(unavailable_prompt_delivery_changes)
-            .collect();
-    }
-    snapshot
-        .prompts
-        .iter()
-        .filter(|prompt| {
-            prompt.status == PromptStatus::Pending && prompt.delivery == PromptDelivery::Queue
-        })
-        .min_by_key(|prompt| prompt.admission_order)
-        .map(unavailable_prompt_delivery_changes)
-        .unwrap_or_default()
-}
-
 fn agent_output_turn_id(
     snapshot: &SessionSnapshot,
     change: &SessionChange,
@@ -785,40 +939,6 @@ fn agent_output_turn_id(
         SessionChange::ActivityAdded { activity } => Ok(activity.turn_id),
         _ => Err(anyhow!("Session change is not Agent output")),
     }
-}
-
-fn unavailable_prompt_delivery_changes(prompt: &Prompt) -> Vec<SessionChange> {
-    let turn_id = TurnId::new();
-    vec![
-        SessionChange::PromptStatusChanged {
-            prompt_id: prompt.id,
-            status: PromptStatus::Delivered,
-        },
-        SessionChange::TurnAdded {
-            turn: Turn {
-                id: turn_id,
-                prompt_id: prompt.id,
-                status: TurnStatus::Failed,
-            },
-        },
-        SessionChange::MessageAdded {
-            message: Message {
-                id: MessageId::new(),
-                turn_id,
-                role: MessageRole::User,
-                status: MessageStatus::Completed,
-                content: prompt.text.clone(),
-            },
-        },
-        SessionChange::ActivityAdded {
-            activity: Activity {
-                id: ActivityId::new(),
-                turn_id,
-                kind: ActivityKind::Error,
-                text: AGENT_UNAVAILABLE.to_owned(),
-            },
-        },
-    ]
 }
 
 fn active_turn_id(snapshot: &SessionSnapshot) -> anyhow::Result<Option<TurnId>> {
@@ -840,72 +960,6 @@ fn derived_session_status(snapshot: &SessionSnapshot) -> anyhow::Result<SessionS
     } else {
         SessionStatus::Idle
     })
-}
-
-impl DeliveredTurn {
-    fn new(
-        prompt_id: PromptId,
-        text: String,
-        delivery: PromptDelivery,
-        admission_order: PromptOrder,
-    ) -> Self {
-        let turn_id = TurnId::new();
-        Self {
-            prompt: Prompt {
-                id: prompt_id,
-                text: text.clone(),
-                delivery,
-                admission_order,
-                status: PromptStatus::Delivered,
-            },
-            turn: Turn {
-                id: turn_id,
-                prompt_id,
-                status: TurnStatus::Failed,
-            },
-            message: Message {
-                id: MessageId::new(),
-                turn_id,
-                role: MessageRole::User,
-                status: MessageStatus::Completed,
-                content: text,
-            },
-            activity: Activity {
-                id: ActivityId::new(),
-                turn_id,
-                kind: ActivityKind::Error,
-                text: AGENT_UNAVAILABLE.to_owned(),
-            },
-        }
-    }
-
-    fn changes(&self) -> Vec<SessionChange> {
-        vec![
-            SessionChange::PromptAdded {
-                prompt: self.prompt.clone(),
-            },
-            SessionChange::TurnAdded {
-                turn: self.turn.clone(),
-            },
-            SessionChange::MessageAdded {
-                message: self.message.clone(),
-            },
-            SessionChange::ActivityAdded {
-                activity: self.activity.clone(),
-            },
-        ]
-    }
-
-    fn transcript(&self) -> Vec<TranscriptItem> {
-        vec![
-            TranscriptItem::Message {
-                message_id: self.message.id,
-            },
-            TranscriptItem::Activity {
-                activity_id: self.activity.id,
-            },
-        ]
-    }
 }
 
 impl SessionStoreState {

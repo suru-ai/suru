@@ -275,14 +275,18 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         .await
         .expect("Session snapshot arrives")
         .expect("Session snapshot is valid");
-    assert_eq!(session_event, SessionEvent::Snapshot(created.clone()));
+    let SessionEvent::Snapshot(authoritative) = &session_event else {
+        panic!("Session attachment begins with an authoritative snapshot");
+    };
+    assert_eq!(authoritative.session.id, created.session.id);
+    let authoritative = authoritative.clone();
     application
         .handle_event(ApplicationEvent::Session(session_event))
         .expect("hydrate the Session route from its stream");
 
     let transcript = rendered_application_rows(&application).join("\n");
     assert!(transcript.contains("Explain this workspace"));
-    assert!(transcript.contains("No Agent is selected"));
+    assert!(transcript.contains("No Provider runtime is configured"));
     assert!(
         transcript.contains(
             std::fs::canonicalize(workspace.path())
@@ -294,7 +298,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
 
     let mut observer = Application::new(workspace.path());
     observer
-        .handle_event(ApplicationEvent::SessionAttached(created.clone()))
+        .handle_event(ApplicationEvent::SessionAttached(authoritative.clone()))
         .expect("attach an independent observer to the Session");
     observer
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -308,7 +312,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         .expect("edit the client-local Session draft");
     application
         .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
-            created.clone(),
+            authoritative.clone(),
         )))
         .expect("rehydrate the Session from a fresh snapshot");
     let with_draft = rendered_application_rows(&application).join("\n");
