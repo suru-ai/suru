@@ -21,6 +21,10 @@ impl ProviderRuntime for FailingProviderRuntime {
             ))
         })
     }
+
+    fn shutdown(&self) -> ProviderFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub async fn spawn_with_failing_provider(

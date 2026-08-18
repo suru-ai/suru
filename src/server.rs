@@ -33,7 +33,9 @@ use crate::protocol::{
     SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionChange,
     SessionError, SessionErrorCode, SessionId, SessionUpdate, ShutdownReason, TurnId,
 };
-use crate::provider::{CodexRuntime, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate};
+use crate::provider::{
+    CodexRuntime, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, wait_for_shutdown,
+};
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
     AdmitPromptError, CreateSessionError, InterruptTurnError, ListSessionsError,
@@ -322,11 +324,7 @@ pub async fn spawn_with_provider(
     let providers_for_shutdown = providers.clone();
     let mut provider_shutdown_requested = task_shutdown.provider_shutdown.subscribe();
     let provider_shutdown_task = tokio::spawn(async move {
-        while !*provider_shutdown_requested.borrow() {
-            if provider_shutdown_requested.changed().await.is_err() {
-                break;
-            }
-        }
+        wait_for_shutdown(&mut provider_shutdown_requested).await;
         providers_for_shutdown.shutdown().await;
     });
     let task = tokio::spawn(async move {

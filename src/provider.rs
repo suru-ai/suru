@@ -3,6 +3,7 @@
 use std::{error::Error, fmt, future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 use futures_util::Stream;
+use tokio::sync::watch;
 
 use crate::protocol::AgentIdentity;
 
@@ -96,6 +97,9 @@ pub trait ProviderRuntime: Send + Sync + 'static {
         &self,
         request: ProviderSessionRequest,
     ) -> ProviderFuture<'_, ProviderSessionConnection>;
+
+    /// Stops in-progress Session startups and releases runtime-owned resources.
+    fn shutdown(&self) -> ProviderFuture<'_, ()>;
 }
 
 pub trait ProviderSession: Send + Sync + 'static {
@@ -132,5 +136,13 @@ impl ProviderSessionConnection {
         self,
     ) -> (AgentIdentity, Arc<dyn ProviderSession>, ProviderEventStream) {
         (self.identity, self.session, self.events)
+    }
+}
+
+pub(crate) async fn wait_for_shutdown(signal: &mut watch::Receiver<bool>) {
+    while !*signal.borrow() {
+        if signal.changed().await.is_err() {
+            break;
+        }
     }
 }

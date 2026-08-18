@@ -177,6 +177,10 @@ impl ProviderRuntime for ControlledProviderRuntime {
                 .map_err(|_| ProviderError::new("test Provider startup was abandoned"))?
         })
     }
+
+    fn shutdown(&self) -> ProviderFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 fn dispatch_prompt_operation(

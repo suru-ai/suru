@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
 };
 
@@ -23,7 +23,7 @@ use tokio::{
 use super::{
     ProviderActivityId, ProviderCommandStatus, ProviderError, ProviderEvent, ProviderEventStream,
     ProviderFuture, ProviderRuntime, ProviderSession, ProviderSessionConnection,
-    ProviderSessionRequest, ProviderTurnInput,
+    ProviderSessionRequest, ProviderTurnInput, wait_for_shutdown,
 };
 use crate::protocol::{AgentId, AgentIdentity, ModelId, ProviderId};
 
@@ -153,12 +153,14 @@ struct ClientError {
 #[derive(Clone, Debug)]
 pub struct CodexRuntime {
     executable: OsString,
+    processes: ProcessRegistry,
 }
 
 impl CodexRuntime {
     pub fn new(executable: impl AsRef<OsStr>) -> Self {
         Self {
             executable: executable.as_ref().to_owned(),
+            processes: ProcessRegistry::new(),
         }
     }
 
@@ -166,7 +168,10 @@ impl CodexRuntime {
         let executable = std::env::var_os(CODEX_PATH_ENV)
             .filter(|path| !path.is_empty())
             .unwrap_or_else(|| OsString::from("codex"));
-        Self { executable }
+        Self {
+            executable,
+            processes: ProcessRegistry::new(),
+        }
     }
 }
 
@@ -182,27 +187,35 @@ impl ProviderRuntime for CodexRuntime {
         request: ProviderSessionRequest,
     ) -> ProviderFuture<'_, ProviderSessionConnection> {
         let executable = self.executable.clone();
-        Box::pin(async move { start_codex_session(executable, request).await })
+        let processes = self.processes.clone();
+        Box::pin(async move { start_codex_session(executable, request, processes).await })
+    }
+
+    fn shutdown(&self) -> ProviderFuture<'_, ()> {
+        Box::pin(async move { self.processes.shutdown().await })
     }
 }
 
 async fn start_codex_session(
     executable: OsString,
     request: ProviderSessionRequest,
+    processes: ProcessRegistry,
 ) -> Result<ProviderSessionConnection, ProviderError> {
-    let mut child = Command::new(&executable)
+    let mut command = Command::new(&executable);
+    command
         .arg("app-server")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| {
-            codex_error(format!(
-                "could not launch Codex app-server `{}`: {error}",
-                executable.to_string_lossy()
-            ))
-        })?;
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().map_err(|error| {
+        codex_error(format!(
+            "could not launch Codex app-server `{}`: {error}",
+            executable.to_string_lossy()
+        ))
+    })?;
 
     let stdin = child
         .stdin
@@ -227,9 +240,20 @@ async fn start_codex_session(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (stopped_tx, stopped_rx) = watch::channel(false);
     let (exit_tx, exit_rx) = watch::channel(None::<ProviderError>);
-    let process = Arc::new(ProcessGuard {
+    let process_control = ProcessControl {
         shutdown: shutdown_tx,
         stopped: stopped_rx,
+    };
+    let process_id = match processes.register(process_control.clone()) {
+        Ok(process_id) => process_id,
+        Err(error) => {
+            let _ = terminate_process_tree(&mut child);
+            let _ = timeout(PROCESS_KILL_TIMEOUT, child.wait()).await;
+            return Err(error);
+        }
+    };
+    let process = Arc::new(ProcessGuard {
+        control: process_control,
     });
 
     tokio::spawn(read_stdout(stdout, writer.clone(), state.clone(), exit_rx));
@@ -239,14 +263,16 @@ async fn start_codex_session(
         let mut sink = tokio::io::sink();
         let _ = tokio::io::copy(&mut stderr, &mut sink).await;
     });
-    tokio::spawn(supervise_child(
+    tokio::spawn(supervise_child(ChildSupervisor {
         child,
-        shutdown_rx,
-        stopped_tx,
-        exit_tx,
-        writer.clone(),
-        process_state,
-    ));
+        shutdown: shutdown_rx,
+        stopped: stopped_tx,
+        exit: exit_tx,
+        writer: writer.clone(),
+        state: process_state,
+        processes,
+        process_id,
+    }));
 
     let transport = JsonRpcTransport {
         writer,
@@ -895,12 +921,84 @@ fn is_active_native_turn(correlation: &NativeCorrelation, thread_id: &str, turn_
     correlation.thread_id == thread_id && correlation.active_turn_id.as_deref() == Some(turn_id)
 }
 
-struct ProcessGuard {
+#[derive(Clone, Debug)]
+struct ProcessRegistry {
+    next_id: Arc<AtomicU64>,
+    state: Arc<StdMutex<ProcessRegistryState>>,
+}
+
+#[derive(Debug)]
+struct ProcessRegistryState {
+    shutting_down: bool,
+    processes: HashMap<u64, ProcessControl>,
+}
+
+impl ProcessRegistry {
+    fn new() -> Self {
+        Self {
+            next_id: Arc::new(AtomicU64::new(1)),
+            state: Arc::new(StdMutex::new(ProcessRegistryState {
+                shutting_down: false,
+                processes: HashMap::new(),
+            })),
+        }
+    }
+
+    fn register(&self, process: ProcessControl) -> Result<u64, ProviderError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Codex process registry lock is not poisoned");
+        if state.shutting_down {
+            return Err(codex_error("Codex runtime is shutting down"));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        state.processes.insert(id, process);
+        Ok(id)
+    }
+
+    fn remove(&self, id: u64) {
+        self.state
+            .lock()
+            .expect("Codex process registry lock is not poisoned")
+            .processes
+            .remove(&id);
+    }
+
+    async fn shutdown(&self) -> Result<(), ProviderError> {
+        let processes = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("Codex process registry lock is not poisoned");
+            state.shutting_down = true;
+            state.processes.values().cloned().collect::<Vec<_>>()
+        };
+        for process in &processes {
+            process.begin_shutdown();
+        }
+        let mut first_error = None;
+        for process in processes {
+            if let Err(error) = process.wait_until_stopped().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProcessControl {
     shutdown: watch::Sender<bool>,
     stopped: watch::Receiver<bool>,
 }
 
-impl ProcessGuard {
+impl ProcessControl {
     fn begin_shutdown(&self) {
         self.shutdown.send_replace(true);
     }
@@ -910,13 +1008,14 @@ impl ProcessGuard {
         if *stopped.borrow() {
             return Ok(());
         }
-        let wait = async {
-            while !*stopped.borrow() {
-                stopped.changed().await.map_err(|_| {
+        let wait = async move {
+            stopped
+                .wait_for(|stopped| *stopped)
+                .await
+                .map(|_| ())
+                .map_err(|_| {
                     codex_error("Codex app-server process supervisor stopped unexpectedly")
-                })?;
-            }
-            Ok(())
+                })
         };
         timeout(
             PROCESS_EXIT_GRACE_PERIOD + PROCESS_KILL_TIMEOUT + Duration::from_millis(250),
@@ -927,32 +1026,62 @@ impl ProcessGuard {
     }
 }
 
+struct ProcessGuard {
+    control: ProcessControl,
+}
+
+impl ProcessGuard {
+    fn begin_shutdown(&self) {
+        self.control.begin_shutdown();
+    }
+
+    async fn wait_until_stopped(&self) -> Result<(), ProviderError> {
+        self.control.wait_until_stopped().await
+    }
+}
+
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
         self.begin_shutdown();
     }
 }
 
-async fn supervise_child(
-    mut child: Child,
-    mut shutdown: watch::Receiver<bool>,
+struct ChildSupervisor {
+    child: Child,
+    shutdown: watch::Receiver<bool>,
     stopped: watch::Sender<bool>,
     exit: watch::Sender<Option<ProviderError>>,
     writer: Arc<Mutex<Option<ChildStdin>>>,
     state: Arc<TransportState>,
-) {
+    processes: ProcessRegistry,
+    process_id: u64,
+}
+
+async fn supervise_child(supervisor: ChildSupervisor) {
+    let ChildSupervisor {
+        mut child,
+        mut shutdown,
+        stopped,
+        exit,
+        writer,
+        state,
+        processes,
+        process_id,
+    } = supervisor;
     let status = tokio::select! {
         biased;
-        _ = wait_for_process_shutdown(&mut shutdown) => {
+        _ = wait_for_shutdown(&mut shutdown) => {
             close_transport(
                 &state,
                 codex_error("Codex app-server transport closed during shutdown"),
             );
-            close_stdin(&writer).await;
-            match timeout(PROCESS_EXIT_GRACE_PERIOD, child.wait()).await {
+            match timeout(PROCESS_EXIT_GRACE_PERIOD, async {
+                close_stdin(&writer).await;
+                child.wait().await
+            }).await {
                 Ok(status) => status,
                 Err(_) => {
-                    let _ = child.start_kill();
+                    let _ = terminate_process_tree(&mut child);
                     match timeout(PROCESS_KILL_TIMEOUT, child.wait()).await {
                         Ok(status) => status,
                         Err(_) => Err(std::io::Error::new(
@@ -975,14 +1104,34 @@ async fn supervise_child(
     exit.send_replace(Some(error.clone()));
     terminate_transport(&state, error);
     stopped.send_replace(true);
+    processes.remove(process_id);
 }
 
-async fn wait_for_process_shutdown(shutdown: &mut watch::Receiver<bool>) {
-    while !*shutdown.borrow() {
-        if shutdown.changed().await.is_err() {
-            break;
+#[cfg(unix)]
+fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
+    let process_group_id = child
+        .id()
+        .and_then(|id| libc::pid_t::try_from(id).ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Codex app-server had no process group ID",
+            )
+        })?;
+    if unsafe { libc::killpg(process_group_id, libc::SIGKILL) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            let _ = child.start_kill();
+            return Err(error);
         }
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
+    child.start_kill()
 }
 
 type PendingResponse = oneshot::Sender<Result<Value, ProviderError>>;

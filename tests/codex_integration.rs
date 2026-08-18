@@ -236,6 +236,8 @@ done
 
 const UNRESPONSIVE_SHUTDOWN: &str = r#"#!/bin/sh
 printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
+sleep 30 &
+printf '%s\n' "$!" > "$CODEX_FIXTURE_CHILD_PID"
 
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
@@ -1299,7 +1301,7 @@ async fn server_shutdown_interrupts_active_codex_and_allows_cooperative_exit() {
             "turn/interrupt"
         ]
     );
-    assert_process_exited(fixture.pid());
+    assert_process_exited(fixture.pid()).await;
 
     drop(client);
     timeout(Duration::from_secs(2), server.shutdown())
@@ -1353,7 +1355,8 @@ async fn server_shutdown_releases_pending_rpc_and_forces_an_unresponsive_codex_t
             .any(|request| request.get("method").and_then(Value::as_str) == Some("turn/interrupt")),
         "shutdown asks active Codex work to interrupt before forcing termination"
     );
-    assert_process_exited(fixture.pid());
+    assert_process_exited(fixture.pid()).await;
+    assert_process_exited(fixture.child_pid()).await;
 }
 
 #[tokio::test]
@@ -1393,8 +1396,11 @@ async fn server_shutdown_closes_transport_with_a_startup_request_pending() {
         .await
         .expect("pending startup RPC does not delay server shutdown")
         .expect("shut down server");
-    fixture.wait_for_exit().await;
-    assert_process_exited(fixture.pid());
+    assert!(
+        fixture.exited.exists(),
+        "server shutdown waits for cooperative Codex startup exit"
+    );
+    assert_process_exited(fixture.pid()).await;
 }
 
 #[tokio::test]
@@ -1802,6 +1808,7 @@ struct ScriptedCodex {
     pid: std::path::PathBuf,
     exited: std::path::PathBuf,
     ready: std::path::PathBuf,
+    child_pid: std::path::PathBuf,
 }
 
 impl ScriptedCodex {
@@ -1813,6 +1820,7 @@ impl ScriptedCodex {
         let pid = directory.path().join("pid");
         let exited = directory.path().join("exited");
         let ready = directory.path().join("ready");
+        let child_pid = directory.path().join("child-pid");
         let script = script
             .replace(
                 "$CODEX_FIXTURE_LOG",
@@ -1833,6 +1841,10 @@ impl ScriptedCodex {
             .replace(
                 "$CODEX_FIXTURE_READY",
                 ready.to_str().expect("fixture ready path is UTF-8"),
+            )
+            .replace(
+                "$CODEX_FIXTURE_CHILD_PID",
+                child_pid.to_str().expect("fixture child PID path is UTF-8"),
             );
         std::fs::write(&executable, script).expect("write scripted Codex executable");
         let mut permissions = std::fs::metadata(&executable)
@@ -1848,6 +1860,7 @@ impl ScriptedCodex {
             pid,
             exited,
             ready,
+            child_pid,
         }
     }
 
@@ -1909,6 +1922,14 @@ impl ScriptedCodex {
             .expect("scripted Codex PID is numeric")
     }
 
+    fn child_pid(&self) -> u32 {
+        std::fs::read_to_string(&self.child_pid)
+            .expect("read scripted Codex child PID")
+            .trim()
+            .parse()
+            .expect("scripted Codex child PID is numeric")
+    }
+
     fn requests(&self) -> Vec<Value> {
         std::fs::read_to_string(&self.log)
             .unwrap_or_default()
@@ -1918,10 +1939,22 @@ impl ScriptedCodex {
     }
 }
 
-fn assert_process_exited(pid: u32) {
-    let system = System::new_all();
-    assert!(
-        system.process(Pid::from_u32(pid)).is_none(),
-        "scripted Codex process {pid} survived server shutdown"
-    );
+async fn assert_process_exited(pid: u32) {
+    if timeout(Duration::from_secs(1), async {
+        loop {
+            if System::new_all().process(Pid::from_u32(pid)).is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let system = System::new_all();
+        if let Some(process) = system.process(Pid::from_u32(pid)) {
+            let _ = process.kill();
+        }
+        panic!("scripted Codex process {pid} survived server shutdown");
+    }
 }

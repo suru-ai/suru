@@ -14,7 +14,7 @@ use tokio::{
 
 use super::{
     ProviderCommandStatus, ProviderEvent, ProviderEventStream, ProviderRuntime, ProviderSession,
-    ProviderSessionRequest, ProviderTurnInput,
+    ProviderSessionRequest, ProviderTurnInput, wait_for_shutdown,
 };
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus, PromptId,
@@ -275,6 +275,7 @@ impl ProviderOrchestrator {
         for actor in actors {
             let _ = actor.task.await;
         }
+        let _ = timeout(Duration::from_secs(2), self.runtime.shutdown()).await;
         self.shutdown_complete.send_replace(true);
     }
 }
@@ -562,14 +563,6 @@ async fn run_provider_session(
 
     if let Some(connected) = provider {
         let _ = timeout(Duration::from_secs(2), connected.session.shutdown()).await;
-    }
-}
-
-async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
-    while !*shutdown.borrow() {
-        if shutdown.changed().await.is_err() {
-            break;
-        }
     }
 }
 
