@@ -1398,6 +1398,354 @@ fn escape_confirmation_is_local_and_targets_the_observed_active_turn() {
 }
 
 #[test]
+fn page_up_exposes_latest_and_end_resumes_following_the_transcript() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            navigable_session_snapshot(SessionId::new(), workspace.path(), 8),
+        ))
+        .expect("attach a long Session");
+
+    let latest = rendered_application_rows_at(&application, 72, 18).join("\n");
+    assert!(latest.contains("Agent section 8"));
+    assert!(!latest.contains("Latest"));
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::PageUp,
+                KeyModifiers::NONE,
+            )))
+            .expect("page up through transcript content"),
+        ApplicationTransition::Continue
+    );
+    let reading_history = rendered_application_rows_at(&application, 72, 18).join("\n");
+    assert!(reading_history.contains("Latest"));
+    assert!(!reading_history.contains("Agent section 8"));
+
+    for _ in 0..2 {
+        assert_eq!(
+            application
+                .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                    KeyCode::PageDown,
+                    KeyModifiers::NONE,
+                )))
+                .expect("page down through transcript content"),
+            ApplicationTransition::Continue
+        );
+        rendered_application_rows_at(&application, 72, 18);
+    }
+    let paged_to_latest = rendered_application_rows_at(&application, 72, 18).join("\n");
+    assert!(paged_to_latest.contains("Agent section 8"));
+    assert!(!paged_to_latest.contains("Latest"));
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )))
+        .expect("page away again before using End");
+    assert!(
+        rendered_application_rows_at(&application, 72, 18)
+            .join("\n")
+            .contains("Latest")
+    );
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::End,
+                KeyModifiers::NONE,
+            )))
+            .expect("return to latest transcript content"),
+        ApplicationTransition::Continue
+    );
+    let resumed = rendered_application_rows_at(&application, 72, 18).join("\n");
+    assert!(resumed.contains("Agent section 8"));
+    assert!(!resumed.contains("Latest"));
+}
+
+#[test]
+fn a_scrolled_message_anchor_survives_streaming_and_terminal_resize_per_client() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let mut snapshot = navigable_session_snapshot(session_id, workspace.path(), 8);
+    snapshot.session.status = SessionStatus::Active;
+    snapshot
+        .turns
+        .last_mut()
+        .expect("fixture has a final Turn")
+        .status = TurnStatus::Active;
+    let streaming_message_id = snapshot
+        .messages
+        .last_mut()
+        .map(|message| {
+            message.status = MessageStatus::Streaming;
+            message.id
+        })
+        .expect("fixture has a final Agent Message");
+
+    let mut reader = Application::new(workspace.path());
+    reader
+        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .expect("attach historical reader");
+    let mut observer = Application::new(workspace.path());
+    observer
+        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .expect("attach tail-following observer");
+    rendered_application_rows_at(&reader, 72, 18);
+    rendered_application_rows_at(&observer, 72, 18);
+    reader
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )))
+        .expect("reader pages into history");
+    let anchored = rendered_application_rows_at(&reader, 72, 18).join("\n");
+    assert!(
+        anchored.contains("Agent section 5"),
+        "expected the fifth Agent Message to be the visible anchor:\n{anchored}"
+    );
+
+    let appended = SessionUpdate {
+        session_id,
+        revision: SessionRevision(snapshot.revision.0 + 1),
+        changes: vec![SessionChange::MessageContentAppended {
+            message_id: streaming_message_id,
+            content: "\n\nSTREAMED TAIL that only a client following the bottom should see"
+                .to_owned(),
+        }],
+    };
+    for application in [&mut reader, &mut observer] {
+        application
+            .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+                appended.clone(),
+            )))
+            .expect("append streamed Agent content");
+    }
+
+    let resized_reader = rendered_application_rows_at(&reader, 42, 15).join("\n");
+    assert!(
+        resized_reader.contains("Agent section 5"),
+        "resize must preserve the logical Message anchor:\n{resized_reader}"
+    );
+    assert!(resized_reader.contains("Latest"));
+    assert!(!resized_reader.contains("STREAMED TAIL"));
+    let following_observer = rendered_application_rows_at(&observer, 42, 15).join("\n");
+    assert!(following_observer.contains("STREAMED TAIL"));
+    assert!(!following_observer.contains("Latest"));
+
+    let completed = SessionUpdate {
+        session_id,
+        revision: SessionRevision(appended.revision.0 + 1),
+        changes: vec![
+            SessionChange::MessageCompleted {
+                message_id: streaming_message_id,
+            },
+            SessionChange::TurnStatusChanged {
+                turn_id: snapshot.turns.last().expect("fixture has a final Turn").id,
+                status: TurnStatus::Completed,
+            },
+            SessionChange::SessionStatusChanged {
+                status: SessionStatus::Idle,
+            },
+        ],
+    };
+    for application in [&mut reader, &mut observer] {
+        application
+            .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+                completed.clone(),
+            )))
+            .expect("complete streamed Agent content");
+    }
+    let completed_reader = rendered_application_rows_at(&reader, 56, 20).join("\n");
+    assert!(completed_reader.contains("Agent section 5"));
+    assert!(completed_reader.contains("Latest"));
+    assert!(
+        rendered_application_rows_at(&observer, 56, 20)
+            .join("\n")
+            .contains("STREAMED TAIL")
+    );
+}
+
+#[test]
+fn resize_that_reveals_the_whole_transcript_resumes_following() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            navigable_session_snapshot(SessionId::new(), workspace.path(), 4),
+        ))
+        .expect("attach a long Session");
+    rendered_application_rows_at(&application, 40, 12);
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )))
+        .expect("page into transcript history");
+    assert!(
+        rendered_application_rows_at(&application, 40, 12)
+            .join("\n")
+            .contains("Latest")
+    );
+
+    let expanded = rendered_application_rows_at(&application, 100, 40).join("\n");
+    assert!(expanded.contains("Agent section 4"));
+    assert!(!expanded.contains("Latest"));
+
+    let compact_again = rendered_application_rows_at(&application, 40, 12).join("\n");
+    assert!(compact_again.contains("Agent section 4"));
+    assert!(!compact_again.contains("Latest"));
+}
+
+#[test]
+fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_changes() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let snapshot = navigable_session_snapshot(session_id, workspace.path(), 8);
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .expect("attach a long Session");
+    rendered_application_rows_at(&application, 72, 22);
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )))
+        .expect("page into transcript history");
+    let anchored = rendered_application_rows_at(&application, 72, 22).join("\n");
+    assert!(
+        anchored.contains("Agent section 4"),
+        "expected the fourth Agent Message to be the visible anchor:\n{anchored}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Reconciled line one\nline two\nline three\nline four\nline five\nfinal draft row"
+                .to_owned(),
+        )))
+        .expect("grow the multiline composer");
+    let growing_composer = rendered_application_rows_at(&application, 72, 22).join("\n");
+    assert!(growing_composer.contains("Agent section 4"));
+    assert!(growing_composer.contains("final draft row"));
+    assert!(growing_composer.contains("Latest"));
+
+    let queued_prompt_id = PromptId::new();
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(snapshot.revision.0 + 1),
+                changes: vec![SessionChange::PromptAdded {
+                    prompt: Prompt {
+                        id: queued_prompt_id,
+                        text: "Queued dock entry".to_owned(),
+                        delivery: PromptDelivery::Queue,
+                        admission_order: PromptOrder(9),
+                        status: PromptStatus::Pending,
+                    },
+                }],
+            },
+        )))
+        .expect("show a queued Prompt dock");
+    let with_dock = rendered_application_rows_at(&application, 72, 22).join("\n");
+    assert!(with_dock.contains("Agent section 4"));
+    assert!(with_dock.contains("Queued dock entry"));
+    assert!(with_dock.contains("Latest"));
+
+    let ApplicationTransition::AdmitPrompt { request, .. } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the multiline steer optimistically")
+    else {
+        panic!("a Session steer should request Prompt admission");
+    };
+    let provisional = rendered_application_rows_at(&application, 72, 22).join("\n");
+    assert!(provisional.contains("Agent section 4"));
+    assert!(provisional.contains("Latest"));
+
+    let delivered_turn_id = TurnId::new();
+    let delivered_message_id = MessageId::new();
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(snapshot.revision.0 + 2),
+                changes: vec![
+                    SessionChange::PromptAdded {
+                        prompt: Prompt {
+                            id: request.prompt.id,
+                            text: request.prompt.text.clone(),
+                            delivery: PromptDelivery::Steer,
+                            admission_order: PromptOrder(10),
+                            status: PromptStatus::Delivered,
+                        },
+                    },
+                    SessionChange::TurnAdded {
+                        turn: Turn {
+                            id: delivered_turn_id,
+                            prompt_id: request.prompt.id,
+                            status: TurnStatus::Active,
+                        },
+                    },
+                    SessionChange::MessageAdded {
+                        message: Message {
+                            id: delivered_message_id,
+                            turn_id: delivered_turn_id,
+                            role: MessageRole::User,
+                            status: MessageStatus::Completed,
+                            content: request.prompt.text.clone(),
+                        },
+                    },
+                ],
+            },
+        )))
+        .expect("reconcile the optimistic Prompt to a stable Message");
+    let reconciled_anchor = rendered_application_rows_at(&application, 72, 22).join("\n");
+    assert!(reconciled_anchor.contains("Agent section 4"));
+    assert!(reconciled_anchor.contains("Latest"));
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("start the queued-Prompt leader");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )))
+        .expect("open queued-Prompt mode");
+    for code in [KeyCode::PageUp, KeyCode::PageDown] {
+        assert_eq!(
+            application
+                .handle_terminal_event(InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE,)))
+                .expect("scoped mode owns transcript navigation keys"),
+            ApplicationTransition::Continue
+        );
+    }
+    let ApplicationTransition::PromotePrompt { prompt_id, .. } = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("queued-Prompt selection remains active")
+    else {
+        panic!("Page keys must not escape queued-Prompt mode");
+    };
+    assert_eq!(prompt_id, queued_prompt_id);
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::FollowLatest))
+        .expect("return to the reconciled tail");
+    let latest = rendered_application_rows_at(&application, 72, 22).join("\n");
+    assert_eq!(latest.matches("Reconciled line one").count(), 1);
+    assert!(!latest.contains("Latest"));
+}
+
+#[test]
 fn ended_session_subscription_requests_a_fresh_snapshot_for_reconciliation() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = Application::new(workspace.path());
@@ -1781,6 +2129,74 @@ fn failed_session_snapshot(
         activities: vec![delivered.activity],
         transcript,
     }
+}
+
+fn navigable_session_snapshot(
+    session_id: SessionId,
+    workspace: &std::path::Path,
+    section_count: usize,
+) -> SessionSnapshot {
+    let mut snapshot = SessionSnapshot {
+        session: Session {
+            id: session_id,
+            workspace: Workspace {
+                path: workspace.to_owned(),
+            },
+            agent: None,
+            status: SessionStatus::Idle,
+        },
+        revision: SessionRevision::INITIAL,
+        prompts: Vec::new(),
+        turns: Vec::new(),
+        messages: Vec::new(),
+        activities: Vec::new(),
+        transcript: Vec::new(),
+    };
+    for section in 1..=section_count {
+        let prompt_id = PromptId::new();
+        let turn_id = TurnId::new();
+        let user_message_id = MessageId::new();
+        let agent_message_id = MessageId::new();
+        snapshot.prompts.push(Prompt {
+            id: prompt_id,
+            text: format!("Prompt section {section}"),
+            delivery: PromptDelivery::Steer,
+            admission_order: PromptOrder(section as u64),
+            status: PromptStatus::Delivered,
+        });
+        snapshot.turns.push(Turn {
+            id: turn_id,
+            prompt_id,
+            status: TurnStatus::Completed,
+        });
+        snapshot.messages.extend([
+            Message {
+                id: user_message_id,
+                turn_id,
+                role: MessageRole::User,
+                status: MessageStatus::Completed,
+                content: format!("Prompt section {section}"),
+            },
+            Message {
+                id: agent_message_id,
+                turn_id,
+                role: MessageRole::Agent,
+                status: MessageStatus::Completed,
+                content: format!(
+                    "## Agent section {section}\n\nA multiline Markdown response for section {section}."
+                ),
+            },
+        ]);
+        snapshot.transcript.extend([
+            TranscriptItem::Message {
+                message_id: user_message_id,
+            },
+            TranscriptItem::Message {
+                message_id: agent_message_id,
+            },
+        ]);
+    }
+    snapshot
 }
 
 fn delivered_update(

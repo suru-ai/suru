@@ -3,6 +3,7 @@
 mod markdown;
 
 use std::{
+    cell::{Cell, RefCell},
     collections::HashMap,
     future::pending,
     io::{Stdout, stdout},
@@ -39,7 +40,7 @@ use crate::{
     },
     protocol::{
         ActivityKind, AdmitPromptRequest, AgentIdentity, CreateSessionRequest, InitialPrompt,
-        MessageRole, PromptDelivery, PromptId, PromptStatus, ServerIdentity, SessionId,
+        MessageId, MessageRole, PromptDelivery, PromptId, PromptStatus, ServerIdentity, SessionId,
         SessionSnapshot, SessionStatus, ShutdownReason, TranscriptItem, TurnId, TurnStatus,
         Workspace,
     },
@@ -83,16 +84,48 @@ impl ResponsiveDetail {
 
 #[derive(Clone, Debug)]
 struct SessionInteraction {
-    scroll_position: usize,
-    follow_latest: bool,
+    follow_latest: Cell<bool>,
+    anchor: Cell<Option<TranscriptAnchor>>,
+    /// Rendering records the latest terminal geometry so semantic page commands can use it.
+    viewport: RefCell<Option<TranscriptViewport>>,
 }
 
 impl Default for SessionInteraction {
     fn default() -> Self {
         Self {
-            scroll_position: 0,
-            follow_latest: true,
+            follow_latest: Cell::new(true),
+            anchor: Cell::new(None),
+            viewport: RefCell::new(None),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TranscriptAnchor {
+    message_id: MessageId,
+    screen_row: isize,
+}
+
+#[derive(Clone, Debug)]
+struct TranscriptViewport {
+    height: usize,
+    scroll_position: usize,
+    maximum_scroll: usize,
+    message_starts: Vec<(MessageId, usize)>,
+}
+
+impl TranscriptViewport {
+    fn anchor_at(&self, scroll_position: usize) -> Option<TranscriptAnchor> {
+        let (message_id, message_start) = self
+            .message_starts
+            .iter()
+            .rev()
+            .find(|(_, start)| *start <= scroll_position)
+            .or_else(|| self.message_starts.first())?;
+        Some(TranscriptAnchor {
+            message_id: *message_id,
+            screen_row: (*message_start as isize).saturating_sub_unsigned(scroll_position),
+        })
     }
 }
 
@@ -339,6 +372,43 @@ impl TuiState {
         self.session_interactions.get(&session_id)
     }
 
+    fn navigate_transcript_page(&mut self, direction: TranscriptDirection) {
+        let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id) else {
+            return;
+        };
+        let Some(interaction) = self.session_interactions.get_mut(&session_id) else {
+            return;
+        };
+        let Some(viewport) = interaction.viewport.get_mut().as_ref() else {
+            return;
+        };
+        let target = match direction {
+            TranscriptDirection::Up => viewport
+                .scroll_position
+                .saturating_sub(viewport.height.max(1)),
+            TranscriptDirection::Down => viewport
+                .scroll_position
+                .saturating_add(viewport.height.max(1))
+                .min(viewport.maximum_scroll),
+        };
+        if target >= viewport.maximum_scroll {
+            interaction.follow_latest.set(true);
+            interaction.anchor.set(None);
+            return;
+        }
+        interaction.follow_latest.set(false);
+        interaction.anchor.set(viewport.anchor_at(target));
+    }
+
+    fn follow_latest(&mut self) {
+        let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id) else {
+            return;
+        };
+        let interaction = self.session_interactions.entry(session_id).or_default();
+        interaction.follow_latest.set(true);
+        interaction.anchor.set(None);
+    }
+
     fn composer_border_style(&self, theme: &Theme) -> Style {
         if self.composer_focused {
             theme.form_field.border
@@ -520,6 +590,12 @@ impl TuiState {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TranscriptDirection {
+    Up,
+    Down,
+}
+
 #[derive(Clone, Copy)]
 struct QueuedPrompt<'a> {
     id: PromptId,
@@ -557,6 +633,9 @@ pub enum CommandId {
     MoveCursorRight,
     HistoryPrevious,
     HistoryNext,
+    ScrollTranscriptPageUp,
+    ScrollTranscriptPageDown,
+    FollowLatest,
     BeginLeader,
     OpenQueuedPrompts,
     SelectPreviousQueuedPrompt,
@@ -659,6 +738,19 @@ impl Application {
                 let key = self.state.composer_key();
                 self.state.composers.history_next(key);
                 self.state.submission_error = None;
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::ScrollTranscriptPageUp) => {
+                self.state.navigate_transcript_page(TranscriptDirection::Up);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::ScrollTranscriptPageDown) => {
+                self.state
+                    .navigate_transcript_page(TranscriptDirection::Down);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::FollowLatest) => {
+                self.state.follow_latest();
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(
@@ -840,7 +932,7 @@ impl Application {
     }
 
     pub fn render(&self, frame: &mut Frame<'_>) {
-        render(frame, &self.state);
+        render_application(frame, &self.state);
     }
 
     pub fn handle_terminal_event(&mut self, event: InputEvent) -> Result<ApplicationTransition> {
@@ -972,6 +1064,24 @@ const COMMAND_BINDINGS: &[CommandBinding] = &[
         label: "Down",
     },
     CommandBinding {
+        code: KeyCode::PageUp,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::ScrollTranscriptPageUp,
+        label: "PageUp",
+    },
+    CommandBinding {
+        code: KeyCode::PageDown,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::ScrollTranscriptPageDown,
+        label: "PageDown",
+    },
+    CommandBinding {
+        code: KeyCode::End,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::FollowLatest,
+        label: "End",
+    },
+    CommandBinding {
         code: KeyCode::Char('x'),
         modifiers: KeyModifiers::CONTROL,
         command: CommandId::BeginLeader,
@@ -1078,13 +1188,17 @@ fn command_from_scoped_bindings(
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
+    render_application(frame, state);
+}
+
+fn render_application(frame: &mut Frame<'_>, state: &TuiState) {
     let theme = Theme::system();
     if terminal_is_too_small(frame.area()) {
         render_terminal_too_small(frame, &theme);
         return;
     }
-    if let Some(session) = &state.session {
-        render_session(frame, state, session.snapshot(), &theme);
+    if state.session.is_some() {
+        render_session(frame, state, &theme);
     } else {
         render_landing(frame, state, &theme);
     }
@@ -1161,22 +1275,24 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     );
 }
 
-fn render_session(
-    frame: &mut Frame<'_>,
-    state: &TuiState,
-    snapshot: &SessionSnapshot,
-    theme: &Theme,
-) {
+fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+    let snapshot = state
+        .session
+        .as_ref()
+        .expect("Session renderer requires a Session")
+        .snapshot();
     let detail = ResponsiveDetail::for_width(frame.area().width);
     let padding = horizontal_padding(frame.area().width);
     let show_header = frame.area().height >= SESSION_HEADER_MINIMUM_HEIGHT;
-    let key = ComposerKey::Session(snapshot.session.id);
+    let session_id = snapshot.session.id;
+    let key = ComposerKey::Session(session_id);
+    let content_width = frame.area().width.saturating_sub(padding.saturating_mul(2));
     let desired_composer_height = composer_block_height(
         frame.area().height,
-        frame.area().width.saturating_sub(padding.saturating_mul(2)),
+        content_width,
         state.composers.text(key),
     );
-    let queued_prompts = state.queued_prompts(snapshot.session.id);
+    let queued_prompts = state.queued_prompts(session_id);
     let desired_pending_height = if queued_prompts.is_empty() {
         0
     } else {
@@ -1198,16 +1314,86 @@ fn render_session(
         .saturating_add(1);
     let composer_height =
         desired_composer_height.min(frame.area().height.saturating_sub(reserved_height).max(1));
+    let mut transcript = transcript_projection(snapshot, theme, content_width);
+    for provisional in state.provisional_prompts(session_id) {
+        push_user_message(
+            &mut transcript.lines,
+            &provisional.text,
+            theme,
+            content_width,
+        );
+    }
+    let interaction = state
+        .session_interaction(session_id)
+        .expect("Session interaction is initialized with its snapshot");
+    let transcript_height_without_latest = frame
+        .area()
+        .height
+        .saturating_sub(u16::from(show_header))
+        .saturating_sub(pending_height)
+        .saturating_sub(composer_height)
+        .saturating_sub(1);
+    let viewport_without_latest = usize::from(if transcript_height_without_latest > 1 {
+        transcript_height_without_latest.saturating_sub(1)
+    } else {
+        transcript_height_without_latest
+    });
+    let (away_from_bottom, viewport_height, maximum_scroll, scroll_position) =
+        if interaction.follow_latest.get() {
+            let maximum_scroll = transcript
+                .lines
+                .len()
+                .saturating_sub(viewport_without_latest);
+            (
+                false,
+                viewport_without_latest,
+                maximum_scroll,
+                maximum_scroll,
+            )
+        } else {
+            let viewport_height = viewport_without_latest.saturating_sub(1);
+            let maximum_scroll = transcript.lines.len().saturating_sub(viewport_height);
+            let scroll_position = interaction.anchor.get().map_or(maximum_scroll, |anchor| {
+                transcript
+                    .message_starts
+                    .iter()
+                    .find(|(message_id, _)| *message_id == anchor.message_id)
+                    .map_or(maximum_scroll, |(_, start)| {
+                        (*start as isize)
+                            .saturating_sub(anchor.screen_row)
+                            .clamp(0, maximum_scroll as isize) as usize
+                    })
+            });
+            if scroll_position >= maximum_scroll {
+                interaction.follow_latest.set(true);
+                interaction.anchor.set(None);
+                let maximum_scroll = transcript
+                    .lines
+                    .len()
+                    .saturating_sub(viewport_without_latest);
+                (
+                    false,
+                    viewport_without_latest,
+                    maximum_scroll,
+                    maximum_scroll,
+                )
+            } else {
+                (true, viewport_height, maximum_scroll, scroll_position)
+            }
+        };
+    let latest_height = u16::from(away_from_bottom);
     let [
         header_area,
         transcript_area,
         pending_area,
+        latest_area,
         composer_area,
         status_area,
     ] = Layout::vertical([
         Constraint::Length(u16::from(show_header)),
         Constraint::Min(1),
         Constraint::Length(pending_height),
+        Constraint::Length(latest_height),
         Constraint::Length(composer_height),
         Constraint::Length(1),
     ])
@@ -1225,30 +1411,45 @@ fn render_session(
 
     let transcript_area = horizontally_inset(transcript_area, padding);
     let pending_area = horizontally_inset(pending_area, padding);
+    let latest_area = horizontally_inset(latest_area, padding);
     let composer_area = horizontally_inset(composer_area, padding);
     let footer_area = horizontally_inset(status_area, padding);
-    let mut lines = transcript_lines(snapshot, theme, transcript_area.width);
-    for provisional in state.provisional_prompts(snapshot.session.id) {
-        push_user_message(&mut lines, &provisional.text, theme, transcript_area.width);
-    }
-    let scroll_position = state
-        .session_interaction(snapshot.session.id)
-        .filter(|interaction| !interaction.follow_latest)
-        .map_or(0, |interaction| interaction.scroll_position)
-        .min(usize::from(u16::MAX)) as u16;
-    let transcript = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    let transcript = if transcript_area.height > 1 {
-        transcript.block(
+    interaction.viewport.replace(Some(TranscriptViewport {
+        height: viewport_height,
+        scroll_position,
+        maximum_scroll,
+        message_starts: transcript.message_starts,
+    }));
+    let transcript_widget = Paragraph::new(Text::from(
+        transcript
+            .lines
+            .into_iter()
+            .skip(scroll_position)
+            .take(viewport_height)
+            .collect::<Vec<_>>(),
+    ));
+    let transcript_widget = if transcript_area.height > 1 {
+        transcript_widget.block(
             Block::default()
                 .borders(Borders::TOP)
                 .border_style(theme.border.subdued),
         )
     } else {
-        transcript
+        transcript_widget
     };
-    frame.render_widget(transcript.scroll((scroll_position, 0)), transcript_area);
+    frame.render_widget(transcript_widget, transcript_area);
     if pending_height > 0 {
         render_pending_prompts(frame, pending_area, state, &queued_prompts, detail, theme);
+    }
+    if away_from_bottom {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!("Latest ↓ · {}", binding_label(&CommandId::FollowLatest)),
+                theme.action.primary,
+            ))
+            .alignment(Alignment::Right),
+            latest_area,
+        );
     }
     render_composer(
         frame,
@@ -1519,12 +1720,18 @@ fn visual_cursor_row(text: &str, cursor: usize, width: u16) -> u16 {
     previous_rows.saturating_add(last_cells / width)
 }
 
-fn transcript_lines(
+struct TranscriptProjection {
+    lines: Vec<Line<'static>>,
+    message_starts: Vec<(MessageId, usize)>,
+}
+
+fn transcript_projection(
     snapshot: &SessionSnapshot,
     theme: &Theme,
     available_width: u16,
-) -> Vec<Line<'static>> {
+) -> TranscriptProjection {
     let mut lines = Vec::new();
+    let mut message_starts = Vec::new();
     for item in &snapshot.transcript {
         match item {
             TranscriptItem::Message { message_id } => {
@@ -1535,11 +1742,14 @@ fn transcript_lines(
                 else {
                     continue;
                 };
+                message_starts.push((*message_id, lines.len()));
                 match message.role {
                     MessageRole::User => {
                         push_user_message(&mut lines, &message.content, theme, available_width)
                     }
-                    MessageRole::Agent => push_agent_message(&mut lines, &message.content, theme),
+                    MessageRole::Agent => {
+                        push_agent_message(&mut lines, &message.content, theme, available_width)
+                    }
                 }
             }
             TranscriptItem::Activity { activity_id } => {
@@ -1554,11 +1764,14 @@ fn transcript_lines(
                     ActivityKind::Status => ("  ", theme.text.subdued),
                     ActivityKind::Error => ("  Error: ", theme.feedback.error),
                 };
-                push_prefixed_lines(&mut lines, prefix, &activity.text, style);
+                push_prefixed_lines(&mut lines, prefix, &activity.text, style, available_width);
             }
         }
     }
-    lines
+    TranscriptProjection {
+        lines,
+        message_starts,
+    }
 }
 
 fn push_user_message(
@@ -1605,23 +1818,75 @@ fn wrapped_content_lines(content: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
-fn push_agent_message(lines: &mut Vec<Line<'static>>, content: &str, theme: &Theme) {
-    for mut line in markdown::render(content, theme) {
-        if !line.spans.is_empty() {
-            line.spans.insert(0, Span::styled("  ", theme.text.primary));
+fn push_agent_message(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    theme: &Theme,
+    available_width: u16,
+) {
+    for line in markdown::render(content, theme) {
+        for mut wrapped in wrap_styled_line(line, available_width.saturating_sub(2).max(1)) {
+            if !wrapped.spans.is_empty() {
+                wrapped
+                    .spans
+                    .insert(0, Span::styled("  ", theme.text.primary));
+            }
+            lines.push(wrapped);
         }
-        lines.push(line);
     }
     if !content.is_empty() {
         lines.push(Line::default());
     }
 }
 
-fn push_prefixed_lines(lines: &mut Vec<Line<'static>>, prefix: &str, content: &str, style: Style) {
+fn wrap_styled_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    if line.spans.is_empty() {
+        return vec![Line::default()];
+    }
+    let width = usize::from(width.max(1));
+    let line_style = line.style;
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut row_width = 0_usize;
+    for span in line.spans {
+        let style = line_style.patch(span.style);
+        let mut chunk = String::new();
+        for character in span.content.chars() {
+            let character_width = character.width().unwrap_or(1);
+            if row_width > 0 && row_width.saturating_add(character_width) > width {
+                if !chunk.is_empty() {
+                    row.push(Span::styled(std::mem::take(&mut chunk), style));
+                }
+                rows.push(Line::from(std::mem::take(&mut row)));
+                row_width = 0;
+            }
+            chunk.push(character);
+            row_width = row_width.saturating_add(character_width);
+        }
+        if !chunk.is_empty() {
+            row.push(Span::styled(chunk, style));
+        }
+    }
+    if !row.is_empty() {
+        rows.push(Line::from(row));
+    }
+    rows
+}
+
+fn push_prefixed_lines(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    content: &str,
+    style: Style,
+    available_width: u16,
+) {
     for (index, line) in content.lines().enumerate() {
-        lines.push(Line::styled(
-            format!("{}{line}", if index == 0 { prefix } else { "  " }),
-            style,
+        lines.extend(wrap_styled_line(
+            Line::styled(
+                format!("{}{line}", if index == 0 { prefix } else { "  " }),
+                style,
+            ),
+            available_width,
         ));
     }
 }
