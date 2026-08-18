@@ -1417,13 +1417,33 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     let latest_area = horizontally_inset(latest_area, padding);
     let composer_area = horizontally_inset(composer_area, padding);
     let footer_area = horizontally_inset(status_area, padding);
+    let first_visible_line = transcript_layout
+        .line_starts
+        .partition_point(|row| *row <= scroll_position)
+        .saturating_sub(1);
+    let window_start = transcript_layout
+        .line_starts
+        .get(first_visible_line)
+        .copied()
+        .unwrap_or(0);
+    let local_scroll = scroll_position
+        .saturating_sub(window_start)
+        .min(usize::from(u16::MAX.saturating_sub(transcript_area.height)))
+        as u16;
     interaction.viewport.replace(Some(TranscriptViewport {
         height: viewport_height,
         scroll_position,
         maximum_scroll,
         message_starts: transcript_layout.message_starts,
     }));
-    let transcript_widget = Paragraph::new(Text::from(transcript.lines)).wrap(Wrap { trim: false });
+    let transcript_widget = Paragraph::new(Text::from(
+        transcript
+            .lines
+            .into_iter()
+            .skip(first_visible_line)
+            .collect::<Vec<_>>(),
+    ))
+    .wrap(Wrap { trim: false });
     let transcript_widget = if transcript_area.height > 1 {
         transcript_widget.block(
             Block::default()
@@ -1433,10 +1453,7 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     } else {
         transcript_widget
     };
-    frame.render_widget(
-        transcript_widget.scroll((scroll_position.min(usize::from(u16::MAX)) as u16, 0)),
-        transcript_area,
-    );
+    frame.render_widget(transcript_widget.scroll((local_scroll, 0)), transcript_area);
     if pending_height > 0 {
         render_pending_prompts(frame, pending_area, state, &queued_prompts, detail, theme);
     }
@@ -1759,6 +1776,7 @@ struct MessageBoundary {
 struct TranscriptLayout {
     row_count: usize,
     message_starts: Vec<MessageStart>,
+    line_starts: Vec<usize>,
 }
 
 impl TranscriptProjection {
@@ -1766,7 +1784,9 @@ impl TranscriptProjection {
         let mut row_count = 0;
         let mut boundaries = self.message_boundaries.iter().peekable();
         let mut message_starts = Vec::with_capacity(self.message_boundaries.len());
+        let mut line_starts = Vec::with_capacity(self.lines.len());
         for (line_index, line) in self.lines.iter().enumerate() {
+            line_starts.push(row_count);
             while boundaries
                 .peek()
                 .is_some_and(|boundary| boundary.line_index == line_index)
@@ -1792,6 +1812,7 @@ impl TranscriptProjection {
         TranscriptLayout {
             row_count,
             message_starts,
+            line_starts,
         }
     }
 }

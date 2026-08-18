@@ -1620,6 +1620,47 @@ fn resize_that_reveals_the_whole_transcript_resumes_following() {
 }
 
 #[test]
+fn transcript_navigation_remains_correct_beyond_the_terminal_scroll_limit() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let prompt_id = PromptId::new();
+    let content = format!("{}TAIL beyond u16", "x\n".repeat(65_700));
+    application
+        .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
+            SessionId::new(),
+            prompt_id,
+            &content,
+            workspace.path(),
+        )))
+        .expect("attach a transcript longer than Ratatui's local scroll offset");
+
+    let latest = rendered_application_rows_at(&application, 72, 18).join("\n");
+    assert!(latest.contains("TAIL beyond u16"));
+    assert!(!latest.contains("Latest"));
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )))
+        .expect("page away from a very long tail");
+    assert!(
+        rendered_application_rows_at(&application, 72, 18)
+            .join("\n")
+            .contains("Latest")
+    );
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::End,
+            KeyModifiers::NONE,
+        )))
+        .expect("return to the very long tail");
+    let resumed = rendered_application_rows_at(&application, 72, 18).join("\n");
+    assert!(resumed.contains("TAIL beyond u16"));
+    assert!(!resumed.contains("Latest"));
+}
+
+#[test]
 fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_changes() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let session_id = SessionId::new();
