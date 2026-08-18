@@ -37,8 +37,8 @@ use crate::{
     },
     protocol::{
         ActivityKind, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, MessageRole,
-        PromptId, ServerIdentity, SessionId, SessionSnapshot, ShutdownReason, TranscriptItem,
-        Workspace,
+        PromptDelivery, PromptId, PromptStatus, ServerIdentity, SessionId, SessionSnapshot,
+        SessionStatus, ShutdownReason, TranscriptItem, TurnId, TurnStatus, Workspace,
     },
     theme::Theme,
 };
@@ -80,6 +80,7 @@ pub struct TuiState {
     session_events_blocked: bool,
     pending_submission: Option<PendingSubmission>,
     failed_submissions: HashMap<PromptId, FailedSubmission>,
+    command_mode: CommandMode,
 }
 
 #[derive(Clone, Debug)]
@@ -98,7 +99,20 @@ struct FailedSubmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SubmissionTarget {
     CreateSession,
-    AdmitPrompt(SessionId),
+    AdmitPrompt(SessionId, PromptDelivery),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CommandMode {
+    #[default]
+    Composer,
+    Leader,
+    QueuedPrompts {
+        selected: PromptId,
+    },
+    InterruptConfirmation {
+        turn_id: TurnId,
+    },
 }
 
 impl Default for TuiState {
@@ -125,6 +139,7 @@ impl TuiState {
             session_events_blocked: false,
             pending_submission: None,
             failed_submissions: HashMap::new(),
+            command_mode: CommandMode::Composer,
         }
     }
 
@@ -203,6 +218,7 @@ impl TuiState {
         }
         self.reconcile_pending_submission();
         self.reconcile_failed_submissions();
+        self.reconcile_command_mode();
         Ok(())
     }
 
@@ -326,7 +342,7 @@ impl TuiState {
 
     fn provisional_prompt(&self, session_id: SessionId) -> Option<&InitialPrompt> {
         let pending = self.pending_submission.as_ref()?;
-        if pending.target != SubmissionTarget::AdmitPrompt(session_id) {
+        if pending.target != SubmissionTarget::AdmitPrompt(session_id, PromptDelivery::Steer) {
             return None;
         }
         let authoritative = self.session.as_ref().is_some_and(|session| {
@@ -338,6 +354,93 @@ impl TuiState {
         });
         (!authoritative).then_some(&pending.prompt)
     }
+
+    fn queued_prompts(&self, session_id: SessionId) -> Vec<QueuedPrompt<'_>> {
+        let mut queued = self
+            .session
+            .as_ref()
+            .filter(|session| session.session_id() == session_id)
+            .map(|session| {
+                session
+                    .snapshot()
+                    .prompts
+                    .iter()
+                    .filter(|prompt| {
+                        prompt.status == PromptStatus::Pending
+                            && prompt.delivery == PromptDelivery::Queue
+                    })
+                    .map(|prompt| QueuedPrompt {
+                        id: prompt.id,
+                        text: &prompt.text,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        queued.sort_unstable_by_key(|entry| {
+            self.session
+                .as_ref()
+                .and_then(|session| {
+                    session
+                        .snapshot()
+                        .prompts
+                        .iter()
+                        .find(|prompt| prompt.id == entry.id)
+                })
+                .map(|prompt| prompt.admission_order)
+        });
+        if let Some(pending) = self.pending_submission.as_ref().filter(|pending| {
+            pending.target == SubmissionTarget::AdmitPrompt(session_id, PromptDelivery::Queue)
+                && !queued.iter().any(|entry| entry.id == pending.prompt.id)
+        }) {
+            queued.push(QueuedPrompt {
+                id: pending.prompt.id,
+                text: &pending.prompt.text,
+            });
+        }
+        queued
+    }
+
+    fn active_turn_id(&self) -> Option<TurnId> {
+        self.session
+            .as_ref()?
+            .snapshot()
+            .turns
+            .iter()
+            .find(|turn| turn.status == TurnStatus::Active)
+            .map(|turn| turn.id)
+    }
+
+    fn reconcile_command_mode(&mut self) {
+        match self.command_mode {
+            CommandMode::QueuedPrompts { selected } => {
+                let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id)
+                else {
+                    self.command_mode = CommandMode::Composer;
+                    return;
+                };
+                let queued = self.queued_prompts(session_id);
+                if !queued.iter().any(|prompt| prompt.id == selected) {
+                    self.command_mode = queued.first().map_or(CommandMode::Composer, |prompt| {
+                        CommandMode::QueuedPrompts {
+                            selected: prompt.id,
+                        }
+                    });
+                }
+            }
+            CommandMode::InterruptConfirmation { turn_id }
+                if self.active_turn_id() != Some(turn_id) =>
+            {
+                self.command_mode = CommandMode::Composer;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct QueuedPrompt<'a> {
+    id: PromptId,
+    text: &'a str,
 }
 
 #[derive(Debug, Default)]
@@ -362,6 +465,7 @@ pub enum ApplicationEvent {
 pub enum CommandId {
     ClearOrExit,
     SubmitSteer,
+    SubmitQueue,
     InsertNewline,
     DeleteBackward,
     DeleteForward,
@@ -369,6 +473,15 @@ pub enum CommandId {
     MoveCursorRight,
     HistoryPrevious,
     HistoryNext,
+    BeginLeader,
+    OpenQueuedPrompts,
+    SelectPreviousQueuedPrompt,
+    SelectNextQueuedPrompt,
+    PromoteSelectedPrompt,
+    CancelSelectedPrompt,
+    RequestInterrupt,
+    ConfirmInterrupt,
+    CloseCommandMode,
     InsertText(String),
 }
 
@@ -381,6 +494,18 @@ pub enum ApplicationTransition {
     AdmitPrompt {
         session_id: SessionId,
         request: AdmitPromptRequest,
+    },
+    PromotePrompt {
+        session_id: SessionId,
+        prompt_id: PromptId,
+    },
+    CancelPrompt {
+        session_id: SessionId,
+        prompt_id: PromptId,
+    },
+    InterruptTurn {
+        session_id: SessionId,
+        turn_id: TurnId,
     },
     SubscribeSession(SessionId),
 }
@@ -449,10 +574,17 @@ impl Application {
                 self.state.submission_error = None;
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::Command(CommandId::SubmitSteer) => {
+            ApplicationEvent::Command(
+                command @ (CommandId::SubmitSteer | CommandId::SubmitQueue),
+            ) => {
                 if self.state.pending_submission.is_some() {
                     return Ok(ApplicationTransition::Continue);
                 }
+                let delivery = if command == CommandId::SubmitQueue {
+                    PromptDelivery::Queue
+                } else {
+                    PromptDelivery::Steer
+                };
                 let key = self.state.composer_key();
                 if self.state.composers.text(key).trim().is_empty() {
                     self.state.submission_error =
@@ -465,12 +597,12 @@ impl Application {
                 if let ComposerKey::Session(session_id) = key {
                     self.state.pending_submission = Some(PendingSubmission {
                         source: key,
-                        target: SubmissionTarget::AdmitPrompt(session_id),
+                        target: SubmissionTarget::AdmitPrompt(session_id, delivery),
                         prompt: prompt.clone(),
                     });
                     return Ok(ApplicationTransition::AdmitPrompt {
                         session_id,
-                        request: AdmitPromptRequest { prompt },
+                        request: AdmitPromptRequest { prompt, delivery },
                     });
                 }
                 self.state.pending_submission = Some(PendingSubmission {
@@ -485,6 +617,88 @@ impl Application {
                     prompt,
                 }))
             }
+            ApplicationEvent::Command(CommandId::BeginLeader) => {
+                self.state.command_mode = CommandMode::Leader;
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::OpenQueuedPrompts) => {
+                let Some(session_id) = self.session_id() else {
+                    self.state.command_mode = CommandMode::Composer;
+                    return Ok(ApplicationTransition::Continue);
+                };
+                self.state.command_mode = self.state.queued_prompts(session_id).first().map_or(
+                    CommandMode::Composer,
+                    |prompt| CommandMode::QueuedPrompts {
+                        selected: prompt.id,
+                    },
+                );
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(
+                command @ (CommandId::SelectPreviousQueuedPrompt
+                | CommandId::SelectNextQueuedPrompt),
+            ) => {
+                let (Some(session_id), CommandMode::QueuedPrompts { selected }) =
+                    (self.session_id(), self.state.command_mode)
+                else {
+                    return Ok(ApplicationTransition::Continue);
+                };
+                let queued = self.state.queued_prompts(session_id);
+                if let Some(index) = queued.iter().position(|prompt| prompt.id == selected) {
+                    let next = if command == CommandId::SelectPreviousQueuedPrompt {
+                        index.saturating_sub(1)
+                    } else {
+                        (index + 1).min(queued.len().saturating_sub(1))
+                    };
+                    self.state.command_mode = CommandMode::QueuedPrompts {
+                        selected: queued[next].id,
+                    };
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(
+                command @ (CommandId::PromoteSelectedPrompt | CommandId::CancelSelectedPrompt),
+            ) => {
+                let (Some(session_id), CommandMode::QueuedPrompts { selected }) =
+                    (self.session_id(), self.state.command_mode)
+                else {
+                    return Ok(ApplicationTransition::Continue);
+                };
+                self.state.command_mode = CommandMode::Composer;
+                Ok(if command == CommandId::PromoteSelectedPrompt {
+                    ApplicationTransition::PromotePrompt {
+                        session_id,
+                        prompt_id: selected,
+                    }
+                } else {
+                    ApplicationTransition::CancelPrompt {
+                        session_id,
+                        prompt_id: selected,
+                    }
+                })
+            }
+            ApplicationEvent::Command(CommandId::RequestInterrupt) => {
+                if let Some(turn_id) = self.state.active_turn_id() {
+                    self.state.command_mode = CommandMode::InterruptConfirmation { turn_id };
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::ConfirmInterrupt) => {
+                let (Some(session_id), CommandMode::InterruptConfirmation { turn_id }) =
+                    (self.session_id(), self.state.command_mode)
+                else {
+                    return Ok(ApplicationTransition::Continue);
+                };
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::InterruptTurn {
+                    session_id,
+                    turn_id,
+                })
+            }
+            ApplicationEvent::Command(CommandId::CloseCommandMode) => {
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::Continue)
+            }
             ApplicationEvent::Managed(ManagedEvent::Fatal(error)) => Err(anyhow!(error)),
             ApplicationEvent::Managed(event @ ManagedEvent::ServerShutdown(_)) => {
                 self.state.apply(event);
@@ -493,6 +707,7 @@ impl Application {
             ApplicationEvent::Managed(event) => {
                 let had_session = self.state.session.is_some();
                 self.state.apply(event);
+                self.state.reconcile_command_mode();
                 if had_session && self.state.session.is_none() {
                     Ok(ApplicationTransition::SessionEnded)
                 } else {
@@ -535,6 +750,20 @@ impl Application {
         render(frame, &self.state);
     }
 
+    pub fn handle_terminal_event(&mut self, event: InputEvent) -> Result<ApplicationTransition> {
+        let command = match self.state.command_mode {
+            CommandMode::Composer => command_for_terminal_event(event),
+            CommandMode::Leader => command_for_leader_event(event),
+            CommandMode::QueuedPrompts { .. } => command_for_queued_prompt_event(event),
+            CommandMode::InterruptConfirmation { .. } => {
+                command_for_interrupt_confirmation_event(event)
+            }
+        };
+        command.map_or(Ok(ApplicationTransition::Continue), |command| {
+            self.handle_event(ApplicationEvent::Command(command))
+        })
+    }
+
     fn session_id(&self) -> Option<SessionId> {
         self.state
             .session
@@ -568,6 +797,7 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
 enum BoundCommand {
     ClearOrExit,
     SubmitSteer,
+    SubmitQueue,
     InsertNewline,
     DeleteBackward,
     DeleteForward,
@@ -575,6 +805,15 @@ enum BoundCommand {
     MoveCursorRight,
     HistoryPrevious,
     HistoryNext,
+    BeginLeader,
+    OpenQueuedPrompts,
+    SelectPreviousQueuedPrompt,
+    SelectNextQueuedPrompt,
+    PromoteSelectedPrompt,
+    CancelSelectedPrompt,
+    RequestInterrupt,
+    ConfirmInterrupt,
+    CloseCommandMode,
 }
 
 impl BoundCommand {
@@ -582,6 +821,7 @@ impl BoundCommand {
         match self {
             Self::ClearOrExit => CommandId::ClearOrExit,
             Self::SubmitSteer => CommandId::SubmitSteer,
+            Self::SubmitQueue => CommandId::SubmitQueue,
             Self::InsertNewline => CommandId::InsertNewline,
             Self::DeleteBackward => CommandId::DeleteBackward,
             Self::DeleteForward => CommandId::DeleteForward,
@@ -589,6 +829,15 @@ impl BoundCommand {
             Self::MoveCursorRight => CommandId::MoveCursorRight,
             Self::HistoryPrevious => CommandId::HistoryPrevious,
             Self::HistoryNext => CommandId::HistoryNext,
+            Self::BeginLeader => CommandId::BeginLeader,
+            Self::OpenQueuedPrompts => CommandId::OpenQueuedPrompts,
+            Self::SelectPreviousQueuedPrompt => CommandId::SelectPreviousQueuedPrompt,
+            Self::SelectNextQueuedPrompt => CommandId::SelectNextQueuedPrompt,
+            Self::PromoteSelectedPrompt => CommandId::PromoteSelectedPrompt,
+            Self::CancelSelectedPrompt => CommandId::CancelSelectedPrompt,
+            Self::RequestInterrupt => CommandId::RequestInterrupt,
+            Self::ConfirmInterrupt => CommandId::ConfirmInterrupt,
+            Self::CloseCommandMode => CommandId::CloseCommandMode,
         }
     }
 }
@@ -607,6 +856,12 @@ const COMMAND_BINDINGS: &[CommandBinding] = &[
         modifiers: KeyModifiers::NONE,
         command: BoundCommand::SubmitSteer,
         label: "Enter",
+    },
+    CommandBinding {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::ALT,
+        command: BoundCommand::SubmitQueue,
+        label: "Alt+Enter",
     },
     CommandBinding {
         code: KeyCode::Enter,
@@ -668,7 +923,66 @@ const COMMAND_BINDINGS: &[CommandBinding] = &[
         command: BoundCommand::HistoryNext,
         label: "Down",
     },
+    CommandBinding {
+        code: KeyCode::Char('x'),
+        modifiers: KeyModifiers::CONTROL,
+        command: BoundCommand::BeginLeader,
+        label: "Ctrl+X",
+    },
+    CommandBinding {
+        code: KeyCode::Esc,
+        modifiers: KeyModifiers::NONE,
+        command: BoundCommand::RequestInterrupt,
+        label: "Esc",
+    },
 ];
+
+const LEADER_BINDINGS: &[CommandBinding] = &[CommandBinding {
+    code: KeyCode::Char('q'),
+    modifiers: KeyModifiers::NONE,
+    command: BoundCommand::OpenQueuedPrompts,
+    label: "q",
+}];
+
+const QUEUED_PROMPT_BINDINGS: &[CommandBinding] = &[
+    CommandBinding {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        command: BoundCommand::PromoteSelectedPrompt,
+        label: "Enter",
+    },
+    CommandBinding {
+        code: KeyCode::Char('d'),
+        modifiers: KeyModifiers::CONTROL,
+        command: BoundCommand::CancelSelectedPrompt,
+        label: "Ctrl+D",
+    },
+    CommandBinding {
+        code: KeyCode::Up,
+        modifiers: KeyModifiers::NONE,
+        command: BoundCommand::SelectPreviousQueuedPrompt,
+        label: "Up",
+    },
+    CommandBinding {
+        code: KeyCode::Down,
+        modifiers: KeyModifiers::NONE,
+        command: BoundCommand::SelectNextQueuedPrompt,
+        label: "Down",
+    },
+    CommandBinding {
+        code: KeyCode::Esc,
+        modifiers: KeyModifiers::NONE,
+        command: BoundCommand::CloseCommandMode,
+        label: "Esc",
+    },
+];
+
+const INTERRUPT_CONFIRMATION_BINDINGS: &[CommandBinding] = &[CommandBinding {
+    code: KeyCode::Esc,
+    modifiers: KeyModifiers::NONE,
+    command: BoundCommand::ConfirmInterrupt,
+    label: "Esc",
+}];
 
 fn binding_for(key: KeyEvent) -> Option<&'static CommandBinding> {
     COMMAND_BINDINGS
@@ -679,8 +993,40 @@ fn binding_for(key: KeyEvent) -> Option<&'static CommandBinding> {
 fn binding_label(command: BoundCommand) -> &'static str {
     COMMAND_BINDINGS
         .iter()
+        .chain(LEADER_BINDINGS)
+        .chain(QUEUED_PROMPT_BINDINGS)
+        .chain(INTERRUPT_CONFIRMATION_BINDINGS)
         .find(|binding| binding.command == command)
         .map_or("", |binding| binding.label)
+}
+
+fn command_for_leader_event(event: InputEvent) -> Option<CommandId> {
+    command_from_scoped_bindings(event, LEADER_BINDINGS).or(Some(CommandId::CloseCommandMode))
+}
+
+fn command_for_queued_prompt_event(event: InputEvent) -> Option<CommandId> {
+    command_from_scoped_bindings(event, QUEUED_PROMPT_BINDINGS)
+}
+
+fn command_for_interrupt_confirmation_event(event: InputEvent) -> Option<CommandId> {
+    command_from_scoped_bindings(event, INTERRUPT_CONFIRMATION_BINDINGS)
+        .or(Some(CommandId::CloseCommandMode))
+}
+
+fn command_from_scoped_bindings(
+    event: InputEvent,
+    bindings: &'static [CommandBinding],
+) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    bindings
+        .iter()
+        .find(|binding| binding.code == key.code && binding.modifiers == key.modifiers)
+        .map(|binding| binding.command.into_command())
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
@@ -751,9 +1097,22 @@ fn render_session(
         frame.area().width,
         state.composers.text(key),
     );
-    let [header_area, transcript_area, composer_area, status_area] = Layout::vertical([
+    let queued_prompts = state.queued_prompts(snapshot.session.id);
+    let pending_height = if queued_prompts.is_empty() {
+        0
+    } else {
+        (queued_prompts.len() as u16).min(3).saturating_add(2)
+    };
+    let [
+        header_area,
+        transcript_area,
+        pending_area,
+        composer_area,
+        status_area,
+    ] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
+        Constraint::Length(pending_height),
         Constraint::Length(composer_height),
         Constraint::Length(1),
     ])
@@ -794,6 +1153,9 @@ fn render_session(
             .scroll((scroll_position, 0)),
         transcript_area,
     );
+    if !queued_prompts.is_empty() {
+        render_pending_prompts(frame, pending_area, state, &queued_prompts, theme);
+    }
     render_composer(
         frame,
         composer_area,
@@ -814,10 +1176,13 @@ fn render_composer(
     theme: &Theme,
 ) {
     let submit = binding_label(BoundCommand::SubmitSteer);
+    let queue = binding_label(BoundCommand::SubmitQueue);
     let newline = binding_label(BoundCommand::InsertNewline);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" Prompt · {submit} submit · {newline} newline "))
+        .title(format!(
+            " Prompt · {submit} submit · {queue} queue · {newline} newline "
+        ))
         .border_style(style);
     let content_width = area.width.saturating_sub(2).max(1);
     let content_height = area.height.saturating_sub(2).max(1);
@@ -832,6 +1197,66 @@ fn render_composer(
         Paragraph::new(text.to_owned()).style(theme.form_field.text)
     };
     frame.render_widget(paragraph.block(block).scroll((scroll, 0)), area);
+}
+
+fn render_pending_prompts(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &TuiState,
+    prompts: &[QueuedPrompt<'_>],
+    theme: &Theme,
+) {
+    let leader = binding_label(BoundCommand::BeginLeader);
+    let queue = binding_label(BoundCommand::OpenQueuedPrompts);
+    let managing = matches!(state.command_mode, CommandMode::QueuedPrompts { .. });
+    let title = if managing {
+        format!(
+            " Pending · {} steer · {} cancel ",
+            binding_label(BoundCommand::PromoteSelectedPrompt),
+            binding_label(BoundCommand::CancelSelectedPrompt)
+        )
+    } else {
+        format!(" Pending · {leader} {queue} manage ")
+    };
+    let selected = match state.command_mode {
+        CommandMode::QueuedPrompts { selected } => Some(selected),
+        _ => None,
+    };
+    let lines = prompts
+        .iter()
+        .map(|prompt| {
+            let text = prompt.text.replace('\n', " ");
+            Line::styled(
+                format!(
+                    "{}{}",
+                    if selected == Some(prompt.id) {
+                        "› "
+                    } else {
+                        "  "
+                    },
+                    text
+                ),
+                if selected == Some(prompt.id) {
+                    theme.selection.focused
+                } else {
+                    theme.text.subdued
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(if managing {
+                    theme.border.default
+                } else {
+                    theme.border.subdued
+                }),
+        ),
+        area,
+    );
 }
 
 fn composer_block_height(terminal_height: u16, width: u16, text: &str) -> u16 {
@@ -1023,6 +1448,9 @@ async fn run_loop(
                             }
                             ApplicationTransition::CreateSession(_)
                             | ApplicationTransition::AdmitPrompt { .. }
+                            | ApplicationTransition::PromotePrompt { .. }
+                            | ApplicationTransition::CancelPrompt { .. }
+                            | ApplicationTransition::InterruptTurn { .. }
                             | ApplicationTransition::SubscribeSession(_) => {
                                 unreachable!("managed events do not issue Session commands");
                             }
@@ -1099,14 +1527,16 @@ async fn run_loop(
                             error,
                         })?;
                     }
+                    SubmissionResult::OperationSucceeded => {}
+                    SubmissionResult::OperationFailed(error) => {
+                        application.handle_event(ApplicationEvent::SessionOperationFailed(error))?;
+                    }
                 }
             }
             input_event = input.next() => {
                 match input_event {
                     Some(Ok(event)) => {
-                        if let Some(command) = command_for_terminal_event(event) {
-                            let transition = application
-                                .handle_event(ApplicationEvent::Command(command))?;
+                            let transition = application.handle_terminal_event(event)?;
                             match transition {
                                 ApplicationTransition::Continue => {}
                                 ApplicationTransition::SessionEnded => {
@@ -1145,11 +1575,52 @@ async fn run_loop(
                                         let _ = results.send(result);
                                     });
                                 }
+                                ApplicationTransition::PromotePrompt { session_id, prompt_id } => {
+                                    let commands = client.session_commands();
+                                    let results = submission_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = commands
+                                            .promote_prompt(session_id, prompt_id)
+                                            .await
+                                            .map(|_| SubmissionResult::OperationSucceeded)
+                                            .unwrap_or_else(|error| {
+                                                SubmissionResult::OperationFailed(error.to_string())
+                                            });
+                                        let _ = results.send(result);
+                                    });
+                                }
+                                ApplicationTransition::CancelPrompt { session_id, prompt_id } => {
+                                    let commands = client.session_commands();
+                                    let results = submission_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = commands
+                                            .cancel_prompt(session_id, prompt_id)
+                                            .await
+                                            .map(|_| SubmissionResult::OperationSucceeded)
+                                            .unwrap_or_else(|error| {
+                                                SubmissionResult::OperationFailed(error.to_string())
+                                            });
+                                        let _ = results.send(result);
+                                    });
+                                }
+                                ApplicationTransition::InterruptTurn { session_id, turn_id } => {
+                                    let commands = client.session_commands();
+                                    let results = submission_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = commands
+                                            .interrupt_turn(session_id, turn_id)
+                                            .await
+                                            .map(|_| SubmissionResult::OperationSucceeded)
+                                            .unwrap_or_else(|error| {
+                                                SubmissionResult::OperationFailed(error.to_string())
+                                            });
+                                        let _ = results.send(result);
+                                    });
+                                }
                                 ApplicationTransition::SubscribeSession(_) => {
                                     unreachable!("terminal input cannot end a Session subscription")
                                 }
                             }
-                        }
                     }
                     Some(Err(error)) => return Err(error.into()),
                     None => return Ok(()),
@@ -1163,6 +1634,8 @@ enum SubmissionResult {
     SessionCreated(Box<SessionSnapshot>),
     PromptAdmitted(PromptId),
     Failed { prompt_id: PromptId, error: String },
+    OperationSucceeded,
+    OperationFailed(String),
 }
 
 struct ConnectedSessionSubscription {
@@ -1265,10 +1738,29 @@ fn status_text(state: &TuiState) -> String {
             recovery.attempt, recovery.retry_in
         );
     }
-    match &state.identity {
+    let connection = match &state.identity {
         Some(identity) => format!("Connected | {}", server_identity_text(identity)),
         None => "Connecting to Chidori server...".to_owned(),
+    };
+    if matches!(
+        state
+            .session
+            .as_ref()
+            .map(|session| session.snapshot().session.status),
+        Some(SessionStatus::Active)
+    ) {
+        let interrupt = binding_label(BoundCommand::RequestInterrupt);
+        let active = if matches!(
+            state.command_mode,
+            CommandMode::InterruptConfirmation { .. }
+        ) {
+            format!("Active · {interrupt} again to interrupt")
+        } else {
+            format!("Active · {interrupt} interrupt")
+        };
+        return format!("{active} | {connection}");
     }
+    connection
 }
 
 fn server_identity_text(identity: &ServerIdentity) -> String {

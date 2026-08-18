@@ -6,9 +6,9 @@ use chidori::{
     protocol::{
         Activity, ActivityId, ActivityKind, CounterSnapshot, CreateSessionRequest, Health,
         InitialPrompt, LifecycleState, Message, MessageId, MessageRole, MessageStatus, Prompt,
-        PromptId, PromptStatus, ServerIdentity, ServerShutdown, Session, SessionChange, SessionId,
-        SessionRevision, SessionSnapshot, SessionStatus, SessionUpdate, ShutdownReason,
-        TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        PromptDelivery, PromptId, PromptOrder, PromptStatus, ServerIdentity, ServerShutdown,
+        Session, SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
+        SessionUpdate, ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{self, AgentOutput, ServerConfig},
     tui::{
@@ -882,6 +882,173 @@ fn provisional_steer_is_immediate_single_and_reconciles_in_place() {
 }
 
 #[test]
+fn queued_prompt_docks_immediately_and_scoped_mode_preserves_the_draft() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (session_id, snapshot, _) = enter_active_session(&mut application, workspace.path());
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Run this later".to_owned(),
+        )))
+        .expect("type queued Prompt");
+    assert_eq!(
+        command_for_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::ALT,
+        ))),
+        Some(CommandId::SubmitQueue)
+    );
+    let ApplicationTransition::AdmitPrompt { request, .. } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitQueue))
+        .expect("submit queued Prompt")
+    else {
+        panic!("Alt+Enter should request queued Prompt admission");
+    };
+    assert_eq!(request.delivery, PromptDelivery::Queue);
+    let prompt_id = request.prompt.id;
+    let optimistic = rendered_application_rows(&application).join("\n");
+    assert!(optimistic.contains("Pending"));
+    assert_eq!(optimistic.matches("Run this later").count(), 1);
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(snapshot.revision.0 + 1),
+                changes: vec![SessionChange::PromptAdded {
+                    prompt: Prompt {
+                        id: prompt_id,
+                        text: request.prompt.text,
+                        delivery: PromptDelivery::Queue,
+                        admission_order: PromptOrder(3),
+                        status: PromptStatus::Pending,
+                    },
+                }],
+            },
+        )))
+        .expect("apply authoritative queued Prompt");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "keep this draft".to_owned(),
+        )))
+        .expect("type a competing draft");
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL,
+            )))
+            .expect("start command leader"),
+        ApplicationTransition::Continue
+    );
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )))
+        .expect("open queued-Prompt mode");
+    let ApplicationTransition::PromotePrompt {
+        session_id: promoted_in,
+        prompt_id: promoted,
+    } = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("promote selected queued Prompt")
+    else {
+        panic!("Enter in queued-Prompt mode should promote the selection");
+    };
+    assert_eq!((promoted_in, promoted), (session_id, prompt_id));
+    application
+        .handle_event(ApplicationEvent::SessionOperationFailed(
+            "competing mutation lost".to_owned(),
+        ))
+        .expect("report failed mutation");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("keep this draft")
+    );
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("restart command leader");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )))
+        .expect("reopen queued-Prompt mode");
+    let ApplicationTransition::CancelPrompt {
+        session_id: cancelled_in,
+        prompt_id: cancelled,
+    } = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("cancel selected queued Prompt")
+    else {
+        panic!("Ctrl+D in queued-Prompt mode should cancel the selection");
+    };
+    assert_eq!((cancelled_in, cancelled), (session_id, prompt_id));
+}
+
+#[test]
+fn escape_confirmation_is_local_and_targets_the_observed_active_turn() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (expected_session_id, snapshot, active_turn_id) =
+        enter_active_session(&mut application, workspace.path());
+    let mut observer = Application::new(workspace.path());
+    observer
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a second local observer");
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .expect("request interruption"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Esc again")
+    );
+    assert!(
+        !rendered_application_rows(&observer)
+            .join("\n")
+            .contains("Esc again"),
+        "interruption confirmation must remain client-local"
+    );
+
+    let ApplicationTransition::InterruptTurn {
+        session_id,
+        turn_id,
+    } = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("confirm interruption")
+    else {
+        panic!("the second Esc should issue a targeted interruption");
+    };
+    assert_eq!(session_id, expected_session_id);
+    assert_eq!(turn_id, active_turn_id);
+}
+
+#[test]
 fn ended_session_subscription_requests_a_fresh_snapshot_for_reconciliation() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = Application::new(workspace.path());
@@ -1203,13 +1370,51 @@ fn enter_session(
     (session_id, snapshot)
 }
 
+fn enter_active_session(
+    application: &mut Application,
+    workspace: &std::path::Path,
+) -> (SessionId, SessionSnapshot, TurnId) {
+    let (session_id, mut snapshot) = enter_session(application, workspace);
+    let prompt_id = PromptId::new();
+    let turn_id = TurnId::new();
+    let message_id = MessageId::new();
+    snapshot.revision = SessionRevision(2);
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.prompts.push(Prompt {
+        id: prompt_id,
+        text: "Long-running work".to_owned(),
+        delivery: PromptDelivery::Steer,
+        admission_order: PromptOrder(2),
+        status: PromptStatus::Delivered,
+    });
+    snapshot.turns.push(Turn {
+        id: turn_id,
+        prompt_id,
+        status: TurnStatus::Active,
+    });
+    snapshot.messages.push(Message {
+        id: message_id,
+        turn_id,
+        role: MessageRole::User,
+        status: MessageStatus::Completed,
+        content: "Long-running work".to_owned(),
+    });
+    snapshot
+        .transcript
+        .push(TranscriptItem::Message { message_id });
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .expect("attach active Session");
+    (session_id, snapshot, turn_id)
+}
+
 fn failed_session_snapshot(
     session_id: SessionId,
     prompt_id: PromptId,
     text: &str,
     workspace: &std::path::Path,
 ) -> SessionSnapshot {
-    let delivered = FailedTurnFixture::new(prompt_id, text);
+    let delivered = FailedTurnFixture::new(prompt_id, text, PromptOrder::INITIAL);
     let transcript = delivered.transcript();
     SessionSnapshot {
         session: Session {
@@ -1235,7 +1440,7 @@ fn delivered_update(
     prompt_id: PromptId,
     text: &str,
 ) -> SessionUpdate {
-    let delivered = FailedTurnFixture::new(prompt_id, text);
+    let delivered = FailedTurnFixture::new(prompt_id, text, PromptOrder(revision.0));
     SessionUpdate {
         session_id,
         revision,
@@ -1251,12 +1456,14 @@ struct FailedTurnFixture {
 }
 
 impl FailedTurnFixture {
-    fn new(prompt_id: PromptId, text: &str) -> Self {
+    fn new(prompt_id: PromptId, text: &str, admission_order: PromptOrder) -> Self {
         let turn_id = TurnId::new();
         Self {
             prompt: Prompt {
                 id: prompt_id,
                 text: text.to_owned(),
+                delivery: PromptDelivery::Steer,
+                admission_order,
                 status: PromptStatus::Delivered,
             },
             turn: Turn {

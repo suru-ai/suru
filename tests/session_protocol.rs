@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use chidori::protocol::{
     Activity, ActivityId, ActivityKind, AdmitPromptRequest, AgentId, AgentIdentity,
     CreateSessionRequest, InitialPrompt, Message, MessageId, MessageRole, MessageStatus, ModelId,
-    Prompt, PromptId, PromptStatus, ProviderId, Session, SessionChange, SessionError,
-    SessionErrorCode, SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary,
-    SessionTimestamp, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+    Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session,
+    SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
+    SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, TranscriptItem, Turn, TurnId,
+    TurnStatus, Workspace,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -76,6 +77,8 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         prompts: vec![Prompt {
             id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
             text: "Explain this workspace".to_owned(),
+            delivery: PromptDelivery::Steer,
+            admission_order: PromptOrder(1),
             status: PromptStatus::Delivered,
         }],
         turns: vec![Turn {
@@ -124,6 +127,8 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         "prompts": [{
             "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
             "text": "Explain this workspace",
+            "delivery": "steer",
+            "admission_order": 1,
             "status": "delivered"
         }],
         "turns": [{
@@ -280,12 +285,14 @@ fn prompt_admission_command_round_trips_with_its_client_generated_identity() {
             id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
             text: "Steer the current Session".to_owned(),
         },
+        delivery: PromptDelivery::Queue,
     };
     let expected = json!({
         "prompt": {
             "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
             "text": "Steer the current Session"
-        }
+        },
+        "delivery": "queue"
     });
 
     assert_eq!(
@@ -301,11 +308,20 @@ fn prompt_admission_command_round_trips_with_its_client_generated_identity() {
 #[test]
 fn session_delta_status_and_error_contracts_use_stable_provider_neutral_shapes() {
     let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let prompt_id = PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9"));
     let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));
     let update = SessionUpdate {
         session_id,
         revision: SessionRevision(8),
         changes: vec![
+            SessionChange::PromptDeliveryChanged {
+                prompt_id,
+                delivery: PromptDelivery::Steer,
+            },
+            SessionChange::PromptStatusChanged {
+                prompt_id,
+                status: PromptStatus::Delivered,
+            },
             SessionChange::TurnStatusChanged {
                 turn_id,
                 status: TurnStatus::Completed,
@@ -321,6 +337,16 @@ fn session_delta_status_and_error_contracts_use_stable_provider_neutral_shapes()
             "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
             "revision": 8,
             "changes": [
+                {
+                    "type": "prompt_delivery_changed",
+                    "prompt_id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
+                    "delivery": "steer"
+                },
+                {
+                    "type": "prompt_status_changed",
+                    "prompt_id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
+                    "status": "delivered"
+                },
                 {
                     "type": "turn_status_changed",
                     "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",

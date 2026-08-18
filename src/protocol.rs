@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const SNAPSHOT_EVENT: &str = "snapshot";
 pub const COUNTER_UPDATED_EVENT: &str = "counter_updated";
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
@@ -90,6 +90,14 @@ impl SessionRevision {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct PromptOrder(pub u64);
+
+impl PromptOrder {
+    pub const INITIAL: Self = Self(1);
+}
+
 /// Milliseconds since the Unix epoch.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -122,6 +130,13 @@ pub enum PromptStatus {
     Pending,
     Delivered,
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptDelivery {
+    Steer,
+    Queue,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -178,6 +193,8 @@ pub struct SessionSummary {
 pub struct Prompt {
     pub id: PromptId,
     pub text: String,
+    pub delivery: PromptDelivery,
+    pub admission_order: PromptOrder,
     pub status: PromptStatus,
 }
 
@@ -241,6 +258,14 @@ pub enum SessionChange {
     PromptAdded {
         prompt: Prompt,
     },
+    PromptDeliveryChanged {
+        prompt_id: PromptId,
+        delivery: PromptDelivery,
+    },
+    PromptStatusChanged {
+        prompt_id: PromptId,
+        status: PromptStatus,
+    },
     TurnAdded {
         turn: Turn,
     },
@@ -284,6 +309,7 @@ pub struct CreateSessionRequest {
 #[serde(deny_unknown_fields)]
 pub struct AdmitPromptRequest {
     pub prompt: InitialPrompt,
+    pub delivery: PromptDelivery,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -294,6 +320,10 @@ pub enum SessionErrorCode {
     InvalidWorkspace,
     SessionNotFound,
     PromptConflict,
+    PromptNotFound,
+    PromptNotPending,
+    TurnNotFound,
+    TurnNotActive,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

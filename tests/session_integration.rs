@@ -23,11 +23,11 @@ use chidori::{
     protocol::{
         Activity, ActivityId, ActivityKind, AdmitPromptRequest, CounterSnapshot,
         CreateSessionRequest, InitialPrompt, LifecycleState, Message, MessageId, MessageRole,
-        MessageStatus, PROTOCOL_VERSION, Prompt, PromptId, PromptStatus, RuntimeDescriptor,
-        SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SNAPSHOT_EVENT, ServerIdentity, Session,
-        SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
-        SessionStatus, SessionSummary, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
-        Workspace,
+        MessageStatus, PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId, PromptOrder,
+        PromptStatus, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
+        SNAPSHOT_EVENT, ServerIdentity, Session, SessionChange, SessionError, SessionErrorCode,
+        SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionUpdate,
+        TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{self, AgentOutput, ServerConfig},
 };
@@ -264,6 +264,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
             id: prompt_id,
             text: "Use the smaller interface".to_owned(),
         },
+        delivery: PromptDelivery::Steer,
     };
     let admitted = client
         .post(format!(
@@ -344,6 +345,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
                 id: prompt_id,
                 text: "Conflicting content".to_owned(),
             },
+            delivery: PromptDelivery::Steer,
         })
         .send()
         .await
@@ -358,7 +360,462 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         SessionErrorCode::PromptConflict
     );
 
+    let conflicting_delivery = client
+        .post(format!(
+            "{}/v1/sessions/{}/prompts",
+            descriptor.base_url, created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&AdmitPromptRequest {
+            prompt: command.prompt.clone(),
+            delivery: PromptDelivery::Queue,
+        })
+        .send()
+        .await
+        .expect("reuse Prompt identity with conflicting delivery");
+    assert_eq!(conflicting_delivery.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        conflicting_delivery
+            .json::<SessionError>()
+            .await
+            .expect("decode delivery conflict")
+            .code,
+        SessionErrorCode::PromptConflict
+    );
+
     drop(events);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn active_turn_admission_orders_queue_and_steer_before_safe_delivery() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "active-prompt-order-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "active-prompt-order-test")
+            .expect("configure managed client"),
+    )
+    .await
+    .expect("connect managed client");
+    receive_managed_client_initial_state(&mut client).await;
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Initial Prompt".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let session_id = created.session.id;
+    let active_prompt_id = PromptId::new();
+    let active_turn_id = TurnId::new();
+    server
+        .session_event_sink()
+        .publish(
+            session_id,
+            vec![
+                SessionChange::PromptAdded {
+                    prompt: Prompt {
+                        id: active_prompt_id,
+                        text: "Long-running work".to_owned(),
+                        delivery: PromptDelivery::Steer,
+                        admission_order: PromptOrder(2),
+                        status: PromptStatus::Delivered,
+                    },
+                },
+                SessionChange::TurnAdded {
+                    turn: Turn {
+                        id: active_turn_id,
+                        prompt_id: active_prompt_id,
+                        status: TurnStatus::Active,
+                    },
+                },
+                SessionChange::MessageAdded {
+                    message: Message {
+                        id: MessageId::new(),
+                        turn_id: active_turn_id,
+                        role: MessageRole::User,
+                        status: MessageStatus::Completed,
+                        content: "Long-running work".to_owned(),
+                    },
+                },
+            ],
+        )
+        .expect("start an active provider Turn");
+    assert_eq!(
+        client
+            .read_session(session_id)
+            .await
+            .expect("read active Session")
+            .session
+            .status,
+        SessionStatus::Active
+    );
+    let rejected_prompt_id = PromptId::new();
+    assert!(
+        server
+            .session_event_sink()
+            .publish(
+                session_id,
+                vec![
+                    SessionChange::PromptAdded {
+                        prompt: Prompt {
+                            id: rejected_prompt_id,
+                            text: "Competing active work".to_owned(),
+                            delivery: PromptDelivery::Steer,
+                            admission_order: PromptOrder(3),
+                            status: PromptStatus::Delivered,
+                        },
+                    },
+                    SessionChange::TurnAdded {
+                        turn: Turn {
+                            id: TurnId::new(),
+                            prompt_id: rejected_prompt_id,
+                            status: TurnStatus::Active,
+                        },
+                    },
+                ],
+            )
+            .is_err(),
+        "a Session must reject a competing active Turn"
+    );
+    assert!(
+        !client
+            .read_session(session_id)
+            .await
+            .expect("read Session after rejected competing Turn")
+            .prompts
+            .iter()
+            .any(|prompt| prompt.id == rejected_prompt_id),
+        "a rejected active Turn must not partially mutate the Session"
+    );
+
+    let queued = client
+        .admit_prompt(
+            session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Run this later".to_owned(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("queue Prompt during active Turn");
+    let second_queued = client
+        .admit_prompt(
+            session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Run this after the first queue".to_owned(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("queue a second Prompt during active Turn");
+    let steer = client
+        .admit_prompt(
+            session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Change direction now".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit steer during active Turn");
+    assert_eq!(queued.admission_order, PromptOrder(3));
+    assert_eq!(second_queued.admission_order, PromptOrder(4));
+    assert_eq!(steer.admission_order, PromptOrder(5));
+    assert_eq!(queued.status, PromptStatus::Pending);
+    assert_eq!(second_queued.status, PromptStatus::Pending);
+    assert_eq!(steer.status, PromptStatus::Pending);
+
+    let delivered = server
+        .agent_output()
+        .continuation_boundary(session_id, active_turn_id)
+        .expect("deliver pending steers at a safe continuation boundary");
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].id, steer.id);
+    assert_eq!(delivered[0].status, PromptStatus::Delivered);
+    let current = client
+        .read_session(session_id)
+        .await
+        .expect("read Session after continuation boundary");
+    assert_eq!(
+        current
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == queued.id)
+            .expect("queued Prompt remains authoritative")
+            .status,
+        PromptStatus::Pending
+    );
+    assert_eq!(
+        current
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == steer.id)
+            .expect("steer remains authoritative")
+            .status,
+        PromptStatus::Delivered
+    );
+    assert!(current.messages.iter().any(|message| {
+        message.turn_id == active_turn_id && message.content == "Change direction now"
+    }));
+
+    server
+        .session_event_sink()
+        .publish(
+            session_id,
+            vec![SessionChange::TurnStatusChanged {
+                turn_id: active_turn_id,
+                status: TurnStatus::Completed,
+            }],
+        )
+        .expect("complete active Turn at an idle boundary");
+    let completed = client
+        .read_session(session_id)
+        .await
+        .expect("read Session after idle boundary");
+    assert_eq!(completed.session.status, SessionStatus::Idle);
+    assert_eq!(
+        completed
+            .turns
+            .iter()
+            .find(|turn| turn.id == active_turn_id)
+            .expect("active Turn remains authoritative")
+            .status,
+        TurnStatus::Completed
+    );
+    assert_eq!(
+        completed
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == queued.id)
+            .expect("queued Prompt remains authoritative")
+            .status,
+        PromptStatus::Delivered
+    );
+    assert_eq!(
+        completed
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == second_queued.id)
+            .expect("second queued Prompt remains authoritative")
+            .status,
+        PromptStatus::Pending
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "prompt-mutation-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let mut first = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "prompt-mutation-test")
+            .expect("configure first client"),
+    )
+    .await
+    .expect("connect first client");
+    let mut second = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "prompt-mutation-test")
+            .expect("configure second client"),
+    )
+    .await
+    .expect("connect second client");
+    receive_managed_client_initial_state(&mut first).await;
+    receive_managed_client_initial_state(&mut second).await;
+
+    let created = first
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Initial Prompt".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let session_id = created.session.id;
+    let active_prompt_id = PromptId::new();
+    let active_turn_id = TurnId::new();
+    server
+        .session_event_sink()
+        .publish(
+            session_id,
+            vec![
+                SessionChange::PromptAdded {
+                    prompt: Prompt {
+                        id: active_prompt_id,
+                        text: "Long-running work".to_owned(),
+                        delivery: PromptDelivery::Steer,
+                        admission_order: PromptOrder(2),
+                        status: PromptStatus::Delivered,
+                    },
+                },
+                SessionChange::TurnAdded {
+                    turn: Turn {
+                        id: active_turn_id,
+                        prompt_id: active_prompt_id,
+                        status: TurnStatus::Active,
+                    },
+                },
+                SessionChange::MessageAdded {
+                    message: Message {
+                        id: MessageId::new(),
+                        turn_id: active_turn_id,
+                        role: MessageRole::User,
+                        status: MessageStatus::Completed,
+                        content: "Long-running work".to_owned(),
+                    },
+                },
+            ],
+        )
+        .expect("start active Turn");
+    let promoted = first
+        .admit_prompt(
+            session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Promote this Prompt".to_owned(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("admit Prompt to promote");
+    let cancelled = first
+        .admit_prompt(
+            session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Cancel this Prompt".to_owned(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("admit Prompt to cancel");
+    let after_interrupt = first
+        .admit_prompt(
+            session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Run after interruption".to_owned(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("admit post-interrupt Prompt");
+
+    let promoted = first
+        .promote_prompt(session_id, promoted.id)
+        .await
+        .expect("promote queued Prompt");
+    assert_eq!(promoted.delivery, PromptDelivery::Steer);
+    assert_eq!(promoted.status, PromptStatus::Pending);
+    let cancelled = first
+        .cancel_prompt(session_id, cancelled.id)
+        .await
+        .expect("cancel queued Prompt");
+    assert_eq!(cancelled.status, PromptStatus::Cancelled);
+    assert!(
+        second
+            .promote_prompt(session_id, cancelled.id)
+            .await
+            .is_err(),
+        "a competing mutation must not revive a cancelled Prompt"
+    );
+
+    let mut observer = second
+        .attach_session(session_id)
+        .await
+        .expect("attach observing client");
+    let SessionEvent::Snapshot(before_interrupt) = observer
+        .next()
+        .await
+        .expect("observer receives snapshot")
+        .expect("observer snapshot is valid")
+    else {
+        panic!("attachment must begin with a Session snapshot");
+    };
+    assert_eq!(before_interrupt.session.status, SessionStatus::Active);
+
+    let interrupted = first
+        .interrupt_turn(session_id, active_turn_id)
+        .await
+        .expect("interrupt active Turn");
+    assert_eq!(interrupted.status, TurnStatus::Interrupted);
+    let SessionEvent::Updated(interrupt_update) = timeout(Duration::from_secs(1), observer.next())
+        .await
+        .expect("interruption update arrives")
+        .expect("observer stream remains open")
+        .expect("interruption update is valid")
+    else {
+        panic!("observer must receive an interruption update");
+    };
+    assert!(interrupt_update.changes.iter().any(|change| {
+        matches!(change, SessionChange::TurnStatusChanged { turn_id, status: TurnStatus::Interrupted }
+            if *turn_id == active_turn_id)
+    }));
+
+    let current = second
+        .read_session(session_id)
+        .await
+        .expect("read interrupted Session from second client");
+    assert_eq!(
+        current
+            .turns
+            .iter()
+            .find(|turn| turn.id == active_turn_id)
+            .expect("active Turn remains authoritative")
+            .status,
+        TurnStatus::Interrupted
+    );
+    assert_eq!(current.session.status, SessionStatus::Idle);
+    assert_eq!(
+        current
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == after_interrupt.id)
+            .expect("queued Prompt remains authoritative")
+            .status,
+        PromptStatus::Pending
+    );
+
+    drop(observer);
+    drop(second);
+    drop(first);
     server.shutdown().await.expect("shut down server");
 }
 
@@ -429,6 +886,7 @@ async fn consecutive_prompt_admissions_are_delivered_without_collapsing_revision
                         id: prompt_id,
                         text: format!("Consecutive steer {}", index + 1),
                     },
+                    delivery: PromptDelivery::Steer,
                 })
                 .send()
         });
@@ -1280,6 +1738,8 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
                     prompt: Prompt {
                         id: prompt_id,
                         text: "Observe this change".to_owned(),
+                        delivery: PromptDelivery::Steer,
+                        admission_order: PromptOrder(2),
                         status: PromptStatus::Delivered,
                     },
                 },
@@ -1553,6 +2013,8 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
         prompts: vec![Prompt {
             id: prompt_id,
             text: "Explain this workspace".to_owned(),
+            delivery: PromptDelivery::Steer,
+            admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Delivered,
         }],
         turns: vec![Turn {

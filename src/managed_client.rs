@@ -16,8 +16,8 @@ use crate::{
     RuntimeConfig,
     protocol::{
         AdmitPromptRequest, CounterSnapshot, CounterUpdate, CreateSessionRequest, Health,
-        LifecycleState, Prompt, RuntimeDescriptor, ServerShutdown, SessionError, SessionId,
-        SessionSnapshot, SessionSummary, ShutdownReason,
+        LifecycleState, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionError,
+        SessionId, SessionSnapshot, SessionSummary, ShutdownReason, Turn, TurnId,
     },
 };
 
@@ -178,6 +178,32 @@ impl ManagedClient {
         self.session_commands().subscribe_session(session_id).await
     }
 
+    pub async fn promote_prompt(
+        &self,
+        session_id: SessionId,
+        prompt_id: PromptId,
+    ) -> Result<Prompt> {
+        self.session_commands()
+            .promote_prompt(session_id, prompt_id)
+            .await
+    }
+
+    pub async fn cancel_prompt(
+        &self,
+        session_id: SessionId,
+        prompt_id: PromptId,
+    ) -> Result<Prompt> {
+        self.session_commands()
+            .cancel_prompt(session_id, prompt_id)
+            .await
+    }
+
+    pub async fn interrupt_turn(&self, session_id: SessionId, turn_id: TurnId) -> Result<Turn> {
+        self.session_commands()
+            .interrupt_turn(session_id, turn_id)
+            .await
+    }
+
     pub async fn read_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
         self.session_commands().read_session(session_id).await
     }
@@ -220,6 +246,42 @@ impl SessionCommandClient {
         .await
     }
 
+    pub(crate) async fn promote_prompt(
+        &self,
+        session_id: SessionId,
+        prompt_id: PromptId,
+    ) -> Result<Prompt> {
+        self.post_session_command_without_body(
+            &format!("/v1/sessions/{session_id}/prompts/{prompt_id}/promote"),
+            "Prompt promotion",
+        )
+        .await
+    }
+
+    pub(crate) async fn cancel_prompt(
+        &self,
+        session_id: SessionId,
+        prompt_id: PromptId,
+    ) -> Result<Prompt> {
+        self.post_session_command_without_body(
+            &format!("/v1/sessions/{session_id}/prompts/{prompt_id}/cancel"),
+            "Prompt cancellation",
+        )
+        .await
+    }
+
+    pub(crate) async fn interrupt_turn(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<Turn> {
+        self.post_session_command_without_body(
+            &format!("/v1/sessions/{session_id}/turns/{turn_id}/interrupt"),
+            "Turn interruption",
+        )
+        .await
+    }
+
     async fn post_session_command<RequestBody, ResponseBody>(
         &self,
         path: &str,
@@ -236,6 +298,25 @@ impl SessionCommandClient {
             .post(format!("{}{path}", descriptor.base_url))
             .bearer_auth(&descriptor.token)
             .json(request)
+            .send()
+            .await
+            .with_context(|| format!("send {operation} command"))?;
+        decode_session_response(response, operation).await
+    }
+
+    async fn post_session_command_without_body<ResponseBody>(
+        &self,
+        path: &str,
+        operation: &str,
+    ) -> Result<ResponseBody>
+    where
+        ResponseBody: DeserializeOwned,
+    {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(format!("{}{path}", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
             .send()
             .await
             .with_context(|| format!("send {operation} command"))?;

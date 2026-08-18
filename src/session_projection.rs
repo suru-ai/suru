@@ -3,7 +3,8 @@
 use anyhow::{Result, bail};
 
 use crate::protocol::{
-    MessageRole, MessageStatus, SessionChange, SessionSnapshot, SessionUpdate, TranscriptItem,
+    MessageRole, MessageStatus, PromptDelivery, PromptStatus, SessionChange, SessionSnapshot,
+    SessionUpdate, TranscriptItem,
 };
 
 pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdate) -> Result<()> {
@@ -21,7 +22,49 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 if next.prompts.iter().any(|existing| existing.id == prompt.id) {
                     bail!("Session update reused a Prompt identity");
                 }
+                if prompt.admission_order.0 == 0
+                    || next
+                        .prompts
+                        .iter()
+                        .any(|existing| existing.admission_order == prompt.admission_order)
+                {
+                    bail!("Session update reused an invalid Prompt admission order");
+                }
                 next.prompts.push(prompt.clone());
+            }
+            SessionChange::PromptDeliveryChanged {
+                prompt_id,
+                delivery,
+            } => {
+                let Some(prompt) = next
+                    .prompts
+                    .iter_mut()
+                    .find(|prompt| prompt.id == *prompt_id)
+                else {
+                    bail!("Session update referenced an unknown Prompt");
+                };
+                if prompt.status != PromptStatus::Pending
+                    || prompt.delivery != PromptDelivery::Queue
+                    || *delivery != PromptDelivery::Steer
+                {
+                    bail!("Session update contained an invalid Prompt promotion");
+                }
+                prompt.delivery = *delivery;
+            }
+            SessionChange::PromptStatusChanged { prompt_id, status } => {
+                let Some(prompt) = next
+                    .prompts
+                    .iter_mut()
+                    .find(|prompt| prompt.id == *prompt_id)
+                else {
+                    bail!("Session update referenced an unknown Prompt");
+                };
+                if prompt.status != PromptStatus::Pending
+                    || !matches!(status, PromptStatus::Delivered | PromptStatus::Cancelled)
+                {
+                    bail!("Session update contained an invalid Prompt status transition");
+                }
+                prompt.status = *status;
             }
             SessionChange::TurnAdded { turn } => {
                 if !next

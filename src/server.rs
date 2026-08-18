@@ -37,8 +37,8 @@ use crate::protocol::{
 };
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
-    AdmitPromptError, CreateSessionError, ListSessionsError, SessionFeed, SessionStore,
-    StoreOutcome,
+    AdmitPromptError, CreateSessionError, InterruptTurnError, ListSessionsError,
+    PromptMutationError, SessionFeed, SessionStore, StoreOutcome,
 };
 
 pub type ServerConfig = RuntimeConfig;
@@ -109,6 +109,19 @@ impl AgentOutputSink {
             },
         };
         self.session_events.publish(session_id, vec![change])
+    }
+
+    pub fn continuation_boundary(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<Vec<crate::protocol::Prompt>> {
+        if *self.session_events.lifecycle.borrow() != LifecycleState::Ready {
+            anyhow::bail!("server is not accepting Session updates");
+        }
+        self.session_events
+            .sessions
+            .continuation_boundary(session_id, turn_id)
     }
 }
 
@@ -281,6 +294,18 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/sessions/{session_id}", get(read_session))
         .route("/v1/sessions/{session_id}/prompts", post(admit_prompt))
+        .route(
+            "/v1/sessions/{session_id}/prompts/{prompt_id}/promote",
+            post(promote_prompt),
+        )
+        .route(
+            "/v1/sessions/{session_id}/prompts/{prompt_id}/cancel",
+            post(cancel_prompt),
+        )
+        .route(
+            "/v1/sessions/{session_id}/turns/{turn_id}/interrupt",
+            post(interrupt_turn),
+        )
         .route("/v1/sessions/{session_id}/events", get(session_events))
         .route("/v1/server/stop", post(stop_server))
         .with_state(state);
@@ -501,6 +526,79 @@ async fn admit_prompt(
             "Session does not exist on this server instance",
         ),
         Err(AdmitPromptError::PromptConflict) => prompt_conflict_response(),
+    }
+}
+
+async fn promote_prompt(
+    State(state): State<AppState>,
+    AxumPath((session_id, prompt_id)): AxumPath<(SessionId, crate::protocol::PromptId)>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    prompt_mutation_response(state.sessions.promote(session_id, prompt_id))
+}
+
+async fn cancel_prompt(
+    State(state): State<AppState>,
+    AxumPath((session_id, prompt_id)): AxumPath<(SessionId, crate::protocol::PromptId)>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    prompt_mutation_response(state.sessions.cancel(session_id, prompt_id))
+}
+
+fn prompt_mutation_response(
+    result: std::result::Result<crate::protocol::Prompt, PromptMutationError>,
+) -> Response {
+    match result {
+        Ok(prompt) => Json(prompt).into_response(),
+        Err(PromptMutationError::SessionNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        Err(PromptMutationError::PromptNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::PromptNotFound,
+            "Prompt does not exist in this Session",
+        ),
+        Err(PromptMutationError::PromptNotPending) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::PromptNotPending,
+            "Prompt is no longer pending",
+        ),
+    }
+}
+
+async fn interrupt_turn(
+    State(state): State<AppState>,
+    AxumPath((session_id, turn_id)): AxumPath<(SessionId, TurnId)>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.sessions.interrupt(session_id, turn_id) {
+        Ok(turn) => Json(turn).into_response(),
+        Err(InterruptTurnError::SessionNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        Err(InterruptTurnError::TurnNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::TurnNotFound,
+            "Turn does not exist in this Session",
+        ),
+        Err(InterruptTurnError::TurnNotActive) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::TurnNotActive,
+            "Turn is no longer active",
+        ),
     }
 }
 
