@@ -27,7 +27,7 @@ use futures_util::StreamExt;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -1210,17 +1210,24 @@ fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlot
         render_terminal_too_small(frame, &theme);
         return;
     }
-    if state.session.is_some() {
-        render_session(frame, state, slots, &theme);
+    let composer_cursor = if state.session.is_some() {
+        render_session(frame, state, slots, &theme)
     } else {
-        render_landing(frame, state, slots, &theme);
-    }
+        render_landing(frame, state, slots, &theme)
+    };
     if state.reconnect_overlay_visible {
         render_reconnect_overlay(frame, &theme);
+    } else if state.composer_focused && matches!(state.command_mode, CommandMode::Composer) {
+        frame.set_cursor_position(composer_cursor);
     }
 }
 
-fn render_landing(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlots, theme: &Theme) {
+fn render_landing(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    slots: &RenderSlots,
+    theme: &Theme,
+) -> Position {
     let detail = ResponsiveDetail::for_width(frame.area().width);
     let show_brand = frame.area().height >= LANDING_BRAND_MINIMUM_HEIGHT;
     let footer_detail = detail.secondary_only_when(show_brand);
@@ -1249,10 +1256,13 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlots, 
             .areas(frame.area());
     let content = horizontally_inset(main, horizontal_padding(frame.area().width));
     let key = ComposerKey::Landing;
+    let composer_text = state.composers.text(key);
+    let composer_cursor = state.composers.cursor(key);
     let composer_height = composer_block_height(
         frame.area().height,
         72_u16.min(content.width),
-        state.composers.text(key),
+        composer_text,
+        composer_cursor,
     );
     let error_height = u16::from(state.submission_error.is_some());
     let show_question = state.submission_error.is_none()
@@ -1291,11 +1301,11 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlots, 
         );
         row = row.saturating_add(1);
     }
-    render_composer(
+    let cursor_position = render_composer(
         frame,
         Rect::new(panel.x, row, panel.width, composer_height),
-        state.composers.text(key),
-        state.composers.cursor(key),
+        composer_text,
+        composer_cursor,
         state.composer_border_style(theme),
         detail,
         theme,
@@ -1307,9 +1317,15 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlots, 
         footer,
         theme,
     );
+    cursor_position
 }
 
-fn render_session(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlots, theme: &Theme) {
+fn render_session(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    slots: &RenderSlots,
+    theme: &Theme,
+) -> Position {
     let snapshot = state
         .session
         .as_ref()
@@ -1320,11 +1336,14 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlots, 
     let show_header = frame.area().height >= SESSION_HEADER_MINIMUM_HEIGHT;
     let session_id = snapshot.session.id;
     let key = ComposerKey::Session(session_id);
+    let composer_text = state.composers.text(key);
+    let composer_cursor = state.composers.cursor(key);
     let content_width = frame.area().width.saturating_sub(padding.saturating_mul(2));
     let desired_composer_height = composer_block_height(
         frame.area().height,
         content_width,
-        state.composers.text(key),
+        composer_text,
+        composer_cursor,
     );
     let composer_top = slots.session_composer_top(&SessionComposerTopSlotContext { session_id });
     let status = match snapshot.session.status {
@@ -1554,16 +1573,17 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlots, 
         );
     }
     render_slot(frame, composer_top_area, composer_top, theme);
-    render_composer(
+    let cursor_position = render_composer(
         frame,
         composer_area,
-        state.composers.text(key),
-        state.composers.cursor(key),
+        composer_text,
+        composer_cursor,
         state.composer_border_style(theme),
         detail,
         theme,
     );
     render_slot(frame, footer_area, footer, theme);
+    cursor_position
 }
 
 fn render_session_header(
@@ -1653,7 +1673,7 @@ fn render_composer(
     style: Style,
     detail: ResponsiveDetail,
     theme: &Theme,
-) {
+) -> Position {
     let submit = binding_label(&CommandId::SubmitSteer);
     let queue = binding_label(&CommandId::SubmitQueue);
     let newline = binding_label(&CommandId::InsertNewline);
@@ -1668,7 +1688,7 @@ fn render_composer(
         .border_style(style);
     let content_width = area.width.saturating_sub(2).max(1);
     let content_height = area.height.saturating_sub(2).max(1);
-    let cursor_row = visual_cursor_row(text, cursor, content_width);
+    let (cursor_row, cursor_column) = visual_cursor_position(text, cursor, content_width);
     let scroll = cursor_row.saturating_sub(content_height.saturating_sub(1));
     let paragraph = if text.is_empty() {
         Paragraph::new(Span::styled(
@@ -1676,9 +1696,15 @@ fn render_composer(
             theme.form_field.placeholder,
         ))
     } else {
-        Paragraph::new(text.to_owned()).style(theme.form_field.text)
+        Paragraph::new(wrapped_composer_lines(text, content_width)).style(theme.form_field.text)
     };
     frame.render_widget(paragraph.block(block).scroll((scroll, 0)), area);
+    Position::new(
+        area.x.saturating_add(1).saturating_add(cursor_column),
+        area.y
+            .saturating_add(1)
+            .saturating_add(cursor_row.saturating_sub(scroll)),
+    )
 }
 
 fn render_pending_prompts(
@@ -1774,39 +1800,73 @@ fn render_reconnect_overlay(frame: &mut Frame<'_>, theme: &Theme) {
     );
 }
 
-fn composer_block_height(terminal_height: u16, width: u16, text: &str) -> u16 {
+fn composer_block_height(terminal_height: u16, width: u16, text: &str, cursor: usize) -> u16 {
     let content_width = width.saturating_sub(2).max(1);
-    let desired = visual_row_count(text, content_width).max(1);
+    let cursor_rows = visual_cursor_position(text, cursor, content_width)
+        .0
+        .saturating_add(1);
+    let desired = visual_row_count(text, content_width)
+        .max(cursor_rows)
+        .max(1);
     let cap = (terminal_height / 3).max(1);
     desired.min(cap).saturating_add(2)
 }
 
 fn visual_row_count(text: &str, width: u16) -> u16 {
-    text.split('\n')
-        .map(|line| wrapped_line_rows(line, width))
-        .fold(0_u16, u16::saturating_add)
+    visual_text_end(text, width).0.saturating_add(1)
 }
 
-fn wrapped_line_rows(line: &str, width: u16) -> u16 {
-    let cells = line.chars().fold(0_u16, |total, character| {
-        total.saturating_add(UnicodeWidthChar::width(character).unwrap_or(0) as u16)
-    });
-    cells.max(1).saturating_add(width - 1) / width
+fn visual_cursor_position(text: &str, cursor: usize, width: u16) -> (u16, u16) {
+    let width = width.max(1);
+    let (row, column) = visual_text_end(&text[..cursor], width);
+    if column >= width {
+        (row.saturating_add(1), 0)
+    } else {
+        (row, column)
+    }
 }
 
-fn visual_cursor_row(text: &str, cursor: usize, width: u16) -> u16 {
-    let prefix = &text[..cursor];
-    let mut lines = prefix.split('\n');
-    let Some(last) = lines.next_back() else {
-        return 0;
-    };
-    let previous_rows = lines
-        .map(|line| wrapped_line_rows(line, width))
-        .fold(0_u16, u16::saturating_add);
-    let last_cells = last.chars().fold(0_u16, |total, character| {
-        total.saturating_add(UnicodeWidthChar::width(character).unwrap_or(0) as u16)
-    });
-    previous_rows.saturating_add(last_cells / width)
+fn visual_text_end(text: &str, width: u16) -> (u16, u16) {
+    let width = width.max(1);
+    let mut row = 0_u16;
+    let mut column = 0_u16;
+    for character in text.chars() {
+        if character == '\n' {
+            row = row.saturating_add(1);
+            column = 0;
+            continue;
+        }
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0) as u16;
+        if column > 0 && column.saturating_add(character_width) > width {
+            row = row.saturating_add(1);
+            column = 0;
+        }
+        column = column.saturating_add(character_width);
+    }
+    (row, column)
+}
+
+fn wrapped_composer_lines(text: &str, width: u16) -> Text<'static> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0_u16;
+    for character in text.chars() {
+        if character == '\n' {
+            lines.push(Line::from(std::mem::take(&mut line)));
+            line_width = 0;
+            continue;
+        }
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0) as u16;
+        if line_width > 0 && line_width.saturating_add(character_width) > width {
+            lines.push(Line::from(std::mem::take(&mut line)));
+            line_width = 0;
+        }
+        line.push(character);
+        line_width = line_width.saturating_add(character_width);
+    }
+    lines.push(Line::from(line));
+    Text::from(lines)
 }
 
 struct TranscriptProjection {

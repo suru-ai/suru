@@ -22,6 +22,7 @@ use ratatui::{
     Frame, Terminal,
     backend::TestBackend,
     buffer::{Buffer, Cell},
+    layout::Position,
     style::{Color, Modifier},
 };
 use std::time::Duration;
@@ -64,6 +65,17 @@ fn rendered_application_buffer(application: &Application, width: u16, height: u1
         .draw(|frame| application.render(frame))
         .expect("render headless TUI application");
     terminal.backend().buffer().clone()
+}
+
+fn rendered_application_cursor_at(application: &Application, width: u16, height: u16) -> Position {
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("create test terminal");
+    terminal
+        .draw(|frame| application.render(frame))
+        .expect("render headless TUI application");
+    terminal
+        .get_cursor_position()
+        .expect("read rendered cursor position")
 }
 
 fn buffer_rows(buffer: &Buffer) -> Vec<String> {
@@ -646,6 +658,83 @@ fn connected_view_centers_the_landing_composer_and_shows_server_identity() {
     assert!(screen.contains("Connected"));
     assert!(screen.contains("pid 42424"));
     assert!(screen.contains("c2f03bd2"));
+}
+
+#[test]
+fn composer_cursor_tracks_empty_unicode_and_multiline_input() {
+    let mut application = Application::default();
+    let empty = rendered_application_buffer(&application, 80, 15);
+    let placeholder = text_position(&empty, "Type a Prompt and press Enter");
+    assert_eq!(
+        rendered_application_cursor_at(&application, 80, 15),
+        Position::new(placeholder.0, placeholder.1)
+    );
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "a🙂β\nsecond".to_owned(),
+        )))
+        .expect("type multiline Unicode Prompt");
+    let multiline = rendered_application_buffer(&application, 80, 15);
+    let second = text_position(&multiline, "second");
+    assert_eq!(
+        rendered_application_cursor_at(&application, 80, 15),
+        Position::new(second.0 + 6, second.1)
+    );
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::MoveCursorLeft))
+        .expect("move cursor within the second line");
+    assert_eq!(
+        rendered_application_cursor_at(&application, 80, 15),
+        Position::new(second.0 + 5, second.1)
+    );
+
+    for _ in 0..7 {
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::MoveCursorLeft))
+            .expect("move cursor onto the Unicode first line");
+    }
+    let first = text_position(&multiline, "a🙂");
+    assert_eq!(
+        rendered_application_cursor_at(&application, 80, 15),
+        Position::new(first.0 + 3, first.1),
+        "the emoji occupies two terminal cells"
+    );
+}
+
+#[test]
+fn composer_cursor_wraps_at_the_right_edge_and_remains_visible_when_scrolled() {
+    let mut wrapped = Application::default();
+    wrapped
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "x".repeat(70),
+        )))
+        .expect("fill the composer's content row");
+    let wrapped_buffer = rendered_application_buffer(&wrapped, 80, 30);
+    let first = text_position(&wrapped_buffer, "xxxx");
+    assert_eq!(prompt_block_height(&buffer_rows(&wrapped_buffer)), 4);
+    assert_eq!(
+        rendered_application_cursor_at(&wrapped, 80, 30),
+        Position::new(first.0, first.1 + 1),
+        "an insertion point after a full row belongs at the start of the next row"
+    );
+
+    let mut scrolled = Application::default();
+    scrolled
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            (1..=20)
+                .map(|line| format!("line{line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )))
+        .expect("type a Prompt taller than the composer cap");
+    let scrolled_buffer = rendered_application_buffer(&scrolled, 80, 30);
+    let final_line = text_position(&scrolled_buffer, "line20");
+    assert_eq!(
+        rendered_application_cursor_at(&scrolled, 80, 30),
+        Position::new(final_line.0 + 6, final_line.1)
+    );
 }
 
 #[test]
