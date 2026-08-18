@@ -220,9 +220,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
 
     let mut observer = Application::new(workspace.path());
     observer
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
-            created.clone(),
-        )))
+        .handle_event(ApplicationEvent::SessionAttached(created.clone()))
         .expect("attach an independent observer to the Session");
     observer
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -269,9 +267,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         )))
         .expect("edit separate landing draft");
     attached_with_landing_draft
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
-            created.clone(),
-        )))
+        .handle_event(ApplicationEvent::SessionAttached(created.clone()))
         .expect("attach while retaining the landing draft");
     attached_with_landing_draft
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -294,6 +290,20 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         .expect("confirm replacement for attached client");
     let recovered_collision = rendered_application_rows(&attached_with_landing_draft).join("\n");
     assert!(recovered_collision.contains("Recovered Session draft"));
+    let previous_draft = command_for_terminal_event(InputEvent::Key(KeyEvent::new(
+        KeyCode::Up,
+        KeyModifiers::NONE,
+    )))
+    .expect("map Up to local draft history");
+    assert_eq!(previous_draft, CommandId::HistoryPrevious);
+    attached_with_landing_draft
+        .handle_event(ApplicationEvent::Command(previous_draft))
+        .expect("recall the displaced landing draft");
+    assert!(
+        rendered_application_rows(&attached_with_landing_draft)
+            .join("\n")
+            .contains("Saved landing draft")
+    );
 
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Recovering(
@@ -308,7 +318,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
             ready_health(replacement_instance, 84_848),
         )))
         .expect("handle replacement connection");
-    application
+    let replacement_transition = application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
             CounterSnapshot {
                 instance_id: replacement_instance,
@@ -317,6 +327,10 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
             },
         )))
         .expect("confirm replacement server snapshot");
+    assert_eq!(replacement_transition, ApplicationTransition::SessionEnded);
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(created)))
+        .expect("ignore a queued event from the ended Session");
     let after_replacement = rendered_application_rows(&application).join("\n");
     assert!(after_replacement.contains("What would you like to work on?"));
     assert!(after_replacement.contains("Keep this unsent draft"));

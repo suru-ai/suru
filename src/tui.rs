@@ -73,6 +73,7 @@ pub struct TuiState {
     composer_focused: bool,
     submission_error: Option<String>,
     session: Option<SessionProjection>,
+    session_events_blocked: bool,
     pending_submission: Option<PendingSubmission>,
     failed_submissions: HashMap<PromptId, FailedSubmission>,
 }
@@ -117,6 +118,7 @@ impl TuiState {
             composer_focused: true,
             submission_error: None,
             session: None,
+            session_events_blocked: false,
             pending_submission: None,
             failed_submissions: HashMap::new(),
         }
@@ -148,15 +150,14 @@ impl TuiState {
                         .as_ref()
                         .is_some_and(|identity| identity.instance_id != snapshot.instance_id);
                     if replaced_server {
-                        if let Some(session_id) = self
-                            .session
-                            .as_ref()
-                            .map(|session| session.snapshot().session.id)
+                        if let Some(session_id) =
+                            self.session.as_ref().map(SessionProjection::session_id)
                         {
                             self.composers.recover_session_to_landing(session_id);
                             self.session_interactions.remove(&session_id);
                         }
                         self.session = None;
+                        self.session_events_blocked = true;
                         self.submission_error =
                             Some("Session ended because the shared server was replaced".to_owned());
                     }
@@ -184,6 +185,9 @@ impl TuiState {
     }
 
     fn apply_session(&mut self, event: SessionEvent) -> Result<()> {
+        if self.session_events_blocked {
+            return Ok(());
+        }
         match event {
             SessionEvent::Snapshot(snapshot) => self.hydrate_session(snapshot),
             SessionEvent::Updated(update) => {
@@ -198,6 +202,16 @@ impl TuiState {
         Ok(())
     }
 
+    fn apply_created_session(&mut self, snapshot: SessionSnapshot) -> Result<()> {
+        self.session_events_blocked = false;
+        self.apply_session(SessionEvent::Snapshot(snapshot))
+    }
+
+    fn apply_attached_session(&mut self, snapshot: SessionSnapshot) -> Result<()> {
+        self.session_events_blocked = false;
+        self.apply_session(SessionEvent::Snapshot(snapshot))
+    }
+
     fn hydrate_session(&mut self, snapshot: SessionSnapshot) {
         self.session_interactions
             .entry(snapshot.session.id)
@@ -210,7 +224,7 @@ impl TuiState {
         self.session
             .as_ref()
             .map_or(ComposerKey::Landing, |session| {
-                ComposerKey::Session(session.snapshot().session.id)
+                ComposerKey::Session(session.session_id())
             })
     }
 
@@ -335,8 +349,9 @@ pub enum ApplicationEvent {
     SessionSubscriptionEnded,
     PromptAdmissionSucceeded(PromptId),
     PromptAdmissionFailed { prompt_id: PromptId, error: String },
+    SessionAttached(SessionSnapshot),
     SessionCreated(SessionSnapshot),
-    SessionCreationFailed(String),
+    SessionOperationFailed(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -357,6 +372,7 @@ pub enum CommandId {
 pub enum ApplicationTransition {
     Continue,
     Exit,
+    SessionEnded,
     CreateSession(CreateSessionRequest),
     AdmitPrompt {
         session_id: SessionId,
@@ -471,8 +487,13 @@ impl Application {
                 Ok(ApplicationTransition::Exit)
             }
             ApplicationEvent::Managed(event) => {
+                let had_session = self.state.session.is_some();
                 self.state.apply(event);
-                Ok(ApplicationTransition::Continue)
+                if had_session && self.state.session.is_none() {
+                    Ok(ApplicationTransition::SessionEnded)
+                } else {
+                    Ok(ApplicationTransition::Continue)
+                }
             }
             ApplicationEvent::Session(event) => {
                 self.state.apply_session(event)?;
@@ -491,11 +512,15 @@ impl Application {
                 self.state.fail_pending_submission(prompt_id, error);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::SessionCreated(snapshot) => {
-                self.state.apply_session(SessionEvent::Snapshot(snapshot))?;
+            ApplicationEvent::SessionAttached(snapshot) => {
+                self.state.apply_attached_session(snapshot)?;
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::SessionCreationFailed(error) => {
+            ApplicationEvent::SessionCreated(snapshot) => {
+                self.state.apply_created_session(snapshot)?;
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SessionOperationFailed(error) => {
                 self.state.submission_error = Some(error);
                 Ok(ApplicationTransition::Continue)
             }
@@ -510,7 +535,7 @@ impl Application {
         self.state
             .session
             .as_ref()
-            .map(|session| session.snapshot().session.id)
+            .map(SessionProjection::session_id)
     }
 }
 
@@ -912,9 +937,20 @@ async fn run_loop(
                     Some(event) => {
                         let transition = application
                             .handle_event(ApplicationEvent::Managed(event))?;
-                        if transition == ApplicationTransition::Exit {
-                            terminal.draw(|frame| application.render(frame))?;
-                            return Ok(());
+                        match transition {
+                            ApplicationTransition::Continue => {}
+                            ApplicationTransition::SessionEnded => {
+                                session_subscription = None;
+                            }
+                            ApplicationTransition::Exit => {
+                                terminal.draw(|frame| application.render(frame))?;
+                                return Ok(());
+                            }
+                            ApplicationTransition::CreateSession(_)
+                            | ApplicationTransition::AdmitPrompt { .. }
+                            | ApplicationTransition::SubscribeSession(_) => {
+                                unreachable!("managed events do not issue Session commands");
+                            }
                         }
                         if application.session_id().is_none() {
                             session_subscription = None;
@@ -964,9 +1000,7 @@ async fn run_loop(
                 match submission {
                     SubmissionResult::SessionCreated(created) => {
                         let session_id = created.session.id;
-                        application.handle_event(ApplicationEvent::Session(
-                            SessionEvent::Snapshot(created),
-                        ))?;
+                        application.handle_event(ApplicationEvent::SessionCreated(created))?;
                         if let Some((_, task)) = session_subscription_task.take() {
                             task.abort();
                         }
@@ -1000,6 +1034,9 @@ async fn run_loop(
                                 .handle_event(ApplicationEvent::Command(command))?;
                             match transition {
                                 ApplicationTransition::Continue => {}
+                                ApplicationTransition::SessionEnded => {
+                                    session_subscription = None;
+                                }
                                 ApplicationTransition::Exit => return Ok(()),
                                 ApplicationTransition::CreateSession(request) => {
                                     let prompt_id = request.prompt.id;

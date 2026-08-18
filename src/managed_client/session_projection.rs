@@ -3,7 +3,7 @@
 use anyhow::Result;
 
 use crate::{
-    protocol::{SessionSnapshot, SessionUpdate},
+    protocol::{SessionId, SessionSnapshot, SessionUpdate},
     session_projection::apply_update,
 };
 
@@ -19,6 +19,10 @@ impl SessionProjection {
 
     pub(crate) fn snapshot(&self) -> &SessionSnapshot {
         &self.snapshot
+    }
+
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.snapshot.session.id
     }
 
     pub(crate) fn apply(&mut self, update: SessionUpdate) -> Result<()> {
