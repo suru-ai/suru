@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SESSION_SNAPSHOT_EVENT: &str = "session_snapshot";
 pub const SESSION_UPDATED_EVENT: &str = "session_updated";
@@ -162,9 +162,50 @@ pub enum MessageStatus {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ActivityKind {
-    Status,
-    Error,
+pub enum ActivityStatus {
+    Active,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Activity {
+    Status {
+        id: ActivityId,
+        turn_id: TurnId,
+        text: String,
+    },
+    Error {
+        id: ActivityId,
+        turn_id: TurnId,
+        text: String,
+    },
+    Command {
+        id: ActivityId,
+        turn_id: TurnId,
+        status: ActivityStatus,
+        command: String,
+        cwd: Option<PathBuf>,
+        output: String,
+        exit_status: Option<i32>,
+    },
+}
+
+impl Activity {
+    pub const fn id(&self) -> ActivityId {
+        match self {
+            Self::Status { id, .. } | Self::Error { id, .. } | Self::Command { id, .. } => *id,
+        }
+    }
+
+    pub const fn turn_id(&self) -> TurnId {
+        match self {
+            Self::Status { turn_id, .. }
+            | Self::Error { turn_id, .. }
+            | Self::Command { turn_id, .. } => *turn_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -212,15 +253,6 @@ pub struct Message {
     pub role: MessageRole,
     pub status: MessageStatus,
     pub content: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Activity {
-    pub id: ActivityId,
-    pub turn_id: TurnId,
-    pub kind: ActivityKind,
-    pub text: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -282,6 +314,15 @@ pub enum SessionChange {
     },
     ActivityAdded {
         activity: Activity,
+    },
+    CommandOutputAppended {
+        activity_id: ActivityId,
+        content: String,
+    },
+    CommandStatusChanged {
+        activity_id: ActivityId,
+        status: ActivityStatus,
+        exit_status: Option<i32>,
     },
     TurnStatusChanged {
         turn_id: TurnId,

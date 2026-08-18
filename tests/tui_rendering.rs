@@ -4,7 +4,7 @@ use chidori::{
         SessionSubscription,
     },
     protocol::{
-        Activity, ActivityId, ActivityKind, AgentId, AgentIdentity, CreateSessionRequest, Health,
+        Activity, ActivityId, ActivityStatus, AgentId, AgentIdentity, CreateSessionRequest, Health,
         InitialPrompt, LifecycleState, Message, MessageId, MessageRole, MessageStatus, ModelId,
         Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, ServerIdentity,
         ServerShutdown, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
@@ -489,10 +489,11 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
         .emit(
             session_id,
             AgentOutput::Activity {
-                activity_id: ActivityId::new(),
-                turn_id,
-                kind: ActivityKind::Status,
-                text: "Reading files".to_owned(),
+                activity: Activity::Status {
+                    id: ActivityId::new(),
+                    turn_id,
+                    text: "Reading files".to_owned(),
+                },
             },
         )
         .expect("publish status Activity");
@@ -820,8 +821,12 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
         model: ModelId::new("gpt-5"),
     });
     active_snapshot.turns[0].status = TurnStatus::Active;
-    active_snapshot.activities[0].kind = ActivityKind::Status;
-    active_snapshot.activities[0].text = "Working".to_owned();
+    let activity_id = active_snapshot.activities[0].id();
+    active_snapshot.activities[0] = Activity::Status {
+        id: activity_id,
+        turn_id: active_snapshot.turns[0].id,
+        text: "Working".to_owned(),
+    };
 
     let mut application = connected_application(workspace.path());
     application
@@ -900,6 +905,146 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
     assert!(too_small.contains("Terminal too small"));
     assert!(!too_small.contains("Keep the transcript visible"));
     assert!(!too_small.contains("Keep the draft visible"));
+}
+
+#[test]
+fn command_activities_render_active_successful_and_failed_states_at_responsive_widths() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let cases = [
+        (ActivityStatus::Active, None, "$ cargo test", Color::Cyan),
+        (
+            ActivityStatus::Completed,
+            Some(0),
+            "✓ cargo test",
+            Color::Green,
+        ),
+        (
+            ActivityStatus::Failed,
+            Some(17),
+            "× cargo test (exit 17)",
+            Color::Red,
+        ),
+    ];
+
+    for (status, exit_status, heading, color) in cases {
+        let mut snapshot = failed_session_snapshot(
+            SessionId::new(),
+            PromptId::new(),
+            "Run the test suite",
+            workspace.path(),
+        );
+        let activity_id = snapshot.activities[0].id();
+        snapshot.activities[0] = Activity::Command {
+            id: activity_id,
+            turn_id: snapshot.turns[0].id,
+            status,
+            command: "cargo test".to_owned(),
+            cwd: Some("/fixture/work".into()),
+            output: "running tests\ntest result available\n".to_owned(),
+            exit_status,
+        };
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach Session with command Activity");
+
+        let desktop = rendered_application_buffer(&application, 100, 22);
+        let desktop_text = buffer_rows(&desktop).join("\n");
+        for expected in [
+            heading,
+            "in /fixture/work",
+            "running tests",
+            "test result available",
+        ] {
+            assert!(
+                desktop_text.contains(expected),
+                "desktop command Activity omitted {expected:?}:\n{desktop_text}"
+            );
+        }
+        assert_eq!(text_cell(&desktop, heading).fg, color);
+
+        let compact = rendered_application_rows_at(&application, 43, 18).join("\n");
+        for expected in [
+            heading,
+            "in /fixture/work",
+            "running tests",
+            "test result available",
+        ] {
+            assert!(
+                compact.contains(expected),
+                "compact command Activity omitted {expected:?}:\n{compact}"
+            );
+        }
+    }
+}
+
+#[test]
+fn streaming_command_updates_reuse_one_projected_transcript_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let mut snapshot = failed_session_snapshot(
+        session_id,
+        PromptId::new(),
+        "Run the test suite",
+        workspace.path(),
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    let turn_id = snapshot.turns[0].id;
+    let activity_id = snapshot.activities[0].id();
+    snapshot.activities[0] = Activity::Command {
+        id: activity_id,
+        turn_id,
+        status: ActivityStatus::Active,
+        command: "cargo test".to_owned(),
+        cwd: None,
+        output: String::new(),
+        exit_status: None,
+    };
+    let initial_revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach active command Activity");
+
+    for (revision, content) in [
+        (initial_revision.0 + 1, "running "),
+        (initial_revision.0 + 2, "tests\n"),
+    ] {
+        application
+            .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+                SessionUpdate {
+                    session_id,
+                    revision: SessionRevision(revision),
+                    changes: vec![SessionChange::CommandOutputAppended {
+                        activity_id,
+                        content: content.to_owned(),
+                    }],
+                },
+            )))
+            .expect("project streamed command output");
+    }
+    let streamed = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert_eq!(streamed.matches("$ cargo test").count(), 1);
+    assert_eq!(streamed.matches("running tests").count(), 1);
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(initial_revision.0 + 3),
+                changes: vec![SessionChange::CommandStatusChanged {
+                    activity_id,
+                    status: ActivityStatus::Completed,
+                    exit_status: Some(0),
+                }],
+            },
+        )))
+        .expect("project command completion");
+    let completed = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert_eq!(completed.matches("✓ cargo test").count(), 1);
+    assert!(!completed.contains("$ cargo test"));
+    assert_eq!(completed.matches("running tests").count(), 1);
 }
 
 #[test]
@@ -2400,10 +2545,9 @@ impl FailedTurnFixture {
                 status: MessageStatus::Completed,
                 content: text.to_owned(),
             },
-            activity: Activity {
+            activity: Activity::Error {
                 id: ActivityId::new(),
                 turn_id,
-                kind: ActivityKind::Error,
                 text: "No Agent is selected".to_owned(),
             },
         }
@@ -2415,7 +2559,7 @@ impl FailedTurnFixture {
                 message_id: self.message.id,
             },
             TranscriptItem::Activity {
-                activity_id: self.activity.id,
+                activity_id: self.activity.id(),
             },
         ]
     }

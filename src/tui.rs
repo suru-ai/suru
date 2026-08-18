@@ -40,7 +40,7 @@ use crate::{
         SessionProjection, SessionStreamError, SessionSubscription,
     },
     protocol::{
-        ActivityKind, AdmitPromptRequest, AgentIdentity, CreateSessionRequest, InitialPrompt,
+        Activity, AdmitPromptRequest, AgentIdentity, CreateSessionRequest, InitialPrompt,
         MessageId, MessageRole, PromptDelivery, PromptId, PromptStatus, ServerIdentity, SessionId,
         SessionSnapshot, SessionStatus, ShutdownReason, TranscriptItem, TurnId, TurnStatus,
         Workspace,
@@ -2048,21 +2048,76 @@ fn transcript_projection(
                 let Some(activity) = snapshot
                     .activities
                     .iter()
-                    .find(|activity| activity.id == *activity_id)
+                    .find(|activity| activity.id() == *activity_id)
                 else {
                     continue;
                 };
-                let (prefix, style) = match activity.kind {
-                    ActivityKind::Status => ("  ", theme.text.subdued),
-                    ActivityKind::Error => ("  Error: ", theme.feedback.error),
-                };
-                push_prefixed_lines(&mut lines, prefix, &activity.text, style);
+                match activity {
+                    Activity::Status { text, .. } => {
+                        push_prefixed_lines(&mut lines, "  ", text, theme.text.subdued)
+                    }
+                    Activity::Error { text, .. } => {
+                        push_prefixed_lines(&mut lines, "  Error: ", text, theme.feedback.error)
+                    }
+                    Activity::Command {
+                        status,
+                        command,
+                        cwd,
+                        output,
+                        exit_status,
+                        ..
+                    } => push_command_activity(
+                        &mut lines,
+                        *status,
+                        command,
+                        cwd.as_deref(),
+                        output,
+                        *exit_status,
+                        theme,
+                    ),
+                }
             }
         }
     }
     TranscriptProjection {
         lines,
         message_boundaries,
+    }
+}
+
+fn push_command_activity(
+    lines: &mut Vec<Line<'static>>,
+    status: crate::protocol::ActivityStatus,
+    command: &str,
+    cwd: Option<&std::path::Path>,
+    output: &str,
+    exit_status: Option<i32>,
+    theme: &Theme,
+) {
+    use crate::protocol::ActivityStatus;
+
+    let (marker, style) = match status {
+        ActivityStatus::Active => ("$ ", theme.accent.primary),
+        ActivityStatus::Completed => ("✓ ", theme.feedback.success),
+        ActivityStatus::Failed => ("× ", theme.feedback.error),
+    };
+    let command = match (status, exit_status) {
+        (ActivityStatus::Failed, Some(exit_status)) => {
+            format!("{command} (exit {exit_status})")
+        }
+        _ => command.to_owned(),
+    };
+    push_prefixed_lines(lines, &format!("  {marker}"), &command, style);
+    if let Some(cwd) = cwd {
+        push_prefixed_lines(
+            lines,
+            "    in ",
+            cwd.to_string_lossy().as_ref(),
+            theme.text.subdued,
+        );
+    }
+    if !output.is_empty() {
+        push_prefixed_lines(lines, "    ", output, theme.text.subdued);
     }
 }
 

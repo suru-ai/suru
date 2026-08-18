@@ -13,8 +13,8 @@ use anyhow::anyhow;
 use tokio::sync::broadcast;
 
 use crate::protocol::{
-    Activity, ActivityId, ActivityKind, AdmitPromptRequest, AgentIdentity, CreateSessionRequest,
-    Message, MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder,
+    Activity, ActivityId, AdmitPromptRequest, AgentIdentity, CreateSessionRequest, Message,
+    MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder,
     PromptStatus, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
     SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, Turn, TurnId, TurnStatus,
     Workspace,
@@ -451,10 +451,9 @@ impl SessionStore {
         ];
         if let Some(message) = failure_message {
             changes.push(SessionChange::ActivityAdded {
-                activity: Activity {
+                activity: Activity::Error {
                     id: ActivityId::new(),
                     turn_id: turn.id,
-                    kind: ActivityKind::Error,
                     text: message,
                 },
             });
@@ -571,10 +570,9 @@ impl SessionStore {
         let update = record.publish(
             session_id,
             vec![SessionChange::ActivityAdded {
-                activity: Activity {
+                activity: Activity::Error {
                     id: ActivityId::new(),
                     turn_id,
-                    kind: ActivityKind::Error,
                     text: message,
                 },
             }],
@@ -597,10 +595,9 @@ impl SessionStore {
         }
         changes.extend([
             SessionChange::ActivityAdded {
-                activity: Activity {
+                activity: Activity::Error {
                     id: ActivityId::new(),
                     turn_id,
-                    kind: ActivityKind::Error,
                     text: message,
                 },
             },
@@ -1083,7 +1080,14 @@ fn agent_output_turn_id(
             .find(|message| message.id == *message_id && message.role == MessageRole::Agent)
             .map(|message| message.turn_id)
             .ok_or_else(|| anyhow!("Agent output referenced an unknown Agent Message")),
-        SessionChange::ActivityAdded { activity } => Ok(activity.turn_id),
+        SessionChange::ActivityAdded { activity } => Ok(activity.turn_id()),
+        SessionChange::CommandOutputAppended { activity_id, .. }
+        | SessionChange::CommandStatusChanged { activity_id, .. } => snapshot
+            .activities
+            .iter()
+            .find(|activity| activity.id() == *activity_id)
+            .map(Activity::turn_id)
+            .ok_or_else(|| anyhow!("Agent output referenced an unknown command Activity")),
         _ => Err(anyhow!("Session change is not Agent output")),
     }
 }

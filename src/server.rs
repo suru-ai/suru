@@ -28,11 +28,10 @@ use uuid::Uuid;
 use crate::RuntimeConfig;
 use crate::build_identity;
 use crate::protocol::{
-    Activity, ActivityId, ActivityKind, AdmitPromptRequest, CreateSessionRequest, LifecycleState,
-    Message, MessageId, MessageRole, MessageStatus, PROTOCOL_VERSION, RuntimeDescriptor,
-    SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity,
-    ServerShutdown, SessionChange, SessionError, SessionErrorCode, SessionId, SessionUpdate,
-    ShutdownReason, TurnId,
+    Activity, AdmitPromptRequest, CreateSessionRequest, LifecycleState, Message, MessageId,
+    MessageRole, MessageStatus, PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
+    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionChange,
+    SessionError, SessionErrorCode, SessionId, SessionUpdate, ShutdownReason, TurnId,
 };
 use crate::provider::{CodexRuntime, ProviderOrchestrator, ProviderRuntime};
 use crate::runtime::protect_current_user_file;
@@ -57,10 +56,7 @@ pub enum AgentOutput {
         message_id: MessageId,
     },
     Activity {
-        activity_id: ActivityId,
-        turn_id: TurnId,
-        kind: ActivityKind,
-        text: String,
+        activity: Activity,
     },
 }
 
@@ -94,19 +90,7 @@ impl AgentOutputSink {
             AgentOutput::MessageCompleted { message_id } => {
                 SessionChange::MessageCompleted { message_id }
             }
-            AgentOutput::Activity {
-                activity_id,
-                turn_id,
-                kind,
-                text,
-            } => SessionChange::ActivityAdded {
-                activity: Activity {
-                    id: activity_id,
-                    turn_id,
-                    kind,
-                    text,
-                },
-            },
+            AgentOutput::Activity { activity } => SessionChange::ActivityAdded { activity },
         };
         if *self.session_events.lifecycle.borrow() != LifecycleState::Ready {
             anyhow::bail!("server is not accepting Session updates");

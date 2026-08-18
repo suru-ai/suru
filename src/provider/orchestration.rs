@@ -9,12 +9,12 @@ use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    ProviderEvent, ProviderEventStream, ProviderRuntime, ProviderSession, ProviderSessionRequest,
-    ProviderTurnInput,
+    ProviderCommandStatus, ProviderEvent, ProviderEventStream, ProviderRuntime, ProviderSession,
+    ProviderSessionRequest, ProviderTurnInput,
 };
 use crate::protocol::{
-    Message, MessageId, MessageRole, MessageStatus, PromptId, SessionChange, SessionId, TurnId,
-    TurnStatus,
+    Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus, PromptId,
+    SessionChange, SessionId, TurnId, TurnStatus,
 };
 use crate::sessions::{DeliveredTurnStatus, InterruptTurnError, SessionStore};
 
@@ -45,6 +45,7 @@ struct ActiveProviderTurn {
     turn_id: TurnId,
     streaming_message_id: Option<MessageId>,
     interruption_acknowledged: bool,
+    command_activities: HashMap<super::ProviderActivityId, ActivityId>,
 }
 
 enum ProviderInput {
@@ -248,6 +249,7 @@ async fn run_provider_session(
                 turn_id: delivered.turn.id,
                 streaming_message_id: None,
                 interruption_acknowledged: false,
+                command_activities: HashMap::new(),
             });
             continue;
         }
@@ -448,10 +450,94 @@ fn project_provider_event(
                 .publish_agent_output(session_id, SessionChange::MessageCompleted { message_id })
                 .map(|_| false)
         }
-        ProviderEvent::TurnCompleted => {
-            if active.streaming_message_id.is_some() {
+        ProviderEvent::CommandStarted {
+            activity_id,
+            command,
+            cwd,
+        } => {
+            if active.command_activities.contains_key(&activity_id) {
                 Err(anyhow::anyhow!(
-                    "Provider completed the Turn before completing its Agent Message"
+                    "Provider reused an active command Activity identity"
+                ))
+            } else {
+                let command_activity_id = ActivityId::new();
+                sessions
+                    .publish_agent_output(
+                        session_id,
+                        SessionChange::ActivityAdded {
+                            activity: Activity::Command {
+                                id: command_activity_id,
+                                turn_id: active.turn_id,
+                                status: ActivityStatus::Active,
+                                command,
+                                cwd,
+                                output: String::new(),
+                                exit_status: None,
+                            },
+                        },
+                    )
+                    .map(|_| {
+                        active
+                            .command_activities
+                            .insert(activity_id, command_activity_id);
+                        false
+                    })
+            }
+        }
+        ProviderEvent::CommandOutputDelta {
+            activity_id,
+            content,
+        } => {
+            let Some(command_activity_id) = active.command_activities.get(&activity_id).copied()
+            else {
+                return fail_invalid_provider_event(
+                    sessions,
+                    session_id,
+                    active,
+                    "Provider sent command output before starting the Activity",
+                );
+            };
+            sessions
+                .publish_agent_output(
+                    session_id,
+                    SessionChange::CommandOutputAppended {
+                        activity_id: command_activity_id,
+                        content,
+                    },
+                )
+                .map(|_| false)
+        }
+        ProviderEvent::CommandCompleted {
+            activity_id,
+            status,
+            exit_status,
+        } => {
+            let Some(command_activity_id) = active.command_activities.remove(&activity_id) else {
+                return fail_invalid_provider_event(
+                    sessions,
+                    session_id,
+                    active,
+                    "Provider completed a command before starting the Activity",
+                );
+            };
+            sessions
+                .publish_agent_output(
+                    session_id,
+                    SessionChange::CommandStatusChanged {
+                        activity_id: command_activity_id,
+                        status: match status {
+                            ProviderCommandStatus::Completed => ActivityStatus::Completed,
+                            ProviderCommandStatus::Failed => ActivityStatus::Failed,
+                        },
+                        exit_status,
+                    },
+                )
+                .map(|_| false)
+        }
+        ProviderEvent::TurnCompleted => {
+            if active.streaming_message_id.is_some() || !active.command_activities.is_empty() {
+                Err(anyhow::anyhow!(
+                    "Provider completed the Turn before completing its streamed output"
                 ))
             } else {
                 sessions

@@ -21,7 +21,7 @@ use chidori::{
     build_identity,
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
-        Activity, ActivityId, ActivityKind, AdmitPromptRequest, AgentId, AgentIdentity,
+        Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
         CreateSessionRequest, InitialPrompt, LifecycleState, Message, MessageId, MessageRole,
         MessageStatus, ModelId, PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId, PromptOrder,
         PromptStatus, ProviderId, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
@@ -29,7 +29,7 @@ use chidori::{
         SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionUpdate,
         TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
-    provider::ProviderEvent,
+    provider::{ProviderActivityId, ProviderCommandStatus, ProviderEvent},
     server::{self, AgentOutput, ServerConfig},
 };
 use eventsource_stream::Eventsource;
@@ -215,6 +215,24 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
 
     turn_request.succeed();
     for event in [
+        ProviderEvent::CommandStarted {
+            activity_id: ProviderActivityId::new("fixture-command"),
+            command: "cargo test --test session_integration".to_owned(),
+            cwd: Some(workspace.path().to_owned()),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("fixture-command"),
+            content: "running 1 test\n".to_owned(),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("fixture-command"),
+            content: "test result: ok\n".to_owned(),
+        },
+        ProviderEvent::CommandCompleted {
+            activity_id: ProviderActivityId::new("fixture-command"),
+            status: ProviderCommandStatus::Completed,
+            exit_status: Some(0),
+        },
         ProviderEvent::AgentMessageStarted,
         ProviderEvent::AgentMessageDelta {
             content: "Hello".to_owned(),
@@ -235,7 +253,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         .read_session(created.session.id)
         .await
         .expect("read completed Session");
-    assert_eq!(completed.revision, SessionRevision(8));
+    assert_eq!(completed.revision, SessionRevision(12));
     assert_eq!(completed.session.agent, Some(identity));
     assert_eq!(completed.session.status, SessionStatus::Idle);
     assert_eq!(completed.prompts[0].status, PromptStatus::Delivered);
@@ -246,6 +264,34 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
     assert_eq!(completed.messages[1].role, MessageRole::Agent);
     assert_eq!(completed.messages[1].status, MessageStatus::Completed);
     assert_eq!(completed.messages[1].content, "Hello from the Provider");
+    assert_eq!(completed.activities.len(), 1);
+    let Activity::Command {
+        id: command_activity_id,
+        status,
+        command,
+        cwd,
+        output,
+        exit_status,
+        ..
+    } = &completed.activities[0]
+    else {
+        panic!("Provider command must project as command Activity");
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(command, "cargo test --test session_integration");
+    assert_eq!(cwd.as_deref(), Some(workspace.path()));
+    assert_eq!(output, "running 1 test\ntest result: ok\n");
+    assert_eq!(*exit_status, Some(0));
+    assert_eq!(
+        completed
+            .transcript
+            .iter()
+            .filter(|item| matches!(item,
+                TranscriptItem::Activity { activity_id } if activity_id == command_activity_id))
+            .count(),
+        1,
+        "streaming command output must not duplicate transcript rows"
+    );
 
     drop(provider_session);
     drop(first_feed);
@@ -445,12 +491,8 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
             .iter()
             .any(|message| message.content == "Reject this steer")
     );
-    assert!(
-        snapshot
-            .activities
-            .iter()
-            .any(|activity| activity.text.contains("controlled steering rejection"))
-    );
+    assert!(snapshot.activities.iter().any(|activity| matches!(activity,
+                Activity::Error { text, .. } if text.contains("controlled steering rejection"))));
 
     provider_session.emit(ProviderEvent::TurnCompleted);
     next_session_update(&mut feed).await;
@@ -516,9 +558,9 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
             if turn.prompt_id == initial_prompt_id && turn.status == TurnStatus::Failed)
     }));
     assert!(startup_failure.changes.iter().any(|change| {
-        matches!(change, SessionChange::ActivityAdded { activity }
-            if activity.kind == ActivityKind::Error
-                && activity.text.contains("deterministic runtime could not start"))
+        matches!(change, SessionChange::ActivityAdded {
+            activity: Activity::Error { text, .. },
+        } if text.contains("deterministic runtime could not start"))
     }));
 
     let execution_prompt_id = PromptId::new();
@@ -567,9 +609,10 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
     let execution_failure = next_session_update(&mut feed).await;
     assert_eq!(execution_failure.revision, SessionRevision(6));
     assert!(execution_failure.changes.iter().any(|change| {
-        matches!(change, SessionChange::ActivityAdded { activity }
-            if activity.turn_id == execution_turn_id
-                && activity.text.contains("deterministic Provider rejected the Turn"))
+        matches!(change, SessionChange::ActivityAdded {
+            activity: Activity::Error { turn_id, text, .. },
+        } if *turn_id == execution_turn_id
+            && text.contains("deterministic Provider rejected the Turn"))
     }));
     assert!(execution_failure.changes.iter().any(|change| {
         matches!(change, SessionChange::TurnStatusChanged {
@@ -695,12 +738,10 @@ async fn authenticated_creation_returns_pending_before_async_provider_failure() 
     assert_eq!(failed.messages[0].role, MessageRole::User);
     assert_eq!(failed.messages[0].content, "Explain this workspace");
     assert_eq!(failed.activities.len(), 1);
-    assert_eq!(failed.activities[0].kind, ActivityKind::Error);
-    assert!(
-        failed.activities[0]
-            .text
-            .contains("Provider startup failed")
-    );
+    assert!(matches!(
+        &failed.activities[0],
+        Activity::Error { text, .. } if text.contains("Provider startup failed")
+    ));
     assert!(
         failed
             .messages
@@ -1452,10 +1493,11 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
             .emit(
                 session_id,
                 AgentOutput::Activity {
-                    activity_id: ActivityId::new(),
-                    turn_id: active_turn_id,
-                    kind: ActivityKind::Status,
-                    text: "Late provider output".to_owned(),
+                    activity: Activity::Status {
+                        id: ActivityId::new(),
+                        turn_id: active_turn_id,
+                        text: "Late provider output".to_owned(),
+                    },
                 },
             )
             .is_err(),
@@ -2547,10 +2589,9 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
                     },
                 },
                 SessionChange::ActivityAdded {
-                    activity: Activity {
+                    activity: Activity::Status {
                         id: ActivityId::new(),
                         turn_id,
-                        kind: ActivityKind::Status,
                         text: "Working".to_owned(),
                     },
                 },
@@ -2718,10 +2759,9 @@ async fn managed_attachment_rehydrates_before_live_deltas_after_same_server_disc
     let initial = failed_session_snapshot(session_id, workspace.path());
     let mut current = initial.clone();
     current.revision = SessionRevision(2);
-    current.activities.push(Activity {
+    current.activities.push(Activity::Status {
         id: ActivityId::new(),
         turn_id: current.turns[0].id,
-        kind: ActivityKind::Status,
         text: "Recovered current state".to_owned(),
     });
     let update = SessionUpdate {
@@ -2815,10 +2855,9 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             status: MessageStatus::Completed,
             content: "Explain this workspace".to_owned(),
         }],
-        activities: vec![Activity {
+        activities: vec![Activity::Error {
             id: activity_id,
             turn_id,
-            kind: ActivityKind::Error,
             text: "No Agent is selected".to_owned(),
         }],
         transcript: vec![

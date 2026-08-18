@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use chidori::protocol::{
-    Activity, ActivityId, ActivityKind, AdmitPromptRequest, AgentId, AgentIdentity,
+    Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
     CreateSessionRequest, InitialPrompt, Message, MessageId, MessageRole, MessageStatus, ModelId,
     Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session,
     SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
@@ -93,10 +93,9 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             status: MessageStatus::Completed,
             content: "Explain this workspace".to_owned(),
         }],
-        activities: vec![Activity {
+        activities: vec![Activity::Error {
             id: ActivityId::from_uuid(fixture_id("0198b27e-345a-700e-ae3b-d971c57fbe87")),
             turn_id: TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d")),
-            kind: ActivityKind::Error,
             text: "No Agent is selected".to_owned(),
         }],
         transcript: vec![
@@ -245,6 +244,95 @@ fn agent_message_streaming_uses_one_stable_provider_neutral_identity() {
     assert_eq!(
         serde_json::from_value::<[SessionUpdate; 3]>(expected)
             .expect("decode Agent Message updates"),
+        updates
+    );
+}
+
+#[test]
+fn command_activity_lifecycle_uses_typed_incremental_updates() {
+    let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));
+    let activity_id = ActivityId::from_uuid(fixture_id("0198b27e-345a-700e-ae3b-d971c57fbe87"));
+    let updates = [
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(8),
+            changes: vec![SessionChange::ActivityAdded {
+                activity: Activity::Command {
+                    id: activity_id,
+                    turn_id,
+                    status: ActivityStatus::Active,
+                    command: "cargo test --test session_protocol".to_owned(),
+                    cwd: Some(PathBuf::from("/work/chidori")),
+                    output: String::new(),
+                    exit_status: None,
+                },
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(9),
+            changes: vec![SessionChange::CommandOutputAppended {
+                activity_id,
+                content: "running 1 test\n".to_owned(),
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(10),
+            changes: vec![SessionChange::CommandStatusChanged {
+                activity_id,
+                status: ActivityStatus::Completed,
+                exit_status: Some(0),
+            }],
+        },
+    ];
+    let expected = json!([
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 8,
+            "changes": [{
+                "type": "activity_added",
+                "activity": {
+                    "id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                    "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+                    "kind": "command",
+                    "status": "active",
+                    "command": "cargo test --test session_protocol",
+                    "cwd": "/work/chidori",
+                    "output": "",
+                    "exit_status": null
+                }
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 9,
+            "changes": [{
+                "type": "command_output_appended",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "content": "running 1 test\n"
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 10,
+            "changes": [{
+                "type": "command_status_changed",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "status": "completed",
+                "exit_status": 0
+            }]
+        }
+    ]);
+
+    assert_eq!(
+        serde_json::to_value(&updates).expect("encode command Activity updates"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<[SessionUpdate; 3]>(expected)
+            .expect("decode command Activity updates"),
         updates
     );
 }

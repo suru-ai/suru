@@ -48,14 +48,47 @@ pub struct ProviderTurnInput {
     pub prompt: String,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ProviderActivityId(String);
+
+impl ProviderActivityId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderCommandStatus {
+    Completed,
+    Failed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderEvent {
     AgentMessageStarted,
-    AgentMessageDelta { content: String },
+    AgentMessageDelta {
+        content: String,
+    },
     AgentMessageCompleted,
+    CommandStarted {
+        activity_id: ProviderActivityId,
+        command: String,
+        cwd: Option<PathBuf>,
+    },
+    CommandOutputDelta {
+        activity_id: ProviderActivityId,
+        content: String,
+    },
+    CommandCompleted {
+        activity_id: ProviderActivityId,
+        status: ProviderCommandStatus,
+        exit_status: Option<i32>,
+    },
     TurnCompleted,
     TurnInterrupted,
-    TurnFailed { message: String },
+    TurnFailed {
+        message: String,
+    },
 }
 
 pub trait ProviderRuntime: Send + Sync + 'static {

@@ -7,9 +7,9 @@ use chidori::{
         ManagedClient, ManagedClientConfig, ManagedEvent, SessionEvent, SessionSubscription,
     },
     protocol::{
-        ActivityKind, AdmitPromptRequest, AgentId, CreateSessionRequest, InitialPrompt,
+        Activity, ActivityStatus, AdmitPromptRequest, AgentId, CreateSessionRequest, InitialPrompt,
         MessageRole, MessageStatus, ModelId, PromptDelivery, PromptId, PromptStatus, ProviderId,
-        SessionId, SessionSnapshot, SessionStatus, TurnId, TurnStatus, Workspace,
+        SessionId, SessionSnapshot, SessionStatus, TranscriptItem, TurnId, TurnStatus, Workspace,
     },
     provider::CodexRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -53,6 +53,11 @@ while IFS= read -r line; do
       printf '%s\n' '{"method":"item/started","params":{"threadId":"other-thread","turnId":"other-turn","item":{"type":"agentMessage","id":"other-message","text":""}}}'
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"other-thread","turnId":"other-turn","itemId":"other-message","delta":"wrong Session content"}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"other-thread","turnId":"other-turn","item":{"type":"agentMessage","id":"other-message","text":"wrong Session content"}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"commandExecution","id":"native-command","command":"cargo test --test codex_integration","cwd":"/fixture/work","status":"inProgress","futureField":true},"futureField":true}}'
+      printf '%s\n' '{"method":"item/commandExecution/outputDelta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"other-command","delta":"wrong command output"}}'
+      printf '%s\n' '{"method":"item/commandExecution/outputDelta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-command","delta":"running ","futureField":true}}'
+      printf '%s\n' '{"method":"item/commandExecution/outputDelta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-command","delta":"tests\n"}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"commandExecution","id":"native-command","command":"cargo test --test codex_integration","cwd":"/fixture/work","status":"completed","aggregatedOutput":"running tests\nall green\n","exitCode":0,"futureField":true},"futureField":true}}'
       printf '%s' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"native-message","text":"","futureField":true},"futureField":true'
       printf '%s\n' '}}'
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"other-message","delta":"wrong item content"}}'
@@ -460,10 +465,10 @@ async fn scripted_codex_rejection_keeps_the_steer_pending_and_reports_the_failur
 
     let rejected = fixture
         .wait_for("steering rejection reaches Session SSE", |snapshot| {
-            snapshot
-                .activities
-                .iter()
-                .any(|activity| activity.text.contains("fixture rejected steering"))
+            snapshot.activities.iter().any(|activity| {
+                matches!(activity,
+                    Activity::Error { text, .. } if text.contains("fixture rejected steering"))
+            })
         })
         .await;
     assert_eq!(
@@ -479,7 +484,7 @@ async fn scripted_codex_rejection_keeps_the_steer_pending_and_reports_the_failur
     assert_eq!(rejected.turns[0].status, TurnStatus::Active);
     assert_eq!(rejected.messages.len(), 1);
     assert_eq!(rejected.activities.len(), 1);
-    assert_eq!(rejected.activities[0].kind, ActivityKind::Error);
+    assert!(matches!(rejected.activities[0], Activity::Error { .. }));
 
     fixture.shutdown().await;
 }
@@ -523,10 +528,8 @@ async fn scripted_codex_transport_loss_during_steering_keeps_the_prompt_pending(
     );
     assert_eq!(failed.messages.len(), 1);
     assert!(
-        failed
-            .activities
-            .iter()
-            .any(|activity| activity.text.contains("status: 29")),
+        failed.activities.iter().any(|activity| matches!(activity,
+                Activity::Error { text, .. } if text.contains("status: 29"))),
         "transport failure is visible: {:?}",
         failed.activities
     );
@@ -664,7 +667,8 @@ async fn assert_terminal_steering_race(
             completed
                 .activities
                 .iter()
-                .any(|activity| activity.text.contains(expected_error))
+                .any(|activity| matches!(activity,
+                    Activity::Error { text, .. } if text.contains(expected_error)))
         ),
         None => assert!(completed.activities.is_empty()),
     }
@@ -768,7 +772,34 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     assert_eq!(agent_message.status, MessageStatus::Completed);
     assert_eq!(agent_message.content, "Hello from Codex");
     assert!(!agent_message.content.contains("fixture diagnostic"));
-    assert!(completed.activities.is_empty());
+    assert_eq!(completed.activities.len(), 1);
+    let Activity::Command {
+        id: command_activity_id,
+        status,
+        command,
+        cwd,
+        output,
+        exit_status,
+        ..
+    } = &completed.activities[0]
+    else {
+        panic!("Codex command must project as command Activity");
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(command, "cargo test --test codex_integration");
+    assert_eq!(cwd.as_deref(), Some(std::path::Path::new("/fixture/work")));
+    assert_eq!(output, "running tests\nall green\n");
+    assert_eq!(*exit_status, Some(0));
+    assert_eq!(
+        completed
+            .transcript
+            .iter()
+            .filter(|item| matches!(item,
+                TranscriptItem::Activity { activity_id } if activity_id == command_activity_id))
+            .count(),
+        1,
+        "Codex command deltas must update one transcript row"
+    );
 
     let requests = fixture.requests();
     let methods = requests
@@ -960,15 +991,23 @@ async fn scripted_codex_interruption_failures_settle_the_command_and_session() {
 
 #[tokio::test]
 async fn scripted_codex_projects_failed_and_interrupted_terminal_outcomes() {
-    let failed = SCRIPTED_CODEX.replace(
-        "\"status\":\"completed\",\"items\":[]",
-        "\"status\":\"failed\",\"error\":{\"message\":\"fixture Turn failed\"},\"items\":[]",
-    );
+    let failed = SCRIPTED_CODEX
+        .replace(
+            "\"cwd\":\"/fixture/work\",\"status\":\"completed\"",
+            "\"cwd\":\"/fixture/work\",\"status\":\"failed\"",
+        )
+        .replace("\"exitCode\":0", "\"exitCode\":17")
+        .replace(
+            "\"status\":\"completed\",\"items\":[]",
+            "\"status\":\"failed\",\"error\":{\"message\":\"fixture Turn failed\"},\"items\":[]",
+        );
     run_terminal_fixture(
         &failed,
         "codex-scripted-failed",
         TurnStatus::Failed,
         Some("fixture Turn failed"),
+        ActivityStatus::Failed,
+        Some(17),
     )
     .await;
 
@@ -981,6 +1020,8 @@ async fn scripted_codex_projects_failed_and_interrupted_terminal_outcomes() {
         "codex-scripted-interrupted",
         TurnStatus::Interrupted,
         None,
+        ActivityStatus::Completed,
+        Some(0),
     )
     .await;
 }
@@ -1001,6 +1042,8 @@ async fn scripted_codex_uses_completed_agent_text_when_no_deltas_arrive() {
         "codex-scripted-completed-text",
         TurnStatus::Completed,
         None,
+        ActivityStatus::Completed,
+        Some(0),
     )
     .await;
 }
@@ -1125,17 +1168,17 @@ async fn assert_provider_failure(
     assert_eq!(failed.prompts[0].status, PromptStatus::Delivered);
     assert_eq!(failed.turns[0].status, TurnStatus::Failed);
     assert_eq!(failed.activities.len(), 1);
-    assert_eq!(failed.activities[0].kind, ActivityKind::Error);
+    let Activity::Error { text, .. } = &failed.activities[0] else {
+        panic!("Provider failure must be an Error Activity");
+    };
     assert!(
-        failed.activities[0].text.contains(expected_error),
-        "expected {expected_error:?} in {:?}",
-        failed.activities[0].text
+        text.contains(expected_error),
+        "expected {expected_error:?} in {text:?}"
     );
-    assert!(!failed.activities[0].text.contains('\n'));
+    assert!(!text.contains('\n'));
     assert!(
-        failed.activities[0].text.chars().count() <= 512,
-        "Provider failure Activity should remain concise: {:?}",
-        failed.activities[0].text
+        text.chars().count() <= 512,
+        "Provider failure Activity should remain concise: {text:?}"
     );
 
     drop(feed);
@@ -1217,11 +1260,12 @@ async fn assert_interruption_failure(script: &str, channel: &str, expected_error
     assert_eq!(failed.session.status, SessionStatus::Idle);
     assert_eq!(failed.turns[0].status, TurnStatus::Failed);
     assert_eq!(failed.activities.len(), 1);
-    assert_eq!(failed.activities[0].kind, ActivityKind::Error);
+    let Activity::Error { text, .. } = &failed.activities[0] else {
+        panic!("interruption failure must project as an error Activity");
+    };
     assert!(
-        failed.activities[0].text.contains(expected_error),
-        "expected {expected_error:?} in {:?}",
-        failed.activities[0].text
+        text.contains(expected_error),
+        "expected {expected_error:?} in {text:?}"
     );
 
     drop(feed);
@@ -1234,6 +1278,8 @@ async fn run_terminal_fixture(
     channel: &str,
     expected_status: TurnStatus,
     expected_error: Option<&str>,
+    expected_command_status: ActivityStatus,
+    expected_exit_status: Option<i32>,
 ) {
     let fixture = ScriptedCodex::new(script);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -1297,6 +1343,17 @@ async fn run_terminal_fixture(
 
     assert_eq!(completed.session.status, SessionStatus::Idle);
     assert_eq!(completed.turns[0].status, expected_status);
+    assert!(
+        completed
+            .activities
+            .iter()
+            .any(|activity| matches!(activity,
+        Activity::Command {
+            status,
+            exit_status,
+            ..
+        } if *status == expected_command_status && *exit_status == expected_exit_status))
+    );
     assert_eq!(
         completed.messages.last().map(|message| message.status),
         Some(MessageStatus::Completed)
@@ -1313,9 +1370,16 @@ async fn run_terminal_fixture(
             completed
                 .activities
                 .iter()
-                .any(|activity| { activity.text.contains(expected_error) })
+                .any(|activity| matches!(activity,
+                    Activity::Error { text, .. } if text.contains(expected_error)))
         ),
-        None => assert!(completed.activities.is_empty()),
+        None => assert!(
+            !completed
+                .activities
+                .iter()
+                .any(|activity| matches!(activity, Activity::Error { .. })),
+            "a successful or interrupted Turn must not add an Error Activity"
+        ),
     }
 
     drop(feed);

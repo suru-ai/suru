@@ -3,8 +3,8 @@
 use anyhow::{Result, bail};
 
 use crate::protocol::{
-    MessageRole, MessageStatus, PromptDelivery, PromptStatus, SessionChange, SessionSnapshot,
-    SessionUpdate, TranscriptItem, TurnStatus,
+    Activity, ActivityStatus, MessageRole, MessageStatus, PromptDelivery, PromptStatus,
+    SessionChange, SessionSnapshot, SessionUpdate, TranscriptItem, TurnStatus,
 };
 
 pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdate) -> Result<()> {
@@ -136,20 +136,80 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 message.status = MessageStatus::Completed;
             }
             SessionChange::ActivityAdded { activity } => {
-                if !next.turns.iter().any(|turn| turn.id == activity.turn_id) {
+                if !next.turns.iter().any(|turn| turn.id == activity.turn_id()) {
                     bail!("Session update referenced an unknown Turn");
                 }
                 if next
                     .activities
                     .iter()
-                    .any(|existing| existing.id == activity.id)
+                    .any(|existing| existing.id() == activity.id())
                 {
                     bail!("Session update reused an Activity identity");
                 }
+                if matches!(
+                    activity,
+                    Activity::Command {
+                        status,
+                        output,
+                        exit_status,
+                        ..
+                    } if *status != ActivityStatus::Active
+                        || !output.is_empty()
+                        || exit_status.is_some()
+                ) {
+                    bail!("Session update added a command Activity outside its initial state");
+                }
                 next.activities.push(activity.clone());
                 next.transcript.push(TranscriptItem::Activity {
-                    activity_id: activity.id,
+                    activity_id: activity.id(),
                 });
+            }
+            SessionChange::CommandOutputAppended {
+                activity_id,
+                content,
+            } => {
+                let Some(activity) = next
+                    .activities
+                    .iter_mut()
+                    .find(|activity| activity.id() == *activity_id)
+                else {
+                    bail!("Session update referenced an unknown Activity");
+                };
+                let Activity::Command { status, output, .. } = activity else {
+                    bail!("Session update appended command output to a different Activity kind");
+                };
+                if *status != ActivityStatus::Active {
+                    bail!("Session update appended output to a terminal command Activity");
+                }
+                output.push_str(content);
+            }
+            SessionChange::CommandStatusChanged {
+                activity_id,
+                status,
+                exit_status,
+            } => {
+                let Some(activity) = next
+                    .activities
+                    .iter_mut()
+                    .find(|activity| activity.id() == *activity_id)
+                else {
+                    bail!("Session update referenced an unknown Activity");
+                };
+                let Activity::Command {
+                    status: current_status,
+                    exit_status: current_exit_status,
+                    ..
+                } = activity
+                else {
+                    bail!("Session update completed a different Activity kind");
+                };
+                if *current_status != ActivityStatus::Active
+                    || !matches!(status, ActivityStatus::Completed | ActivityStatus::Failed)
+                {
+                    bail!("Session update contained an invalid command Activity status transition");
+                }
+                *current_status = *status;
+                *current_exit_status = *exit_status;
             }
             SessionChange::TurnStatusChanged { turn_id, status } => {
                 let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {

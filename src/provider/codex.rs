@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     ffi::{OsStr, OsString},
+    path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicI64, Ordering},
@@ -20,8 +21,9 @@ use tokio::{
 };
 
 use super::{
-    ProviderError, ProviderEvent, ProviderEventStream, ProviderFuture, ProviderRuntime,
-    ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderTurnInput,
+    ProviderActivityId, ProviderCommandStatus, ProviderError, ProviderEvent, ProviderEventStream,
+    ProviderFuture, ProviderRuntime, ProviderSession, ProviderSessionConnection,
+    ProviderSessionRequest, ProviderTurnInput,
 };
 use crate::protocol::{AgentId, AgentIdentity, ModelId, ProviderId};
 
@@ -318,6 +320,7 @@ async fn start_codex_session(
         thread_id: started.thread.id.clone(),
         active_turn_id: None,
         active_agent_message: None,
+        active_commands: HashMap::new(),
     }));
     let session = Arc::new(CodexSession {
         thread_id: started.thread.id,
@@ -399,6 +402,7 @@ impl ProviderSession for CodexSession {
             }
             correlation.active_turn_id = Some(started.turn.id);
             correlation.active_agent_message = None;
+            correlation.active_commands.clear();
             Ok(())
         })
     }
@@ -486,11 +490,16 @@ struct NativeCorrelation {
     thread_id: String,
     active_turn_id: Option<String>,
     active_agent_message: Option<ActiveNativeAgentMessage>,
+    active_commands: HashMap<String, ActiveNativeCommand>,
 }
 
 struct ActiveNativeAgentMessage {
     item_id: String,
     streamed_text: String,
+}
+
+struct ActiveNativeCommand {
+    streamed_output: String,
 }
 
 enum NativeNotification {
@@ -510,6 +519,28 @@ enum NativeNotification {
         turn_id: String,
         item_id: String,
         text: String,
+    },
+    CommandStarted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        command: String,
+        cwd: Option<PathBuf>,
+        status: NativeCommandStatus,
+    },
+    CommandOutputDelta {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        delta: String,
+    },
+    CommandCompleted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        aggregated_output: Option<String>,
+        exit_status: Option<i32>,
+        status: NativeCommandStatus,
     },
     TurnCompleted {
         thread_id: String,
@@ -540,6 +571,17 @@ enum NativeItem {
         #[serde(default)]
         text: String,
     },
+    CommandExecution {
+        id: String,
+        command: String,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+        status: NativeCommandStatus,
+        #[serde(default, rename = "aggregatedOutput")]
+        aggregated_output: Option<String>,
+        #[serde(default, rename = "exitCode")]
+        exit_code: Option<i32>,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -551,6 +593,15 @@ struct AgentMessageDeltaParams {
     turn_id: String,
     item_id: String,
     delta: String,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum NativeCommandStatus {
+    InProgress,
+    Completed,
+    Failed,
+    Declined,
 }
 
 #[derive(Deserialize)]
@@ -690,6 +741,109 @@ fn project_native_notification(
             correlation.active_agent_message = None;
             Ok(projected)
         }
+        NativeNotification::CommandStarted {
+            thread_id,
+            turn_id,
+            item_id,
+            command,
+            cwd,
+            status,
+        } => {
+            if !is_active_native_turn(correlation, &thread_id, &turn_id) {
+                return Ok(Vec::new());
+            }
+            if !matches!(status, NativeCommandStatus::InProgress) {
+                return Err(codex_error(
+                    "Codex started a command outside its active state",
+                ));
+            }
+            if correlation.active_commands.contains_key(&item_id) {
+                return Err(codex_error("Codex reused an active command item identity"));
+            }
+            correlation.active_commands.insert(
+                item_id.clone(),
+                ActiveNativeCommand {
+                    streamed_output: String::new(),
+                },
+            );
+            Ok(vec![ProviderEvent::CommandStarted {
+                activity_id: ProviderActivityId::new(item_id),
+                command,
+                cwd,
+            }])
+        }
+        NativeNotification::CommandOutputDelta {
+            thread_id,
+            turn_id,
+            item_id,
+            delta,
+        } => {
+            if !is_active_native_turn(correlation, &thread_id, &turn_id) {
+                return Ok(Vec::new());
+            }
+            let Some(command) = correlation.active_commands.get_mut(&item_id) else {
+                return Ok(Vec::new());
+            };
+            command.streamed_output.push_str(&delta);
+            Ok(vec![ProviderEvent::CommandOutputDelta {
+                activity_id: ProviderActivityId::new(item_id),
+                content: delta,
+            }])
+        }
+        NativeNotification::CommandCompleted {
+            thread_id,
+            turn_id,
+            item_id,
+            aggregated_output,
+            exit_status,
+            status,
+        } => {
+            if !is_active_native_turn(correlation, &thread_id, &turn_id) {
+                return Ok(Vec::new());
+            }
+            let Some(command) = correlation.active_commands.get(&item_id) else {
+                return Err(codex_error(
+                    "Codex completed a command before starting the Activity",
+                ));
+            };
+            let remaining = match aggregated_output {
+                Some(output) => output
+                    .strip_prefix(&command.streamed_output)
+                    .ok_or_else(|| {
+                        codex_error(
+                            "Codex completed a command with output that did not match its stream",
+                        )
+                    })?
+                    .to_owned(),
+                None => String::new(),
+            };
+            let status = match status {
+                NativeCommandStatus::Completed => ProviderCommandStatus::Completed,
+                NativeCommandStatus::Failed | NativeCommandStatus::Declined => {
+                    ProviderCommandStatus::Failed
+                }
+                NativeCommandStatus::InProgress => {
+                    return Err(codex_error(
+                        "Codex completed a command while it was still active",
+                    ));
+                }
+            };
+            correlation.active_commands.remove(&item_id);
+            let activity_id = ProviderActivityId::new(item_id);
+            let mut projected = Vec::with_capacity(if remaining.is_empty() { 1 } else { 2 });
+            if !remaining.is_empty() {
+                projected.push(ProviderEvent::CommandOutputDelta {
+                    activity_id: activity_id.clone(),
+                    content: remaining,
+                });
+            }
+            projected.push(ProviderEvent::CommandCompleted {
+                activity_id,
+                status,
+                exit_status,
+            });
+            Ok(projected)
+        }
         NativeNotification::TurnCompleted {
             thread_id,
             turn_id,
@@ -700,6 +854,7 @@ fn project_native_notification(
             }
             correlation.active_turn_id = None;
             correlation.active_agent_message = None;
+            correlation.active_commands.clear();
             Ok(vec![match outcome {
                 NativeTurnOutcome::Completed => ProviderEvent::TurnCompleted,
                 NativeTurnOutcome::Interrupted => ProviderEvent::TurnInterrupted,
@@ -971,12 +1126,35 @@ fn decode_notification(
                         item_id: id,
                     }))
                 }
+                NativeItem::CommandExecution {
+                    id,
+                    command,
+                    cwd,
+                    status,
+                    ..
+                } => Ok(Some(NativeNotification::CommandStarted {
+                    thread_id: params.thread_id,
+                    turn_id: params.turn_id,
+                    item_id: id,
+                    command,
+                    cwd,
+                    status,
+                })),
                 NativeItem::Unknown => Ok(None),
             }
         }
         "item/agentMessage/delta" => {
             let params: AgentMessageDeltaParams = decode_notification_params(method, params)?;
             Ok(Some(NativeNotification::AgentMessageDelta {
+                thread_id: params.thread_id,
+                turn_id: params.turn_id,
+                item_id: params.item_id,
+                delta: params.delta,
+            }))
+        }
+        "item/commandExecution/outputDelta" => {
+            let params: AgentMessageDeltaParams = decode_notification_params(method, params)?;
+            Ok(Some(NativeNotification::CommandOutputDelta {
                 thread_id: params.thread_id,
                 turn_id: params.turn_id,
                 item_id: params.item_id,
@@ -994,6 +1172,20 @@ fn decode_notification(
                         text,
                     }))
                 }
+                NativeItem::CommandExecution {
+                    id,
+                    aggregated_output,
+                    exit_code,
+                    status,
+                    ..
+                } => Ok(Some(NativeNotification::CommandCompleted {
+                    thread_id: params.thread_id,
+                    turn_id: params.turn_id,
+                    item_id: id,
+                    aggregated_output,
+                    exit_status: exit_code,
+                    status,
+                })),
                 NativeItem::Unknown => Ok(None),
             }
         }
