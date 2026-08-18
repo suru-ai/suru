@@ -2,8 +2,12 @@ use std::{convert::Infallible, sync::Arc};
 
 use axum::{
     Json, Router,
+    body::{Body, Bytes},
     extract::{Path as AxumPath, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     response::{IntoResponse, Response, sse::Event, sse::Sse},
     routing::get,
 };
@@ -806,7 +810,52 @@ async fn managed_session_stream_rejects_a_non_monotonic_revision() {
         .await
         .expect("invalid Session update arrives")
         .expect_err("duplicate revision must be rejected");
-    assert!(error.contains("revision is not monotonic"));
+    assert!(error.to_string().contains("revision is not monotonic"));
+    assert!(!error.is_recoverable());
+
+    drop(subscription);
+    drop(client);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn managed_session_stream_classifies_body_failures_as_recoverable() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let session_id = SessionId::new();
+    let snapshot = failed_session_snapshot(session_id, workspace.path());
+    let fixture = MalformedSessionStreamFixture::spawn_transport_failure(
+        state_dir.path(),
+        "broken-session-transport-test",
+        snapshot.clone(),
+    )
+    .await;
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "broken-session-transport-test")
+            .expect("configure managed client"),
+    )
+    .await
+    .expect("connect managed client to fixture server");
+    receive_managed_client_initial_state(&mut client).await;
+    let mut subscription = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to fixture Session");
+
+    assert_eq!(
+        subscription
+            .next()
+            .await
+            .expect("Session snapshot arrives")
+            .expect("Session snapshot is valid"),
+        SessionEvent::Snapshot(snapshot)
+    );
+    let error = subscription
+        .next()
+        .await
+        .expect("transport failure arrives")
+        .expect_err("broken response body must fail");
+    assert!(error.is_recoverable());
 
     drop(subscription);
     drop(client);
@@ -855,6 +904,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
 struct MalformedSessionStreamState {
     descriptor: RuntimeDescriptor,
     snapshot: SessionSnapshot,
+    transport_failure: bool,
 }
 
 struct MalformedSessionStreamFixture {
@@ -863,6 +913,23 @@ struct MalformedSessionStreamFixture {
 
 impl MalformedSessionStreamFixture {
     async fn spawn(state_dir: &std::path::Path, channel: &str, snapshot: SessionSnapshot) -> Self {
+        Self::spawn_with_transport_failure(state_dir, channel, snapshot, false).await
+    }
+
+    async fn spawn_transport_failure(
+        state_dir: &std::path::Path,
+        channel: &str,
+        snapshot: SessionSnapshot,
+    ) -> Self {
+        Self::spawn_with_transport_failure(state_dir, channel, snapshot, true).await
+    }
+
+    async fn spawn_with_transport_failure(
+        state_dir: &std::path::Path,
+        channel: &str,
+        snapshot: SessionSnapshot,
+        transport_failure: bool,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind malformed Session stream fixture");
@@ -891,6 +958,7 @@ impl MalformedSessionStreamFixture {
         let state = Arc::new(MalformedSessionStreamState {
             descriptor,
             snapshot,
+            transport_failure,
         });
         let app = Router::new()
             .route("/health", get(malformed_fixture_health))
@@ -961,6 +1029,23 @@ async fn malformed_fixture_session_events(
         return StatusCode::NOT_FOUND.into_response();
     }
     let snapshot = state.snapshot.clone();
+    if state.transport_failure {
+        let snapshot_event = format!(
+            "event: {SESSION_SNAPSHOT_EVENT}\nid: {}\ndata: {}\n\n",
+            snapshot.revision.0,
+            serde_json::to_string(&snapshot).expect("serialize fixture Session snapshot"),
+        );
+        let snapshot_chunk =
+            stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(snapshot_event)) });
+        let failed_chunk = stream::once(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Err::<Bytes, _>(std::io::Error::other("fixture Session transport failure"))
+        });
+        return Response::builder()
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(snapshot_chunk.chain(failed_chunk)))
+            .expect("build broken Session stream response");
+    }
     let update = SessionUpdate {
         session_id,
         revision: SessionRevision::INITIAL,

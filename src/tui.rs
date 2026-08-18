@@ -31,7 +31,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::{
     managed_client::{
         ManagedClient, ManagedEvent, RecoveryStatus, SessionCommandClient, SessionEvent,
-        SessionProjection, SessionSubscription,
+        SessionProjection, SessionStreamError, SessionSubscription,
     },
     protocol::{
         ActivityKind, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, MessageRole,
@@ -867,23 +867,15 @@ async fn run_loop(
                     Some(Ok(event)) => {
                         application.handle_event(ApplicationEvent::Session(event))?;
                     }
-                    Some(Err(error)) => return Err(anyhow!(error)),
-                    None => {
-                        session_subscription = None;
-                        let transition = application.handle_event(
-                            ApplicationEvent::SessionSubscriptionEnded,
+                    Some(Err(error)) if !error.is_recoverable() => return Err(error.into()),
+                    Some(Err(_)) | None => {
+                        recover_session_subscription(
+                            &mut application,
+                            &mut session_subscription,
+                            &mut session_subscription_task,
+                            client.session_commands(),
+                            &subscription_tx,
                         )?;
-                        if let ApplicationTransition::SubscribeSession(session_id) = transition
-                            && session_subscription_task.is_none() {
-                            session_subscription_task = Some((
-                                session_id,
-                                spawn_session_subscription(
-                                    client.session_commands(),
-                                    session_id,
-                                    subscription_tx.clone(),
-                                ),
-                            ));
-                        }
                     }
                 }
             }
@@ -1030,9 +1022,29 @@ fn spawn_session_subscription(
     })
 }
 
+fn recover_session_subscription(
+    application: &mut Application,
+    subscription: &mut Option<SessionSubscription>,
+    subscription_task: &mut Option<(SessionId, tokio::task::JoinHandle<()>)>,
+    commands: SessionCommandClient,
+    connected: &tokio::sync::mpsc::UnboundedSender<ConnectedSessionSubscription>,
+) -> Result<()> {
+    *subscription = None;
+    let transition = application.handle_event(ApplicationEvent::SessionSubscriptionEnded)?;
+    if let ApplicationTransition::SubscribeSession(session_id) = transition
+        && subscription_task.is_none()
+    {
+        *subscription_task = Some((
+            session_id,
+            spawn_session_subscription(commands, session_id, connected.clone()),
+        ));
+    }
+    Ok(())
+}
+
 async fn next_session_event(
     subscription: &mut Option<SessionSubscription>,
-) -> Option<std::result::Result<SessionEvent, String>> {
+) -> Option<std::result::Result<SessionEvent, SessionStreamError>> {
     match subscription {
         Some(subscription) => subscription.next().await,
         None => pending().await,

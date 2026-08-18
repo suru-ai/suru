@@ -1,7 +1,7 @@
 //! Authenticated Session stream transport and provider-neutral event decoding.
 
 use anyhow::{Context, Result, bail};
-use eventsource_stream::Eventsource;
+use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -10,6 +10,57 @@ use crate::protocol::{
     SessionUpdate,
 };
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct SessionStreamError {
+    kind: SessionStreamErrorKind,
+    message: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SessionStreamErrorKind {
+    Transport,
+    Protocol,
+}
+
+impl SessionStreamError {
+    fn transport(message: impl Into<String>) -> Self {
+        Self {
+            kind: SessionStreamErrorKind::Transport,
+            message: message.into(),
+        }
+    }
+
+    fn protocol(error: anyhow::Error) -> Self {
+        Self {
+            kind: SessionStreamErrorKind::Protocol,
+            message: error.to_string(),
+        }
+    }
+
+    fn event_source(error: EventStreamError<reqwest::Error>) -> Self {
+        let message = format!("Session event stream failed: {error}");
+        match error {
+            EventStreamError::Transport(_) => Self::transport(message),
+            EventStreamError::Utf8(_) | EventStreamError::Parser(_) => Self {
+                kind: SessionStreamErrorKind::Protocol,
+                message,
+            },
+        }
+    }
+
+    pub fn is_recoverable(&self) -> bool {
+        self.kind == SessionStreamErrorKind::Transport
+    }
+}
+
+impl std::fmt::Display for SessionStreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SessionStreamError {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEvent {
     Snapshot(SessionSnapshot),
@@ -17,7 +68,7 @@ pub enum SessionEvent {
 }
 
 pub struct SessionSubscription {
-    events: mpsc::Receiver<Result<SessionEvent, String>>,
+    events: mpsc::Receiver<Result<SessionEvent, SessionStreamError>>,
     task: JoinHandle<()>,
 }
 
@@ -45,7 +96,7 @@ impl SessionSubscription {
         })
     }
 
-    pub async fn next(&mut self) -> Option<Result<SessionEvent, String>> {
+    pub async fn next(&mut self) -> Option<Result<SessionEvent, SessionStreamError>> {
         self.events.recv().await
     }
 }
@@ -59,23 +110,19 @@ impl Drop for SessionSubscription {
 async fn consume(
     response: reqwest::Response,
     session_id: SessionId,
-    events: mpsc::Sender<Result<SessionEvent, String>>,
+    events: mpsc::Sender<Result<SessionEvent, SessionStreamError>>,
 ) {
     let mut stream = response.bytes_stream().eventsource();
     let mut saw_snapshot = false;
     let mut last_revision = None;
     while let Some(next) = stream.next().await {
         let decoded = match next {
-            Ok(event) => decode_event(event, session_id, &mut saw_snapshot, &mut last_revision),
-            Err(error) => Err(anyhow::anyhow!("Session event stream failed: {error}")),
+            Ok(event) => decode_event(event, session_id, &mut saw_snapshot, &mut last_revision)
+                .map_err(SessionStreamError::protocol),
+            Err(error) => Err(SessionStreamError::event_source(error)),
         };
         let failed = decoded.is_err();
-        if events
-            .send(decoded.map_err(|error| error.to_string()))
-            .await
-            .is_err()
-            || failed
-        {
+        if events.send(decoded).await.is_err() || failed {
             return;
         }
     }

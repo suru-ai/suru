@@ -29,7 +29,7 @@ mod session_projection;
 mod session_stream;
 
 pub(crate) use session_projection::SessionProjection;
-pub use session_stream::{SessionEvent, SessionSubscription};
+pub use session_stream::{SessionEvent, SessionStreamError, SessionSubscription};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
