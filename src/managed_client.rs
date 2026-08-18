@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -190,27 +191,8 @@ impl SessionCommandClient {
         &self,
         request: CreateSessionRequest,
     ) -> Result<SessionSnapshot> {
-        let descriptor = self.descriptor.borrow().clone();
-        let response = self
-            .http
-            .post(format!("{}/v1/sessions", descriptor.base_url))
-            .bearer_auth(&descriptor.token)
-            .json(&request)
-            .send()
+        self.post_session_command("/v1/sessions", &request, "Session creation")
             .await
-            .context("send Session creation command")?;
-        if response.status().is_success() {
-            return response
-                .json::<SessionSnapshot>()
-                .await
-                .context("decode created Session snapshot");
-        }
-        let status = response.status();
-        let error = response.json::<SessionError>().await.ok();
-        match error {
-            Some(error) => bail!(error.message),
-            None => bail!("Session creation failed with HTTP {status}"),
-        }
     }
 
     pub(crate) async fn admit_prompt(
@@ -218,29 +200,44 @@ impl SessionCommandClient {
         session_id: SessionId,
         request: AdmitPromptRequest,
     ) -> Result<Prompt> {
+        self.post_session_command(
+            &format!("/v1/sessions/{session_id}/prompts"),
+            &request,
+            "Prompt admission",
+        )
+        .await
+    }
+
+    async fn post_session_command<RequestBody, ResponseBody>(
+        &self,
+        path: &str,
+        request: &RequestBody,
+        operation: &str,
+    ) -> Result<ResponseBody>
+    where
+        RequestBody: Serialize + ?Sized,
+        ResponseBody: DeserializeOwned,
+    {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
-            .post(format!(
-                "{}/v1/sessions/{session_id}/prompts",
-                descriptor.base_url
-            ))
+            .post(format!("{}{path}", descriptor.base_url))
             .bearer_auth(&descriptor.token)
-            .json(&request)
+            .json(request)
             .send()
             .await
-            .context("send Prompt admission command")?;
+            .with_context(|| format!("send {operation} command"))?;
         if response.status().is_success() {
             return response
-                .json::<Prompt>()
+                .json::<ResponseBody>()
                 .await
-                .context("decode admitted Prompt");
+                .with_context(|| format!("decode {operation} response"));
         }
         let status = response.status();
         let error = response.json::<SessionError>().await.ok();
         match error {
             Some(error) => bail!(error.message),
-            None => bail!("Prompt admission failed with HTTP {status}"),
+            None => bail!("{operation} failed with HTTP {status}"),
         }
     }
 

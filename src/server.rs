@@ -16,9 +16,10 @@ use axum::{
 };
 use fs2::FileExt;
 use futures_util::{StreamExt, stream};
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
     net::TcpListener,
-    sync::{oneshot, watch},
+    sync::{broadcast, oneshot, watch},
     task::JoinHandle,
     time::{Duration, Instant},
 };
@@ -33,7 +34,9 @@ use crate::protocol::{
     ServerIdentity, ServerShutdown, SessionError, SessionErrorCode, SessionId, ShutdownReason,
 };
 use crate::runtime::protect_current_user_file;
-use crate::sessions::{SessionCommandError, SessionFeed, SessionStore, StoreOutcome};
+use crate::sessions::{
+    AdmitPromptError, CreateSessionError, SessionFeed, SessionStore, StoreOutcome,
+};
 
 pub type ServerConfig = RuntimeConfig;
 
@@ -340,43 +343,27 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
 }
 
 async fn create_session(State(state): State<AppState>, request: Request) -> Response {
-    if !is_authenticated(request.headers(), &state.descriptor.token) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let Ok(body) = to_bytes(request.into_body(), 64 * 1024).await else {
-        return session_error_response(
-            StatusCode::BAD_REQUEST,
-            SessionErrorCode::InvalidCommand,
-            "Session command body is too large",
-        );
-    };
-    let Ok(request) = serde_json::from_slice::<CreateSessionRequest>(&body) else {
-        return session_error_response(
-            StatusCode::BAD_REQUEST,
-            SessionErrorCode::InvalidCommand,
-            "Session command is not valid JSON",
-        );
-    };
+    let request =
+        match decode_session_command::<CreateSessionRequest>(&state, request, "Session creation")
+            .await
+        {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
 
     match state.sessions.create(request) {
-        Ok(StoreOutcome::Created(snapshot)) => {
-            (StatusCode::CREATED, Json(snapshot)).into_response()
-        }
-        Ok(StoreOutcome::Existing(snapshot)) => (StatusCode::OK, Json(snapshot)).into_response(),
-        Err(SessionCommandError::EmptyPrompt) => session_error_response(
+        Ok(outcome) => store_outcome_response(outcome),
+        Err(CreateSessionError::EmptyPrompt) => session_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             SessionErrorCode::EmptyPrompt,
             "Prompt must contain non-whitespace text",
         ),
-        Err(SessionCommandError::InvalidWorkspace) => session_error_response(
+        Err(CreateSessionError::InvalidWorkspace) => session_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             SessionErrorCode::InvalidWorkspace,
             "Workspace must be an existing local directory",
         ),
-        Err(SessionCommandError::PromptConflict) => prompt_conflict_response(),
-        Err(SessionCommandError::SessionNotFound) => {
-            unreachable!("Session creation does not address an existing Session")
-        }
+        Err(CreateSessionError::PromptConflict) => prompt_conflict_response(),
     }
 }
 
@@ -385,41 +372,60 @@ async fn admit_prompt(
     AxumPath(session_id): AxumPath<SessionId>,
     request: Request,
 ) -> Response {
-    if !is_authenticated(request.headers(), &state.descriptor.token) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let Ok(body) = to_bytes(request.into_body(), 64 * 1024).await else {
-        return session_error_response(
-            StatusCode::BAD_REQUEST,
-            SessionErrorCode::InvalidCommand,
-            "Prompt admission command body is too large",
-        );
-    };
-    let Ok(request) = serde_json::from_slice::<AdmitPromptRequest>(&body) else {
-        return session_error_response(
-            StatusCode::BAD_REQUEST,
-            SessionErrorCode::InvalidCommand,
-            "Prompt admission command is not valid JSON",
-        );
-    };
+    let request =
+        match decode_session_command::<AdmitPromptRequest>(&state, request, "Prompt admission")
+            .await
+        {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
 
     match state.sessions.admit(session_id, request) {
-        Ok(StoreOutcome::Created(prompt)) => (StatusCode::CREATED, Json(prompt)).into_response(),
-        Ok(StoreOutcome::Existing(prompt)) => (StatusCode::OK, Json(prompt)).into_response(),
-        Err(SessionCommandError::EmptyPrompt) => session_error_response(
+        Ok(outcome) => store_outcome_response(outcome),
+        Err(AdmitPromptError::EmptyPrompt) => session_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             SessionErrorCode::EmptyPrompt,
             "Prompt must contain non-whitespace text",
         ),
-        Err(SessionCommandError::SessionNotFound) => session_error_response(
+        Err(AdmitPromptError::SessionNotFound) => session_error_response(
             StatusCode::NOT_FOUND,
             SessionErrorCode::SessionNotFound,
             "Session does not exist on this server instance",
         ),
-        Err(SessionCommandError::PromptConflict) => prompt_conflict_response(),
-        Err(SessionCommandError::InvalidWorkspace) => {
-            unreachable!("Prompt admission does not accept a Workspace")
-        }
+        Err(AdmitPromptError::PromptConflict) => prompt_conflict_response(),
+    }
+}
+
+async fn decode_session_command<T: DeserializeOwned>(
+    state: &AppState,
+    request: Request,
+    command_name: &str,
+) -> std::result::Result<T, Response> {
+    if !is_authenticated(request.headers(), &state.descriptor.token) {
+        return Err(StatusCode::UNAUTHORIZED.into_response());
+    }
+    let body = to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|_| {
+            session_error_response(
+                StatusCode::BAD_REQUEST,
+                SessionErrorCode::InvalidCommand,
+                format!("{command_name} command body is too large"),
+            )
+        })?;
+    serde_json::from_slice(&body).map_err(|_| {
+        session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidCommand,
+            format!("{command_name} command is not valid JSON"),
+        )
+    })
+}
+
+fn store_outcome_response<T: Serialize>(outcome: StoreOutcome<T>) -> Response {
+    match outcome {
+        StoreOutcome::Created(value) => (StatusCode::CREATED, Json(value)).into_response(),
+        StoreOutcome::Existing(value) => (StatusCode::OK, Json(value)).into_response(),
     }
 }
 
@@ -482,11 +488,11 @@ fn session_event_stream(
                         let _ = changed;
                         None
                     }
-                    changed = updates.changed() => {
-                        if changed.is_err() {
-                            return None;
-                        }
-                        let update = updates.borrow_and_update().clone()?;
+                    received = updates.recv() => {
+                        let update = match received {
+                            Ok(update) => update,
+                            Err(broadcast::error::RecvError::Closed | broadcast::error::RecvError::Lagged(_)) => return None,
+                        };
                         if !update.revision.immediately_follows(delivered_revision) {
                             return None;
                         }

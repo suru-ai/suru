@@ -645,6 +645,57 @@ fn failed_admission_restores_stable_prompt_and_saves_intervening_input_to_histor
 }
 
 #[test]
+fn authoritative_delivery_after_an_ambiguous_failure_removes_the_restored_retry() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (session_id, snapshot) = enter_session(&mut application, workspace.path());
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Accepted despite transport failure".to_owned(),
+        )))
+        .expect("type steer");
+    let ApplicationTransition::AdmitPrompt { request, .. } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit steer")
+    else {
+        panic!("a Session steer should request Prompt admission");
+    };
+    application
+        .handle_event(ApplicationEvent::PromptAdmissionFailed {
+            prompt_id: request.prompt.id,
+            error: "response connection closed".to_owned(),
+        })
+        .expect("restore ambiguously failed Prompt");
+    assert_eq!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .matches("Accepted despite transport failure")
+            .count(),
+        1
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            delivered_update(
+                session_id,
+                SessionRevision(snapshot.revision.0 + 1),
+                request.prompt.id,
+                &request.prompt.text,
+            ),
+        )))
+        .expect("reconcile late authoritative delivery");
+    let reconciled = rendered_application_rows(&application).join("\n");
+    assert_eq!(
+        reconciled
+            .matches("Accepted despite transport failure")
+            .count(),
+        1
+    );
+    assert!(reconciled.contains("Type a Prompt"));
+    assert!(!reconciled.contains("response connection closed"));
+}
+
+#[test]
 fn multiline_history_is_boundary_aware_and_session_drafts_keep_their_cursor() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = Application::new(workspace.path());

@@ -1256,6 +1256,12 @@ async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
     let cursor_restore_position = screen
         .find("\u{1b}[?25h")
         .expect("fatal TUI restores the cursor");
+    let bracketed_paste_enable_position = screen
+        .find("\u{1b}[?2004h")
+        .expect("fatal TUI enabled bracketed paste while it was active");
+    let bracketed_paste_disable_position = screen
+        .find("\u{1b}[?2004l")
+        .expect("fatal TUI disables bracketed paste on exit");
     let error_detail_position = screen
         .find("unknown event type 'future_event'")
         .expect("fatal protocol detail remains visible");
@@ -1266,6 +1272,11 @@ async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
     assert!(
         cursor_restore_position < error_detail_position,
         "fatal error was reported before restoring the cursor: {screen:?}"
+    );
+    assert!(
+        bracketed_paste_enable_position < bracketed_paste_disable_position
+            && bracketed_paste_disable_position < error_detail_position,
+        "fatal TUI did not bracket its active lifetime with paste mode: {screen:?}"
     );
     assert!(
         screen.contains("__CHIDORI_STTY_RESTORED__"),

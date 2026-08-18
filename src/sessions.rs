@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tokio::sync::watch;
+use tokio::sync::broadcast;
 
 use crate::protocol::{
     Activity, ActivityId, ActivityKind, AdmitPromptRequest, CreateSessionRequest, Message,
@@ -18,6 +18,7 @@ use crate::protocol::{
 
 const AGENT_UNAVAILABLE: &str =
     "No Agent is selected for this Session; provider integrations are unavailable.";
+const SESSION_UPDATE_CAPACITY: usize = 256;
 
 #[derive(Clone, Default)]
 pub(crate) struct SessionStore {
@@ -25,9 +26,15 @@ pub(crate) struct SessionStore {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SessionCommandError {
+pub(crate) enum CreateSessionError {
     EmptyPrompt,
     InvalidWorkspace,
+    PromptConflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmitPromptError {
+    EmptyPrompt,
     SessionNotFound,
     PromptConflict,
 }
@@ -46,33 +53,70 @@ struct SessionStoreState {
 
 struct SessionRecord {
     snapshot: SessionSnapshot,
-    updates: watch::Sender<Option<SessionUpdate>>,
+    updates: broadcast::Sender<SessionUpdate>,
 }
 
 struct PromptOwner {
     session_id: SessionId,
     text: String,
-    creation_workspace: Option<PathBuf>,
+    origin: PromptOrigin,
+}
+
+enum PromptOrigin {
+    SessionCreation {
+        requested_workspace: PathBuf,
+        canonical_workspace: PathBuf,
+    },
+    Steer,
 }
 
 pub(crate) struct SessionFeed {
     pub(crate) snapshot: SessionSnapshot,
-    pub(crate) updates: watch::Receiver<Option<SessionUpdate>>,
+    pub(crate) updates: broadcast::Receiver<SessionUpdate>,
+}
+
+struct DeliveredTurn {
+    prompt: Prompt,
+    turn: Turn,
+    message: Message,
+    activity: Activity,
 }
 
 impl SessionStore {
     pub(crate) fn create(
         &self,
         request: CreateSessionRequest,
-    ) -> Result<StoreOutcome<SessionSnapshot>, SessionCommandError> {
+    ) -> Result<StoreOutcome<SessionSnapshot>, CreateSessionError> {
         if request.prompt.text.trim().is_empty() {
-            return Err(SessionCommandError::EmptyPrompt);
+            return Err(CreateSessionError::EmptyPrompt);
+        }
+
+        {
+            let state = self
+                .state
+                .lock()
+                .expect("Session store lock is not poisoned");
+            if let Some(owner) = state.prompts.get(&request.prompt.id) {
+                let PromptOrigin::SessionCreation {
+                    requested_workspace,
+                    ..
+                } = &owner.origin
+                else {
+                    return Err(CreateSessionError::PromptConflict);
+                };
+                if owner.text != request.prompt.text {
+                    return Err(CreateSessionError::PromptConflict);
+                }
+                if requested_workspace == &request.workspace.path {
+                    return Ok(StoreOutcome::Existing(snapshot_for_owner(&state, owner)));
+                }
+            }
         }
 
         let workspace_path = fs::canonicalize(&request.workspace.path)
-            .map_err(|_| SessionCommandError::InvalidWorkspace)?;
+            .map_err(|_| CreateSessionError::InvalidWorkspace)?;
         if !workspace_path.is_dir() {
-            return Err(SessionCommandError::InvalidWorkspace);
+            return Err(CreateSessionError::InvalidWorkspace);
         }
 
         let mut state = self
@@ -81,22 +125,19 @@ impl SessionStore {
             .expect("Session store lock is not poisoned");
         if let Some(owner) = state.prompts.get(&request.prompt.id) {
             if owner.text == request.prompt.text
-                && owner.creation_workspace.as_ref() == Some(&workspace_path)
+                && let PromptOrigin::SessionCreation {
+                    canonical_workspace,
+                    ..
+                } = &owner.origin
+                && canonical_workspace == &workspace_path
             {
-                let snapshot = state
-                    .sessions
-                    .get(&owner.session_id)
-                    .expect("Prompt owner always references its Session")
-                    .snapshot
-                    .clone();
-                return Ok(StoreOutcome::Existing(snapshot));
+                return Ok(StoreOutcome::Existing(snapshot_for_owner(&state, owner)));
             }
-            return Err(SessionCommandError::PromptConflict);
+            return Err(CreateSessionError::PromptConflict);
         }
 
         let session_id = SessionId::new();
-        let (prompt, turn, message, activity) =
-            delivered_prompt(request.prompt.id, request.prompt.text.clone());
+        let delivered = DeliveredTurn::new(request.prompt.id, request.prompt.text.clone());
         let snapshot = SessionSnapshot {
             session: Session {
                 id: session_id,
@@ -107,18 +148,21 @@ impl SessionStore {
                 status: SessionStatus::Idle,
             },
             revision: SessionRevision::INITIAL,
-            prompts: vec![prompt],
-            turns: vec![turn],
-            messages: vec![message],
-            activities: vec![activity],
+            prompts: vec![delivered.prompt],
+            turns: vec![delivered.turn],
+            messages: vec![delivered.message],
+            activities: vec![delivered.activity],
         };
-        let (updates, _) = watch::channel(None);
+        let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
         state.prompts.insert(
             request.prompt.id,
             PromptOwner {
                 session_id,
                 text: request.prompt.text,
-                creation_workspace: Some(workspace_path),
+                origin: PromptOrigin::SessionCreation {
+                    requested_workspace: request.workspace.path,
+                    canonical_workspace: workspace_path,
+                },
             },
         );
         state.sessions.insert(
@@ -135,9 +179,9 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         request: AdmitPromptRequest,
-    ) -> Result<StoreOutcome<Prompt>, SessionCommandError> {
+    ) -> Result<StoreOutcome<Prompt>, AdmitPromptError> {
         if request.prompt.text.trim().is_empty() {
-            return Err(SessionCommandError::EmptyPrompt);
+            return Err(AdmitPromptError::EmptyPrompt);
         }
 
         let mut state = self
@@ -147,7 +191,7 @@ impl SessionStore {
         if let Some(owner) = state.prompts.get(&request.prompt.id) {
             if owner.session_id == session_id
                 && owner.text == request.prompt.text
-                && owner.creation_workspace.is_none()
+                && matches!(&owner.origin, PromptOrigin::Steer)
             {
                 let prompt = state
                     .sessions
@@ -163,14 +207,13 @@ impl SessionStore {
                     .clone();
                 return Ok(StoreOutcome::Existing(prompt));
             }
-            return Err(SessionCommandError::PromptConflict);
+            return Err(AdmitPromptError::PromptConflict);
         }
 
         let Some(record) = state.sessions.get_mut(&session_id) else {
-            return Err(SessionCommandError::SessionNotFound);
+            return Err(AdmitPromptError::SessionNotFound);
         };
-        let (prompt, turn, message, activity) =
-            delivered_prompt(request.prompt.id, request.prompt.text.clone());
+        let delivered = DeliveredTurn::new(request.prompt.id, request.prompt.text.clone());
         let revision = SessionRevision(
             record
                 .snapshot
@@ -182,31 +225,18 @@ impl SessionStore {
         let update = SessionUpdate {
             session_id,
             revision,
-            changes: vec![
-                SessionChange::PromptAdded {
-                    prompt: prompt.clone(),
-                },
-                SessionChange::TurnAdded { turn: turn.clone() },
-                SessionChange::MessageAdded {
-                    message: message.clone(),
-                },
-                SessionChange::ActivityAdded {
-                    activity: activity.clone(),
-                },
-            ],
+            changes: delivered.changes(),
         };
         record.snapshot.revision = revision;
-        record.snapshot.prompts.push(prompt.clone());
-        record.snapshot.turns.push(turn);
-        record.snapshot.messages.push(message);
-        record.snapshot.activities.push(activity);
-        record.updates.send_replace(Some(update));
+        let prompt = delivered.prompt.clone();
+        delivered.append_to(&mut record.snapshot);
+        let _ = record.updates.send(update);
         state.prompts.insert(
             request.prompt.id,
             PromptOwner {
                 session_id,
                 text: request.prompt.text,
-                creation_workspace: None,
+                origin: PromptOrigin::Steer,
             },
         );
         Ok(StoreOutcome::Created(prompt))
@@ -225,30 +255,65 @@ impl SessionStore {
     }
 }
 
-fn delivered_prompt(prompt_id: PromptId, text: String) -> (Prompt, Turn, Message, Activity) {
-    let turn_id = TurnId::new();
-    (
-        Prompt {
-            id: prompt_id,
-            text: text.clone(),
-            status: PromptStatus::Delivered,
-        },
-        Turn {
-            id: turn_id,
-            prompt_id,
-            status: TurnStatus::Failed,
-        },
-        Message {
-            id: MessageId::new(),
-            turn_id,
-            role: MessageRole::User,
-            content: text,
-        },
-        Activity {
-            id: ActivityId::new(),
-            turn_id,
-            kind: ActivityKind::Error,
-            text: AGENT_UNAVAILABLE.to_owned(),
-        },
-    )
+fn snapshot_for_owner(state: &SessionStoreState, owner: &PromptOwner) -> SessionSnapshot {
+    state
+        .sessions
+        .get(&owner.session_id)
+        .expect("Prompt owner always references its Session")
+        .snapshot
+        .clone()
+}
+
+impl DeliveredTurn {
+    fn new(prompt_id: PromptId, text: String) -> Self {
+        let turn_id = TurnId::new();
+        Self {
+            prompt: Prompt {
+                id: prompt_id,
+                text: text.clone(),
+                status: PromptStatus::Delivered,
+            },
+            turn: Turn {
+                id: turn_id,
+                prompt_id,
+                status: TurnStatus::Failed,
+            },
+            message: Message {
+                id: MessageId::new(),
+                turn_id,
+                role: MessageRole::User,
+                content: text,
+            },
+            activity: Activity {
+                id: ActivityId::new(),
+                turn_id,
+                kind: ActivityKind::Error,
+                text: AGENT_UNAVAILABLE.to_owned(),
+            },
+        }
+    }
+
+    fn changes(&self) -> Vec<SessionChange> {
+        vec![
+            SessionChange::PromptAdded {
+                prompt: self.prompt.clone(),
+            },
+            SessionChange::TurnAdded {
+                turn: self.turn.clone(),
+            },
+            SessionChange::MessageAdded {
+                message: self.message.clone(),
+            },
+            SessionChange::ActivityAdded {
+                activity: self.activity.clone(),
+            },
+        ]
+    }
+
+    fn append_to(self, snapshot: &mut SessionSnapshot) {
+        snapshot.prompts.push(self.prompt);
+        snapshot.turns.push(self.turn);
+        snapshot.messages.push(self.message);
+        snapshot.activities.push(self.activity);
+    }
 }

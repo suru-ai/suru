@@ -1,6 +1,7 @@
 //! Ratatui view state and terminal lifecycle.
 
 use std::{
+    collections::HashMap,
     future::pending,
     io::{Stdout, stdout},
     path::{Path, PathBuf},
@@ -9,7 +10,10 @@ use std::{
 use anyhow::{Result, anyhow};
 use crossterm::{
     cursor::{Hide, Show},
-    event::{Event as InputEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, Event as InputEvent, EventStream, KeyCode,
+        KeyEvent, KeyEventKind, KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -53,12 +57,19 @@ pub struct TuiState {
     submission_error: Option<String>,
     session: Option<SessionProjection>,
     pending_submission: Option<PendingSubmission>,
+    failed_submissions: HashMap<PromptId, FailedSubmission>,
 }
 
 #[derive(Clone, Debug)]
 struct PendingSubmission {
     source: ComposerKey,
     target: SubmissionTarget,
+    prompt: InitialPrompt,
+}
+
+#[derive(Clone, Debug)]
+struct FailedSubmission {
+    source: ComposerKey,
     prompt: InitialPrompt,
 }
 
@@ -88,6 +99,7 @@ impl TuiState {
             submission_error: None,
             session: None,
             pending_submission: None,
+            failed_submissions: HashMap::new(),
         }
     }
 
@@ -157,6 +169,7 @@ impl TuiState {
             }
         }
         self.reconcile_pending_submission();
+        self.reconcile_failed_submissions();
         Ok(())
     }
 
@@ -208,7 +221,44 @@ impl TuiState {
             .expect("matching pending submission exists");
         self.composers
             .admission_failed(pending.source, &pending.prompt);
+        self.failed_submissions.insert(
+            pending.prompt.id,
+            FailedSubmission {
+                source: pending.source,
+                prompt: pending.prompt,
+            },
+        );
         self.submission_error = Some(error);
+    }
+
+    fn reconcile_failed_submissions(&mut self) {
+        let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
+            return;
+        };
+        let destination = ComposerKey::Session(snapshot.session.id);
+        let reconciled = self
+            .failed_submissions
+            .keys()
+            .copied()
+            .filter(|prompt_id| {
+                snapshot
+                    .prompts
+                    .iter()
+                    .any(|prompt| prompt.id == *prompt_id)
+            })
+            .collect::<Vec<_>>();
+        for prompt_id in reconciled {
+            let failed = self
+                .failed_submissions
+                .remove(&prompt_id)
+                .expect("failed submission identity was just observed");
+            if self
+                .composers
+                .late_admission_reconciled(failed.source, destination, &failed.prompt)
+            {
+                self.submission_error = None;
+            }
+        }
     }
 
     fn provisional_prompt(&self, session_id: SessionId) -> Option<&InitialPrompt> {
@@ -342,6 +392,7 @@ impl Application {
                     return Ok(ApplicationTransition::Continue);
                 }
                 let prompt = self.state.composers.begin_submission(key);
+                self.state.failed_submissions.remove(&prompt.id);
                 self.state.submission_error = None;
                 if let ComposerKey::Session(session_id) = key {
                     self.state.pending_submission = Some(PendingSubmission {
@@ -968,7 +1019,7 @@ impl TerminalSession {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut output = stdout();
-        if let Err(error) = execute!(output, EnterAlternateScreen, Hide) {
+        if let Err(error) = execute!(output, EnterAlternateScreen, Hide, EnableBracketedPaste) {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -976,7 +1027,7 @@ impl TerminalSession {
             Ok(terminal) => Ok(Self { terminal }),
             Err(error) => {
                 let mut output = stdout();
-                let _ = execute!(output, LeaveAlternateScreen, Show);
+                let _ = execute!(output, DisableBracketedPaste, LeaveAlternateScreen, Show);
                 let _ = disable_raw_mode();
                 Err(error.into())
             }
@@ -986,7 +1037,12 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            Show
+        );
         let _ = disable_raw_mode();
     }
 }

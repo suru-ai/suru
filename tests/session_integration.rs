@@ -21,7 +21,7 @@ use chidori::{
     server::{self, ServerConfig},
 };
 use eventsource_stream::Eventsource;
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt, future::join_all, stream};
 use tokio::time::{Duration, timeout};
 
 #[tokio::test]
@@ -173,6 +173,26 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
             SessionErrorCode::PromptConflict
         );
     }
+
+    std::fs::remove_dir(workspace.path()).expect("remove Workspace after accepted creation");
+    let retry_after_workspace_disappears = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&request)
+        .send()
+        .await
+        .expect("retry Session creation after Workspace disappears");
+    assert_eq!(
+        retry_after_workspace_disappears.status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        retry_after_workspace_disappears
+            .json::<SessionSnapshot>()
+            .await
+            .expect("decode retry after Workspace disappears"),
+        first
+    );
 
     server.shutdown().await.expect("shut down server");
 }
@@ -326,6 +346,106 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
             .code,
         SessionErrorCode::PromptConflict
     );
+
+    drop(events);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn consecutive_prompt_admissions_are_delivered_without_collapsing_revisions() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid workspace");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "consecutive-prompt-admission-test")
+            .expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Initial Prompt".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode Session");
+    let response = client
+        .get(format!(
+            "{}/v1/sessions/{}/events",
+            descriptor.base_url, created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("open Session stream")
+        .error_for_status()
+        .expect("Session stream authenticates");
+    let mut events = response.bytes_stream().eventsource();
+    timeout(Duration::from_secs(1), events.next())
+        .await
+        .expect("Session snapshot arrives")
+        .expect("Session stream remains open")
+        .expect("decode Session snapshot event");
+
+    let mut prompt_ids = (0..32).map(|_| PromptId::new()).collect::<Vec<_>>();
+    let admissions = prompt_ids
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, prompt_id)| {
+            client
+                .post(format!(
+                    "{}/v1/sessions/{}/prompts",
+                    descriptor.base_url, created.session.id
+                ))
+                .bearer_auth(&descriptor.token)
+                .json(&AdmitPromptRequest {
+                    prompt: InitialPrompt {
+                        id: prompt_id,
+                        text: format!("Consecutive steer {}", index + 1),
+                    },
+                })
+                .send()
+        });
+    for response in join_all(admissions).await {
+        response
+            .expect("admit consecutive steer")
+            .error_for_status()
+            .expect("consecutive steer is accepted");
+    }
+
+    let mut delivered_prompts = Vec::new();
+    for expected_revision in 2..=33 {
+        let event = timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("every consecutive Session update arrives")
+            .expect("Session stream remains open")
+            .expect("decode consecutive Session update");
+        let update = serde_json::from_str::<SessionUpdate>(&event.data)
+            .expect("decode consecutive Session update body");
+        assert_eq!(update.revision, SessionRevision(expected_revision));
+        delivered_prompts.extend(update.changes.iter().filter_map(|change| match change {
+            SessionChange::PromptAdded { prompt } => Some(prompt.id),
+            _ => None,
+        }));
+    }
+    delivered_prompts.sort_by_key(|prompt_id| prompt_id.as_uuid());
+    prompt_ids.sort_by_key(|prompt_id| prompt_id.as_uuid());
+    assert_eq!(delivered_prompts, prompt_ids);
 
     drop(events);
     server.shutdown().await.expect("shut down server");
