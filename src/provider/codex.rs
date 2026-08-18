@@ -1231,6 +1231,7 @@ fn spawn_codex_child(command: &mut Command) -> std::io::Result<(Child, ProcessTr
         Threading::CREATE_SUSPENDED,
     };
 
+    #[link(name = "ntdll")]
     unsafe extern "system" {
         fn NtResumeProcess(process_handle: windows_sys::Win32::Foundation::HANDLE) -> i32;
     }
