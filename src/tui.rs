@@ -1325,6 +1325,7 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
             content_width,
         );
     }
+    transcript.split_oversized_lines(content_width);
     let transcript_layout = transcript.layout(content_width);
     let interaction = state
         .session_interaction(session_id)
@@ -1767,6 +1768,8 @@ struct TranscriptProjection {
     message_boundaries: Vec<MessageBoundary>,
 }
 
+const MAX_TRANSCRIPT_SOURCE_LINE_ROWS: usize = 32_000;
+
 #[derive(Clone, Copy)]
 struct MessageBoundary {
     message_id: MessageId,
@@ -1780,6 +1783,22 @@ struct TranscriptLayout {
 }
 
 impl TranscriptProjection {
+    fn split_oversized_lines(&mut self, width: u16) {
+        let original_lines = std::mem::take(&mut self.lines);
+        let mut remapped_line_indices = Vec::with_capacity(original_lines.len() + 1);
+        for line in original_lines {
+            remapped_line_indices.push(self.lines.len());
+            split_oversized_line(line, width, &mut self.lines);
+        }
+        remapped_line_indices.push(self.lines.len());
+        for boundary in &mut self.message_boundaries {
+            boundary.line_index = remapped_line_indices
+                .get(boundary.line_index)
+                .copied()
+                .unwrap_or(self.lines.len());
+        }
+    }
+
     fn layout(&self, width: u16) -> TranscriptLayout {
         let mut row_count = 0;
         let mut boundaries = self.message_boundaries.iter().peekable();
@@ -1797,11 +1816,7 @@ impl TranscriptProjection {
                     row: row_count,
                 });
             }
-            row_count = row_count.saturating_add(
-                Paragraph::new(line.clone())
-                    .wrap(Wrap { trim: false })
-                    .line_count(width),
-            );
+            row_count = row_count.saturating_add(wrapped_line_count(line, width));
         }
         for boundary in boundaries {
             message_starts.push(MessageStart {
@@ -1815,6 +1830,84 @@ impl TranscriptProjection {
             line_starts,
         }
     }
+}
+
+fn wrapped_line_count(line: &Line<'static>, width: u16) -> usize {
+    Paragraph::new(line.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+}
+
+fn split_oversized_line(line: Line<'static>, width: u16, output: &mut Vec<Line<'static>>) {
+    if wrapped_line_count(&line, width) <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
+        output.push(line);
+        return;
+    }
+    let character_count = line
+        .spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>();
+    if character_count < 2 {
+        output.push(line);
+        return;
+    }
+    let (left, right) = split_line_at_character_midpoint(line, character_count);
+    split_oversized_line(left, width, output);
+    split_oversized_line(right, width, output);
+}
+
+fn split_line_at_character_midpoint(
+    line: Line<'static>,
+    character_count: usize,
+) -> (Line<'static>, Line<'static>) {
+    let Line {
+        style,
+        alignment,
+        spans,
+    } = line;
+    let mut remaining_left = character_count / 2;
+    let mut left_spans = Vec::new();
+    let mut right_spans = Vec::new();
+    for span in spans {
+        if remaining_left == 0 {
+            right_spans.push(span);
+            continue;
+        }
+        let span_character_count = span.content.chars().count();
+        if span_character_count <= remaining_left {
+            remaining_left -= span_character_count;
+            left_spans.push(span);
+            continue;
+        }
+
+        let content = span.content.into_owned();
+        let split_byte = content
+            .char_indices()
+            .nth(remaining_left)
+            .map_or(content.len(), |(index, _)| index);
+        let (left, right) = content.split_at(split_byte);
+        if !left.is_empty() {
+            left_spans.push(Span::styled(left.to_owned(), span.style));
+        }
+        if !right.is_empty() {
+            right_spans.push(Span::styled(right.to_owned(), span.style));
+        }
+        remaining_left = 0;
+    }
+
+    (
+        Line {
+            style,
+            alignment,
+            spans: left_spans,
+        },
+        Line {
+            style,
+            alignment,
+            spans: right_spans,
+        },
+    )
 }
 
 fn transcript_projection(

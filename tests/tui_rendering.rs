@@ -834,7 +834,7 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
     let short = rendered_application_rows_at(&application, 100, 6).join("\n");
     assert!(!short.contains("Chidori"));
     assert!(!short.contains("Workspace"));
-    assert!(short.contains("Keep the transcript visible"));
+    assert!(short.contains("Working"));
     assert!(short.contains("Keep the draft visible"));
     assert!(short.contains("active"));
     assert!(short.contains("Connected"));
@@ -1657,6 +1657,52 @@ fn transcript_navigation_remains_correct_beyond_the_terminal_scroll_limit() {
         .expect("return to the very long tail");
     let resumed = rendered_application_rows_at(&application, 72, 18).join("\n");
     assert!(resumed.contains("TAIL beyond u16"));
+    assert!(!resumed.contains("Latest"));
+}
+
+#[test]
+fn transcript_navigation_reaches_tail_of_one_oversized_wrapped_line() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
+    let terminal_width = 28;
+    let transcript_width = terminal_width - 2;
+    let agent_message = snapshot
+        .messages
+        .iter_mut()
+        .find(|message| message.role == MessageRole::Agent)
+        .expect("fixture has an Agent Message");
+    agent_message.content = format!(
+        "{} TAIL",
+        "x".repeat(usize::from(transcript_width) * 65_700)
+    );
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach one Agent line longer than Ratatui's local scroll offset");
+
+    let latest = rendered_application_rows_at(&application, terminal_width, 18).join("\n");
+    assert!(latest.contains("TAIL"));
+    assert!(!latest.contains("Latest"));
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )))
+        .expect("page away from the oversized wrapped line tail");
+    assert!(
+        rendered_application_rows_at(&application, terminal_width, 18)
+            .join("\n")
+            .contains("Latest")
+    );
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::End,
+            KeyModifiers::NONE,
+        )))
+        .expect("return to the oversized wrapped line tail");
+    let resumed = rendered_application_rows_at(&application, terminal_width, 18).join("\n");
+    assert!(resumed.contains("TAIL"));
     assert!(!resumed.contains("Latest"));
 }
 
