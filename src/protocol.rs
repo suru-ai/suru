@@ -3,9 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 5;
-pub const SNAPSHOT_EVENT: &str = "snapshot";
-pub const COUNTER_UPDATED_EVENT: &str = "counter_updated";
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SESSION_SNAPSHOT_EVENT: &str = "session_snapshot";
 pub const SESSION_UPDATED_EVENT: &str = "session_updated";
@@ -472,21 +470,6 @@ impl<'de> Deserialize<'de> for RuntimeDescriptor {
             },
         ))
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CounterSnapshot {
-    pub instance_id: Uuid,
-    pub value: u64,
-    pub revision: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CounterUpdate {
-    pub value: u64,
-    pub revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -28,12 +28,11 @@ use uuid::Uuid;
 use crate::RuntimeConfig;
 use crate::build_identity;
 use crate::protocol::{
-    Activity, ActivityId, ActivityKind, AdmitPromptRequest, COUNTER_UPDATED_EVENT, CounterSnapshot,
-    CounterUpdate, CreateSessionRequest, LifecycleState, Message, MessageId, MessageRole,
-    MessageStatus, PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
-    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SNAPSHOT_EVENT, ServerIdentity, ServerShutdown,
-    SessionChange, SessionError, SessionErrorCode, SessionId, SessionUpdate, ShutdownReason,
-    TurnId,
+    Activity, ActivityId, ActivityKind, AdmitPromptRequest, CreateSessionRequest, LifecycleState,
+    Message, MessageId, MessageRole, MessageStatus, PROTOCOL_VERSION, RuntimeDescriptor,
+    SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity,
+    ServerShutdown, SessionChange, SessionError, SessionErrorCode, SessionId, SessionUpdate,
+    ShutdownReason, TurnId,
 };
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
@@ -233,15 +232,8 @@ impl ShutdownController {
 #[derive(Clone)]
 struct AppState {
     descriptor: Arc<RuntimeDescriptor>,
-    counter: watch::Sender<CounterState>,
     sessions: SessionStore,
     shutdown: ShutdownController,
-}
-
-#[derive(Clone, Copy)]
-struct CounterState {
-    value: u64,
-    revision: u64,
 }
 
 pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
@@ -274,10 +266,6 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
     );
     write_descriptor(&config.descriptor_path(), &descriptor)?;
 
-    let (counter, _) = watch::channel(CounterState {
-        value: 0,
-        revision: 0,
-    });
     let (lifecycle, _) = watch::channel(LifecycleState::Starting);
     let (shutdown_intent, _) = watch::channel(None);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -289,7 +277,6 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
     let sessions = SessionStore::default();
     let state = AppState {
         descriptor: Arc::new(descriptor.clone()),
-        counter: counter.clone(),
         sessions: sessions.clone(),
         shutdown: shutdown.clone(),
     };
@@ -319,7 +306,6 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
     let task_lifecycle = lifecycle.clone();
     let task = tokio::spawn(async move {
         let _lock = lock;
-        let counter_task = tokio::spawn(run_counter(counter));
         let result = axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
@@ -329,7 +315,6 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
         if result.is_err() {
             task_lifecycle.send_replace(LifecycleState::Failed);
         }
-        counter_task.abort();
         remove_own_descriptor(&descriptor_path, instance_id);
         result
     });
@@ -362,8 +347,6 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
     }
 
     Sse::new(event_stream(
-        state.descriptor.identity.instance_id,
-        state.counter.subscribe(),
         state.shutdown.subscribe_to_intent(),
         Duration::from_secs(10),
     ))
@@ -371,39 +354,24 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
 }
 
 struct EventStreamState {
-    counter: watch::Receiver<CounterState>,
     shutdown: watch::Receiver<Option<ServerShutdown>>,
     keepalive: tokio::time::Interval,
-    delivered_revision: u64,
     finished: bool,
 }
 
 fn event_stream(
-    instance_id: Uuid,
-    mut counter: watch::Receiver<CounterState>,
     shutdown: watch::Receiver<Option<ServerShutdown>>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
-    let current = *counter.borrow_and_update();
-    let snapshot = CounterSnapshot {
-        instance_id,
-        value: current.value,
-        revision: current.revision,
-    };
-    let snapshot_event = Event::default()
-        .event(SNAPSHOT_EVENT)
-        .id(snapshot.revision.to_string())
-        .json_data(snapshot)
-        .expect("counter snapshots always serialize");
-    let first = stream::once(async move { Ok::<_, std::convert::Infallible>(snapshot_event) });
+    let first = stream::once(async move {
+        Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
+    });
     let state = EventStreamState {
-        counter,
         shutdown,
         keepalive: tokio::time::interval_at(
             Instant::now() + keepalive_interval,
             keepalive_interval,
         ),
-        delivered_revision: current.revision,
         finished: false,
     };
     let updates = stream::unfold(state, |mut state| async move {
@@ -417,33 +385,11 @@ fn event_stream(
                     return None;
                 }
                 let shutdown = state.shutdown.borrow_and_update().clone()?;
-                let revision = state.counter.borrow().revision;
                 let event = Event::default()
                     .event(SERVER_SHUTDOWN_EVENT)
-                    .id(revision.to_string())
                     .json_data(shutdown)
                     .expect("server shutdown intents always serialize");
                 state.finished = true;
-                Some((Ok::<_, std::convert::Infallible>(event), state))
-            }
-            changed = state.counter.changed() => {
-                if changed.is_err() {
-                    return None;
-                }
-                let current = *state.counter.borrow_and_update();
-                if current.revision != state.delivered_revision.saturating_add(1) {
-                    return None;
-                }
-                let update = CounterUpdate {
-                    value: current.value,
-                    revision: current.revision,
-                };
-                let event = Event::default()
-                    .event(COUNTER_UPDATED_EVENT)
-                    .id(update.revision.to_string())
-                    .json_data(update)
-                    .expect("counter updates always serialize");
-                state.delivered_revision = current.revision;
                 Some((Ok::<_, std::convert::Infallible>(event), state))
             }
             _ = state.keepalive.tick() => Some((
@@ -456,20 +402,6 @@ fn event_stream(
     });
 
     first.chain(updates)
-}
-
-async fn run_counter(counter: watch::Sender<CounterState>) {
-    let mut interval = tokio::time::interval_at(
-        Instant::now() + Duration::from_secs(1),
-        Duration::from_secs(1),
-    );
-    loop {
-        interval.tick().await;
-        counter.send_modify(|state| {
-            state.value += 1;
-            state.revision += 1;
-        });
-    }
 }
 
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -914,62 +846,38 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn lagging_event_stream_closes_without_affecting_counter_or_healthy_stream() {
-        let instance_id = Uuid::new_v4();
-        let (counter, _) = watch::channel(CounterState {
-            value: 0,
-            revision: 0,
-        });
+    async fn lifecycle_streams_receive_shutdown_intent_independently() {
         let (shutdown, _) = watch::channel(None);
-        let healthy = event_stream(
-            instance_id,
-            counter.subscribe(),
-            shutdown.subscribe(),
-            Duration::from_secs(60),
-        );
-        let lagging = event_stream(
-            instance_id,
-            counter.subscribe(),
-            shutdown.subscribe(),
-            Duration::from_secs(60),
-        );
-        pin_mut!(healthy);
-        pin_mut!(lagging);
+        let first = event_stream(shutdown.subscribe(), Duration::from_secs(60));
+        let second = event_stream(shutdown.subscribe(), Duration::from_secs(60));
+        pin_mut!(first);
+        pin_mut!(second);
 
-        assert!(healthy.next().await.is_some(), "healthy snapshot arrives");
-        assert!(lagging.next().await.is_some(), "lagging snapshot arrives");
-
-        counter.send_modify(|state| {
-            state.value = 1;
-            state.revision = 1;
-        });
         assert!(
-            healthy.next().await.is_some(),
-            "healthy subscriber receives revision 1"
+            first.next().await.is_some(),
+            "first connected comment arrives"
         );
-        counter.send_modify(|state| {
-            state.value = 2;
-            state.revision = 2;
-        });
         assert!(
-            healthy.next().await.is_some(),
-            "healthy subscriber receives revision 2"
+            second.next().await.is_some(),
+            "second connected comment arrives"
         );
 
-        assert_eq!(counter.borrow().revision, 2);
-        assert!(
-            lagging.next().await.is_none(),
-            "subscriber that missed bounded latest-state delivery is disconnected"
-        );
-
-        counter.send_modify(|state| {
-            state.value = 3;
-            state.revision = 3;
-        });
-        assert!(
-            healthy.next().await.is_some(),
-            "healthy subscriber continues after lagging stream closes"
-        );
-        assert_eq!(counter.borrow().revision, 3);
+        let intent = ServerShutdown {
+            instance_id: Uuid::new_v4(),
+            reason: ShutdownReason::Manual,
+        };
+        shutdown.send_replace(Some(intent.clone()));
+        let _ = first
+            .next()
+            .await
+            .expect("first subscriber receives shutdown")
+            .expect("lifecycle stream is infallible");
+        let _ = second
+            .next()
+            .await
+            .expect("second subscriber receives shutdown")
+            .expect("lifecycle stream is infallible");
+        assert!(first.next().await.is_none());
+        assert!(second.next().await.is_none());
     }
 }

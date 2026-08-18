@@ -9,8 +9,8 @@ initially running as a TUI, but potentially eventually with native GUIs across t
 
 1. Build Chidori with `cargo build`.
 2. Run `target/debug/chidori` in two terminals.
-3. Confirm both TUIs show the same server ID and PID, and that their counters advance together.
-4. Press `q` in both TUIs, wait a few seconds, then run `target/debug/chidori` again.
-5. Confirm the relaunched TUI shows the same server ID and PID with a counter value that advanced while no TUI was connected.
+3. Confirm both TUIs show the same server ID and PID.
+4. Press `Ctrl+C` with an empty composer in both TUIs, wait a few seconds, then run `target/debug/chidori` again.
+5. Confirm the relaunched TUI shows the same server ID and PID, proving the shared server survived without connected clients.
 
 The detached debug server intentionally remains running after this check. Its output is written to the debug channel's `server.log` under Chidori's per-user state directory.

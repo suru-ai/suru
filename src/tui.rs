@@ -1,6 +1,7 @@
 //! Ratatui view state and terminal lifecycle.
 
 mod markdown;
+mod slots;
 
 use std::{
     cell::{Cell, RefCell},
@@ -50,6 +51,11 @@ use crate::{
 mod composer;
 
 use composer::{ComposerKey, ComposerMemory};
+use slots::{
+    HomeFooterSlotContext, PromptContextSlotContext, PromptFooterSlotContext,
+    PromptStatusSlotContext, RenderSlots, RenderedSlot, SessionComposerTopSlotContext, SlotText,
+    truncate_to_width,
+};
 
 const NARROW_TERMINAL_WIDTH: u16 = 44;
 const MINIMUM_TERMINAL_WIDTH: u16 = 28;
@@ -138,10 +144,8 @@ impl TranscriptViewport {
 #[derive(Clone, Debug)]
 pub struct TuiState {
     identity: Option<ServerIdentity>,
-    pending_identity: Option<ServerIdentity>,
-    counter: Option<u64>,
     recovery: Option<RecoveryStatus>,
-    /// Manual stop preserves the last confirmed identity and counter as useful final context.
+    /// Manual stop preserves the last confirmed identity as useful final context.
     manually_stopped: bool,
     fatal_error: Option<String>,
     workspace: PathBuf,
@@ -207,8 +211,6 @@ impl TuiState {
     fn new(workspace: impl AsRef<Path>) -> Self {
         Self {
             identity: None,
-            pending_identity: None,
-            counter: None,
             recovery: None,
             manually_stopped: false,
             fatal_error: None,
@@ -231,49 +233,36 @@ impl TuiState {
         match event {
             ManagedEvent::Connecting => {
                 self.identity = None;
-                self.pending_identity = None;
-                self.counter = None;
                 self.recovery = None;
                 self.reconnect_overlay_visible = false;
                 self.manually_stopped = false;
                 self.fatal_error = None;
             }
             ManagedEvent::Connected(health) => {
-                self.pending_identity = Some(health.identity);
+                let replaced_server = self
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.instance_id != health.instance_id);
+                if replaced_server {
+                    if let Some(session_id) =
+                        self.session.as_ref().map(SessionProjection::session_id)
+                    {
+                        self.composers.recover_session_to_landing(session_id);
+                        self.session_interactions.remove(&session_id);
+                        self.pending_steers
+                            .retain(|steer| steer.session_id != session_id);
+                    }
+                    self.session = None;
+                    self.session_events_blocked = true;
+                    self.submission_error =
+                        Some("Session ended because the shared server was replaced".to_owned());
+                }
+                self.identity = Some(health.identity);
+                self.recovery = None;
+                self.reconnect_overlay_visible = false;
                 self.manually_stopped = false;
                 self.fatal_error = None;
             }
-            ManagedEvent::Snapshot(snapshot) => {
-                let confirms_pending_identity = self
-                    .pending_identity
-                    .as_ref()
-                    .is_some_and(|identity| identity.instance_id == snapshot.instance_id);
-                if confirms_pending_identity {
-                    let replaced_server = self
-                        .identity
-                        .as_ref()
-                        .is_some_and(|identity| identity.instance_id != snapshot.instance_id);
-                    if replaced_server {
-                        if let Some(session_id) =
-                            self.session.as_ref().map(SessionProjection::session_id)
-                        {
-                            self.composers.recover_session_to_landing(session_id);
-                            self.session_interactions.remove(&session_id);
-                            self.pending_steers
-                                .retain(|steer| steer.session_id != session_id);
-                        }
-                        self.session = None;
-                        self.session_events_blocked = true;
-                        self.submission_error =
-                            Some("Session ended because the shared server was replaced".to_owned());
-                    }
-                    self.identity = self.pending_identity.take();
-                }
-                self.counter = Some(snapshot.value);
-                self.recovery = None;
-                self.reconnect_overlay_visible = false;
-            }
-            ManagedEvent::CounterUpdated(update) => self.counter = Some(update.value),
             ManagedEvent::Recovering(status) => {
                 if self.recovery.is_none() {
                     self.reconnect_overlay_visible = false;
@@ -284,7 +273,6 @@ impl TuiState {
             }
             ManagedEvent::ServerShutdown(shutdown) => {
                 if shutdown.reason == ShutdownReason::Manual {
-                    self.pending_identity = None;
                     self.recovery = None;
                     self.reconnect_overlay_visible = false;
                     self.manually_stopped = true;
@@ -608,9 +596,27 @@ struct QueuedPrompt<'a> {
     text: &'a str,
 }
 
-#[derive(Debug, Default)]
 pub struct Application {
     state: TuiState,
+    slots: RenderSlots,
+}
+
+impl std::fmt::Debug for Application {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Application")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for Application {
+    fn default() -> Self {
+        Self {
+            state: TuiState::default(),
+            slots: RenderSlots::builtins(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -683,6 +689,7 @@ impl Application {
     pub fn new(workspace: impl AsRef<Path>) -> Self {
         Self {
             state: TuiState::new(workspace),
+            slots: RenderSlots::builtins(),
         }
     }
 
@@ -938,7 +945,7 @@ impl Application {
     }
 
     pub fn render(&self, frame: &mut Frame<'_>) {
-        render(frame, &self.state);
+        render_with_slots(frame, &self.state, &self.slots);
     }
 
     pub fn handle_terminal_event(&mut self, event: InputEvent) -> Result<ApplicationTransition> {
@@ -1194,25 +1201,52 @@ fn command_from_scoped_bindings(
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
+    render_with_slots(frame, state, &RenderSlots::builtins());
+}
+
+fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlots) {
     let theme = Theme::system();
     if terminal_is_too_small(frame.area()) {
         render_terminal_too_small(frame, &theme);
         return;
     }
     if state.session.is_some() {
-        render_session(frame, state, &theme);
+        render_session(frame, state, slots, &theme);
     } else {
-        render_landing(frame, state, &theme);
+        render_landing(frame, state, slots, &theme);
     }
     if state.reconnect_overlay_visible {
         render_reconnect_overlay(frame, &theme);
     }
 }
 
-fn render_landing(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
-    let [main, footer_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
+fn render_landing(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlots, theme: &Theme) {
     let detail = ResponsiveDetail::for_width(frame.area().width);
+    let show_brand = frame.area().height >= LANDING_BRAND_MINIMUM_HEIGHT;
+    let footer_detail = detail.secondary_only_when(show_brand);
+    let footer_width = frame
+        .area()
+        .width
+        .saturating_sub(horizontal_padding(frame.area().width).saturating_mul(2));
+    let context = if footer_detail.shows_secondary() {
+        format!(
+            "Agent unavailable · Workspace {}",
+            state.workspace.to_string_lossy()
+        )
+    } else {
+        "Agent unavailable".to_owned()
+    };
+    let footer = slots.home_footer(&HomeFooterSlotContext {
+        width: footer_width,
+        context: SlotText::new(context, theme.text.subdued),
+        connection: SlotText::new(
+            connection_status_text(state, footer_detail),
+            status_style(state, theme),
+        ),
+    });
+    let [main, footer_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(footer.height())])
+            .areas(frame.area());
     let content = horizontally_inset(main, horizontal_padding(frame.area().width));
     let key = ComposerKey::Landing;
     let composer_height = composer_block_height(
@@ -1220,7 +1254,6 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
         72_u16.min(content.width),
         state.composers.text(key),
     );
-    let show_brand = frame.area().height >= LANDING_BRAND_MINIMUM_HEIGHT;
     let error_height = u16::from(state.submission_error.is_some());
     let show_question = state.submission_error.is_none()
         || main.height
@@ -1268,16 +1301,15 @@ fn render_landing(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
         theme,
     );
 
-    render_landing_footer(
+    render_slot(
         frame,
-        state,
         horizontally_inset(footer_area, horizontal_padding(frame.area().width)),
-        detail.secondary_only_when(show_brand),
+        footer,
         theme,
     );
 }
 
-fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+fn render_session(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlots, theme: &Theme) {
     let snapshot = state
         .session
         .as_ref()
@@ -1294,6 +1326,49 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
         content_width,
         state.composers.text(key),
     );
+    let composer_top = slots.session_composer_top(&SessionComposerTopSlotContext { session_id });
+    let status = match snapshot.session.status {
+        SessionStatus::Idle => "idle".to_owned(),
+        SessionStatus::Active => {
+            let interrupt = binding_label(&CommandId::RequestInterrupt);
+            if matches!(
+                state.command_mode,
+                CommandMode::InterruptConfirmation { .. }
+            ) {
+                format!("active · {interrupt} again to interrupt")
+            } else {
+                format!("active · {interrupt} interrupt")
+            }
+        }
+    };
+    let activity_style = if snapshot.session.status == SessionStatus::Active {
+        theme.feedback.warning
+    } else {
+        theme.text.subdued
+    };
+    let agent = if snapshot.session.status == SessionStatus::Active && !detail.shows_secondary() {
+        String::new()
+    } else {
+        agent_context(snapshot.session.agent.as_ref(), detail)
+    };
+    let footer = slots.prompt_footer(
+        &PromptFooterSlotContext {
+            session_id,
+            width: content_width,
+        },
+        &PromptStatusSlotContext {
+            session_id,
+            status: SlotText::new(status, activity_style),
+        },
+        &PromptContextSlotContext {
+            session_id,
+            agent: SlotText::new(agent, activity_style),
+            connection: SlotText::new(
+                connection_status_text(state, ResponsiveDetail::CoreOnly),
+                status_style(state, theme),
+            ),
+        },
+    );
     let queued_prompts = state.queued_prompts(session_id);
     let desired_pending_height = if queued_prompts.is_empty() {
         0
@@ -1302,7 +1377,8 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     };
     let core_height = u16::from(show_header)
         .saturating_add(desired_composer_height)
-        .saturating_add(1)
+        .saturating_add(composer_top.height())
+        .saturating_add(footer.height())
         .saturating_add(1);
     let pending_room = frame.area().height.saturating_sub(core_height);
     let pending_height = if pending_room >= 3 {
@@ -1312,7 +1388,8 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     };
     let reserved_height = u16::from(show_header)
         .saturating_add(pending_height)
-        .saturating_add(1)
+        .saturating_add(composer_top.height())
+        .saturating_add(footer.height())
         .saturating_add(1);
     let composer_height =
         desired_composer_height.min(frame.area().height.saturating_sub(reserved_height).max(1));
@@ -1330,20 +1407,24 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     let interaction = state
         .session_interaction(session_id)
         .expect("Session interaction is initialized with its snapshot");
-    let [_, transcript_without_latest, _, _, _, _] = session_areas(
+    let [_, transcript_without_latest, _, _, _, _, _] = session_areas(
         frame.area(),
         u16::from(show_header),
         pending_height,
         0,
+        composer_top.height(),
         composer_height,
+        footer.height(),
     );
     let viewport_without_latest = transcript_viewport_height(transcript_without_latest);
-    let [_, transcript_with_latest, _, _, _, _] = session_areas(
+    let [_, transcript_with_latest, _, _, _, _, _] = session_areas(
         frame.area(),
         u16::from(show_header),
         pending_height,
         1,
+        composer_top.height(),
         composer_height,
+        footer.height(),
     );
     let viewport_with_latest = transcript_viewport_height(transcript_with_latest);
     let (away_from_bottom, viewport_height, maximum_scroll, scroll_position) =
@@ -1393,6 +1474,7 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
         transcript_area,
         pending_area,
         latest_area,
+        composer_top_area,
         composer_area,
         status_area,
     ] = session_areas(
@@ -1400,7 +1482,9 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
         u16::from(show_header),
         pending_height,
         latest_height,
+        composer_top.height(),
         composer_height,
+        footer.height(),
     );
     if show_header {
         render_session_header(
@@ -1416,6 +1500,7 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     let transcript_area = horizontally_inset(transcript_area, padding);
     let pending_area = horizontally_inset(pending_area, padding);
     let latest_area = horizontally_inset(latest_area, padding);
+    let composer_top_area = horizontally_inset(composer_top_area, padding);
     let composer_area = horizontally_inset(composer_area, padding);
     let footer_area = horizontally_inset(status_area, padding);
     let first_visible_line = transcript_layout
@@ -1468,6 +1553,7 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
             latest_area,
         );
     }
+    render_slot(frame, composer_top_area, composer_top, theme);
     render_composer(
         frame,
         composer_area,
@@ -1477,7 +1563,7 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
         detail,
         theme,
     );
-    render_session_footer(frame, state, snapshot, footer_area, detail, theme);
+    render_slot(frame, footer_area, footer, theme);
 }
 
 fn render_session_header(
@@ -1519,49 +1605,6 @@ fn render_session_header(
     );
 }
 
-fn render_session_footer(
-    frame: &mut Frame<'_>,
-    state: &TuiState,
-    snapshot: &SessionSnapshot,
-    area: Rect,
-    detail: ResponsiveDetail,
-    theme: &Theme,
-) {
-    let status = match snapshot.session.status {
-        SessionStatus::Idle => "idle".to_owned(),
-        SessionStatus::Active => {
-            let interrupt = binding_label(&CommandId::RequestInterrupt);
-            if matches!(
-                state.command_mode,
-                CommandMode::InterruptConfirmation { .. }
-            ) {
-                format!("active · {interrupt} again to interrupt")
-            } else {
-                format!("active · {interrupt} interrupt")
-            }
-        }
-    };
-    let context = agent_context(snapshot.session.agent.as_ref(), detail);
-    let left = if snapshot.session.status == SessionStatus::Active && !detail.shows_secondary() {
-        status
-    } else {
-        format!("{status} · {context}")
-    };
-    let activity_style = if snapshot.session.status == SessionStatus::Active {
-        theme.feedback.warning
-    } else {
-        theme.text.subdued
-    };
-    render_spread_line(
-        frame,
-        area,
-        &left,
-        activity_style,
-        &connection_status_text(state, ResponsiveDetail::CoreOnly),
-        status_style(state, theme),
-    );
-}
-
 fn agent_context(agent: Option<&AgentIdentity>, detail: ResponsiveDetail) -> String {
     match (agent, detail) {
         (None, _) => "Agent unavailable".to_owned(),
@@ -1578,15 +1621,18 @@ fn session_areas(
     header_height: u16,
     pending_height: u16,
     latest_height: u16,
+    composer_top_height: u16,
     composer_height: u16,
-) -> [Rect; 6] {
+    footer_height: u16,
+) -> [Rect; 7] {
     Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Min(1),
         Constraint::Length(pending_height),
         Constraint::Length(latest_height),
+        Constraint::Length(composer_top_height),
         Constraint::Length(composer_height),
-        Constraint::Length(1),
+        Constraint::Length(footer_height),
     ])
     .areas(area)
 }
@@ -2408,80 +2454,24 @@ fn horizontally_inset(area: Rect, padding: u16) -> Rect {
     )
 }
 
-fn render_landing_footer(
+fn render_slot(
     frame: &mut Frame<'_>,
-    state: &TuiState,
     area: Rect,
-    detail: ResponsiveDetail,
+    slot: RenderedSlot<Line<'static>>,
     theme: &Theme,
 ) {
-    let context = if detail.shows_secondary() {
-        format!(
-            "Agent unavailable · Workspace {}",
-            state.workspace.to_string_lossy()
-        )
-    } else {
-        "Agent unavailable".to_owned()
-    };
-    render_spread_line(
-        frame,
-        area,
-        &context,
-        theme.text.subdued,
-        &connection_status_text(state, detail),
-        status_style(state, theme),
-    );
-}
-
-fn render_spread_line(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    left: &str,
-    left_style: Style,
-    right: &str,
-    right_style: Style,
-) {
-    let width = usize::from(area.width);
-    if width == 0 {
-        return;
-    }
-    let right = truncate_to_width(right, width);
-    let right_width = right.width();
-    let gap = usize::from(!left.is_empty() && !right.is_empty()) * 2;
-    let left_width = width.saturating_sub(right_width.saturating_add(gap));
-    let left = truncate_to_width(left, left_width);
-    let spacing = " ".repeat(width.saturating_sub(left.width() + right_width));
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(left, left_style),
-            Span::raw(spacing),
-            Span::styled(right, right_style),
-        ])),
-        area,
-    );
-}
-
-fn truncate_to_width(value: &str, width: usize) -> String {
-    if value.width() <= width {
-        return value.to_owned();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let suffix = if width > 1 { "…" } else { "" };
-    let content_width = width.saturating_sub(suffix.width());
-    let mut result = String::new();
-    let mut used = 0;
-    for character in value.chars() {
-        let character_width = character.width().unwrap_or(0);
-        if used + character_width > content_width {
-            break;
-        }
-        result.push(character);
-        used += character_width;
-    }
-    result.push_str(suffix);
-    result
+    let rows = slot
+        .failures
+        .into_iter()
+        .map(|failure| {
+            Line::styled(
+                format!("Extension error · {}: {}", failure.slot, failure.message),
+                theme.feedback.error,
+            )
+        })
+        .chain(slot.content)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(rows), area);
 }
 
 fn connection_status_text(state: &TuiState, detail: ResponsiveDetail) -> String {
@@ -2614,5 +2604,163 @@ impl Drop for TerminalSession {
             Show
         );
         let _ = disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        buffer::{Buffer, Cell},
+        style::{Color, Style},
+    };
+
+    use super::slots::{Placement, RenderSlots, TestContribution};
+    use super::{Application, ApplicationEvent, SessionEvent};
+    use crate::protocol::{
+        Session, SessionId, SessionRevision, SessionSnapshot, SessionStatus, Workspace,
+    };
+
+    fn rendered_buffer(application: &Application) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("create test terminal");
+        terminal
+            .draw(|frame| application.render(frame))
+            .expect("render headless TUI application");
+        terminal.backend().buffer().clone()
+    }
+
+    fn rendered_rows(application: &Application) -> Vec<String> {
+        let buffer = rendered_buffer(application);
+        buffer
+            .content()
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    fn text_cell<'a>(buffer: &'a Buffer, needle: &str) -> &'a Cell {
+        for (y, row) in rendered_rows_from_buffer(buffer).into_iter().enumerate() {
+            if let Some(byte_offset) = row.find(needle) {
+                let x = row[..byte_offset].chars().count() as u16;
+                return buffer.cell((x, y as u16)).expect("text cell is in bounds");
+            }
+        }
+        panic!("rendered frame did not contain {needle:?}");
+    }
+
+    fn rendered_rows_from_buffer(buffer: &Buffer) -> Vec<String> {
+        buffer
+            .content()
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn named_slots_compose_in_order_and_isolate_failed_contributions() {
+        let slots = RenderSlots::testing([
+            TestContribution::home_footer(Placement::Prepend, Ok("prepend")),
+            TestContribution::home_footer(Placement::Replace, Err("replacement failed")),
+            TestContribution::home_footer(Placement::Append, Ok("append one")),
+            TestContribution::home_footer(Placement::Append, Ok("append two")),
+        ]);
+        let application = Application {
+            slots,
+            ..Application::default()
+        };
+
+        let rows = rendered_rows(&application);
+        let prepend = rows.iter().position(|row| row.contains("prepend")).unwrap();
+        let default = rows
+            .iter()
+            .position(|row| row.contains("Agent unavailable"))
+            .unwrap();
+        let append_one = rows
+            .iter()
+            .position(|row| row.contains("append one"))
+            .unwrap();
+        let append_two = rows
+            .iter()
+            .position(|row| row.contains("append two"))
+            .unwrap();
+        let failure = rows
+            .iter()
+            .position(|row| row.contains("Extension error · home.footer"))
+            .unwrap();
+
+        assert!(prepend < default);
+        assert!(default < append_one);
+        assert!(append_one < append_two);
+        assert!(failure < prepend);
+
+        let slots = RenderSlots::testing([
+            TestContribution::home_footer(Placement::Prepend, Ok("prepend")),
+            TestContribution::home_footer(Placement::Replace, Ok("replacement one")),
+            TestContribution::home_footer(Placement::Replace, Ok("replacement two")),
+            TestContribution::home_footer(Placement::Append, Ok("append")),
+        ]);
+        let application = Application {
+            slots,
+            ..Application::default()
+        };
+        let screen = rendered_rows(&application).join("\n");
+        assert!(screen.contains("prepend"));
+        assert!(screen.contains("replacement two"));
+        assert!(screen.contains("append"));
+        assert!(!screen.contains("replacement one"));
+        assert!(!screen.contains("Agent unavailable"));
+    }
+
+    #[test]
+    fn session_slots_render_with_their_typed_session_context() {
+        let session_id = SessionId::new();
+        let slots = RenderSlots::testing([
+            TestContribution::session_composer_top(Placement::Append, Ok("composer top")),
+            TestContribution::prompt_footer_status(Placement::Prepend, Ok("status extension"))
+                .styled(Style::default().fg(Color::LightMagenta)),
+            TestContribution::prompt_footer_status(Placement::Append, Err("status failed")),
+            TestContribution::prompt_footer_context(Placement::Append, Ok("context extension")),
+            TestContribution::prompt_footer(Placement::Append, Ok("footer extension")),
+        ]);
+        let mut application = Application {
+            slots,
+            ..Application::default()
+        };
+        application
+            .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+                SessionSnapshot {
+                    session: Session {
+                        id: session_id,
+                        workspace: Workspace {
+                            path: PathBuf::from("/workspace"),
+                        },
+                        agent: None,
+                        status: SessionStatus::Idle,
+                    },
+                    revision: SessionRevision::INITIAL,
+                    prompts: Vec::new(),
+                    turns: Vec::new(),
+                    messages: Vec::new(),
+                    activities: Vec::new(),
+                    transcript: Vec::new(),
+                },
+            )))
+            .expect("hydrate test Application");
+
+        let buffer = rendered_buffer(&application);
+        let screen = rendered_rows_from_buffer(&buffer).join("\n");
+        assert!(screen.contains("composer top"));
+        assert!(screen.contains("status extension · idle"));
+        assert!(screen.contains("Agent unavailable · context extension"));
+        assert!(screen.contains("footer extension"));
+        assert!(screen.contains("Extension error · prompt.footer.status: status failed"));
+        assert_eq!(
+            text_cell(&buffer, "status extension").fg,
+            Color::LightMagenta
+        );
+        assert_ne!(text_cell(&buffer, "idle").fg, Color::LightMagenta);
     }
 }

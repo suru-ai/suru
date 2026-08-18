@@ -4,12 +4,12 @@ use chidori::{
         SessionSubscription,
     },
     protocol::{
-        Activity, ActivityId, ActivityKind, AgentId, AgentIdentity, CounterSnapshot,
-        CreateSessionRequest, Health, InitialPrompt, LifecycleState, Message, MessageId,
-        MessageRole, MessageStatus, ModelId, Prompt, PromptDelivery, PromptId, PromptOrder,
-        PromptStatus, ProviderId, ServerIdentity, ServerShutdown, Session, SessionChange,
-        SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionUpdate, ShutdownReason,
-        TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        Activity, ActivityId, ActivityKind, AgentId, AgentIdentity, CreateSessionRequest, Health,
+        InitialPrompt, LifecycleState, Message, MessageId, MessageRole, MessageStatus, ModelId,
+        Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, ServerIdentity,
+        ServerShutdown, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
+        SessionStatus, SessionUpdate, ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus,
+        Workspace,
     },
     server::{self, AgentOutput, ServerConfig},
     tui::{
@@ -138,25 +138,11 @@ fn connected_application(workspace: &std::path::Path) -> Application {
         )))
         .expect("connect application");
     application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
-            CounterSnapshot {
-                instance_id,
-                value: 17,
-                revision: 17,
-            },
-        )))
-        .expect("confirm connected application");
-    application
 }
 
-fn connected_state(instance_id: Uuid, pid: u32, value: u64) -> TuiState {
+fn connected_state(instance_id: Uuid, pid: u32) -> TuiState {
     let mut state = TuiState::default();
     state.apply(ManagedEvent::Connected(ready_health(instance_id, pid)));
-    state.apply(ManagedEvent::Snapshot(CounterSnapshot {
-        instance_id,
-        value,
-        revision: value,
-    }));
     state
 }
 
@@ -166,26 +152,16 @@ fn headless_application_handles_terminal_and_managed_events_through_the_producti
         Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
     let mut application = Application::default();
 
-    application
+    let managed_transition = application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
             ready_health(instance_id, 42_424),
         )))
         .expect("handle connected event");
-    let managed_transition = application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
-            CounterSnapshot {
-                instance_id,
-                value: 17,
-                revision: 17,
-            },
-        )))
-        .expect("handle counter snapshot");
     assert_eq!(managed_transition, ApplicationTransition::Continue);
 
     let screen = rendered_application_rows(&application).join("\n");
     assert!(screen.contains("What would you like to work on?"));
     assert!(screen.contains("Prompt"));
-    assert!(!screen.contains("Chidori Counter"));
     assert!(screen.contains("Connected"));
     assert!(screen.contains("pid 42424"));
     assert!(screen.contains("c2f03bd2"));
@@ -236,7 +212,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
     .expect("connect managed client");
     let mut application = Application::new(workspace.path());
 
-    for _ in 0..3 {
+    for _ in 0..2 {
         application
             .handle_event(ApplicationEvent::Managed(
                 client.next().await.expect("managed event arrives"),
@@ -246,7 +222,6 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
     let landing = rendered_application_rows(&application).join("\n");
     assert!(landing.contains("What would you like to work on?"));
     assert!(landing.contains("Prompt"));
-    assert!(!landing.contains("Chidori Counter"));
 
     for character in "Explain this workspace".chars() {
         let command = command_for_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -304,7 +279,6 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
                 .as_ref()
         )
     );
-    assert!(!transcript.contains("Chidori Counter"));
 
     let mut observer = Application::new(workspace.path());
     observer
@@ -341,15 +315,6 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         )))
         .expect("connect attached client to original server");
     attached_with_landing_draft
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
-            CounterSnapshot {
-                instance_id: original_instance,
-                value: 0,
-                revision: 0,
-            },
-        )))
-        .expect("confirm original server identity");
-    attached_with_landing_draft
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
             "Saved landing draft".to_owned(),
         )))
@@ -367,15 +332,6 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
             ready_health(replacement_instance, 84_848),
         )))
         .expect("connect attached client to replacement");
-    attached_with_landing_draft
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
-            CounterSnapshot {
-                instance_id: replacement_instance,
-                value: 0,
-                revision: 0,
-            },
-        )))
-        .expect("confirm replacement for attached client");
     let recovered_collision = rendered_application_rows(&attached_with_landing_draft).join("\n");
     assert!(recovered_collision.contains("Recovered Session draft"));
     let previous_draft = command_for_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -401,20 +357,11 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
             },
         )))
         .expect("handle replacement recovery");
-    application
+    let replacement_transition = application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
             ready_health(replacement_instance, 84_848),
         )))
         .expect("handle replacement connection");
-    let replacement_transition = application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
-            CounterSnapshot {
-                instance_id: replacement_instance,
-                value: 0,
-                revision: 0,
-            },
-        )))
-        .expect("confirm replacement server snapshot");
     assert_eq!(replacement_transition, ApplicationTransition::SessionEnded);
     application
         .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(created)))
@@ -448,7 +395,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
     .await
     .expect("connect managed client");
     let mut application = Application::new(workspace.path());
-    for _ in 0..3 {
+    for _ in 0..2 {
         application
             .handle_event(ApplicationEvent::Managed(
                 client.next().await.expect("managed event arrives"),
@@ -691,12 +638,11 @@ fn connecting_view_exposes_connection_state_before_a_snapshot_arrives() {
 fn connected_view_centers_the_landing_composer_and_shows_server_identity() {
     let instance_id =
         Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
-    let state = connected_state(instance_id, 42_424, 17);
+    let state = connected_state(instance_id, 42_424);
 
     let screen = rendered_state_rows(&state).join("\n");
     assert!(screen.contains("What would you like to work on?"));
     assert!(screen.contains("Prompt"));
-    assert!(!screen.contains("Chidori Counter"));
     assert!(screen.contains("Connected"));
     assert!(screen.contains("pid 42424"));
     assert!(screen.contains("c2f03bd2"));
@@ -862,7 +808,7 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
 fn recovering_view_retains_the_landing_composer_and_last_server_identity() {
     let instance_id =
         Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
-    let mut state = connected_state(instance_id, 42_424, 17);
+    let mut state = connected_state(instance_id, 42_424);
 
     state.apply(ManagedEvent::Recovering(RecoveryStatus {
         attempt: 2,
@@ -927,15 +873,6 @@ fn reconnect_overlay_waits_for_the_grace_period_and_blocks_composer_input() {
             ready_health(instance_id, 42_424),
         )))
         .expect("reconnect to surviving server");
-    application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
-            CounterSnapshot {
-                instance_id,
-                value: 18,
-                revision: 18,
-            },
-        )))
-        .expect("hydrate recovered connection");
     let recovered = rendered_application_rows_at(&application, 80, 15).join("\n");
     assert!(!recovered.contains("Reconnecting to Chidori"));
     assert!(recovered.contains("Keep the Session visible"));
@@ -945,12 +882,12 @@ fn reconnect_overlay_waits_for_the_grace_period_and_blocks_composer_input() {
 }
 
 #[test]
-fn recovered_view_switches_identity_on_the_fresh_lifecycle_snapshot() {
+fn recovered_view_switches_identity_on_the_confirmed_connection() {
     let previous_instance_id = Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002")
         .expect("parse previous instance ID");
     let recovered_instance_id = Uuid::parse_str("a4cc72ad-5507-4d4f-89f4-a3f7f1119d41")
         .expect("parse recovered instance ID");
-    let mut state = connected_state(previous_instance_id, 42_424, 17);
+    let mut state = connected_state(previous_instance_id, 42_424);
     state.apply(ManagedEvent::Recovering(RecoveryStatus {
         attempt: 1,
         retry_in: Duration::ZERO,
@@ -960,17 +897,6 @@ fn recovered_view_switches_identity_on_the_fresh_lifecycle_snapshot() {
         84_848,
     )));
 
-    let awaiting_snapshot = rendered_state_rows(&state).join("\n");
-    assert!(awaiting_snapshot.contains("Recovering"));
-    assert!(awaiting_snapshot.contains("What would you like to work on?"));
-    assert!(awaiting_snapshot.contains("pid 42424"));
-    assert!(!awaiting_snapshot.contains("84848"));
-
-    state.apply(ManagedEvent::Snapshot(CounterSnapshot {
-        instance_id: recovered_instance_id,
-        value: 1,
-        revision: 1,
-    }));
     let recovered = rendered_state_rows(&state).join("\n");
     assert!(recovered.contains("Connected"));
     assert!(recovered.contains("pid 84848"));
@@ -981,7 +907,7 @@ fn recovered_view_switches_identity_on_the_fresh_lifecycle_snapshot() {
 fn manual_stop_view_retains_the_landing_screen_and_last_server_identity() {
     let instance_id =
         Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
-    let mut state = connected_state(instance_id, 42_424, 17);
+    let mut state = connected_state(instance_id, 42_424);
 
     state.apply(ManagedEvent::ServerShutdown(ServerShutdown {
         instance_id,
@@ -999,7 +925,7 @@ fn manual_stop_view_retains_the_landing_screen_and_last_server_identity() {
 fn fatal_protocol_error_is_rendered_visibly_with_the_last_known_state() {
     let instance_id =
         Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
-    let mut state = connected_state(instance_id, 42_424, 17);
+    let mut state = connected_state(instance_id, 42_424);
 
     state.apply(ManagedEvent::Fatal(
         "server sent unknown event type 'future_event'".to_owned(),

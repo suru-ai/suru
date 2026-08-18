@@ -15,9 +15,9 @@ use tokio::{
 use crate::{
     RuntimeConfig,
     protocol::{
-        AdmitPromptRequest, CounterSnapshot, CounterUpdate, CreateSessionRequest, Health,
-        LifecycleState, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionError,
-        SessionId, SessionSnapshot, SessionSummary, ShutdownReason, Turn, TurnId,
+        AdmitPromptRequest, CreateSessionRequest, Health, LifecycleState, Prompt, PromptId,
+        RuntimeDescriptor, ServerShutdown, SessionError, SessionId, SessionSnapshot,
+        SessionSummary, ShutdownReason, Turn, TurnId,
     },
 };
 
@@ -79,8 +79,6 @@ impl ManagedClientConfig {
 pub enum ManagedEvent {
     Connecting,
     Connected(Health),
-    Snapshot(CounterSnapshot),
-    CounterUpdated(CounterUpdate),
     Recovering(RecoveryStatus),
     ServerShutdown(ServerShutdown),
     Fatal(String),

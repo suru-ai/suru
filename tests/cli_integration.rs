@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
     fs::{File, OpenOptions},
+    io::Write,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -22,9 +23,8 @@ use chidori::{
         ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus, start_server,
     },
     protocol::{
-        COUNTER_UPDATED_EVENT, CounterSnapshot, CounterUpdate, Health, LifecycleState,
-        PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SNAPSHOT_EVENT, ServerIdentity,
-        ServerShutdown, ShutdownReason,
+        Health, LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
+        ServerIdentity, ServerShutdown, ShutdownReason,
     },
     server::{self, ServerConfig},
 };
@@ -88,17 +88,15 @@ async fn launching_current_build_replaces_an_authenticated_mismatched_server() {
     let mut client = ManagedClient::connect(config)
         .await
         .expect("connect to replacement server");
-    let (identity, snapshot) = receive_initial_state(&mut client).await;
+    let identity = receive_initial_state(&mut client).await;
     assert_eq!(identity.instance_id, replacement.instance_id);
-    assert_eq!(snapshot.instance_id, replacement.instance_id);
-    assert!(snapshot.revision < 41, "replacement counter should reset");
 
     drop(client);
     stop_test_server(state_dir.path(), channel);
 }
 
 #[tokio::test]
-async fn attached_client_reconnects_to_the_replacement_and_its_fresh_snapshot() {
+async fn attached_client_reconnects_to_the_replacement() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "attached-build-replacement-test";
     let old_executable = inert_server_executable(state_dir.path());
@@ -115,13 +113,10 @@ async fn attached_client_reconnects_to_the_replacement_and_its_fresh_snapshot() 
     let mut also_attached = ManagedClient::connect(old_config)
         .await
         .expect("attach another client to the original server");
-    let (original_identity, original_snapshot) = receive_initial_state(&mut attached).await;
-    let (also_original_identity, also_original_snapshot) =
-        receive_initial_state(&mut also_attached).await;
+    let original_identity = receive_initial_state(&mut attached).await;
+    let also_original_identity = receive_initial_state(&mut also_attached).await;
     assert_eq!(original_identity.instance_id, previous.instance_id);
     assert_eq!(also_original_identity.instance_id, previous.instance_id);
-    assert_eq!(original_snapshot.value, 41);
-    assert_eq!(also_original_snapshot.value, 41);
 
     let current_config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure current-build managed client")
@@ -133,17 +128,11 @@ async fn attached_client_reconnects_to_the_replacement_and_its_fresh_snapshot() 
         receive_recovered_state(&mut attached, previous.instance_id),
         receive_recovered_state(&mut also_attached, previous.instance_id),
     );
-    let (reconnected, fresh_snapshot) = first_reconnected;
-    let (also_reconnected, also_fresh_snapshot) = second_reconnected;
+    let reconnected = first_reconnected;
+    let also_reconnected = second_reconnected;
 
     assert_eq!(reconnected.instance_id, replacement.instance_id);
     assert_eq!(also_reconnected.instance_id, replacement.instance_id);
-    assert_eq!(fresh_snapshot.instance_id, replacement.instance_id);
-    assert_eq!(also_fresh_snapshot.instance_id, replacement.instance_id);
-    assert!(fresh_snapshot.value < original_snapshot.value);
-    assert!(fresh_snapshot.revision < original_snapshot.revision);
-    assert!(also_fresh_snapshot.value < also_original_snapshot.value);
-    assert!(also_fresh_snapshot.revision < also_original_snapshot.revision);
     assert_eq!(
         fixture
             .shutdown_request()
@@ -155,7 +144,7 @@ async fn attached_client_reconnects_to_the_replacement_and_its_fresh_snapshot() 
     let mut current = ManagedClient::connect(current_config)
         .await
         .expect("attach a current-build client to the replacement");
-    let (current_identity, _) = receive_initial_state(&mut current).await;
+    let current_identity = receive_initial_state(&mut current).await;
     assert_eq!(current_identity.instance_id, replacement.instance_id);
     drop(also_attached);
 
@@ -164,13 +153,11 @@ async fn attached_client_reconnects_to_the_replacement_and_its_fresh_snapshot() 
         receive_recovered_state(&mut attached, replacement.instance_id),
         receive_recovered_state(&mut current, replacement.instance_id),
     );
-    let (restarted, restarted_snapshot) = old_recovery;
-    let (current_restarted, _) = current_recovery;
+    let restarted = old_recovery;
+    let current_restarted = current_recovery;
     assert_ne!(restarted.instance_id, replacement.instance_id);
     assert_eq!(restarted.instance_id, current_restarted.instance_id);
     assert_eq!(restarted.build_identity, replacement.build_identity);
-    assert_eq!(restarted_snapshot.instance_id, restarted.instance_id);
-    assert!(restarted_snapshot.revision < 41);
 
     drop(attached);
     drop(current);
@@ -259,7 +246,7 @@ async fn launcher_replaces_a_build_and_protocol_mismatch_before_connecting() {
     let mut client = ManagedClient::connect(config)
         .await
         .expect("replace the stale build and connect the launching client");
-    let (replacement, snapshot) = receive_initial_state(&mut client).await;
+    let replacement = receive_initial_state(&mut client).await;
 
     assert_ne!(replacement.instance_id, previous.instance_id);
     assert_ne!(replacement.pid, previous.pid);
@@ -274,8 +261,6 @@ async fn launcher_replaces_a_build_and_protocol_mismatch_before_connecting() {
         mismatched.is_stopped(),
         "launcher returned before the exact stale instance released its channel lock"
     );
-    assert_eq!(snapshot.instance_id, replacement.instance_id);
-    assert!(snapshot.revision < 41, "replacement snapshot must be fresh");
 
     drop(client);
     stop_test_server(state_dir.path(), channel);
@@ -473,7 +458,7 @@ async fn simultaneous_launchers_converge_on_one_authenticated_server() {
 
     let mut identities = Vec::new();
     for client in &mut clients {
-        identities.push(receive_initial_state(client).await.0);
+        identities.push(receive_initial_state(client).await);
     }
     let winner = identities.first().expect("at least one server identity");
     assert!(identities.iter().all(|identity| {
@@ -500,8 +485,8 @@ async fn managed_clients_recover_from_a_crash_and_converge_on_one_replacement() 
     let mut second = ManagedClient::connect(config)
         .await
         .expect("connect second managed client");
-    let (first_identity, _) = receive_initial_state(&mut first).await;
-    let (second_identity, _) = receive_initial_state(&mut second).await;
+    let first_identity = receive_initial_state(&mut first).await;
+    let second_identity = receive_initial_state(&mut second).await;
     assert_eq!(first_identity.instance_id, second_identity.instance_id);
 
     stop_test_server(state_dir.path(), channel);
@@ -510,49 +495,24 @@ async fn managed_clients_recover_from_a_crash_and_converge_on_one_replacement() 
         receive_recovered_state(&mut first, first_identity.instance_id),
         receive_recovered_state(&mut second, second_identity.instance_id),
     );
-    assert_ne!(first_recovered.0.instance_id, first_identity.instance_id);
-    assert_eq!(
-        first_recovered.0.instance_id,
-        second_recovered.0.instance_id
-    );
-    assert_eq!(first_recovered.0.pid, second_recovered.0.pid);
-    assert_eq!(first_recovered.1.instance_id, first_recovered.0.instance_id);
-    assert_eq!(
-        second_recovered.1.instance_id,
-        second_recovered.0.instance_id
-    );
-
-    let (first_update, second_update) = tokio::join!(
-        receive_counter_update(&mut first),
-        receive_counter_update(&mut second),
-    );
-    assert!(first_update.value > first_recovered.1.value);
-    assert!(second_update.value > second_recovered.1.value);
+    assert_ne!(first_recovered.instance_id, first_identity.instance_id);
+    assert_eq!(first_recovered.instance_id, second_recovered.instance_id);
+    assert_eq!(first_recovered.pid, second_recovered.pid);
 
     drop(first);
-    let later_second_update = receive_counter_update(&mut second).await;
-    assert!(later_second_update.value > second_update.value);
-
     drop(second);
     stop_test_server(state_dir.path(), channel);
 }
 
-async fn receive_recovered_state(
-    client: &mut ManagedClient,
-    previous_instance_id: Uuid,
-) -> (Health, CounterSnapshot) {
+async fn receive_recovered_state(client: &mut ManagedClient, previous_instance_id: Uuid) -> Health {
     timeout(Duration::from_secs(10), async {
         let mut saw_recovering = false;
-        let mut recovered_identity = None;
         loop {
             match client.next().await.expect("managed client remains open") {
                 ManagedEvent::Recovering(_) => saw_recovering = true,
                 ManagedEvent::Connected(identity) if saw_recovering => {
                     assert_ne!(identity.instance_id, previous_instance_id);
-                    recovered_identity = Some(identity);
-                }
-                ManagedEvent::Snapshot(snapshot) if recovered_identity.is_some() => {
-                    return (recovered_identity.expect("recovered identity"), snapshot);
+                    return identity;
                 }
                 ManagedEvent::Fatal(error) => panic!("managed client recovery failed: {error}"),
                 _ => {}
@@ -561,20 +521,6 @@ async fn receive_recovered_state(
     })
     .await
     .expect("managed client recovers from the crashed server")
-}
-
-async fn receive_counter_update(client: &mut ManagedClient) -> chidori::protocol::CounterUpdate {
-    timeout(Duration::from_secs(2), async {
-        loop {
-            match client.next().await.expect("managed client remains open") {
-                ManagedEvent::CounterUpdated(update) => return update,
-                ManagedEvent::Fatal(error) => panic!("managed client failed: {error}"),
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("counter updates resume after recovery")
 }
 
 #[tokio::test]
@@ -674,59 +620,12 @@ async fn dropping_a_recovering_client_cancels_its_next_network_attempt_promptly(
 }
 
 #[tokio::test]
-async fn lagging_managed_client_recovers_and_converges_on_a_fresh_snapshot() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let channel = "lagging-managed-client-test";
-    let fixture = ReadinessFixture::spawn_rapid_updates(state_dir.path(), channel).await;
-    let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir.path(), channel)
-            .expect("configure managed client")
-            .with_server_executable(inert_server_executable(state_dir.path())),
-    )
-    .await
-    .expect("connect managed client");
-    let (identity, initial_snapshot) = receive_initial_state(&mut client).await;
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let recovered_snapshot = timeout(Duration::from_secs(2), async {
-        let mut saw_recovering = false;
-        let mut saw_reconnected_identity = false;
-        let mut last_update_revision = initial_snapshot.revision;
-        loop {
-            match client.next().await.expect("managed client remains open") {
-                ManagedEvent::CounterUpdated(update) if !saw_recovering => {
-                    assert!(update.revision > last_update_revision);
-                    last_update_revision = update.revision;
-                }
-                ManagedEvent::Recovering(_) => saw_recovering = true,
-                ManagedEvent::Connected(reconnected) if saw_recovering => {
-                    assert_eq!(reconnected.instance_id, identity.instance_id);
-                    saw_reconnected_identity = true;
-                }
-                ManagedEvent::Snapshot(snapshot) if saw_reconnected_identity => {
-                    assert!(snapshot.revision > last_update_revision);
-                    break snapshot;
-                }
-                ManagedEvent::Fatal(error) => panic!("lag recovery failed: {error}"),
-                event => panic!("unexpected event during lag recovery: {event:?}"),
-            }
-        }
-    })
-    .await
-    .expect("lagging client abandons its incomplete stream and recovers");
-
-    assert_eq!(recovered_snapshot.instance_id, identity.instance_id);
-    assert!(fixture.event_requests() >= 2);
-}
-
-#[tokio::test]
 async fn managed_client_surfaces_protocol_corruption_as_ordered_fatal_events() {
     for (channel, violation, expected_error) in [
         (
             "malformed-event-json-test",
             ProtocolViolation::MalformedJson,
-            "decode counter snapshot",
+            "decode server shutdown intent",
         ),
         (
             "unknown-event-tag-test",
@@ -737,21 +636,6 @@ async fn managed_client_surfaces_protocol_corruption_as_ordered_fatal_events() {
             "event-instance-identity-test",
             ProtocolViolation::UnexpectedInstance,
             "unexpected server instance",
-        ),
-        (
-            "update-before-snapshot-test",
-            ProtocolViolation::UpdateBeforeSnapshot,
-            "counter update before its snapshot",
-        ),
-        (
-            "duplicate-snapshot-test",
-            ProtocolViolation::DuplicateSnapshot,
-            "more than one snapshot",
-        ),
-        (
-            "non-monotonic-revision-test",
-            ProtocolViolation::NonMonotonicRevision,
-            "revision is not monotonic",
         ),
     ] {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -773,20 +657,17 @@ async fn managed_client_surfaces_protocol_corruption_as_ordered_fatal_events() {
             client.next().await,
             Some(ManagedEvent::Connected(_))
         ));
-        let fatal = timeout(Duration::from_secs(1), async {
-            loop {
-                match client.next().await.expect("managed client remains open") {
-                    ManagedEvent::Snapshot(_) => {}
-                    ManagedEvent::Fatal(error) => break error,
-                    ManagedEvent::Recovering(status) => {
-                        panic!("protocol corruption was retried: {status:?}")
-                    }
-                    event => panic!("unexpected event before fatal failure: {event:?}"),
-                }
+        let fatal = match timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("protocol corruption becomes a prompt fatal event")
+            .expect("managed client remains open")
+        {
+            ManagedEvent::Fatal(error) => error,
+            ManagedEvent::Recovering(status) => {
+                panic!("protocol corruption was retried: {status:?}")
             }
-        })
-        .await
-        .expect("protocol corruption becomes a prompt fatal event");
+            event => panic!("unexpected event before fatal failure: {event:?}"),
+        };
 
         assert!(
             fatal.contains(expected_error),
@@ -794,45 +675,6 @@ async fn managed_client_surfaces_protocol_corruption_as_ordered_fatal_events() {
         );
         assert!(client.next().await.is_none());
     }
-}
-
-#[tokio::test]
-async fn managed_client_rejects_revision_regression_across_same_instance_recovery() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let channel = "recovered-revision-regression-test";
-    let _fixture =
-        ReadinessFixture::spawn_recovered_revision_regression(state_dir.path(), channel).await;
-    let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir.path(), channel)
-            .expect("configure managed client")
-            .with_server_executable(inert_server_executable(state_dir.path())),
-    )
-    .await
-    .expect("connect managed client");
-    let (identity, snapshot) = receive_initial_state(&mut client).await;
-    assert_eq!(snapshot.revision, 5);
-
-    let fatal = timeout(Duration::from_secs(1), async {
-        let mut saw_recovering = false;
-        loop {
-            match client.next().await.expect("managed client remains open") {
-                ManagedEvent::Recovering(_) => saw_recovering = true,
-                ManagedEvent::Connected(reconnected) if saw_recovering => {
-                    assert_eq!(reconnected.instance_id, identity.instance_id);
-                }
-                ManagedEvent::Fatal(error) => break error,
-                ManagedEvent::Snapshot(regressed) => {
-                    panic!("accepted regressed snapshot after recovery: {regressed:?}")
-                }
-                event => panic!("unexpected event during recovery: {event:?}"),
-            }
-        }
-    })
-    .await
-    .expect("same-instance revision regression becomes a fatal error");
-
-    assert!(fatal.contains("snapshot revision is not monotonic across recovery"));
-    assert!(client.next().await.is_none());
 }
 
 #[tokio::test]
@@ -847,7 +689,7 @@ async fn authenticated_shutdown_intent_does_not_trigger_crash_recovery() {
     )
     .await
     .expect("connect managed client");
-    let (identity, _) = receive_initial_state(&mut client).await;
+    let identity = receive_initial_state(&mut client).await;
 
     let shutdown = timeout(Duration::from_secs(1), client.next())
         .await
@@ -929,7 +771,7 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
     )
     .await
     .expect("recover from stale descriptor");
-    let (identity, _) = receive_initial_state(&mut client).await;
+    let identity = receive_initial_state(&mut client).await;
 
     assert_ne!(identity.pid, unrelated.0.id());
     assert!(
@@ -967,7 +809,7 @@ async fn managed_client_recovers_from_malformed_and_partially_written_descriptor
         )
         .await
         .expect("recover from invalid runtime descriptor");
-        let (identity, _) = receive_initial_state(&mut client).await;
+        let identity = receive_initial_state(&mut client).await;
         let published = read_runtime_descriptor(runtime_dir.join("runtime.json"));
         assert_eq!(published.instance_id, identity.instance_id);
         assert_eq!(published.pid, identity.pid);
@@ -1006,7 +848,7 @@ async fn reuse_requires_an_authenticated_matching_server_identity() {
         )
         .await
         .expect("replace unauthenticated or identity-inconsistent registration");
-        let (identity, _) = receive_initial_state(&mut client).await;
+        let identity = receive_initial_state(&mut client).await;
         assert_ne!(identity.instance_id, decoy.descriptor().instance_id);
 
         drop(client);
@@ -1172,21 +1014,17 @@ async fn server_stop_notifies_attached_clients_and_remains_stopped() {
     assert!(stdout.contains(&descriptor.pid.to_string()));
     assert!(stdout.contains(&descriptor.instance_id.to_string()));
 
-    let shutdown = timeout(Duration::from_secs(1), async {
-        loop {
-            match managed.next().await {
-                Some(ManagedEvent::ServerShutdown(shutdown)) => break shutdown,
-                Some(ManagedEvent::CounterUpdated(_)) => {}
-                Some(ManagedEvent::Recovering(status)) => {
-                    panic!("manual stop triggered recovery: {status:?}")
-                }
-                Some(event) => panic!("expected manual shutdown intent, got {event:?}"),
-                None => panic!("attached client closed before manual intent"),
-            }
+    let shutdown = match timeout(Duration::from_secs(1), managed.next())
+        .await
+        .expect("attached client receives manual stop intent")
+    {
+        Some(ManagedEvent::ServerShutdown(shutdown)) => shutdown,
+        Some(ManagedEvent::Recovering(status)) => {
+            panic!("manual stop triggered recovery: {status:?}")
         }
-    })
-    .await
-    .expect("attached client receives manual stop intent");
+        Some(event) => panic!("expected manual shutdown intent, got {event:?}"),
+        None => panic!("attached client closed before manual intent"),
+    };
     assert_eq!(shutdown.instance_id, descriptor.instance_id);
     assert_eq!(shutdown.reason, ShutdownReason::Manual);
     assert!(matches!(
@@ -1339,16 +1177,85 @@ async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
 }
 
 #[cfg(target_os = "linux")]
+#[tokio::test]
+async fn clean_tui_exit_restores_the_terminal() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "clean-tui-exit-test";
+    let started = run_server_cli(state_dir.path(), channel, "start").await;
+    assert!(
+        started.status.success(),
+        "server start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let binary = AttachedTuiGuard::escaped_binary();
+    let tui_command = format!(
+        "stty rows 24 cols 80; original_stty=$(stty -g); '{binary}'; chidori_status=$?; restored_stty=$(stty -g); if [ \"$original_stty\" = \"$restored_stty\" ]; then printf '\\n__CHIDORI_STTY_RESTORED__\\n'; else printf '\\n__CHIDORI_STTY_CHANGED__:%s:%s\\n' \"$original_stty\" \"$restored_stty\"; fi; exit $chidori_status"
+    );
+    let mut tui = AttachedTuiGuard::spawn_shell_command(state_dir.path(), channel, &tui_command);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(tui.is_running(), "TUI exited before clean-exit input");
+    tui.child_mut()
+        .stdin
+        .as_mut()
+        .expect("TUI stdin remains open")
+        .write_all(b"\x03")
+        .expect("send Ctrl+C to the empty composer");
+    timeout(Duration::from_secs(2), async {
+        while tui.is_running() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("TUI exits cleanly after Ctrl+C");
+
+    let output = tui.wait_with_output();
+    assert!(
+        output.status.success(),
+        "clean TUI exit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let screen = String::from_utf8_lossy(&output.stdout);
+    for sequence in [
+        "\u{1b}[?1049h",
+        "\u{1b}[?1049l",
+        "\u{1b}[?25l",
+        "\u{1b}[?25h",
+    ] {
+        assert!(
+            screen.contains(sequence),
+            "missing terminal sequence {sequence:?}"
+        );
+    }
+    assert!(screen.contains("\u{1b}[?2004h"));
+    assert!(screen.contains("\u{1b}[?2004l"));
+    assert!(
+        screen.contains("__CHIDORI_STTY_RESTORED__"),
+        "clean exit did not restore raw mode: {screen:?}"
+    );
+
+    stop_test_server(state_dir.path(), channel);
+}
+
+#[cfg(target_os = "linux")]
 struct AttachedTuiGuard(Option<Child>);
 
 #[cfg(target_os = "linux")]
 impl AttachedTuiGuard {
     fn spawn(state_dir: &std::path::Path, channel: &str) -> Self {
-        let binary = env!("CARGO_BIN_EXE_chidori").replace('\'', "'\\''");
+        let binary = Self::escaped_binary();
         let tui_command = format!("stty rows 24 cols 80; exec '{binary}'");
+        Self::spawn_shell_command(state_dir, channel, &tui_command)
+    }
+
+    fn escaped_binary() -> String {
+        env!("CARGO_BIN_EXE_chidori").replace('\'', "'\\''")
+    }
+
+    fn spawn_shell_command(state_dir: &std::path::Path, channel: &str, tui_command: &str) -> Self {
         Self(Some(
             Command::new("script")
-                .args(["-qef", "/dev/null", "-c", &tui_command])
+                .args(["-qef", "/dev/null", "-c", tui_command])
                 .env("CHIDORI_STATE_DIR", state_dir)
                 .env("CHIDORI_CHANNEL", channel)
                 .stdin(Stdio::piped())
@@ -1453,7 +1360,7 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
     )
     .await
     .expect("connect after start command has exited");
-    let (identity, _) = receive_initial_state(&mut client).await;
+    let identity = receive_initial_state(&mut client).await;
     assert_ne!(identity.pid, std::process::id());
     assert_eq!(identity.pid, first_descriptor.pid);
     assert_eq!(identity.instance_id, first_descriptor.instance_id);
@@ -1506,7 +1413,7 @@ async fn managed_client_starts_a_missing_server_before_streaming_initial_state()
         .await
         .expect("connect through managed startup");
 
-    let (identity, _) = receive_initial_state(&mut client).await;
+    let identity = receive_initial_state(&mut client).await;
     assert_ne!(identity.pid, std::process::id());
 
     drop(client);
@@ -1514,7 +1421,7 @@ async fn managed_client_starts_a_missing_server_before_streaming_initial_state()
 }
 
 #[tokio::test]
-async fn sequential_managed_clients_reuse_the_persistent_advancing_server() {
+async fn sequential_managed_clients_reuse_the_persistent_server() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "managed-reuse-test";
     let config = ManagedClientConfig::new(state_dir.path(), channel)
@@ -1524,20 +1431,16 @@ async fn sequential_managed_clients_reuse_the_persistent_advancing_server() {
     let mut first = ManagedClient::connect(config.clone())
         .await
         .expect("connect first managed client");
-    let (first_identity, first_snapshot) = receive_initial_state(&mut first).await;
+    let first_identity = receive_initial_state(&mut first).await;
     drop(first);
-
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
 
     let mut second = ManagedClient::connect(config)
         .await
         .expect("connect second managed client");
-    let (second_identity, second_snapshot) = receive_initial_state(&mut second).await;
+    let second_identity = receive_initial_state(&mut second).await;
 
     assert_eq!(second_identity.pid, first_identity.pid);
     assert_eq!(second_identity.instance_id, first_identity.instance_id);
-    assert_eq!(second_snapshot.instance_id, first_snapshot.instance_id);
-    assert!(second_snapshot.value > first_snapshot.value);
 
     drop(second);
     stop_test_server(state_dir.path(), channel);
@@ -1569,7 +1472,7 @@ async fn managed_client_waits_through_transitional_lifecycle_before_opening_even
             .expect("managed client connects");
 
         assert!(fixture.events_opened.load(Ordering::SeqCst));
-        let (identity, _) = receive_initial_state(&mut client).await;
+        let identity = receive_initial_state(&mut client).await;
         assert_eq!(identity.lifecycle, LifecycleState::Ready);
     }
 }
@@ -1661,18 +1564,15 @@ struct ReadinessState {
     events_opened: Arc<AtomicBool>,
     events_ready: Arc<AtomicBool>,
     event_requests: Arc<AtomicUsize>,
-    counter: Arc<AtomicUsize>,
     event_behavior: FixtureEventBehavior,
 }
 
 #[derive(Clone, Copy)]
 enum FixtureEventBehavior {
     StayConnected,
-    DisconnectAfterSnapshot,
-    ShutdownAfterSnapshot,
-    RapidUpdates,
+    DisconnectAfterConnected,
+    ShutdownAfterConnected,
     ProtocolViolation(ProtocolViolation),
-    RegressingRecoverySnapshot,
 }
 
 #[derive(Clone, Copy)]
@@ -1680,9 +1580,6 @@ enum ProtocolViolation {
     MalformedJson,
     UnknownEvent,
     UnexpectedInstance,
-    UpdateBeforeSnapshot,
-    DuplicateSnapshot,
-    NonMonotonicRevision,
 }
 
 struct ReadinessFixture {
@@ -1713,7 +1610,7 @@ impl ReadinessFixture {
             state_dir,
             channel,
             LifecycleState::Ready,
-            FixtureEventBehavior::DisconnectAfterSnapshot,
+            FixtureEventBehavior::DisconnectAfterConnected,
         )
         .await
     }
@@ -1723,17 +1620,7 @@ impl ReadinessFixture {
             state_dir,
             channel,
             LifecycleState::Ready,
-            FixtureEventBehavior::ShutdownAfterSnapshot,
-        )
-        .await
-    }
-
-    async fn spawn_rapid_updates(state_dir: &std::path::Path, channel: &str) -> Self {
-        Self::spawn_with_event_behavior(
-            state_dir,
-            channel,
-            LifecycleState::Ready,
-            FixtureEventBehavior::RapidUpdates,
+            FixtureEventBehavior::ShutdownAfterConnected,
         )
         .await
     }
@@ -1763,19 +1650,6 @@ impl ReadinessFixture {
             LifecycleState::Ready,
             FixtureEventBehavior::ProtocolViolation(violation),
             chidori_binary_build_identity(),
-        )
-        .await
-    }
-
-    async fn spawn_recovered_revision_regression(
-        state_dir: &std::path::Path,
-        channel: &str,
-    ) -> Self {
-        Self::spawn_with_event_behavior(
-            state_dir,
-            channel,
-            LifecycleState::Ready,
-            FixtureEventBehavior::RegressingRecoverySnapshot,
         )
         .await
     }
@@ -1828,14 +1702,12 @@ impl ReadinessFixture {
         let events_opened = Arc::new(AtomicBool::new(false));
         let events_ready = Arc::new(AtomicBool::new(true));
         let event_requests = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::new(AtomicUsize::new(0));
         let state = ReadinessState {
             descriptor,
             lifecycle: lifecycle.clone(),
             events_opened: events_opened.clone(),
             events_ready: events_ready.clone(),
             event_requests: event_requests.clone(),
-            counter,
             event_behavior,
         };
         let app = Router::new()
@@ -1889,19 +1761,20 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let instance_id = state.descriptor.instance_id;
-    let current = state.counter.load(Ordering::SeqCst) as u64;
+    let connected = || {
+        stream::once(std::future::ready(Ok::<_, Infallible>(
+            Event::default().comment("connected"),
+        )))
+    };
     match state.event_behavior {
         FixtureEventBehavior::StayConnected => {
-            Sse::new(fixture_snapshot_stream(instance_id, current).chain(stream::pending()))
-                .into_response()
+            Sse::new(connected().chain(stream::pending())).into_response()
         }
-        FixtureEventBehavior::DisconnectAfterSnapshot if request_index > 0 => {
+        FixtureEventBehavior::DisconnectAfterConnected if request_index > 0 => {
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
-        FixtureEventBehavior::DisconnectAfterSnapshot => {
-            Sse::new(fixture_snapshot_stream(instance_id, current)).into_response()
-        }
-        FixtureEventBehavior::ShutdownAfterSnapshot => {
+        FixtureEventBehavior::DisconnectAfterConnected => Sse::new(connected()).into_response(),
+        FixtureEventBehavior::ShutdownAfterConnected => {
             let shutdown = ServerShutdown {
                 instance_id,
                 reason: ShutdownReason::Manual,
@@ -1910,36 +1783,11 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
                 Ok::<_, Infallible>(
                     Event::default()
                         .event(SERVER_SHUTDOWN_EVENT)
-                        .id(current.to_string())
                         .json_data(shutdown)
                         .expect("serialize shutdown intent"),
                 )
             });
-            Sse::new(fixture_snapshot_stream(instance_id, current).chain(shutdown_event))
-                .into_response()
-        }
-        FixtureEventBehavior::RapidUpdates => {
-            let updates = stream::unfold(
-                (
-                    tokio::time::interval(Duration::from_millis(1)),
-                    state.counter.clone(),
-                ),
-                |(mut interval, counter)| async move {
-                    interval.tick().await;
-                    let revision = counter.fetch_add(1, Ordering::SeqCst) as u64 + 1;
-                    let update = CounterUpdate {
-                        value: revision,
-                        revision,
-                    };
-                    let event = Event::default()
-                        .event(COUNTER_UPDATED_EVENT)
-                        .id(revision.to_string())
-                        .json_data(update)
-                        .expect("serialize fixture counter update");
-                    Some((Ok::<_, Infallible>(event), (interval, counter)))
-                },
-            );
-            Sse::new(fixture_snapshot_stream(instance_id, current).chain(updates)).into_response()
+            Sse::new(connected().chain(shutdown_event)).into_response()
         }
         FixtureEventBehavior::ProtocolViolation(violation) => {
             let events = protocol_violation_events(&state, violation)
@@ -1947,64 +1795,26 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
                 .map(Ok::<_, Infallible>);
             Sse::new(stream::iter(events)).into_response()
         }
-        FixtureEventBehavior::RegressingRecoverySnapshot => {
-            let revision = if request_index == 0 { 5 } else { 4 };
-            Sse::new(fixture_snapshot_stream(instance_id, revision)).into_response()
-        }
     }
 }
 
-fn fixture_snapshot_stream(
-    instance_id: Uuid,
-    revision: u64,
-) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
-    stream::once(std::future::ready(Ok(fixture_snapshot_event(
-        instance_id,
-        revision,
-    ))))
-}
-
-fn fixture_snapshot_event(instance_id: Uuid, revision: u64) -> Event {
-    Event::default()
-        .event(SNAPSHOT_EVENT)
-        .id(revision.to_string())
-        .json_data(CounterSnapshot {
-            instance_id,
-            value: revision,
-            revision,
-        })
-        .expect("serialize fixture snapshot")
-}
-
-fn protocol_violation_events(state: &ReadinessState, violation: ProtocolViolation) -> Vec<Event> {
-    let update = |value: u64, revision: u64| {
-        Event::default()
-            .event(COUNTER_UPDATED_EVENT)
-            .id(revision.to_string())
-            .json_data(CounterUpdate { value, revision })
-            .expect("serialize fixture counter update")
-    };
+fn protocol_violation_events(_state: &ReadinessState, violation: ProtocolViolation) -> Vec<Event> {
     match violation {
         ProtocolViolation::MalformedJson => {
-            vec![Event::default().event(SNAPSHOT_EVENT).id("0").data("{")]
+            vec![Event::default().event(SERVER_SHUTDOWN_EVENT).data("{")]
         }
         ProtocolViolation::UnknownEvent => {
-            vec![Event::default().event("future_event").id("0").data("{}")]
+            vec![Event::default().event("future_event").data("{}")]
         }
-        ProtocolViolation::UnexpectedInstance => {
-            vec![fixture_snapshot_event(Uuid::new_v4(), 0)]
-        }
-        ProtocolViolation::UpdateBeforeSnapshot => vec![update(1, 1)],
-        ProtocolViolation::DuplicateSnapshot => vec![
-            fixture_snapshot_event(state.descriptor.instance_id, 0),
-            fixture_snapshot_event(state.descriptor.instance_id, 0),
+        ProtocolViolation::UnexpectedInstance => vec![
+            Event::default()
+                .event(SERVER_SHUTDOWN_EVENT)
+                .json_data(ServerShutdown {
+                    instance_id: Uuid::new_v4(),
+                    reason: ShutdownReason::Manual,
+                })
+                .expect("serialize shutdown intent for an unexpected server"),
         ],
-        ProtocolViolation::NonMonotonicRevision => {
-            vec![
-                fixture_snapshot_event(state.descriptor.instance_id, 2),
-                update(3, 2),
-            ]
-        }
     }
 }
 
@@ -2186,20 +1996,8 @@ async fn build_replacement_events(
     if !fixture_authenticated(&headers, &descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let snapshot = CounterSnapshot {
-        instance_id: descriptor.instance_id,
-        value: 41,
-        revision: 41,
-    };
-    let first = stream::once(async move {
-        Ok::<_, Infallible>(
-            Event::default()
-                .event(SNAPSHOT_EVENT)
-                .id("41")
-                .json_data(snapshot)
-                .expect("serialize old-build snapshot"),
-        )
-    });
+    let first =
+        stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) });
     let shutdowns = stream::unfold(
         state.shutdown_intent.subscribe(),
         |mut shutdown_intent| async move {
@@ -2207,7 +2005,6 @@ async fn build_replacement_events(
             let shutdown = shutdown_intent.borrow_and_update().clone()?;
             let event = Event::default()
                 .event(SERVER_SHUTDOWN_EVENT)
-                .id("41")
                 .json_data(shutdown)
                 .expect("serialize old-build shutdown intent");
             Some((Ok::<_, Infallible>(event), shutdown_intent))

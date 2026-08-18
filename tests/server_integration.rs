@@ -273,21 +273,17 @@ async fn authenticated_manual_stop_notifies_clients_and_removes_its_registration
         .expect("decode stopping health");
     assert_eq!(stopping.lifecycle, LifecycleState::Stopping);
 
-    let shutdown = timeout(Duration::from_secs(1), async {
-        loop {
-            match managed.next().await {
-                Some(ManagedEvent::ServerShutdown(shutdown)) => break shutdown,
-                Some(ManagedEvent::CounterUpdated(_)) => {}
-                Some(ManagedEvent::Recovering(status)) => {
-                    panic!("manual shutdown triggered recovery: {status:?}")
-                }
-                Some(event) => panic!("expected manual shutdown intent, got {event:?}"),
-                None => panic!("managed client closed before shutdown intent"),
-            }
+    let shutdown = match timeout(Duration::from_secs(1), managed.next())
+        .await
+        .expect("managed client receives manual shutdown intent")
+    {
+        Some(ManagedEvent::ServerShutdown(shutdown)) => shutdown,
+        Some(ManagedEvent::Recovering(status)) => {
+            panic!("manual shutdown triggered recovery: {status:?}")
         }
-    })
-    .await
-    .expect("managed client receives manual shutdown intent");
+        Some(event) => panic!("expected manual shutdown intent, got {event:?}"),
+        None => panic!("managed client closed before shutdown intent"),
+    };
     assert_eq!(shutdown.instance_id, descriptor.instance_id);
     assert_eq!(shutdown.reason, ShutdownReason::Manual);
     assert!(matches!(
@@ -655,7 +651,7 @@ async fn descriptor_replacement_never_exposes_a_partial_publication() {
 }
 
 #[tokio::test]
-async fn managed_client_receives_snapshot_before_absolute_counter_updates() {
+async fn managed_client_connects_without_periodic_domain_events() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let server = server::spawn(
         ServerConfig::new(state_dir.path(), "events-test").expect("configure server"),
@@ -670,79 +666,34 @@ async fn managed_client_receives_snapshot_before_absolute_counter_updates() {
     .await
     .expect("connect managed client");
 
-    let (identity, snapshot) = receive_initial_state(&mut client).await;
+    assert!(matches!(
+        timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("connecting event arrives"),
+        Some(ManagedEvent::Connecting)
+    ));
+    let connected = timeout(Duration::from_secs(1), client.next())
+        .await
+        .expect("connected event arrives")
+        .expect("managed client remains open");
+    let ManagedEvent::Connected(identity) = connected else {
+        panic!("expected connected event, got {connected:?}");
+    };
     assert_eq!(identity.instance_id, descriptor.instance_id);
     assert_eq!(identity.pid, descriptor.pid);
-    assert_eq!(snapshot.instance_id, descriptor.instance_id);
-    assert_eq!(snapshot.value, 0);
-    assert_eq!(snapshot.revision, 0);
-
-    let update = timeout(Duration::from_secs(2), client.next())
-        .await
-        .expect("counter update arrives")
-        .expect("managed client remains open");
-    let ManagedEvent::CounterUpdated(update) = update else {
-        panic!("expected counter update event, got {update:?}");
-    };
-    assert_eq!(update.value, 1);
-    assert_eq!(update.revision, 1);
+    assert!(
+        timeout(Duration::from_millis(1_100), client.next())
+            .await
+            .is_err(),
+        "the lifecycle stream must stay quiet while the server remains ready"
+    );
 
     drop(client);
     server.shutdown().await.expect("shut down server");
 }
 
 #[tokio::test]
-async fn stalled_subscriber_does_not_delay_the_counter_or_a_healthy_subscriber() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let server = server::spawn(
-        ServerConfig::new(state_dir.path(), "stalled-subscriber-test").expect("configure server"),
-    )
-    .await
-    .expect("spawn server");
-    let descriptor = server.descriptor().clone();
-    let stalled_response = reqwest::Client::new()
-        .get(format!("{}/v1/events", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("open stalled subscriber")
-        .error_for_status()
-        .expect("stalled subscriber authenticates");
-    let mut healthy = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir.path(), "stalled-subscriber-test")
-            .expect("configure healthy managed client"),
-    )
-    .await
-    .expect("connect healthy managed client");
-    let (_, snapshot) = receive_initial_state(&mut healthy).await;
-
-    let first = timeout(Duration::from_secs(2), healthy.next())
-        .await
-        .expect("healthy subscriber receives first update")
-        .expect("healthy subscriber remains connected");
-    let ManagedEvent::CounterUpdated(first) = first else {
-        panic!("expected first counter update, got {first:?}");
-    };
-    let second = timeout(Duration::from_secs(2), healthy.next())
-        .await
-        .expect("healthy subscriber receives second update")
-        .expect("healthy subscriber remains connected");
-    let ManagedEvent::CounterUpdated(second) = second else {
-        panic!("expected second counter update, got {second:?}");
-    };
-
-    assert!(first.revision > snapshot.revision);
-    assert_eq!(second.revision, first.revision + 1);
-    assert_eq!(first.value, first.revision);
-    assert_eq!(second.value, second.revision);
-
-    drop(stalled_response);
-    drop(healthy);
-    server.shutdown().await.expect("shut down server");
-}
-
-#[tokio::test]
-async fn sse_keepalive_comments_are_periodic_and_revision_neutral() {
+async fn sse_keepalive_comments_are_periodic_and_event_neutral() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let server = server::spawn(
         ServerConfig::new(state_dir.path(), "keepalive-test").expect("configure server"),
@@ -770,46 +721,19 @@ async fn sse_keepalive_comments_are_periodic_and_revision_neutral() {
                 .expect("read event stream bytes");
             raw.extend_from_slice(&chunk);
             let text = String::from_utf8_lossy(&raw);
-            let Some(comment_position) = text.find(": keep-alive\n\n") else {
-                continue;
-            };
-            if text[comment_position + ": keep-alive\n\n".len()..].contains("id: ") {
+            if text.contains(": keep-alive\n\n") {
                 break;
             }
         }
     })
     .await
-    .expect("keepalive comment arrives independently of counter updates");
+    .expect("periodic keepalive comment arrives");
 
     let text = String::from_utf8(raw).expect("SSE response is UTF-8");
-    let records = text.split("\n\n").collect::<Vec<_>>();
-    let comment_index = records
-        .iter()
-        .position(|record| *record == ": keep-alive")
-        .expect("keepalive is an SSE comment without event metadata");
-    let revisions = records
-        .iter()
-        .filter_map(|record| {
-            record
-                .lines()
-                .find_map(|line| line.strip_prefix("id: "))
-                .map(|revision| revision.parse::<u64>().expect("revision ID is numeric"))
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        records[..comment_index]
-            .iter()
-            .any(|record| record.contains("id: "))
-    );
-    assert!(
-        records[comment_index + 1..]
-            .iter()
-            .any(|record| record.contains("id: "))
-    );
-    assert!(
-        revisions.windows(2).all(|pair| pair[1] == pair[0] + 1),
-        "keepalives must not consume counter revisions: {revisions:?}"
-    );
+    assert!(text.contains(": connected\n\n"));
+    assert!(text.contains(": keep-alive\n\n"));
+    assert!(!text.contains("event:"));
+    assert!(!text.contains("id:"));
 
     server.shutdown().await.expect("shut down server");
 }
@@ -832,23 +756,19 @@ async fn graceful_server_shutdown_emits_intent_without_starting_crash_recovery()
     receive_initial_state(&mut client).await;
 
     let observe_shutdown = async {
-        loop {
-            match timeout(Duration::from_secs(1), client.next())
-                .await
-                .expect("shutdown intent arrives")
-            {
-                Some(ManagedEvent::ServerShutdown(shutdown)) => {
-                    assert_eq!(shutdown.instance_id, instance_id);
-                    assert_eq!(shutdown.reason, ShutdownReason::Manual);
-                    break;
-                }
-                Some(ManagedEvent::CounterUpdated(_)) => {}
-                Some(ManagedEvent::Recovering(status)) => {
-                    panic!("graceful shutdown triggered recovery: {status:?}")
-                }
-                Some(event) => panic!("expected shutdown intent, got {event:?}"),
-                None => panic!("managed client closed without shutdown intent"),
+        match timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("shutdown intent arrives")
+        {
+            Some(ManagedEvent::ServerShutdown(shutdown)) => {
+                assert_eq!(shutdown.instance_id, instance_id);
+                assert_eq!(shutdown.reason, ShutdownReason::Manual);
             }
+            Some(ManagedEvent::Recovering(status)) => {
+                panic!("graceful shutdown triggered recovery: {status:?}")
+            }
+            Some(event) => panic!("expected shutdown intent, got {event:?}"),
+            None => panic!("managed client closed without shutdown intent"),
         }
         assert!(matches!(
             timeout(Duration::from_secs(1), client.next()).await,
@@ -878,12 +798,6 @@ async fn authenticated_replacement_stop_emits_replacement_intent() {
         .error_for_status()
         .expect("event stream opens");
     let mut events = response.bytes_stream().eventsource();
-    events
-        .next()
-        .await
-        .expect("snapshot arrives")
-        .expect("snapshot is valid");
-
     let response = request_server_shutdown(&descriptor, ShutdownReason::Replacement).await;
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
 
@@ -910,29 +824,4 @@ async fn authenticated_replacement_stop_emits_replacement_intent() {
         .run_until_ctrl_c()
         .await
         .expect("join replaced server");
-}
-
-#[tokio::test]
-async fn counter_advances_without_connected_clients() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let server = server::spawn(
-        ServerConfig::new(state_dir.path(), "idle-counter-test").expect("configure server"),
-    )
-    .await
-    .expect("spawn server");
-
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
-
-    let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir.path(), "idle-counter-test")
-            .expect("configure managed client"),
-    )
-    .await
-    .expect("connect after server has run without clients");
-    let (_, snapshot) = receive_initial_state(&mut client).await;
-    assert!(snapshot.value >= 1);
-    assert_eq!(snapshot.value, snapshot.revision);
-
-    drop(client);
-    server.shutdown().await.expect("shut down server");
 }

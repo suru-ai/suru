@@ -1,6 +1,6 @@
 use chidori::{
     managed_client::{ManagedClient, ManagedEvent},
-    protocol::{CounterSnapshot, Health, RuntimeDescriptor, ServerShutdown, ShutdownReason},
+    protocol::{Health, RuntimeDescriptor, ServerShutdown, ShutdownReason},
 };
 use tokio::time::{Duration, timeout};
 
@@ -23,7 +23,7 @@ pub fn read_runtime_descriptor(path: impl AsRef<std::path::Path>) -> RuntimeDesc
     .unwrap_or_else(|error| panic!("decode runtime descriptor {path:?}: {error}"))
 }
 
-pub async fn receive_initial_state(client: &mut ManagedClient) -> (Health, CounterSnapshot) {
+pub async fn receive_initial_state(client: &mut ManagedClient) -> Health {
     assert!(matches!(
         timeout(Duration::from_secs(1), client.next())
             .await
@@ -37,14 +37,7 @@ pub async fn receive_initial_state(client: &mut ManagedClient) -> (Health, Count
     let ManagedEvent::Connected(identity) = connected else {
         panic!("expected connected event, got {connected:?}");
     };
-    let snapshot = timeout(Duration::from_secs(1), client.next())
-        .await
-        .expect("snapshot arrives")
-        .expect("managed client remains open");
-    let ManagedEvent::Snapshot(snapshot) = snapshot else {
-        panic!("expected snapshot event, got {snapshot:?}");
-    };
-    (identity, snapshot)
+    identity
 }
 
 pub async fn request_server_shutdown(

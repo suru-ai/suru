@@ -9,7 +9,7 @@ use crate::protocol::{Health, LifecycleState, PROTOCOL_VERSION, RuntimeDescripto
 
 use super::{
     ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus, STARTUP_TIMEOUT,
-    event_stream::{self, StreamOutcome, StreamProtocolState},
+    event_stream::{self, StreamOutcome},
     launcher,
     lifecycle::{self, Registration},
 };
@@ -90,8 +90,6 @@ async fn run_managed_client(
     if events.send(ManagedEvent::Connecting).await.is_err() {
         return;
     }
-    let mut protocol_state = StreamProtocolState::default();
-
     loop {
         descriptor.send_replace(connection.descriptor.clone());
         let active_instance_id = connection.descriptor.instance_id;
@@ -103,19 +101,17 @@ async fn run_managed_client(
         {
             return;
         }
-        let replaced_instance_id = match protocol_state
-            .consume(connection.response, &events, active_instance_id)
-            .await
-        {
-            Ok(StreamOutcome::Disconnected | StreamOutcome::Lagged) => None,
-            Ok(StreamOutcome::ManualShutdown) => return,
-            Ok(StreamOutcome::Replacement { instance_id }) => Some(instance_id),
-            Ok(StreamOutcome::ReceiverClosed) => return,
-            Err(error) => {
-                let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
-                return;
-            }
-        };
+        let replaced_instance_id =
+            match event_stream::consume(connection.response, &events, active_instance_id).await {
+                Ok(StreamOutcome::Disconnected) => None,
+                Ok(StreamOutcome::ManualShutdown) => return,
+                Ok(StreamOutcome::Replacement { instance_id }) => Some(instance_id),
+                Ok(StreamOutcome::ReceiverClosed) => return,
+                Err(error) => {
+                    let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
+                    return;
+                }
+            };
 
         if let Some(replaced_instance_id) = replaced_instance_id {
             if events

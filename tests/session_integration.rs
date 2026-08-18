@@ -21,13 +21,13 @@ use chidori::{
     build_identity,
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
-        Activity, ActivityId, ActivityKind, AdmitPromptRequest, CounterSnapshot,
-        CreateSessionRequest, InitialPrompt, LifecycleState, Message, MessageId, MessageRole,
-        MessageStatus, PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId, PromptOrder,
-        PromptStatus, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
-        SNAPSHOT_EVENT, ServerIdentity, Session, SessionChange, SessionError, SessionErrorCode,
-        SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionUpdate,
-        TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        Activity, ActivityId, ActivityKind, AdmitPromptRequest, CreateSessionRequest,
+        InitialPrompt, LifecycleState, Message, MessageId, MessageRole, MessageStatus,
+        PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
+        RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity, Session,
+        SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
+        SessionStatus, SessionSummary, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
+        Workspace,
     },
     server::{self, AgentOutput, ServerConfig},
 };
@@ -1911,10 +1911,6 @@ async fn receive_managed_client_initial_state(client: &mut ManagedClient) {
         client.next().await,
         Some(chidori::managed_client::ManagedEvent::Connected(_))
     ));
-    assert!(matches!(
-        client.next().await,
-        Some(chidori::managed_client::ManagedEvent::Snapshot(_))
-    ));
 }
 
 #[tokio::test]
@@ -2224,20 +2220,8 @@ async fn malformed_fixture_server_events(
     if !fixture_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let snapshot = CounterSnapshot {
-        instance_id: state.descriptor.instance_id,
-        value: 0,
-        revision: 0,
-    };
-    let first = stream::once(async move {
-        Ok::<_, Infallible>(
-            Event::default()
-                .event(SNAPSHOT_EVENT)
-                .id("0")
-                .json_data(snapshot)
-                .expect("serialize fixture server snapshot"),
-        )
-    });
+    let first =
+        stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) });
     Sse::new(first.chain(stream::pending())).into_response()
 }
 
@@ -2392,22 +2376,9 @@ async fn reconnecting_fixture_server_events(
     if !fixture_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let snapshot = CounterSnapshot {
-        instance_id: state.descriptor.instance_id,
-        value: 0,
-        revision: 0,
-    };
     Sse::new(
-        stream::once(async move {
-            Ok::<_, Infallible>(
-                Event::default()
-                    .event(SNAPSHOT_EVENT)
-                    .id("0")
-                    .json_data(snapshot)
-                    .expect("serialize fixture server snapshot"),
-            )
-        })
-        .chain(stream::pending()),
+        stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) })
+            .chain(stream::pending()),
     )
     .into_response()
 }
