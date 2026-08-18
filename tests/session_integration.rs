@@ -932,18 +932,25 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
         },
         AgentOutput::MessageCompleted { message_id },
     ];
-    for (index, event) in expected.into_iter().enumerate() {
-        let published = output
-            .emit(session_id, event)
-            .expect("publish provider-neutral Agent output");
-        assert_eq!(published.revision, SessionRevision(index as u64 + 2));
+    let published = expected
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let update = output
+                .emit(session_id, event)
+                .expect("publish provider-neutral Agent output");
+            assert_eq!(update.revision, SessionRevision(index as u64 + 2));
+            update
+        })
+        .collect::<Vec<_>>();
+    for expected_update in published {
         assert_eq!(
             timeout(Duration::from_secs(1), subscription.next())
                 .await
                 .expect("Session update arrives")
                 .expect("Session stream remains open")
                 .expect("Session update is valid"),
-            SessionEvent::Updated(published)
+            SessionEvent::Updated(expected_update)
         );
     }
 

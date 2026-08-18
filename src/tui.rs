@@ -823,18 +823,15 @@ fn render_composer(
     let content_height = area.height.saturating_sub(2).max(1);
     let cursor_row = visual_cursor_row(text, cursor, content_width);
     let scroll = cursor_row.saturating_sub(content_height.saturating_sub(1));
-    let content = if text.is_empty() {
-        Span::styled(
+    let paragraph = if text.is_empty() {
+        Paragraph::new(Span::styled(
             "Type a Prompt and press Enter",
             theme.form_field.placeholder,
-        )
+        ))
     } else {
-        Span::styled(text.to_owned(), theme.form_field.text)
+        Paragraph::new(text.to_owned()).style(theme.form_field.text)
     };
-    frame.render_widget(
-        Paragraph::new(content).block(block).scroll((scroll, 0)),
-        area,
-    );
+    frame.render_widget(paragraph.block(block).scroll((scroll, 0)), area);
 }
 
 fn composer_block_height(terminal_height: u16, width: u16, text: &str) -> u16 {
@@ -1078,7 +1075,7 @@ async fn run_loop(
                 match submission {
                     SubmissionResult::SessionCreated(created) => {
                         let session_id = created.session.id;
-                        application.handle_event(ApplicationEvent::SessionCreated(created))?;
+                        application.handle_event(ApplicationEvent::SessionCreated(*created))?;
                         if let Some((_, task)) = session_subscription_task.take() {
                             task.abort();
                         }
@@ -1122,7 +1119,9 @@ async fn run_loop(
                                     let results = submission_tx.clone();
                                     tokio::spawn(async move {
                                         let result = match commands.create_session(request).await {
-                                            Ok(created) => SubmissionResult::SessionCreated(created),
+                                            Ok(created) => {
+                                                SubmissionResult::SessionCreated(Box::new(created))
+                                            }
                                             Err(error) => SubmissionResult::Failed {
                                                 prompt_id,
                                                 error: error.to_string(),
@@ -1161,7 +1160,7 @@ async fn run_loop(
 }
 
 enum SubmissionResult {
-    SessionCreated(SessionSnapshot),
+    SessionCreated(Box<SessionSnapshot>),
     PromptAdmitted(PromptId),
     Failed { prompt_id: PromptId, error: String },
 }

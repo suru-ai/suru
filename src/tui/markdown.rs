@@ -57,7 +57,7 @@ impl<'a> Renderer<'a> {
             }
             Event::SoftBreak => {
                 if self.in_code_block {
-                    self.flush_line();
+                    self.flush_code_line();
                 } else {
                     self.push(" ", self.current_style());
                 }
@@ -196,7 +196,7 @@ impl<'a> Renderer<'a> {
         let mut remaining = text;
         while let Some((line, rest)) = remaining.split_once('\n') {
             self.push(line, self.theme.markdown.code_block);
-            self.flush_line();
+            self.flush_code_line();
             remaining = rest;
         }
         if !remaining.is_empty() {
@@ -233,6 +233,11 @@ impl<'a> Renderer<'a> {
             self.lines
                 .push(Line::from(std::mem::take(&mut self.current)));
         }
+    }
+
+    fn flush_code_line(&mut self) {
+        self.lines
+            .push(Line::from(std::mem::take(&mut self.current)));
     }
 
     fn blank_line(&mut self) {

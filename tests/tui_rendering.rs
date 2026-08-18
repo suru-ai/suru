@@ -432,7 +432,8 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
             },
             prompt: InitialPrompt {
                 id: PromptId::new(),
-                text: "Explain the stream".to_owned(),
+                text: "Explain the stream\nwhile keeping this deliberately long user Message elevated across every wrapped continuation of the transcript block, including its semantic left accent"
+                    .to_owned(),
             },
         })
         .await
@@ -500,7 +501,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
             session_id,
             AgentOutput::MessageDelta {
                 message_id,
-                content: "\n    println!(\"hi\");\n}\n```\n\n<future>Readable fallback</future>"
+                content: "\n\n    println!(\"hi\");\n}\n```\n\n<future>Readable fallback</future>"
                     .to_owned(),
             },
         )
@@ -540,7 +541,37 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
     let error_row = text_position(&completed, "Error:").1;
     let status_row = text_position(&completed, "Reading files").1;
     let agent_row = text_position(&completed, "Streamed heading").1;
+    let code_start_row = text_position(&completed, "fn main() {").1;
+    let code_after_blank_row = text_position(&completed, "println!(\"hi\");").1;
     assert!(user_row < error_row && error_row < status_row && status_row < agent_row);
+    assert_eq!(
+        code_after_blank_row,
+        code_start_row + 2,
+        "fenced code preserves blank lines: {:?}",
+        &rows[usize::from(code_start_row)..=usize::from(code_after_blank_row)]
+    );
+    let accented_user_rows = (user_row..error_row)
+        .filter(|row| {
+            completed
+                .cell((0, *row))
+                .is_some_and(|cell| cell.symbol() == "┃")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        accented_user_rows.len() >= 3,
+        "source and wrapped user lines keep the block accent"
+    );
+    for row in accented_user_rows {
+        assert_eq!(
+            completed.cell((0, row)).expect("accent cell").fg,
+            Color::Cyan
+        );
+        assert_eq!(
+            completed.cell((99, row)).expect("elevated row edge").bg,
+            Color::Black,
+            "the elevated surface spans the full user block width"
+        );
+    }
     assert_eq!(text_cell(&completed, "┃").fg, Color::Cyan);
     assert_eq!(text_cell(&completed, "Explain the stream").bg, Color::Black);
     assert_eq!(text_cell(&completed, "Error:").fg, Color::Red);
