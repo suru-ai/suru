@@ -26,7 +26,6 @@ pub(crate) struct TextRoles {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurfaceRoles {
     pub(crate) elevated: Style,
-    #[allow(dead_code)] // No overlay is part of this issue's UI slice yet.
     pub(crate) overlay: Style,
 }
 

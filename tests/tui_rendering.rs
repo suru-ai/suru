@@ -4,11 +4,12 @@ use chidori::{
         SessionSubscription,
     },
     protocol::{
-        Activity, ActivityId, ActivityKind, CounterSnapshot, CreateSessionRequest, Health,
-        InitialPrompt, LifecycleState, Message, MessageId, MessageRole, MessageStatus, Prompt,
-        PromptDelivery, PromptId, PromptOrder, PromptStatus, ServerIdentity, ServerShutdown,
-        Session, SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
-        SessionUpdate, ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        Activity, ActivityId, ActivityKind, AgentId, AgentIdentity, CounterSnapshot,
+        CreateSessionRequest, Health, InitialPrompt, LifecycleState, Message, MessageId,
+        MessageRole, MessageStatus, ModelId, Prompt, PromptDelivery, PromptId, PromptOrder,
+        PromptStatus, ProviderId, ServerIdentity, ServerShutdown, Session, SessionChange,
+        SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionUpdate, ShutdownReason,
+        TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{self, AgentOutput, ServerConfig},
     tui::{
@@ -579,6 +580,10 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
     let agent_row = text_position(&completed, "Streamed heading").1;
     let code_start_row = text_position(&completed, "fn main() {").1;
     let code_after_blank_row = text_position(&completed, "println!(\"hi\");").1;
+    let user_accent_column = text_position(&completed, "Explain the stream")
+        .0
+        .saturating_sub(2);
+    let user_block_right_edge = completed.area.width.saturating_sub(3);
     assert!(user_row < error_row && error_row < status_row && status_row < agent_row);
     assert_eq!(
         code_after_blank_row,
@@ -589,7 +594,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
     let accented_user_rows = (user_row..error_row)
         .filter(|row| {
             completed
-                .cell((0, *row))
+                .cell((user_accent_column, *row))
                 .is_some_and(|cell| cell.symbol() == "┃")
         })
         .collect::<Vec<_>>();
@@ -599,11 +604,17 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
     );
     for row in accented_user_rows {
         assert_eq!(
-            completed.cell((0, row)).expect("accent cell").fg,
+            completed
+                .cell((user_accent_column, row))
+                .expect("accent cell")
+                .fg,
             Color::Cyan
         );
         assert_eq!(
-            completed.cell((99, row)).expect("elevated row edge").bg,
+            completed
+                .cell((user_block_right_edge, row))
+                .expect("elevated row edge")
+                .bg,
             Color::Black,
             "the elevated surface spans the full user block width"
         );
@@ -662,6 +673,194 @@ fn connected_view_centers_the_landing_composer_and_shows_server_identity() {
 }
 
 #[test]
+fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let instance_id =
+        Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(instance_id, 42_424),
+        )))
+        .expect("connect application");
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
+            CounterSnapshot {
+                instance_id,
+                value: 17,
+                revision: 17,
+            },
+        )))
+        .expect("confirm connected application");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Keep the composer usable".to_owned(),
+        )))
+        .expect("type a landing draft");
+
+    let wide = rendered_application_rows_at(&application, 80, 16).join("\n");
+    for content in [
+        "Chidori",
+        "What would you like to work on?",
+        "Keep the composer usable",
+        "Agent unavailable",
+        "Workspace",
+        "Connected",
+        "Enter submit",
+    ] {
+        assert!(
+            wide.contains(content),
+            "wide landing frame omitted {content:?}"
+        );
+    }
+
+    let narrow = rendered_application_rows_at(&application, 43, 10).join("\n");
+    for core in [
+        "Chidori",
+        "What would you like to work on?",
+        "Keep the composer usable",
+        "Agent unavailable",
+        "Connected",
+    ] {
+        assert!(
+            narrow.contains(core),
+            "narrow landing frame omitted {core:?}"
+        );
+    }
+    for secondary in ["Workspace", "Provider", "Model", "Enter submit"] {
+        assert!(
+            !narrow.contains(secondary),
+            "narrow landing frame retained secondary metadata {secondary:?}"
+        );
+    }
+
+    let short = rendered_application_rows_at(&application, 80, 6).join("\n");
+    assert!(!short.contains("Chidori"));
+    assert!(short.contains("What would you like to work on?"));
+    assert!(short.contains("Keep the composer usable"));
+    assert!(short.contains("Connected"));
+
+    let too_small = rendered_application_rows_at(&application, 24, 4).join("\n");
+    assert!(too_small.contains("Terminal too small"));
+    assert!(!too_small.contains("Keep the composer usable"));
+    assert!(!too_small.contains("Prompt"));
+}
+
+#[test]
+fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let instance_id =
+        Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
+    let mut active_snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Keep the transcript visible",
+        workspace.path(),
+    );
+    active_snapshot.session.status = SessionStatus::Active;
+    active_snapshot.session.agent = Some(AgentIdentity {
+        agent: AgentId::new("codex"),
+        provider: ProviderId::new("openai"),
+        model: ModelId::new("gpt-5"),
+    });
+    active_snapshot.turns[0].status = TurnStatus::Active;
+    active_snapshot.activities[0].kind = ActivityKind::Status;
+    active_snapshot.activities[0].text = "Working".to_owned();
+
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(instance_id, 42_424),
+        )))
+        .expect("connect application");
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
+            CounterSnapshot {
+                instance_id,
+                value: 17,
+                revision: 17,
+            },
+        )))
+        .expect("confirm connected application");
+    application
+        .handle_event(ApplicationEvent::SessionAttached(active_snapshot.clone()))
+        .expect("attach active Session");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Keep the draft visible".to_owned(),
+        )))
+        .expect("type a Session draft");
+
+    let wide = rendered_application_rows_at(&application, 100, 16).join("\n");
+    for content in [
+        "Chidori",
+        "Workspace",
+        workspace.path().to_string_lossy().as_ref(),
+        "Connected",
+        "Keep the transcript visible",
+        "Keep the draft visible",
+        "active",
+        "Esc interrupt",
+        "Agent codex",
+        "Provider openai",
+        "Model gpt-5",
+        "Enter submit",
+    ] {
+        assert!(
+            wide.contains(content),
+            "wide Session frame omitted {content:?}"
+        );
+    }
+
+    let narrow = rendered_application_rows_at(&application, 43, 10).join("\n");
+    for core in [
+        "Chidori",
+        "Connected",
+        "Keep the transcript visible",
+        "Keep the draft visible",
+        "active",
+        "Esc interrupt",
+    ] {
+        assert!(
+            narrow.contains(core),
+            "narrow Session frame omitted {core:?}"
+        );
+    }
+    for secondary in ["Workspace", "Provider", "Model", "Enter submit"] {
+        assert!(
+            !narrow.contains(secondary),
+            "narrow Session frame retained secondary metadata {secondary:?}"
+        );
+    }
+
+    let short = rendered_application_rows_at(&application, 100, 6).join("\n");
+    assert!(!short.contains("Chidori"));
+    assert!(!short.contains("Workspace"));
+    assert!(short.contains("Keep the transcript visible"));
+    assert!(short.contains("Keep the draft visible"));
+    assert!(short.contains("active"));
+    assert!(short.contains("Connected"));
+
+    let mut idle = Application::new(workspace.path());
+    let mut idle_snapshot = active_snapshot;
+    idle_snapshot.session.status = SessionStatus::Idle;
+    idle_snapshot.session.agent = None;
+    idle.handle_event(ApplicationEvent::SessionAttached(idle_snapshot))
+        .expect("attach unavailable-Agent Session");
+    let idle_frame = rendered_application_rows_at(&idle, 80, 12).join("\n");
+    assert!(idle_frame.contains("idle"));
+    assert!(idle_frame.contains("Agent unavailable"));
+    assert!(!idle_frame.contains("Esc interrupt"));
+    assert!(!idle_frame.contains("Provider"));
+    assert!(!idle_frame.contains("Model"));
+
+    let too_small = rendered_application_rows_at(&application, 24, 4).join("\n");
+    assert!(too_small.contains("Terminal too small"));
+    assert!(!too_small.contains("Keep the transcript visible"));
+    assert!(!too_small.contains("Keep the draft visible"));
+}
+
+#[test]
 fn recovering_view_retains_the_landing_composer_and_last_server_identity() {
     let instance_id =
         Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
@@ -677,6 +876,89 @@ fn recovering_view_retains_the_landing_composer_and_last_server_identity() {
     assert!(screen.contains("What would you like to work on?"));
     assert!(screen.contains("Recovering"));
     assert!(screen.contains("pid 42424"));
+}
+
+#[test]
+fn reconnect_overlay_waits_for_the_grace_period_and_blocks_composer_input() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let instance_id =
+        Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(instance_id, 42_424),
+        )))
+        .expect("connect application");
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
+            CounterSnapshot {
+                instance_id,
+                value: 17,
+                revision: 17,
+            },
+        )))
+        .expect("confirm connected application");
+    application
+        .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
+            SessionId::new(),
+            PromptId::new(),
+            "Keep the Session visible",
+            workspace.path(),
+        )))
+        .expect("attach Session");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Preserve this draft".to_owned(),
+        )))
+        .expect("type Session draft");
+
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Recovering(
+            RecoveryStatus {
+                attempt: 1,
+                retry_in: Duration::from_millis(50),
+            },
+        )))
+        .expect("begin recovery");
+    let brief = rendered_application_rows_at(&application, 80, 15).join("\n");
+    assert!(brief.contains("Recovering"));
+    assert!(brief.contains("Keep the Session visible"));
+    assert!(brief.contains("Preserve this draft"));
+    assert!(!brief.contains("Reconnecting to Chidori"));
+    assert!(!brief.contains("Your Session will resume automatically"));
+
+    application
+        .handle_event(ApplicationEvent::ReconnectGraceElapsed)
+        .expect("show delayed reconnect overlay");
+    let prolonged = rendered_application_rows_at(&application, 80, 15).join("\n");
+    assert!(prolonged.contains("Reconnecting to Chidori"));
+    assert!(prolonged.contains("Your Session will resume automatically"));
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            " must stay blocked".to_owned(),
+        )))
+        .expect("reconnect mode owns composer input");
+
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(instance_id, 42_424),
+        )))
+        .expect("reconnect to surviving server");
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Snapshot(
+            CounterSnapshot {
+                instance_id,
+                value: 18,
+                revision: 18,
+            },
+        )))
+        .expect("hydrate recovered connection");
+    let recovered = rendered_application_rows_at(&application, 80, 15).join("\n");
+    assert!(!recovered.contains("Reconnecting to Chidori"));
+    assert!(recovered.contains("Keep the Session visible"));
+    assert!(recovered.contains("Preserve this draft"));
+    assert!(!recovered.contains("must stay blocked"));
+    assert!(recovered.contains("Connected"));
 }
 
 #[test]

@@ -7,6 +7,8 @@ use std::{
     future::pending,
     io::{Stdout, stdout},
     path::{Path, PathBuf},
+    pin::Pin,
+    time::Duration,
 };
 
 use anyhow::{Result, anyhow};
@@ -26,7 +28,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -36,9 +38,10 @@ use crate::{
         SessionProjection, SessionStreamError, SessionSubscription,
     },
     protocol::{
-        ActivityKind, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, MessageRole,
-        PromptDelivery, PromptId, PromptStatus, ServerIdentity, SessionId, SessionSnapshot,
-        SessionStatus, ShutdownReason, TranscriptItem, TurnId, TurnStatus, Workspace,
+        ActivityKind, AdmitPromptRequest, AgentIdentity, CreateSessionRequest, InitialPrompt,
+        MessageRole, PromptDelivery, PromptId, PromptStatus, ServerIdentity, SessionId,
+        SessionSnapshot, SessionStatus, ShutdownReason, TranscriptItem, TurnId, TurnStatus,
+        Workspace,
     },
     theme::Theme,
 };
@@ -46,6 +49,13 @@ use crate::{
 mod composer;
 
 use composer::{ComposerKey, ComposerMemory};
+
+const NARROW_TERMINAL_WIDTH: u16 = 44;
+const MINIMUM_TERMINAL_WIDTH: u16 = 28;
+const MINIMUM_TERMINAL_HEIGHT: u16 = 5;
+const LANDING_BRAND_MINIMUM_HEIGHT: u16 = 9;
+const SESSION_HEADER_MINIMUM_HEIGHT: u16 = 8;
+const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 struct SessionInteraction {
@@ -78,6 +88,7 @@ pub struct TuiState {
     submission_error: Option<String>,
     session: Option<SessionProjection>,
     session_events_blocked: bool,
+    reconnect_overlay_visible: bool,
     pending_submission: Option<PendingSubmission>,
     failed_submissions: HashMap<PromptId, FailedSubmission>,
     pending_steers: Vec<PendingSteer>,
@@ -145,6 +156,7 @@ impl TuiState {
             submission_error: None,
             session: None,
             session_events_blocked: false,
+            reconnect_overlay_visible: false,
             pending_submission: None,
             failed_submissions: HashMap::new(),
             pending_steers: Vec::new(),
@@ -159,6 +171,7 @@ impl TuiState {
                 self.pending_identity = None;
                 self.counter = None;
                 self.recovery = None;
+                self.reconnect_overlay_visible = false;
                 self.manually_stopped = false;
                 self.fatal_error = None;
             }
@@ -195,9 +208,13 @@ impl TuiState {
                 }
                 self.counter = Some(snapshot.value);
                 self.recovery = None;
+                self.reconnect_overlay_visible = false;
             }
             ManagedEvent::CounterUpdated(update) => self.counter = Some(update.value),
             ManagedEvent::Recovering(status) => {
+                if self.recovery.is_none() {
+                    self.reconnect_overlay_visible = false;
+                }
                 self.recovery = Some(status);
                 self.manually_stopped = false;
                 self.fatal_error = None;
@@ -206,11 +223,15 @@ impl TuiState {
                 if shutdown.reason == ShutdownReason::Manual {
                     self.pending_identity = None;
                     self.recovery = None;
+                    self.reconnect_overlay_visible = false;
                     self.manually_stopped = true;
                     self.fatal_error = None;
                 }
             }
-            ManagedEvent::Fatal(error) => self.fatal_error = Some(error),
+            ManagedEvent::Fatal(error) => {
+                self.reconnect_overlay_visible = false;
+                self.fatal_error = Some(error);
+            }
         }
     }
 
@@ -489,6 +510,7 @@ pub struct Application {
 #[derive(Debug)]
 pub enum ApplicationEvent {
     Command(CommandId),
+    ReconnectGraceElapsed,
     Managed(ManagedEvent),
     Session(SessionEvent),
     SessionSubscriptionEnded,
@@ -557,6 +579,9 @@ impl Application {
 
     pub fn handle_event(&mut self, event: ApplicationEvent) -> Result<ApplicationTransition> {
         match event {
+            ApplicationEvent::Command(_) if self.state.reconnect_overlay_visible => {
+                Ok(ApplicationTransition::Continue)
+            }
             ApplicationEvent::Command(CommandId::ClearOrExit) => {
                 let key = self.state.composer_key();
                 if self.state.composers.is_empty(key) {
@@ -737,6 +762,12 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::Continue)
             }
+            ApplicationEvent::ReconnectGraceElapsed => {
+                if self.state.recovery.is_some() {
+                    self.state.reconnect_overlay_visible = true;
+                }
+                Ok(ApplicationTransition::Continue)
+            }
             ApplicationEvent::Managed(ManagedEvent::Fatal(error)) => Err(anyhow!(error)),
             ApplicationEvent::Managed(event @ ManagedEvent::ServerShutdown(_)) => {
                 self.state.apply(event);
@@ -807,6 +838,10 @@ impl Application {
             .session
             .as_ref()
             .map(SessionProjection::session_id)
+    }
+
+    fn is_recovering(&self) -> bool {
+        self.state.recovery.is_some()
     }
 }
 
@@ -1020,58 +1055,86 @@ fn command_from_scoped_bindings(
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     let theme = Theme::system();
+    if terminal_is_too_small(frame.area()) {
+        render_terminal_too_small(frame, &theme);
+        return;
+    }
     if let Some(session) = &state.session {
         render_session(frame, state, session.snapshot(), &theme);
     } else {
         render_landing(frame, state, &theme);
     }
+    if state.reconnect_overlay_visible {
+        render_reconnect_overlay(frame, &theme);
+    }
 }
 
 fn render_landing(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
-    let [main, status_area] =
-        Layout::vertical([Constraint::Min(7), Constraint::Length(1)]).areas(frame.area());
+    let [main, footer_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
+    let narrow = frame.area().width < NARROW_TERMINAL_WIDTH;
+    let content = horizontally_inset(main, horizontal_padding(frame.area().width));
     let key = ComposerKey::Landing;
     let composer_height = composer_block_height(
         frame.area().height,
-        72_u16.min(frame.area().width),
+        72_u16.min(content.width),
         state.composers.text(key),
     );
-    let panel = centered_rect(main, 72, composer_height.saturating_add(3));
-    let [brand_area, question_area, error_area, composer_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(composer_height),
-    ])
-    .areas(panel);
-    frame.render_widget(
-        Paragraph::new("Chidori")
-            .alignment(Alignment::Center)
-            .style(theme.accent.primary.add_modifier(Modifier::BOLD)),
-        brand_area,
-    );
-    frame.render_widget(
-        Paragraph::new("What would you like to work on?").alignment(Alignment::Center),
-        question_area,
-    );
+    let show_brand = frame.area().height >= LANDING_BRAND_MINIMUM_HEIGHT;
+    let error_height = u16::from(state.submission_error.is_some());
+    let show_question = state.submission_error.is_none()
+        || main.height
+            >= composer_height
+                .saturating_add(error_height)
+                .saturating_add(1);
+    let panel_height = composer_height
+        .saturating_add(u16::from(show_question))
+        .saturating_add(u16::from(show_brand))
+        .saturating_add(error_height);
+    let panel = centered_rect(content, 72, panel_height);
+    let mut row = panel.y;
+    if show_brand {
+        frame.render_widget(
+            Paragraph::new("Chidori")
+                .alignment(Alignment::Center)
+                .style(theme.accent.primary.add_modifier(Modifier::BOLD)),
+            Rect::new(panel.x, row, panel.width, 1),
+        );
+        row = row.saturating_add(1);
+    }
+    if show_question {
+        frame.render_widget(
+            Paragraph::new("What would you like to work on?").alignment(Alignment::Center),
+            Rect::new(panel.x, row, panel.width, 1),
+        );
+        row = row.saturating_add(1);
+    }
     if let Some(error) = &state.submission_error {
         frame.render_widget(
             Paragraph::new(error.as_str())
                 .alignment(Alignment::Center)
                 .style(theme.form_field.invalid),
-            error_area,
+            Rect::new(panel.x, row, panel.width, 1),
         );
+        row = row.saturating_add(1);
     }
     render_composer(
         frame,
-        composer_area,
+        Rect::new(panel.x, row, panel.width, composer_height),
         state.composers.text(key),
         state.composers.cursor(key),
         state.composer_border_style(theme),
+        !narrow,
         theme,
     );
 
-    render_status(frame, state, status_area, theme);
+    render_landing_footer(
+        frame,
+        state,
+        horizontally_inset(footer_area, horizontal_padding(frame.area().width)),
+        !narrow && show_brand,
+        theme,
+    );
 }
 
 fn render_session(
@@ -1080,18 +1143,37 @@ fn render_session(
     snapshot: &SessionSnapshot,
     theme: &Theme,
 ) {
+    let narrow = frame.area().width < NARROW_TERMINAL_WIDTH;
+    let padding = horizontal_padding(frame.area().width);
+    let show_header = frame.area().height >= SESSION_HEADER_MINIMUM_HEIGHT;
     let key = ComposerKey::Session(snapshot.session.id);
-    let composer_height = composer_block_height(
+    let desired_composer_height = composer_block_height(
         frame.area().height,
-        frame.area().width,
+        frame.area().width.saturating_sub(padding.saturating_mul(2)),
         state.composers.text(key),
     );
     let queued_prompts = state.queued_prompts(snapshot.session.id);
-    let pending_height = if queued_prompts.is_empty() {
+    let desired_pending_height = if queued_prompts.is_empty() {
         0
     } else {
         (queued_prompts.len() as u16).min(3).saturating_add(2)
     };
+    let core_height = u16::from(show_header)
+        .saturating_add(desired_composer_height)
+        .saturating_add(1)
+        .saturating_add(1);
+    let pending_room = frame.area().height.saturating_sub(core_height);
+    let pending_height = if pending_room >= 3 {
+        desired_pending_height.min(pending_room)
+    } else {
+        0
+    };
+    let reserved_height = u16::from(show_header)
+        .saturating_add(pending_height)
+        .saturating_add(1)
+        .saturating_add(1);
+    let composer_height =
+        desired_composer_height.min(frame.area().height.saturating_sub(reserved_height).max(1));
     let [
         header_area,
         transcript_area,
@@ -1099,29 +1181,28 @@ fn render_session(
         composer_area,
         status_area,
     ] = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(u16::from(show_header)),
         Constraint::Min(1),
         Constraint::Length(pending_height),
         Constraint::Length(composer_height),
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    frame.render_widget(
-        Paragraph::new(Text::from(vec![
-            Line::styled("Chidori", theme.accent.primary.add_modifier(Modifier::BOLD)),
-            Line::styled(
-                snapshot
-                    .session
-                    .workspace
-                    .path
-                    .to_string_lossy()
-                    .into_owned(),
-                theme.text.subdued,
-            ),
-        ])),
-        header_area,
-    );
+    if show_header {
+        render_session_header(
+            frame,
+            state,
+            snapshot,
+            horizontally_inset(header_area, padding),
+            !narrow,
+            theme,
+        );
+    }
 
+    let transcript_area = horizontally_inset(transcript_area, padding);
+    let pending_area = horizontally_inset(pending_area, padding);
+    let composer_area = horizontally_inset(composer_area, padding);
+    let footer_area = horizontally_inset(status_area, padding);
     let mut lines = transcript_lines(snapshot, theme, transcript_area.width);
     for provisional in state.provisional_prompts(snapshot.session.id) {
         push_user_message(&mut lines, &provisional.text, theme, transcript_area.width);
@@ -1131,19 +1212,19 @@ fn render_session(
         .filter(|interaction| !interaction.follow_latest)
         .map_or(0, |interaction| interaction.scroll_position)
         .min(usize::from(u16::MAX)) as u16;
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(theme.border.subdued),
-            )
-            .scroll((scroll_position, 0)),
-        transcript_area,
-    );
-    if !queued_prompts.is_empty() {
-        render_pending_prompts(frame, pending_area, state, &queued_prompts, theme);
+    let transcript = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let transcript = if transcript_area.height > 1 {
+        transcript.block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(theme.border.subdued),
+        )
+    } else {
+        transcript
+    };
+    frame.render_widget(transcript.scroll((scroll_position, 0)), transcript_area);
+    if pending_height > 0 {
+        render_pending_prompts(frame, pending_area, state, &queued_prompts, !narrow, theme);
     }
     render_composer(
         frame,
@@ -1151,9 +1232,103 @@ fn render_session(
         state.composers.text(key),
         state.composers.cursor(key),
         state.composer_border_style(theme),
+        !narrow,
         theme,
     );
-    render_status(frame, state, status_area, theme);
+    render_session_footer(frame, state, snapshot, footer_area, !narrow, theme);
+}
+
+fn render_session_header(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    snapshot: &SessionSnapshot,
+    area: Rect,
+    detailed: bool,
+    theme: &Theme,
+) {
+    let connection = connection_status_text(state, false);
+    let connection_width = connection.width().min(usize::from(area.width));
+    let left_width = usize::from(area.width).saturating_sub(connection_width.saturating_add(2));
+    let brand = truncate_to_width("Chidori", left_width);
+    let orientation_width = left_width.saturating_sub(brand.width());
+    let orientation = if detailed {
+        truncate_to_width(
+            &format!(
+                " · Workspace {}",
+                snapshot.session.workspace.path.to_string_lossy()
+            ),
+            orientation_width,
+        )
+    } else {
+        String::new()
+    };
+    let spacing = " ".repeat(
+        usize::from(area.width)
+            .saturating_sub(brand.width() + orientation.width() + connection_width),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(brand, theme.accent.primary.add_modifier(Modifier::BOLD)),
+            Span::styled(orientation, theme.text.subdued),
+            Span::raw(spacing),
+            Span::styled(connection, status_style(state, theme)),
+        ])),
+        area,
+    );
+}
+
+fn render_session_footer(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    snapshot: &SessionSnapshot,
+    area: Rect,
+    detailed: bool,
+    theme: &Theme,
+) {
+    let status = match snapshot.session.status {
+        SessionStatus::Idle => "idle".to_owned(),
+        SessionStatus::Active => {
+            let interrupt = binding_label(&CommandId::RequestInterrupt);
+            if matches!(
+                state.command_mode,
+                CommandMode::InterruptConfirmation { .. }
+            ) {
+                format!("active · {interrupt} again to interrupt")
+            } else {
+                format!("active · {interrupt} interrupt")
+            }
+        }
+    };
+    let context = agent_context(snapshot.session.agent.as_ref(), detailed);
+    let left = if snapshot.session.status == SessionStatus::Active && !detailed {
+        status
+    } else {
+        format!("{status} · {context}")
+    };
+    let activity_style = if snapshot.session.status == SessionStatus::Active {
+        theme.feedback.warning
+    } else {
+        theme.text.subdued
+    };
+    render_spread_line(
+        frame,
+        area,
+        &left,
+        activity_style,
+        &connection_status_text(state, false),
+        status_style(state, theme),
+    );
+}
+
+fn agent_context(agent: Option<&AgentIdentity>, detailed: bool) -> String {
+    match (agent, detailed) {
+        (None, _) => "Agent unavailable".to_owned(),
+        (Some(agent), false) => format!("Agent {}", agent.agent),
+        (Some(agent), true) => format!(
+            "Agent {} · Provider {} · Model {}",
+            agent.agent, agent.provider, agent.model
+        ),
+    }
 }
 
 fn render_composer(
@@ -1162,16 +1337,20 @@ fn render_composer(
     text: &str,
     cursor: usize,
     style: Style,
+    show_shortcuts: bool,
     theme: &Theme,
 ) {
     let submit = binding_label(&CommandId::SubmitSteer);
     let queue = binding_label(&CommandId::SubmitQueue);
     let newline = binding_label(&CommandId::InsertNewline);
+    let title = if show_shortcuts {
+        format!(" Prompt · {submit} submit · {queue} queue · {newline} newline ")
+    } else {
+        " Prompt ".to_owned()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(
-            " Prompt · {submit} submit · {queue} queue · {newline} newline "
-        ))
+        .title(title)
         .border_style(style);
     let content_width = area.width.saturating_sub(2).max(1);
     let content_height = area.height.saturating_sub(2).max(1);
@@ -1193,12 +1372,15 @@ fn render_pending_prompts(
     area: Rect,
     state: &TuiState,
     prompts: &[QueuedPrompt<'_>],
+    show_shortcuts: bool,
     theme: &Theme,
 ) {
     let leader = binding_label(&CommandId::BeginLeader);
     let queue = binding_label(&CommandId::OpenQueuedPrompts);
     let managing = matches!(state.command_mode, CommandMode::QueuedPrompts { .. });
-    let title = if managing {
+    let title = if !show_shortcuts {
+        " Pending ".to_owned()
+    } else if managing {
         format!(
             " Pending · {} steer · {} cancel ",
             binding_label(&CommandId::PromoteSelectedPrompt),
@@ -1244,6 +1426,36 @@ fn render_pending_prompts(
                     theme.border.subdued
                 }),
         ),
+        area,
+    );
+}
+
+fn render_reconnect_overlay(frame: &mut Frame<'_>, theme: &Theme) {
+    frame.render_widget(Block::default().style(theme.surface.overlay), frame.area());
+    let area = centered_rect(frame.area(), 48, 5);
+    frame.render_widget(Clear, area);
+    let details = if area.width >= 42 {
+        vec![
+            Line::styled("Reconnecting to Chidori…", theme.feedback.warning),
+            Line::default(),
+            Line::styled("Your Session will resume automatically", theme.text.subdued),
+        ]
+    } else {
+        vec![
+            Line::styled("Reconnecting to Chidori…", theme.feedback.warning),
+            Line::styled("Your Session will", theme.text.subdued),
+            Line::styled("resume automatically", theme.text.subdued),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(details))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme.border.default)
+                    .style(theme.surface.elevated),
+            ),
         area,
     );
 }
@@ -1381,15 +1593,6 @@ fn push_agent_message(lines: &mut Vec<Line<'static>>, content: &str, theme: &The
     }
 }
 
-fn render_status(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: &Theme) {
-    frame.render_widget(
-        Paragraph::new(Line::from(status_text(state)))
-            .alignment(Alignment::Center)
-            .style(status_style(state, theme)),
-        area,
-    );
-}
-
 fn push_prefixed_lines(lines: &mut Vec<Line<'static>>, prefix: &str, content: &str, style: Style) {
     for (index, line) in content.lines().enumerate() {
         lines.push(Line::styled(
@@ -1415,6 +1618,7 @@ async fn run_loop(
     let mut input = EventStream::new();
     let mut session_subscription: Option<SessionSubscription> = None;
     let mut session_subscription_task: Option<(SessionId, tokio::task::JoinHandle<()>)> = None;
+    let mut reconnect_grace: Option<Pin<Box<tokio::time::Sleep>>> = None;
     let (submission_tx, mut submission_rx) = tokio::sync::mpsc::unbounded_channel();
     let (subscription_tx, mut subscription_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -1424,8 +1628,17 @@ async fn run_loop(
             managed_event = client.next() => {
                 match managed_event {
                     Some(event) => {
+                        let was_recovering = application.is_recovering();
                         let transition = application
                             .handle_event(ApplicationEvent::Managed(event))?;
+                        let is_recovering = application.is_recovering();
+                        if !was_recovering && is_recovering {
+                            reconnect_grace = Some(Box::pin(tokio::time::sleep(
+                                RECONNECT_GRACE_PERIOD,
+                            )));
+                        } else if !is_recovering {
+                            reconnect_grace = None;
+                        }
                         match transition {
                             ApplicationTransition::Continue => {}
                             ApplicationTransition::SessionEnded => {
@@ -1453,6 +1666,10 @@ async fn run_loop(
                     }
                     None => return Err(anyhow!("managed client stopped unexpectedly")),
                 }
+            }
+            _ = wait_for_reconnect_grace(&mut reconnect_grace) => {
+                application.handle_event(ApplicationEvent::ReconnectGraceElapsed)?;
+                reconnect_grace = None;
             }
             session_event = next_session_event(&mut session_subscription) => {
                 match session_event {
@@ -1718,6 +1935,146 @@ async fn next_session_event(
     match subscription {
         Some(subscription) => subscription.next().await,
         None => pending().await,
+    }
+}
+
+async fn wait_for_reconnect_grace(grace: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
+    match grace {
+        Some(grace) => grace.as_mut().await,
+        None => pending().await,
+    }
+}
+
+fn terminal_is_too_small(area: Rect) -> bool {
+    area.width < MINIMUM_TERMINAL_WIDTH || area.height < MINIMUM_TERMINAL_HEIGHT
+}
+
+fn render_terminal_too_small(frame: &mut Frame<'_>, theme: &Theme) {
+    let full_message = "Terminal too small";
+    let message = if frame.area().width < full_message.width() as u16 {
+        "Too small"
+    } else {
+        full_message
+    };
+    let message_height = if frame.area().width < message.width() as u16 {
+        2
+    } else {
+        1
+    };
+    let area = centered_rect(frame.area(), frame.area().width, message_height);
+    frame.render_widget(
+        Paragraph::new(message)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .style(theme.feedback.warning),
+        area,
+    );
+}
+
+fn horizontal_padding(width: u16) -> u16 {
+    if width < NARROW_TERMINAL_WIDTH { 1 } else { 2 }
+}
+
+fn horizontally_inset(area: Rect, padding: u16) -> Rect {
+    let padding = padding.min(area.width / 2);
+    Rect::new(
+        area.x.saturating_add(padding),
+        area.y,
+        area.width.saturating_sub(padding.saturating_mul(2)),
+        area.height,
+    )
+}
+
+fn render_landing_footer(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    area: Rect,
+    detailed: bool,
+    theme: &Theme,
+) {
+    let context = if detailed {
+        format!(
+            "Agent unavailable · Workspace {}",
+            state.workspace.to_string_lossy()
+        )
+    } else {
+        "Agent unavailable".to_owned()
+    };
+    render_spread_line(
+        frame,
+        area,
+        &context,
+        theme.text.subdued,
+        &connection_status_text(state, detailed),
+        status_style(state, theme),
+    );
+}
+
+fn render_spread_line(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    left: &str,
+    left_style: Style,
+    right: &str,
+    right_style: Style,
+) {
+    let width = usize::from(area.width);
+    if width == 0 {
+        return;
+    }
+    let right = truncate_to_width(right, width);
+    let right_width = right.width();
+    let gap = usize::from(!left.is_empty() && !right.is_empty()) * 2;
+    let left_width = width.saturating_sub(right_width.saturating_add(gap));
+    let left = truncate_to_width(left, left_width);
+    let spacing = " ".repeat(width.saturating_sub(left.width() + right_width));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(left, left_style),
+            Span::raw(spacing),
+            Span::styled(right, right_style),
+        ])),
+        area,
+    );
+}
+
+fn truncate_to_width(value: &str, width: usize) -> String {
+    if value.width() <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let suffix = if width > 1 { "…" } else { "" };
+    let content_width = width.saturating_sub(suffix.width());
+    let mut result = String::new();
+    let mut used = 0;
+    for character in value.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if used + character_width > content_width {
+            break;
+        }
+        result.push(character);
+        used += character_width;
+    }
+    result.push_str(suffix);
+    result
+}
+
+fn connection_status_text(state: &TuiState, detailed: bool) -> String {
+    if detailed {
+        return status_text(state);
+    }
+    if state.fatal_error.is_some() {
+        "Connection failed".to_owned()
+    } else if state.manually_stopped {
+        "Server stopped".to_owned()
+    } else if state.recovery.is_some() {
+        "Recovering".to_owned()
+    } else if state.identity.is_some() {
+        "Connected".to_owned()
+    } else {
+        "Connecting".to_owned()
     }
 }
 
