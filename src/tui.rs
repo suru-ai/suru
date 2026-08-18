@@ -106,25 +106,31 @@ struct TranscriptAnchor {
     screen_row: isize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MessageStart {
+    message_id: MessageId,
+    row: usize,
+}
+
 #[derive(Clone, Debug)]
 struct TranscriptViewport {
     height: usize,
     scroll_position: usize,
     maximum_scroll: usize,
-    message_starts: Vec<(MessageId, usize)>,
+    message_starts: Vec<MessageStart>,
 }
 
 impl TranscriptViewport {
     fn anchor_at(&self, scroll_position: usize) -> Option<TranscriptAnchor> {
-        let (message_id, message_start) = self
+        let message_start = self
             .message_starts
             .iter()
             .rev()
-            .find(|(_, start)| *start <= scroll_position)
+            .find(|start| start.row <= scroll_position)
             .or_else(|| self.message_starts.first())?;
         Some(TranscriptAnchor {
-            message_id: *message_id,
-            screen_row: (*message_start as isize).saturating_sub_unsigned(scroll_position),
+            message_id: message_start.message_id,
+            screen_row: (message_start.row as isize).saturating_sub_unsigned(scroll_position),
         })
     }
 }
@@ -932,7 +938,7 @@ impl Application {
     }
 
     pub fn render(&self, frame: &mut Frame<'_>) {
-        render_application(frame, &self.state);
+        render(frame, &self.state);
     }
 
     pub fn handle_terminal_event(&mut self, event: InputEvent) -> Result<ApplicationTransition> {
@@ -1188,10 +1194,6 @@ fn command_from_scoped_bindings(
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
-    render_application(frame, state);
-}
-
-fn render_application(frame: &mut Frame<'_>, state: &TuiState) {
     let theme = Theme::system();
     if terminal_is_too_small(frame.area()) {
         render_terminal_too_small(frame, &theme);
@@ -1323,26 +1325,30 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
             content_width,
         );
     }
+    let transcript_layout = transcript.layout(content_width);
     let interaction = state
         .session_interaction(session_id)
         .expect("Session interaction is initialized with its snapshot");
-    let transcript_height_without_latest = frame
-        .area()
-        .height
-        .saturating_sub(u16::from(show_header))
-        .saturating_sub(pending_height)
-        .saturating_sub(composer_height)
-        .saturating_sub(1);
-    let viewport_without_latest = usize::from(if transcript_height_without_latest > 1 {
-        transcript_height_without_latest.saturating_sub(1)
-    } else {
-        transcript_height_without_latest
-    });
+    let [_, transcript_without_latest, _, _, _, _] = session_areas(
+        frame.area(),
+        u16::from(show_header),
+        pending_height,
+        0,
+        composer_height,
+    );
+    let viewport_without_latest = transcript_viewport_height(transcript_without_latest);
+    let [_, transcript_with_latest, _, _, _, _] = session_areas(
+        frame.area(),
+        u16::from(show_header),
+        pending_height,
+        1,
+        composer_height,
+    );
+    let viewport_with_latest = transcript_viewport_height(transcript_with_latest);
     let (away_from_bottom, viewport_height, maximum_scroll, scroll_position) =
         if interaction.follow_latest.get() {
-            let maximum_scroll = transcript
-                .lines
-                .len()
+            let maximum_scroll = transcript_layout
+                .row_count
                 .saturating_sub(viewport_without_latest);
             (
                 false,
@@ -1351,15 +1357,15 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
                 maximum_scroll,
             )
         } else {
-            let viewport_height = viewport_without_latest.saturating_sub(1);
-            let maximum_scroll = transcript.lines.len().saturating_sub(viewport_height);
+            let viewport_height = viewport_with_latest;
+            let maximum_scroll = transcript_layout.row_count.saturating_sub(viewport_height);
             let scroll_position = interaction.anchor.get().map_or(maximum_scroll, |anchor| {
-                transcript
+                transcript_layout
                     .message_starts
                     .iter()
-                    .find(|(message_id, _)| *message_id == anchor.message_id)
-                    .map_or(maximum_scroll, |(_, start)| {
-                        (*start as isize)
+                    .find(|start| start.message_id == anchor.message_id)
+                    .map_or(maximum_scroll, |start| {
+                        (start.row as isize)
                             .saturating_sub(anchor.screen_row)
                             .clamp(0, maximum_scroll as isize) as usize
                     })
@@ -1367,9 +1373,8 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
             if scroll_position >= maximum_scroll {
                 interaction.follow_latest.set(true);
                 interaction.anchor.set(None);
-                let maximum_scroll = transcript
-                    .lines
-                    .len()
+                let maximum_scroll = transcript_layout
+                    .row_count
                     .saturating_sub(viewport_without_latest);
                 (
                     false,
@@ -1389,15 +1394,13 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
         latest_area,
         composer_area,
         status_area,
-    ] = Layout::vertical([
-        Constraint::Length(u16::from(show_header)),
-        Constraint::Min(1),
-        Constraint::Length(pending_height),
-        Constraint::Length(latest_height),
-        Constraint::Length(composer_height),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    ] = session_areas(
+        frame.area(),
+        u16::from(show_header),
+        pending_height,
+        latest_height,
+        composer_height,
+    );
     if show_header {
         render_session_header(
             frame,
@@ -1418,16 +1421,9 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
         height: viewport_height,
         scroll_position,
         maximum_scroll,
-        message_starts: transcript.message_starts,
+        message_starts: transcript_layout.message_starts,
     }));
-    let transcript_widget = Paragraph::new(Text::from(
-        transcript
-            .lines
-            .into_iter()
-            .skip(scroll_position)
-            .take(viewport_height)
-            .collect::<Vec<_>>(),
-    ));
+    let transcript_widget = Paragraph::new(Text::from(transcript.lines)).wrap(Wrap { trim: false });
     let transcript_widget = if transcript_area.height > 1 {
         transcript_widget.block(
             Block::default()
@@ -1437,7 +1433,10 @@ fn render_session(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     } else {
         transcript_widget
     };
-    frame.render_widget(transcript_widget, transcript_area);
+    frame.render_widget(
+        transcript_widget.scroll((scroll_position.min(usize::from(u16::MAX)) as u16, 0)),
+        transcript_area,
+    );
     if pending_height > 0 {
         render_pending_prompts(frame, pending_area, state, &queued_prompts, detail, theme);
     }
@@ -1554,6 +1553,32 @@ fn agent_context(agent: Option<&AgentIdentity>, detail: ResponsiveDetail) -> Str
             agent.agent, agent.provider, agent.model
         ),
     }
+}
+
+fn session_areas(
+    area: Rect,
+    header_height: u16,
+    pending_height: u16,
+    latest_height: u16,
+    composer_height: u16,
+) -> [Rect; 6] {
+    Layout::vertical([
+        Constraint::Length(header_height),
+        Constraint::Min(1),
+        Constraint::Length(pending_height),
+        Constraint::Length(latest_height),
+        Constraint::Length(composer_height),
+        Constraint::Length(1),
+    ])
+    .areas(area)
+}
+
+fn transcript_viewport_height(area: Rect) -> usize {
+    usize::from(if area.height > 1 {
+        area.height.saturating_sub(1)
+    } else {
+        area.height
+    })
 }
 
 fn render_composer(
@@ -1722,7 +1747,53 @@ fn visual_cursor_row(text: &str, cursor: usize, width: u16) -> u16 {
 
 struct TranscriptProjection {
     lines: Vec<Line<'static>>,
-    message_starts: Vec<(MessageId, usize)>,
+    message_boundaries: Vec<MessageBoundary>,
+}
+
+#[derive(Clone, Copy)]
+struct MessageBoundary {
+    message_id: MessageId,
+    line_index: usize,
+}
+
+struct TranscriptLayout {
+    row_count: usize,
+    message_starts: Vec<MessageStart>,
+}
+
+impl TranscriptProjection {
+    fn layout(&self, width: u16) -> TranscriptLayout {
+        let mut row_count = 0;
+        let mut boundaries = self.message_boundaries.iter().peekable();
+        let mut message_starts = Vec::with_capacity(self.message_boundaries.len());
+        for (line_index, line) in self.lines.iter().enumerate() {
+            while boundaries
+                .peek()
+                .is_some_and(|boundary| boundary.line_index == line_index)
+            {
+                let boundary = boundaries.next().expect("peeked Message boundary exists");
+                message_starts.push(MessageStart {
+                    message_id: boundary.message_id,
+                    row: row_count,
+                });
+            }
+            row_count = row_count.saturating_add(
+                Paragraph::new(line.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(width),
+            );
+        }
+        for boundary in boundaries {
+            message_starts.push(MessageStart {
+                message_id: boundary.message_id,
+                row: row_count,
+            });
+        }
+        TranscriptLayout {
+            row_count,
+            message_starts,
+        }
+    }
 }
 
 fn transcript_projection(
@@ -1731,7 +1802,7 @@ fn transcript_projection(
     available_width: u16,
 ) -> TranscriptProjection {
     let mut lines = Vec::new();
-    let mut message_starts = Vec::new();
+    let mut message_boundaries = Vec::new();
     for item in &snapshot.transcript {
         match item {
             TranscriptItem::Message { message_id } => {
@@ -1742,14 +1813,15 @@ fn transcript_projection(
                 else {
                     continue;
                 };
-                message_starts.push((*message_id, lines.len()));
+                message_boundaries.push(MessageBoundary {
+                    message_id: *message_id,
+                    line_index: lines.len(),
+                });
                 match message.role {
                     MessageRole::User => {
                         push_user_message(&mut lines, &message.content, theme, available_width)
                     }
-                    MessageRole::Agent => {
-                        push_agent_message(&mut lines, &message.content, theme, available_width)
-                    }
+                    MessageRole::Agent => push_agent_message(&mut lines, &message.content, theme),
                 }
             }
             TranscriptItem::Activity { activity_id } => {
@@ -1764,13 +1836,13 @@ fn transcript_projection(
                     ActivityKind::Status => ("  ", theme.text.subdued),
                     ActivityKind::Error => ("  Error: ", theme.feedback.error),
                 };
-                push_prefixed_lines(&mut lines, prefix, &activity.text, style, available_width);
+                push_prefixed_lines(&mut lines, prefix, &activity.text, style);
             }
         }
     }
     TranscriptProjection {
         lines,
-        message_starts,
+        message_boundaries,
     }
 }
 
@@ -1818,75 +1890,23 @@ fn wrapped_content_lines(content: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
-fn push_agent_message(
-    lines: &mut Vec<Line<'static>>,
-    content: &str,
-    theme: &Theme,
-    available_width: u16,
-) {
-    for line in markdown::render(content, theme) {
-        for mut wrapped in wrap_styled_line(line, available_width.saturating_sub(2).max(1)) {
-            if !wrapped.spans.is_empty() {
-                wrapped
-                    .spans
-                    .insert(0, Span::styled("  ", theme.text.primary));
-            }
-            lines.push(wrapped);
+fn push_agent_message(lines: &mut Vec<Line<'static>>, content: &str, theme: &Theme) {
+    for mut line in markdown::render(content, theme) {
+        if !line.spans.is_empty() {
+            line.spans.insert(0, Span::styled("  ", theme.text.primary));
         }
+        lines.push(line);
     }
     if !content.is_empty() {
         lines.push(Line::default());
     }
 }
 
-fn wrap_styled_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
-    if line.spans.is_empty() {
-        return vec![Line::default()];
-    }
-    let width = usize::from(width.max(1));
-    let line_style = line.style;
-    let mut rows = Vec::new();
-    let mut row = Vec::new();
-    let mut row_width = 0_usize;
-    for span in line.spans {
-        let style = line_style.patch(span.style);
-        let mut chunk = String::new();
-        for character in span.content.chars() {
-            let character_width = character.width().unwrap_or(1);
-            if row_width > 0 && row_width.saturating_add(character_width) > width {
-                if !chunk.is_empty() {
-                    row.push(Span::styled(std::mem::take(&mut chunk), style));
-                }
-                rows.push(Line::from(std::mem::take(&mut row)));
-                row_width = 0;
-            }
-            chunk.push(character);
-            row_width = row_width.saturating_add(character_width);
-        }
-        if !chunk.is_empty() {
-            row.push(Span::styled(chunk, style));
-        }
-    }
-    if !row.is_empty() {
-        rows.push(Line::from(row));
-    }
-    rows
-}
-
-fn push_prefixed_lines(
-    lines: &mut Vec<Line<'static>>,
-    prefix: &str,
-    content: &str,
-    style: Style,
-    available_width: u16,
-) {
+fn push_prefixed_lines(lines: &mut Vec<Line<'static>>, prefix: &str, content: &str, style: Style) {
     for (index, line) in content.lines().enumerate() {
-        lines.extend(wrap_styled_line(
-            Line::styled(
-                format!("{}{line}", if index == 0 { prefix } else { "  " }),
-                style,
-            ),
-            available_width,
+        lines.push(Line::styled(
+            format!("{}{line}", if index == 0 { prefix } else { "  " }),
+            style,
         ));
     }
 }

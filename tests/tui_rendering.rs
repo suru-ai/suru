@@ -92,6 +92,12 @@ fn text_cell<'a>(buffer: &'a Buffer, needle: &str) -> &'a Cell {
         .expect("rendered text position is inside the buffer")
 }
 
+fn rendered_row(rows: &[String], needle: &str) -> usize {
+    rows.iter()
+        .position(|row| row.contains(needle))
+        .unwrap_or_else(|| panic!("rendered frame did not contain {needle:?}"))
+}
+
 async fn apply_next_session_event(
     application: &mut Application,
     subscription: &mut SessionSubscription,
@@ -1501,7 +1507,9 @@ fn a_scrolled_message_anchor_survives_streaming_and_terminal_resize_per_client()
             KeyModifiers::NONE,
         )))
         .expect("reader pages into history");
-    let anchored = rendered_application_rows_at(&reader, 72, 18).join("\n");
+    let anchored_rows = rendered_application_rows_at(&reader, 72, 18);
+    let anchor_row = rendered_row(&anchored_rows, "Agent section 5");
+    let anchored = anchored_rows.join("\n");
     assert!(
         anchored.contains("Agent section 5"),
         "expected the fifth Agent Message to be the visible anchor:\n{anchored}"
@@ -1524,7 +1532,13 @@ fn a_scrolled_message_anchor_survives_streaming_and_terminal_resize_per_client()
             .expect("append streamed Agent content");
     }
 
-    let resized_reader = rendered_application_rows_at(&reader, 42, 15).join("\n");
+    let resized_reader_rows = rendered_application_rows_at(&reader, 42, 15);
+    assert_eq!(
+        rendered_row(&resized_reader_rows, "Agent section 5"),
+        anchor_row,
+        "resize must keep the Message on the same rendered row"
+    );
+    let resized_reader = resized_reader_rows.join("\n");
     assert!(
         resized_reader.contains("Agent section 5"),
         "resize must preserve the logical Message anchor:\n{resized_reader}"
@@ -1558,7 +1572,13 @@ fn a_scrolled_message_anchor_survives_streaming_and_terminal_resize_per_client()
             )))
             .expect("complete streamed Agent content");
     }
-    let completed_reader = rendered_application_rows_at(&reader, 56, 20).join("\n");
+    let completed_reader_rows = rendered_application_rows_at(&reader, 56, 20);
+    assert_eq!(
+        rendered_row(&completed_reader_rows, "Agent section 5"),
+        anchor_row,
+        "completion must keep the Message on the same rendered row"
+    );
+    let completed_reader = completed_reader_rows.join("\n");
     assert!(completed_reader.contains("Agent section 5"));
     assert!(completed_reader.contains("Latest"));
     assert!(
@@ -1615,7 +1635,9 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
             KeyModifiers::NONE,
         )))
         .expect("page into transcript history");
-    let anchored = rendered_application_rows_at(&application, 72, 22).join("\n");
+    let anchored_rows = rendered_application_rows_at(&application, 72, 22);
+    let anchor_row = rendered_row(&anchored_rows, "Agent section 4");
+    let anchored = anchored_rows.join("\n");
     assert!(
         anchored.contains("Agent section 4"),
         "expected the fourth Agent Message to be the visible anchor:\n{anchored}"
@@ -1627,7 +1649,13 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                 .to_owned(),
         )))
         .expect("grow the multiline composer");
-    let growing_composer = rendered_application_rows_at(&application, 72, 22).join("\n");
+    let growing_composer_rows = rendered_application_rows_at(&application, 72, 22);
+    assert_eq!(
+        rendered_row(&growing_composer_rows, "Agent section 4"),
+        anchor_row,
+        "composer growth must keep the Message on the same rendered row"
+    );
+    let growing_composer = growing_composer_rows.join("\n");
     assert!(growing_composer.contains("Agent section 4"));
     assert!(growing_composer.contains("final draft row"));
     assert!(growing_composer.contains("Latest"));
@@ -1650,7 +1678,13 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
             },
         )))
         .expect("show a queued Prompt dock");
-    let with_dock = rendered_application_rows_at(&application, 72, 22).join("\n");
+    let with_dock_rows = rendered_application_rows_at(&application, 72, 22);
+    assert_eq!(
+        rendered_row(&with_dock_rows, "Agent section 4"),
+        anchor_row,
+        "queued dock changes must keep the Message on the same rendered row"
+    );
+    let with_dock = with_dock_rows.join("\n");
     assert!(with_dock.contains("Agent section 4"));
     assert!(with_dock.contains("Queued dock entry"));
     assert!(with_dock.contains("Latest"));
@@ -1661,7 +1695,13 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
     else {
         panic!("a Session steer should request Prompt admission");
     };
-    let provisional = rendered_application_rows_at(&application, 72, 22).join("\n");
+    let provisional_rows = rendered_application_rows_at(&application, 72, 22);
+    assert_eq!(
+        rendered_row(&provisional_rows, "Agent section 4"),
+        anchor_row,
+        "provisional content must keep the Message on the same rendered row"
+    );
+    let provisional = provisional_rows.join("\n");
     assert!(provisional.contains("Agent section 4"));
     assert!(provisional.contains("Latest"));
 
@@ -1702,7 +1742,13 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
             },
         )))
         .expect("reconcile the optimistic Prompt to a stable Message");
-    let reconciled_anchor = rendered_application_rows_at(&application, 72, 22).join("\n");
+    let reconciled_anchor_rows = rendered_application_rows_at(&application, 72, 22);
+    assert_eq!(
+        rendered_row(&reconciled_anchor_rows, "Agent section 4"),
+        anchor_row,
+        "Message reconciliation must keep the anchor on the same rendered row"
+    );
+    let reconciled_anchor = reconciled_anchor_rows.join("\n");
     assert!(reconciled_anchor.contains("Agent section 4"));
     assert!(reconciled_anchor.contains("Latest"));
 
