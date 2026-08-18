@@ -49,11 +49,12 @@ pub(crate) enum PromptMutationError {
     PromptNotPending,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InterruptTurnError {
     SessionNotFound,
     TurnNotFound,
     TurnNotActive,
+    ProviderFailure(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -734,16 +735,16 @@ impl SessionStore {
         Ok(prompt)
     }
 
-    pub(crate) fn interrupt(
+    pub(crate) fn interrupt_target(
         &self,
         session_id: SessionId,
         turn_id: TurnId,
     ) -> Result<Turn, InterruptTurnError> {
-        let mut state = self
+        let state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let mut turn = state
+        let turn = state
             .sessions
             .get(&session_id)
             .ok_or(InterruptTurnError::SessionNotFound)?
@@ -759,22 +760,6 @@ impl SessionStore {
         if turn.status != TurnStatus::Active {
             return Err(InterruptTurnError::TurnNotActive);
         }
-        let updated_at = state.next_timestamp();
-        let record = state
-            .sessions
-            .get_mut(&session_id)
-            .expect("Session existence was checked while holding the store lock");
-        record
-            .publish(
-                session_id,
-                vec![SessionChange::TurnStatusChanged {
-                    turn_id,
-                    status: TurnStatus::Interrupted,
-                }],
-            )
-            .expect("Turn interruption preserves Session invariants");
-        record.summary.updated_at = updated_at;
-        turn.status = TurnStatus::Interrupted;
         Ok(turn)
     }
 

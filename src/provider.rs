@@ -67,6 +67,8 @@ pub trait ProviderRuntime: Send + Sync + 'static {
 
 pub trait ProviderSession: Send + Sync + 'static {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()>;
+
+    fn interrupt_turn(&self) -> ProviderFuture<'_, ()>;
 }
 
 pub struct ProviderSessionConnection {

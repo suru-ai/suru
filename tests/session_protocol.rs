@@ -408,6 +408,11 @@ fn session_delta_status_and_error_contracts_use_stable_provider_neutral_shapes()
         })
     );
     assert_eq!(
+        serde_json::to_value(SessionErrorCode::TurnInterruptionFailed)
+            .expect("encode interruption failure code"),
+        json!("turn_interruption_failed")
+    );
+    assert_eq!(
         serde_json::to_value([
             PromptStatus::Pending,
             PromptStatus::Delivered,

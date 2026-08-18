@@ -1065,8 +1065,10 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
 async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = spawn_with_failing_provider(
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
         ServerConfig::new(state_dir.path(), "prompt-mutation-test").expect("configure server"),
+        runtime,
     )
     .await
     .expect("spawn server");
@@ -1092,47 +1094,26 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
             },
             prompt: InitialPrompt {
                 id: PromptId::new(),
-                text: "Initial Prompt".to_owned(),
+                text: "Long-running work".to_owned(),
             },
         })
         .await
         .expect("create Session");
     let session_id = created.session.id;
-    let active_prompt_id = PromptId::new();
-    let active_turn_id = TurnId::new();
-    server
-        .session_event_sink()
-        .publish(
-            session_id,
-            vec![
-                SessionChange::PromptAdded {
-                    prompt: Prompt {
-                        id: active_prompt_id,
-                        text: "Long-running work".to_owned(),
-                        delivery: PromptDelivery::Steer,
-                        admission_order: PromptOrder(2),
-                        status: PromptStatus::Delivered,
-                    },
-                },
-                SessionChange::TurnAdded {
-                    turn: Turn {
-                        id: active_turn_id,
-                        prompt_id: active_prompt_id,
-                        status: TurnStatus::Active,
-                    },
-                },
-                SessionChange::MessageAdded {
-                    message: Message {
-                        id: MessageId::new(),
-                        turn_id: active_turn_id,
-                        role: MessageRole::User,
-                        status: MessageStatus::Completed,
-                        content: "Long-running work".to_owned(),
-                    },
-                },
-            ],
-        )
-        .expect("start active Turn");
+    let start = provider.next_start().await;
+    let mut provider_session = start.succeed(AgentIdentity {
+        agent: AgentId::new("codex"),
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("test-model"),
+    });
+    let turn_start = provider_session.next_turn().await;
+    assert_eq!(turn_start.prompt(), "Long-running work");
+    let active = first
+        .read_session(session_id)
+        .await
+        .expect("read delivered initial Prompt");
+    let active_turn_id = active.turns[0].id;
+    turn_start.succeed();
     let promoted = first
         .admit_prompt(
             session_id,
@@ -1210,11 +1191,28 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
     };
     assert_eq!(before_interrupt.session.status, SessionStatus::Active);
 
-    let interrupted = first
-        .interrupt_turn(session_id, active_turn_id)
+    let (acknowledged, ()) =
+        tokio::join!(first.interrupt_turn(session_id, active_turn_id), async {
+            provider_session.next_interrupt().await.succeed();
+        });
+    let acknowledged = acknowledged.expect("Provider acknowledges interruption");
+    assert_eq!(acknowledged.status, TurnStatus::Active);
+    let during_interruption = second
+        .read_session(session_id)
         .await
-        .expect("interrupt active Turn");
-    assert_eq!(interrupted.status, TurnStatus::Interrupted);
+        .expect("read Session during cooperative interruption");
+    assert_eq!(during_interruption.session.status, SessionStatus::Active);
+    assert_eq!(
+        during_interruption
+            .turns
+            .iter()
+            .find(|turn| turn.id == active_turn_id)
+            .expect("active Turn remains authoritative")
+            .status,
+        TurnStatus::Active
+    );
+
+    provider_session.emit(ProviderEvent::TurnInterrupted);
     let SessionEvent::Updated(interrupt_update) = timeout(Duration::from_secs(1), observer.next())
         .await
         .expect("interruption update arrives")
@@ -1287,6 +1285,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
     );
 
     drop(observer);
+    drop(provider_session);
     drop(second);
     drop(first);
     server.shutdown().await.expect("shut down server");

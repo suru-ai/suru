@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Result;
 use futures_util::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::{
     ProviderEvent, ProviderEventStream, ProviderRuntime, ProviderSession, ProviderSessionRequest,
@@ -14,8 +14,9 @@ use super::{
 };
 use crate::protocol::{
     Message, MessageId, MessageRole, MessageStatus, PromptId, SessionChange, SessionId, TurnId,
+    TurnStatus,
 };
-use crate::sessions::{DeliveredTurnStatus, SessionStore};
+use crate::sessions::{DeliveredTurnStatus, InterruptTurnError, SessionStore};
 
 #[derive(Clone)]
 pub(crate) struct ProviderOrchestrator {
@@ -24,9 +25,14 @@ pub(crate) struct ProviderOrchestrator {
     actors: Arc<Mutex<HashMap<SessionId, mpsc::UnboundedSender<ProviderCommand>>>>,
 }
 
-#[derive(Clone, Copy)]
-struct ProviderCommand {
-    prompt_id: PromptId,
+enum ProviderCommand {
+    StartPrompt {
+        prompt_id: PromptId,
+    },
+    InterruptTurn {
+        turn_id: TurnId,
+        response: oneshot::Sender<Result<crate::protocol::Turn, InterruptTurnError>>,
+    },
 }
 
 struct ConnectedProviderSession {
@@ -37,6 +43,12 @@ struct ConnectedProviderSession {
 struct ActiveProviderTurn {
     turn_id: TurnId,
     streaming_message_id: Option<MessageId>,
+    interruption_acknowledged: bool,
+}
+
+enum ProviderInput {
+    Command(Option<ProviderCommand>),
+    Event(Option<Result<ProviderEvent, super::ProviderError>>),
 }
 
 impl ProviderOrchestrator {
@@ -69,7 +81,7 @@ impl ProviderOrchestrator {
             commands_rx,
         ));
         commands_tx
-            .send(ProviderCommand { prompt_id })
+            .send(ProviderCommand::StartPrompt { prompt_id })
             .expect("new Provider actor accepts its initial Prompt");
     }
 
@@ -82,8 +94,64 @@ impl ProviderOrchestrator {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Session has no Provider actor"))?;
         actor
-            .send(ProviderCommand { prompt_id })
+            .send(ProviderCommand::StartPrompt { prompt_id })
             .map_err(|_| anyhow::anyhow!("Session Provider actor stopped unexpectedly"))
+    }
+
+    pub(crate) async fn interrupt_turn(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<crate::protocol::Turn, InterruptTurnError> {
+        let target = self.sessions.interrupt_target(session_id, turn_id)?;
+        if target.status == TurnStatus::Interrupted {
+            return Ok(target);
+        }
+        let actor = self
+            .actors
+            .lock()
+            .expect("Provider actor registry lock is not poisoned")
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| {
+                self.fail_unavailable_interruption(
+                    session_id,
+                    turn_id,
+                    "Provider interruption failed: the Session has no Provider actor.",
+                )
+            })?;
+        let (response_tx, response_rx) = oneshot::channel();
+        actor
+            .send(ProviderCommand::InterruptTurn {
+                turn_id,
+                response: response_tx,
+            })
+            .map_err(|_| {
+                self.fail_unavailable_interruption(
+                    session_id,
+                    turn_id,
+                    "Provider interruption failed: the Provider Session stopped unexpectedly.",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            self.fail_unavailable_interruption(
+                session_id,
+                turn_id,
+                "Provider interruption failed: the Provider Session stopped unexpectedly.",
+            )
+        })?
+    }
+
+    fn fail_unavailable_interruption(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        message: &str,
+    ) -> InterruptTurnError {
+        let _ = self
+            .sessions
+            .fail_turn(session_id, turn_id, None, message.to_owned());
+        InterruptTurnError::ProviderFailure(message.to_owned())
     }
 }
 
@@ -102,6 +170,13 @@ async fn run_provider_session(
             let Some(command) = commands.recv().await else {
                 return;
             };
+            let ProviderCommand::StartPrompt { prompt_id } = command else {
+                if let ProviderCommand::InterruptTurn { turn_id, response } = command {
+                    let result = sessions.interrupt_target(session_id, turn_id);
+                    let _ = response.send(result);
+                }
+                continue;
+            };
             if provider.is_none() {
                 let connection = runtime
                     .start_session(ProviderSessionRequest {
@@ -113,7 +188,7 @@ async fn run_provider_session(
                     Err(error) => {
                         let _ = sessions.deliver_prompt(
                             session_id,
-                            command.prompt_id,
+                            prompt_id,
                             DeliveredTurnStatus::Failed {
                                 message: format!("Provider startup failed: {error}"),
                             },
@@ -125,7 +200,7 @@ async fn run_provider_session(
                 if let Err(error) = sessions.bind_agent(session_id, identity) {
                     let _ = sessions.deliver_prompt(
                         session_id,
-                        command.prompt_id,
+                        prompt_id,
                         DeliveredTurnStatus::Failed {
                             message: format!("Provider startup failed: {error}"),
                         },
@@ -135,15 +210,12 @@ async fn run_provider_session(
                 provider = Some(ConnectedProviderSession { session, events });
             }
 
-            let delivered = match sessions.deliver_prompt(
-                session_id,
-                command.prompt_id,
-                DeliveredTurnStatus::Active,
-            ) {
-                Ok(Some(delivered)) => delivered,
-                Ok(None) => continue,
-                Err(_) => continue,
-            };
+            let delivered =
+                match sessions.deliver_prompt(session_id, prompt_id, DeliveredTurnStatus::Active) {
+                    Ok(Some(delivered)) => delivered,
+                    Ok(None) => continue,
+                    Err(_) => continue,
+                };
             let provider_session = provider
                 .as_ref()
                 .expect("Provider connection exists before Prompt delivery")
@@ -166,22 +238,78 @@ async fn run_provider_session(
             active = Some(ActiveProviderTurn {
                 turn_id: delivered.turn.id,
                 streaming_message_id: None,
+                interruption_acknowledged: false,
             });
             continue;
         }
 
-        let connected = provider
-            .as_mut()
-            .expect("an active Provider Turn has a Provider Session");
-        tokio::select! {
-            command = commands.recv() => {
-                if command.is_none() {
-                    return;
-                }
+        let provider_session = provider
+            .as_ref()
+            .expect("an active Provider Turn has a Provider Session")
+            .session
+            .clone();
+        let input = {
+            let events = &mut provider
+                .as_mut()
+                .expect("an active Provider Turn has a Provider Session")
+                .events;
+            tokio::select! {
+                command = commands.recv() => ProviderInput::Command(command),
+                event = events.next() => ProviderInput::Event(event),
+            }
+        };
+        match input {
+            ProviderInput::Command(None) => return,
+            ProviderInput::Command(Some(ProviderCommand::StartPrompt { .. })) => {
                 // Prompts admitted while startup was still pending can already be queued here.
                 // Keep them pending until queued delivery and steering gain their own orchestration.
             }
-            event = connected.events.next() => {
+            ProviderInput::Command(Some(ProviderCommand::InterruptTurn { turn_id, response })) => {
+                let target = match sessions.interrupt_target(session_id, turn_id) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                        continue;
+                    }
+                };
+                if target.status == TurnStatus::Interrupted {
+                    let _ = response.send(Ok(target));
+                    continue;
+                }
+                let current = active
+                    .as_mut()
+                    .expect("Provider input is handled while a Turn is active");
+                if current.turn_id != turn_id {
+                    let _ = response.send(Err(InterruptTurnError::ProviderFailure(
+                        "Provider interruption failed: the Provider owns a different active Turn."
+                            .to_owned(),
+                    )));
+                    continue;
+                }
+                if current.interruption_acknowledged {
+                    let _ = response.send(Ok(target));
+                    continue;
+                }
+                match provider_session.interrupt_turn().await {
+                    Ok(()) => {
+                        current.interruption_acknowledged = true;
+                        let _ = response.send(Ok(target));
+                    }
+                    Err(error) => {
+                        let message = format!("Provider interruption failed: {error}");
+                        let _ = sessions.fail_turn(
+                            session_id,
+                            current.turn_id,
+                            current.streaming_message_id.take(),
+                            message.clone(),
+                        );
+                        active = None;
+                        provider = None;
+                        let _ = response.send(Err(InterruptTurnError::ProviderFailure(message)));
+                    }
+                }
+            }
+            ProviderInput::Event(event) => {
                 let Some(current) = active.as_mut() else {
                     continue;
                 };

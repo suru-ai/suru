@@ -549,7 +549,7 @@ async fn interrupt_turn(
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match state.sessions.interrupt(session_id, turn_id) {
+    match state.providers.interrupt_turn(session_id, turn_id).await {
         Ok(turn) => Json(turn).into_response(),
         Err(InterruptTurnError::SessionNotFound) => session_error_response(
             StatusCode::NOT_FOUND,
@@ -565,6 +565,11 @@ async fn interrupt_turn(
             StatusCode::CONFLICT,
             SessionErrorCode::TurnNotActive,
             "Turn is no longer active",
+        ),
+        Err(InterruptTurnError::ProviderFailure(message)) => session_error_response(
+            StatusCode::BAD_GATEWAY,
+            SessionErrorCode::TurnInterruptionFailed,
+            message,
         ),
     }
 }

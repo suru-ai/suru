@@ -27,6 +27,7 @@ use crate::protocol::{AgentId, AgentIdentity, ModelId, ProviderId};
 
 const CODEX_PATH_ENV: &str = "CHIDORI_CODEX_PATH";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REMOTE_ERROR_CHARS: usize = 384;
 
 #[derive(Serialize)]
@@ -75,6 +76,13 @@ struct ThreadStartParams<'a> {
 struct TurnStartParams<'a> {
     thread_id: &'a str,
     input: [TextInput<'a>; 1],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnInterruptParams<'a> {
+    thread_id: &'a str,
+    turn_id: &'a str,
 }
 
 #[derive(Serialize)]
@@ -386,6 +394,30 @@ impl ProviderSession for CodexSession {
             Ok(())
         })
     }
+
+    fn interrupt_turn(&self) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            let turn_id = self
+                .correlation
+                .lock()
+                .expect("Codex native correlation lock is not poisoned")
+                .active_turn_id
+                .clone()
+                .ok_or_else(|| codex_error("Codex has no active Turn to interrupt"))?;
+            self.transport
+                .request_with_timeout(
+                    "turn/interrupt",
+                    &TurnInterruptParams {
+                        thread_id: &self.thread_id,
+                        turn_id: &turn_id,
+                    },
+                    INTERRUPT_REQUEST_TIMEOUT,
+                )
+                .await
+                .map_err(|error| codex_error(format!("Codex Turn interruption failed: {error}")))?;
+            Ok(())
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -661,6 +693,16 @@ impl JsonRpcTransport {
         method: &str,
         params: &T,
     ) -> Result<Value, ProviderError> {
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout<T: Serialize + ?Sized>(
+        &self,
+        method: &str,
+        params: &T,
+        request_timeout: Duration,
+    ) -> Result<Value, ProviderError> {
         if self.state.terminated.load(Ordering::Acquire) {
             return Err(codex_error("Codex app-server transport has ended"));
         }
@@ -687,7 +729,7 @@ impl JsonRpcTransport {
             return Err(error);
         }
 
-        match timeout(REQUEST_TIMEOUT, response_rx).await {
+        match timeout(request_timeout, response_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(codex_error(format!(
                 "Codex app-server ended before `{method}` completed"

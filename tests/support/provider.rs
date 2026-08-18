@@ -24,6 +24,7 @@ pub struct StartRequest {
 
 pub struct ControlledProviderSession {
     turns: mpsc::UnboundedReceiver<TurnStart>,
+    interruptions: mpsc::UnboundedReceiver<TurnInterrupt>,
     events: mpsc::UnboundedSender<Result<ProviderEvent, ProviderError>>,
 }
 
@@ -32,8 +33,13 @@ pub struct TurnStart {
     response: oneshot::Sender<Result<(), ProviderError>>,
 }
 
+pub struct TurnInterrupt {
+    response: oneshot::Sender<Result<(), ProviderError>>,
+}
+
 struct ControlledSessionHandle {
     turns: mpsc::UnboundedSender<TurnStart>,
+    interruptions: mpsc::UnboundedSender<TurnInterrupt>,
 }
 
 impl ControlledProvider {
@@ -60,6 +66,7 @@ impl StartRequest {
 
     pub fn succeed(self, identity: AgentIdentity) -> ControlledProviderSession {
         let (turns_tx, turns_rx) = mpsc::unbounded_channel();
+        let (interruptions_tx, interruptions_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let events: ProviderEventStream = Box::pin(stream::unfold(events_rx, |mut events| async {
             events.recv().await.map(|event| (event, events))
@@ -67,12 +74,16 @@ impl StartRequest {
         self.response
             .send(Ok(ProviderSessionConnection::new(
                 identity,
-                Arc::new(ControlledSessionHandle { turns: turns_tx }),
+                Arc::new(ControlledSessionHandle {
+                    turns: turns_tx,
+                    interruptions: interruptions_tx,
+                }),
                 events,
             )))
             .unwrap_or_else(|_| panic!("Provider startup response remains connected"));
         ControlledProviderSession {
             turns: turns_rx,
+            interruptions: interruptions_rx,
             events: events_tx,
         }
     }
@@ -87,6 +98,13 @@ impl StartRequest {
 impl ControlledProviderSession {
     pub async fn next_turn(&mut self) -> TurnStart {
         self.turns
+            .recv()
+            .await
+            .expect("Provider Session remains connected")
+    }
+
+    pub async fn next_interrupt(&mut self) -> TurnInterrupt {
+        self.interruptions
             .recv()
             .await
             .expect("Provider Session remains connected")
@@ -114,6 +132,14 @@ impl TurnStart {
         self.response
             .send(Err(ProviderError::new(message)))
             .unwrap_or_else(|_| panic!("Provider Turn response remains connected"));
+    }
+}
+
+impl TurnInterrupt {
+    pub fn succeed(self) {
+        self.response
+            .send(Ok(()))
+            .unwrap_or_else(|_| panic!("Provider interruption response remains connected"));
     }
 }
 
@@ -152,6 +178,21 @@ impl ProviderSession for ControlledSessionHandle {
             response_rx
                 .await
                 .map_err(|_| ProviderError::new("test Provider Turn was abandoned"))?
+        })
+    }
+
+    fn interrupt_turn(&self) -> ProviderFuture<'_, ()> {
+        let interruptions = self.interruptions.clone();
+        Box::pin(async move {
+            let (response_tx, response_rx) = oneshot::channel();
+            interruptions
+                .send(TurnInterrupt {
+                    response: response_tx,
+                })
+                .map_err(|_| ProviderError::new("test Provider Session disconnected"))?;
+            response_rx
+                .await
+                .map_err(|_| ProviderError::new("test Provider interruption was abandoned"))?
         })
     }
 }
