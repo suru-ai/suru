@@ -1,10 +1,12 @@
 //! Authoritative in-memory Session ownership for one shared server instance.
 
 use std::{
+    cmp::Reverse,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use tokio::sync::broadcast;
@@ -12,8 +14,8 @@ use tokio::sync::broadcast;
 use crate::protocol::{
     Activity, ActivityId, ActivityKind, AdmitPromptRequest, CreateSessionRequest, Message,
     MessageId, MessageRole, Prompt, PromptId, PromptStatus, Session, SessionChange, SessionId,
-    SessionRevision, SessionSnapshot, SessionStatus, SessionUpdate, Turn, TurnId, TurnStatus,
-    Workspace,
+    SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
+    SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
 };
 
 const AGENT_UNAVAILABLE: &str =
@@ -49,10 +51,12 @@ pub(crate) enum StoreOutcome<T> {
 struct SessionStoreState {
     sessions: HashMap<SessionId, SessionRecord>,
     prompts: HashMap<PromptId, PromptOwner>,
+    last_timestamp: Option<SessionTimestamp>,
 }
 
 struct SessionRecord {
     snapshot: SessionSnapshot,
+    summary: SessionSummary,
     updates: broadcast::Sender<SessionUpdate>,
 }
 
@@ -80,6 +84,11 @@ struct DeliveredTurn {
     turn: Turn,
     message: Message,
     activity: Activity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ListSessionsError {
+    InvalidWorkspace,
 }
 
 impl SessionStore {
@@ -146,6 +155,7 @@ impl SessionStore {
             return Err(CreateSessionError::PromptConflict);
         }
 
+        let title = request.prompt.text.trim().to_owned();
         let session_id = SessionId::new();
         let delivered = DeliveredTurn::new(request.prompt.id, request.prompt.text.clone());
         let snapshot = SessionSnapshot {
@@ -164,6 +174,16 @@ impl SessionStore {
             activities: vec![delivered.activity],
         };
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
+        let timestamp = state.next_timestamp();
+        let summary = SessionSummary {
+            id: session_id,
+            title,
+            workspace: snapshot.session.workspace.clone(),
+            agent: snapshot.session.agent.clone(),
+            status: snapshot.session.status,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
         state.prompts.insert(
             request.prompt.id,
             PromptOwner {
@@ -179,6 +199,7 @@ impl SessionStore {
             session_id,
             SessionRecord {
                 snapshot: snapshot.clone(),
+                summary,
                 updates,
             },
         );
@@ -217,9 +238,14 @@ impl SessionStore {
             return Err(AdmitPromptError::PromptConflict);
         }
 
-        let Some(record) = state.sessions.get_mut(&session_id) else {
+        if !state.sessions.contains_key(&session_id) {
             return Err(AdmitPromptError::SessionNotFound);
-        };
+        }
+        let updated_at = state.next_timestamp();
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
         let delivered = DeliveredTurn::new(request.prompt.id, request.prompt.text.clone());
         let revision = SessionRevision(
             record
@@ -237,6 +263,8 @@ impl SessionStore {
         record.snapshot.revision = revision;
         let prompt = delivered.prompt.clone();
         delivered.append_to(&mut record.snapshot);
+        record.summary.status = record.snapshot.session.status;
+        record.summary.updated_at = updated_at;
         let _ = record.updates.send(update);
         state.prompts.insert(
             request.prompt.id,
@@ -259,6 +287,44 @@ impl SessionStore {
             snapshot: record.snapshot.clone(),
             updates: record.updates.subscribe(),
         })
+    }
+
+    pub(crate) fn snapshot(&self, session_id: SessionId) -> Option<SessionSnapshot> {
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .sessions
+            .get(&session_id)
+            .map(|record| record.snapshot.clone())
+    }
+
+    pub(crate) fn list(
+        &self,
+        workspace: Option<&Path>,
+    ) -> Result<Vec<SessionSummary>, ListSessionsError> {
+        let workspace = workspace
+            .map(fs::canonicalize)
+            .transpose()
+            .map_err(|_| ListSessionsError::InvalidWorkspace)?;
+        if workspace.as_ref().is_some_and(|path| !path.is_dir()) {
+            return Err(ListSessionsError::InvalidWorkspace);
+        }
+
+        let mut summaries = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .sessions
+            .values()
+            .filter(|record| {
+                workspace
+                    .as_ref()
+                    .is_none_or(|path| record.summary.workspace.path == *path)
+            })
+            .map(|record| record.summary.clone())
+            .collect::<Vec<_>>();
+        summaries.sort_unstable_by_key(|summary| Reverse(summary.updated_at));
+        Ok(summaries)
     }
 }
 
@@ -359,5 +425,20 @@ impl DeliveredTurn {
         snapshot.turns.push(self.turn);
         snapshot.messages.push(self.message);
         snapshot.activities.push(self.activity);
+    }
+}
+
+impl SessionStoreState {
+    fn next_timestamp(&mut self) -> SessionTimestamp {
+        let current = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let timestamp = SessionTimestamp(self.last_timestamp.map_or(current, |previous| {
+            current.max(previous.0.saturating_add(1))
+        }));
+        self.last_timestamp = Some(timestamp);
+        timestamp
     }
 }

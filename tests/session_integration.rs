@@ -1,4 +1,10 @@
-use std::{convert::Infallible, sync::Arc};
+use std::{
+    convert::Infallible,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use axum::{
     Json, Router,
@@ -20,7 +26,7 @@ use chidori::{
         PROTOCOL_VERSION, Prompt, PromptId, PromptStatus, RuntimeDescriptor,
         SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SNAPSHOT_EVENT, ServerIdentity, Session,
         SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
-        SessionStatus, SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
+        SessionStatus, SessionSummary, SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{self, ServerConfig},
 };
@@ -456,6 +462,235 @@ async fn consecutive_prompt_admissions_are_delivered_without_collapsing_revision
 }
 
 #[tokio::test]
+async fn authenticated_clients_can_read_a_session_by_id() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "session-read-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Explain this workspace".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+    let session_url = format!("{}/v1/sessions/{}", descriptor.base_url, created.session.id);
+
+    let unauthenticated = client
+        .get(&session_url)
+        .send()
+        .await
+        .expect("read Session without authentication");
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let read = client
+        .get(&session_url)
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("read authenticated Session")
+        .error_for_status()
+        .expect("Session read succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode Session read");
+    assert_eq!(read, created);
+
+    let missing = client
+        .get(format!(
+            "{}/v1/sessions/{}",
+            descriptor.base_url,
+            SessionId::new()
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("read missing Session");
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        missing
+            .json::<SessionError>()
+            .await
+            .expect("decode missing Session error")
+            .code,
+        SessionErrorCode::SessionNotFound
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let first_workspace_parent = tempfile::tempdir().expect("create first Workspace parent");
+    let first_workspace = first_workspace_parent.path().join("workspace");
+    std::fs::create_dir(&first_workspace).expect("create first Workspace");
+    let second_workspace = tempfile::tempdir().expect("create second Workspace");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "session-list-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let client = reqwest::Client::new();
+
+    let create = |path: &std::path::Path, text: &str| CreateSessionRequest {
+        workspace: Workspace {
+            path: path.to_owned(),
+        },
+        prompt: InitialPrompt {
+            id: PromptId::new(),
+            text: text.to_owned(),
+        },
+    };
+    let first = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&create(&first_workspace, "First Session"))
+        .send()
+        .await
+        .expect("create first Session")
+        .error_for_status()
+        .expect("first Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode first Session");
+    let second = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&create(second_workspace.path(), "  Second Session  "))
+        .send()
+        .await
+        .expect("create second Session")
+        .error_for_status()
+        .expect("second Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode second Session");
+
+    let unauthenticated = client
+        .get(format!("{}/v1/sessions", descriptor.base_url))
+        .send()
+        .await
+        .expect("list Sessions without authentication");
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let summaries = client
+        .get(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("list Sessions")
+        .error_for_status()
+        .expect("Session listing succeeds")
+        .json::<Vec<SessionSummary>>()
+        .await
+        .expect("decode Session summaries");
+    assert_eq!(
+        summaries
+            .iter()
+            .map(|summary| summary.id)
+            .collect::<Vec<_>>(),
+        vec![second.session.id, first.session.id]
+    );
+    assert_eq!(summaries[0].title, "Second Session");
+    assert!(summaries[0].updated_at > summaries[1].updated_at);
+
+    let filtered = client
+        .get(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .query(&[(
+            "workspace",
+            first_workspace_parent.path().join(".").join("workspace"),
+        )])
+        .send()
+        .await
+        .expect("list Sessions for one Workspace")
+        .error_for_status()
+        .expect("filtered Session listing succeeds")
+        .json::<Vec<SessionSummary>>()
+        .await
+        .expect("decode filtered Session summaries");
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].id, first.session.id);
+    assert_eq!(filtered[0].title, "First Session");
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_new_server_instance_does_not_expose_the_replaced_instances_sessions() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let channel = "ephemeral-session-replacement-test";
+    let original = server::spawn(
+        ServerConfig::new(state_dir.path(), channel).expect("configure original server"),
+    )
+    .await
+    .expect("spawn original server");
+    let original_descriptor = original.descriptor().clone();
+    let session = reqwest::Client::new()
+        .post(format!("{}/v1/sessions", original_descriptor.base_url))
+        .bearer_auth(&original_descriptor.token)
+        .json(&CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Ephemeral Session".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+    original.shutdown().await.expect("stop original server");
+
+    let replacement = server::spawn(
+        ServerConfig::new(state_dir.path(), channel).expect("configure replacement server"),
+    )
+    .await
+    .expect("spawn replacement server");
+    let replacement_descriptor = replacement.descriptor().clone();
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{}",
+            replacement_descriptor.base_url, session.session.id
+        ))
+        .bearer_auth(&replacement_descriptor.token)
+        .send()
+        .await
+        .expect("read old Session from replacement server");
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+    replacement
+        .shutdown()
+        .await
+        .expect("shut down replacement server");
+}
+
+#[tokio::test]
 async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid workspace");
@@ -758,6 +993,159 @@ async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_clie
     server.shutdown().await.expect("shut down server");
 }
 
+#[tokio::test]
+async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "managed-session-attach-test")
+            .expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "managed-session-attach-test")
+            .expect("configure managed client"),
+    )
+    .await
+    .expect("connect managed client");
+    receive_managed_client_initial_state(&mut client).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Attach to this Session".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+
+    assert_eq!(
+        client
+            .read_session(created.session.id)
+            .await
+            .expect("read Session through managed client"),
+        created
+    );
+    let summaries = client
+        .list_sessions(Some(workspace.path()))
+        .await
+        .expect("discover Sessions through managed client");
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].id, created.session.id);
+
+    let mut attachment = client
+        .attach_session(created.session.id)
+        .await
+        .expect("attach to known Session ID");
+    assert_eq!(
+        attachment
+            .next()
+            .await
+            .expect("attached Session event arrives")
+            .expect("attached Session event is valid"),
+        SessionEvent::Snapshot(created)
+    );
+
+    drop(attachment);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn two_clients_converge_on_one_session_without_observing_another_session() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "shared-session-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let mut first_client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "shared-session-test")
+            .expect("configure first client"),
+    )
+    .await
+    .expect("connect first client");
+    let mut second_client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "shared-session-test")
+            .expect("configure second client"),
+    )
+    .await
+    .expect("connect second client");
+    receive_managed_client_initial_state(&mut first_client).await;
+    receive_managed_client_initial_state(&mut second_client).await;
+
+    let shared = first_client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Shared Session".to_owned(),
+            },
+        })
+        .await
+        .expect("create shared Session");
+    let isolated = first_client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Isolated Session".to_owned(),
+            },
+        })
+        .await
+        .expect("create isolated Session");
+    let mut first_attachment = first_client
+        .attach_session(shared.session.id)
+        .await
+        .expect("attach first client to shared Session");
+    let mut second_attachment = second_client
+        .attach_session(shared.session.id)
+        .await
+        .expect("attach second client to shared Session");
+
+    let first_projection = first_attachment
+        .next()
+        .await
+        .expect("first client receives shared Session")
+        .expect("first shared Session snapshot is valid");
+    let second_projection = second_attachment
+        .next()
+        .await
+        .expect("second client receives shared Session")
+        .expect("second shared Session snapshot is valid");
+    assert_eq!(first_projection, SessionEvent::Snapshot(shared.clone()));
+    assert_eq!(second_projection, first_projection);
+
+    let mut isolated_attachment = second_client
+        .attach_session(isolated.session.id)
+        .await
+        .expect("attach second client to isolated Session");
+    assert_eq!(
+        isolated_attachment
+            .next()
+            .await
+            .expect("isolated Session snapshot arrives")
+            .expect("isolated Session snapshot is valid"),
+        SessionEvent::Snapshot(isolated)
+    );
+
+    drop(isolated_attachment);
+    drop(second_attachment);
+    drop(first_attachment);
+    drop(second_client);
+    drop(first_client);
+    server.shutdown().await.expect("shut down server");
+}
+
 async fn receive_managed_client_initial_state(client: &mut ManagedClient) {
     assert!(matches!(
         client.next().await,
@@ -858,6 +1246,77 @@ async fn managed_session_stream_classifies_body_failures_as_recoverable() {
     assert!(error.is_recoverable());
 
     drop(subscription);
+    drop(client);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn managed_attachment_rehydrates_before_live_deltas_after_same_server_disconnect() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let session_id = SessionId::new();
+    let initial = failed_session_snapshot(session_id, workspace.path());
+    let mut current = initial.clone();
+    current.revision = SessionRevision(2);
+    current.activities.push(Activity {
+        id: ActivityId::new(),
+        turn_id: current.turns[0].id,
+        kind: ActivityKind::Status,
+        text: "Recovered current state".to_owned(),
+    });
+    let update = SessionUpdate {
+        session_id,
+        revision: SessionRevision(3),
+        changes: vec![SessionChange::SessionStatusChanged {
+            status: SessionStatus::Active,
+        }],
+    };
+    let fixture = ReconnectingSessionStreamFixture::spawn(
+        state_dir.path(),
+        "reconnecting-session-stream-test",
+        initial.clone(),
+        current.clone(),
+        update.clone(),
+    )
+    .await;
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "reconnecting-session-stream-test")
+            .expect("configure managed client"),
+    )
+    .await
+    .expect("connect managed client to fixture server");
+    receive_managed_client_initial_state(&mut client).await;
+    let mut attachment = client
+        .attach_session(session_id)
+        .await
+        .expect("attach to fixture Session");
+
+    assert_eq!(
+        attachment
+            .next()
+            .await
+            .expect("initial Session snapshot arrives")
+            .expect("initial Session snapshot is valid"),
+        SessionEvent::Snapshot(initial)
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), attachment.next())
+            .await
+            .expect("attachment reconnects")
+            .expect("fresh Session snapshot arrives")
+            .expect("fresh Session snapshot is valid"),
+        SessionEvent::Snapshot(current)
+    );
+    assert_eq!(
+        attachment
+            .next()
+            .await
+            .expect("live Session delta arrives")
+            .expect("live Session delta is valid"),
+        SessionEvent::Updated(update)
+    );
+
+    drop(attachment);
     drop(client);
     drop(fixture);
 }
@@ -1073,4 +1532,162 @@ fn fixture_authenticated(headers: &HeaderMap, token: &str) -> bool {
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value == format!("Bearer {token}"))
+}
+
+#[derive(Clone)]
+struct ReconnectingSessionStreamState {
+    descriptor: RuntimeDescriptor,
+    connections: Arc<AtomicUsize>,
+    initial: SessionSnapshot,
+    current: SessionSnapshot,
+    update: SessionUpdate,
+}
+
+struct ReconnectingSessionStreamFixture {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ReconnectingSessionStreamFixture {
+    async fn spawn(
+        state_dir: &std::path::Path,
+        channel: &str,
+        initial: SessionSnapshot,
+        current: SessionSnapshot,
+        update: SessionUpdate,
+    ) -> Self {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind reconnecting Session stream fixture");
+        let descriptor = RuntimeDescriptor::new(
+            format!(
+                "http://{}",
+                listener.local_addr().expect("read fixture address")
+            ),
+            "reconnecting-session-stream-token".to_owned(),
+            ServerIdentity {
+                instance_id: uuid::Uuid::new_v4(),
+                pid: std::process::id(),
+                protocol_version: PROTOCOL_VERSION,
+                build_identity: build_identity::for_current_executable()
+                    .expect("identify fixture test executable"),
+            },
+        );
+        let runtime_dir = state_dir.join(channel);
+        std::fs::create_dir_all(&runtime_dir).expect("create fixture runtime directory");
+        serde_json::to_writer(
+            std::fs::File::create(runtime_dir.join("runtime.json"))
+                .expect("create fixture runtime descriptor"),
+            &descriptor,
+        )
+        .expect("write fixture runtime descriptor");
+        let state = Arc::new(ReconnectingSessionStreamState {
+            descriptor,
+            connections: Arc::new(AtomicUsize::new(0)),
+            initial,
+            current,
+            update,
+        });
+        let app = Router::new()
+            .route("/health", get(reconnecting_fixture_health))
+            .route("/v1/events", get(reconnecting_fixture_server_events))
+            .route(
+                "/v1/sessions/{session_id}/events",
+                get(reconnecting_fixture_session_events),
+            )
+            .with_state(state);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve reconnecting Session stream fixture");
+        });
+        Self { task }
+    }
+}
+
+impl Drop for ReconnectingSessionStreamFixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn reconnecting_fixture_health(
+    State(state): State<Arc<ReconnectingSessionStreamState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !fixture_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(state.descriptor.health(LifecycleState::Ready)).into_response()
+}
+
+async fn reconnecting_fixture_server_events(
+    State(state): State<Arc<ReconnectingSessionStreamState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !fixture_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let snapshot = CounterSnapshot {
+        instance_id: state.descriptor.instance_id,
+        value: 0,
+        revision: 0,
+    };
+    Sse::new(
+        stream::once(async move {
+            Ok::<_, Infallible>(
+                Event::default()
+                    .event(SNAPSHOT_EVENT)
+                    .id("0")
+                    .json_data(snapshot)
+                    .expect("serialize fixture server snapshot"),
+            )
+        })
+        .chain(stream::pending()),
+    )
+    .into_response()
+}
+
+async fn reconnecting_fixture_session_events(
+    State(state): State<Arc<ReconnectingSessionStreamState>>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    headers: HeaderMap,
+) -> Response {
+    if !fixture_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if session_id != state.initial.session.id {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    if state.connections.fetch_add(1, Ordering::SeqCst) == 0 {
+        let snapshot = state.initial.clone();
+        return Sse::new(stream::once(async move {
+            Ok::<_, Infallible>(
+                Event::default()
+                    .event(SESSION_SNAPSHOT_EVENT)
+                    .id(snapshot.revision.0.to_string())
+                    .json_data(snapshot)
+                    .expect("serialize initial fixture Session snapshot"),
+            )
+        }))
+        .into_response();
+    }
+
+    let snapshot = state.current.clone();
+    let update = state.update.clone();
+    let events = stream::iter([
+        Event::default()
+            .event(SESSION_SNAPSHOT_EVENT)
+            .id(snapshot.revision.0.to_string())
+            .json_data(snapshot)
+            .expect("serialize current fixture Session snapshot"),
+        Event::default()
+            .event(SESSION_UPDATED_EVENT)
+            .id(update.revision.0.to_string())
+            .json_data(update)
+            .expect("serialize fixture Session update"),
+    ])
+    .map(Ok::<_, Infallible>)
+    .chain(stream::pending());
+    Sse::new(events).into_response()
 }

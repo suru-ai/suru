@@ -188,6 +188,9 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         .create_session(request)
         .await
         .expect("create Session through managed client");
+    application
+        .handle_event(ApplicationEvent::SessionCreated(created.clone()))
+        .expect("transition application after Session creation");
     let mut subscription = client
         .subscribe_session(created.session.id)
         .await
@@ -197,10 +200,10 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         .await
         .expect("Session snapshot arrives")
         .expect("Session snapshot is valid");
-    assert_eq!(session_event, SessionEvent::Snapshot(created));
+    assert_eq!(session_event, SessionEvent::Snapshot(created.clone()));
     application
         .handle_event(ApplicationEvent::Session(session_event))
-        .expect("transition application to Session route");
+        .expect("hydrate the Session route from its stream");
 
     let transcript = rendered_application_rows(&application).join("\n");
     assert!(transcript.contains("Explain this workspace"));
@@ -214,6 +217,34 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         )
     );
     assert!(!transcript.contains("Chidori Counter"));
+
+    let mut observer = Application::new(workspace.path());
+    observer
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+            created.clone(),
+        )))
+        .expect("attach an independent observer to the Session");
+    observer
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Observer-only draft".to_owned(),
+        )))
+        .expect("edit the observer's local draft");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Keep this unsent draft".to_owned(),
+        )))
+        .expect("edit the client-local Session draft");
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+            created.clone(),
+        )))
+        .expect("rehydrate the Session from a fresh snapshot");
+    let with_draft = rendered_application_rows(&application).join("\n");
+    let observer_with_draft = rendered_application_rows(&observer).join("\n");
+    assert!(with_draft.contains("Keep this unsent draft"));
+    assert!(!with_draft.contains("Observer-only draft"));
+    assert!(observer_with_draft.contains("Observer-only draft"));
+    assert!(!observer_with_draft.contains("Keep this unsent draft"));
 
     let replacement_instance = Uuid::new_v4();
     application
@@ -240,6 +271,8 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         .expect("confirm replacement server snapshot");
     let after_replacement = rendered_application_rows(&application).join("\n");
     assert!(after_replacement.contains("What would you like to work on?"));
+    assert!(after_replacement.contains("Keep this unsent draft"));
+    assert!(after_replacement.contains("Session ended because the shared server was replaced"));
     assert!(!after_replacement.contains("Explain this workspace"));
     assert!(!after_replacement.contains("No Agent is selected"));
 

@@ -17,7 +17,7 @@ use crate::{
     protocol::{
         AdmitPromptRequest, CounterSnapshot, CounterUpdate, CreateSessionRequest, Health,
         LifecycleState, Prompt, RuntimeDescriptor, ServerShutdown, SessionError, SessionId,
-        SessionSnapshot, ShutdownReason,
+        SessionSnapshot, SessionSummary, ShutdownReason,
     },
 };
 
@@ -178,6 +178,18 @@ impl ManagedClient {
         self.session_commands().subscribe_session(session_id).await
     }
 
+    pub async fn read_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+        self.session_commands().read_session(session_id).await
+    }
+
+    pub async fn list_sessions(&self, workspace: Option<&Path>) -> Result<Vec<SessionSummary>> {
+        self.session_commands().list_sessions(workspace).await
+    }
+
+    pub async fn attach_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
+        self.session_commands().attach_session(session_id).await
+    }
+
     pub(crate) fn session_commands(&self) -> SessionCommandClient {
         SessionCommandClient {
             http: self.http.clone(),
@@ -247,6 +259,60 @@ impl SessionCommandClient {
     ) -> Result<SessionSubscription> {
         let descriptor = self.descriptor.borrow().clone();
         SessionSubscription::open(&self.http, &descriptor, session_id).await
+    }
+
+    pub(crate) async fn read_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .get(format!("{}/v1/sessions/{session_id}", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Session read")?;
+        decode_session_response(response, "Session read").await
+    }
+
+    pub(crate) async fn list_sessions(
+        &self,
+        workspace: Option<&Path>,
+    ) -> Result<Vec<SessionSummary>> {
+        let descriptor = self.descriptor.borrow().clone();
+        let request = self
+            .http
+            .get(format!("{}/v1/sessions", descriptor.base_url))
+            .bearer_auth(&descriptor.token);
+        let request = match workspace {
+            Some(workspace) => request.query(&[("workspace", workspace)]),
+            None => request,
+        };
+        let response = request.send().await.context("send Session listing")?;
+        decode_session_response(response, "Session listing").await
+    }
+
+    pub(crate) async fn attach_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionSubscription> {
+        SessionSubscription::open_attached(&self.http, self.descriptor.clone(), session_id).await
+    }
+}
+
+async fn decode_session_response<T>(response: reqwest::Response, operation: &str) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if response.status().is_success() {
+        return response
+            .json::<T>()
+            .await
+            .with_context(|| format!("decode {operation} response"));
+    }
+    let status = response.status();
+    let error = response.json::<SessionError>().await.ok();
+    match error {
+        Some(error) => bail!(error.message),
+        None => bail!("{operation} failed with HTTP {status}"),
     }
 }
 

@@ -110,6 +110,21 @@ impl ComposerMemory {
         })
     }
 
+    pub(super) fn recover_session_to_landing(&mut self, session_id: SessionId) {
+        let Some(mut recovered) = self.composers.remove(&ComposerKey::Session(session_id)) else {
+            return;
+        };
+        if recovered.text.is_empty() {
+            return;
+        }
+        if let Some(landing) = self.composers.remove(&ComposerKey::Landing)
+            && !landing.text.is_empty()
+        {
+            recovered.push_history(landing.text);
+        }
+        self.composers.insert(ComposerKey::Landing, recovered);
+    }
+
     fn composer_mut(&mut self, key: ComposerKey) -> &mut ComposerState {
         self.composers.entry(key).or_default()
     }

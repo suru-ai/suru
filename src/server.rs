@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -9,14 +9,14 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::to_bytes,
-    extract::{Path as AxumPath, Request, State},
+    extract::{Path as AxumPath, Query, Request, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response, sse::Event, sse::Sse},
     routing::{get, post},
 };
 use fs2::FileExt;
 use futures_util::{StreamExt, stream};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     net::TcpListener,
     sync::{broadcast, oneshot, watch},
@@ -35,7 +35,8 @@ use crate::protocol::{
 };
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
-    AdmitPromptError, CreateSessionError, SessionFeed, SessionStore, StoreOutcome,
+    AdmitPromptError, CreateSessionError, ListSessionsError, SessionFeed, SessionStore,
+    StoreOutcome,
 };
 
 pub type ServerConfig = RuntimeConfig;
@@ -175,7 +176,8 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/events", get(events))
-        .route("/v1/sessions", post(create_session))
+        .route("/v1/sessions", get(list_sessions).post(create_session))
+        .route("/v1/sessions/{session_id}", get(read_session))
         .route("/v1/sessions/{session_id}/prompts", post(admit_prompt))
         .route("/v1/sessions/{session_id}/events", get(session_events))
         .route("/v1/server/stop", post(stop_server))
@@ -426,6 +428,48 @@ fn store_outcome_response<T: Serialize>(outcome: StoreOutcome<T>) -> Response {
     match outcome {
         StoreOutcome::Created(value) => (StatusCode::CREATED, Json(value)).into_response(),
         StoreOutcome::Existing(value) => (StatusCode::OK, Json(value)).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListSessionsQuery {
+    workspace: Option<PathBuf>,
+}
+
+async fn list_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<ListSessionsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.sessions.list(query.workspace.as_deref()) {
+        Ok(summaries) => Json(summaries).into_response(),
+        Err(ListSessionsError::InvalidWorkspace) => session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::InvalidWorkspace,
+            "Workspace filter must be an existing local directory",
+        ),
+    }
+}
+
+async fn read_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.sessions.snapshot(session_id) {
+        Some(snapshot) => Json(snapshot).into_response(),
+        None => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
     }
 }
 

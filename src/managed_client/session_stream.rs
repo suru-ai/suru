@@ -1,9 +1,14 @@
 //! Authenticated Session stream transport and provider-neutral event decoding.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 
 use crate::protocol::{
     RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SessionId, SessionSnapshot,
@@ -78,18 +83,35 @@ impl SessionSubscription {
         descriptor: &RuntimeDescriptor,
         session_id: SessionId,
     ) -> Result<Self> {
-        let response = http
-            .get(format!(
-                "{}/v1/sessions/{session_id}/events",
-                descriptor.base_url
-            ))
-            .bearer_auth(&descriptor.token)
-            .send()
-            .await?
-            .error_for_status()
+        let response = open_response(http, descriptor, session_id)
+            .await
             .context("server rejected the Session event stream")?;
         let (events_tx, events_rx) = mpsc::channel(32);
-        let task = tokio::spawn(consume(response, session_id, events_tx));
+        let task = tokio::spawn(consume_once(response, session_id, events_tx));
+        Ok(Self {
+            events: events_rx,
+            task,
+        })
+    }
+
+    pub(super) async fn open_attached(
+        http: &reqwest::Client,
+        descriptor: watch::Receiver<RuntimeDescriptor>,
+        session_id: SessionId,
+    ) -> Result<Self> {
+        let initial_descriptor = descriptor.borrow().clone();
+        let response = open_response(http, &initial_descriptor, session_id)
+            .await
+            .context("server rejected the Session event stream")?;
+        let (events_tx, events_rx) = mpsc::channel(32);
+        let task = tokio::spawn(run_attached(
+            http.clone(),
+            descriptor,
+            initial_descriptor.instance_id,
+            session_id,
+            response,
+            events_tx,
+        ));
         Ok(Self {
             events: events_rx,
             task,
@@ -101,31 +123,137 @@ impl SessionSubscription {
     }
 }
 
+async fn open_response(
+    http: &reqwest::Client,
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+) -> reqwest::Result<reqwest::Response> {
+    http.get(format!(
+        "{}/v1/sessions/{session_id}/events",
+        descriptor.base_url
+    ))
+    .bearer_auth(&descriptor.token)
+    .send()
+    .await?
+    .error_for_status()
+}
+
 impl Drop for SessionSubscription {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-async fn consume(
+enum StreamOutcome {
+    Disconnected,
+    ReceiverClosed,
+    Failed(SessionStreamError),
+}
+
+async fn consume_once(
     response: reqwest::Response,
     session_id: SessionId,
     events: mpsc::Sender<Result<SessionEvent, SessionStreamError>>,
 ) {
-    let mut stream = response.bytes_stream().eventsource();
-    let mut saw_snapshot = false;
     let mut last_revision = None;
-    while let Some(next) = stream.next().await {
-        let decoded = match next {
-            Ok(event) => decode_event(event, session_id, &mut saw_snapshot, &mut last_revision)
-                .map_err(SessionStreamError::protocol),
-            Err(error) => Err(SessionStreamError::event_source(error)),
+    if let StreamOutcome::Failed(error) =
+        consume(response, session_id, &events, &mut last_revision).await
+    {
+        let _ = events.send(Err(error)).await;
+    }
+}
+
+async fn run_attached(
+    http: reqwest::Client,
+    mut descriptor: watch::Receiver<RuntimeDescriptor>,
+    attached_instance_id: uuid::Uuid,
+    session_id: SessionId,
+    initial_response: reqwest::Response,
+    events: mpsc::Sender<Result<SessionEvent, SessionStreamError>>,
+) {
+    let mut response = Some(initial_response);
+    let mut last_revision = None;
+    loop {
+        let active_descriptor = descriptor.borrow().clone();
+        if active_descriptor.instance_id != attached_instance_id {
+            return;
+        }
+        let next_response = match response.take() {
+            Some(response) => Ok(response),
+            None => open_response(&http, &active_descriptor, session_id).await,
         };
-        let failed = decoded.is_err();
-        if events.send(decoded).await.is_err() || failed {
+        let next_response = match next_response {
+            Ok(response) => response,
+            Err(error)
+                if error
+                    .status()
+                    .is_some_and(|status| status.is_client_error()) =>
+            {
+                let _ = events
+                    .send(Err(SessionStreamError::protocol(anyhow::anyhow!(
+                        "server rejected the Session event stream: {error}"
+                    ))))
+                    .await;
+                return;
+            }
+            Err(_) => {
+                if !wait_to_reconnect(&mut descriptor, attached_instance_id).await {
+                    return;
+                }
+                continue;
+            }
+        };
+
+        match consume(next_response, session_id, &events, &mut last_revision).await {
+            StreamOutcome::Disconnected => {}
+            StreamOutcome::ReceiverClosed => return,
+            StreamOutcome::Failed(error) if error.is_recoverable() => {}
+            StreamOutcome::Failed(error) => {
+                let _ = events.send(Err(error)).await;
+                return;
+            }
+        }
+        if !wait_to_reconnect(&mut descriptor, attached_instance_id).await {
             return;
         }
     }
+}
+
+async fn wait_to_reconnect(
+    descriptor: &mut watch::Receiver<RuntimeDescriptor>,
+    attached_instance_id: uuid::Uuid,
+) -> bool {
+    tokio::select! {
+        changed = descriptor.changed() => {
+            changed.is_ok() && descriptor.borrow().instance_id == attached_instance_id
+        }
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {
+            descriptor.borrow().instance_id == attached_instance_id
+        }
+    }
+}
+
+async fn consume(
+    response: reqwest::Response,
+    session_id: SessionId,
+    events: &mpsc::Sender<Result<SessionEvent, SessionStreamError>>,
+    last_revision: &mut Option<crate::protocol::SessionRevision>,
+) -> StreamOutcome {
+    let mut stream = response.bytes_stream().eventsource();
+    let mut saw_snapshot = false;
+    while let Some(next) = stream.next().await {
+        let event = match next {
+            Ok(event) => match decode_event(event, session_id, &mut saw_snapshot, last_revision) {
+                Ok(event) => event,
+                Err(error) => return StreamOutcome::Failed(SessionStreamError::protocol(error)),
+            },
+            Err(error) => return StreamOutcome::Failed(SessionStreamError::event_source(error)),
+        };
+        if events.send(Ok(event)).await.is_err() {
+            return StreamOutcome::ReceiverClosed;
+        }
+    }
+    StreamOutcome::Disconnected
 }
 
 fn decode_event(
@@ -150,6 +278,9 @@ fn decode_event(
             }
             if snapshot.revision.0 != event_revision {
                 bail!("Session snapshot revision does not match its SSE ID");
+            }
+            if last_revision.is_some_and(|previous| snapshot.revision < previous) {
+                bail!("Session snapshot revision is not monotonic across recovery");
             }
             *saw_snapshot = true;
             *last_revision = Some(snapshot.revision);

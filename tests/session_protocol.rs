@@ -4,14 +4,55 @@ use chidori::protocol::{
     Activity, ActivityId, ActivityKind, AdmitPromptRequest, AgentId, AgentIdentity,
     CreateSessionRequest, InitialPrompt, Message, MessageId, MessageRole, ModelId, Prompt,
     PromptId, PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode,
-    SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionUpdate, Turn, TurnId,
-    TurnStatus, Workspace,
+    SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
+    SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
 };
 use serde_json::json;
 use uuid::Uuid;
 
 fn fixture_id(value: &str) -> Uuid {
     Uuid::parse_str(value).expect("parse fixture identity")
+}
+
+#[test]
+fn session_summary_round_trips_with_discovery_metadata() {
+    let summary = SessionSummary {
+        id: SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
+        title: "Explain this workspace".to_owned(),
+        workspace: Workspace {
+            path: PathBuf::from("/work/chidori"),
+        },
+        agent: Some(AgentIdentity {
+            agent: AgentId::new("coding"),
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("gpt-5"),
+        }),
+        status: SessionStatus::Active,
+        created_at: SessionTimestamp(1_755_497_600_000),
+        updated_at: SessionTimestamp(1_755_497_600_321),
+    };
+    let expected = json!({
+        "id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+        "title": "Explain this workspace",
+        "workspace": { "path": "/work/chidori" },
+        "agent": {
+            "agent": "coding",
+            "provider": "codex",
+            "model": "gpt-5"
+        },
+        "status": "active",
+        "created_at": 1_755_497_600_000_u64,
+        "updated_at": 1_755_497_600_321_u64
+    });
+
+    assert_eq!(
+        serde_json::to_value(&summary).expect("encode Session summary"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionSummary>(expected).expect("decode Session summary"),
+        summary
+    );
 }
 
 #[test]

@@ -129,8 +129,16 @@ impl TuiState {
                         .as_ref()
                         .is_some_and(|identity| identity.instance_id != snapshot.instance_id);
                     if replaced_server {
+                        if let Some(session_id) = self
+                            .session
+                            .as_ref()
+                            .map(|session| session.snapshot().session.id)
+                        {
+                            self.composers.recover_session_to_landing(session_id);
+                        }
                         self.session = None;
-                        self.submission_error = None;
+                        self.submission_error =
+                            Some("Session ended because the shared server was replaced".to_owned());
                     }
                     self.identity = self.pending_identity.take();
                 }
@@ -290,6 +298,8 @@ pub enum ApplicationEvent {
     SessionSubscriptionEnded,
     PromptAdmissionSucceeded(PromptId),
     PromptAdmissionFailed { prompt_id: PromptId, error: String },
+    SessionCreated(SessionSnapshot),
+    SessionCreationFailed(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -442,6 +452,14 @@ impl Application {
             }
             ApplicationEvent::PromptAdmissionFailed { prompt_id, error } => {
                 self.state.fail_pending_submission(prompt_id, error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SessionCreated(snapshot) => {
+                self.state.apply_session(SessionEvent::Snapshot(snapshot))?;
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SessionCreationFailed(error) => {
+                self.state.submission_error = Some(error);
                 Ok(ApplicationTransition::Continue)
             }
         }

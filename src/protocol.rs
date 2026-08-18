@@ -90,6 +90,11 @@ impl SessionRevision {
     }
 }
 
+/// Milliseconds since the Unix epoch.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SessionTimestamp(pub u64);
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Workspace {
@@ -149,6 +154,18 @@ pub struct Session {
     pub workspace: Workspace,
     pub agent: Option<AgentIdentity>,
     pub status: SessionStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSummary {
+    pub id: SessionId,
+    pub title: String,
+    pub workspace: Workspace,
+    pub agent: Option<AgentIdentity>,
+    pub status: SessionStatus,
+    pub created_at: SessionTimestamp,
+    pub updated_at: SessionTimestamp,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
