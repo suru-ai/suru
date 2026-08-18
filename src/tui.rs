@@ -836,7 +836,7 @@ async fn run_loop(
     let mut application = Application::new(workspace);
     let mut input = EventStream::new();
     let mut session_subscription: Option<SessionSubscription> = None;
-    let mut session_subscription_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut session_subscription_task: Option<(SessionId, tokio::task::JoinHandle<()>)> = None;
     let (submission_tx, mut submission_rx) = tokio::sync::mpsc::unbounded_channel();
     let (subscription_tx, mut subscription_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -854,7 +854,7 @@ async fn run_loop(
                         }
                         if application.session_id().is_none() {
                             session_subscription = None;
-                            if let Some(task) = session_subscription_task.take() {
+                            if let Some((_, task)) = session_subscription_task.take() {
                                 task.abort();
                             }
                         }
@@ -875,10 +875,13 @@ async fn run_loop(
                         )?;
                         if let ApplicationTransition::SubscribeSession(session_id) = transition
                             && session_subscription_task.is_none() {
-                            session_subscription_task = Some(spawn_session_subscription(
-                                client.session_commands(),
+                            session_subscription_task = Some((
                                 session_id,
-                                subscription_tx.clone(),
+                                spawn_session_subscription(
+                                    client.session_commands(),
+                                    session_id,
+                                    subscription_tx.clone(),
+                                ),
                             ));
                         }
                     }
@@ -888,7 +891,12 @@ async fn run_loop(
                 let Some(connected) = connected else {
                     return Err(anyhow!("Session subscription task channel stopped unexpectedly"));
                 };
-                session_subscription_task = None;
+                if session_subscription_task
+                    .as_ref()
+                    .is_some_and(|(session_id, _)| *session_id == connected.session_id)
+                {
+                    session_subscription_task = None;
+                }
                 if application.session_id() == Some(connected.session_id) {
                     session_subscription = Some(connected.subscription);
                 }
@@ -903,10 +911,16 @@ async fn run_loop(
                         application.handle_event(ApplicationEvent::Session(
                             SessionEvent::Snapshot(created),
                         ))?;
-                        session_subscription_task = Some(spawn_session_subscription(
-                            client.session_commands(),
+                        if let Some((_, task)) = session_subscription_task.take() {
+                            task.abort();
+                        }
+                        session_subscription_task = Some((
                             session_id,
-                            subscription_tx.clone(),
+                            spawn_session_subscription(
+                                client.session_commands(),
+                                session_id,
+                                subscription_tx.clone(),
+                            ),
                         ));
                     }
                     SubmissionResult::PromptAdmitted(prompt_id) => {
