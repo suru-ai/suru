@@ -471,11 +471,16 @@ async fn admit_prompt(
 
     match state.sessions.admit(session_id, request) {
         Ok(StoreOutcome::Created(admission)) => {
-            if admission.disposition == PromptAdmissionDisposition::StartImmediately {
-                state
+            match admission.disposition {
+                PromptAdmissionDisposition::StartImmediately => state
                     .providers
                     .schedule_prompt(session_id, admission.prompt.id)
-                    .expect("stored Sessions retain their Provider actor");
+                    .expect("stored Sessions retain their Provider actor"),
+                PromptAdmissionDisposition::SteerActive => state
+                    .providers
+                    .schedule_steer(session_id)
+                    .expect("stored Sessions retain their Provider actor"),
+                PromptAdmissionDisposition::RemainPending => {}
             }
             (StatusCode::CREATED, Json(admission.prompt)).into_response()
         }

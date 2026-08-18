@@ -29,6 +29,7 @@ enum ProviderCommand {
     StartPrompt {
         prompt_id: PromptId,
     },
+    SteerPrompt,
     InterruptTurn {
         turn_id: TurnId,
         response: oneshot::Sender<Result<crate::protocol::Turn, InterruptTurnError>>,
@@ -86,6 +87,14 @@ impl ProviderOrchestrator {
     }
 
     pub(crate) fn schedule_prompt(&self, session_id: SessionId, prompt_id: PromptId) -> Result<()> {
+        self.schedule(session_id, ProviderCommand::StartPrompt { prompt_id })
+    }
+
+    pub(crate) fn schedule_steer(&self, session_id: SessionId) -> Result<()> {
+        self.schedule(session_id, ProviderCommand::SteerPrompt)
+    }
+
+    fn schedule(&self, session_id: SessionId, command: ProviderCommand) -> Result<()> {
         let actor = self
             .actors
             .lock()
@@ -94,7 +103,7 @@ impl ProviderOrchestrator {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Session has no Provider actor"))?;
         actor
-            .send(ProviderCommand::StartPrompt { prompt_id })
+            .send(command)
             .map_err(|_| anyhow::anyhow!("Session Provider actor stopped unexpectedly"))
     }
 
@@ -254,8 +263,11 @@ async fn run_provider_session(
                 .expect("an active Provider Turn has a Provider Session")
                 .events;
             tokio::select! {
-                command = commands.recv() => ProviderInput::Command(command),
+                // Preserve the Provider's terminal boundary when both it and a later command
+                // became ready while an RPC was in flight.
+                biased;
                 event = events.next() => ProviderInput::Event(event),
+                command = commands.recv() => ProviderInput::Command(command),
             }
         };
         match input {
@@ -263,6 +275,33 @@ async fn run_provider_session(
             ProviderInput::Command(Some(ProviderCommand::StartPrompt { .. })) => {
                 // Prompts admitted while startup was still pending can already be queued here.
                 // Keep them pending until queued delivery and steering gain their own orchestration.
+            }
+            ProviderInput::Command(Some(ProviderCommand::SteerPrompt)) => {
+                let current = active
+                    .as_ref()
+                    .expect("Provider input is handled while a Turn is active");
+                let prompt = match sessions.next_pending_steer(session_id, current.turn_id) {
+                    Ok(Some(prompt)) => prompt,
+                    Ok(None) | Err(_) => continue,
+                };
+                match provider_session
+                    .steer_turn(ProviderTurnInput {
+                        prompt: prompt.text.clone(),
+                    })
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = sessions.deliver_steer(session_id, current.turn_id, prompt.id);
+                    }
+                    Err(error) => {
+                        let _ = sessions.report_steer_failure(
+                            session_id,
+                            current.turn_id,
+                            prompt.id,
+                            format!("Provider steering failed: {error}"),
+                        );
+                    }
+                }
             }
             ProviderInput::Command(Some(ProviderCommand::InterruptTurn { turn_id, response })) => {
                 let target = match sessions.interrupt_target(session_id, turn_id) {

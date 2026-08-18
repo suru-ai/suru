@@ -75,6 +75,7 @@ struct SessionRecord {
     summary: SessionSummary,
     updates: broadcast::Sender<SessionUpdate>,
     next_prompt_order: PromptOrder,
+    steer_targets: HashMap<PromptId, TurnId>,
 }
 
 struct PromptOwner {
@@ -104,6 +105,7 @@ pub(crate) struct PromptAdmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PromptAdmissionDisposition {
     StartImmediately,
+    SteerActive,
     RemainPending,
 }
 
@@ -237,6 +239,7 @@ impl SessionStore {
                 summary,
                 updates,
                 next_prompt_order: PromptOrder(2),
+                steer_targets: HashMap::new(),
             },
         );
         Ok(StoreOutcome::Created(snapshot))
@@ -292,13 +295,16 @@ impl SessionStore {
                 .checked_add(1)
                 .expect("Prompt admission order space is not exhausted"),
         );
-        let disposition = if active_turn_id(&record.snapshot)
-            .expect("stored Sessions preserve the one-active-Turn invariant")
-            .is_none()
-        {
-            PromptAdmissionDisposition::StartImmediately
-        } else {
-            PromptAdmissionDisposition::RemainPending
+        let (disposition, steer_target) = match (
+            active_turn_id(&record.snapshot)
+                .expect("stored Sessions preserve the one-active-Turn invariant"),
+            request.delivery,
+        ) {
+            (None, _) => (PromptAdmissionDisposition::StartImmediately, None),
+            (Some(turn_id), PromptDelivery::Steer) => {
+                (PromptAdmissionDisposition::SteerActive, Some(turn_id))
+            }
+            (Some(_), PromptDelivery::Queue) => (PromptAdmissionDisposition::RemainPending, None),
         };
         let prompt = Prompt {
             id: request.prompt.id,
@@ -316,6 +322,9 @@ impl SessionStore {
             )
             .expect("admission changes preserve Session invariants");
         record.next_prompt_order = next_prompt_order;
+        if let Some(turn_id) = steer_target {
+            record.steer_targets.insert(prompt.id, turn_id);
+        }
         record.summary.updated_at = updated_at;
         state.prompts.insert(
             request.prompt.id,
@@ -455,8 +464,124 @@ impl SessionStore {
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
         record.publish(session_id, changes)?;
+        record.steer_targets.remove(&prompt_id);
         record.summary.updated_at = updated_at;
         Ok(Some(DeliveredTurn { prompt, turn }))
+    }
+
+    pub(crate) fn next_pending_steer(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> anyhow::Result<Option<Prompt>> {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let record = state
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+        record.next_pending_steer(turn_id)
+    }
+
+    pub(crate) fn deliver_steer(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        prompt_id: PromptId,
+    ) -> anyhow::Result<Option<Prompt>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let prompt = {
+            let record = state
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+            let Some(prompt) = record.pending_steer(turn_id, prompt_id)? else {
+                return Ok(None);
+            };
+            let earliest = record
+                .next_pending_steer(turn_id)?
+                .expect("the target is a pending steer Prompt");
+            if earliest.id != prompt_id {
+                return Err(anyhow!(
+                    "Steer Prompts must be delivered in admission order"
+                ));
+            }
+            prompt.clone()
+        };
+        let updated_at = state.next_timestamp();
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
+        record.publish(
+            session_id,
+            vec![
+                SessionChange::PromptStatusChanged {
+                    prompt_id,
+                    status: PromptStatus::Delivered,
+                },
+                SessionChange::MessageAdded {
+                    message: Message {
+                        id: MessageId::new(),
+                        turn_id,
+                        role: MessageRole::User,
+                        status: MessageStatus::Completed,
+                        content: prompt.text.clone(),
+                    },
+                },
+            ],
+        )?;
+        record.steer_targets.remove(&prompt_id);
+        record.summary.updated_at = updated_at;
+        let mut delivered = prompt;
+        delivered.status = PromptStatus::Delivered;
+        Ok(Some(delivered))
+    }
+
+    pub(crate) fn report_steer_failure(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        prompt_id: PromptId,
+        message: String,
+    ) -> anyhow::Result<Option<SessionUpdate>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        {
+            let record = state
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+            if record.pending_steer(turn_id, prompt_id)?.is_none() {
+                return Ok(None);
+            }
+        }
+        let updated_at = state.next_timestamp();
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
+        let update = record.publish(
+            session_id,
+            vec![SessionChange::ActivityAdded {
+                activity: Activity {
+                    id: ActivityId::new(),
+                    turn_id,
+                    kind: ActivityKind::Error,
+                    text: message,
+                },
+            }],
+        )?;
+        record.steer_targets.remove(&prompt_id);
+        record.summary.updated_at = updated_at;
+        Ok(Some(update))
     }
 
     pub(crate) fn fail_turn(
@@ -840,6 +965,51 @@ impl PromptOwner {
 }
 
 impl SessionRecord {
+    fn next_pending_steer(&self, turn_id: TurnId) -> anyhow::Result<Option<Prompt>> {
+        if active_turn_id(&self.snapshot)? != Some(turn_id) {
+            return Ok(None);
+        }
+        Ok(self
+            .snapshot
+            .prompts
+            .iter()
+            .filter(|prompt| {
+                prompt.status == PromptStatus::Pending
+                    && prompt.delivery == PromptDelivery::Steer
+                    && self.steer_targets.get(&prompt.id) == Some(&turn_id)
+            })
+            .min_by_key(|prompt| prompt.admission_order)
+            .cloned())
+    }
+
+    fn pending_steer(
+        &self,
+        turn_id: TurnId,
+        prompt_id: PromptId,
+    ) -> anyhow::Result<Option<Prompt>> {
+        if active_turn_id(&self.snapshot)? != Some(turn_id) {
+            return Ok(None);
+        }
+        let prompt = self
+            .snapshot
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == prompt_id)
+            .ok_or_else(|| anyhow!("Steering referenced an unknown Prompt"))?;
+        if prompt.status != PromptStatus::Pending {
+            return Ok(None);
+        }
+        if prompt.delivery != PromptDelivery::Steer {
+            return Err(anyhow!("Steering referenced a queued Prompt"));
+        }
+        if self.steer_targets.get(&prompt_id) != Some(&turn_id) {
+            return Err(anyhow!(
+                "Steering referenced a Prompt admitted outside the active Turn"
+            ));
+        }
+        Ok(Some(prompt.clone()))
+    }
+
     fn publish(
         &mut self,
         session_id: SessionId,
@@ -855,6 +1025,17 @@ impl SessionRecord {
         let mut changes = changes
             .into_iter()
             .filter(|change| !matches!(change, SessionChange::SessionStatusChanged { .. }))
+            .collect::<Vec<_>>();
+        let terminal_turns = changes
+            .iter()
+            .filter_map(|change| match change {
+                SessionChange::TurnStatusChanged { turn_id, status }
+                    if *status != TurnStatus::Active =>
+                {
+                    Some(*turn_id)
+                }
+                _ => None,
+            })
             .collect::<Vec<_>>();
         let mut update = SessionUpdate {
             session_id,
@@ -878,6 +1059,8 @@ impl SessionRecord {
             .checked_add(1)
             .map(PromptOrder)
             .ok_or_else(|| anyhow!("Prompt admission order space is exhausted"))?;
+        self.steer_targets
+            .retain(|_, turn_id| !terminal_turns.contains(turn_id));
         self.snapshot = next;
         self.summary.session = self.snapshot.session.clone();
         let _ = self.updates.send(update.clone());

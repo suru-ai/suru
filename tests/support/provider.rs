@@ -24,14 +24,18 @@ pub struct StartRequest {
 
 pub struct ControlledProviderSession {
     turns: mpsc::UnboundedReceiver<TurnStart>,
+    steers: mpsc::UnboundedReceiver<TurnSteer>,
     interruptions: mpsc::UnboundedReceiver<TurnInterrupt>,
     events: mpsc::UnboundedSender<Result<ProviderEvent, ProviderError>>,
 }
 
-pub struct TurnStart {
+pub struct PromptOperation {
     input: ProviderTurnInput,
     response: oneshot::Sender<Result<(), ProviderError>>,
 }
+
+pub type TurnStart = PromptOperation;
+pub type TurnSteer = PromptOperation;
 
 pub struct TurnInterrupt {
     response: oneshot::Sender<Result<(), ProviderError>>,
@@ -39,6 +43,7 @@ pub struct TurnInterrupt {
 
 struct ControlledSessionHandle {
     turns: mpsc::UnboundedSender<TurnStart>,
+    steers: mpsc::UnboundedSender<TurnSteer>,
     interruptions: mpsc::UnboundedSender<TurnInterrupt>,
 }
 
@@ -66,6 +71,7 @@ impl StartRequest {
 
     pub fn succeed(self, identity: AgentIdentity) -> ControlledProviderSession {
         let (turns_tx, turns_rx) = mpsc::unbounded_channel();
+        let (steers_tx, steers_rx) = mpsc::unbounded_channel();
         let (interruptions_tx, interruptions_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let events: ProviderEventStream = Box::pin(stream::unfold(events_rx, |mut events| async {
@@ -76,6 +82,7 @@ impl StartRequest {
                 identity,
                 Arc::new(ControlledSessionHandle {
                     turns: turns_tx,
+                    steers: steers_tx,
                     interruptions: interruptions_tx,
                 }),
                 events,
@@ -83,6 +90,7 @@ impl StartRequest {
             .unwrap_or_else(|_| panic!("Provider startup response remains connected"));
         ControlledProviderSession {
             turns: turns_rx,
+            steers: steers_rx,
             interruptions: interruptions_rx,
             events: events_tx,
         }
@@ -103,6 +111,13 @@ impl ControlledProviderSession {
             .expect("Provider Session remains connected")
     }
 
+    pub async fn next_steer(&mut self) -> TurnSteer {
+        self.steers
+            .recv()
+            .await
+            .expect("Provider Session remains connected")
+    }
+
     pub async fn next_interrupt(&mut self) -> TurnInterrupt {
         self.interruptions
             .recv()
@@ -117,7 +132,7 @@ impl ControlledProviderSession {
     }
 }
 
-impl TurnStart {
+impl PromptOperation {
     pub fn prompt(&self) -> &str {
         &self.input.prompt
     }
@@ -125,13 +140,13 @@ impl TurnStart {
     pub fn succeed(self) {
         self.response
             .send(Ok(()))
-            .unwrap_or_else(|_| panic!("Provider Turn response remains connected"));
+            .unwrap_or_else(|_| panic!("Provider Prompt operation response remains connected"));
     }
 
     pub fn fail(self, message: impl Into<String>) {
         self.response
             .send(Err(ProviderError::new(message)))
-            .unwrap_or_else(|_| panic!("Provider Turn response remains connected"));
+            .unwrap_or_else(|_| panic!("Provider Prompt operation response remains connected"));
     }
 }
 
@@ -164,21 +179,40 @@ impl ProviderRuntime for ControlledProviderRuntime {
     }
 }
 
+fn dispatch_prompt_operation(
+    operations: mpsc::UnboundedSender<PromptOperation>,
+    input: ProviderTurnInput,
+    abandoned_message: &'static str,
+) -> ProviderFuture<'static, ()> {
+    Box::pin(async move {
+        let (response_tx, response_rx) = oneshot::channel();
+        operations
+            .send(PromptOperation {
+                input,
+                response: response_tx,
+            })
+            .map_err(|_| ProviderError::new("test Provider Session disconnected"))?;
+        response_rx
+            .await
+            .map_err(|_| ProviderError::new(abandoned_message))?
+    })
+}
+
 impl ProviderSession for ControlledSessionHandle {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
-        let turns = self.turns.clone();
-        Box::pin(async move {
-            let (response_tx, response_rx) = oneshot::channel();
-            turns
-                .send(TurnStart {
-                    input,
-                    response: response_tx,
-                })
-                .map_err(|_| ProviderError::new("test Provider Session disconnected"))?;
-            response_rx
-                .await
-                .map_err(|_| ProviderError::new("test Provider Turn was abandoned"))?
-        })
+        dispatch_prompt_operation(
+            self.turns.clone(),
+            input,
+            "test Provider Turn was abandoned",
+        )
+    }
+
+    fn steer_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
+        dispatch_prompt_operation(
+            self.steers.clone(),
+            input,
+            "test Provider steering was abandoned",
+        )
     }
 
     fn interrupt_turn(&self) -> ProviderFuture<'_, ()> {

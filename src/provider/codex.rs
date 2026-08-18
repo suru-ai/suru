@@ -80,6 +80,14 @@ struct TurnStartParams<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct TurnSteerParams<'a> {
+    thread_id: &'a str,
+    input: [TextInput<'a>; 1],
+    expected_turn_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TurnInterruptParams<'a> {
     thread_id: &'a str,
     turn_id: &'a str,
@@ -395,6 +403,44 @@ impl ProviderSession for CodexSession {
         })
     }
 
+    fn steer_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            let turn_id = self
+                .correlation
+                .lock()
+                .expect("Codex native correlation lock is not poisoned")
+                .active_turn_id
+                .clone()
+                .ok_or_else(|| codex_error("Codex has no active Turn to steer"))?;
+            let result = self
+                .transport
+                .request(
+                    "turn/steer",
+                    &TurnSteerParams {
+                        thread_id: &self.thread_id,
+                        input: [TextInput {
+                            kind: "text",
+                            text: &input.prompt,
+                        }],
+                        expected_turn_id: &turn_id,
+                    },
+                )
+                .await
+                .map_err(|error| codex_error(format!("Codex Turn steering failed: {error}")))?;
+            let steered: TurnSteerResult = serde_json::from_value(result).map_err(|error| {
+                codex_error(format!(
+                    "Codex returned an invalid turn/steer response: {error}"
+                ))
+            })?;
+            if steered.turn_id != turn_id {
+                return Err(codex_error(
+                    "Codex returned an invalid turn/steer response: Turn ID did not match the active Turn",
+                ));
+            }
+            Ok(())
+        })
+    }
+
     fn interrupt_turn(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             let turn_id = self
@@ -423,6 +469,12 @@ impl ProviderSession for CodexSession {
 #[derive(Deserialize)]
 struct TurnStartResult {
     turn: NativeTurn,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnSteerResult {
+    turn_id: String,
 }
 
 #[derive(Deserialize)]

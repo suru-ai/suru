@@ -25,11 +25,11 @@ The working context in which an agent operates, initially rooted at a local dire
 _Avoid_: Project, working directory, location
 
 **Turn**:
-A unit of work that begins when a prompt is delivered and includes the resulting agent activity.
+A unit of work that begins when a Prompt is delivered while a Session is idle and includes the resulting agent activity. An active Turn may accept delivered steer Prompts without beginning another Turn.
 _Avoid_: Request, exchange
 
 **Prompt**:
-User input submitted for delivery to an agent. A Prompt may remain pending before it becomes the user Message that begins a Turn.
+User input submitted for delivery to an agent. A delivered Prompt becomes either the user Message that begins a Turn or a later user Message that steers its active Turn.
 _Avoid_: Request, draft, message
 
 **Message**:

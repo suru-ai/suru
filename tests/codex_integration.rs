@@ -3,13 +3,16 @@
 use std::{os::unix::fs::PermissionsExt, sync::Arc};
 
 use chidori::{
-    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, SessionEvent},
+    managed_client::{
+        ManagedClient, ManagedClientConfig, ManagedEvent, SessionEvent, SessionSubscription,
+    },
     protocol::{
-        ActivityKind, AgentId, CreateSessionRequest, InitialPrompt, MessageRole, MessageStatus,
-        ModelId, PromptId, PromptStatus, ProviderId, SessionStatus, TurnStatus, Workspace,
+        ActivityKind, AdmitPromptRequest, AgentId, CreateSessionRequest, InitialPrompt,
+        MessageRole, MessageStatus, ModelId, PromptDelivery, PromptId, PromptStatus, ProviderId,
+        SessionId, SessionSnapshot, SessionStatus, TurnId, TurnStatus, Workspace,
     },
     provider::CodexRuntime,
-    server::{self, ServerConfig},
+    server::{self, RunningServer, ServerConfig},
 };
 use serde_json::Value;
 use tokio::time::{Duration, timeout};
@@ -110,6 +113,14 @@ while IFS= read -r line; do
 done
 "#;
 
+const START_TURN: &str = r#"      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'"#;
+
+const COMPLETE_BEFORE_STEER: &str = r#"      while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
+        sleep 0.01
+      done
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'"#;
+
 const NONZERO_AFTER_TURN_START: &str = r#"#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
@@ -161,8 +172,504 @@ const REJECT_INTERRUPTION: &str = r#"      printf '%s\n' '{"id":4,"error":{"code
 const TIME_OUT_INTERRUPTION: &str = "      sleep 10";
 const LOSE_PROCESS_DURING_INTERRUPT: &str = "      exit 23";
 
+const STEERING_CODEX: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+__TURN_START_ACTION__
+      ;;
+    *'"method":"turn/steer"'*)
+__STEER_ACTION__
+      ;;
+  esac
+done
+"#;
+
+const ACCEPT_STEER: &str = r#"      while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
+        sleep 0.01
+      done
+      printf '%s\n' '{"id":4,"result":{"turnId":"native-turn"}}'"#;
+
+const REJECT_STEER: &str = r#"      printf '%s\n' '{"id":4,"error":{"code":-32600,"message":"fixture rejected steering"}}'"#;
+
+const COMPLETE_THEN_ACCEPT_STEER: &str = r#"      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
+      printf '%s\n' '{"id":4,"result":{"turnId":"native-turn"}}'"#;
+
+const COMPLETE_THEN_REJECT_STEER: &str = r#"      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
+      printf '%s\n' '{"id":4,"error":{"code":-32600,"message":"no active turn to steer"}}'"#;
+
+const LOSE_PROCESS_DURING_STEER: &str = "      exit 29";
+
 fn interruption_script(action: &str) -> String {
     INTERRUPTION_CODEX.replace("__INTERRUPT_ACTION__", action)
+}
+
+fn steering_script(action: &str) -> String {
+    steering_script_with_start(START_TURN, action)
+}
+
+fn steering_script_with_start(start_action: &str, steer_action: &str) -> String {
+    STEERING_CODEX
+        .replace("__TURN_START_ACTION__", start_action)
+        .replace("__STEER_ACTION__", steer_action)
+}
+
+struct SteeringFixture {
+    codex: ScriptedCodex,
+    _state_dir: tempfile::TempDir,
+    _workspace: tempfile::TempDir,
+    server: RunningServer,
+    client: ManagedClient,
+    feed: SessionSubscription,
+    session_id: SessionId,
+    turn_id: TurnId,
+}
+
+impl SteeringFixture {
+    async fn start(script: &str, channel: &str) -> Self {
+        let codex = ScriptedCodex::new(script);
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let workspace = tempfile::tempdir().expect("create valid Workspace");
+        let server = server::spawn_with_provider(
+            ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+            Arc::new(CodexRuntime::new(codex.executable())),
+        )
+        .await
+        .expect("spawn server");
+        let mut client = ManagedClient::connect(
+            ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+        )
+        .await
+        .expect("connect client");
+        receive_initial_state(&mut client).await;
+        let created = client
+            .create_session(CreateSessionRequest {
+                workspace: Workspace {
+                    path: workspace.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Begin the steering fixture".to_owned(),
+                },
+            })
+            .await
+            .expect("create Session");
+        codex.wait_for_method("turn/start").await;
+        let active = timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = client
+                    .read_session(created.session.id)
+                    .await
+                    .expect("read Session");
+                if snapshot
+                    .turns
+                    .first()
+                    .is_some_and(|turn| turn.status == TurnStatus::Active)
+                {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial Codex Turn becomes active");
+        let mut feed = client
+            .subscribe_session(created.session.id)
+            .await
+            .expect("subscribe to Session SSE");
+        assert!(matches!(
+            feed.next()
+                .await
+                .expect("Session feed remains open")
+                .expect("Session snapshot is valid"),
+            SessionEvent::Snapshot(_)
+        ));
+        Self {
+            codex,
+            _state_dir: state_dir,
+            _workspace: workspace,
+            server,
+            client,
+            feed,
+            session_id: created.session.id,
+            turn_id: active.turns[0].id,
+        }
+    }
+
+    async fn wait_for(
+        &mut self,
+        description: &str,
+        predicate: impl Fn(&SessionSnapshot) -> bool,
+    ) -> SessionSnapshot {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                self.feed
+                    .next()
+                    .await
+                    .expect("Session feed remains open")
+                    .expect("Session update is valid");
+                let snapshot = self
+                    .client
+                    .read_session(self.session_id)
+                    .await
+                    .expect("read steering fixture Session");
+                if predicate(&snapshot) {
+                    return snapshot;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{description}"))
+    }
+
+    async fn shutdown(self) {
+        let Self {
+            codex,
+            _state_dir: state_dir,
+            _workspace: workspace,
+            server,
+            client,
+            feed,
+            ..
+        } = self;
+        drop(feed);
+        drop(client);
+        server.shutdown().await.expect("shut down server");
+        drop(codex);
+        drop(state_dir);
+        drop(workspace);
+    }
+}
+
+enum TerminalSteerOutcome {
+    Accepted,
+    Rejected { error: &'static str },
+}
+
+#[tokio::test]
+async fn scripted_codex_accepts_one_idempotent_steer_before_delivering_its_prompt() {
+    let mut fixture =
+        SteeringFixture::start(&steering_script(ACCEPT_STEER), "codex-scripted-steering").await;
+    let active_turn_id = fixture.turn_id;
+    let prompt_id = PromptId::new();
+    let steer = AdmitPromptRequest {
+        prompt: InitialPrompt {
+            id: prompt_id,
+            text: "Change course".to_owned(),
+        },
+        delivery: PromptDelivery::Steer,
+    };
+
+    let admitted = fixture
+        .client
+        .admit_prompt(fixture.session_id, steer.clone())
+        .await
+        .expect("admit steer Prompt");
+    assert_eq!(admitted.status, PromptStatus::Pending);
+    fixture.codex.wait_for_method("turn/steer").await;
+
+    let retried = fixture
+        .client
+        .admit_prompt(fixture.session_id, steer.clone())
+        .await
+        .expect("retry identical steer admission");
+    assert_eq!(retried.status, PromptStatus::Pending);
+    let before_acknowledgement = fixture
+        .client
+        .read_session(fixture.session_id)
+        .await
+        .expect("read Session before steering acknowledgement");
+    assert_eq!(
+        before_acknowledgement.prompts[1].status,
+        PromptStatus::Pending
+    );
+    assert_eq!(before_acknowledgement.turns.len(), 1);
+    assert_eq!(before_acknowledgement.messages.len(), 1);
+
+    fixture.codex.release();
+    let delivered = fixture
+        .wait_for("accepted steer becomes delivered", |snapshot| {
+            snapshot
+                .prompts
+                .iter()
+                .find(|prompt| prompt.id == prompt_id)
+                .is_some_and(|prompt| prompt.status == PromptStatus::Delivered)
+        })
+        .await;
+    assert_eq!(delivered.turns.len(), 1);
+    assert_eq!(delivered.turns[0].id, active_turn_id);
+    assert_eq!(delivered.turns[0].status, TurnStatus::Active);
+    assert_eq!(delivered.messages.len(), 2);
+    assert_eq!(delivered.messages[1].role, MessageRole::User);
+    assert_eq!(delivered.messages[1].turn_id, active_turn_id);
+    assert_eq!(delivered.messages[1].content, "Change course");
+
+    let after_delivery_retry = fixture
+        .client
+        .admit_prompt(fixture.session_id, steer)
+        .await
+        .expect("retry delivered steer admission");
+    assert_eq!(after_delivery_retry.status, PromptStatus::Delivered);
+    let steer_requests = fixture
+        .codex
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "turn/steer")
+        .collect::<Vec<_>>();
+    assert_eq!(steer_requests.len(), 1);
+    assert_eq!(steer_requests[0]["params"]["threadId"], "native-thread");
+    assert_eq!(steer_requests[0]["params"]["expectedTurnId"], "native-turn");
+    assert_eq!(
+        steer_requests[0]["params"]["input"],
+        serde_json::json!([{ "type": "text", "text": "Change course" }])
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn scripted_codex_rejection_keeps_the_steer_pending_and_reports_the_failure() {
+    let mut fixture = SteeringFixture::start(
+        &steering_script(REJECT_STEER),
+        "codex-scripted-steer-rejection",
+    )
+    .await;
+    let prompt_id = PromptId::new();
+    let admitted = fixture
+        .client
+        .admit_prompt(
+            fixture.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: prompt_id,
+                    text: "Try a rejected course correction".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit steer Prompt");
+    assert_eq!(admitted.status, PromptStatus::Pending);
+
+    let rejected = fixture
+        .wait_for("steering rejection reaches Session SSE", |snapshot| {
+            snapshot
+                .activities
+                .iter()
+                .any(|activity| activity.text.contains("fixture rejected steering"))
+        })
+        .await;
+    assert_eq!(
+        rejected
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == prompt_id)
+            .expect("steer Prompt remains authoritative")
+            .status,
+        PromptStatus::Pending
+    );
+    assert_eq!(rejected.turns.len(), 1);
+    assert_eq!(rejected.turns[0].status, TurnStatus::Active);
+    assert_eq!(rejected.messages.len(), 1);
+    assert_eq!(rejected.activities.len(), 1);
+    assert_eq!(rejected.activities[0].kind, ActivityKind::Error);
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn scripted_codex_transport_loss_during_steering_keeps_the_prompt_pending() {
+    let mut fixture = SteeringFixture::start(
+        &steering_script(LOSE_PROCESS_DURING_STEER),
+        "codex-scripted-steer-process-loss",
+    )
+    .await;
+    let prompt_id = PromptId::new();
+    fixture
+        .client
+        .admit_prompt(
+            fixture.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: prompt_id,
+                    text: "Steer across a broken transport".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit steer Prompt");
+
+    let failed = fixture
+        .wait_for("steering transport loss reaches Session SSE", |snapshot| {
+            snapshot.turns[0].status == TurnStatus::Failed
+        })
+        .await;
+    assert_eq!(
+        failed
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == prompt_id)
+            .expect("steer Prompt remains authoritative")
+            .status,
+        PromptStatus::Pending
+    );
+    assert_eq!(failed.messages.len(), 1);
+    assert!(
+        failed
+            .activities
+            .iter()
+            .any(|activity| activity.text.contains("status: 29")),
+        "transport failure is visible: {:?}",
+        failed.activities
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn scripted_codex_terminal_completion_during_steering_is_ordered_after_its_response() {
+    assert_terminal_steering_race(
+        COMPLETE_THEN_ACCEPT_STEER,
+        "codex-steer-terminal-acceptance",
+        TerminalSteerOutcome::Accepted,
+    )
+    .await;
+    assert_terminal_steering_race(
+        COMPLETE_THEN_REJECT_STEER,
+        "codex-steer-terminal-rejection",
+        TerminalSteerOutcome::Rejected {
+            error: "no active turn to steer",
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn scripted_codex_terminal_event_wins_when_it_precedes_the_queued_steer() {
+    let mut fixture = SteeringFixture::start(
+        &steering_script_with_start(COMPLETE_BEFORE_STEER, ACCEPT_STEER),
+        "codex-terminal-before-steer",
+    )
+    .await;
+    let prompt_id = PromptId::new();
+    fixture
+        .client
+        .admit_prompt(
+            fixture.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: prompt_id,
+                    text: "Stay pending after the terminal boundary".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit boundary steer Prompt");
+    fixture.codex.release();
+
+    let completed = fixture
+        .wait_for("native completion reaches Session SSE", |snapshot| {
+            snapshot.turns[0].status == TurnStatus::Completed
+        })
+        .await;
+    assert_eq!(completed.turns.len(), 1);
+    assert_eq!(completed.messages.len(), 1);
+    assert_eq!(
+        completed
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == prompt_id)
+            .expect("boundary Prompt remains authoritative")
+            .status,
+        PromptStatus::Pending
+    );
+    assert_eq!(
+        fixture
+            .codex
+            .requests()
+            .iter()
+            .filter(|request| request["method"] == "turn/steer")
+            .count(),
+        0
+    );
+
+    fixture.shutdown().await;
+}
+
+async fn assert_terminal_steering_race(
+    steer_action: &str,
+    channel: &str,
+    outcome: TerminalSteerOutcome,
+) {
+    let mut fixture = SteeringFixture::start(&steering_script(steer_action), channel).await;
+    let active_turn_id = fixture.turn_id;
+    let prompt_id = PromptId::new();
+    fixture
+        .client
+        .admit_prompt(
+            fixture.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: prompt_id,
+                    text: "Race the terminal boundary".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit boundary steer Prompt");
+
+    let completed = fixture
+        .wait_for(
+            "terminal steering race settles through Session SSE",
+            |snapshot| snapshot.turns[0].status == TurnStatus::Completed,
+        )
+        .await;
+    let (expected_prompt_status, expected_message_count, expected_error) = match outcome {
+        TerminalSteerOutcome::Accepted => (PromptStatus::Delivered, 2, None),
+        TerminalSteerOutcome::Rejected { error } => (PromptStatus::Pending, 1, Some(error)),
+    };
+    assert_eq!(completed.session.status, SessionStatus::Idle);
+    assert_eq!(completed.turns.len(), 1);
+    assert_eq!(completed.turns[0].id, active_turn_id);
+    assert_eq!(
+        completed
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == prompt_id)
+            .expect("boundary steer Prompt remains authoritative")
+            .status,
+        expected_prompt_status
+    );
+    assert_eq!(completed.messages.len(), expected_message_count);
+    assert_eq!(
+        completed
+            .messages
+            .iter()
+            .filter(|message| message.content == "Race the terminal boundary")
+            .count(),
+        usize::from(expected_prompt_status == PromptStatus::Delivered)
+    );
+    match expected_error {
+        Some(expected_error) => assert!(
+            completed
+                .activities
+                .iter()
+                .any(|activity| activity.text.contains(expected_error))
+        ),
+        None => assert!(completed.activities.is_empty()),
+    }
+
+    fixture.shutdown().await;
 }
 
 #[tokio::test]

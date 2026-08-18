@@ -256,6 +256,211 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
 }
 
 #[tokio::test]
+async fn provider_session_steers_the_active_turn_only_after_provider_acceptance() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "provider-steering-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "provider-steering-test")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_managed_client_initial_state(&mut client).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Begin through the Provider seam".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let preactive_prompt_id = PromptId::new();
+    client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: preactive_prompt_id,
+                    text: "Remain pending across Provider startup".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit Prompt before the initial Turn becomes active");
+    let start = provider.next_start().await;
+    let identity = AgentIdentity {
+        agent: AgentId::new("codex"),
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("controlled-model"),
+    };
+    let mut provider_session = start.succeed(identity);
+    let initial_turn = provider_session.next_turn().await;
+    initial_turn.succeed();
+    let mut feed = client
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe to Session SSE");
+    feed.next()
+        .await
+        .expect("Session feed remains open")
+        .expect("Session snapshot is valid");
+
+    let accepted_prompt_id = PromptId::new();
+    client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: accepted_prompt_id,
+                    text: "Accept this steer".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit accepted steer");
+    next_session_update(&mut feed).await;
+    let accepted = provider_session.next_steer().await;
+    assert_eq!(accepted.prompt(), "Accept this steer");
+    assert_eq!(
+        client
+            .read_session(created.session.id)
+            .await
+            .expect("read pending steer")
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == accepted_prompt_id)
+            .expect("accepted steer remains authoritative")
+            .status,
+        PromptStatus::Pending
+    );
+    accepted.succeed();
+    next_session_update(&mut feed).await;
+
+    let rejected_prompt_id = PromptId::new();
+    client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: rejected_prompt_id,
+                    text: "Reject this steer".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit rejected steer");
+    next_session_update(&mut feed).await;
+    let rejected = provider_session.next_steer().await;
+    assert_eq!(rejected.prompt(), "Reject this steer");
+    rejected.fail("controlled steering rejection");
+    next_session_update(&mut feed).await;
+
+    let following_prompt_id = PromptId::new();
+    client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: following_prompt_id,
+                    text: "Accept the steer after rejection".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit steer after rejection");
+    next_session_update(&mut feed).await;
+    let following = provider_session.next_steer().await;
+    assert_eq!(following.prompt(), "Accept the steer after rejection");
+    following.succeed();
+    next_session_update(&mut feed).await;
+
+    let snapshot = client
+        .read_session(created.session.id)
+        .await
+        .expect("read steered Session");
+    assert_eq!(snapshot.turns.len(), 1);
+    assert_eq!(snapshot.turns[0].status, TurnStatus::Active);
+    assert_eq!(
+        snapshot
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == preactive_prompt_id)
+            .expect("preactive Prompt remains authoritative")
+            .status,
+        PromptStatus::Pending
+    );
+    assert_eq!(
+        snapshot
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == following_prompt_id)
+            .expect("following steer remains authoritative")
+            .status,
+        PromptStatus::Delivered
+    );
+    assert_eq!(
+        snapshot
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == accepted_prompt_id)
+            .expect("accepted steer remains authoritative")
+            .status,
+        PromptStatus::Delivered
+    );
+    assert_eq!(
+        snapshot
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == rejected_prompt_id)
+            .expect("rejected steer remains authoritative")
+            .status,
+        PromptStatus::Pending
+    );
+    assert_eq!(
+        snapshot
+            .messages
+            .iter()
+            .filter(|message| message.content == "Accept this steer")
+            .count(),
+        1
+    );
+    assert!(
+        !snapshot
+            .messages
+            .iter()
+            .any(|message| message.content == "Reject this steer")
+    );
+    assert!(
+        snapshot
+            .activities
+            .iter()
+            .any(|activity| activity.text.contains("controlled steering rejection"))
+    );
+
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    next_session_update(&mut feed).await;
+    drop(provider_session);
+    drop(feed);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usable() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
