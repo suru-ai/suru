@@ -7,6 +7,10 @@ use chidori::{
     },
     server::{self, ServerConfig},
 };
+use diesel::{
+    Connection, QueryableByName, RunQueryDsl, SqliteConnection, connection::SimpleConnection,
+    sql_types::BigInt,
+};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use tokio::time::{Duration, timeout};
@@ -17,6 +21,33 @@ use support::{
     read_runtime_descriptor, receive_initial_state, request_server_shutdown,
     write_runtime_descriptor,
 };
+
+#[derive(QueryableByName)]
+struct SqliteCount {
+    #[diesel(sql_type = BigInt)]
+    value: i64,
+}
+
+fn seed_database(path: &std::path::Path, sql: &str) {
+    std::fs::create_dir_all(path.parent().expect("database has a parent directory"))
+        .expect("create fixture data directory");
+    let mut connection =
+        SqliteConnection::establish(path.to_str().expect("fixture database path is valid UTF-8"))
+            .expect("open fixture database");
+    connection
+        .batch_execute(sql)
+        .expect("seed fixture database");
+}
+
+fn sqlite_count(path: &std::path::Path, query: &str) -> i64 {
+    let mut connection =
+        SqliteConnection::establish(path.to_str().expect("fixture database path is valid UTF-8"))
+            .expect("open fixture database");
+    diesel::sql_query(query)
+        .get_result::<SqliteCount>(&mut connection)
+        .expect("query fixture database")
+        .value
+}
 
 #[test]
 fn build_identity_changes_with_executable_contents() {
@@ -88,6 +119,79 @@ async fn release_channel_server_uses_private_base_state_and_data_roots() {
     }
 
     server.shutdown().await.expect("shut down release server");
+}
+
+#[tokio::test]
+async fn server_refuses_a_database_schema_newer_than_the_binary() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let config = ServerConfig::new(state_dir.path(), "newer-schema-test")
+        .expect("configure server")
+        .with_data_dir(data_dir.path());
+    let database_path = config.data_dir().join("chidori.db");
+    seed_database(
+        &database_path,
+        "
+        CREATE TABLE __diesel_schema_migrations (
+            version VARCHAR(50) PRIMARY KEY NOT NULL,
+            run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO __diesel_schema_migrations (version) VALUES ('99999999999999');
+        ",
+    );
+
+    let error = server::spawn(config)
+        .await
+        .err()
+        .expect("newer database schema must stop server startup");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("schema 99999999999999 is newer than this Chidori binary"),
+        "startup error should explain the unsafe downgrade: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_embedded_database_migration_leaves_no_partial_schema() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let config = ServerConfig::new(state_dir.path(), "migration-atomicity-test")
+        .expect("configure server")
+        .with_data_dir(data_dir.path());
+    let database_path = config.data_dir().join("chidori.db");
+    seed_database(
+        &database_path,
+        "
+        CREATE TABLE migration_collision (id BIGINT NOT NULL);
+        CREATE INDEX sessions_updated_at_idx ON migration_collision(id);
+        ",
+    );
+
+    let error = server::spawn(config)
+        .await
+        .err()
+        .expect("broken migration must stop server startup");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("apply Session database migrations"),
+        "startup error should identify migration failure: {message}"
+    );
+    assert_eq!(
+        sqlite_count(
+            &database_path,
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+        ),
+        0,
+        "the table created before the failing statement must be rolled back"
+    );
+    assert_eq!(
+        sqlite_count(
+            &database_path,
+            "SELECT COUNT(*) AS value FROM __diesel_schema_migrations WHERE version = '20260820000000'",
+        ),
+        0,
+        "a failed migration must not be recorded as applied"
+    );
 }
 
 #[tokio::test]

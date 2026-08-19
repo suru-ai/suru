@@ -3223,27 +3223,31 @@ async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace
 }
 
 #[tokio::test]
-async fn a_new_server_instance_does_not_expose_the_replaced_instances_sessions() {
+async fn session_metadata_remains_listed_after_a_server_restart() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let channel = "ephemeral-session-replacement-test";
-    let original = spawn_with_failing_provider(
-        ServerConfig::new(state_dir.path(), channel).expect("configure original server"),
-    )
-    .await
-    .expect("spawn original server");
+    let initial_selection = controlled_selection("gpt-persisted", "low", "slow");
+    let updated_selection = controlled_selection("gpt-persisted", "high", "fast");
+    let config = ServerConfig::new(state_dir.path(), "session-metadata-restart-test")
+        .expect("configure original server")
+        .with_data_dir(data_dir.path());
+    let (original_runtime, _original_provider) = ControlledProvider::new();
+    let original = server::spawn_with_provider(config.clone(), original_runtime)
+        .await
+        .expect("spawn original server");
     let original_descriptor = original.descriptor().clone();
     let session = reqwest::Client::new()
         .post(format!("{}/v1/sessions", original_descriptor.base_url))
         .bearer_auth(&original_descriptor.token)
         .json(&CreateSessionRequest {
-            agent_selection: None,
+            agent_selection: Some(initial_selection),
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
                 id: PromptId::new(),
-                text: "Ephemeral Session".to_owned(),
+                text: "  Durable Session  ".to_owned(),
             },
         })
         .send()
@@ -3254,24 +3258,63 @@ async fn a_new_server_instance_does_not_expose_the_replaced_instances_sessions()
         .json::<SessionSnapshot>()
         .await
         .expect("decode created Session");
+    reqwest::Client::new()
+        .post(format!(
+            "{}/v1/sessions/{}/agent-selection",
+            original_descriptor.base_url, session.session.id
+        ))
+        .bearer_auth(&original_descriptor.token)
+        .json(&UpdateAgentSelectionRequest {
+            operation_id: AgentSelectionOperationId::new(),
+            selection: updated_selection.clone(),
+        })
+        .send()
+        .await
+        .expect("update Agent Selection before restart")
+        .error_for_status()
+        .expect("Agent Selection update succeeds before restart");
+    let before_restart = reqwest::Client::new()
+        .get(format!("{}/v1/sessions", original_descriptor.base_url))
+        .bearer_auth(&original_descriptor.token)
+        .send()
+        .await
+        .expect("list Sessions before restart")
+        .error_for_status()
+        .expect("Session listing succeeds before restart")
+        .json::<Vec<SessionSummary>>()
+        .await
+        .expect("decode Session summaries before restart");
+    assert_eq!(before_restart.len(), 1);
+    assert_eq!(before_restart[0].session.id, session.session.id);
+    assert_eq!(before_restart[0].title, "Durable Session");
+    assert_eq!(
+        before_restart[0].session.agent_selection,
+        Some(updated_selection)
+    );
+    assert_eq!(
+        before_restart[0].session.workspace.path,
+        std::fs::canonicalize(workspace.path()).expect("canonicalize expected Workspace")
+    );
+    assert!(before_restart[0].created_at < before_restart[0].updated_at);
     original.shutdown().await.expect("stop original server");
 
-    let replacement = spawn_with_failing_provider(
-        ServerConfig::new(state_dir.path(), channel).expect("configure replacement server"),
-    )
-    .await
-    .expect("spawn replacement server");
+    let (replacement_runtime, _replacement_provider) = ControlledProvider::new();
+    let replacement = server::spawn_with_provider(config, replacement_runtime)
+        .await
+        .expect("spawn replacement server");
     let replacement_descriptor = replacement.descriptor().clone();
-    let response = reqwest::Client::new()
-        .get(format!(
-            "{}/v1/sessions/{}",
-            replacement_descriptor.base_url, session.session.id
-        ))
+    let after_restart = reqwest::Client::new()
+        .get(format!("{}/v1/sessions", replacement_descriptor.base_url))
         .bearer_auth(&replacement_descriptor.token)
         .send()
         .await
-        .expect("read old Session from replacement server");
-    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        .expect("list Sessions after restart")
+        .error_for_status()
+        .expect("Session listing succeeds after restart")
+        .json::<Vec<SessionSummary>>()
+        .await
+        .expect("decode Session summaries after restart");
+    assert_eq!(after_restart, before_restart);
 
     replacement
         .shutdown()

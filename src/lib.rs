@@ -7,6 +7,7 @@ mod runtime;
 pub mod server;
 mod session_projection;
 mod sessions;
+mod storage;
 mod theme;
 pub mod tui;
 

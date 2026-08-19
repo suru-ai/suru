@@ -10,6 +10,8 @@ blake3 = "1.8.2"
 clap = { version = "4.5.46", features = ["derive"] }
 crossterm = { version = "0.28.1", features = ["event-stream"] }
 dirs = "6.0.0"
+diesel = { version = "2", features = ["sqlite"] }
+diesel_migrations = "2"
 eventsource-stream = "0.2.3"
 fs2 = "0.4.3"
 futures-util = "0.3.31"
