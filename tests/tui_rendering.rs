@@ -6,10 +6,13 @@ use chidori::{
     protocol::{
         Activity, ActivityId, ActivityStatus, AgentSelection, CreateSessionRequest, FileChange,
         Health, InitialPrompt, LifecycleState, Message, MessageId, MessageRole, MessageStatus,
-        ModelAvailability, ModelId, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
-        ProviderId, ServerIdentity, ServerShutdown, Session, SessionChange, SessionId,
-        SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-        SessionUpdate, ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        ModelAvailability, ModelCatalog, ModelDescriptor, ModelId, ModelOptionChoice,
+        ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
+        ModelOptionRole, ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder,
+        PromptStatus, ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ServerIdentity,
+        ServerShutdown, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
+        SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, ShutdownReason,
+        TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{AgentOutput, ServerConfig},
     tui::{
@@ -251,6 +254,846 @@ fn slash_autocomplete_invokes_new_session_from_a_description_match() {
     assert!(landing.contains("Type a Prompt and press Enter"));
     assert!(!landing.contains("Long-running work"));
     assert!(!landing.contains("/new"));
+}
+
+#[test]
+fn models_commands_dispatch_one_semantic_model_list_action() {
+    let mut canonical = Application::default();
+    type_terminal_text(&mut canonical, "/models");
+    assert!(
+        rendered_application_rows(&canonical)
+            .join("\n")
+            .contains("Choose Model")
+    );
+    assert!(matches!(
+        canonical
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("select /models"),
+        ApplicationTransition::ListModels(_)
+    ));
+
+    let mut alias = Application::default();
+    type_terminal_text(&mut alias, "/mo");
+    assert!(
+        rendered_application_rows(&alias)
+            .join("\n")
+            .contains("/models")
+    );
+    assert!(matches!(
+        alias
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("select /mo"),
+        ApplicationTransition::ListModels(_)
+    ));
+
+    let mut keybinding = Application::default();
+    keybinding
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("begin semantic leader keybinding");
+    assert!(matches!(
+        keybinding
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('m'),
+                KeyModifiers::NONE,
+            )))
+            .expect("invoke Model picker"),
+        ApplicationTransition::ListModels(_)
+    ));
+}
+
+#[test]
+fn landing_model_picker_groups_sorts_focuses_and_searches_models() {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Loading Models")
+    );
+
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("zeta"),
+                        models: vec![model_descriptor(
+                            "zeta",
+                            "z-native",
+                            "Zebra",
+                            false,
+                            ModelAvailability::Available,
+                        )],
+                        status: ProviderCatalogStatus::Fresh,
+                    },
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("alpha"),
+                        models: vec![
+                            model_descriptor(
+                                "alpha",
+                                "alpha-pro-2026",
+                                "Alpha Pro",
+                                false,
+                                ModelAvailability::Available,
+                            ),
+                            model_descriptor(
+                                "alpha",
+                                "alpha-default",
+                                "Default",
+                                true,
+                                ModelAvailability::Available,
+                            ),
+                            model_descriptor(
+                                "alpha",
+                                "alpha-native-identifier-that-must-remain-visible",
+                                "An exceptionally long Model display name that would consume the entire picker row",
+                                false,
+                                ModelAvailability::Unavailable,
+                            ),
+                        ],
+                        status: ProviderCatalogStatus::Refreshing,
+                    },
+                ],
+            },
+        })
+        .expect("load cached Model catalog");
+
+    let rows = rendered_application_rows(&application);
+    assert!(rendered_row(&rows, "Provider alpha") < rendered_row(&rows, "Provider zeta"));
+    assert!(rendered_row(&rows, "Alpha Pro") < rendered_row(&rows, "Default"));
+    let default = rows
+        .iter()
+        .find(|row| row.contains("alpha-default"))
+        .expect("render Provider default Model");
+    assert!(default.contains("default"));
+    assert!(default.contains('›'));
+    assert!(
+        rows.iter()
+            .find(|row| row.contains("Alpha Pro"))
+            .expect("render display name")
+            .contains("alpha-pro-2026")
+    );
+    let long = rows
+        .iter()
+        .find(|row| row.contains("An exceptionally"))
+        .expect("render long Model row");
+    assert!(long.contains("alpha-native"));
+    assert!(long.contains("unavailable"));
+
+    type_terminal_text(&mut application, "z-native");
+    let searched = rendered_application_rows(&application).join("\n");
+    assert!(searched.contains("Zebra"));
+    assert!(!searched.contains("Alpha Pro"));
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("close cached picker");
+    assert!(matches!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                chidori::tui::SemanticCommandId::ModelList,
+            )))
+            .expect("reopen cached picker and request background refresh"),
+        ApplicationTransition::ListModels(_)
+    ));
+    let reopened = rendered_application_rows(&application).join("\n");
+    assert!(reopened.contains("Alpha Pro"));
+    assert!(!reopened.contains("Loading Models"));
+}
+
+#[test]
+fn open_model_picker_merges_refreshes_stably_and_isolates_provider_failures() {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request: request.clone(),
+            catalog: ModelCatalog {
+                providers: vec![
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("alpha"),
+                        models: vec![
+                            model_descriptor(
+                                "alpha",
+                                "alpha-pro",
+                                "Alpha Pro",
+                                false,
+                                ModelAvailability::Available,
+                            ),
+                            model_descriptor(
+                                "alpha",
+                                "default",
+                                "Default",
+                                true,
+                                ModelAvailability::Available,
+                            ),
+                        ],
+                        status: ProviderCatalogStatus::Refreshing,
+                    },
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("broken"),
+                        models: Vec::new(),
+                        status: ProviderCatalogStatus::Failed {
+                            message: "credentials expired".to_owned(),
+                        },
+                    },
+                ],
+            },
+        })
+        .expect("show cached Models");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus Alpha Pro");
+
+    application
+        .handle_event(ApplicationEvent::ModelsRefreshed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("alpha"),
+                        models: vec![
+                            model_descriptor(
+                                "alpha",
+                                "default",
+                                "Default renamed",
+                                true,
+                                ModelAvailability::Available,
+                            ),
+                            model_descriptor(
+                                "alpha",
+                                "new",
+                                "Aardvark New",
+                                false,
+                                ModelAvailability::Available,
+                            ),
+                        ],
+                        status: ProviderCatalogStatus::Fresh,
+                    },
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("broken"),
+                        models: Vec::new(),
+                        status: ProviderCatalogStatus::Failed {
+                            message: "credentials expired".to_owned(),
+                        },
+                    },
+                ],
+            },
+        })
+        .expect("merge refreshed Models");
+
+    let rows = rendered_application_rows(&application);
+    let removed = rows
+        .iter()
+        .find(|row| row.contains("Alpha Pro"))
+        .expect("keep removed Model in place");
+    assert!(removed.contains("unavailable"));
+    assert!(removed.contains('›'));
+    assert!(rendered_row(&rows, "Alpha Pro") < rendered_row(&rows, "Default renamed"));
+    assert!(rendered_row(&rows, "Default renamed") < rendered_row(&rows, "Aardvark New"));
+    assert!(
+        rows.join("\n")
+            .contains("Retry broken: credentials expired")
+    );
+
+    for _ in 0..3 {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            )))
+            .expect("navigate to Provider retry");
+    }
+    assert!(matches!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("retry failed Provider"),
+        ApplicationTransition::ListModels(_)
+    ));
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("close retrying picker");
+    assert!(matches!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                chidori::tui::SemanticCommandId::ModelList,
+            )))
+            .expect("reopen from the latest normalized cache"),
+        ApplicationTransition::ListModels(_)
+    ));
+    let reopened = rendered_application_rows(&application);
+    assert!(!reopened.join("\n").contains("Alpha Pro"));
+    assert!(rendered_row(&reopened, "Aardvark New") < rendered_row(&reopened, "Default renamed"));
+}
+
+#[test]
+fn model_picker_refresh_failure_preserves_the_visible_selection() {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request: request.clone(),
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("alpha"),
+                    models: vec![
+                        model_descriptor(
+                            "alpha",
+                            "alpha-pro",
+                            "Alpha Pro",
+                            false,
+                            ModelAvailability::Available,
+                        ),
+                        model_descriptor(
+                            "alpha",
+                            "default",
+                            "Default",
+                            true,
+                            ModelAvailability::Available,
+                        ),
+                    ],
+                    status: ProviderCatalogStatus::Refreshing,
+                }],
+            },
+        })
+        .expect("show cached Models");
+    application
+        .handle_event(ApplicationEvent::ModelListingFailed {
+            request,
+            error: "refresh timed out".to_owned(),
+        })
+        .expect("show stale cached Models");
+
+    let rows = rendered_application_rows(&application);
+    assert!(
+        rows.iter()
+            .find(|row| row.contains("Default"))
+            .expect("keep the selected cached Model")
+            .contains('›')
+    );
+    assert!(rows.join("\n").contains("refresh timed out"));
+}
+
+#[test]
+fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let authoritative = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("old"),
+        options: Vec::new(),
+    };
+    let snapshot = selected_session_snapshot(session_id, workspace.path(), authoritative.clone());
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .expect("attach selected Session");
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Session Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    let mut new_model = model_descriptor(
+        "codex",
+        "new",
+        "New Model",
+        false,
+        ModelAvailability::Available,
+    );
+    new_model.options = vec![
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("reasoning_effort"),
+            label: "Reasoning".to_owned(),
+            description: None,
+            role: ModelOptionRole::ReasoningEffort,
+            kind: ModelOptionKind::Select {
+                choices: vec![
+                    ModelOptionChoice {
+                        id: ModelOptionChoiceId::new("low"),
+                        label: "Low".to_owned(),
+                        description: None,
+                        availability: ModelAvailability::Available,
+                    },
+                    ModelOptionChoice {
+                        id: ModelOptionChoiceId::new("high"),
+                        label: "High".to_owned(),
+                        description: None,
+                        availability: ModelAvailability::Available,
+                    },
+                ],
+                default: ModelOptionChoiceId::new("high"),
+            },
+        },
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("fast"),
+            label: "Fast".to_owned(),
+            description: None,
+            role: ModelOptionRole::Speed,
+            kind: ModelOptionKind::Toggle { default: true },
+        },
+    ];
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("other"),
+                        models: vec![model_descriptor(
+                            "other",
+                            "foreign",
+                            "Foreign Model",
+                            true,
+                            ModelAvailability::Available,
+                        )],
+                        status: ProviderCatalogStatus::Fresh,
+                    },
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("codex"),
+                        models: vec![
+                            model_descriptor(
+                                "codex",
+                                "old",
+                                "Old Model",
+                                true,
+                                ModelAvailability::Available,
+                            ),
+                            new_model,
+                        ],
+                        status: ProviderCatalogStatus::Fresh,
+                    },
+                ],
+            },
+        })
+        .expect("load Session-scoped catalog");
+    let picker = rendered_application_rows(&application).join("\n");
+    assert!(picker.contains("Session Provider codex"));
+    assert!(picker.contains("use /new to change Provider"));
+    assert!(!picker.contains("Foreign Model"));
+    assert!(
+        picker
+            .lines()
+            .find(|row| row.contains("Old Model"))
+            .expect("render current Model")
+            .contains("current")
+    );
+    let tiny_picker = rendered_application_rows_at(&application, 28, 5).join("\n");
+    assert!(tiny_picker.contains("Old Model"));
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus New Model");
+    let ApplicationTransition::UpdateAgentSelection {
+        session_id: updated_session,
+        request,
+    } = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("select New Model")
+    else {
+        panic!("selecting a Session Model should update Agent Selection");
+    };
+    assert_eq!(updated_session, session_id);
+    assert_eq!(request.selection.model, ModelId::new("new"));
+    assert_eq!(
+        request.selection.options,
+        vec![
+            chidori::protocol::ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("high"),
+                },
+            },
+            chidori::protocol::ModelOptionSelection {
+                id: ModelOptionId::new("fast"),
+                value: ModelOptionValue::Toggle { enabled: true },
+            },
+        ]
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Model New Model")
+    );
+    assert!(matches!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                chidori::tui::SemanticCommandId::ModelList,
+            )))
+            .expect("reopen picker around optimistic Model"),
+        ApplicationTransition::ListModels(_)
+    ));
+    let optimistic_picker = rendered_application_rows(&application);
+    let optimistic = optimistic_picker
+        .iter()
+        .find(|row| row.contains("New Model"))
+        .expect("render optimistic Model row");
+    assert!(optimistic.contains("current"));
+    assert!(optimistic.contains('›'));
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("prevent rapid reselection while the first operation is pending"),
+        ApplicationTransition::Continue
+    );
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("close optimistic Model picker");
+
+    type_terminal_text(&mut application, "must wait");
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("block Prompt during optimistic selection"),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                chidori::tui::SemanticCommandId::SessionList,
+            )))
+            .expect("block navigation during optimistic selection"),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                chidori::tui::SemanticCommandId::SessionNew,
+            )))
+            .expect("block /new during optimistic selection"),
+        ApplicationTransition::Continue
+    );
+
+    let mut other_client = Application::new(workspace.path());
+    other_client
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach another client");
+    type_terminal_text(&mut other_client, "other client can submit");
+    assert!(matches!(
+        other_client
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("submit from unaffected client"),
+        ApplicationTransition::AdmitPrompt { .. }
+    ));
+
+    application
+        .handle_event(ApplicationEvent::AgentSelectionUpdateFailed {
+            operation_id: request.operation_id,
+            error: "Model rejected".to_owned(),
+        })
+        .expect("reject optimistic selection");
+    let rolled_back = rendered_application_rows(&application).join("\n");
+    assert!(rolled_back.contains("Model Old Model"));
+    assert!(rolled_back.contains("Model rejected"));
+    assert!(matches!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("unblock Prompt after selection rejection"),
+        ApplicationTransition::AdmitPrompt { .. }
+    ));
+}
+
+#[test]
+fn landing_model_selection_and_new_session_inherit_complete_agent_selection() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open landing Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    let mut model = model_descriptor(
+        "codex",
+        "gpt-native",
+        "GPT Friendly",
+        true,
+        ModelAvailability::Available,
+    );
+    model.options.push(ModelOptionDescriptor {
+        id: ModelOptionId::new("reasoning_effort"),
+        label: "Reasoning".to_owned(),
+        description: None,
+        role: ModelOptionRole::ReasoningEffort,
+        kind: ModelOptionKind::Select {
+            choices: vec![ModelOptionChoice {
+                id: ModelOptionChoiceId::new("high"),
+                label: "High".to_owned(),
+                description: None,
+                availability: ModelAvailability::Available,
+            }],
+            default: ModelOptionChoiceId::new("high"),
+        },
+    });
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![model],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("load landing Models");
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("select landing Model"),
+        ApplicationTransition::Continue
+    );
+    let wide = rendered_application_rows_at(&application, 100, 16).join("\n");
+    assert!(wide.contains("Model GPT Friendly"));
+    assert!(wide.contains("Reasoning High"));
+    let compact = rendered_application_rows_at(&application, 43, 10).join("\n");
+    assert!(compact.contains("Model GPT Friendly"));
+    assert!(!compact.contains("Reasoning High"));
+
+    type_terminal_text(&mut application, "Create with selection");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit selected landing Model")
+    else {
+        panic!("landing Prompt should create a Session");
+    };
+    let selected = request
+        .agent_selection
+        .expect("landing selection is sent during Session creation");
+    assert_eq!(selected.model, ModelId::new("gpt-native"));
+    assert_eq!(selected.options.len(), 1);
+
+    let inherited = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("inherited"),
+        options: vec![chidori::protocol::ModelOptionSelection {
+            id: ModelOptionId::new("reasoning_effort"),
+            value: ModelOptionValue::Select {
+                choice: ModelOptionChoiceId::new("medium"),
+            },
+        }],
+    };
+    let mut attached = Application::new(workspace.path());
+    attached
+        .handle_event(ApplicationEvent::SessionAttached(
+            selected_session_snapshot(SessionId::new(), workspace.path(), inherited.clone()),
+        ))
+        .expect("attach Session before /new");
+    assert_eq!(
+        attached
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                chidori::tui::SemanticCommandId::SessionNew,
+            )))
+            .expect("start inherited /new flow"),
+        ApplicationTransition::DetachSession
+    );
+    type_terminal_text(&mut attached, "Inherited work");
+    let ApplicationTransition::CreateSession(request) = attached
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("create inherited Session")
+    else {
+        panic!("/new landing Prompt should create a Session");
+    };
+    assert_eq!(request.agent_selection, Some(inherited));
+}
+
+#[test]
+fn open_model_picker_refocuses_on_an_authoritative_multi_client_update() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let old = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("old"),
+        options: Vec::new(),
+    };
+    let new = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("new"),
+        options: Vec::new(),
+    };
+    let mut observer = Application::new(workspace.path());
+    observer
+        .handle_event(ApplicationEvent::SessionAttached(
+            selected_session_snapshot(session_id, workspace.path(), old),
+        ))
+        .expect("attach observing client");
+    let ApplicationTransition::ListModels(request) = observer
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open observer Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    let catalog = ModelCatalog {
+        providers: vec![ProviderModelCatalog {
+            provider: ProviderId::new("codex"),
+            models: vec![
+                model_descriptor(
+                    "codex",
+                    "old",
+                    "Old Model",
+                    true,
+                    ModelAvailability::Available,
+                ),
+                model_descriptor(
+                    "codex",
+                    "new",
+                    "New Model",
+                    false,
+                    ModelAvailability::Available,
+                ),
+            ],
+            status: ProviderCatalogStatus::Fresh,
+        }],
+    };
+    observer
+        .handle_event(ApplicationEvent::ModelsListed {
+            request: request.clone(),
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![model_descriptor(
+                        "codex",
+                        "new",
+                        "New Model",
+                        true,
+                        ModelAvailability::Available,
+                    )],
+                    status: ProviderCatalogStatus::Refreshing,
+                }],
+            },
+        })
+        .expect("load cache without the authoritative Model");
+    assert!(
+        rendered_application_rows(&observer)
+            .iter()
+            .find(|row| row.contains("New Model"))
+            .expect("focus fallback Model")
+            .contains('›')
+    );
+    observer
+        .handle_event(ApplicationEvent::ModelsListed {
+            request: request.clone(),
+            catalog: catalog.clone(),
+        })
+        .expect("merge a newly available authoritative Model");
+    assert!(
+        rendered_application_rows(&observer)
+            .iter()
+            .find(|row| row.contains("Old Model"))
+            .expect("render newly available authoritative Model")
+            .contains('›')
+    );
+    observer
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )))
+        .expect("move away from current Model before refresh");
+    observer
+        .handle_event(ApplicationEvent::ModelsRefreshed { request, catalog })
+        .expect("merge refresh without moving the cursor");
+    let refreshed = rendered_application_rows(&observer);
+    assert!(
+        refreshed
+            .iter()
+            .find(|row| row.contains("New Model"))
+            .expect("render manually focused Model")
+            .contains('›')
+    );
+    assert!(
+        refreshed
+            .iter()
+            .find(|row| row.contains("Old Model"))
+            .expect("render authoritative Model")
+            .contains("current")
+    );
+
+    observer
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(2),
+                changes: vec![SessionChange::AgentSelectionChanged { selection: new }],
+            },
+        )))
+        .expect("apply another client's authoritative selection");
+    let rows = rendered_application_rows(&observer);
+    let new_row = rows
+        .iter()
+        .find(|row| row.contains("New Model"))
+        .expect("render remotely selected Model");
+    assert!(new_row.contains("current"));
+    assert!(new_row.contains('›'));
+    assert!(
+        !rows
+            .iter()
+            .find(|row| row.contains("Old Model"))
+            .expect("keep old Model available")
+            .contains('›')
+    );
 }
 
 #[test]
@@ -3616,6 +4459,48 @@ fn session_summary(
         title: title.to_owned(),
         created_at: SessionTimestamp(1),
         updated_at: SessionTimestamp(updated_at),
+    }
+}
+
+fn model_descriptor(
+    provider: &str,
+    id: &str,
+    display_name: &str,
+    is_default: bool,
+    availability: ModelAvailability,
+) -> ModelDescriptor {
+    ModelDescriptor {
+        provider: ProviderId::new(provider),
+        id: ModelId::new(id),
+        display_name: display_name.to_owned(),
+        description: format!("{display_name} description"),
+        is_default,
+        availability,
+        options: Vec::new(),
+    }
+}
+
+fn selected_session_snapshot(
+    session_id: SessionId,
+    workspace: &std::path::Path,
+    selection: AgentSelection,
+) -> SessionSnapshot {
+    SessionSnapshot {
+        session: Session {
+            id: session_id,
+            workspace: Workspace {
+                path: workspace.to_owned(),
+            },
+            agent_selection: Some(selection),
+            agent_selection_availability: ModelAvailability::Available,
+            status: SessionStatus::Idle,
+        },
+        revision: SessionRevision::INITIAL,
+        prompts: Vec::new(),
+        turns: Vec::new(),
+        messages: Vec::new(),
+        activities: Vec::new(),
+        transcript: Vec::new(),
     }
 }
 

@@ -2,6 +2,7 @@
 
 mod commands;
 mod markdown;
+mod model_picker;
 mod session_picker;
 mod slots;
 
@@ -42,10 +43,12 @@ use crate::{
         SessionProjection, SessionStreamError, SessionSubscription,
     },
     protocol::{
-        Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, FileChange,
-        InitialPrompt, MessageId, MessageRole, PromptDelivery, PromptId, PromptStatus,
-        ServerIdentity, SessionId, SessionSnapshot, SessionStatus, SessionSummary,
-        SessionTimestamp, ShutdownReason, TranscriptItem, TurnId, TurnStatus, Workspace,
+        Activity, AdmitPromptRequest, AgentSelection, AgentSelectionOperationId,
+        CreateSessionRequest, FileChange, InitialPrompt, MessageId, MessageRole, ModelAvailability,
+        ModelCatalog, ModelDescriptor, ModelOptionKind, ModelOptionSelection, ModelOptionValue,
+        PromptDelivery, PromptId, PromptStatus, ServerIdentity, SessionChange, SessionId,
+        SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, ShutdownReason,
+        TranscriptItem, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
     },
     theme::Theme,
 };
@@ -55,6 +58,7 @@ mod composer;
 pub use commands::SemanticCommandId;
 use commands::{CommandAutocomplete, command_for_leader_key, descriptor};
 use composer::{ComposerKey, ComposerMemory};
+use model_picker::{ModelPicker, ModelPickerAction, ModelPickerRow};
 use session_picker::{SessionPicker, SessionPickerRow};
 use slots::{
     HomeFooterSlotContext, PromptContextSlotContext, PromptFooterSlotContext,
@@ -95,6 +99,17 @@ impl SessionListScope {
 pub struct SessionListRequest {
     id: u64,
     scope: SessionListScope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelListRequest {
+    sequence: u64,
+}
+
+impl ModelListRequest {
+    const fn new(sequence: u64) -> Self {
+        Self { sequence }
+    }
 }
 
 impl SessionListRequest {
@@ -197,6 +212,9 @@ pub struct TuiState {
     composer_focused: bool,
     submission_error: Option<String>,
     session: Option<SessionProjection>,
+    landing_agent_selection: Option<AgentSelection>,
+    pending_agent_selection: Option<PendingAgentSelection>,
+    confirmed_agent_selection: Option<(SessionId, AgentSelection)>,
     session_events_blocked: bool,
     reconnect_overlay_visible: bool,
     pending_submission: Option<PendingSubmission>,
@@ -204,6 +222,7 @@ pub struct TuiState {
     pending_steers: Vec<PendingSteer>,
     command_mode: CommandMode,
     command_autocomplete: CommandAutocomplete,
+    model_picker: ModelPicker,
     session_picker: SessionPicker,
 }
 
@@ -212,6 +231,13 @@ struct PendingSubmission {
     source: ComposerKey,
     target: SubmissionTarget,
     prompt: InitialPrompt,
+}
+
+#[derive(Clone, Debug)]
+struct PendingAgentSelection {
+    session_id: SessionId,
+    operation_id: AgentSelectionOperationId,
+    selection: AgentSelection,
 }
 
 #[derive(Clone, Debug)]
@@ -266,6 +292,9 @@ impl TuiState {
             composer_focused: true,
             submission_error: None,
             session: None,
+            landing_agent_selection: None,
+            pending_agent_selection: None,
+            confirmed_agent_selection: None,
             session_events_blocked: false,
             reconnect_overlay_visible: false,
             pending_submission: None,
@@ -273,6 +302,7 @@ impl TuiState {
             pending_steers: Vec::new(),
             command_mode: CommandMode::Composer,
             command_autocomplete: CommandAutocomplete::default(),
+            model_picker: ModelPicker::default(),
             session_picker: SessionPicker::new(workspace),
         }
     }
@@ -328,6 +358,8 @@ impl TuiState {
                             .retain(|steer| steer.session_id != session_id);
                     }
                     self.session = None;
+                    self.pending_agent_selection = None;
+                    self.confirmed_agent_selection = None;
                     self.session_events_blocked = true;
                     self.submission_error =
                         Some("Session ended because the shared server was replaced".to_owned());
@@ -366,6 +398,13 @@ impl TuiState {
         if self.session_events_blocked {
             return Ok(());
         }
+        let selection_changed = match &event {
+            SessionEvent::Snapshot(_) => true,
+            SessionEvent::Updated(update) => update
+                .changes
+                .iter()
+                .any(|change| matches!(change, SessionChange::AgentSelectionChanged { .. })),
+        };
         match event {
             SessionEvent::Snapshot(snapshot) => self.hydrate_session(snapshot),
             SessionEvent::Updated(update) => {
@@ -374,6 +413,11 @@ impl TuiState {
                 };
                 session.apply(update)?;
             }
+        }
+        if selection_changed {
+            self.confirmed_agent_selection = None;
+            let current = self.agent_selection().cloned();
+            self.model_picker.refocus(current.as_ref());
         }
         self.reconcile_pending_submission();
         self.reconcile_failed_submissions();
@@ -407,6 +451,28 @@ impl TuiState {
             .map_or(ComposerKey::Landing, |session| {
                 ComposerKey::Session(session.session_id())
             })
+    }
+
+    fn agent_selection(&self) -> Option<&AgentSelection> {
+        let Some(session) = self.session.as_ref() else {
+            return self.landing_agent_selection.as_ref();
+        };
+        let session_id = session.session_id();
+        self.pending_agent_selection
+            .as_ref()
+            .filter(|pending| pending.session_id == session_id)
+            .map(|pending| &pending.selection)
+            .or_else(|| {
+                self.confirmed_agent_selection
+                    .as_ref()
+                    .filter(|(confirmed_session, _)| *confirmed_session == session_id)
+                    .map(|(_, selection)| selection)
+            })
+            .or(session.snapshot().session.agent_selection.as_ref())
+    }
+
+    fn selection_update_pending(&self) -> bool {
+        self.pending_agent_selection.is_some()
     }
 
     fn reconcile_pending_submission(&mut self) {
@@ -740,6 +806,26 @@ pub enum ApplicationEvent {
         request: SessionListRequest,
         error: String,
     },
+    ModelsListed {
+        request: ModelListRequest,
+        catalog: ModelCatalog,
+    },
+    ModelsRefreshed {
+        request: ModelListRequest,
+        catalog: ModelCatalog,
+    },
+    ModelListingFailed {
+        request: ModelListRequest,
+        error: String,
+    },
+    AgentSelectionUpdated {
+        operation_id: AgentSelectionOperationId,
+        selection: AgentSelection,
+    },
+    AgentSelectionUpdateFailed {
+        operation_id: AgentSelectionOperationId,
+        error: String,
+    },
     SessionAttachmentFailed(String),
     SessionCreated(SessionSnapshot),
     SessionOperationFailed(String),
@@ -782,6 +868,14 @@ pub enum CommandId {
     ToggleSessionScope,
     SelectSession,
     CloseSessionPicker,
+    InsertModelSearch(String),
+    DeleteModelSearchBackward,
+    SelectPreviousModel,
+    SelectNextModel,
+    PagePreviousModels,
+    PageNextModels,
+    SelectModel,
+    CloseModelPicker,
     InvokeSemantic(SemanticCommandId),
     InsertText(String),
     PasteText(String),
@@ -813,6 +907,11 @@ pub enum ApplicationTransition {
     SubscribeSession(SessionId),
     AttachSession(SessionId),
     ListSessions(SessionListRequest),
+    ListModels(ModelListRequest),
+    UpdateAgentSelection {
+        session_id: SessionId,
+        request: UpdateAgentSelectionRequest,
+    },
 }
 
 impl Application {
@@ -828,6 +927,14 @@ impl Application {
             ApplicationEvent::Command(_) if self.state.reconnect_overlay_visible => {
                 Ok(ApplicationTransition::Continue)
             }
+            ApplicationEvent::Command(
+                CommandId::SubmitSteer
+                | CommandId::SubmitQueue
+                | CommandId::SelectSession
+                | CommandId::SelectModel
+                | CommandId::InvokeSemantic(SemanticCommandId::SessionList)
+                | CommandId::InvokeSemantic(SemanticCommandId::SessionNew),
+            ) if self.state.selection_update_pending() => Ok(ApplicationTransition::Continue),
             ApplicationEvent::Command(CommandId::ClearOrExit) => {
                 let key = self.state.composer_key();
                 if self.state.composers.is_empty(key) {
@@ -912,6 +1019,14 @@ impl Application {
                 let Some(command) = self.state.command_autocomplete.selected() else {
                     return Ok(ApplicationTransition::Continue);
                 };
+                if self.state.selection_update_pending()
+                    && matches!(
+                        command,
+                        SemanticCommandId::SessionList | SemanticCommandId::SessionNew
+                    )
+                {
+                    return Ok(ApplicationTransition::Continue);
+                }
                 let key = self.state.composer_key();
                 self.state.composers.clear(key);
                 self.state.sync_command_autocomplete();
@@ -960,6 +1075,67 @@ impl Application {
                 }
                 Ok(ApplicationTransition::Continue)
             }
+            ApplicationEvent::Command(CommandId::InsertModelSearch(text)) => {
+                self.state.model_picker.insert(&text);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::DeleteModelSearchBackward) => {
+                self.state.model_picker.delete_backward();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::SelectPreviousModel) => {
+                self.state.model_picker.select_previous();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::SelectNextModel) => {
+                self.state.model_picker.select_next();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::PagePreviousModels) => {
+                self.state.model_picker.page_previous();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::PageNextModels) => {
+                self.state.model_picker.page_next();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::SelectModel) => {
+                match self.state.model_picker.choose() {
+                    Some(ModelPickerAction::Retry) => {
+                        Ok(self.state.model_picker.begin_retry().map_or(
+                            ApplicationTransition::Continue,
+                            ApplicationTransition::ListModels,
+                        ))
+                    }
+                    Some(ModelPickerAction::Select(model)) => {
+                        let selection = selection_with_advertised_defaults(&model);
+                        self.state.model_picker.close();
+                        let Some(session_id) = self.session_id() else {
+                            self.state.landing_agent_selection = Some(selection);
+                            return Ok(ApplicationTransition::Continue);
+                        };
+                        let operation_id = AgentSelectionOperationId::new();
+                        self.state.pending_agent_selection = Some(PendingAgentSelection {
+                            session_id,
+                            operation_id,
+                            selection: selection.clone(),
+                        });
+                        self.state.submission_error = None;
+                        Ok(ApplicationTransition::UpdateAgentSelection {
+                            session_id,
+                            request: UpdateAgentSelectionRequest {
+                                operation_id,
+                                selection,
+                            },
+                        })
+                    }
+                    None => Ok(ApplicationTransition::Continue),
+                }
+            }
+            ApplicationEvent::Command(CommandId::CloseModelPicker) => {
+                self.state.model_picker.close();
+                Ok(ApplicationTransition::Continue)
+            }
             ApplicationEvent::Command(CommandId::InvokeSemantic(command)) => {
                 self.invoke_semantic(command)
             }
@@ -1001,7 +1177,7 @@ impl Application {
                     prompt: prompt.clone(),
                 });
                 Ok(ApplicationTransition::CreateSession(CreateSessionRequest {
-                    agent_selection: None,
+                    agent_selection: self.state.landing_agent_selection.clone(),
                     workspace: Workspace {
                         path: self.state.workspace.clone(),
                     },
@@ -1145,6 +1321,62 @@ impl Application {
                 self.state.session_picker.fail_listing(&request, error);
                 Ok(ApplicationTransition::Continue)
             }
+            ApplicationEvent::ModelsListed { request, catalog } => {
+                let current = self.state.agent_selection().cloned();
+                self.state
+                    .model_picker
+                    .load(&request, catalog, current.as_ref());
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::ModelsRefreshed { request, catalog } => {
+                let current = self.state.agent_selection().cloned();
+                self.state
+                    .model_picker
+                    .load(&request, catalog, current.as_ref());
+                self.state.model_picker.finish(&request);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::ModelListingFailed { request, error } => {
+                self.state.model_picker.fail(&request, error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::AgentSelectionUpdated {
+                operation_id,
+                selection,
+            } => {
+                if self
+                    .state
+                    .pending_agent_selection
+                    .as_ref()
+                    .is_some_and(|pending| pending.operation_id == operation_id)
+                {
+                    let session_id = self
+                        .state
+                        .pending_agent_selection
+                        .take()
+                        .expect("matching pending Agent Selection exists")
+                        .session_id;
+                    self.state.confirmed_agent_selection = Some((session_id, selection));
+                    self.state.submission_error = None;
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::AgentSelectionUpdateFailed {
+                operation_id,
+                error,
+            } => {
+                if self
+                    .state
+                    .pending_agent_selection
+                    .as_ref()
+                    .is_some_and(|pending| pending.operation_id == operation_id)
+                {
+                    self.state.pending_agent_selection = None;
+                    self.state.confirmed_agent_selection = None;
+                    self.state.submission_error = Some(error);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
             ApplicationEvent::SessionAttachmentFailed(error) => {
                 let request = self.state.session_picker.fail_attachment(error);
                 Ok(ApplicationTransition::ListSessions(request))
@@ -1161,19 +1393,46 @@ impl Application {
     }
 
     fn invoke_semantic(&mut self, command: SemanticCommandId) -> Result<ApplicationTransition> {
+        if self.state.selection_update_pending()
+            && matches!(
+                command,
+                SemanticCommandId::SessionList | SemanticCommandId::SessionNew
+            )
+        {
+            return Ok(ApplicationTransition::Continue);
+        }
         match command {
+            SemanticCommandId::ModelList => {
+                let current = self.state.agent_selection().cloned();
+                let provider_scope = self
+                    .state
+                    .session
+                    .as_ref()
+                    .and_then(|_| current.as_ref().map(|selection| selection.provider.clone()));
+                let request = self
+                    .state
+                    .model_picker
+                    .open(current.as_ref(), provider_scope);
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::ListModels(request))
+            }
             SemanticCommandId::SessionList => {
                 let request = self.state.session_picker.open();
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::ListSessions(request))
             }
             SemanticCommandId::SessionNew => {
+                let inherited_selection = self.state.agent_selection().cloned();
                 let source = self.state.composer_key();
                 self.state.composers.clear(source);
                 self.state.composers.clear(ComposerKey::Landing);
                 self.state.submission_error = None;
                 self.state.command_mode = CommandMode::Composer;
                 let detached = self.state.session.take().is_some();
+                if detached {
+                    self.state.landing_agent_selection = inherited_selection;
+                    self.state.confirmed_agent_selection = None;
+                }
                 self.state.session_events_blocked = detached;
                 self.state.sync_command_autocomplete();
                 Ok(if detached {
@@ -1196,6 +1455,12 @@ impl Application {
     }
 
     pub fn handle_terminal_event(&mut self, event: InputEvent) -> Result<ApplicationTransition> {
+        if self.state.model_picker.is_open() {
+            return command_for_model_picker_event(event)
+                .map_or(Ok(ApplicationTransition::Continue), |command| {
+                    self.handle_event(ApplicationEvent::Command(command))
+                });
+        }
         if self.state.session_picker.is_open() {
             return command_for_session_picker_event(event)
                 .map_or(Ok(ApplicationTransition::Continue), |command| {
@@ -1274,31 +1539,76 @@ fn command_for_autocomplete_event(event: InputEvent) -> Option<CommandId> {
 }
 
 fn command_for_session_picker_event(event: InputEvent) -> Option<CommandId> {
+    command_for_picker_event(event, &SESSION_PICKER_COMMANDS)
+}
+
+fn command_for_model_picker_event(event: InputEvent) -> Option<CommandId> {
+    command_for_picker_event(event, &MODEL_PICKER_COMMANDS)
+}
+
+struct PickerCommandBindings {
+    previous: CommandId,
+    next: CommandId,
+    page_previous: CommandId,
+    page_next: CommandId,
+    select: CommandId,
+    close: CommandId,
+    delete_backward: CommandId,
+    insert: fn(String) -> CommandId,
+    toggle_scope: Option<CommandId>,
+}
+
+const SESSION_PICKER_COMMANDS: PickerCommandBindings = PickerCommandBindings {
+    previous: CommandId::SelectPreviousSession,
+    next: CommandId::SelectNextSession,
+    page_previous: CommandId::PagePreviousSessions,
+    page_next: CommandId::PageNextSessions,
+    select: CommandId::SelectSession,
+    close: CommandId::CloseSessionPicker,
+    delete_backward: CommandId::DeleteSessionSearchBackward,
+    insert: CommandId::InsertSessionSearch,
+    toggle_scope: Some(CommandId::ToggleSessionScope),
+};
+
+const MODEL_PICKER_COMMANDS: PickerCommandBindings = PickerCommandBindings {
+    previous: CommandId::SelectPreviousModel,
+    next: CommandId::SelectNextModel,
+    page_previous: CommandId::PagePreviousModels,
+    page_next: CommandId::PageNextModels,
+    select: CommandId::SelectModel,
+    close: CommandId::CloseModelPicker,
+    delete_backward: CommandId::DeleteModelSearchBackward,
+    insert: CommandId::InsertModelSearch,
+    toggle_scope: None,
+};
+
+fn command_for_picker_event(
+    event: InputEvent,
+    bindings: &PickerCommandBindings,
+) -> Option<CommandId> {
     match event {
         InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,
         InputEvent::Key(key) => match (key.code, key.modifiers) {
             (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                Some(CommandId::SelectPreviousSession)
+                Some(bindings.previous.clone())
             }
             (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
-                Some(CommandId::SelectNextSession)
+                Some(bindings.next.clone())
             }
-            (KeyCode::PageUp, KeyModifiers::NONE) => Some(CommandId::PagePreviousSessions),
-            (KeyCode::PageDown, KeyModifiers::NONE) => Some(CommandId::PageNextSessions),
-            (KeyCode::Char('a'), KeyModifiers::CONTROL) => Some(CommandId::ToggleSessionScope),
-            (KeyCode::Enter, KeyModifiers::NONE) => Some(CommandId::SelectSession),
-            (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::CloseSessionPicker),
-            (KeyCode::Backspace, KeyModifiers::NONE) => {
-                Some(CommandId::DeleteSessionSearchBackward)
-            }
+            (KeyCode::PageUp, KeyModifiers::NONE) => Some(bindings.page_previous.clone()),
+            (KeyCode::PageDown, KeyModifiers::NONE) => Some(bindings.page_next.clone()),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => bindings.toggle_scope.clone(),
+            (KeyCode::Enter, KeyModifiers::NONE) => Some(bindings.select.clone()),
+            (KeyCode::Esc, KeyModifiers::NONE) => Some(bindings.close.clone()),
+            (KeyCode::Backspace, KeyModifiers::NONE) => Some(bindings.delete_backward.clone()),
             (KeyCode::Char(character), modifiers)
                 if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
             {
-                Some(CommandId::InsertSessionSearch(character.to_string()))
+                Some((bindings.insert)(character.to_string()))
             }
             _ => None,
         },
-        InputEvent::Paste(text) => Some(CommandId::InsertSessionSearch(text)),
+        InputEvent::Paste(text) => Some((bindings.insert)(text)),
         _ => None,
     }
 }
@@ -1542,9 +1852,13 @@ fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlot
     if state.session_picker.is_open() && !state.reconnect_overlay_visible {
         render_session_picker(frame, state, &theme);
     }
+    if state.model_picker.is_open() && !state.reconnect_overlay_visible {
+        render_model_picker(frame, state, &theme);
+    }
     if state.reconnect_overlay_visible {
         render_reconnect_overlay(frame, &theme);
     } else if !state.session_picker.is_open()
+        && !state.model_picker.is_open()
         && state.composer_focused
         && matches!(state.command_mode, CommandMode::Composer)
     {
@@ -1646,6 +1960,175 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
         ),
         area,
     );
+}
+
+fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+    let area = centered_rect(
+        frame.area(),
+        frame.area().width.saturating_sub(4).min(76),
+        frame.area().height.saturating_sub(2).min(14),
+    );
+    let content_width = area.width.saturating_sub(2);
+    let content_height = area.height.saturating_sub(2);
+    let mut lines = Vec::with_capacity(usize::from(content_height));
+    if content_height >= 3 {
+        lines.push(Line::styled(
+            truncate_to_width(
+                &format!("Search: {}", state.model_picker.query()),
+                usize::from(content_width),
+            ),
+            theme.text.subdued,
+        ));
+    }
+    if content_height >= 3
+        && let Some(provider) = state.model_picker.provider_scope()
+        && lines.len() < usize::from(content_height)
+    {
+        lines.push(Line::styled(
+            truncate_to_width(
+                &format!("Session Provider {provider} · use /new to change Provider"),
+                usize::from(content_width),
+            ),
+            theme.text.subdued,
+        ));
+    }
+    if state.model_picker.is_loading() && lines.len() < usize::from(content_height) {
+        lines.push(Line::styled("Loading Models…", theme.text.subdued));
+    } else {
+        let footer_rows = usize::from(content_height >= 3);
+        let row_capacity = usize::from(content_height).saturating_sub(lines.len() + footer_rows);
+        let current = state.agent_selection();
+        let rows = state
+            .model_picker
+            .visible_rows(row_capacity, current)
+            .map(|row| match row {
+                ModelPickerRow::Provider {
+                    provider,
+                    refreshing,
+                } => Line::styled(
+                    truncate_to_width(
+                        &format!(
+                            "Provider {provider}{}",
+                            if refreshing { " · refreshing" } else { "" }
+                        ),
+                        usize::from(content_width),
+                    ),
+                    theme.accent.primary.add_modifier(Modifier::BOLD),
+                ),
+                ModelPickerRow::Model {
+                    model,
+                    selected,
+                    current,
+                } => Line::styled(
+                    model_picker_row_text(model, selected, current, usize::from(content_width)),
+                    if selected {
+                        theme.selection.focused
+                    } else if model.availability == ModelAvailability::Unavailable {
+                        theme.text.subdued
+                    } else {
+                        theme.text.primary
+                    },
+                ),
+                ModelPickerRow::Error {
+                    provider,
+                    message,
+                    selected,
+                } => Line::styled(
+                    truncate_to_width(
+                        &format!(
+                            "{}Retry {provider}: {message}",
+                            if selected { "› " } else { "  " }
+                        ),
+                        usize::from(content_width),
+                    ),
+                    if selected {
+                        theme.selection.focused
+                    } else {
+                        theme.feedback.error
+                    },
+                ),
+            })
+            .collect::<Vec<_>>();
+        lines.extend(rows);
+        if !state.model_picker.has_rows() && lines.len() < usize::from(content_height) {
+            lines.push(Line::styled("No Models found", theme.text.subdued));
+        }
+    }
+    if content_height >= 3 && lines.len() < usize::from(content_height) {
+        lines.push(Line::styled(
+            truncate_to_width(
+                "Type to search · Enter select/retry · Esc close",
+                usize::from(content_width),
+            ),
+            theme.text.subdued,
+        ));
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Models ")
+                .border_style(theme.border.default)
+                .style(theme.surface.overlay),
+        ),
+        area,
+    );
+}
+
+fn model_picker_row_text(
+    model: &ModelDescriptor,
+    selected: bool,
+    current: bool,
+    width: usize,
+) -> String {
+    let marker = if selected { "› " } else { "  " };
+    let native = (model.display_name != model.id.as_str()).then_some(model.id.as_str());
+    let mut states = Vec::new();
+    let mut compact_states = Vec::new();
+    if current {
+        states.push("current");
+        compact_states.push("C");
+    }
+    if model.is_default {
+        states.push("default");
+        compact_states.push("D");
+    }
+    if model.availability == ModelAvailability::Unavailable {
+        states.push("unavailable");
+        compact_states.push("U");
+    }
+    let marker_width = marker.width();
+    let available = width.saturating_sub(marker_width);
+    let field_count = 1 + usize::from(native.is_some()) + usize::from(!states.is_empty());
+    let wide_separator = " · ";
+    let compact_separator = " ";
+    let full_state = (!states.is_empty()).then(|| format!("[{}]", states.join(", ")));
+    let compact_state =
+        (!compact_states.is_empty()).then(|| format!("[{}]", compact_states.join(",")));
+    let minimum_text_width = 4 * (1 + usize::from(native.is_some()));
+    let full_fixed = full_state.as_ref().map_or(0, |state| state.width())
+        + wide_separator.width() * field_count.saturating_sub(1);
+    let (separator, state) = if available >= full_fixed.saturating_add(minimum_text_width) {
+        (wide_separator, full_state)
+    } else {
+        (compact_separator, compact_state)
+    };
+    let fixed = state.as_ref().map_or(0, |state| state.width())
+        + separator.width() * field_count.saturating_sub(1);
+    let flexible = available.saturating_sub(fixed);
+    let (display_width, native_width) = native.map_or((flexible, 0), |native| {
+        let native_width = native.width().min((flexible / 2).max(1));
+        (flexible.saturating_sub(native_width), native_width)
+    });
+    let mut fields = vec![truncate_to_width(&model.display_name, display_width)];
+    if let Some(native) = native {
+        fields.push(truncate_to_width(native, native_width));
+    }
+    if let Some(state) = state {
+        fields.push(state);
+    }
+    truncate_to_width(&format!("{marker}{}", fields.join(separator)), width)
 }
 
 fn session_picker_row_text(row: SessionPickerRow<'_>, width: usize, now: u64) -> String {
@@ -1830,13 +2313,11 @@ fn render_landing(
         .area()
         .width
         .saturating_sub(horizontal_padding(frame.area().width).saturating_mul(2));
+    let agent = agent_selection_context(state, footer_detail);
     let context = if footer_detail.shows_secondary() {
-        format!(
-            "Agent unavailable · Workspace {}",
-            state.workspace.to_string_lossy()
-        )
+        format!("{agent} · Workspace {}", state.workspace.to_string_lossy())
     } else {
-        "Agent unavailable".to_owned()
+        agent
     };
     let footer = slots.home_footer(&HomeFooterSlotContext {
         width: footer_width,
@@ -1964,10 +2445,18 @@ fn render_session(
     } else {
         theme.text.subdued
     };
-    let agent = if snapshot.session.status == SessionStatus::Active && !detail.shows_secondary() {
-        String::new()
+    let (agent, agent_style) = if let Some(error) = state.submission_error.as_ref() {
+        (
+            format!(
+                "Error: {error} · {}",
+                agent_selection_context(state, ResponsiveDetail::CoreOnly)
+            ),
+            theme.feedback.error,
+        )
+    } else if snapshot.session.status == SessionStatus::Active && !detail.shows_secondary() {
+        (String::new(), activity_style)
     } else {
-        agent_selection_context(snapshot.session.agent_selection.as_ref(), detail)
+        (agent_selection_context(state, detail), activity_style)
     };
     let footer = slots.prompt_footer(
         &PromptFooterSlotContext {
@@ -1980,7 +2469,7 @@ fn render_session(
         },
         &PromptContextSlotContext {
             session_id,
-            agent: SlotText::new(agent, activity_style),
+            agent: SlotText::new(agent, agent_style),
             connection: SlotText::new(
                 connection_status_text(state, ResponsiveDetail::CoreOnly),
                 status_style(state, theme),
@@ -2227,16 +2716,34 @@ fn render_session_header(
     );
 }
 
-fn agent_selection_context(selection: Option<&AgentSelection>, detail: ResponsiveDetail) -> String {
-    match (selection, detail) {
-        (None, _) => "Agent unavailable".to_owned(),
-        (Some(selection), ResponsiveDetail::CoreOnly) => format!("Model {}", selection.model),
-        (Some(selection), ResponsiveDetail::Secondary) => {
-            format!(
-                "Model {} · Provider {}",
-                selection.model, selection.provider
-            )
-        }
+fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String {
+    match state.agent_selection() {
+        None => "Agent unavailable".to_owned(),
+        Some(selection) => state
+            .model_picker
+            .selection_summary(selection, detail.shows_secondary()),
+    }
+}
+
+fn selection_with_advertised_defaults(model: &ModelDescriptor) -> AgentSelection {
+    AgentSelection {
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        options: model
+            .options
+            .iter()
+            .map(|option| ModelOptionSelection {
+                id: option.id.clone(),
+                value: match &option.kind {
+                    ModelOptionKind::Select { default, .. } => ModelOptionValue::Select {
+                        choice: default.clone(),
+                    },
+                    ModelOptionKind::Toggle { default } => {
+                        ModelOptionValue::Toggle { enabled: *default }
+                    }
+                },
+            })
+            .collect(),
     }
 }
 
@@ -2848,8 +3355,10 @@ async fn run_loop(
     let (submission_tx, mut submission_rx) = tokio::sync::mpsc::unbounded_channel();
     let (subscription_tx, mut subscription_rx) = tokio::sync::mpsc::unbounded_channel();
     let (picker_tx, mut picker_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (model_tx, mut model_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut session_list_task: Option<(SessionListRequest, tokio::task::JoinHandle<()>)> = None;
     let mut session_attachment_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut model_list_task: Option<(ModelListRequest, tokio::task::JoinHandle<()>)> = None;
 
     loop {
         terminal.draw(|frame| application.render(frame))?;
@@ -2885,7 +3394,9 @@ async fn run_loop(
                             | ApplicationTransition::InterruptTurn { .. }
                             | ApplicationTransition::SubscribeSession(_)
                             | ApplicationTransition::AttachSession(_)
-                            | ApplicationTransition::ListSessions(_) => {
+                            | ApplicationTransition::ListSessions(_)
+                            | ApplicationTransition::ListModels(_)
+                            | ApplicationTransition::UpdateAgentSelection { .. } => {
                                 unreachable!("managed events do not issue Session commands");
                             }
                         }
@@ -2969,6 +3480,51 @@ async fn run_loop(
                     SubmissionResult::OperationFailed(error) => {
                         application.handle_event(ApplicationEvent::SessionOperationFailed(error))?;
                     }
+                    SubmissionResult::AgentSelectionUpdated {
+                        operation_id,
+                        selection,
+                    } => {
+                        application.handle_event(ApplicationEvent::AgentSelectionUpdated {
+                            operation_id,
+                            selection,
+                        })?;
+                    }
+                    SubmissionResult::AgentSelectionUpdateFailed {
+                        operation_id,
+                        error,
+                    } => {
+                        application.handle_event(ApplicationEvent::AgentSelectionUpdateFailed {
+                            operation_id,
+                            error,
+                        })?;
+                    }
+                }
+            }
+            model = model_rx.recv() => {
+                let Some(model) = model else {
+                    return Err(anyhow!("Model picker task channel stopped unexpectedly"));
+                };
+                match model {
+                    ModelPickerResult::Listed { request, catalog } => {
+                        application.handle_event(ApplicationEvent::ModelsListed {
+                            request,
+                            catalog,
+                        })?;
+                    }
+                    ModelPickerResult::Refreshed { request, catalog } => {
+                        finish_listing(&mut model_list_task, &request);
+                        application.handle_event(ApplicationEvent::ModelsRefreshed {
+                            request,
+                            catalog,
+                        })?;
+                    }
+                    ModelPickerResult::Failed { request, error } => {
+                        finish_listing(&mut model_list_task, &request);
+                        application.handle_event(ApplicationEvent::ModelListingFailed {
+                            request,
+                            error,
+                        })?;
+                    }
                 }
             }
             picker = picker_rx.recv() => {
@@ -2977,14 +3533,14 @@ async fn run_loop(
                 };
                 match picker {
                     SessionPickerResult::Listed { request, sessions } => {
-                        finish_session_listing(&mut session_list_task, &request);
+                        finish_listing(&mut session_list_task, &request);
                         application.handle_event(ApplicationEvent::SessionsListed {
                             request,
                             sessions,
                         })?;
                     }
                     SessionPickerResult::ListingFailed { request, error } => {
-                        finish_session_listing(&mut session_list_task, &request);
+                        finish_listing(&mut session_list_task, &request);
                         application.handle_event(ApplicationEvent::SessionListingFailed {
                             request,
                             error,
@@ -3106,6 +3662,28 @@ async fn run_loop(
                                         picker_tx.clone(),
                                     );
                                 }
+                                ApplicationTransition::ListModels(request) => {
+                                    replace_listing(
+                                        &mut model_list_task,
+                                        request,
+                                        |request| spawn_model_listing(
+                                            client.session_commands(),
+                                            request,
+                                            model_tx.clone(),
+                                        ),
+                                    );
+                                }
+                                ApplicationTransition::UpdateAgentSelection {
+                                    session_id,
+                                    request,
+                                } => {
+                                    spawn_agent_selection_update(
+                                        client.session_commands(),
+                                        session_id,
+                                        request,
+                                        submission_tx.clone(),
+                                    );
+                                }
                             }
                     }
                     Some(Err(error)) => return Err(error.into()),
@@ -3119,9 +3697,92 @@ async fn run_loop(
 enum SubmissionResult {
     SessionCreated(Box<SessionSnapshot>),
     PromptAdmitted(PromptId),
-    Failed { prompt_id: PromptId, error: String },
+    Failed {
+        prompt_id: PromptId,
+        error: String,
+    },
     OperationSucceeded,
     OperationFailed(String),
+    AgentSelectionUpdated {
+        operation_id: AgentSelectionOperationId,
+        selection: AgentSelection,
+    },
+    AgentSelectionUpdateFailed {
+        operation_id: AgentSelectionOperationId,
+        error: String,
+    },
+}
+
+enum ModelPickerResult {
+    Listed {
+        request: ModelListRequest,
+        catalog: ModelCatalog,
+    },
+    Refreshed {
+        request: ModelListRequest,
+        catalog: ModelCatalog,
+    },
+    Failed {
+        request: ModelListRequest,
+        error: String,
+    },
+}
+
+fn spawn_model_listing(
+    commands: SessionCommandClient,
+    request: ModelListRequest,
+    results: tokio::sync::mpsc::UnboundedSender<ModelPickerResult>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let listing_error = match commands.list_models().await {
+            Ok(catalog) => {
+                if results
+                    .send(ModelPickerResult::Listed {
+                        request: request.clone(),
+                        catalog,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                None
+            }
+            Err(error) => Some(error.to_string()),
+        };
+        let result = match commands.refresh_models().await {
+            Ok(catalog) => ModelPickerResult::Refreshed { request, catalog },
+            Err(error) => ModelPickerResult::Failed {
+                request,
+                error: listing_error.map_or_else(
+                    || error.to_string(),
+                    |listing| format!("{listing}; refresh failed: {error}"),
+                ),
+            },
+        };
+        let _ = results.send(result);
+    })
+}
+
+fn spawn_agent_selection_update(
+    commands: SessionCommandClient,
+    session_id: SessionId,
+    request: UpdateAgentSelectionRequest,
+    results: tokio::sync::mpsc::UnboundedSender<SubmissionResult>,
+) {
+    tokio::spawn(async move {
+        let operation_id = request.operation_id;
+        let result = match commands.update_agent_selection(session_id, request).await {
+            Ok(selection) => SubmissionResult::AgentSelectionUpdated {
+                operation_id,
+                selection,
+            },
+            Err(error) => SubmissionResult::AgentSelectionUpdateFailed {
+                operation_id,
+                error: error.to_string(),
+            },
+        };
+        let _ = results.send(result);
+    });
 }
 
 enum SessionPickerResult {
@@ -3146,16 +3807,26 @@ fn replace_session_listing(
     request: SessionListRequest,
     results: tokio::sync::mpsc::UnboundedSender<SessionPickerResult>,
 ) {
+    replace_listing(active, request, |request| {
+        spawn_session_listing(commands, request, results)
+    });
+}
+
+fn replace_listing<Request: Clone>(
+    active: &mut Option<(Request, tokio::task::JoinHandle<()>)>,
+    request: Request,
+    spawn: impl FnOnce(Request) -> tokio::task::JoinHandle<()>,
+) {
     if let Some((_, task)) = active.take() {
         task.abort();
     }
-    let task = spawn_session_listing(commands, request.clone(), results);
+    let task = spawn(request.clone());
     *active = Some((request, task));
 }
 
-fn finish_session_listing(
-    active: &mut Option<(SessionListRequest, tokio::task::JoinHandle<()>)>,
-    completed: &SessionListRequest,
+fn finish_listing<Request: PartialEq>(
+    active: &mut Option<(Request, tokio::task::JoinHandle<()>)>,
+    completed: &Request,
 ) {
     if active
         .as_ref()

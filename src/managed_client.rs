@@ -221,27 +221,11 @@ impl ManagedClient {
     }
 
     pub async fn list_models(&self) -> Result<ModelCatalog> {
-        let descriptor = self.descriptor.borrow().clone();
-        let response = self
-            .http
-            .get(format!("{}/v1/models", descriptor.base_url))
-            .bearer_auth(&descriptor.token)
-            .send()
-            .await
-            .context("send Model listing")?;
-        decode_api_response(response, "Model listing").await
+        self.session_commands().list_models().await
     }
 
     pub async fn refresh_models(&self) -> Result<ModelCatalog> {
-        let descriptor = self.descriptor.borrow().clone();
-        let response = self
-            .http
-            .post(format!("{}/v1/models/refresh", descriptor.base_url))
-            .bearer_auth(&descriptor.token)
-            .send()
-            .await
-            .context("send Model catalog refresh")?;
-        decode_api_response(response, "Model catalog refresh").await
+        self.session_commands().refresh_models().await
     }
 
     pub async fn attach_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
@@ -257,6 +241,29 @@ impl ManagedClient {
 }
 
 impl SessionCommandClient {
+    pub(crate) async fn list_models(&self) -> Result<ModelCatalog> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .get(format!("{}/v1/models", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Model listing")?;
+        decode_api_response(response, "Model listing").await
+    }
+
+    pub(crate) async fn refresh_models(&self) -> Result<ModelCatalog> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(format!("{}/v1/models/refresh", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Model catalog refresh")?;
+        decode_api_response(response, "Model catalog refresh").await
+    }
     pub(crate) async fn create_session(
         &self,
         request: CreateSessionRequest,
