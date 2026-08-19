@@ -16,12 +16,13 @@ use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
     AgentSelection, AgentSelectionOperationId, CreateSessionRequest, Message, MessageId,
     MessageRole, MessageStatus, ModelAvailability, ModelOptionValue, Prompt, PromptDelivery,
-    PromptId, PromptOrder, PromptStatus, Session, SessionChange, SessionId, SessionRevision,
-    SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, Turn, TurnId,
-    TurnStatus, UpdateAgentSelectionRequest, Workspace,
+    PromptId, PromptOrder, PromptStatus, ProviderId, Session, SessionChange, SessionId,
+    SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
+    SessionUpdate, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
 };
+use crate::provider::ProviderResumeState;
 use crate::session_projection::apply_update;
-use crate::storage::{PersistedSession, StorageSink};
+use crate::storage::{PersistedSession, StorageSink, StoredResumeState};
 
 const SESSION_UPDATE_CAPACITY: usize = 256;
 
@@ -88,6 +89,7 @@ struct SessionRecord {
     steer_targets: HashMap<PromptId, TurnId>,
     selection_operations: HashMap<AgentSelectionOperationId, AgentSelection>,
     selection_retry_prompt: Option<PromptId>,
+    resume_states: HashMap<ProviderId, ProviderResumeState>,
 }
 
 struct PromptOwner {
@@ -169,7 +171,11 @@ impl SessionStore {
         let mut sessions = HashMap::new();
         let mut prompts = HashMap::new();
         for persisted in persisted_sessions {
-            let PersistedSession { summary, snapshot } = persisted;
+            let PersistedSession {
+                summary,
+                snapshot,
+                resume_states,
+            } = persisted;
             let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
             let next_prompt_order = snapshot
                 .prompts
@@ -201,6 +207,7 @@ impl SessionStore {
                     steer_targets: HashMap::new(),
                     selection_operations: HashMap::new(),
                     selection_retry_prompt: None,
+                    resume_states,
                 },
             );
         }
@@ -334,6 +341,7 @@ impl SessionStore {
                 steer_targets: HashMap::new(),
                 selection_operations: HashMap::new(),
                 selection_retry_prompt: None,
+                resume_states: HashMap::new(),
             },
         );
         self.storage.created(persisted_summary, snapshot.clone());
@@ -456,6 +464,51 @@ impl SessionStore {
             .sessions
             .get(&session_id)
             .map(|record| record.snapshot.clone())
+    }
+
+    pub(crate) fn workspace(&self, session_id: SessionId) -> Option<PathBuf> {
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .sessions
+            .get(&session_id)
+            .map(|record| record.snapshot.session.workspace.path.clone())
+    }
+
+    pub(crate) fn resume_state(
+        &self,
+        session_id: SessionId,
+        provider: &ProviderId,
+    ) -> Option<ProviderResumeState> {
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .sessions
+            .get(&session_id)
+            .and_then(|record| record.resume_states.get(provider))
+            .cloned()
+    }
+
+    pub(crate) fn save_resume_state(
+        &self,
+        session_id: SessionId,
+        provider: ProviderId,
+        resume_state: ProviderResumeState,
+    ) -> anyhow::Result<()> {
+        self.storage.save_resume_state(StoredResumeState {
+            session_id,
+            provider: provider.clone(),
+            resume_state: resume_state.clone(),
+        })?;
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?
+            .resume_states
+            .insert(provider, resume_state);
+        Ok(())
     }
 
     pub(crate) fn reconcile_effective_agent_selection(

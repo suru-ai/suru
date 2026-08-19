@@ -154,13 +154,29 @@ impl ProviderOrchestrator {
         workspace: PathBuf,
         prompt_id: PromptId,
     ) {
+        let commands_tx = self
+            .get_or_spawn_actor_commands(session_id, workspace)
+            .expect("new Session accepts its initial Prompt");
+        commands_tx
+            .send(ProviderCommand::StartPrompt { prompt_id })
+            .expect("new Provider actor accepts its initial Prompt");
+    }
+
+    fn get_or_spawn_actor_commands(
+        &self,
+        session_id: SessionId,
+        workspace: PathBuf,
+    ) -> Result<mpsc::UnboundedSender<ProviderCommand>> {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let mut actors = self
             .actors
             .lock()
             .expect("Provider actor registry lock is not poisoned");
+        if let Some(actor) = actors.entries.get(&session_id) {
+            return Ok(actor.commands.clone());
+        }
         if actors.shutting_down || *self.shutdown.borrow() {
-            return;
+            return Err(anyhow::anyhow!("Provider orchestrator is shutting down"));
         }
         let runtime = self.runtime.clone();
         let sessions = self.sessions.clone();
@@ -180,14 +196,17 @@ impl ProviderOrchestrator {
                 task,
             },
         );
-        drop(actors);
-        commands_tx
-            .send(ProviderCommand::StartPrompt { prompt_id })
-            .expect("new Provider actor accepts its initial Prompt");
+        Ok(commands_tx)
     }
 
     pub(crate) fn schedule_prompt(&self, session_id: SessionId, prompt_id: PromptId) -> Result<()> {
-        self.schedule(session_id, ProviderCommand::StartPrompt { prompt_id })
+        let workspace = self
+            .sessions
+            .workspace(session_id)
+            .ok_or_else(|| anyhow::anyhow!("Session does not exist on this server instance"))?;
+        self.get_or_spawn_actor_commands(session_id, workspace)?
+            .send(ProviderCommand::StartPrompt { prompt_id })
+            .map_err(|_| anyhow::anyhow!("Session Provider actor stopped unexpectedly"))
     }
 
     pub(crate) fn schedule_steer(&self, session_id: SessionId) -> Result<()> {
@@ -315,6 +334,7 @@ async fn run_provider_session(
 ) {
     let mut provider: Option<ConnectedProviderSession> = None;
     let mut active: Option<ActiveProviderTurn> = None;
+    let provider_id = runtime.provider_id();
 
     'actor: loop {
         if *shutdown.borrow() {
@@ -360,6 +380,7 @@ async fn run_provider_session(
                     connection = runtime.start_session(ProviderSessionRequest {
                         session_id,
                         workspace: workspace.clone(),
+                        resume_state: sessions.resume_state(session_id, &provider_id),
                     }) => connection,
                 };
                 let connection = match connection {
@@ -380,7 +401,26 @@ async fn run_provider_session(
                         continue;
                     }
                 };
-                let (identity, session, events) = connection.into_parts();
+                let (identity, resume_state, session, events) = connection.into_parts();
+                if let Some(resume_state) = resume_state
+                    && let Err(error) =
+                        sessions.save_resume_state(session_id, provider_id.clone(), resume_state)
+                {
+                    let _ = updates.apply(|| {
+                        sessions.deliver_prompt(
+                            session_id,
+                            prompt_id,
+                            None,
+                            DeliveredTurnStatus::Failed {
+                                message: format!(
+                                    "Provider startup failed: save Resume State: {error}"
+                                ),
+                            },
+                        )
+                    });
+                    let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
+                    continue;
+                }
                 let selection = identity.selection.clone();
                 let Some(selected) =
                     updates.apply(|| sessions.initialize_agent_selection(session_id, selection))

@@ -129,6 +129,22 @@ const DURABILITY_CODEX_SUFFIX: &str = r#"
 done
 "#;
 
+const PERSISTED_RESUME_CODEX: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"persisted-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"thread/resume"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"persisted-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"persisted-turn"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"persisted-thread","turn":{"id":"persisted-turn","status":"completed","items":[]}}}'
+      ;;
+"#;
+
 const MODEL_CATALOG_CODEX: &str = r#"#!/bin/sh
 attempt=1
 if [ -e "$CODEX_FIXTURE_ATTEMPTS" ]; then
@@ -2770,6 +2786,132 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
         .await
         .expect("replacement server exits after graceful cleanup")
         .expect("reap replacement server");
+}
+
+#[tokio::test]
+async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_restart() {
+    let fixture = ScriptedCodex::new_multiprocess(PERSISTED_RESUME_CODEX);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let channel = "codex-persisted-resume-state";
+    let config = ServerConfig::new(state_dir.path(), channel)
+        .expect("configure original server")
+        .with_data_dir(data_dir.path());
+
+    let original = server::spawn_with_provider(
+        config.clone(),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn original server");
+    let mut original_client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure original client")
+            .with_data_dir(data_dir.path()),
+    )
+    .await
+    .expect("connect original client");
+    receive_initial_state(&mut original_client).await;
+    let created = original_client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Establish durable Codex context".to_owned(),
+            },
+        })
+        .await
+        .expect("create original Session");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = original_client
+                .read_session(created.session.id)
+                .await
+                .expect("read original Session");
+            if snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Completed)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("original Turn completes");
+    drop(original_client);
+    original.shutdown().await.expect("stop original server");
+
+    let replacement =
+        server::spawn_with_provider(config, Arc::new(CodexRuntime::new(fixture.executable())))
+            .await
+            .expect("spawn replacement server");
+    let mut replacement_client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure replacement client")
+            .with_data_dir(data_dir.path()),
+    )
+    .await
+    .expect("connect replacement client");
+    receive_initial_state(&mut replacement_client).await;
+    replacement_client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Continue durable Codex context".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit Prompt to reopened Session");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = replacement_client
+                .read_session(created.session.id)
+                .await
+                .expect("read reopened Session");
+            if snapshot.turns.len() == 2 && snapshot.turns[1].status == TurnStatus::Completed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("continued Turn completes after restart");
+
+    let requests = fixture.requests();
+    assert_eq!(
+        fixture.methods(),
+        [
+            "initialize",
+            "initialized",
+            "thread/start",
+            "turn/start",
+            "initialize",
+            "initialized",
+            "thread/resume",
+            "turn/start"
+        ]
+    );
+    let resume = requests
+        .iter()
+        .find(|request| request["method"] == "thread/resume")
+        .expect("replacement server resumes the persisted Codex Thread");
+    assert_eq!(resume["params"]["threadId"], "persisted-thread");
+
+    drop(replacement_client);
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement server");
 }
 
 #[tokio::test]

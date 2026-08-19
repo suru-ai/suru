@@ -22,15 +22,14 @@ use tokio::{
 
 use super::{
     ProviderActivityId, ProviderCommandStatus, ProviderError, ProviderEvent, ProviderEventStream,
-    ProviderFileChangeStatus, ProviderFuture, ProviderRuntime, ProviderSession,
-    ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
-    wait_for_shutdown,
+    ProviderFileChangeStatus, ProviderFuture, ProviderResumeState, ProviderRuntime,
+    ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
+    ProviderTurnInput, wait_for_shutdown,
 };
 use crate::protocol::{
     AgentId, AgentIdentity, AgentSelection, FileChange, ModelAvailability, ModelDescriptor,
     ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
     ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue, ProviderId,
-    SessionId,
 };
 
 const CODEX_PATH_ENV: &str = "CHIDORI_CODEX_PATH";
@@ -301,18 +300,28 @@ struct ClientError {
 pub struct CodexRuntime {
     executable: OsString,
     processes: ProcessRegistry,
-    thread_ids_by_session: Arc<StdMutex<HashMap<SessionId, CodexThreadId>>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Deserialize, Serialize)]
+struct CodexResumeState {
+    thread_id: CodexThreadId,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(transparent)]
 struct CodexThreadId(String);
+
+impl CodexThreadId {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 impl CodexRuntime {
     pub fn new(executable: impl AsRef<OsStr>) -> Self {
         Self {
             executable: executable.as_ref().to_owned(),
             processes: ProcessRegistry::new(),
-            thread_ids_by_session: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -347,10 +356,7 @@ impl ProviderRuntime for CodexRuntime {
     ) -> ProviderFuture<'_, ProviderSessionConnection> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
-        let thread_ids_by_session = self.thread_ids_by_session.clone();
-        Box::pin(async move {
-            start_codex_session(executable, request, processes, thread_ids_by_session).await
-        })
+        Box::pin(async move { start_codex_session(executable, request, processes).await })
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
@@ -493,18 +499,10 @@ async fn start_codex_session(
     executable: OsString,
     request: ProviderSessionRequest,
     processes: ProcessRegistry,
-    thread_ids_by_session: Arc<StdMutex<HashMap<SessionId, CodexThreadId>>>,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let (transport, events_rx, process) =
         start_initialized_codex_transport(executable, processes).await?;
-    start_codex_thread(
-        transport,
-        events_rx,
-        process,
-        request,
-        thread_ids_by_session,
-    )
-    .await
+    start_codex_thread(transport, events_rx, process, request).await
 }
 
 async fn start_initialized_codex_transport(
@@ -625,23 +623,24 @@ async fn start_codex_thread(
     events_rx: mpsc::UnboundedReceiver<Result<NativeNotification, ProviderError>>,
     process: Arc<ProcessGuard>,
     request: ProviderSessionRequest,
-    thread_ids_by_session: Arc<StdMutex<HashMap<SessionId, CodexThreadId>>>,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let cwd = request
         .workspace
         .to_str()
         .ok_or_else(|| codex_error("Workspace path cannot be represented for Codex app-server"))?;
-    let known_thread_id = thread_ids_by_session
-        .lock()
-        .expect("Codex Thread registry lock is not poisoned")
-        .get(&request.session_id)
-        .cloned();
+    let known_thread_id = request
+        .resume_state
+        .map(ProviderResumeState::into_payload)
+        .map(serde_json::from_value::<CodexResumeState>)
+        .transpose()
+        .map_err(|error| codex_error(format!("Codex Resume State is invalid: {error}")))?
+        .map(|state| state.thread_id);
     let (method, result) = if let Some(thread_id) = known_thread_id.as_ref() {
         let result = transport
             .request(
                 "thread/resume",
                 &ThreadResumeParams {
-                    thread_id: &thread_id.0,
+                    thread_id: thread_id.as_str(),
                     cwd,
                     approval_policy: "never",
                     sandbox: "danger-full-access",
@@ -687,10 +686,12 @@ async fn start_codex_thread(
             "Codex returned an invalid thread/resume response: resumed Provider Session ID changed",
         ));
     }
-    thread_ids_by_session
-        .lock()
-        .expect("Codex Thread registry lock is not poisoned")
-        .insert(request.session_id, CodexThreadId(started.thread.id.clone()));
+    let resume_state = ProviderResumeState::new(
+        serde_json::to_value(CodexResumeState {
+            thread_id: CodexThreadId(started.thread.id.clone()),
+        })
+        .expect("Codex Resume State serialization is infallible"),
+    );
 
     let mut initial_options = Vec::new();
     if let NativeField::Present(Some(effort)) = started.reasoning_effort {
@@ -748,6 +749,7 @@ async fn start_codex_thread(
                 options: initial_options,
             },
         },
+        Some(resume_state),
         session,
         events,
     ))

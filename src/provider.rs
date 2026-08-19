@@ -3,6 +3,7 @@
 use std::{error::Error, fmt, future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 use futures_util::Stream;
+use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::protocol::{
@@ -82,6 +83,24 @@ impl Error for ProviderError {}
 pub struct ProviderSessionRequest {
     pub session_id: SessionId,
     pub workspace: PathBuf,
+    pub resume_state: Option<ProviderResumeState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderResumeState(Value);
+
+impl ProviderResumeState {
+    pub fn new(payload: Value) -> Self {
+        Self(payload)
+    }
+
+    pub fn payload(&self) -> &Value {
+        &self.0
+    }
+
+    pub fn into_payload(self) -> Value {
+        self.0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -243,6 +262,7 @@ pub trait ProviderSession: Send + Sync + 'static {
 
 pub struct ProviderSessionConnection {
     identity: AgentIdentity,
+    resume_state: Option<ProviderResumeState>,
     session: Arc<dyn ProviderSession>,
     events: ProviderEventStream,
 }
@@ -250,11 +270,13 @@ pub struct ProviderSessionConnection {
 impl ProviderSessionConnection {
     pub fn new(
         identity: AgentIdentity,
+        resume_state: Option<ProviderResumeState>,
         session: Arc<dyn ProviderSession>,
         events: ProviderEventStream,
     ) -> Self {
         Self {
             identity,
+            resume_state,
             session,
             events,
         }
@@ -262,8 +284,13 @@ impl ProviderSessionConnection {
 
     pub(crate) fn into_parts(
         self,
-    ) -> (AgentIdentity, Arc<dyn ProviderSession>, ProviderEventStream) {
-        (self.identity, self.session, self.events)
+    ) -> (
+        AgentIdentity,
+        Option<ProviderResumeState>,
+        Arc<dyn ProviderSession>,
+        ProviderEventStream,
+    ) {
+        (self.identity, self.resume_state, self.session, self.events)
     }
 }
 

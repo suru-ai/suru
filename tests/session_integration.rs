@@ -3576,6 +3576,109 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
 }
 
 #[tokio::test]
+async fn persisted_session_without_resume_state_starts_a_fresh_provider_conversation() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "missing-resume-state-test")
+        .expect("configure original server")
+        .with_data_dir(data_dir.path());
+    let (original_runtime, mut original_provider) = ControlledProvider::new();
+    let original = server::spawn_with_provider(config.clone(), original_runtime)
+        .await
+        .expect("spawn original server");
+    let original_descriptor = original.descriptor().clone();
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{}/v1/sessions", original_descriptor.base_url))
+        .bearer_auth(&original_descriptor.token)
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Persist without Provider Resume State".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("create original Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+    let original_start = original_provider.next_start().await;
+    assert!(original_start.resume_state().is_none());
+    let mut original_session = original_start.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-fresh", "low", "slow"),
+    });
+    original_session.next_turn().await.succeed();
+    original_session.emit(ProviderEvent::TurnCompleted);
+    read_session_at_least_revision(
+        &client,
+        &original_descriptor,
+        created.session.id,
+        SessionRevision(4),
+    )
+    .await;
+    original.shutdown().await.expect("stop original server");
+
+    let (replacement_runtime, mut replacement_provider) = ControlledProvider::new();
+    let replacement = server::spawn_with_provider(config, replacement_runtime)
+        .await
+        .expect("spawn replacement server");
+    let replacement_descriptor = replacement.descriptor().clone();
+    client
+        .post(format!(
+            "{}/v1/sessions/{}/prompts",
+            replacement_descriptor.base_url, created.session.id
+        ))
+        .bearer_auth(&replacement_descriptor.token)
+        .json(&AdmitPromptRequest {
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Continue without Provider Resume State".to_owned(),
+            },
+            delivery: PromptDelivery::Steer,
+        })
+        .send()
+        .await
+        .expect("admit Prompt to restored Session")
+        .error_for_status()
+        .expect("restored Session accepts a Prompt");
+    let replacement_start = timeout(Duration::from_secs(1), replacement_provider.next_start())
+        .await
+        .expect("restored Session starts a Provider conversation");
+    assert!(replacement_start.resume_state().is_none());
+    let mut replacement_session = replacement_start.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-fresh", "low", "slow"),
+    });
+    let continued = replacement_session.next_turn().await;
+    assert_eq!(continued.prompt(), "Continue without Provider Resume State");
+    continued.succeed();
+    replacement_session.emit(ProviderEvent::TurnCompleted);
+    let reopened = read_session_at_least_revision(
+        &client,
+        &replacement_descriptor,
+        created.session.id,
+        SessionRevision(7),
+    )
+    .await;
+    assert_eq!(reopened.turns.len(), 2);
+    assert_eq!(reopened.turns[1].status, TurnStatus::Completed);
+
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement server");
+}
+
+#[tokio::test]
 async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid workspace");

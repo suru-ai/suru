@@ -74,6 +74,10 @@ impl StartRequest {
         &self.request.workspace
     }
 
+    pub fn resume_state(&self) -> Option<&chidori::provider::ProviderResumeState> {
+        self.request.resume_state.as_ref()
+    }
+
     pub fn succeed(self, identity: AgentIdentity) -> ControlledProviderSession {
         let (turns_tx, turns_rx) = mpsc::unbounded_channel();
         let (steers_tx, steers_rx) = mpsc::unbounded_channel();
@@ -85,6 +89,7 @@ impl StartRequest {
         self.response
             .send(Ok(ProviderSessionConnection::new(
                 identity,
+                None,
                 Arc::new(ControlledSessionHandle {
                     turns: turns_tx,
                     steers: steers_tx,

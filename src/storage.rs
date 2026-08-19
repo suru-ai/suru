@@ -29,12 +29,13 @@ use crate::{
         SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate,
         TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
+    provider::ProviderResumeState,
     runtime::protect_current_user_file,
     session_projection::apply_update,
 };
 
 const DATABASE_FILE: &str = "chidori.db";
-const CURRENT_SCHEMA_VERSION: &str = "20260820020000";
+const CURRENT_SCHEMA_VERSION: &str = "20260820030000";
 const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(100);
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
@@ -56,6 +57,14 @@ diesel::table! {
     landing_agent_selection (singleton) {
         singleton -> Integer,
         selection -> Text,
+    }
+}
+
+diesel::table! {
+    provider_resume_states (session_id, provider) {
+        session_id -> Text,
+        provider -> Text,
+        payload -> Text,
     }
 }
 
@@ -110,6 +119,13 @@ pub(crate) struct StorageRepository {
 pub(crate) struct PersistedSession {
     pub(crate) summary: SessionSummary,
     pub(crate) snapshot: SessionSnapshot,
+    pub(crate) resume_states: HashMap<ProviderId, ProviderResumeState>,
+}
+
+pub(crate) struct StoredResumeState {
+    pub(crate) session_id: SessionId,
+    pub(crate) provider: ProviderId,
+    pub(crate) resume_state: ProviderResumeState,
 }
 
 #[derive(Debug)]
@@ -248,6 +264,30 @@ impl StorageRepository {
             .map_err(|error| StorageError::WriteLandingAgentSelection(error.to_string()))?;
         Ok(())
     }
+
+    fn save_resume_state(&self, state: &StoredResumeState) -> Result<(), StorageError> {
+        let session_id = state.session_id;
+        let row = ProviderResumeStateRow {
+            session_id: session_id.to_string(),
+            provider: state.provider.to_string(),
+            payload: encode(session_id, "Resume State", state.resume_state.payload())?,
+        };
+        let mut connection = connect(&self.database_path)?;
+        diesel::insert_into(provider_resume_states::table)
+            .values(&row)
+            .on_conflict((
+                provider_resume_states::session_id,
+                provider_resume_states::provider,
+            ))
+            .do_update()
+            .set(provider_resume_states::payload.eq(&row.payload))
+            .execute(&mut connection)
+            .map_err(|error| StorageError::Write {
+                session_id,
+                message: error.to_string(),
+            })?;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -261,13 +301,17 @@ pub(crate) struct StorageWriter {
 }
 
 enum WriterCommand {
-    Create(PersistedSession),
+    Create(Box<PersistedSession>),
     Update {
         summary: SessionSummary,
         update: SessionUpdate,
         durability: Option<std_mpsc::SyncSender<Result<(), String>>>,
     },
     SaveLandingAgentSelection(AgentSelection),
+    SaveResumeState {
+        state: StoredResumeState,
+        durability: std_mpsc::SyncSender<Result<(), String>>,
+    },
     Shutdown,
 }
 
@@ -299,6 +343,7 @@ impl StorageWriter {
             loop {
                 match receiver.recv_timeout(IDLE_FLUSH_DELAY) {
                     Ok(WriterCommand::Create(persisted)) => {
+                        let persisted = *persisted;
                         sessions.insert(
                             persisted.snapshot.session.id,
                             WriterState {
@@ -338,6 +383,22 @@ impl StorageWriter {
                     Ok(WriterCommand::SaveLandingAgentSelection(selection)) => {
                         repository.save_landing_agent_selection(selection)?;
                     }
+                    Ok(WriterCommand::SaveResumeState { state, durability }) => {
+                        let result =
+                            flush_sessions(&repository, &mut sessions, Some(state.session_id))
+                                .and_then(|()| repository.save_resume_state(&state));
+                        if result.is_ok()
+                            && let Some(session) = sessions.get_mut(&state.session_id)
+                        {
+                            session
+                                .persisted
+                                .resume_states
+                                .insert(state.provider, state.resume_state);
+                        }
+                        let _ = durability
+                            .send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                        result?;
+                    }
                     Ok(WriterCommand::Shutdown) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                         flush_sessions(&repository, &mut sessions, None)?;
                         break;
@@ -369,10 +430,13 @@ impl StorageWriter {
 
 impl StorageSink {
     pub(crate) fn created(&self, summary: SessionSummary, snapshot: SessionSnapshot) {
-        let _ = self.commands.send(WriterCommand::Create(PersistedSession {
-            summary,
-            snapshot,
-        }));
+        let _ = self
+            .commands
+            .send(WriterCommand::Create(Box::new(PersistedSession {
+                summary,
+                snapshot,
+                resume_states: HashMap::new(),
+            })));
     }
 
     pub(crate) fn updated(
@@ -412,6 +476,19 @@ impl StorageSink {
         let _ = self
             .commands
             .send(WriterCommand::SaveLandingAgentSelection(selection));
+    }
+
+    pub(crate) fn save_resume_state(&self, state: StoredResumeState) -> Result<(), StorageError> {
+        let (durability, receipt) = std_mpsc::sync_channel(0);
+        self.commands
+            .send(WriterCommand::SaveResumeState { state, durability })
+            .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))?;
+        receipt
+            .recv()
+            .map_err(|_| {
+                StorageError::WriterTask("writer stopped before confirming Resume State".to_owned())
+            })?
+            .map_err(StorageError::WriterTask)
     }
 }
 
@@ -526,6 +603,14 @@ struct ActivityRow {
     payload: String,
 }
 
+#[derive(Insertable, Queryable, Selectable)]
+#[diesel(table_name = provider_resume_states)]
+struct ProviderResumeStateRow {
+    session_id: String,
+    provider: String,
+    payload: String,
+}
+
 struct StoredRows {
     session_id: SessionId,
     session: SessionRow,
@@ -560,7 +645,11 @@ struct TranscriptPosition<'a> {
 
 impl StoredRows {
     fn from_session(persisted: PersistedSession) -> Result<Self, StorageError> {
-        let PersistedSession { summary, snapshot } = persisted;
+        let PersistedSession {
+            summary,
+            snapshot,
+            resume_states: _,
+        } = persisted;
         let session_id = snapshot.session.id;
         let id = session_id.to_string();
         let transcript_order = snapshot
@@ -1162,6 +1251,11 @@ fn load_session(
         .select(ActivityRow::as_select())
         .load(connection)
         .map_err(|error| StorageError::Read(error.to_string()))?;
+    let resume_state_rows = provider_resume_states::table
+        .filter(provider_resume_states::session_id.eq(&stored_session_id))
+        .select(ProviderResumeStateRow::as_select())
+        .load::<ProviderResumeStateRow>(connection)
+        .map_err(|error| StorageError::Read(error.to_string()))?;
 
     let prompts = prompt_rows
         .into_iter()
@@ -1187,6 +1281,17 @@ fn load_session(
         .iter()
         .map(|(activity, _)| activity.clone())
         .collect();
+    let resume_states = resume_state_rows
+        .into_iter()
+        .map(|row| {
+            let payload =
+                decode::<serde_json::Value>(&stored_session_id, "Resume State", &row.payload)?;
+            Ok((
+                ProviderId::new(row.provider),
+                ProviderResumeState::new(payload),
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, StorageError>>()?;
     let mut transcript = decoded_messages
         .into_iter()
         .map(|(message, order)| {
@@ -1216,7 +1321,11 @@ fn load_session(
         activities,
         transcript: transcript.into_iter().map(|(_, item)| item).collect(),
     };
-    Ok(PersistedSession { summary, snapshot })
+    Ok(PersistedSession {
+        summary,
+        snapshot,
+        resume_states,
+    })
 }
 
 fn save_rows(connection: &mut SqliteConnection, rows: StoredRows) -> Result<(), StorageError> {
