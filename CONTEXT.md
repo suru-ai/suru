@@ -5,16 +5,24 @@ Chidori is an interactive workspace in which a user collaborates with an AI agen
 ## Language
 
 **Agent**:
-The configured participant the user addresses, backed by a provider and model.
+The configured participant the user addresses, backed by a Provider and Model.
 _Avoid_: Assistant, bot
+
+**Agent Selection**:
+The Provider, Model, and Model Option configuration a Session will use when its next Turn begins. It follows the Provider's effective selection once resolved, while an active Turn retains the Agent it began with.
+_Avoid_: Model setting, model choice
 
 **Provider**:
 The external product through which an agent operates, such as Codex or Copilot. A Provider identifies that product rather than its underlying model vendor.
 _Avoid_: Backend
 
 **Model**:
-The language model selected for an agent through its provider.
+The language model selected for an Agent through its Provider.
 _Avoid_: Engine
+
+**Model Option**:
+A Provider-advertised, Model-specific configuration dimension such as reasoning effort or speed. Model Options compose independently within an Agent Selection.
+_Avoid_: Variant, trait, model setting
 
 **Session**:
 A workspace for conversation between a user and an agent. A Session is independently addressable, may be viewed from multiple clients, and may exist before an agent is selected.
@@ -25,7 +33,7 @@ The working context in which an agent operates, initially rooted at a local dire
 _Avoid_: Project, working directory, location
 
 **Turn**:
-A unit of work that begins when a Prompt is delivered while a Session is idle and includes the resulting agent activity. An active Turn may accept delivered steer Prompts without beginning another Turn.
+A unit of work that begins when a Prompt is delivered while a Session is idle and includes the resulting Agent activity. A Turn retains its effective Agent identity and may accept delivered steer Prompts without beginning another Turn.
 _Avoid_: Request, exchange
 
 **Prompt**:

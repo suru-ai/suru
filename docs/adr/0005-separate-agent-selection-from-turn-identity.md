@@ -1,0 +1,3 @@
+# Separate Agent Selection from Turn identity
+
+Chidori treats a Session's mutable Agent Selection, including independent Provider-advertised Model Options, as authoritative intent shared by every attached client, while each Turn captures the effective Agent identity and options that actually perform it. Providers resolve the selected Model and options when the next Turn begins; if the effective configuration differs, Chidori updates the Agent Selection and records the change as Activity without rewriting earlier Turns. Switching Providers within an existing Session remains unsupported until Chidori has an explicit context-transfer model, because Provider-native Session context cannot currently be transferred faithfully.
