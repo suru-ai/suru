@@ -41,6 +41,56 @@ fn build_identity_changes_with_executable_contents() {
 }
 
 #[tokio::test]
+async fn release_channel_server_uses_private_base_state_and_data_roots() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for root in [state_dir.path(), data_dir.path()] {
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
+                .expect("make runtime root permissions permissive");
+        }
+    }
+    let config = ServerConfig::new(state_dir.path(), "release")
+        .expect("configure release server")
+        .with_data_dir(data_dir.path());
+
+    let server = server::spawn(config.clone())
+        .await
+        .expect("spawn release server");
+
+    assert_eq!(config.state_dir(), state_dir.path());
+    assert_eq!(config.data_dir(), data_dir.path());
+    assert!(state_dir.path().join("runtime.json").exists());
+    assert!(!state_dir.path().join("release").exists());
+    assert!(!data_dir.path().join("release").exists());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for root in [state_dir.path(), data_dir.path()] {
+            let mode = std::fs::metadata(root)
+                .expect("read runtime root metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        assert_windows_current_user_only(state_dir.path());
+        assert_windows_current_user_only(data_dir.path());
+    }
+
+    server.shutdown().await.expect("shut down release server");
+}
+
+#[tokio::test]
 async fn authenticated_health_describes_the_ready_server() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let server = server::spawn(

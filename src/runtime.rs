@@ -9,55 +9,102 @@ const RUNTIME_FILE: &str = "runtime.json";
 const LOCK_FILE: &str = "server.lock";
 
 #[derive(Clone, Debug)]
-pub struct RuntimeConfig {
-    state_dir: PathBuf,
-    channel: String,
-}
+struct Channel(String);
 
-impl RuntimeConfig {
-    pub fn new(state_dir: impl AsRef<Path>, channel: impl Into<String>) -> Result<Self> {
+impl Channel {
+    fn new(channel: impl Into<String>) -> Result<Self> {
         let channel = channel.into();
-        let channel_is_safe = !channel.is_empty()
+        let is_safe = !channel.is_empty()
             && channel != "."
             && channel != ".."
             && channel
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
-        if !channel_is_safe {
+        if !is_safe {
             bail!("channel must contain only letters, numbers, '.', '-', or '_'");
         }
+        Ok(Self(channel))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn resolve_root(&self, base_dir: &Path) -> PathBuf {
+        if self.0 == "release" {
+            base_dir.to_path_buf()
+        } else {
+            base_dir.join(&self.0)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    state_base_dir: PathBuf,
+    data_base_dir: PathBuf,
+    state_dir: PathBuf,
+    data_dir: PathBuf,
+    channel: Channel,
+}
+
+impl RuntimeConfig {
+    pub fn new(state_base_dir: impl AsRef<Path>, channel: impl Into<String>) -> Result<Self> {
+        let channel = Channel::new(channel)?;
+        let state_base_dir = state_base_dir.as_ref().to_path_buf();
+        let state_dir = channel.resolve_root(&state_base_dir);
         Ok(Self {
-            state_dir: state_dir.as_ref().to_path_buf(),
+            state_base_dir: state_base_dir.clone(),
+            data_base_dir: state_base_dir,
+            data_dir: state_dir.clone(),
+            state_dir,
             channel,
         })
+    }
+
+    pub fn with_data_dir(mut self, data_base_dir: impl AsRef<Path>) -> Self {
+        self.data_base_dir = data_base_dir.as_ref().to_path_buf();
+        self.data_dir = self.channel.resolve_root(&self.data_base_dir);
+        self
+    }
+
+    pub(crate) fn state_base_dir(&self) -> &Path {
+        &self.state_base_dir
+    }
+
+    pub(crate) fn data_base_dir(&self) -> &Path {
+        &self.data_base_dir
     }
 
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
     }
 
-    pub fn channel(&self) -> &str {
-        &self.channel
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
-    pub fn runtime_dir(&self) -> PathBuf {
-        self.state_dir.join(&self.channel)
+    pub fn channel(&self) -> &str {
+        self.channel.as_str()
     }
 
     pub fn descriptor_path(&self) -> PathBuf {
-        self.runtime_dir().join(RUNTIME_FILE)
+        self.state_dir.join(RUNTIME_FILE)
     }
 
     pub(crate) fn lock_path(&self) -> PathBuf {
-        self.runtime_dir().join(LOCK_FILE)
+        self.state_dir.join(LOCK_FILE)
     }
 
     pub(crate) fn create_private_runtime_dir(&self) -> Result<PathBuf> {
-        let runtime_dir = self.runtime_dir();
-        fs::create_dir_all(&runtime_dir)
+        let runtime_dir = &self.state_dir;
+        fs::create_dir_all(runtime_dir)
             .with_context(|| format!("create runtime directory {runtime_dir:?}"))?;
-        protect_current_user_directory(&runtime_dir)?;
-        Ok(runtime_dir)
+        protect_current_user_directory(runtime_dir)?;
+        fs::create_dir_all(&self.data_dir)
+            .with_context(|| format!("create data directory {:?}", self.data_dir))?;
+        protect_current_user_directory(&self.data_dir)?;
+        Ok(runtime_dir.to_path_buf())
     }
 }
 

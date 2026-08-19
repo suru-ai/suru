@@ -41,9 +41,9 @@ pub struct ManagedClientConfig {
 }
 
 impl ManagedClientConfig {
-    pub fn new(state_dir: impl AsRef<Path>, channel: impl Into<String>) -> Result<Self> {
+    pub fn new(state_base_dir: impl AsRef<Path>, channel: impl Into<String>) -> Result<Self> {
         Ok(Self {
-            runtime: RuntimeConfig::new(state_dir, channel)?,
+            runtime: RuntimeConfig::new(state_base_dir, channel)?,
             server_executable: std::env::current_exe()
                 .context("find current Chidori executable")?,
         })
@@ -54,8 +54,17 @@ impl ManagedClientConfig {
         self
     }
 
+    pub fn with_data_dir(mut self, data_base_dir: impl AsRef<Path>) -> Self {
+        self.runtime = self.runtime.with_data_dir(data_base_dir);
+        self
+    }
+
     pub fn state_dir(&self) -> &Path {
         self.runtime.state_dir()
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        self.runtime.data_dir()
     }
 
     pub fn channel(&self) -> &str {

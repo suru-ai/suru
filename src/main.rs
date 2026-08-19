@@ -25,8 +25,10 @@ enum CliCommand {
     },
     #[command(name = "__server", hide = true)]
     InternalServer {
-        #[arg(long)]
-        state_dir: PathBuf,
+        #[arg(long = "state-dir")]
+        state_base_dir: PathBuf,
+        #[arg(long = "data-dir")]
+        data_base_dir: PathBuf,
         #[arg(long)]
         channel: String,
     },
@@ -74,8 +76,12 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Some(CliCommand::InternalServer { state_dir, channel }) => {
-            server::spawn(ServerConfig::new(state_dir, channel)?)
+        Some(CliCommand::InternalServer {
+            state_base_dir,
+            data_base_dir,
+            channel,
+        }) => {
+            server::spawn(ServerConfig::new(state_base_dir, channel)?.with_data_dir(data_base_dir))
                 .await?
                 .run_until_ctrl_c()
                 .await
@@ -90,11 +96,17 @@ async fn main() -> Result<()> {
 }
 
 fn default_client_config() -> Result<ManagedClientConfig> {
-    let state_dir = match std::env::var_os("CHIDORI_STATE_DIR") {
+    let state_base_dir = match std::env::var_os("CHIDORI_STATE_DIR") {
         Some(path) => PathBuf::from(path),
         None => dirs::state_dir()
             .or_else(dirs::data_local_dir)
             .context("determine the current user's state directory")?
+            .join("chidori"),
+    };
+    let data_base_dir = match std::env::var_os("CHIDORI_DATA_DIR") {
+        Some(path) => PathBuf::from(path),
+        None => dirs::data_local_dir()
+            .context("determine the current user's data directory")?
             .join("chidori"),
     };
     let channel = std::env::var("CHIDORI_CHANNEL").unwrap_or_else(|_| {
@@ -104,5 +116,5 @@ fn default_client_config() -> Result<ManagedClientConfig> {
             "release".to_owned()
         }
     });
-    ManagedClientConfig::new(state_dir, channel)
+    Ok(ManagedClientConfig::new(state_base_dir, channel)?.with_data_dir(data_base_dir))
 }

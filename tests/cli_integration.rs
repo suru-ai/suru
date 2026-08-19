@@ -716,6 +716,8 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
             .arg("__server")
             .arg("--state-dir")
             .arg(state_dir.path())
+            .arg("--data-dir")
+            .arg(state_dir.path())
             .arg("--channel")
             .arg(unrelated_channel)
             .stdin(Stdio::null())
@@ -1370,8 +1372,9 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
 }
 
 #[test]
-fn build_profile_selects_an_isolated_default_channel() {
+fn build_profile_selects_isolated_default_state_and_data_roots() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let (expected_channel, other_channel) = if cfg!(debug_assertions) {
         ("debug", "release")
     } else {
@@ -1380,6 +1383,7 @@ fn build_profile_selects_an_isolated_default_channel() {
     let output = Command::new(env!("CARGO_BIN_EXE_chidori"))
         .args(["server", "start"])
         .env("CHIDORI_STATE_DIR", state_dir.path())
+        .env("CHIDORI_DATA_DIR", data_dir.path())
         .env_remove("CHIDORI_CHANNEL")
         .output()
         .expect("start server on the build profile's default channel");
@@ -1389,14 +1393,12 @@ fn build_profile_selects_an_isolated_default_channel() {
         "server start failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        state_dir
-            .path()
-            .join(expected_channel)
-            .join("runtime.json")
-            .exists()
-    );
+    let expected_state_root = test_runtime_root(state_dir.path(), expected_channel);
+    let expected_data_root = test_runtime_root(data_dir.path(), expected_channel);
+    assert!(expected_state_root.join("runtime.json").exists());
+    assert!(expected_data_root.exists());
     assert!(!state_dir.path().join(other_channel).exists());
+    assert!(!data_dir.path().join(other_channel).exists());
 
     stop_test_server(state_dir.path(), expected_channel);
 }
@@ -2050,7 +2052,7 @@ async fn build_replacement_stop(
 }
 
 fn stop_test_server(state_dir: &std::path::Path, channel: &str) {
-    let descriptor_path = state_dir.join(channel).join("runtime.json");
+    let descriptor_path = test_runtime_root(state_dir, channel).join("runtime.json");
     let descriptor = read_runtime_descriptor(descriptor_path);
     let mut system = System::new_all();
     system.refresh_all();
@@ -2058,4 +2060,12 @@ fn stop_test_server(state_dir: &std::path::Path, channel: &str) {
         .process(Pid::from_u32(descriptor.pid))
         .expect("find detached test server");
     assert!(process.kill(), "stop detached test server");
+}
+
+fn test_runtime_root(base_dir: &std::path::Path, channel: &str) -> std::path::PathBuf {
+    if channel == "release" {
+        base_dir.to_path_buf()
+    } else {
+        base_dir.join(channel)
+    }
 }

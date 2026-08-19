@@ -148,7 +148,9 @@ fn spawn_detached(config: &ManagedClientConfig) -> Result<Child> {
     command
         .arg("__server")
         .arg("--state-dir")
-        .arg(config.state_dir())
+        .arg(config.runtime.state_base_dir())
+        .arg("--data-dir")
+        .arg(config.runtime.data_base_dir())
         .arg("--channel")
         .arg(config.channel())
         .stdin(Stdio::null())
@@ -176,7 +178,7 @@ pub(super) fn startup_error(config: &ManagedClientConfig, message: &str) -> anyh
 }
 
 fn log_path(config: &ManagedClientConfig) -> PathBuf {
-    config.runtime.runtime_dir().join(SERVER_LOG_FILE)
+    config.state_dir().join(SERVER_LOG_FILE)
 }
 
 fn read_log_tail(path: &Path) -> Result<String> {
