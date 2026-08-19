@@ -11,9 +11,10 @@ use chidori::{
     },
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, CreateSessionRequest,
-        InitialPrompt, MessageRole, MessageStatus, ModelId, PromptDelivery, PromptId, PromptStatus,
-        ProviderId, SessionChange, SessionId, SessionSnapshot, SessionStatus, ShutdownReason,
-        TranscriptItem, TurnId, TurnStatus, Workspace,
+        InitialPrompt, MessageRole, MessageStatus, ModelAvailability, ModelId, ModelOptionKind,
+        ModelOptionRole, PromptDelivery, PromptId, PromptStatus, ProviderCatalogStatus, ProviderId,
+        SessionChange, SessionId, SessionSnapshot, SessionStatus, ShutdownReason, TranscriptItem,
+        TurnId, TurnStatus, Workspace,
     },
     provider::CodexRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -73,6 +74,45 @@ while IFS= read -r line; do
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-message","delta":" from Codex"}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"native-message","text":"Hello from Codex"},"futureField":true}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[],"futureField":true},"futureField":true}}'
+      ;;
+  esac
+done
+"#;
+
+const MODEL_CATALOG_CODEX: &str = r#"#!/bin/sh
+attempt=1
+if [ -e "$CODEX_FIXTURE_ATTEMPTS" ]; then
+  attempt=$(( $(cat "$CODEX_FIXTURE_ATTEMPTS") + 1 ))
+fi
+printf '%s\n' "$attempt" > "$CODEX_FIXTURE_ATTEMPTS"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"model/list"'*'"cursor":null'*)
+      if [ "$attempt" -gt 1 ]; then
+        printf '%s\n' '{"id":2,"error":{"code":-32001,"message":"temporary catalog outage"}}'
+      else
+        printf '%s\n' '{"id":2,"result":{"data":[{"id":"gpt-opaque","displayName":"GPT Fixture","description":"Primary fixture model","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Faster"},{"reasoningEffort":"xhigh","description":"Deepest"}],"defaultReasoningEffort":"xhigh","serviceTiers":[],"defaultServiceTier":null,"isDefault":true},{"id":"hidden-model","displayName":"Hidden","description":"Not selectable","hidden":true,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","serviceTiers":[],"defaultServiceTier":null,"isDefault":false}],"nextCursor":"opaque-page-2"}}'
+      fi
+      ;;
+    *'"method":"model/list"'*'"cursor":"opaque-page-2"'*)
+      printf '%s\n' '{"id":3,"result":{"data":[{"id":"fast-model","displayName":"Fast Fixture","description":"Has independent speed","hidden":false,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","serviceTiers":[{"id":"fast","name":"Fast","description":"Priority processing"}],"defaultServiceTier":null,"isDefault":false}],"nextCursor":null}}'
+      ;;
+  esac
+done
+"#;
+
+const MALFORMED_MODEL_CATALOG_CODEX: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"model/list"'*)
+      printf '%s\n' '{"id":2,"result":{"data":[{"id":"incomplete"}],"nextCursor":null}}'
       ;;
   esac
 done
@@ -630,6 +670,119 @@ impl SteeringFixture {
 enum TerminalSteerOutcome {
     Accepted,
     Rejected { error: &'static str },
+}
+
+#[tokio::test]
+async fn codex_model_catalog_is_paginated_normalized_and_kept_across_refresh_failure() {
+    let codex = ScriptedCodex::new(MODEL_CATALOG_CODEX);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-model-catalog").expect("configure server"),
+        Arc::new(CodexRuntime::new(codex.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-model-catalog")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+
+    let initial = client.list_models().await.expect("discover Codex Models");
+    assert_eq!(initial.providers.len(), 1);
+    let catalog = &initial.providers[0];
+    assert_eq!(catalog.provider, ProviderId::new("codex"));
+    assert_eq!(catalog.status, ProviderCatalogStatus::Fresh);
+    assert_eq!(catalog.models.len(), 2);
+    assert_eq!(catalog.models[0].id, ModelId::new("gpt-opaque"));
+    assert_eq!(catalog.models[0].display_name, "GPT Fixture");
+    assert_eq!(catalog.models[0].availability, ModelAvailability::Available);
+    assert_eq!(catalog.models[0].options.len(), 1);
+    assert_eq!(
+        catalog.models[0].options[0].role,
+        ModelOptionRole::ReasoningEffort
+    );
+    let ModelOptionKind::Select { choices, default } = &catalog.models[0].options[0].kind else {
+        panic!("reasoning effort is a Select option");
+    };
+    assert_eq!(
+        choices
+            .iter()
+            .map(|choice| choice.id.as_str())
+            .collect::<Vec<_>>(),
+        ["low", "xhigh"]
+    );
+    assert_eq!(default.as_str(), "xhigh");
+    assert_eq!(catalog.models[1].options[0].role, ModelOptionRole::Speed);
+    let ModelOptionKind::Select { choices, default } = &catalog.models[1].options[0].kind else {
+        panic!("speed is a Select option");
+    };
+    assert_eq!(
+        choices
+            .iter()
+            .map(|choice| choice.id.as_str())
+            .collect::<Vec<_>>(),
+        ["default", "fast"]
+    );
+    assert_eq!(default.as_str(), "default");
+
+    let cached = client.list_models().await.expect("read cached catalog");
+    assert_eq!(
+        cached.providers[0].status,
+        ProviderCatalogStatus::Refreshing
+    );
+    assert_eq!(cached.providers[0].models, catalog.models);
+    let stale = client
+        .refresh_models()
+        .await
+        .expect("observe failed background refresh");
+    assert_eq!(stale.providers[0].models, catalog.models);
+    assert!(matches!(
+        &stale.providers[0].status,
+        ProviderCatalogStatus::Stale { message } if message.contains("temporary catalog outage")
+    ));
+
+    let requests = codex.requests();
+    assert!(requests.iter().any(|request| {
+        request.get("method").and_then(Value::as_str) == Some("model/list")
+            && request["params"]["cursor"] == Value::String("opaque-page-2".to_owned())
+    }));
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn malformed_codex_model_results_are_reported_for_the_codex_provider() {
+    let codex = ScriptedCodex::new(MALFORMED_MODEL_CATALOG_CODEX);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-malformed-model-catalog")
+            .expect("configure server"),
+        Arc::new(CodexRuntime::new(codex.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-malformed-model-catalog")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+
+    let catalog = client.list_models().await.expect("request Model catalog");
+    assert_eq!(catalog.providers[0].provider, ProviderId::new("codex"));
+    assert!(catalog.providers[0].models.is_empty());
+    assert!(matches!(
+        &catalog.providers[0].status,
+        ProviderCatalogStatus::Failed { message }
+            if message.contains("invalid model/list response")
+    ));
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
 }
 
 #[tokio::test]

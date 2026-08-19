@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chidori::{
+    protocol::{ModelDescriptor, ProviderId},
     provider::{
         ProviderError, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
         ProviderSessionRequest,
@@ -11,6 +12,14 @@ use chidori::{
 pub struct FailingProviderRuntime;
 
 impl ProviderRuntime for FailingProviderRuntime {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::new("failing")
+    }
+
+    fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
+        Box::pin(async { Err(ProviderError::new("Model discovery is unavailable.")) })
+    }
+
     fn start_session(
         &self,
         _request: ProviderSessionRequest,

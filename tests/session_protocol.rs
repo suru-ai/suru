@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use chidori::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-    CreateSessionRequest, InitialPrompt, Message, MessageId, MessageRole, MessageStatus, ModelId,
+    CreateSessionRequest, InitialPrompt, Message, MessageId, MessageRole, MessageStatus,
+    ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
+    ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionValue,
     Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session,
     SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
     SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, TranscriptItem, Turn, TurnId,
@@ -518,5 +520,101 @@ fn session_delta_status_and_error_contracts_use_stable_provider_neutral_shapes()
         ])
         .expect("encode Turn statuses"),
         json!(["active", "completed", "failed", "interrupted"])
+    );
+}
+
+#[test]
+fn model_descriptors_and_option_values_use_strict_typed_json() {
+    let descriptor = ModelDescriptor {
+        provider: ProviderId::new("codex"),
+        id: ModelId::new("provider/model:opaque"),
+        display_name: "Model Name".to_owned(),
+        description: "Model description".to_owned(),
+        is_default: true,
+        availability: ModelAvailability::Available,
+        options: vec![
+            ModelOptionDescriptor {
+                id: ModelOptionId::new("effort-native"),
+                label: "Reasoning".to_owned(),
+                description: Some("Controls thinking".to_owned()),
+                role: ModelOptionRole::ReasoningEffort,
+                kind: ModelOptionKind::Select {
+                    choices: vec![ModelOptionChoice {
+                        id: ModelOptionChoiceId::new("provider-high"),
+                        label: "High".to_owned(),
+                        description: None,
+                        availability: ModelAvailability::Available,
+                    }],
+                    default: ModelOptionChoiceId::new("provider-high"),
+                },
+            },
+            ModelOptionDescriptor {
+                id: ModelOptionId::new("preview"),
+                label: "Preview".to_owned(),
+                description: None,
+                role: ModelOptionRole::Other,
+                kind: ModelOptionKind::Toggle { default: false },
+            },
+        ],
+    };
+    let encoded = serde_json::to_value(&descriptor).expect("encode Model descriptor");
+    assert_eq!(
+        encoded,
+        json!({
+            "provider": "codex",
+            "id": "provider/model:opaque",
+            "display_name": "Model Name",
+            "description": "Model description",
+            "is_default": true,
+            "availability": "available",
+            "options": [
+                {
+                    "id": "effort-native",
+                    "label": "Reasoning",
+                    "description": "Controls thinking",
+                    "role": "reasoning_effort",
+                    "kind": {
+                        "type": "select",
+                        "choices": [{
+                            "id": "provider-high",
+                            "label": "High",
+                            "description": null,
+                            "availability": "available"
+                        }],
+                        "default": "provider-high"
+                    }
+                },
+                {
+                    "id": "preview",
+                    "label": "Preview",
+                    "description": null,
+                    "role": "other",
+                    "kind": { "type": "toggle", "default": false }
+                }
+            ]
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<ModelDescriptor>(encoded).expect("decode Model descriptor"),
+        descriptor
+    );
+    assert_eq!(
+        serde_json::to_value([
+            ModelOptionValue::Select {
+                choice: ModelOptionChoiceId::new("provider-high")
+            },
+            ModelOptionValue::Toggle { enabled: true },
+        ])
+        .expect("encode Model Option values"),
+        json!([
+            { "type": "select", "choice": "provider-high" },
+            { "type": "toggle", "enabled": true }
+        ])
+    );
+    assert!(
+        serde_json::from_value::<ModelOptionValue>(
+            json!({ "type": "toggle", "enabled": true, "provider_data": 1 })
+        )
+        .is_err()
     );
 }

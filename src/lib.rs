@@ -1,5 +1,6 @@
 pub mod build_identity;
 pub mod managed_client;
+mod model_catalog;
 pub mod protocol;
 pub mod provider;
 mod runtime;

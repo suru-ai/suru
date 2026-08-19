@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::RuntimeConfig;
 use crate::build_identity;
+use crate::model_catalog::ModelCatalogService;
 use crate::protocol::{
     Activity, AdmitPromptRequest, CreateSessionRequest, LifecycleState, Message, MessageId,
     MessageRole, MessageStatus, PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
@@ -231,6 +232,7 @@ struct AppState {
     descriptor: Arc<RuntimeDescriptor>,
     sessions: SessionStore,
     providers: ProviderOrchestrator,
+    model_catalog: ModelCatalogService,
     shutdown: ShutdownController,
 }
 
@@ -284,6 +286,7 @@ pub async fn spawn_with_provider(
         provider_updates: provider_updates.clone(),
     };
     let sessions = SessionStore::default();
+    let model_catalog = ModelCatalogService::new([runtime.clone()]);
     let providers = ProviderOrchestrator::new(
         runtime,
         sessions.clone(),
@@ -294,11 +297,14 @@ pub async fn spawn_with_provider(
         descriptor: Arc::new(descriptor.clone()),
         sessions: sessions.clone(),
         providers: providers.clone(),
+        model_catalog,
         shutdown: shutdown.clone(),
     };
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/events", get(events))
+        .route("/v1/models", get(list_models))
+        .route("/v1/models/refresh", post(refresh_models))
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/sessions/{session_id}", get(read_session))
         .route("/v1/sessions/{session_id}/prompts", post(admit_prompt))
@@ -363,6 +369,20 @@ pub async fn spawn_with_provider(
         shutdown,
         task,
     })
+}
+
+async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(state.model_catalog.list().await).into_response()
+}
+
+async fn refresh_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(state.model_catalog.refresh().await).into_response()
 }
 
 async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {

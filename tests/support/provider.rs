@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chidori::protocol::AgentIdentity;
+use chidori::protocol::{AgentIdentity, ModelDescriptor, ProviderId};
 use chidori::provider::{
     ProviderError, ProviderEvent, ProviderEventStream, ProviderFuture, ProviderRuntime,
     ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderTurnInput,
@@ -159,6 +159,14 @@ impl TurnInterrupt {
 }
 
 impl ProviderRuntime for ControlledProviderRuntime {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::new("controlled")
+    }
+
+    fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn start_session(
         &self,
         request: ProviderSessionRequest,

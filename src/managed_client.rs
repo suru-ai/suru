@@ -15,8 +15,8 @@ use tokio::{
 use crate::{
     RuntimeConfig,
     protocol::{
-        AdmitPromptRequest, CreateSessionRequest, Health, LifecycleState, Prompt, PromptId,
-        RuntimeDescriptor, ServerShutdown, SessionError, SessionId, SessionSnapshot,
+        AdmitPromptRequest, CreateSessionRequest, Health, LifecycleState, ModelCatalog, Prompt,
+        PromptId, RuntimeDescriptor, ServerShutdown, SessionError, SessionId, SessionSnapshot,
         SessionSummary, ShutdownReason, Turn, TurnId,
     },
 };
@@ -210,6 +210,30 @@ impl ManagedClient {
         self.session_commands().list_sessions(workspace).await
     }
 
+    pub async fn list_models(&self) -> Result<ModelCatalog> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .get(format!("{}/v1/models", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Model listing")?;
+        decode_api_response(response, "Model listing").await
+    }
+
+    pub async fn refresh_models(&self) -> Result<ModelCatalog> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(format!("{}/v1/models/refresh", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Model catalog refresh")?;
+        decode_api_response(response, "Model catalog refresh").await
+    }
+
     pub async fn attach_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
         self.session_commands().attach_session(session_id).await
     }
@@ -299,7 +323,7 @@ impl SessionCommandClient {
             .send()
             .await
             .with_context(|| format!("send {operation} command"))?;
-        decode_session_response(response, operation).await
+        decode_api_response(response, operation).await
     }
 
     async fn post_session_command_without_body<ResponseBody>(
@@ -318,7 +342,7 @@ impl SessionCommandClient {
             .send()
             .await
             .with_context(|| format!("send {operation} command"))?;
-        decode_session_response(response, operation).await
+        decode_api_response(response, operation).await
     }
 
     pub(crate) async fn subscribe_session(
@@ -338,7 +362,7 @@ impl SessionCommandClient {
             .send()
             .await
             .context("send Session read")?;
-        decode_session_response(response, "Session read").await
+        decode_api_response(response, "Session read").await
     }
 
     pub(crate) async fn list_sessions(
@@ -355,7 +379,7 @@ impl SessionCommandClient {
             None => request,
         };
         let response = request.send().await.context("send Session listing")?;
-        decode_session_response(response, "Session listing").await
+        decode_api_response(response, "Session listing").await
     }
 
     pub(crate) async fn attach_session(
@@ -366,7 +390,7 @@ impl SessionCommandClient {
     }
 }
 
-async fn decode_session_response<T>(response: reqwest::Response, operation: &str) -> Result<T>
+async fn decode_api_response<T>(response: reqwest::Response, operation: &str) -> Result<T>
 where
     T: serde::de::DeserializeOwned,
 {

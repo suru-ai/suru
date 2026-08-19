@@ -26,6 +26,10 @@ use super::{
     ProviderSessionRequest, ProviderTurnInput, wait_for_shutdown,
 };
 use crate::protocol::{AgentId, AgentIdentity, ModelId, ProviderId, SessionId};
+use crate::protocol::{
+    ModelAvailability, ModelDescriptor, ModelOptionChoice, ModelOptionChoiceId,
+    ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
+};
 
 const CODEX_PATH_ENV: &str = "CHIDORI_CODEX_PATH";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,6 +72,51 @@ struct ClientInfo {
 #[serde(rename_all = "camelCase")]
 struct InitializeCapabilities {
     experimental_api: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelListParams<'a> {
+    cursor: Option<&'a str>,
+    limit: Option<u32>,
+    include_hidden: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeModelList {
+    data: Vec<NativeModel>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeModel {
+    id: String,
+    display_name: String,
+    description: String,
+    hidden: bool,
+    supported_reasoning_efforts: Vec<NativeReasoningEffort>,
+    default_reasoning_effort: String,
+    #[serde(default)]
+    service_tiers: Vec<NativeServiceTier>,
+    #[serde(default)]
+    default_service_tier: Option<String>,
+    is_default: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeReasoningEffort {
+    reasoning_effort: String,
+    description: String,
+}
+
+#[derive(Deserialize)]
+struct NativeServiceTier {
+    id: String,
+    name: String,
+    description: String,
 }
 
 #[derive(Serialize)]
@@ -196,6 +245,16 @@ impl Default for CodexRuntime {
 }
 
 impl ProviderRuntime for CodexRuntime {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::new("codex")
+    }
+
+    fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
+        let executable = self.executable.clone();
+        let processes = self.processes.clone();
+        Box::pin(async move { discover_codex_models(executable, processes).await })
+    }
+
     fn start_session(
         &self,
         request: ProviderSessionRequest,
@@ -213,12 +272,166 @@ impl ProviderRuntime for CodexRuntime {
     }
 }
 
+async fn discover_codex_models(
+    executable: OsString,
+    processes: ProcessRegistry,
+) -> Result<Vec<ModelDescriptor>, ProviderError> {
+    let (transport, _events, process) =
+        start_initialized_codex_transport(executable, processes).await?;
+    let mut cursor = None;
+    let mut seen_cursors = std::collections::HashSet::new();
+    let mut models = Vec::new();
+    loop {
+        let result = transport
+            .request(
+                "model/list",
+                &ModelListParams {
+                    cursor: cursor.as_deref(),
+                    limit: None,
+                    include_hidden: Some(true),
+                },
+            )
+            .await
+            .map_err(|error| codex_error_context("Codex Model discovery failed", error))?;
+        let page: NativeModelList = serde_json::from_value(result).map_err(|error| {
+            codex_error(format!(
+                "Codex returned an invalid model/list response: {error}"
+            ))
+        })?;
+        models.extend(
+            page.data
+                .into_iter()
+                .filter(|model| !model.hidden)
+                .map(normalize_model),
+        );
+        match page.next_cursor {
+            Some(next) if next.is_empty() => {
+                return Err(codex_error(
+                    "Codex returned an invalid model/list response: pagination cursor was empty",
+                ));
+            }
+            Some(next) if !seen_cursors.insert(next.clone()) => {
+                return Err(codex_error(
+                    "Codex returned an invalid model/list response: pagination cursor did not advance",
+                ));
+            }
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    transport.close().await;
+    process.wait_until_stopped().await?;
+    Ok(models)
+}
+
+fn normalize_model(model: NativeModel) -> ModelDescriptor {
+    let provider = ProviderId::new("codex");
+    let mut options = Vec::new();
+    if !model.supported_reasoning_efforts.is_empty() {
+        options.push(ModelOptionDescriptor {
+            id: ModelOptionId::new("reasoning_effort"),
+            label: "Reasoning effort".to_owned(),
+            description: None,
+            role: ModelOptionRole::ReasoningEffort,
+            kind: ModelOptionKind::Select {
+                choices: model
+                    .supported_reasoning_efforts
+                    .into_iter()
+                    .map(|effort| ModelOptionChoice {
+                        label: title_case_id(&effort.reasoning_effort),
+                        id: ModelOptionChoiceId::new(effort.reasoning_effort),
+                        description: Some(effort.description),
+                        availability: ModelAvailability::Available,
+                    })
+                    .collect(),
+                default: ModelOptionChoiceId::new(model.default_reasoning_effort),
+            },
+        });
+    }
+    if !model.service_tiers.is_empty() {
+        let mut choices = model
+            .service_tiers
+            .into_iter()
+            .map(|tier| ModelOptionChoice {
+                id: ModelOptionChoiceId::new(tier.id),
+                label: tier.name,
+                description: Some(tier.description),
+                availability: ModelAvailability::Available,
+            })
+            .collect::<Vec<_>>();
+        let default = model
+            .default_service_tier
+            .unwrap_or_else(|| "default".to_owned());
+        if !choices.iter().any(|choice| choice.id.as_str() == default) && default == "default" {
+            choices.insert(
+                0,
+                ModelOptionChoice {
+                    id: ModelOptionChoiceId::new("default"),
+                    label: "Default".to_owned(),
+                    description: None,
+                    availability: ModelAvailability::Available,
+                },
+            );
+        }
+        options.push(ModelOptionDescriptor {
+            id: ModelOptionId::new("service_tier"),
+            label: "Speed".to_owned(),
+            description: None,
+            role: ModelOptionRole::Speed,
+            kind: ModelOptionKind::Select {
+                choices,
+                default: ModelOptionChoiceId::new(default),
+            },
+        });
+    }
+    ModelDescriptor {
+        provider,
+        id: ModelId::new(model.id),
+        display_name: model.display_name,
+        description: model.description,
+        is_default: model.is_default,
+        availability: ModelAvailability::Available,
+        options,
+    }
+}
+
+fn title_case_id(value: &str) -> String {
+    let mut characters = value.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
 async fn start_codex_session(
     executable: OsString,
     request: ProviderSessionRequest,
     processes: ProcessRegistry,
     thread_ids_by_session: Arc<StdMutex<HashMap<SessionId, CodexThreadId>>>,
 ) -> Result<ProviderSessionConnection, ProviderError> {
+    let (transport, events_rx, process) =
+        start_initialized_codex_transport(executable, processes).await?;
+    start_codex_thread(
+        transport,
+        events_rx,
+        process,
+        request,
+        thread_ids_by_session,
+    )
+    .await
+}
+
+async fn start_initialized_codex_transport(
+    executable: OsString,
+    processes: ProcessRegistry,
+) -> Result<
+    (
+        JsonRpcTransport,
+        mpsc::UnboundedReceiver<Result<NativeNotification, ProviderError>>,
+        Arc<ProcessGuard>,
+    ),
+    ProviderError,
+> {
     let mut command = Command::new(&executable);
     command
         .arg("app-server")
@@ -318,6 +531,16 @@ async fn start_codex_session(
         .await
         .map_err(|error| codex_error_context("Codex initialization failed", error))?;
 
+    Ok((transport, events_rx, process))
+}
+
+async fn start_codex_thread(
+    transport: JsonRpcTransport,
+    events_rx: mpsc::UnboundedReceiver<Result<NativeNotification, ProviderError>>,
+    process: Arc<ProcessGuard>,
+    request: ProviderSessionRequest,
+    thread_ids_by_session: Arc<StdMutex<HashMap<SessionId, CodexThreadId>>>,
+) -> Result<ProviderSessionConnection, ProviderError> {
     let cwd = request
         .workspace
         .to_str()

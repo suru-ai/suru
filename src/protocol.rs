@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SESSION_SNAPSHOT_EVENT: &str = "session_snapshot";
 pub const SESSION_UPDATED_EVENT: &str = "session_updated";
@@ -75,6 +75,98 @@ macro_rules! named_identity {
 named_identity!(AgentId);
 named_identity!(ProviderId);
 named_identity!(ModelId);
+named_identity!(ModelOptionId);
+named_identity!(ModelOptionChoiceId);
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAvailability {
+    Available,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelOptionRole {
+    ReasoningEffort,
+    Speed,
+    Context,
+    Verbosity,
+    Other,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelOptionChoice {
+    pub id: ModelOptionChoiceId,
+    pub label: String,
+    pub description: Option<String>,
+    pub availability: ModelAvailability,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelOptionKind {
+    Select {
+        choices: Vec<ModelOptionChoice>,
+        default: ModelOptionChoiceId,
+    },
+    Toggle {
+        default: bool,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelOptionDescriptor {
+    pub id: ModelOptionId,
+    pub label: String,
+    pub description: Option<String>,
+    pub role: ModelOptionRole,
+    pub kind: ModelOptionKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelDescriptor {
+    pub provider: ProviderId,
+    pub id: ModelId,
+    pub display_name: String,
+    pub description: String,
+    pub is_default: bool,
+    pub availability: ModelAvailability,
+    pub options: Vec<ModelOptionDescriptor>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelOptionValue {
+    Select { choice: ModelOptionChoiceId },
+    Toggle { enabled: bool },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderCatalogStatus {
+    Fresh,
+    Refreshing,
+    Stale { message: String },
+    Failed { message: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModelCatalog {
+    pub provider: ProviderId,
+    pub models: Vec<ModelDescriptor>,
+    pub status: ProviderCatalogStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCatalog {
+    pub providers: Vec<ProviderModelCatalog>,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]

@@ -5,7 +5,9 @@ use std::{error::Error, fmt, future::Future, path::PathBuf, pin::Pin, sync::Arc}
 use futures_util::Stream;
 use tokio::sync::watch;
 
-use crate::protocol::{AgentIdentity, SessionId};
+use crate::protocol::{
+    AgentIdentity, ModelDescriptor, ModelOptionKind, ModelOptionRole, ProviderId, SessionId,
+};
 
 mod codex;
 mod orchestration;
@@ -105,6 +107,10 @@ pub enum ProviderEvent {
 }
 
 pub trait ProviderRuntime: Send + Sync + 'static {
+    fn provider_id(&self) -> ProviderId;
+
+    fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>>;
+
     fn start_session(
         &self,
         request: ProviderSessionRequest,
@@ -112,6 +118,53 @@ pub trait ProviderRuntime: Send + Sync + 'static {
 
     /// Stops in-progress Session startups and releases runtime-owned resources.
     fn shutdown(&self) -> ProviderFuture<'_, ()>;
+}
+
+pub(crate) fn validate_models(models: &[ModelDescriptor]) -> Result<(), ProviderError> {
+    let mut model_ids = std::collections::HashSet::new();
+    for model in models {
+        if model.id.as_str().is_empty() || !model_ids.insert((&model.provider, &model.id)) {
+            return Err(ProviderError::new(format!(
+                "Model catalog contains an empty or duplicate Model ID `{}`",
+                model.id
+            )));
+        }
+        let mut roles = std::collections::HashSet::new();
+        let mut option_ids = std::collections::HashSet::new();
+        for option in &model.options {
+            if option.id.as_str().is_empty() || !option_ids.insert(&option.id) {
+                return Err(ProviderError::new(format!(
+                    "Model `{}` contains an empty or duplicate option ID `{}`",
+                    model.id, option.id
+                )));
+            }
+            if option.role != ModelOptionRole::Other && !roles.insert(option.role) {
+                return Err(ProviderError::new(format!(
+                    "Model `{}` has duplicate {:?} options",
+                    model.id, option.role
+                )));
+            }
+            if let ModelOptionKind::Select { choices, default } = &option.kind {
+                let mut choice_ids = std::collections::HashSet::new();
+                if choices
+                    .iter()
+                    .any(|choice| choice.id.as_str().is_empty() || !choice_ids.insert(&choice.id))
+                {
+                    return Err(ProviderError::new(format!(
+                        "Model `{}` option `{}` contains an empty or duplicate choice ID",
+                        model.id, option.id
+                    )));
+                }
+                if !choices.iter().any(|choice| choice.id == *default) {
+                    return Err(ProviderError::new(format!(
+                        "Model `{}` option `{}` has a default that is not one of its choices",
+                        model.id, option.id
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub trait ProviderSession: Send + Sync + 'static {
