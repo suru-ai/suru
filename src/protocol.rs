@@ -141,23 +141,31 @@ pub struct ModelDescriptor {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentSelectionMaterializationError {
-    IncompleteOptions { option: ModelOptionId },
+    MissingOption { option: ModelOptionId },
+    DuplicateOption { option: ModelOptionId },
+    UnknownOption { option: ModelOptionId },
     InvalidOptionValue { option: ModelOptionId },
 }
 
 impl fmt::Display for AgentSelectionMaterializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IncompleteOptions { option } => {
+            Self::MissingOption { option } => {
+                write!(formatter, "Model Option `{option}` is missing")
+            }
+            Self::DuplicateOption { option } => {
                 write!(
                     formatter,
-                    "Model Option `{option}` is missing or duplicated"
+                    "Model Option `{option}` is selected more than once"
                 )
+            }
+            Self::UnknownOption { option } => {
+                write!(formatter, "Model Option `{option}` is unknown")
             }
             Self::InvalidOptionValue { option } => {
                 write!(
                     formatter,
-                    "Model Option `{option}` has an unavailable value"
+                    "Model Option `{option}` has no such available value"
                 )
             }
         }
@@ -197,12 +205,12 @@ impl ModelDescriptor {
                     .iter()
                     .filter(|selection| selection.id == descriptor.id);
                 let selection = matching.next().ok_or_else(|| {
-                    AgentSelectionMaterializationError::IncompleteOptions {
+                    AgentSelectionMaterializationError::MissingOption {
                         option: descriptor.id.clone(),
                     }
                 })?;
                 if matching.next().is_some() {
-                    return Err(AgentSelectionMaterializationError::IncompleteOptions {
+                    return Err(AgentSelectionMaterializationError::DuplicateOption {
                         option: descriptor.id.clone(),
                     });
                 }
@@ -214,20 +222,15 @@ impl ModelDescriptor {
                 Ok(selection.clone())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if current.options.len() != self.options.len() {
-            let option = current
+        if let Some(selection) = current.options.iter().find(|selection| {
+            !self
                 .options
                 .iter()
-                .find(|selection| {
-                    !self
-                        .options
-                        .iter()
-                        .any(|descriptor| descriptor.id == selection.id)
-                })
-                .map(|selection| selection.id.clone())
-                .or_else(|| self.options.first().map(|descriptor| descriptor.id.clone()))
-                .expect("different option counts expose an extra or expected option");
-            return Err(AgentSelectionMaterializationError::IncompleteOptions { option });
+                .any(|descriptor| descriptor.id == selection.id)
+        }) {
+            return Err(AgentSelectionMaterializationError::UnknownOption {
+                option: selection.id.clone(),
+            });
         }
         Ok(AgentSelection {
             provider: self.provider.clone(),

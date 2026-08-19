@@ -1281,19 +1281,7 @@ fn is_native_selection_rejection(
             let identifies_option = selection.options.iter().any(|option| {
                 let option_id = option.id.as_str().to_ascii_lowercase();
                 let option_label = option_id.replace('_', " ");
-                let choice = match &option.value {
-                    ModelOptionValue::Select { choice } => choice.as_str(),
-                    ModelOptionValue::Toggle { enabled } => {
-                        if *enabled {
-                            "true"
-                        } else {
-                            "false"
-                        }
-                    }
-                };
-                message.contains(&option_id)
-                    || message.contains(&option_label)
-                    || message.contains(&choice.to_ascii_lowercase())
+                message.contains(&option_id) || message.contains(&option_label)
             });
             rejected && (identifies_model || identifies_option)
         }
@@ -2659,7 +2647,14 @@ fn finish_transport(state: &TransportState, error: ProviderError, publish_error:
 mod tests {
     use std::{ffi::OsString, sync::Mutex};
 
-    use super::{CODEX_PATH_ENV, CodexRuntime};
+    use crate::protocol::{
+        AgentSelection, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
+        ModelOptionValue, ProviderId,
+    };
+
+    use super::{
+        CODEX_PATH_ENV, CodexRuntime, NativeTurnFailureKind, is_native_selection_rejection,
+    };
 
     static ENVIRONMENT: Mutex<()> = Mutex::new(());
 
@@ -2697,5 +2692,25 @@ mod tests {
                 std::env::remove_var(CODEX_PATH_ENV);
             }
         }
+    }
+
+    #[test]
+    fn generic_failures_do_not_treat_incidental_choice_text_as_selection_rejection() {
+        let selection = AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("gpt-fixture"),
+            options: vec![ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("low"),
+                },
+            }],
+        };
+
+        assert!(!is_native_selection_rejection(
+            "Access denied because credits are low",
+            &NativeTurnFailureKind::Other,
+            &selection,
+        ));
     }
 }
