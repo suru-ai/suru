@@ -4354,14 +4354,7 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
         .await
         .expect("discover Sessions through managed client");
     assert_eq!(summaries.len(), 1);
-    assert_eq!(
-        summaries[0]
-            .readable()
-            .expect("new Session is readable")
-            .session
-            .id,
-        created.session.id
-    );
+    assert_eq!(summaries[0].id(), created.session.id);
 
     let mut attachment = client
         .attach_session(created.session.id)
@@ -4628,14 +4621,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
         .list_sessions(None)
         .await
         .expect("list Sessions before update");
-    assert_eq!(
-        before_update[0]
-            .readable()
-            .expect("new Session is readable")
-            .session
-            .id,
-        isolated.session.id
-    );
+    assert_eq!(before_update[0].id(), isolated.session.id);
     let prompt_id = PromptId::new();
     let turn_id = TurnId::new();
     let update = session_events

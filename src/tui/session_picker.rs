@@ -160,6 +160,10 @@ impl SessionPicker {
 
     pub(super) fn begin_attachment(&mut self) -> Option<SessionId> {
         let selected = self.selected?;
+        self.sessions
+            .iter()
+            .find(|summary| summary.id() == selected)?
+            .readable()?;
         self.attaching = Some(selected);
         self.error = None;
         Some(selected)
@@ -181,7 +185,7 @@ impl SessionPicker {
                 let readable = summary.readable();
                 SessionPickerRow {
                     title: summary.title(),
-                    selected: readable.is_some() && self.selected == Some(summary.id()),
+                    selected: self.selected == Some(summary.id()),
                     current: readable.is_some() && current == Some(summary.id()),
                     active: readable
                         .is_some_and(|summary| summary.session.status == SessionStatus::Active),
@@ -232,7 +236,7 @@ impl SessionPicker {
         self.sessions
             .iter()
             .filter(|summary| fuzzy_title_matches(&self.query, summary.title()))
-            .filter_map(|summary| summary.readable().map(|summary| summary.session.id))
+            .map(SessionListItem::id)
             .collect()
     }
 

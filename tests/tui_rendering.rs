@@ -12,7 +12,8 @@ use chidori::{
         PromptOrder, PromptStatus, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
         ServerIdentity, ServerShutdown, Session, SessionChange, SessionId, SessionListItem,
         SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-        SessionUpdate, ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        SessionUpdate, ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus,
+        UnreadableSessionSummary, Workspace,
     },
     server::{AgentOutput, ServerConfig},
     tui::{
@@ -3554,6 +3555,56 @@ fn session_picker_scroll_window_keeps_the_current_session_visible() {
             )))
             .expect("select wrapped newest Session"),
         ApplicationTransition::AttachSession(newest_id)
+    );
+}
+
+#[test]
+fn unreadable_session_picker_rows_remain_navigable_without_attachment() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let mut sessions = vec![session_summary(
+        SessionId::new(),
+        workspace.path(),
+        "Readable Session",
+        SessionStatus::Idle,
+        100,
+    )];
+    sessions.extend((1..=12).map(|index| {
+        SessionListItem::Unreadable(UnreadableSessionSummary {
+            id: SessionId::new(),
+            title: format!("Unreadable Session {index}"),
+            created_at: SessionTimestamp(1),
+            updated_at: SessionTimestamp(100 - index),
+            workspace: Some(Workspace {
+                path: workspace.path().to_owned(),
+            }),
+        })
+    }));
+    open_session_picker_with(&mut application, sessions);
+
+    for _ in 0..12 {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            )))
+            .expect("navigate through unreadable Sessions");
+    }
+    let picker = rendered_application_rows_at(&application, 80, 10).join("\n");
+    let oldest = picker
+        .lines()
+        .find(|row| row.contains("Unreadable Session 12"))
+        .expect("selected unreadable Session is scrolled into view");
+    assert!(oldest.contains("[unreadable]"));
+    assert!(oldest.contains('›'));
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("unreadable Session has no attachment action"),
+        ApplicationTransition::Continue
     );
 }
 
