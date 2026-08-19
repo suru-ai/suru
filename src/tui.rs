@@ -1,5 +1,6 @@
 //! Ratatui view state and terminal lifecycle.
 
+mod commands;
 mod markdown;
 mod slots;
 
@@ -50,6 +51,8 @@ use crate::{
 
 mod composer;
 
+pub use commands::SemanticCommandId;
+use commands::{CommandAutocomplete, command_for_leader_key, descriptor};
 use composer::{ComposerKey, ComposerMemory};
 use slots::{
     HomeFooterSlotContext, PromptContextSlotContext, PromptFooterSlotContext,
@@ -160,6 +163,7 @@ pub struct TuiState {
     failed_submissions: HashMap<PromptId, FailedSubmission>,
     pending_steers: Vec<PendingSteer>,
     command_mode: CommandMode,
+    command_autocomplete: CommandAutocomplete,
 }
 
 #[derive(Clone, Debug)]
@@ -226,7 +230,14 @@ impl TuiState {
             failed_submissions: HashMap::new(),
             pending_steers: Vec::new(),
             command_mode: CommandMode::Composer,
+            command_autocomplete: CommandAutocomplete::default(),
         }
+    }
+
+    fn sync_command_autocomplete(&mut self) {
+        let key = self.composer_key();
+        self.command_autocomplete
+            .sync(self.composers.text(key), self.composers.cursor(key));
     }
 
     pub fn apply(&mut self, event: ManagedEvent) {
@@ -256,6 +267,7 @@ impl TuiState {
                     self.session_events_blocked = true;
                     self.submission_error =
                         Some("Session ended because the shared server was replaced".to_owned());
+                    self.sync_command_autocomplete();
                 }
                 self.identity = Some(health.identity);
                 self.recovery = None;
@@ -322,6 +334,7 @@ impl TuiState {
             .or_default();
         self.submission_error = None;
         self.session = Some(SessionProjection::new(snapshot));
+        self.sync_command_autocomplete();
     }
 
     fn composer_key(&self) -> ComposerKey {
@@ -359,6 +372,29 @@ impl TuiState {
         }
         self.composers
             .admission_reconciled(pending.source, destination, &pending.prompt);
+        self.submission_error = None;
+    }
+
+    fn acknowledge_pending_submission(&mut self, prompt_id: PromptId) {
+        let detached = self.pending_submission.as_ref().is_some_and(|pending| {
+            pending.prompt.id == prompt_id
+                && matches!(
+                    pending.target,
+                    SubmissionTarget::AdmitPrompt(session_id, _)
+                        if self.session.as_ref().map(SessionProjection::session_id)
+                            != Some(session_id)
+                )
+        });
+        if !detached {
+            self.reconcile_pending_submission();
+            return;
+        }
+        let pending = self
+            .pending_submission
+            .take()
+            .expect("detached pending submission was just observed");
+        self.composers
+            .admission_reconciled(pending.source, pending.source, &pending.prompt);
         self.submission_error = None;
     }
 
@@ -657,7 +693,13 @@ pub enum CommandId {
     RequestInterrupt,
     ConfirmInterrupt,
     CloseCommandMode,
+    SelectPreviousAutocomplete,
+    SelectNextAutocomplete,
+    DismissAutocomplete,
+    SelectAutocomplete,
+    InvokeSemantic(SemanticCommandId),
     InsertText(String),
+    PasteText(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -665,6 +707,7 @@ pub enum ApplicationTransition {
     Continue,
     Exit,
     SessionEnded,
+    DetachSession,
     CreateSession(CreateSessionRequest),
     AdmitPrompt {
         session_id: SessionId,
@@ -705,52 +748,69 @@ impl Application {
                 }
                 self.state.composers.clear(key);
                 self.state.submission_error = None;
+                self.state.sync_command_autocomplete();
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::InsertText(text)) => {
                 let key = self.state.composer_key();
                 self.state.composers.insert(key, &text);
                 self.state.submission_error = None;
+                self.state.sync_command_autocomplete();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::PasteText(text)) => {
+                let key = self.state.composer_key();
+                self.state.composers.insert(key, &text);
+                self.state.submission_error = None;
+                let text = self.state.composers.text(key);
+                self.state.command_autocomplete.suppress(text);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::InsertNewline) => {
                 let key = self.state.composer_key();
                 self.state.composers.insert(key, "\n");
                 self.state.submission_error = None;
+                self.state.sync_command_autocomplete();
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::DeleteBackward) => {
                 let key = self.state.composer_key();
                 self.state.composers.delete_backward(key);
                 self.state.submission_error = None;
+                self.state.sync_command_autocomplete();
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::DeleteForward) => {
                 let key = self.state.composer_key();
                 self.state.composers.delete_forward(key);
                 self.state.submission_error = None;
+                self.state.sync_command_autocomplete();
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::MoveCursorLeft) => {
                 let key = self.state.composer_key();
                 self.state.composers.move_left(key);
+                self.state.sync_command_autocomplete();
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::MoveCursorRight) => {
                 let key = self.state.composer_key();
                 self.state.composers.move_right(key);
+                self.state.sync_command_autocomplete();
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::HistoryPrevious) => {
                 let key = self.state.composer_key();
                 self.state.composers.history_previous(key);
                 self.state.submission_error = None;
+                self.state.sync_command_autocomplete();
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::HistoryNext) => {
                 let key = self.state.composer_key();
                 self.state.composers.history_next(key);
                 self.state.submission_error = None;
+                self.state.sync_command_autocomplete();
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::ScrollTranscriptPageUp) => {
@@ -765,6 +825,32 @@ impl Application {
             ApplicationEvent::Command(CommandId::FollowLatest) => {
                 self.state.follow_latest();
                 Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::SelectPreviousAutocomplete) => {
+                self.state.command_autocomplete.select_previous();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::SelectNextAutocomplete) => {
+                self.state.command_autocomplete.select_next();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::DismissAutocomplete) => {
+                let key = self.state.composer_key();
+                let text = self.state.composers.text(key);
+                self.state.command_autocomplete.dismiss(text);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::SelectAutocomplete) => {
+                let Some(command) = self.state.command_autocomplete.selected() else {
+                    return Ok(ApplicationTransition::Continue);
+                };
+                let key = self.state.composer_key();
+                self.state.composers.clear(key);
+                self.state.sync_command_autocomplete();
+                self.invoke_semantic(command)
+            }
+            ApplicationEvent::Command(CommandId::InvokeSemantic(command)) => {
+                self.invoke_semantic(command)
             }
             ApplicationEvent::Command(
                 command @ (CommandId::SubmitSteer | CommandId::SubmitQueue),
@@ -784,6 +870,7 @@ impl Application {
                     return Ok(ApplicationTransition::Continue);
                 }
                 let prompt = self.state.composers.begin_submission(key);
+                self.state.sync_command_autocomplete();
                 self.state.failed_submissions.remove(&prompt.id);
                 self.state.submission_error = None;
                 if let ComposerKey::Session(session_id) = key {
@@ -921,8 +1008,8 @@ impl Application {
                 .map_or(ApplicationTransition::Continue, |session_id| {
                     ApplicationTransition::SubscribeSession(session_id)
                 })),
-            ApplicationEvent::PromptAdmissionSucceeded(_prompt_id) => {
-                self.state.reconcile_pending_submission();
+            ApplicationEvent::PromptAdmissionSucceeded(prompt_id) => {
+                self.state.acknowledge_pending_submission(prompt_id);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::PromptAdmissionFailed { prompt_id, error } => {
@@ -944,11 +1031,36 @@ impl Application {
         }
     }
 
+    fn invoke_semantic(&mut self, command: SemanticCommandId) -> Result<ApplicationTransition> {
+        match command {
+            SemanticCommandId::SessionNew => {
+                let source = self.state.composer_key();
+                self.state.composers.clear(source);
+                self.state.composers.clear(ComposerKey::Landing);
+                self.state.submission_error = None;
+                self.state.command_mode = CommandMode::Composer;
+                let detached = self.state.session.take().is_some();
+                self.state.session_events_blocked = detached;
+                self.state.sync_command_autocomplete();
+                Ok(if detached {
+                    ApplicationTransition::DetachSession
+                } else {
+                    ApplicationTransition::Continue
+                })
+            }
+        }
+    }
+
     pub fn render(&self, frame: &mut Frame<'_>) {
         render_with_slots(frame, &self.state, &self.slots);
     }
 
     pub fn handle_terminal_event(&mut self, event: InputEvent) -> Result<ApplicationTransition> {
+        if self.state.command_autocomplete.is_visible()
+            && let Some(command) = command_for_autocomplete_event(event.clone())
+        {
+            return self.handle_event(ApplicationEvent::Command(command));
+        }
         let command = match self.state.command_mode {
             CommandMode::Composer => command_for_terminal_event(event),
             CommandMode::Leader => command_for_leader_event(event),
@@ -990,7 +1102,27 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
                 _ => None,
             }
         }
-        InputEvent::Paste(text) => Some(CommandId::InsertText(text)),
+        InputEvent::Paste(text) => Some(CommandId::PasteText(text)),
+        _ => None,
+    }
+}
+
+fn command_for_autocomplete_event(event: InputEvent) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            Some(CommandId::SelectPreviousAutocomplete)
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            Some(CommandId::SelectNextAutocomplete)
+        }
+        (KeyCode::Enter | KeyCode::Tab, KeyModifiers::NONE) => Some(CommandId::SelectAutocomplete),
+        (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::DismissAutocomplete),
         _ => None,
     }
 }
@@ -1162,6 +1294,11 @@ fn binding_for(key: KeyEvent) -> Option<&'static CommandBinding> {
 }
 
 fn binding_label(command: &CommandId) -> &'static str {
+    if let CommandId::InvokeSemantic(command) = command {
+        return descriptor(*command)
+            .keybinding
+            .map_or("", |binding| binding.label);
+    }
     COMMAND_BINDINGS
         .iter()
         .chain(LEADER_BINDINGS)
@@ -1172,7 +1309,15 @@ fn binding_label(command: &CommandId) -> &'static str {
 }
 
 fn command_for_leader_event(event: InputEvent) -> Option<CommandId> {
-    command_from_scoped_bindings(event, LEADER_BINDINGS).or(Some(CommandId::CloseCommandMode))
+    let semantic = match &event {
+        InputEvent::Key(key) if key.kind == KeyEventKind::Press => {
+            command_for_leader_key(*key).map(CommandId::InvokeSemantic)
+        }
+        _ => None,
+    };
+    semantic
+        .or_else(|| command_from_scoped_bindings(event, LEADER_BINDINGS))
+        .or(Some(CommandId::CloseCommandMode))
 }
 
 fn command_for_queued_prompt_event(event: InputEvent) -> Option<CommandId> {
@@ -1210,16 +1355,90 @@ fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlot
         render_terminal_too_small(frame, &theme);
         return;
     }
-    let composer_cursor = if state.session.is_some() {
+    let composer = if state.session.is_some() {
         render_session(frame, state, slots, &theme)
     } else {
         render_landing(frame, state, slots, &theme)
     };
+    if state.command_autocomplete.is_visible() && !state.reconnect_overlay_visible {
+        render_command_autocomplete(frame, state, composer.area, &theme);
+    }
     if state.reconnect_overlay_visible {
         render_reconnect_overlay(frame, &theme);
     } else if state.composer_focused && matches!(state.command_mode, CommandMode::Composer) {
-        frame.set_cursor_position(composer_cursor);
+        frame.set_cursor_position(composer.cursor);
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RenderedComposer {
+    area: Rect,
+    cursor: Position,
+}
+
+fn render_command_autocomplete(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    composer_area: Rect,
+    theme: &Theme,
+) {
+    let available_width = frame
+        .area()
+        .width
+        .saturating_sub(horizontal_padding(frame.area().width).saturating_mul(2));
+    let width = available_width.clamp(1, 72);
+    let room_above = composer_area.y.saturating_sub(frame.area().y);
+    let bordered = room_above >= 3;
+    let row_count = state.command_autocomplete.rows().len() as u16;
+    let height = if bordered {
+        row_count.saturating_add(2).min(room_above)
+    } else {
+        row_count.min(room_above.max(1))
+    };
+    let x = frame
+        .area()
+        .x
+        .saturating_add(frame.area().width.saturating_sub(width) / 2);
+    let y = composer_area.y.saturating_sub(height).max(frame.area().y);
+    let area = Rect::new(x, y, width, height);
+    let content_width = width.saturating_sub(if bordered { 2 } else { 0 });
+    let rows = state
+        .command_autocomplete
+        .rows()
+        .map(|(selected, command)| {
+            let slash = command
+                .slash
+                .expect("autocomplete only contains commands with slash metadata");
+            let content = truncate_to_width(
+                &format!(
+                    "/{}  {} · {}",
+                    slash.name, command.title, command.description
+                ),
+                usize::from(content_width),
+            );
+            Line::styled(
+                content,
+                if selected {
+                    theme.selection.focused
+                } else {
+                    theme.text.primary
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let paragraph = if bordered {
+        Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Commands ")
+                .border_style(theme.border.default)
+                .style(theme.surface.overlay),
+        )
+    } else {
+        Paragraph::new(rows).style(theme.surface.overlay)
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
 }
 
 fn render_landing(
@@ -1227,7 +1446,7 @@ fn render_landing(
     state: &TuiState,
     slots: &RenderSlots,
     theme: &Theme,
-) -> Position {
+) -> RenderedComposer {
     let detail = ResponsiveDetail::for_width(frame.area().width);
     let show_brand = frame.area().height >= LANDING_BRAND_MINIMUM_HEIGHT;
     let footer_detail = detail.secondary_only_when(show_brand);
@@ -1301,9 +1520,10 @@ fn render_landing(
         );
         row = row.saturating_add(1);
     }
-    let cursor_position = render_composer(
+    let composer_area = Rect::new(panel.x, row, panel.width, composer_height);
+    let cursor = render_composer(
         frame,
-        Rect::new(panel.x, row, panel.width, composer_height),
+        composer_area,
         composer_text,
         composer_cursor,
         state.composer_border_style(theme),
@@ -1317,7 +1537,10 @@ fn render_landing(
         footer,
         theme,
     );
-    cursor_position
+    RenderedComposer {
+        area: composer_area,
+        cursor,
+    }
 }
 
 fn render_session(
@@ -1325,7 +1548,7 @@ fn render_session(
     state: &TuiState,
     slots: &RenderSlots,
     theme: &Theme,
-) -> Position {
+) -> RenderedComposer {
     let snapshot = state
         .session
         .as_ref()
@@ -1573,7 +1796,7 @@ fn render_session(
         );
     }
     render_slot(frame, composer_top_area, composer_top, theme);
-    let cursor_position = render_composer(
+    let cursor = render_composer(
         frame,
         composer_area,
         composer_text,
@@ -1583,7 +1806,10 @@ fn render_session(
         theme,
     );
     render_slot(frame, footer_area, footer, theme);
-    cursor_position
+    RenderedComposer {
+        area: composer_area,
+        cursor,
+    }
 }
 
 fn render_session_header(
@@ -2233,6 +2459,7 @@ async fn run_loop(
                                 return Ok(());
                             }
                             ApplicationTransition::CreateSession(_)
+                            | ApplicationTransition::DetachSession
                             | ApplicationTransition::AdmitPrompt { .. }
                             | ApplicationTransition::PromotePrompt { .. }
                             | ApplicationTransition::CancelPrompt { .. }
@@ -2331,6 +2558,12 @@ async fn run_loop(
                                 ApplicationTransition::Continue => {}
                                 ApplicationTransition::SessionEnded => {
                                     session_subscription = None;
+                                }
+                                ApplicationTransition::DetachSession => {
+                                    session_subscription = None;
+                                    if let Some((_, task)) = session_subscription_task.take() {
+                                        task.abort();
+                                    }
                                 }
                                 ApplicationTransition::Exit => return Ok(()),
                                 ApplicationTransition::CreateSession(request) => {

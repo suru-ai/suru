@@ -211,6 +211,391 @@ fn headless_application_handles_terminal_and_managed_events_through_the_producti
     assert_eq!(terminal_transition, ApplicationTransition::Exit);
 }
 
+#[test]
+fn slash_autocomplete_invokes_new_session_from_a_description_match() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (_, _, _) = enter_active_session(&mut application, workspace.path());
+
+    for character in "/fresh".chars() {
+        assert_eq!(
+            application
+                .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )))
+                .expect("type slash command query"),
+            ApplicationTransition::Continue
+        );
+    }
+
+    let autocomplete = rendered_application_rows(&application).join("\n");
+    assert!(autocomplete.contains("/new"));
+    assert!(autocomplete.contains("fresh landing composer"));
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("select canonical slash command"),
+        ApplicationTransition::DetachSession
+    );
+    let landing = rendered_application_rows(&application).join("\n");
+    assert!(landing.contains("What would you like to work on?"));
+    assert!(landing.contains("Type a Prompt and press Enter"));
+    assert!(!landing.contains("Long-running work"));
+    assert!(!landing.contains("/new"));
+}
+
+#[test]
+fn slash_autocomplete_keeps_the_landing_composer_visible_at_minimum_size() {
+    let mut application = Application::default();
+    for character in "/n".chars() {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )))
+            .expect("type slash query at minimum size");
+    }
+
+    let buffer = rendered_application_buffer(&application, 28, 5);
+    assert!(buffer_rows(&buffer).join("\n").contains("/new"));
+    let cursor = rendered_application_cursor_at(&application, 28, 5);
+    assert_eq!(
+        buffer
+            .cell(Position::new(cursor.x.saturating_sub(1), cursor.y))
+            .expect("cell before the composer cursor is visible")
+            .symbol(),
+        "n"
+    );
+}
+
+#[test]
+fn new_session_keybinding_defers_creation_until_the_next_prompt() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (_, old_snapshot, _) = enter_active_session(&mut application, workspace.path());
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "discard this draft".to_owned(),
+        )))
+        .expect("type a Session draft");
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL,
+            )))
+            .expect("begin semantic leader keybinding"),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('n'),
+                KeyModifiers::NONE,
+            )))
+            .expect("invoke new Session"),
+        ApplicationTransition::DetachSession
+    );
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+            old_snapshot.clone(),
+        )))
+        .expect("ignore a queued event from the detached Session");
+    let landing = rendered_application_rows(&application).join("\n");
+    assert!(landing.contains("What would you like to work on?"));
+    assert!(landing.contains("Type a Prompt and press Enter"));
+    assert!(!landing.contains("discard this draft"));
+    assert!(!landing.contains("Long-running work"));
+
+    application
+        .handle_event(ApplicationEvent::SessionAttached(old_snapshot))
+        .expect("reattach the independently addressable active Session");
+    let reattached = rendered_application_rows(&application).join("\n");
+    assert!(reattached.contains("Long-running work"));
+    assert!(reattached.contains("active"));
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                chidori::tui::SemanticCommandId::SessionNew,
+            )))
+            .expect("return to landing through the same semantic command"),
+        ApplicationTransition::DetachSession
+    );
+
+    for character in "Next Prompt".chars() {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )))
+            .expect("type the next landing Prompt");
+    }
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("submit the next landing Prompt")
+    else {
+        panic!("the first Prompt after /new should create a Session");
+    };
+    assert_eq!(request.prompt.text, "Next Prompt");
+    assert_eq!(request.workspace.path, workspace.path());
+}
+
+#[test]
+fn new_session_releases_a_detached_prompt_after_its_admission_succeeds() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (_, _, _) = enter_active_session(&mut application, workspace.path());
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Continue in the old Session".to_owned(),
+        )))
+        .expect("type an in-flight Prompt");
+    let ApplicationTransition::AdmitPrompt { request, .. } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("begin Prompt admission")
+    else {
+        panic!("the old Session Prompt should be admitted");
+    };
+    let admitted_prompt_id = request.prompt.id;
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                chidori::tui::SemanticCommandId::SessionNew,
+            )))
+            .expect("detach while admission remains in flight"),
+        ApplicationTransition::DetachSession
+    );
+    application
+        .handle_event(ApplicationEvent::PromptAdmissionSucceeded(
+            admitted_prompt_id,
+        ))
+        .expect("acknowledge the detached Prompt admission");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Start separate work".to_owned(),
+        )))
+        .expect("type the next landing Prompt");
+
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit after detached admission settles")
+    else {
+        panic!("a settled detached admission must not block landing submission");
+    };
+    assert_eq!(request.prompt.text, "Start separate work");
+}
+
+#[test]
+fn dismissed_alias_is_submitted_literally_before_turn_interruption() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (_, _, _) = enter_active_session(&mut application, workspace.path());
+    for character in "/clear".chars() {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )))
+            .expect("type slash alias");
+    }
+    let canonical_result = rendered_application_rows(&application).join("\n");
+    assert!(canonical_result.contains("/clear"));
+    assert!(canonical_result.contains("/new"));
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .expect("dismiss autocomplete before interrupting"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("Esc again")
+    );
+
+    let ApplicationTransition::AdmitPrompt { request, .. } = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("submit dismissed alias as literal Prompt input")
+    else {
+        panic!("dismissed slash text should remain a normal Prompt");
+    };
+    assert_eq!(request.prompt.text, "/clear");
+}
+
+#[test]
+fn pasted_multiline_and_unmatched_slash_text_remain_literal_prompts() {
+    let mut pasted = Application::default();
+    pasted
+        .handle_terminal_event(InputEvent::Paste("/new".to_owned()))
+        .expect("paste slash text");
+    let ApplicationTransition::CreateSession(pasted_request) = pasted
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("submit pasted slash text")
+    else {
+        panic!("pasted slash text should create a Session Prompt");
+    };
+    assert_eq!(pasted_request.prompt.text, "/new");
+
+    let mut multiline = Application::default();
+    multiline
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "/new".to_owned(),
+        )))
+        .expect("type a slash query");
+    multiline
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+        )))
+        .expect("make slash text multiline");
+    multiline
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "literal continuation".to_owned(),
+        )))
+        .expect("type multiline continuation");
+    let ApplicationTransition::CreateSession(multiline_request) = multiline
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("submit multiline slash text")
+    else {
+        panic!("multiline slash text should create a Session Prompt");
+    };
+    assert_eq!(multiline_request.prompt.text, "/new\nliteral continuation");
+
+    let mut unmatched = Application::default();
+    unmatched
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "/zzzz".to_owned(),
+        )))
+        .expect("type unmatched slash text");
+    let ApplicationTransition::CreateSession(unmatched_request) = unmatched
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("submit unmatched slash text")
+    else {
+        panic!("unmatched slash text should create a Session Prompt");
+    };
+    assert_eq!(unmatched_request.prompt.text, "/zzzz");
+}
+
+#[test]
+fn autocomplete_navigation_and_tab_invoke_the_canonical_alias_target() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (_, _, _) = enter_active_session(&mut application, workspace.path());
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "/clear".to_owned(),
+        )))
+        .expect("type slash alias");
+
+    for (code, modifiers) in [
+        (KeyCode::Up, KeyModifiers::NONE),
+        (KeyCode::Char('n'), KeyModifiers::CONTROL),
+        (KeyCode::Char('p'), KeyModifiers::CONTROL),
+        (KeyCode::Down, KeyModifiers::NONE),
+    ] {
+        assert_eq!(
+            application
+                .handle_terminal_event(InputEvent::Key(KeyEvent::new(code, modifiers)))
+                .expect("navigate autocomplete"),
+            ApplicationTransition::Continue
+        );
+    }
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+            )))
+            .expect("select the alias result with Tab"),
+        ApplicationTransition::DetachSession
+    );
+    let landing = rendered_application_rows(&application).join("\n");
+    assert!(landing.contains("Type a Prompt and press Enter"));
+    assert!(!landing.contains("/clear"));
+}
+
+#[test]
+fn autocomplete_selection_precedes_an_open_scoped_command_mode() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (_, _, _) = enter_active_session(&mut application, workspace.path());
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "/new".to_owned(),
+        )))
+        .expect("type slash command");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("open the leader while autocomplete is visible");
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("autocomplete owns Enter before the leader"),
+        ApplicationTransition::DetachSession
+    );
+}
+
+#[test]
+fn autocomplete_tracks_the_active_composer_when_a_session_attaches() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "/".to_owned(),
+        )))
+        .expect("open autocomplete on landing");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("/new")
+    );
+
+    application
+        .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
+            SessionId::new(),
+            PromptId::new(),
+            "Existing Session Prompt",
+            workspace.path(),
+        )))
+        .expect("attach an existing Session with an empty composer");
+    let attached = rendered_application_rows(&application).join("\n");
+    assert!(attached.contains("Existing Session Prompt"));
+    assert!(!attached.contains("/new"));
+}
+
 #[tokio::test]
 async fn headless_application_creates_a_session_and_renders_its_first_turn_through_the_managed_client()
  {
