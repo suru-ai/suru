@@ -2,7 +2,7 @@
 
 use crate::protocol::{
     AgentSelection, ModelAvailability, ModelDescriptor, ModelOptionChoiceId, ModelOptionDescriptor,
-    ModelOptionId, ModelOptionKind, ModelOptionValue,
+    ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionValue,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -283,6 +283,75 @@ impl ModelOptions {
         selection.value = picker.selected.clone().into();
         self.choices = None;
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ReasoningCycle {
+    Advanced(AgentSelection),
+    Unavailable(String),
+}
+
+/// Advances the unique Reasoning Effort option to the next Provider-advertised
+/// available choice, wrapping past the end. The explicit default participates
+/// as an ordinary choice.
+pub(super) fn cycle_reasoning_effort(
+    model: &ModelDescriptor,
+    current: Option<&AgentSelection>,
+) -> ReasoningCycle {
+    let mut reasoning = model
+        .options
+        .iter()
+        .filter(|descriptor| descriptor.role == ModelOptionRole::ReasoningEffort);
+    let Some(descriptor) = reasoning.next() else {
+        return ReasoningCycle::Unavailable(format!(
+            "{} has no Reasoning Effort option",
+            model.display_name
+        ));
+    };
+    if reasoning.next().is_some() {
+        return ReasoningCycle::Unavailable(format!(
+            "{} advertises more than one Reasoning Effort option",
+            model.display_name
+        ));
+    }
+    let ModelOptionKind::Select { choices, .. } = &descriptor.kind else {
+        return ReasoningCycle::Unavailable(format!(
+            "{} has no Reasoning Effort choices",
+            model.display_name
+        ));
+    };
+    let mut selection = if current.is_some_and(|selection| {
+        selection.provider == model.provider && selection.model == model.id
+    }) {
+        selection_preserving_current_values(model, current.expect("same Model was checked"))
+    } else {
+        model.default_agent_selection()
+    };
+    let current_choice = match selected_value(&selection, &descriptor.id) {
+        Some(ModelOptionValue::Select { choice }) => Some(choice.clone()),
+        _ => None,
+    };
+    let after_current = current_choice
+        .as_ref()
+        .and_then(|current| choices.iter().position(|choice| &choice.id == current))
+        .map_or(0, |index| index + 1);
+    let next = (0..choices.len())
+        .map(|offset| &choices[(after_current + offset) % choices.len()])
+        .find(|choice| choice.availability == ModelAvailability::Available);
+    let Some(next) = next.filter(|next| Some(&next.id) != current_choice.as_ref()) else {
+        return ReasoningCycle::Unavailable(format!(
+            "{} has no alternate Reasoning Effort choice",
+            model.display_name
+        ));
+    };
+    let choice = next.id.clone();
+    let value = selection
+        .options
+        .iter_mut()
+        .find(|option| option.id == descriptor.id)
+        .expect("a complete Agent Selection covers every advertised option");
+    value.value = ModelOptionValue::Select { choice };
+    ReasoningCycle::Advanced(selection)
 }
 
 impl From<&ModelOptionValue> for ChoiceValue {

@@ -56,9 +56,11 @@ use crate::{
 mod composer;
 
 pub use commands::SemanticCommandId;
-use commands::{CommandAutocomplete, command_for_leader_key, descriptor};
+use commands::{
+    CommandAutocomplete, command_for_direct_semantic_key, command_for_leader_key, descriptor,
+};
 use composer::{ComposerKey, ComposerMemory};
-use model_options::{ModelOptionChoiceRow, ModelOptions};
+use model_options::{ModelOptionChoiceRow, ModelOptions, ReasoningCycle, cycle_reasoning_effort};
 use model_picker::{ModelPicker, ModelPickerAction, ModelPickerRow};
 use session_picker::{SessionPicker, SessionPickerRow};
 use slots::{
@@ -215,6 +217,9 @@ pub struct TuiState {
     session: Option<SessionProjection>,
     landing_agent_selection: Option<AgentSelection>,
     pending_agent_selection: Option<PendingAgentSelection>,
+    /// Newest complete Agent Selection awaiting the in-flight request; rapid
+    /// cycles coalesce here so transport stays serialized per Session.
+    queued_agent_selection: Option<(SessionId, AgentSelection)>,
     confirmed_agent_selection: Option<(SessionId, AgentSelection)>,
     session_events_blocked: bool,
     reconnect_overlay_visible: bool,
@@ -297,6 +302,7 @@ impl TuiState {
             session: None,
             landing_agent_selection: None,
             pending_agent_selection: None,
+            queued_agent_selection: None,
             confirmed_agent_selection: None,
             session_events_blocked: false,
             reconnect_overlay_visible: false,
@@ -364,6 +370,7 @@ impl TuiState {
                     }
                     self.session = None;
                     self.pending_agent_selection = None;
+                    self.queued_agent_selection = None;
                     self.confirmed_agent_selection = None;
                     self.session_events_blocked = true;
                     self.submission_error =
@@ -463,10 +470,16 @@ impl TuiState {
             return self.landing_agent_selection.as_ref();
         };
         let session_id = session.session_id();
-        self.pending_agent_selection
+        self.queued_agent_selection
             .as_ref()
-            .filter(|pending| pending.session_id == session_id)
-            .map(|pending| &pending.selection)
+            .filter(|(queued_session, _)| *queued_session == session_id)
+            .map(|(_, selection)| selection)
+            .or_else(|| {
+                self.pending_agent_selection
+                    .as_ref()
+                    .filter(|pending| pending.session_id == session_id)
+                    .map(|pending| &pending.selection)
+            })
             .or_else(|| {
                 self.confirmed_agent_selection
                     .as_ref()
@@ -477,7 +490,7 @@ impl TuiState {
     }
 
     fn selection_update_pending(&self) -> bool {
-        self.pending_agent_selection.is_some()
+        self.pending_agent_selection.is_some() || self.queued_agent_selection.is_some()
     }
 
     fn reconcile_pending_submission(&mut self) {
@@ -1361,8 +1374,15 @@ impl Application {
                         .take()
                         .expect("matching pending Agent Selection exists")
                         .session_id;
-                    self.state.confirmed_agent_selection = Some((session_id, selection));
                     self.state.submission_error = None;
+                    if let Some((queued_session, queued)) = self.state.queued_agent_selection.take()
+                        && queued_session == session_id
+                        && queued != selection
+                    {
+                        self.state.confirmed_agent_selection = Some((session_id, selection));
+                        return self.begin_agent_selection_update(queued_session, queued);
+                    }
+                    self.state.confirmed_agent_selection = Some((session_id, selection));
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -1376,8 +1396,20 @@ impl Application {
                     .as_ref()
                     .is_some_and(|pending| pending.operation_id == operation_id)
                 {
-                    self.state.pending_agent_selection = None;
-                    self.state.confirmed_agent_selection = None;
+                    let session_id = self
+                        .state
+                        .pending_agent_selection
+                        .take()
+                        .expect("matching pending Agent Selection exists")
+                        .session_id;
+                    if let Some((queued_session, queued)) = self.state.queued_agent_selection.take()
+                        && queued_session == session_id
+                    {
+                        // A newer queued selection supersedes this failure.
+                        return self.begin_agent_selection_update(queued_session, queued);
+                    }
+                    // Keep any prior confirmed acceptance: it is newer
+                    // authoritative state than the snapshot base.
                     self.state.submission_error = Some(error);
                 }
                 Ok(ApplicationTransition::Continue)
@@ -1455,6 +1487,27 @@ impl Application {
                 self.state.model_options.close();
                 Ok(ApplicationTransition::Continue)
             }
+            SemanticCommandId::ModelOptionReasoningCycle => {
+                let current = self.state.agent_selection().cloned();
+                let Some(model) = self
+                    .state
+                    .model_picker
+                    .cached_model_for_options(current.as_ref())
+                else {
+                    self.state.submission_error = Some(
+                        "No concrete Model is loaded yet; use /models to choose one".to_owned(),
+                    );
+                    let request = self.state.model_picker.begin_refresh();
+                    return Ok(ApplicationTransition::ListModels(request));
+                };
+                match cycle_reasoning_effort(&model, current.as_ref()) {
+                    ReasoningCycle::Advanced(selection) => self.apply_agent_selection(selection),
+                    ReasoningCycle::Unavailable(message) => {
+                        self.state.submission_error = Some(message);
+                        Ok(ApplicationTransition::Continue)
+                    }
+                }
+            }
             SemanticCommandId::SessionList => {
                 let request = self.state.session_picker.open();
                 self.state.command_mode = CommandMode::Composer;
@@ -1491,13 +1544,27 @@ impl Application {
             self.state.landing_agent_selection = Some(selection);
             return Ok(ApplicationTransition::Continue);
         };
+        self.state.submission_error = None;
+        if self.state.pending_agent_selection.is_some() {
+            // Transport stays serialized: coalesce to the newest complete
+            // Agent Selection instead of sending every intermediate state.
+            self.state.queued_agent_selection = Some((session_id, selection));
+            return Ok(ApplicationTransition::Continue);
+        }
+        self.begin_agent_selection_update(session_id, selection)
+    }
+
+    fn begin_agent_selection_update(
+        &mut self,
+        session_id: SessionId,
+        selection: AgentSelection,
+    ) -> Result<ApplicationTransition> {
         let operation_id = AgentSelectionOperationId::new();
         self.state.pending_agent_selection = Some(PendingAgentSelection {
             session_id,
             operation_id,
             selection: selection.clone(),
         });
-        self.state.submission_error = None;
         Ok(ApplicationTransition::UpdateAgentSelection {
             session_id,
             request: UpdateAgentSelectionRequest {
@@ -1617,6 +1684,9 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
         InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,
         InputEvent::Key(key) if binding_for(key).is_some() => {
             binding_for(key).map(|binding| binding.command.clone())
+        }
+        InputEvent::Key(key) if command_for_direct_semantic_key(key).is_some() => {
+            command_for_direct_semantic_key(key).map(CommandId::InvokeSemantic)
         }
         InputEvent::Key(key)
             if !key
@@ -3771,19 +3841,25 @@ async fn run_loop(
                         operation_id,
                         selection,
                     } => {
-                        application.handle_event(ApplicationEvent::AgentSelectionUpdated {
-                            operation_id,
-                            selection,
-                        })?;
+                        let transition = application.handle_event(
+                            ApplicationEvent::AgentSelectionUpdated {
+                                operation_id,
+                                selection,
+                            },
+                        )?;
+                        flush_agent_selection(&client, transition, &submission_tx);
                     }
                     SubmissionResult::AgentSelectionUpdateFailed {
                         operation_id,
                         error,
                     } => {
-                        application.handle_event(ApplicationEvent::AgentSelectionUpdateFailed {
-                            operation_id,
-                            error,
-                        })?;
+                        let transition = application.handle_event(
+                            ApplicationEvent::AgentSelectionUpdateFailed {
+                                operation_id,
+                                error,
+                            },
+                        )?;
+                        flush_agent_selection(&client, transition, &submission_tx);
                     }
                 }
             }
@@ -4048,6 +4124,27 @@ fn spawn_model_listing(
         };
         let _ = results.send(result);
     })
+}
+
+/// Dispatches the follow-up request when settling one Agent Selection
+/// operation released a coalesced newer selection.
+fn flush_agent_selection(
+    client: &ManagedClient,
+    transition: ApplicationTransition,
+    results: &tokio::sync::mpsc::UnboundedSender<SubmissionResult>,
+) {
+    if let ApplicationTransition::UpdateAgentSelection {
+        session_id,
+        request,
+    } = transition
+    {
+        spawn_agent_selection_update(
+            client.session_commands(),
+            session_id,
+            request,
+            results.clone(),
+        );
+    }
 }
 
 fn spawn_agent_selection_update(

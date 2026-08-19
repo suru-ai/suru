@@ -23,9 +23,11 @@ use chidori::{
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
         AgentSelection, AgentSelectionOperationId, CreateSessionRequest, FileChange, InitialPrompt,
-        LifecycleState, Message, MessageId, MessageRole, MessageStatus, ModelAvailability, ModelId,
-        ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue,
-        PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
+        LifecycleState, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
+        ModelCatalog, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
+        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
+        ModelOptionSelection, ModelOptionValue, PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId,
+        PromptOrder, PromptStatus, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
         RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity, Session,
         SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
         SessionStatus, SessionSummary, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
@@ -35,7 +37,9 @@ use chidori::{
         ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderFileChangeStatus,
     },
     server::{self, AgentOutput, ServerConfig},
+    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
+use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use eventsource_stream::Eventsource;
 use futures_util::{StreamExt, future::join_all, stream};
 use tokio::time::{Duration, timeout};
@@ -1153,6 +1157,281 @@ async fn agent_selection_commands_are_idempotent_and_converge_across_clients() {
             .session
             .agent_selection,
         Some(final_selection)
+    );
+
+    drop(first_feed);
+    drop(second_feed);
+    drop(first);
+    drop(second);
+    server.shutdown().await.expect("shut down server");
+}
+
+fn opaque_cycling_selection(effort: &str) -> AgentSelection {
+    AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("gpt-cycle"),
+        options: vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning-opaque"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new(effort),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("fast-opaque"),
+                value: ModelOptionValue::Toggle { enabled: false },
+            },
+        ],
+    }
+}
+
+fn opaque_cycling_catalog() -> ModelCatalog {
+    let effort_choice = |id: &str, label: &str| ModelOptionChoice {
+        id: ModelOptionChoiceId::new(id),
+        label: label.to_owned(),
+        description: None,
+        availability: ModelAvailability::Available,
+    };
+    ModelCatalog {
+        providers: vec![ProviderModelCatalog {
+            provider: ProviderId::new("controlled"),
+            models: vec![ModelDescriptor {
+                provider: ProviderId::new("controlled"),
+                id: ModelId::new("gpt-cycle"),
+                display_name: "Cycle Native".to_owned(),
+                description: "Cycle Native description".to_owned(),
+                is_default: true,
+                availability: ModelAvailability::Available,
+                options: vec![
+                    ModelOptionDescriptor {
+                        id: ModelOptionId::new("reasoning-opaque"),
+                        label: "Effort".to_owned(),
+                        description: None,
+                        role: ModelOptionRole::ReasoningEffort,
+                        kind: ModelOptionKind::Select {
+                            choices: vec![
+                                effort_choice("low", "Low"),
+                                effort_choice("medium", "Medium"),
+                                effort_choice("high", "High"),
+                            ],
+                            default: ModelOptionChoiceId::new("medium"),
+                        },
+                    },
+                    ModelOptionDescriptor {
+                        id: ModelOptionId::new("fast-opaque"),
+                        label: "Fast".to_owned(),
+                        description: None,
+                        role: ModelOptionRole::Speed,
+                        kind: ModelOptionKind::Toggle { default: false },
+                    },
+                ],
+            }],
+            status: ProviderCatalogStatus::Fresh,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn rapid_reasoning_cycles_serialize_coalesce_and_converge_across_clients() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, _provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "reasoning-cycle-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut first = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "reasoning-cycle-test")
+            .expect("configure first client"),
+    )
+    .await
+    .expect("connect first client");
+    let mut second = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "reasoning-cycle-test")
+            .expect("configure second client"),
+    )
+    .await
+    .expect("connect second client");
+    receive_managed_client_initial_state(&mut first).await;
+    receive_managed_client_initial_state(&mut second).await;
+    let created = first
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(opaque_cycling_selection("low")),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Cycle Reasoning Effort rapidly".to_owned(),
+            },
+        })
+        .await
+        .expect("create selected Session");
+    let session_id = created.session.id;
+    let mut first_feed = first
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe first client");
+    let mut second_feed = second
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe second client");
+    for feed in [&mut first_feed, &mut second_feed] {
+        assert!(matches!(
+            feed.next()
+                .await
+                .expect("snapshot arrives")
+                .expect("valid feed"),
+            SessionEvent::Snapshot(_)
+        ));
+    }
+
+    // Drive the first client's TUI: warm the catalog, then cycle rapidly.
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(created))
+        .expect("attach the driving TUI client");
+    let ApplicationTransition::ListModels(catalog_request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker to warm the catalog")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request: catalog_request,
+            catalog: opaque_cycling_catalog(),
+        })
+        .expect("cache the Model catalog");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("close the warmed Model picker");
+
+    let press = |application: &mut Application| {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('t'),
+                KeyModifiers::CONTROL,
+            )))
+            .expect("press Ctrl+T")
+    };
+    let ApplicationTransition::UpdateAgentSelection {
+        request: first_request,
+        ..
+    } = press(&mut application)
+    else {
+        panic!("the first cycle should dispatch one selection request");
+    };
+    assert_eq!(first_request.selection, opaque_cycling_selection("medium"));
+    assert_eq!(press(&mut application), ApplicationTransition::Continue);
+    assert_eq!(press(&mut application), ApplicationTransition::Continue);
+
+    // Serialized transport: the first request settles against the real
+    // server before the coalesced latest selection is dispatched.
+    let accepted = first
+        .update_agent_selection(session_id, first_request.clone())
+        .await
+        .expect("accept the first cycle");
+    let ApplicationTransition::UpdateAgentSelection {
+        request: coalesced_request,
+        ..
+    } = application
+        .handle_event(ApplicationEvent::AgentSelectionUpdated {
+            operation_id: first_request.operation_id,
+            selection: accepted,
+        })
+        .expect("settle the first cycle")
+    else {
+        panic!("settling should flush the coalesced latest selection");
+    };
+    assert_eq!(
+        coalesced_request.selection,
+        opaque_cycling_selection("low"),
+        "three rapid presses wrap back to Low and skip the intermediate High",
+    );
+    let accepted = first
+        .update_agent_selection(session_id, coalesced_request.clone())
+        .await
+        .expect("accept the coalesced cycle");
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::AgentSelectionUpdated {
+                operation_id: coalesced_request.operation_id,
+                selection: accepted,
+            })
+            .expect("settle the coalesced cycle"),
+        ApplicationTransition::Continue
+    );
+
+    // Both observers see exactly the accepted selections, in acceptance
+    // order, and the skipped intermediate choice never reaches the wire.
+    let first_updates = [
+        next_session_update(&mut first_feed).await,
+        next_session_update(&mut first_feed).await,
+    ];
+    let second_updates = [
+        next_session_update(&mut second_feed).await,
+        next_session_update(&mut second_feed).await,
+    ];
+    assert_eq!(first_updates, second_updates);
+    assert_eq!(first_updates[0].revision, SessionRevision(2));
+    assert_eq!(first_updates[1].revision, SessionRevision(3));
+    assert_eq!(
+        first_updates[0].changes,
+        vec![SessionChange::AgentSelectionChanged {
+            selection: opaque_cycling_selection("medium"),
+        }]
+    );
+    assert_eq!(
+        first_updates[1].changes,
+        vec![SessionChange::AgentSelectionChanged {
+            selection: opaque_cycling_selection("low"),
+        }]
+    );
+
+    // A stale idempotent replay produces no new revision and cannot
+    // overwrite the converged state in the driving client.
+    let replayed = first
+        .update_agent_selection(session_id, first_request.clone())
+        .await
+        .expect("replay the settled operation");
+    assert_eq!(replayed, opaque_cycling_selection("medium"));
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::AgentSelectionUpdated {
+                operation_id: first_request.operation_id,
+                selection: replayed,
+            })
+            .expect("ignore the stale replay"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        timeout(Duration::from_millis(50), first_feed.next())
+            .await
+            .is_err(),
+        "an idempotent replay must not publish another revision"
+    );
+
+    for update in first_updates {
+        application
+            .handle_event(ApplicationEvent::Session(SessionEvent::Updated(update)))
+            .expect("apply the acceptance stream to the driving client");
+    }
+    assert_eq!(
+        first
+            .read_session(session_id)
+            .await
+            .expect("read converged Session")
+            .session
+            .agent_selection,
+        Some(opaque_cycling_selection("low"))
     );
 
     drop(first_feed);

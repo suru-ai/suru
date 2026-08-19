@@ -13,6 +13,7 @@ pub enum SemanticCommandId {
     ModelOptionsSelect,
     ModelOptionsApply,
     ModelOptionsCancel,
+    ModelOptionReasoningCycle,
     SessionList,
     SessionNew,
 }
@@ -27,6 +28,7 @@ impl SemanticCommandId {
             Self::ModelOptionsSelect => "model.options.select",
             Self::ModelOptionsApply => "model.options.apply",
             Self::ModelOptionsCancel => "model.options.cancel",
+            Self::ModelOptionReasoningCycle => "model.option.reasoning.cycle",
             Self::SessionList => "session.list",
             Self::SessionNew => "session.new",
         }
@@ -48,14 +50,17 @@ pub(super) struct SlashCommand {
     aliases: &'static [&'static str],
 }
 
+/// A semantic keybinding either follows the `Ctrl+X` leader prefix or fires
+/// directly from the composer when `prefix` is `None`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SemanticKeybinding {
-    prefix_code: KeyCode,
-    prefix_modifiers: KeyModifiers,
+    prefix: Option<(KeyCode, KeyModifiers)>,
     code: KeyCode,
     modifiers: KeyModifiers,
     pub(super) label: &'static str,
 }
+
+const LEADER_PREFIX: (KeyCode, KeyModifiers) = (KeyCode::Char('x'), KeyModifiers::CONTROL);
 
 const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
@@ -67,8 +72,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             aliases: &["mo"],
         }),
         keybinding: Some(SemanticKeybinding {
-            prefix_code: KeyCode::Char('x'),
-            prefix_modifiers: KeyModifiers::CONTROL,
+            prefix: Some(LEADER_PREFIX),
             code: KeyCode::Char('m'),
             modifiers: KeyModifiers::NONE,
             label: "Ctrl+X M",
@@ -83,8 +87,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             aliases: &["variants"],
         }),
         keybinding: Some(SemanticKeybinding {
-            prefix_code: KeyCode::Char('x'),
-            prefix_modifiers: KeyModifiers::CONTROL,
+            prefix: Some(LEADER_PREFIX),
             code: KeyCode::Char('o'),
             modifiers: KeyModifiers::NONE,
             label: "Ctrl+X O",
@@ -126,6 +129,18 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         keybinding: None,
     },
     SemanticCommandDescriptor {
+        id: SemanticCommandId::ModelOptionReasoningCycle,
+        title: "Cycle Reasoning Effort",
+        description: "Advance the Reasoning Effort to the next advertised choice",
+        slash: None,
+        keybinding: Some(SemanticKeybinding {
+            prefix: None,
+            code: KeyCode::Char('t'),
+            modifiers: KeyModifiers::CONTROL,
+            label: "Ctrl+T",
+        }),
+    },
+    SemanticCommandDescriptor {
         id: SemanticCommandId::SessionList,
         title: "Switch Session",
         description: "Search and attach to a live Session",
@@ -134,8 +149,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             aliases: &["resume", "continue"],
         }),
         keybinding: Some(SemanticKeybinding {
-            prefix_code: KeyCode::Char('x'),
-            prefix_modifiers: KeyModifiers::CONTROL,
+            prefix: Some(LEADER_PREFIX),
             code: KeyCode::Char('l'),
             modifiers: KeyModifiers::NONE,
             label: "Ctrl+X L",
@@ -150,8 +164,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             aliases: &["clear"],
         }),
         keybinding: Some(SemanticKeybinding {
-            prefix_code: KeyCode::Char('x'),
-            prefix_modifiers: KeyModifiers::CONTROL,
+            prefix: Some(LEADER_PREFIX),
             code: KeyCode::Char('n'),
             modifiers: KeyModifiers::NONE,
             label: "Ctrl+X N",
@@ -167,10 +180,20 @@ pub(super) fn descriptor(id: SemanticCommandId) -> &'static SemanticCommandDescr
 }
 
 pub(super) fn command_for_leader_key(key: KeyEvent) -> Option<SemanticCommandId> {
+    command_for_semantic_binding(key, Some(LEADER_PREFIX))
+}
+
+pub(super) fn command_for_direct_semantic_key(key: KeyEvent) -> Option<SemanticCommandId> {
+    command_for_semantic_binding(key, None)
+}
+
+fn command_for_semantic_binding(
+    key: KeyEvent,
+    prefix: Option<(KeyCode, KeyModifiers)>,
+) -> Option<SemanticCommandId> {
     SEMANTIC_COMMANDS.iter().find_map(|command| {
         command.keybinding.and_then(|binding| {
-            (binding.prefix_code == KeyCode::Char('x')
-                && binding.prefix_modifiers == KeyModifiers::CONTROL
+            (binding.prefix == prefix
                 && binding.code == key.code
                 && binding.modifiers == key.modifiers)
                 .then_some(command.id)
