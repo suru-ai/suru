@@ -151,6 +151,71 @@ while IFS= read -r line; do
 done
 "#;
 
+const UNKNOWN_SERVER_REQUEST: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":"unknown-correlation","method":"future/request","params":{"ignored":true}}'
+      read -r response
+      printf '%s\n' "$response" >> "$CODEX_FIXTURE_LOG"
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
+      ;;
+  esac
+done
+"#;
+
+const UNSUPPORTED_SERVER_REQUEST: &str = r#"#!/bin/sh
+request_pipe="$CODEX_FIXTURE_LOG.pipe"
+mkfifo "$request_pipe"
+exec 3<&0
+while IFS= read -r captured; do
+  printf '%s\n' "$captured" >> "$CODEX_FIXTURE_LOG"
+  printf '%s\n' "$captured"
+done <&3 > "$request_pipe" &
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":"unsupported-correlation","method":"$CODEX_FIXTURE_METHOD","params":{"fixture":true}}'
+      read -r response
+      while :; do sleep 1; done
+      ;;
+  esac
+done < "$request_pipe"
+"#;
+
+const PROCESS_LOSS_WITH_UNSUPPORTED_REQUEST: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":"abandoned-interaction","method":"item/tool/requestUserInput","params":{"fixture":true}}'
+      exit 17
+      ;;
+  esac
+done
+"#;
+
 const MULTIPROCESS_SCRIPT_PREFIX: &str = r#"#!/bin/sh
 attempt=1
 if [ -e "$CODEX_FIXTURE_ATTEMPTS" ]; then
@@ -1070,6 +1135,117 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
 }
 
 #[tokio::test]
+async fn unknown_server_request_gets_method_not_found_without_corrupting_response_routing() {
+    let fixture = ScriptedCodex::new(UNKNOWN_SERVER_REQUEST);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-unknown-server-request")
+            .expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-unknown-server-request")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Keep routing the Codex Turn".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let mut feed = client
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe to Session SSE");
+
+    let completed = timeout(Duration::from_secs(2), async {
+        loop {
+            feed.next()
+                .await
+                .expect("Session feed remains open")
+                .expect("Session event is valid");
+            let snapshot = client
+                .read_session(created.session.id)
+                .await
+                .expect("read Session after unknown server request");
+            if snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status != TurnStatus::Active)
+            {
+                return snapshot;
+            }
+        }
+    })
+    .await
+    .expect("Codex Turn settles after unknown server request");
+
+    assert_eq!(completed.turns[0].status, TurnStatus::Completed);
+    assert!(completed.activities.is_empty());
+    let response = fixture
+        .requests()
+        .into_iter()
+        .find(|message| message.get("id") == Some(&Value::String("unknown-correlation".to_owned())))
+        .expect("unknown server request receives a response");
+    assert_eq!(response["error"]["code"], -32601);
+    assert!(response.get("result").is_none());
+
+    drop(feed);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn unsupported_server_interactions_are_rejected_and_fail_the_active_turn() {
+    for (method, channel) in [
+        (
+            "item/commandExecution/requestApproval",
+            "codex-unsupported-approval",
+        ),
+        (
+            "item/tool/requestUserInput",
+            "codex-unsupported-structured-input",
+        ),
+        (
+            "mcpServer/elicitation/request",
+            "codex-unsupported-elicitation",
+        ),
+        ("item/tool/call", "codex-unsupported-host-tool"),
+    ] {
+        let script = UNSUPPORTED_SERVER_REQUEST.replace("$CODEX_FIXTURE_METHOD", method);
+        let fixture = ScriptedCodex::new(&script);
+        assert_provider_failure(fixture.executable(), channel, method).await;
+
+        let response = fixture
+            .requests()
+            .into_iter()
+            .find(|message| {
+                message.get("id") == Some(&Value::String("unsupported-correlation".to_owned()))
+            })
+            .unwrap_or_else(|| panic!("{method} receives a correlated response"));
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(method))
+        );
+        assert!(response.get("result").is_none());
+    }
+}
+
+#[tokio::test]
 async fn scripted_codex_interrupt_acknowledges_before_trailing_output_and_terminal_event() {
     let fixture = ScriptedCodex::new(&interruption_script(ACKNOWLEDGE_AND_COMPLETE_INTERRUPTION));
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -1323,6 +1499,11 @@ async fn codex_launch_protocol_and_process_failures_settle_as_error_activities()
             "Codex app-server",
         ),
         (NONZERO_AFTER_TURN_START, "codex-nonzero-exit", "status: 17"),
+        (
+            PROCESS_LOSS_WITH_UNSUPPORTED_REQUEST,
+            "codex-process-loss-with-unsupported-request",
+            "Codex app-server",
+        ),
     ] {
         let fixture = ScriptedCodex::new(script);
         assert_provider_failure(fixture.executable(), channel, expected).await;

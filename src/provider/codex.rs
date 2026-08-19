@@ -35,6 +35,8 @@ const PENDING_TURN_START_GRACE_PERIOD: Duration = Duration::from_millis(250);
 const PROCESS_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(500);
 const PROCESS_KILL_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_REMOTE_ERROR_CHARS: usize = 384;
+const UNSUPPORTED_INTERACTION_ERROR_CODE: i64 = -32000;
+const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
 
 #[derive(Serialize)]
 struct ClientRequest<'a, T> {
@@ -1558,10 +1560,26 @@ async fn route_message(
 ) -> Result<(), ProviderError> {
     if let Some(method) = message.method.as_deref() {
         if let Some(id) = message.id {
-            reject_server_request(writer, id, method).await?;
-            return Err(codex_error(format!(
-                "Codex app-server requested unsupported interaction `{method}`"
-            )));
+            if is_unsupported_interaction(method) {
+                reject_server_request(
+                    writer,
+                    id,
+                    UNSUPPORTED_INTERACTION_ERROR_CODE,
+                    format!("Chidori does not support interactive request `{method}`"),
+                )
+                .await?;
+                return Err(codex_error(format!(
+                    "Codex app-server requested unsupported interaction `{method}`"
+                )));
+            }
+            reject_server_request(
+                writer,
+                id,
+                METHOD_NOT_FOUND_ERROR_CODE,
+                format!("Chidori does not recognize server request `{method}`"),
+            )
+            .await?;
+            return Ok(());
         }
         if let Some(event) = decode_notification(method, message.params.as_ref())? {
             let _ = state.events.send(Ok(event));
@@ -1600,20 +1618,30 @@ async fn route_message(
 async fn reject_server_request(
     writer: &Arc<Mutex<Option<ChildStdin>>>,
     id: RequestId,
-    method: &str,
+    code: i64,
+    message: String,
 ) -> Result<(), ProviderError> {
     write_json_line(
         writer,
         &ClientErrorResponse {
             id,
-            error: ClientError {
-                code: -32601,
-                message: format!("Chidori does not support `{method}` requests"),
-            },
+            error: ClientError { code, message },
         },
         "reject Codex app-server request",
     )
     .await
+}
+
+fn is_unsupported_interaction(method: &str) -> bool {
+    matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput"
+            | "mcpServer/elicitation/request"
+            | "item/tool/call"
+    )
 }
 
 fn decode_notification(
