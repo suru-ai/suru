@@ -25,7 +25,7 @@ use super::{
     ProviderFuture, ProviderRuntime, ProviderSession, ProviderSessionConnection,
     ProviderSessionRequest, ProviderTurnInput, wait_for_shutdown,
 };
-use crate::protocol::{AgentId, AgentIdentity, ModelId, ProviderId};
+use crate::protocol::{AgentId, AgentIdentity, ModelId, ProviderId, SessionId};
 
 const CODEX_PATH_ENV: &str = "CHIDORI_CODEX_PATH";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -75,6 +75,15 @@ struct ThreadStartParams<'a> {
     approval_policy: &'static str,
     sandbox: &'static str,
     ephemeral: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadResumeParams<'a> {
+    thread_id: &'a str,
+    cwd: &'a str,
+    approval_policy: &'static str,
+    sandbox: &'static str,
 }
 
 #[derive(Serialize)]
@@ -155,13 +164,18 @@ struct ClientError {
 pub struct CodexRuntime {
     executable: OsString,
     processes: ProcessRegistry,
+    thread_ids_by_session: Arc<StdMutex<HashMap<SessionId, CodexThreadId>>>,
 }
+
+#[derive(Clone, Debug)]
+struct CodexThreadId(String);
 
 impl CodexRuntime {
     pub fn new(executable: impl AsRef<OsStr>) -> Self {
         Self {
             executable: executable.as_ref().to_owned(),
             processes: ProcessRegistry::new(),
+            thread_ids_by_session: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -169,10 +183,7 @@ impl CodexRuntime {
         let executable = std::env::var_os(CODEX_PATH_ENV)
             .filter(|path| !path.is_empty())
             .unwrap_or_else(|| OsString::from("codex"));
-        Self {
-            executable,
-            processes: ProcessRegistry::new(),
-        }
+        Self::new(executable)
     }
 }
 
@@ -189,7 +200,10 @@ impl ProviderRuntime for CodexRuntime {
     ) -> ProviderFuture<'_, ProviderSessionConnection> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
-        Box::pin(async move { start_codex_session(executable, request, processes).await })
+        let thread_ids_by_session = self.thread_ids_by_session.clone();
+        Box::pin(async move {
+            start_codex_session(executable, request, processes, thread_ids_by_session).await
+        })
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
@@ -201,6 +215,7 @@ async fn start_codex_session(
     executable: OsString,
     request: ProviderSessionRequest,
     processes: ProcessRegistry,
+    thread_ids_by_session: Arc<StdMutex<HashMap<SessionId, CodexThreadId>>>,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let mut command = Command::new(&executable);
     command
@@ -295,43 +310,76 @@ async fn start_codex_session(
             },
         )
         .await
-        .map_err(|error| codex_error(format!("Codex initialization failed: {error}")))?;
+        .map_err(|error| codex_error_context("Codex initialization failed", error))?;
     transport
         .notify("initialized")
         .await
-        .map_err(|error| codex_error(format!("Codex initialization failed: {error}")))?;
+        .map_err(|error| codex_error_context("Codex initialization failed", error))?;
 
     let cwd = request
         .workspace
         .to_str()
         .ok_or_else(|| codex_error("Workspace path cannot be represented for Codex app-server"))?;
-    let result = transport
-        .request(
-            "thread/start",
-            &ThreadStartParams {
-                cwd,
-                approval_policy: "never",
-                sandbox: "danger-full-access",
-                ephemeral: false,
-            },
-        )
-        .await
-        .map_err(|error| codex_error(format!("Codex Session startup failed: {error}")))?;
-    let started: ThreadStartResult = serde_json::from_value(result).map_err(|error| {
+    let known_thread_id = thread_ids_by_session
+        .lock()
+        .expect("Codex Thread registry lock is not poisoned")
+        .get(&request.session_id)
+        .cloned();
+    let (method, result) = if let Some(thread_id) = known_thread_id.as_ref() {
+        let result = transport
+            .request(
+                "thread/resume",
+                &ThreadResumeParams {
+                    thread_id: &thread_id.0,
+                    cwd,
+                    approval_policy: "never",
+                    sandbox: "danger-full-access",
+                },
+            )
+            .await
+            .map_err(|error| codex_error_context("Codex Session resume failed", error))?;
+        ("thread/resume", result)
+    } else {
+        let result = transport
+            .request(
+                "thread/start",
+                &ThreadStartParams {
+                    cwd,
+                    approval_policy: "never",
+                    sandbox: "danger-full-access",
+                    ephemeral: false,
+                },
+            )
+            .await
+            .map_err(|error| codex_error_context("Codex Session startup failed", error))?;
+        ("thread/start", result)
+    };
+    let started: ThreadConnectionResult = serde_json::from_value(result).map_err(|error| {
         codex_error(format!(
-            "Codex returned an invalid thread/start response: {error}"
+            "Codex returned an invalid {method} response: {error}"
         ))
     })?;
     if started.thread.id.is_empty() {
-        return Err(codex_error(
-            "Codex returned an invalid thread/start response: Provider Session ID was empty",
-        ));
+        return Err(codex_error(format!(
+            "Codex returned an invalid {method} response: Provider Session ID was empty"
+        )));
     }
     if started.model.is_empty() {
+        return Err(codex_error(format!(
+            "Codex returned an invalid {method} response: effective Model was empty"
+        )));
+    }
+    if let Some(known_thread_id) = known_thread_id.as_ref()
+        && started.thread.id != known_thread_id.0
+    {
         return Err(codex_error(
-            "Codex returned an invalid thread/start response: effective Model was empty",
+            "Codex returned an invalid thread/resume response: resumed Provider Session ID changed",
         ));
     }
+    thread_ids_by_session
+        .lock()
+        .expect("Codex Thread registry lock is not poisoned")
+        .insert(request.session_id, CodexThreadId(started.thread.id.clone()));
 
     let correlation = Arc::new(StdMutex::new(NativeCorrelation {
         thread_id: started.thread.id.clone(),
@@ -370,7 +418,7 @@ async fn start_codex_session(
 }
 
 #[derive(Deserialize)]
-struct ThreadStartResult {
+struct ThreadConnectionResult {
     thread: NativeThread,
     model: String,
 }
@@ -442,7 +490,7 @@ impl ProviderSession for CodexSession {
                     },
                 )
                 .await
-                .map_err(|error| codex_error(format!("Codex Turn steering failed: {error}")))?;
+                .map_err(|error| codex_error_context("Codex Turn steering failed", error))?;
             let steered: TurnSteerResult = serde_json::from_value(result).map_err(|error| {
                 codex_error(format!(
                     "Codex returned an invalid turn/steer response: {error}"
@@ -476,7 +524,7 @@ impl ProviderSession for CodexSession {
                     INTERRUPT_REQUEST_TIMEOUT,
                 )
                 .await
-                .map_err(|error| codex_error(format!("Codex Turn interruption failed: {error}")))?;
+                .map_err(|error| codex_error_context("Codex Turn interruption failed", error))?;
             Ok(())
         })
     }
@@ -548,7 +596,7 @@ async fn start_native_turn(
                 },
             )
             .await
-            .map_err(|error| codex_error(format!("Codex Turn startup failed: {error}")))?;
+            .map_err(|error| codex_error_context("Codex Turn startup failed", error))?;
         let started: TurnStartResult = serde_json::from_value(result).map_err(|error| {
             codex_error(format!(
                 "Codex returned an invalid turn/start response: {error}"
@@ -1351,7 +1399,7 @@ impl JsonRpcTransport {
         request_timeout: Duration,
     ) -> Result<Value, ProviderError> {
         if self.state.terminated.load(Ordering::Acquire) {
-            return Err(codex_error("Codex app-server transport has ended"));
+            return Err(codex_error("Codex app-server transport has ended").mark_session_lost());
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let key = id.to_string();
@@ -1380,7 +1428,8 @@ impl JsonRpcTransport {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(codex_error(format!(
                 "Codex app-server ended before `{method}` completed"
-            ))),
+            ))
+            .mark_session_lost()),
             Err(_) => {
                 self.state
                     .pending
@@ -1430,15 +1479,13 @@ async fn write_json_line<T: Serialize + ?Sized>(
     let mut writer = writer.lock().await;
     let writer = writer
         .as_mut()
-        .ok_or_else(|| codex_error("Codex app-server transport has ended"))?;
-    writer
-        .write_all(&bytes)
-        .await
-        .map_err(|error| codex_error(format!("could not {operation}: {error}")))?;
-    writer
-        .flush()
-        .await
-        .map_err(|error| codex_error(format!("could not flush after {operation}: {error}")))
+        .ok_or_else(|| codex_error("Codex app-server transport has ended").mark_session_lost())?;
+    writer.write_all(&bytes).await.map_err(|error| {
+        codex_error(format!("could not {operation}: {error}")).mark_session_lost()
+    })?;
+    writer.flush().await.map_err(|error| {
+        codex_error(format!("could not flush after {operation}: {error}")).mark_session_lost()
+    })
 }
 
 async fn read_stdout(
@@ -1715,8 +1762,18 @@ fn codex_error(message: impl AsRef<str>) -> ProviderError {
     ))
 }
 
+fn codex_error_context(context: &str, error: ProviderError) -> ProviderError {
+    let session_lost = error.is_session_lost();
+    let contextual = codex_error(format!("{context}: {error}"));
+    if session_lost {
+        contextual.mark_session_lost()
+    } else {
+        contextual
+    }
+}
+
 fn terminate_transport(state: &TransportState, error: ProviderError) {
-    finish_transport(state, error, true);
+    finish_transport(state, error.mark_session_lost(), true);
 }
 
 fn close_transport(state: &TransportState, error: ProviderError) {

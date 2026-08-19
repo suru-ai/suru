@@ -5,7 +5,7 @@ use std::{error::Error, fmt, future::Future, path::PathBuf, pin::Pin, sync::Arc}
 use futures_util::Stream;
 use tokio::sync::watch;
 
-use crate::protocol::AgentIdentity;
+use crate::protocol::{AgentIdentity, SessionId};
 
 mod codex;
 mod orchestration;
@@ -21,13 +21,24 @@ pub type ProviderEventStream =
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderError {
     message: String,
+    session_lost: bool,
 }
 
 impl ProviderError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            session_lost: false,
         }
+    }
+
+    pub(crate) fn mark_session_lost(mut self) -> Self {
+        self.session_lost = true;
+        self
+    }
+
+    pub(crate) fn is_session_lost(&self) -> bool {
+        self.session_lost
     }
 }
 
@@ -41,6 +52,7 @@ impl Error for ProviderError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderSessionRequest {
+    pub session_id: SessionId,
     pub workspace: PathBuf,
 }
 

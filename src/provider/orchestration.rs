@@ -297,10 +297,27 @@ async fn run_provider_session(
             break;
         }
         if active.is_none() {
-            let command = tokio::select! {
-                biased;
-                _ = wait_for_shutdown(&mut shutdown) => break,
-                command = commands.recv() => command,
+            let input = if let Some(connected) = provider.as_mut() {
+                tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut shutdown) => break,
+                    event = connected.events.next() => ProviderInput::Event(event),
+                    command = commands.recv() => ProviderInput::Command(command),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut shutdown) => break,
+                    command = commands.recv() => ProviderInput::Command(command),
+                }
+            };
+            let command = match input {
+                ProviderInput::Command(command) => command,
+                ProviderInput::Event(Some(Ok(_))) => continue,
+                ProviderInput::Event(Some(Err(_)) | None) => {
+                    provider = None;
+                    continue;
+                }
             };
             let Some(command) = command else { break };
             let prompt_id = match command {
@@ -317,6 +334,7 @@ async fn run_provider_session(
                     biased;
                     _ = wait_for_shutdown(&mut shutdown) => break 'actor,
                     connection = runtime.start_session(ProviderSessionRequest {
+                        session_id,
                         workspace: workspace.clone(),
                     }) => connection,
                 };
@@ -382,6 +400,7 @@ async fn run_provider_session(
                 }) => started,
             };
             if let Err(error) = started {
+                let session_lost = error.is_session_lost();
                 let _ = updates.apply(|| {
                     sessions.fail_turn(
                         session_id,
@@ -391,6 +410,9 @@ async fn run_provider_session(
                         format!("Provider execution failed: {error}"),
                     )
                 });
+                if session_lost {
+                    provider = None;
+                }
                 continue;
             }
             active = Some(ActiveProviderTurn {
