@@ -128,11 +128,35 @@ done
 
 const START_TURN: &str = r#"      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'"#;
 
-const COMPLETE_BEFORE_STEER: &str = r#"      while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
-        sleep 0.01
-      done
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
-      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'"#;
+const SEQUENTIAL_QUEUE_TURNS: &str = r#"      turn_index=$((turn_index + 1))
+      response_id=$((turn_index + 2))
+      printf '{"id":%s,"result":{"turn":{"id":"native-turn-%s"}}}\n' "$response_id" "$turn_index"
+      (
+        while [ ! -e "$CODEX_FIXTURE_RELEASE-$turn_index" ]; do
+          sleep 0.01
+        done
+        printf '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-%s","status":"completed","items":[]}}}\n' "$turn_index"
+        printf '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-%s","status":"completed","items":[]}}}\n' "$turn_index"
+      ) &"#;
+
+const TERMINAL_BOUNDARY_TURNS: &str = r#"      turn_index=$((turn_index + 1))
+      if [ "$turn_index" -eq 1 ]; then
+        while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
+          sleep 0.01
+        done
+        printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn-1"}}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-1","status":"completed","items":[]}}}'
+      else
+        printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn-2"}}}'
+        (
+          while [ ! -e "$CODEX_FIXTURE_RELEASE-2" ]; do
+            sleep 0.01
+          done
+          printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-2","status":"completed","items":[]}}}'
+        ) &
+      fi"#;
+
+const UNEXPECTED_STEER: &str = "      exit 65";
 
 const NONZERO_AFTER_TURN_START: &str = r#"#!/bin/sh
 while IFS= read -r line; do
@@ -339,7 +363,8 @@ const REJECT_INTERRUPTION: &str = r#"      printf '%s\n' '{"id":4,"error":{"code
 const TIME_OUT_INTERRUPTION: &str = "      sleep 10";
 const LOSE_PROCESS_DURING_INTERRUPT: &str = "      exit 23";
 
-const STEERING_CODEX: &str = r#"#!/bin/sh
+const PROMPT_OPERATION_CODEX: &str = r#"#!/bin/sh
+turn_index=0
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
   case "$line" in
@@ -357,6 +382,7 @@ __STEER_ACTION__
       ;;
   esac
 done
+wait
 "#;
 
 const COOPERATIVE_SHUTDOWN: &str = r#"#!/bin/sh
@@ -465,11 +491,11 @@ fn interruption_script(action: &str) -> String {
 }
 
 fn steering_script(action: &str) -> String {
-    steering_script_with_start(START_TURN, action)
+    prompt_operation_script(START_TURN, action)
 }
 
-fn steering_script_with_start(start_action: &str, steer_action: &str) -> String {
-    STEERING_CODEX
+fn prompt_operation_script(start_action: &str, steer_action: &str) -> String {
+    PROMPT_OPERATION_CODEX
         .replace("__TURN_START_ACTION__", start_action)
         .replace("__STEER_ACTION__", steer_action)
 }
@@ -604,6 +630,237 @@ impl SteeringFixture {
 enum TerminalSteerOutcome {
     Accepted,
     Rejected { error: &'static str },
+}
+
+#[tokio::test]
+async fn scripted_codex_delivers_the_authoritative_queue_once_in_admission_order() {
+    let codex = ScriptedCodex::new(&prompt_operation_script(
+        SEQUENTIAL_QUEUE_TURNS,
+        UNEXPECTED_STEER,
+    ));
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-scripted-queueing").expect("configure server"),
+        Arc::new(CodexRuntime::new(codex.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut author = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-scripted-queueing")
+            .expect("configure author client"),
+    )
+    .await
+    .expect("connect author client");
+    let mut observer = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-scripted-queueing")
+            .expect("configure observer client"),
+    )
+    .await
+    .expect("connect observer client");
+    receive_initial_state(&mut author).await;
+    receive_initial_state(&mut observer).await;
+
+    let created = author
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Run the initial Turn".to_owned(),
+            },
+        })
+        .await
+        .expect("create queued-delivery Session");
+    let session_id = created.session.id;
+    let mut feed = observer
+        .subscribe_session(session_id)
+        .await
+        .expect("observe Session through SSE");
+    codex.wait_for_method_count("turn/start", 1).await;
+
+    let first_request = AdmitPromptRequest {
+        prompt: InitialPrompt {
+            id: PromptId::new(),
+            text: "Run the first queued Turn".to_owned(),
+        },
+        delivery: PromptDelivery::Queue,
+    };
+    let cancelled_request = AdmitPromptRequest {
+        prompt: InitialPrompt {
+            id: PromptId::new(),
+            text: "Cancel this queued Turn".to_owned(),
+        },
+        delivery: PromptDelivery::Queue,
+    };
+    let second_request = AdmitPromptRequest {
+        prompt: InitialPrompt {
+            id: PromptId::new(),
+            text: "Run the second queued Turn".to_owned(),
+        },
+        delivery: PromptDelivery::Queue,
+    };
+    let first = author
+        .admit_prompt(session_id, first_request.clone())
+        .await
+        .expect("admit first queued Prompt");
+    let cancelled = author
+        .admit_prompt(session_id, cancelled_request)
+        .await
+        .expect("admit cancellable queued Prompt");
+    let second = author
+        .admit_prompt(session_id, second_request)
+        .await
+        .expect("admit second queued Prompt");
+    assert_eq!(first.status, PromptStatus::Pending);
+    assert_eq!(cancelled.status, PromptStatus::Pending);
+    assert_eq!(second.status, PromptStatus::Pending);
+    assert!(first.admission_order < cancelled.admission_order);
+    assert!(cancelled.admission_order < second.admission_order);
+
+    let cancelled = observer
+        .cancel_prompt(session_id, cancelled.id)
+        .await
+        .expect("cancel queued Prompt from another client");
+    assert_eq!(cancelled.status, PromptStatus::Cancelled);
+    let retried = author
+        .admit_prompt(session_id, first_request.clone())
+        .await
+        .expect("retry identical queued admission");
+    assert_eq!(retried.status, PromptStatus::Pending);
+
+    let pending = observer
+        .read_session(session_id)
+        .await
+        .expect("read pending queue from observer");
+    assert_eq!(pending.session.status, SessionStatus::Active);
+    assert_eq!(pending.turns.len(), 1);
+    assert_eq!(pending.messages.len(), 1);
+    assert_eq!(
+        pending
+            .prompts
+            .iter()
+            .map(|prompt| prompt.status)
+            .collect::<Vec<_>>(),
+        [
+            PromptStatus::Delivered,
+            PromptStatus::Pending,
+            PromptStatus::Cancelled,
+            PromptStatus::Pending,
+        ]
+    );
+    assert_eq!(
+        codex
+            .requests()
+            .iter()
+            .filter(|request| request["method"] == "turn/start")
+            .count(),
+        1
+    );
+
+    codex.release_turn(1);
+    codex.wait_for_method_count("turn/start", 2).await;
+    let first_queued_turn = wait_for_session_snapshot(
+        &observer,
+        &mut feed,
+        session_id,
+        "first queued Prompt begins after the first terminal boundary",
+        |snapshot| snapshot.turns.len() == 2 && snapshot.turns[1].status == TurnStatus::Active,
+    )
+    .await;
+    assert_eq!(first_queued_turn.session.status, SessionStatus::Active);
+    assert_eq!(first_queued_turn.turns[0].status, TurnStatus::Completed);
+    assert_eq!(first_queued_turn.turns[1].prompt_id, first.id);
+    assert_eq!(first_queued_turn.messages.len(), 2);
+    assert_eq!(first_queued_turn.messages[1].content, first.text);
+    assert_eq!(
+        first_queued_turn
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == second.id)
+            .expect("second queued Prompt remains authoritative")
+            .status,
+        PromptStatus::Pending
+    );
+
+    let delivered_retry = author
+        .admit_prompt(session_id, first_request)
+        .await
+        .expect("retry delivered queued admission");
+    assert_eq!(delivered_retry.status, PromptStatus::Delivered);
+
+    codex.release_turn(2);
+    codex.wait_for_method_count("turn/start", 3).await;
+    let second_queued_turn = wait_for_session_snapshot(
+        &observer,
+        &mut feed,
+        session_id,
+        "second queued Prompt begins after the second terminal boundary",
+        |snapshot| snapshot.turns.len() == 3 && snapshot.turns[2].status == TurnStatus::Active,
+    )
+    .await;
+    assert_eq!(second_queued_turn.session.status, SessionStatus::Active);
+    assert_eq!(second_queued_turn.turns[1].status, TurnStatus::Completed);
+    assert_eq!(second_queued_turn.turns[2].prompt_id, second.id);
+    assert_eq!(second_queued_turn.messages.len(), 3);
+    assert_eq!(second_queued_turn.messages[2].content, second.text);
+
+    codex.release_turn(3);
+    let completed = wait_for_session_snapshot(
+        &observer,
+        &mut feed,
+        session_id,
+        "the final queued Turn reaches idle",
+        |snapshot| snapshot.turns[2].status == TurnStatus::Completed,
+    )
+    .await;
+    assert_eq!(completed.session.status, SessionStatus::Idle);
+    assert_eq!(completed.turns.len(), 3);
+    assert_eq!(completed.messages.len(), 3);
+    assert_eq!(
+        completed
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Run the initial Turn",
+            "Run the first queued Turn",
+            "Run the second queued Turn",
+        ]
+    );
+    let requests = codex.requests();
+    let turn_starts = requests
+        .iter()
+        .filter(|request| request["method"] == "turn/start")
+        .collect::<Vec<_>>();
+    assert_eq!(turn_starts.len(), 3);
+    assert_eq!(
+        turn_starts
+            .iter()
+            .map(|request| request["params"]["input"][0]["text"]
+                .as_str()
+                .expect("turn/start contains text input"))
+            .collect::<Vec<_>>(),
+        [
+            "Run the initial Turn",
+            "Run the first queued Turn",
+            "Run the second queued Turn",
+        ]
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["method"] != "turn/queue"),
+        "Chidori must not submit Prompts to Codex's queue API"
+    );
+
+    drop(feed);
+    drop(observer);
+    drop(author);
+    server.shutdown().await.expect("shut down server");
 }
 
 #[tokio::test]
@@ -804,44 +1061,70 @@ async fn scripted_codex_terminal_completion_during_steering_is_ordered_after_its
 }
 
 #[tokio::test]
-async fn scripted_codex_terminal_event_wins_when_it_precedes_the_queued_steer() {
+async fn scripted_codex_handles_pending_steers_before_starting_the_queued_turn() {
     let mut fixture = SteeringFixture::start(
-        &steering_script_with_start(COMPLETE_BEFORE_STEER, ACCEPT_STEER),
-        "codex-terminal-before-steer",
+        &prompt_operation_script(TERMINAL_BOUNDARY_TURNS, UNEXPECTED_STEER),
+        "codex-terminal-steer-priority",
     )
     .await;
-    let prompt_id = PromptId::new();
-    fixture
+    let queued = fixture
         .client
         .admit_prompt(
             fixture.session_id,
             AdmitPromptRequest {
                 prompt: InitialPrompt {
-                    id: prompt_id,
-                    text: "Stay pending after the terminal boundary".to_owned(),
+                    id: PromptId::new(),
+                    text: "Run after the terminal boundary".to_owned(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("admit queued Prompt before the boundary steer");
+    let steer = fixture
+        .client
+        .admit_prompt(
+            fixture.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Apply this steer before continuing".to_owned(),
                 },
                 delivery: PromptDelivery::Steer,
             },
         )
         .await
-        .expect("admit boundary steer Prompt");
-    fixture.codex.release();
+        .expect("admit steer while native completion is pending");
+    assert!(queued.admission_order < steer.admission_order);
+    assert_eq!(queued.status, PromptStatus::Pending);
+    assert_eq!(steer.status, PromptStatus::Pending);
 
-    let completed = fixture
-        .wait_for("native completion reaches Session SSE", |snapshot| {
-            snapshot.turns[0].status == TurnStatus::Completed
-        })
+    fixture.codex.release();
+    fixture.codex.wait_for_method_count("turn/start", 2).await;
+
+    let continued = fixture
+        .wait_for(
+            "steer is reconciled before the queued Turn begins",
+            |snapshot| snapshot.turns.len() == 2 && snapshot.turns[1].status == TurnStatus::Active,
+        )
         .await;
-    assert_eq!(completed.turns.len(), 1);
-    assert_eq!(completed.messages.len(), 1);
+    assert_eq!(continued.session.status, SessionStatus::Active);
+    assert_eq!(continued.turns[0].status, TurnStatus::Completed);
+    assert_eq!(continued.turns[1].prompt_id, queued.id);
+    assert_eq!(continued.messages.len(), 3);
+    assert_eq!(continued.messages[0].content, "Begin the steering fixture");
+    assert_eq!(continued.messages[1].content, steer.text);
+    assert_eq!(continued.messages[1].turn_id, continued.turns[0].id);
+    assert_eq!(continued.messages[2].content, queued.text);
+    assert_eq!(continued.messages[2].turn_id, continued.turns[1].id);
     assert_eq!(
-        completed
+        continued
             .prompts
             .iter()
-            .find(|prompt| prompt.id == prompt_id)
-            .expect("boundary Prompt remains authoritative")
+            .find(|prompt| prompt.id == steer.id)
+            .expect("boundary steer remains authoritative")
             .status,
-        PromptStatus::Pending
+        PromptStatus::Delivered
     );
     assert_eq!(
         fixture
@@ -852,6 +1135,25 @@ async fn scripted_codex_terminal_event_wins_when_it_precedes_the_queued_steer() 
             .count(),
         0
     );
+    let turn_starts = fixture
+        .codex
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "turn/start")
+        .collect::<Vec<_>>();
+    assert_eq!(turn_starts.len(), 2);
+    assert_eq!(
+        turn_starts[1]["params"]["input"],
+        serde_json::json!([{ "type": "text", "text": "Run after the terminal boundary" }])
+    );
+
+    fixture.codex.release_turn(2);
+    let completed = fixture
+        .wait_for("queued Turn reaches its terminal boundary", |snapshot| {
+            snapshot.turns[1].status == TurnStatus::Completed
+        })
+        .await;
+    assert_eq!(completed.session.status, SessionStatus::Idle);
 
     fixture.shutdown().await;
 }
@@ -885,9 +1187,9 @@ async fn assert_terminal_steering_race(
             |snapshot| snapshot.turns[0].status == TurnStatus::Completed,
         )
         .await;
-    let (expected_prompt_status, expected_message_count, expected_error) = match outcome {
-        TerminalSteerOutcome::Accepted => (PromptStatus::Delivered, 2, None),
-        TerminalSteerOutcome::Rejected { error } => (PromptStatus::Pending, 1, Some(error)),
+    let expected_error = match outcome {
+        TerminalSteerOutcome::Accepted => None,
+        TerminalSteerOutcome::Rejected { error } => Some(error),
     };
     assert_eq!(completed.session.status, SessionStatus::Idle);
     assert_eq!(completed.turns.len(), 1);
@@ -899,16 +1201,16 @@ async fn assert_terminal_steering_race(
             .find(|prompt| prompt.id == prompt_id)
             .expect("boundary steer Prompt remains authoritative")
             .status,
-        expected_prompt_status
+        PromptStatus::Delivered
     );
-    assert_eq!(completed.messages.len(), expected_message_count);
+    assert_eq!(completed.messages.len(), 2);
     assert_eq!(
         completed
             .messages
             .iter()
             .filter(|message| message.content == "Race the terminal boundary")
             .count(),
-        usize::from(expected_prompt_status == PromptStatus::Delivered)
+        1
     );
     match expected_error {
         Some(expected_error) => assert!(
@@ -2461,6 +2763,38 @@ async fn wait_for_agent_output(client: &ManagedClient, session_id: SessionId) ->
     .expect("scripted Codex Agent output reaches the Session")
 }
 
+async fn wait_for_session_snapshot(
+    client: &ManagedClient,
+    feed: &mut SessionSubscription,
+    session_id: SessionId,
+    description: &str,
+    predicate: impl Fn(&SessionSnapshot) -> bool,
+) -> SessionSnapshot {
+    timeout(Duration::from_secs(2), async {
+        let mut observed_revision = 0;
+        loop {
+            let snapshot = client
+                .read_session(session_id)
+                .await
+                .expect("read observed Session");
+            if predicate(&snapshot) && observed_revision >= snapshot.revision.0 {
+                return snapshot;
+            }
+            observed_revision = match feed
+                .next()
+                .await
+                .expect("Session feed remains open")
+                .expect("Session update is valid")
+            {
+                SessionEvent::Snapshot(snapshot) => snapshot.revision.0,
+                SessionEvent::Updated(update) => update.revision.0,
+            };
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{description}"))
+}
+
 struct ScriptedCodex {
     _directory: tempfile::TempDir,
     executable: std::path::PathBuf,
@@ -2541,12 +2875,20 @@ impl ScriptedCodex {
     }
 
     async fn wait_for_method(&self, expected: &str) {
+        self.wait_for_method_count(expected, 1).await;
+    }
+
+    async fn wait_for_method_count(&self, expected: &str, count: usize) {
         timeout(Duration::from_secs(2), async {
             loop {
                 if self
                     .requests()
                     .iter()
-                    .any(|request| request.get("method").and_then(Value::as_str) == Some(expected))
+                    .filter(|request| {
+                        request.get("method").and_then(Value::as_str) == Some(expected)
+                    })
+                    .count()
+                    >= count
                 {
                     return;
                 }
@@ -2560,6 +2902,14 @@ impl ScriptedCodex {
                 self.requests()
             )
         });
+    }
+
+    fn release_turn(&self, turn_index: usize) {
+        std::fs::write(
+            format!("{}-{turn_index}", self.release.display()),
+            b"release",
+        )
+        .expect("release scripted Codex Turn");
     }
 
     fn release(&self) {

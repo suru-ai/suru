@@ -20,7 +20,9 @@ use crate::protocol::{
     Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus, PromptId,
     SessionChange, SessionId, TurnId, TurnStatus,
 };
-use crate::sessions::{DeliveredTurnStatus, InterruptTurnError, SessionStore};
+use crate::sessions::{
+    DeliveredTurn, DeliveredTurnStatus, InterruptTurnError, ProviderTurnOutcome, SessionStore,
+};
 
 #[derive(Clone)]
 pub(crate) struct ProviderOrchestrator {
@@ -105,6 +107,11 @@ impl ActiveProviderTurn {
 enum ProviderInput {
     Command(Option<ProviderCommand>),
     Event(Option<Result<ProviderEvent, super::ProviderError>>),
+}
+
+enum ProviderEventProjection {
+    Continue,
+    Terminal(Option<DeliveredTurn>),
 }
 
 impl ProviderOrchestrator {
@@ -543,8 +550,41 @@ async fn run_provider_session(
                 };
                 match event {
                     Some(Ok(event)) => {
-                        if project_provider_event(&sessions, &updates, session_id, current, event) {
+                        if let ProviderEventProjection::Terminal(next_turn) =
+                            project_provider_event(&sessions, &updates, session_id, current, event)
+                        {
                             active = None;
+                            if let Some(delivered) = next_turn {
+                                let started = tokio::select! {
+                                    biased;
+                                    _ = wait_for_shutdown(&mut shutdown) => break 'actor,
+                                    started = provider_session.start_turn(ProviderTurnInput {
+                                        prompt: delivered.prompt.text,
+                                    }) => started,
+                                };
+                                if let Err(error) = started {
+                                    let session_lost = error.is_session_lost();
+                                    let _ = updates.apply(|| {
+                                        sessions.fail_turn(
+                                            session_id,
+                                            delivered.turn.id,
+                                            None,
+                                            Vec::new(),
+                                            format!("Provider execution failed: {error}"),
+                                        )
+                                    });
+                                    if session_lost {
+                                        provider = None;
+                                    }
+                                } else {
+                                    active = Some(ActiveProviderTurn {
+                                        turn_id: delivered.turn.id,
+                                        streaming_message_id: None,
+                                        interruption_acknowledged: false,
+                                        command_activities: HashMap::new(),
+                                    });
+                                }
+                            }
                         }
                     }
                     Some(Err(error)) => {
@@ -594,7 +634,7 @@ fn project_provider_event(
     session_id: SessionId,
     active: &mut ActiveProviderTurn,
     event: ProviderEvent,
-) -> bool {
+) -> ProviderEventProjection {
     let Some(projected) = updates.apply(|| {
         let projection = match event {
             ProviderEvent::AgentMessageStarted => {
@@ -618,7 +658,7 @@ fn project_provider_event(
                                 },
                             },
                         )
-                        .map(|_| false)
+                        .map(|_| ProviderEventProjection::Continue)
                 }
             }
             ProviderEvent::AgentMessageDelta { content } => {
@@ -638,7 +678,7 @@ fn project_provider_event(
                             content,
                         },
                     )
-                    .map(|_| false)
+                    .map(|_| ProviderEventProjection::Continue)
             }
             ProviderEvent::AgentMessageCompleted => {
                 let Some(message_id) = active.streaming_message_id.take() else {
@@ -654,7 +694,7 @@ fn project_provider_event(
                         session_id,
                         SessionChange::MessageCompleted { message_id },
                     )
-                    .map(|_| false)
+                    .map(|_| ProviderEventProjection::Continue)
             }
             ProviderEvent::CommandStarted {
                 activity_id,
@@ -686,7 +726,7 @@ fn project_provider_event(
                             active
                                 .command_activities
                                 .insert(activity_id, command_activity_id);
-                            false
+                            ProviderEventProjection::Continue
                         })
                 }
             }
@@ -712,7 +752,7 @@ fn project_provider_event(
                             content,
                         },
                     )
-                    .map(|_| false)
+                    .map(|_| ProviderEventProjection::Continue)
             }
             ProviderEvent::CommandCompleted {
                 activity_id,
@@ -743,7 +783,7 @@ fn project_provider_event(
                     )
                     .map(|_| {
                         active.command_activities.remove(&activity_id);
-                        false
+                        ProviderEventProjection::Continue
                     })
             }
             ProviderEvent::TurnCompleted => {
@@ -753,51 +793,55 @@ fn project_provider_event(
                     ))
                 } else {
                     sessions
-                        .complete_turn(session_id, active.turn_id)
-                        .map(|_| true)
+                        .finish_provider_turn(
+                            session_id,
+                            active.turn_id,
+                            ProviderTurnOutcome::Completed,
+                        )
+                        .map(ProviderEventProjection::Terminal)
                 }
             }
             ProviderEvent::TurnInterrupted => {
                 let streaming_message_id = active.streaming_message_id.take();
                 let active_command_ids = active.take_command_activity_ids();
                 sessions
-                    .interrupt_provider_turn(
+                    .finish_provider_turn(
                         session_id,
                         active.turn_id,
-                        streaming_message_id,
-                        active_command_ids,
+                        ProviderTurnOutcome::Interrupted {
+                            streaming_message_id,
+                            active_command_ids,
+                        },
                     )
-                    .map(|_| true)
+                    .map(ProviderEventProjection::Terminal)
             }
             ProviderEvent::TurnFailed { message } => {
                 let streaming_message_id = active.streaming_message_id.take();
                 let active_command_ids = active.take_command_activity_ids();
                 sessions
-                    .fail_turn(
+                    .finish_provider_turn(
                         session_id,
                         active.turn_id,
-                        streaming_message_id,
-                        active_command_ids,
-                        message,
+                        ProviderTurnOutcome::Failed {
+                            streaming_message_id,
+                            active_command_ids,
+                            message,
+                        },
                     )
-                    .map(|_| true)
+                    .map(ProviderEventProjection::Terminal)
             }
         };
 
         projection.unwrap_or_else(|error| {
-            let streaming_message_id = active.streaming_message_id.take();
-            let active_command_ids = active.take_command_activity_ids();
-            let _ = sessions.fail_turn(
+            finish_invalid_provider_event(
+                sessions,
                 session_id,
-                active.turn_id,
-                streaming_message_id,
-                active_command_ids,
+                active,
                 format!("Provider execution failed: {error}"),
-            );
-            true
+            )
         })
     }) else {
-        return true;
+        return ProviderEventProjection::Terminal(None);
     };
     projected
 }
@@ -807,15 +851,34 @@ fn fail_invalid_provider_event(
     session_id: SessionId,
     active: &mut ActiveProviderTurn,
     message: &str,
-) -> bool {
+) -> ProviderEventProjection {
+    finish_invalid_provider_event(
+        sessions,
+        session_id,
+        active,
+        format!("Provider execution failed: {message}"),
+    )
+}
+
+fn finish_invalid_provider_event(
+    sessions: &SessionStore,
+    session_id: SessionId,
+    active: &mut ActiveProviderTurn,
+    message: String,
+) -> ProviderEventProjection {
     let streaming_message_id = active.streaming_message_id.take();
     let active_command_ids = active.take_command_activity_ids();
-    let _ = sessions.fail_turn(
-        session_id,
-        active.turn_id,
-        streaming_message_id,
-        active_command_ids,
-        format!("Provider execution failed: {message}"),
-    );
-    true
+    let next_turn = sessions
+        .finish_provider_turn(
+            session_id,
+            active.turn_id,
+            ProviderTurnOutcome::Failed {
+                streaming_message_id,
+                active_command_ids,
+                message,
+            },
+        )
+        .ok()
+        .flatten();
+    ProviderEventProjection::Terminal(next_turn)
 }

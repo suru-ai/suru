@@ -119,6 +119,19 @@ pub(crate) enum DeliveredTurnStatus {
     Failed { message: String },
 }
 
+pub(crate) enum ProviderTurnOutcome {
+    Completed,
+    Failed {
+        streaming_message_id: Option<MessageId>,
+        active_command_ids: Vec<ActivityId>,
+        message: String,
+    },
+    Interrupted {
+        streaming_message_id: Option<MessageId>,
+        active_command_ids: Vec<ActivityId>,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ListSessionsError {
     InvalidWorkspace,
@@ -428,32 +441,12 @@ impl SessionStore {
             DeliveredTurnStatus::Active => (TurnStatus::Active, None),
             DeliveredTurnStatus::Failed { message } => (TurnStatus::Failed, Some(message)),
         };
-        let turn = Turn {
-            id: TurnId::new(),
-            prompt_id,
-            status: turn_status,
-        };
-        let mut changes = vec![
-            SessionChange::PromptStatusChanged {
-                prompt_id,
-                status: PromptStatus::Delivered,
-            },
-            SessionChange::TurnAdded { turn: turn.clone() },
-            SessionChange::MessageAdded {
-                message: Message {
-                    id: MessageId::new(),
-                    turn_id: turn.id,
-                    role: MessageRole::User,
-                    status: MessageStatus::Completed,
-                    content: prompt.text.clone(),
-                },
-            },
-        ];
+        let (delivered, mut changes) = prepare_prompt_delivery(prompt, turn_status);
         if let Some(message) = failure_message {
             changes.push(SessionChange::ActivityAdded {
                 activity: Activity::Error {
                     id: ActivityId::new(),
-                    turn_id: turn.id,
+                    turn_id: delivered.turn.id,
                     text: message,
                 },
             });
@@ -465,7 +458,7 @@ impl SessionStore {
         record.publish(session_id, changes)?;
         record.steer_targets.remove(&prompt_id);
         record.summary.updated_at = updated_at;
-        Ok(Some(DeliveredTurn { prompt, turn }))
+        Ok(Some(delivered))
     }
 
     pub(crate) fn next_pending_steer(
@@ -517,24 +510,9 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        record.publish(
-            session_id,
-            vec![
-                SessionChange::PromptStatusChanged {
-                    prompt_id,
-                    status: PromptStatus::Delivered,
-                },
-                SessionChange::MessageAdded {
-                    message: Message {
-                        id: MessageId::new(),
-                        turn_id,
-                        role: MessageRole::User,
-                        status: MessageStatus::Completed,
-                        content: prompt.text.clone(),
-                    },
-                },
-            ],
-        )?;
+        let mut changes = Vec::with_capacity(2);
+        append_steer_delivery_changes(&mut changes, &prompt, turn_id);
+        record.publish(session_id, changes)?;
         record.steer_targets.remove(&prompt_id);
         record.summary.updated_at = updated_at;
         let mut delivered = prompt;
@@ -607,33 +585,114 @@ impl SessionStore {
         self.publish(session_id, changes)
     }
 
-    pub(crate) fn complete_turn(
+    pub(crate) fn finish_provider_turn(
         &self,
         session_id: SessionId,
         turn_id: TurnId,
-    ) -> anyhow::Result<SessionUpdate> {
-        self.publish(
-            session_id,
-            vec![SessionChange::TurnStatusChanged {
-                turn_id,
-                status: TurnStatus::Completed,
-            }],
-        )
-    }
+        outcome: ProviderTurnOutcome,
+    ) -> anyhow::Result<Option<DeliveredTurn>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let (pending_steers, next_queued_prompt) = {
+            let record = state
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+            if active_turn_id(&record.snapshot)? != Some(turn_id) {
+                return Ok(None);
+            }
+            let mut pending_steers = record
+                .snapshot
+                .prompts
+                .iter()
+                .filter(|prompt| {
+                    prompt.status == PromptStatus::Pending
+                        && prompt.delivery == PromptDelivery::Steer
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            pending_steers.sort_unstable_by_key(|prompt| prompt.admission_order);
+            let next_queued_prompt = record
+                .snapshot
+                .prompts
+                .iter()
+                .filter(|prompt| {
+                    prompt.status == PromptStatus::Pending
+                        && prompt.delivery == PromptDelivery::Queue
+                })
+                .min_by_key(|prompt| prompt.admission_order)
+                .cloned();
+            (pending_steers, next_queued_prompt)
+        };
 
-    pub(crate) fn interrupt_provider_turn(
-        &self,
-        session_id: SessionId,
-        turn_id: TurnId,
-        streaming_message_id: Option<MessageId>,
-        active_command_ids: Vec<ActivityId>,
-    ) -> anyhow::Result<SessionUpdate> {
-        let mut changes = terminal_output_changes(streaming_message_id, active_command_ids);
-        changes.push(SessionChange::TurnStatusChanged {
-            turn_id,
-            status: TurnStatus::Interrupted,
+        let mut changes = Vec::with_capacity(pending_steers.len() * 2 + 6);
+        for prompt in &pending_steers {
+            append_steer_delivery_changes(&mut changes, prompt, turn_id);
+        }
+        match outcome {
+            ProviderTurnOutcome::Completed => {
+                changes.push(SessionChange::TurnStatusChanged {
+                    turn_id,
+                    status: TurnStatus::Completed,
+                });
+            }
+            ProviderTurnOutcome::Failed {
+                streaming_message_id,
+                active_command_ids,
+                message,
+            } => {
+                changes.extend(terminal_output_changes(
+                    streaming_message_id,
+                    active_command_ids,
+                ));
+                changes.extend([
+                    SessionChange::ActivityAdded {
+                        activity: Activity::Error {
+                            id: ActivityId::new(),
+                            turn_id,
+                            text: message,
+                        },
+                    },
+                    SessionChange::TurnStatusChanged {
+                        turn_id,
+                        status: TurnStatus::Failed,
+                    },
+                ]);
+            }
+            ProviderTurnOutcome::Interrupted {
+                streaming_message_id,
+                active_command_ids,
+            } => {
+                changes.extend(terminal_output_changes(
+                    streaming_message_id,
+                    active_command_ids,
+                ));
+                changes.push(SessionChange::TurnStatusChanged {
+                    turn_id,
+                    status: TurnStatus::Interrupted,
+                });
+            }
+        }
+
+        let next_turn = next_queued_prompt.map(|prompt| {
+            let (delivered, delivery_changes) = prepare_prompt_delivery(prompt, TurnStatus::Active);
+            changes.extend(delivery_changes);
+            delivered
         });
-        self.publish(session_id, changes)
+
+        let updated_at = state.next_timestamp();
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
+        record.publish(session_id, changes)?;
+        for prompt in pending_steers {
+            record.steer_targets.remove(&prompt.id);
+        }
+        record.summary.updated_at = updated_at;
+        Ok(next_turn)
     }
 
     pub(crate) fn publish(
@@ -928,6 +987,56 @@ fn terminal_output_changes(
         }
     }));
     changes
+}
+
+fn append_steer_delivery_changes(
+    changes: &mut Vec<SessionChange>,
+    prompt: &Prompt,
+    turn_id: TurnId,
+) {
+    changes.extend([
+        SessionChange::PromptStatusChanged {
+            prompt_id: prompt.id,
+            status: PromptStatus::Delivered,
+        },
+        SessionChange::MessageAdded {
+            message: Message {
+                id: MessageId::new(),
+                turn_id,
+                role: MessageRole::User,
+                status: MessageStatus::Completed,
+                content: prompt.text.clone(),
+            },
+        },
+    ]);
+}
+
+fn prepare_prompt_delivery(
+    prompt: Prompt,
+    turn_status: TurnStatus,
+) -> (DeliveredTurn, Vec<SessionChange>) {
+    let turn = Turn {
+        id: TurnId::new(),
+        prompt_id: prompt.id,
+        status: turn_status,
+    };
+    let changes = vec![
+        SessionChange::PromptStatusChanged {
+            prompt_id: prompt.id,
+            status: PromptStatus::Delivered,
+        },
+        SessionChange::TurnAdded { turn: turn.clone() },
+        SessionChange::MessageAdded {
+            message: Message {
+                id: MessageId::new(),
+                turn_id: turn.id,
+                role: MessageRole::User,
+                status: MessageStatus::Completed,
+                content: prompt.text.clone(),
+            },
+        },
+    ];
+    (DeliveredTurn { prompt, turn }, changes)
 }
 
 fn snapshot_for_owner(state: &SessionStoreState, owner: &PromptOwner) -> SessionSnapshot {

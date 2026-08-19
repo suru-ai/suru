@@ -1553,7 +1553,25 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
             .status,
         TurnStatus::Interrupted
     );
-    assert_eq!(current.session.status, SessionStatus::Idle);
+    assert_eq!(current.session.status, SessionStatus::Active);
+    assert_eq!(current.turns.len(), 2);
+    assert_eq!(current.turns[1].prompt_id, after_interrupt.id);
+    assert_eq!(current.turns[1].status, TurnStatus::Active);
+    assert_eq!(
+        current
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == promoted.id)
+            .expect("promoted Prompt remains authoritative")
+            .status,
+        PromptStatus::Delivered
+    );
+    assert!(current.messages.iter().any(|message| {
+        message.turn_id == active_turn_id && message.content == "Promote this Prompt"
+    }));
+    assert!(current.messages.iter().any(|message| {
+        message.turn_id == current.turns[1].id && message.content == "Run after interruption"
+    }));
 
     assert!(
         server
@@ -1596,8 +1614,27 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
             .find(|prompt| prompt.id == after_interrupt.id)
             .expect("queued Prompt remains authoritative")
             .status,
-        PromptStatus::Pending
+        PromptStatus::Delivered
     );
+
+    let queued_start = provider_session.next_turn().await;
+    assert_eq!(queued_start.prompt(), "Run after interruption");
+    queued_start.succeed();
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = second
+                .read_session(session_id)
+                .await
+                .expect("read completed queued Turn");
+            if snapshot.session.status == SessionStatus::Idle {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued Turn reaches its terminal boundary");
 
     drop(observer);
     drop(provider_session);
