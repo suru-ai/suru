@@ -216,6 +216,9 @@ pub struct TuiState {
     submission_error: Option<String>,
     session: Option<SessionProjection>,
     landing_agent_selection: Option<AgentSelection>,
+    confirmed_landing_agent_selection: Option<AgentSelection>,
+    pending_landing_agent_selection: Option<AgentSelection>,
+    queued_landing_agent_selection: Option<AgentSelection>,
     pending_agent_selection: Option<PendingAgentSelection>,
     /// Newest complete Agent Selection awaiting the in-flight request; rapid
     /// cycles coalesce here so transport stays serialized per Session.
@@ -301,6 +304,9 @@ impl TuiState {
             submission_error: None,
             session: None,
             landing_agent_selection: None,
+            confirmed_landing_agent_selection: None,
+            pending_landing_agent_selection: None,
+            queued_landing_agent_selection: None,
             pending_agent_selection: None,
             queued_agent_selection: None,
             confirmed_agent_selection: None,
@@ -376,6 +382,14 @@ impl TuiState {
                     self.submission_error =
                         Some("Session ended because the shared server was replaced".to_owned());
                     self.sync_command_autocomplete();
+                }
+                if self.session.is_none() {
+                    self.landing_agent_selection = health.landing_agent_selection.clone();
+                    self.confirmed_landing_agent_selection = health.landing_agent_selection.clone();
+                    self.pending_landing_agent_selection = None;
+                    self.queued_landing_agent_selection = None;
+                    self.model_picker
+                        .refocus(self.landing_agent_selection.as_ref());
                 }
                 self.identity = Some(health.identity);
                 self.recovery = None;
@@ -836,6 +850,8 @@ pub enum ApplicationEvent {
         request: ModelListRequest,
         error: String,
     },
+    LandingAgentSelectionConfirmed(AgentSelection),
+    LandingAgentSelectionConfirmationFailed(String),
     AgentSelectionUpdated {
         operation_id: AgentSelectionOperationId,
         selection: AgentSelection,
@@ -926,6 +942,7 @@ pub enum ApplicationTransition {
     AttachSession(SessionId),
     ListSessions(SessionListRequest),
     ListModels(ModelListRequest),
+    ConfirmLandingAgentSelection(AgentSelection),
     UpdateAgentSelection {
         session_id: SessionId,
         request: UpdateAgentSelectionRequest,
@@ -1358,6 +1375,32 @@ impl Application {
                 }
                 Ok(ApplicationTransition::Continue)
             }
+            ApplicationEvent::LandingAgentSelectionConfirmed(selection) => {
+                if self.state.pending_landing_agent_selection.take().is_none() {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                self.state.confirmed_landing_agent_selection = Some(selection.clone());
+                self.state.submission_error = None;
+                if let Some(queued) = self.state.queued_landing_agent_selection.take()
+                    && queued != selection
+                {
+                    return Ok(self.begin_landing_agent_selection_confirmation(queued));
+                }
+                self.state.landing_agent_selection = Some(selection);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::LandingAgentSelectionConfirmationFailed(error) => {
+                if self.state.pending_landing_agent_selection.take().is_none() {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                if let Some(queued) = self.state.queued_landing_agent_selection.take() {
+                    return Ok(self.begin_landing_agent_selection_confirmation(queued));
+                }
+                self.state.landing_agent_selection =
+                    self.state.confirmed_landing_agent_selection.clone();
+                self.state.submission_error = Some(error);
+                Ok(ApplicationTransition::Continue)
+            }
             ApplicationEvent::AgentSelectionUpdated {
                 operation_id,
                 selection,
@@ -1522,7 +1565,10 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 let detached = self.state.session.take().is_some();
                 if detached {
-                    self.state.landing_agent_selection = inherited_selection;
+                    self.state.landing_agent_selection = inherited_selection.clone();
+                    self.state.confirmed_landing_agent_selection = inherited_selection;
+                    self.state.pending_landing_agent_selection = None;
+                    self.state.queued_landing_agent_selection = None;
                     self.state.confirmed_agent_selection = None;
                 }
                 self.state.session_events_blocked = detached;
@@ -1541,8 +1587,12 @@ impl Application {
         selection: AgentSelection,
     ) -> Result<ApplicationTransition> {
         let Some(session_id) = self.session_id() else {
-            self.state.landing_agent_selection = Some(selection);
-            return Ok(ApplicationTransition::Continue);
+            self.state.landing_agent_selection = Some(selection.clone());
+            if self.state.pending_landing_agent_selection.is_some() {
+                self.state.queued_landing_agent_selection = Some(selection);
+                return Ok(ApplicationTransition::Continue);
+            }
+            return Ok(self.begin_landing_agent_selection_confirmation(selection));
         };
         self.state.submission_error = None;
         if self.state.pending_agent_selection.is_some() {
@@ -1552,6 +1602,14 @@ impl Application {
             return Ok(ApplicationTransition::Continue);
         }
         self.begin_agent_selection_update(session_id, selection)
+    }
+
+    fn begin_landing_agent_selection_confirmation(
+        &mut self,
+        selection: AgentSelection,
+    ) -> ApplicationTransition {
+        self.state.pending_landing_agent_selection = Some(selection.clone());
+        ApplicationTransition::ConfirmLandingAgentSelection(selection)
     }
 
     fn begin_agent_selection_update(
@@ -3753,6 +3811,7 @@ async fn run_loop(
                             | ApplicationTransition::AttachSession(_)
                             | ApplicationTransition::ListSessions(_)
                             | ApplicationTransition::ListModels(_)
+                            | ApplicationTransition::ConfirmLandingAgentSelection(_)
                             | ApplicationTransition::UpdateAgentSelection { .. } => {
                                 unreachable!("managed events do not issue Session commands");
                             }
@@ -3836,6 +3895,18 @@ async fn run_loop(
                     SubmissionResult::OperationSucceeded => {}
                     SubmissionResult::OperationFailed(error) => {
                         application.handle_event(ApplicationEvent::SessionOperationFailed(error))?;
+                    }
+                    SubmissionResult::LandingAgentSelectionConfirmed(selection) => {
+                        let transition = application.handle_event(
+                            ApplicationEvent::LandingAgentSelectionConfirmed(selection),
+                        )?;
+                        flush_landing_agent_selection(&client, transition, &submission_tx);
+                    }
+                    SubmissionResult::LandingAgentSelectionConfirmationFailed(error) => {
+                        let transition = application.handle_event(
+                            ApplicationEvent::LandingAgentSelectionConfirmationFailed(error),
+                        )?;
+                        flush_landing_agent_selection(&client, transition, &submission_tx);
                     }
                     SubmissionResult::AgentSelectionUpdated {
                         operation_id,
@@ -4036,6 +4107,13 @@ async fn run_loop(
                                         ),
                                     );
                                 }
+                                ApplicationTransition::ConfirmLandingAgentSelection(selection) => {
+                                    spawn_landing_agent_selection_confirmation(
+                                        client.session_commands(),
+                                        selection,
+                                        submission_tx.clone(),
+                                    );
+                                }
                                 ApplicationTransition::UpdateAgentSelection {
                                     session_id,
                                     request,
@@ -4066,6 +4144,8 @@ enum SubmissionResult {
     },
     OperationSucceeded,
     OperationFailed(String),
+    LandingAgentSelectionConfirmed(AgentSelection),
+    LandingAgentSelectionConfirmationFailed(String),
     AgentSelectionUpdated {
         operation_id: AgentSelectionOperationId,
         selection: AgentSelection,
@@ -4145,6 +4225,36 @@ fn flush_agent_selection(
             results.clone(),
         );
     }
+}
+
+fn flush_landing_agent_selection(
+    client: &ManagedClient,
+    transition: ApplicationTransition,
+    results: &tokio::sync::mpsc::UnboundedSender<SubmissionResult>,
+) {
+    if let ApplicationTransition::ConfirmLandingAgentSelection(selection) = transition {
+        spawn_landing_agent_selection_confirmation(
+            client.session_commands(),
+            selection,
+            results.clone(),
+        );
+    }
+}
+
+fn spawn_landing_agent_selection_confirmation(
+    commands: SessionCommandClient,
+    selection: AgentSelection,
+    results: tokio::sync::mpsc::UnboundedSender<SubmissionResult>,
+) {
+    tokio::spawn(async move {
+        let result = match commands.confirm_landing_agent_selection(selection).await {
+            Ok(selection) => SubmissionResult::LandingAgentSelectionConfirmed(selection),
+            Err(error) => {
+                SubmissionResult::LandingAgentSelectionConfirmationFailed(error.to_string())
+            }
+        };
+        let _ = results.send(result);
+    });
 }
 
 fn spawn_agent_selection_update(

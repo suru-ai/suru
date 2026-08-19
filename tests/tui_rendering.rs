@@ -229,6 +229,32 @@ fn headless_application_handles_terminal_and_managed_events_through_the_producti
 }
 
 #[test]
+fn connected_application_uses_the_persisted_landing_agent_selection() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let selected = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-remembered"),
+        options: Vec::new(),
+    };
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(fixture_instance_id(), 42_424)
+                .with_landing_agent_selection(Some(selected.clone())),
+        )))
+        .expect("connect with persisted landing Agent Selection");
+
+    type_terminal_text(&mut application, "Use the remembered Agent");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit with persisted landing Agent Selection")
+    else {
+        panic!("landing Prompt should create a Session");
+    };
+    assert_eq!(request.agent_selection, Some(selected));
+}
+
+#[test]
 fn slash_autocomplete_invokes_new_session_from_a_description_match() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = Application::new(workspace.path());
@@ -510,15 +536,16 @@ fn model_picker_hands_off_to_ordered_options_and_applies_complete_landing_select
     let staged = rendered_application_rows(&application).join("\n");
     assert!(staged.contains("Reasoning · High"));
     assert!(staged.contains("Fast · On"));
-    assert_eq!(
-        application
-            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::CONTROL,
-            )))
-            .expect("apply complete options"),
-        ApplicationTransition::Continue
-    );
+    let ApplicationTransition::ConfirmLandingAgentSelection(confirmed) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+        )))
+        .expect("apply complete options")
+    else {
+        panic!("landing options should confirm the complete Agent Selection");
+    };
+    assert_eq!(confirmed.model, ModelId::new("gpt-configurable"));
     assert!(
         !rendered_application_rows(&application)
             .join("\n")
@@ -689,15 +716,15 @@ fn options_command_resolves_provider_default_and_explains_unavailable_configurat
             .expect("choose the same plain Model through /models"),
         ApplicationTransition::ListModels(_)
     ));
-    assert_eq!(
+    assert!(matches!(
         unavailable
             .handle_terminal_event(InputEvent::Key(KeyEvent::new(
                 KeyCode::Enter,
                 KeyModifiers::NONE,
             )))
             .expect("apply a Model without descriptors immediately"),
-        ApplicationTransition::Continue
-    );
+        ApplicationTransition::ConfirmLandingAgentSelection(_)
+    ));
     assert!(
         !rendered_application_rows(&unavailable)
             .join("\n")
@@ -1240,10 +1267,11 @@ fn reasoning_cycle_advances_provider_order_wrapping_through_the_default() {
     );
 
     // The landing default starts at Medium, so advertised order continues High.
-    assert_eq!(
-        press_reasoning_cycle(&mut application),
-        ApplicationTransition::Continue
-    );
+    let ApplicationTransition::ConfirmLandingAgentSelection(high) =
+        press_reasoning_cycle(&mut application)
+    else {
+        panic!("the first landing selection should dispatch immediately");
+    };
     assert!(reasoning_summary(&application).contains("Reasoning High"));
 
     assert_eq!(
@@ -1258,6 +1286,29 @@ fn reasoning_cycle_advances_provider_order_wrapping_through_the_default() {
         ApplicationTransition::Continue
     );
     assert!(reasoning_summary(&application).contains("Reasoning Medium"));
+
+    let ApplicationTransition::ConfirmLandingAgentSelection(latest) = application
+        .handle_event(ApplicationEvent::LandingAgentSelectionConfirmed(high))
+        .expect("settle the first landing confirmation")
+    else {
+        panic!("settling should flush only the latest coalesced landing selection");
+    };
+    assert_eq!(
+        latest
+            .options
+            .iter()
+            .find(|option| option.id == ModelOptionId::new("reasoning_effort"))
+            .map(|option| &option.value),
+        Some(&ModelOptionValue::Select {
+            choice: ModelOptionChoiceId::new("medium"),
+        })
+    );
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::LandingAgentSelectionConfirmed(latest))
+            .expect("settle the latest landing confirmation"),
+        ApplicationTransition::Continue
+    );
 }
 
 #[test]
@@ -2414,15 +2465,17 @@ fn landing_model_selection_and_new_session_inherit_complete_agent_selection() {
             .expect("select landing Model"),
         ApplicationTransition::Continue
     );
-    assert_eq!(
-        application
-            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::CONTROL,
-            )))
-            .expect("apply landing Model options"),
-        ApplicationTransition::Continue
-    );
+    let ApplicationTransition::ConfirmLandingAgentSelection(confirmed) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+        )))
+        .expect("apply landing Model options")
+    else {
+        panic!("landing options should confirm the complete Agent Selection");
+    };
+    assert_eq!(confirmed.model, ModelId::new("gpt-native"));
+    assert_eq!(confirmed.options.len(), 1);
     let wide = rendered_application_rows_at(&application, 100, 16).join("\n");
     assert!(wide.contains("Model GPT Friendly"));
     assert!(wide.contains("Reasoning High"));

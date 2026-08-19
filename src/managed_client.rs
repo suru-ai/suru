@@ -191,6 +191,15 @@ impl ManagedClient {
             .await
     }
 
+    pub async fn confirm_landing_agent_selection(
+        &self,
+        selection: AgentSelection,
+    ) -> Result<AgentSelection> {
+        self.session_commands()
+            .confirm_landing_agent_selection(selection)
+            .await
+    }
+
     pub async fn subscribe_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
         self.session_commands().subscribe_session(session_id).await
     }
@@ -305,6 +314,25 @@ impl SessionCommandClient {
             "Agent Selection update",
         )
         .await
+    }
+
+    pub(crate) async fn confirm_landing_agent_selection(
+        &self,
+        selection: AgentSelection,
+    ) -> Result<AgentSelection> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .put(format!(
+                "{}/v1/landing-agent-selection",
+                descriptor.base_url
+            ))
+            .bearer_auth(&descriptor.token)
+            .json(&selection)
+            .send()
+            .await
+            .context("send landing Agent Selection update command")?;
+        decode_api_response(response, "Landing Agent Selection update").await
     }
 
     pub(crate) async fn promote_prompt(

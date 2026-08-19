@@ -21,14 +21,14 @@ use crate::protocol::{
     TurnStatus, UpdateAgentSelectionRequest, Workspace,
 };
 use crate::session_projection::apply_update;
-use crate::storage::{PersistedSession, SessionPersistenceSink};
+use crate::storage::{PersistedSession, StorageSink};
 
 const SESSION_UPDATE_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 pub(crate) struct SessionStore {
     state: Arc<Mutex<SessionStoreState>>,
-    persistence: SessionPersistenceSink,
+    storage: StorageSink,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,10 +161,7 @@ pub(crate) enum ListSessionsError {
 }
 
 impl SessionStore {
-    pub(crate) fn new(
-        persisted_sessions: Vec<PersistedSession>,
-        persistence: SessionPersistenceSink,
-    ) -> Self {
+    pub(crate) fn new(persisted_sessions: Vec<PersistedSession>, storage: StorageSink) -> Self {
         let last_timestamp = persisted_sessions
             .iter()
             .map(|persisted| persisted.summary.updated_at)
@@ -213,7 +210,7 @@ impl SessionStore {
                 prompts,
                 last_timestamp,
             })),
-            persistence,
+            storage,
         }
     }
 
@@ -339,8 +336,7 @@ impl SessionStore {
                 selection_retry_prompt: None,
             },
         );
-        self.persistence
-            .created(persisted_summary, snapshot.clone());
+        self.storage.created(persisted_summary, snapshot.clone());
         Ok(StoreOutcome::Created(snapshot))
     }
 
@@ -414,7 +410,7 @@ impl SessionStore {
         };
         record
             .commit(
-                &self.persistence,
+                &self.storage,
                 session_id,
                 vec![SessionChange::PromptAdded {
                     prompt: prompt.clone(),
@@ -576,7 +572,7 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        let update = record.commit(&self.persistence, session_id, changes, updated_at)?;
+        let update = record.commit(&self.storage, session_id, changes, updated_at)?;
         Ok(Some(update))
     }
 
@@ -606,7 +602,7 @@ impl SessionStore {
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
         let update = record.commit(
-            &self.persistence,
+            &self.storage,
             session_id,
             vec![SessionChange::AgentSelectionChanged { selection }],
             updated_at,
@@ -670,7 +666,7 @@ impl SessionStore {
             }
             record
                 .commit(
-                    &self.persistence,
+                    &self.storage,
                     session_id,
                     changes,
                     updated_at.expect("changed selection has a timestamp"),
@@ -757,7 +753,7 @@ impl SessionStore {
                 .sessions
                 .get_mut(&session_id)
                 .expect("Session existence was checked while holding the store lock");
-            let update = record.commit(&self.persistence, session_id, changes, updated_at)?;
+            let update = record.commit(&self.storage, session_id, changes, updated_at)?;
             record.selection_retry_prompt = Some(restored.id);
             update
         };
@@ -830,7 +826,7 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        record.commit(&self.persistence, session_id, changes, updated_at)?;
+        record.commit(&self.storage, session_id, changes, updated_at)?;
         record.steer_targets.remove(&prompt_id);
         if record.selection_retry_prompt == Some(prompt_id) {
             record.selection_retry_prompt = None;
@@ -889,7 +885,7 @@ impl SessionStore {
             .expect("Session existence was checked while holding the store lock");
         let mut changes = Vec::with_capacity(2);
         append_steer_delivery_changes(&mut changes, &prompt, turn_id);
-        record.commit(&self.persistence, session_id, changes, updated_at)?;
+        record.commit(&self.storage, session_id, changes, updated_at)?;
         record.steer_targets.remove(&prompt_id);
         let mut delivered = prompt;
         delivered.status = PromptStatus::Delivered;
@@ -922,7 +918,7 @@ impl SessionStore {
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
         let update = record.commit(
-            &self.persistence,
+            &self.storage,
             session_id,
             vec![SessionChange::ActivityAdded {
                 activity: Activity::Error {
@@ -1064,7 +1060,7 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        record.commit(&self.persistence, session_id, changes, updated_at)?;
+        record.commit(&self.storage, session_id, changes, updated_at)?;
         for prompt in pending_steers {
             record.steer_targets.remove(&prompt.id);
         }
@@ -1088,7 +1084,7 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        stored.commit(&self.persistence, session_id, changes, updated_at)
+        stored.commit(&self.storage, session_id, changes, updated_at)
     }
 
     pub(crate) fn publish_agent_output(
@@ -1121,7 +1117,7 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        record.commit(&self.persistence, session_id, vec![change], updated_at)
+        record.commit(&self.storage, session_id, vec![change], updated_at)
     }
 
     pub(crate) fn continuation_boundary(
@@ -1181,7 +1177,7 @@ impl SessionStore {
                 },
             ]);
         }
-        record.commit(&self.persistence, session_id, changes, updated_at)?;
+        record.commit(&self.storage, session_id, changes, updated_at)?;
         Ok(delivered
             .into_iter()
             .map(|mut prompt| {
@@ -1228,7 +1224,7 @@ impl SessionStore {
         prompt.delivery = PromptDelivery::Steer;
         record
             .commit(
-                &self.persistence,
+                &self.storage,
                 session_id,
                 vec![SessionChange::PromptDeliveryChanged {
                     prompt_id,
@@ -1272,7 +1268,7 @@ impl SessionStore {
             .expect("Session existence was checked while holding the store lock");
         record
             .commit(
-                &self.persistence,
+                &self.storage,
                 session_id,
                 vec![SessionChange::PromptStatusChanged {
                     prompt_id,
@@ -1486,14 +1482,14 @@ impl PromptOwner {
 impl SessionRecord {
     fn commit(
         &mut self,
-        persistence: &SessionPersistenceSink,
+        storage: &StorageSink,
         session_id: SessionId,
         changes: Vec<SessionChange>,
         updated_at: SessionTimestamp,
     ) -> anyhow::Result<SessionUpdate> {
         let update = self.publish(session_id, changes)?;
         self.summary.updated_at = updated_at;
-        persistence.updated(self.summary.clone(), &update)?;
+        storage.updated(self.summary.clone(), &update)?;
         let _ = self.updates.send(update.clone());
         Ok(update)
     }

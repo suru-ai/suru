@@ -22,16 +22,16 @@ use chidori::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-        AgentSelection, AgentSelectionOperationId, CreateSessionRequest, FileChange, InitialPrompt,
-        LifecycleState, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
-        ModelCatalog, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
-        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
-        ModelOptionSelection, ModelOptionValue, PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId,
-        PromptOrder, PromptStatus, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
-        RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity, Session,
-        SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
-        SessionStatus, SessionSummary, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
-        UpdateAgentSelectionRequest, Workspace,
+        AgentSelection, AgentSelectionOperationId, CreateSessionRequest, FileChange, Health,
+        InitialPrompt, LifecycleState, Message, MessageId, MessageRole, MessageStatus,
+        ModelAvailability, ModelCatalog, ModelDescriptor, ModelId, ModelOptionChoice,
+        ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
+        ModelOptionRole, ModelOptionSelection, ModelOptionValue, PROTOCOL_VERSION, Prompt,
+        PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderCatalogStatus, ProviderId,
+        ProviderModelCatalog, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
+        ServerIdentity, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
+        SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionUpdate,
+        TranscriptItem, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
     },
     provider::{
         ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderFileChangeStatus,
@@ -1018,6 +1018,117 @@ async fn session_creation_makes_the_landing_agent_selection_authoritative() {
     assert_eq!(created.session.agent_selection, Some(selection));
 
     server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn confirmed_landing_agent_selection_defaults_new_sessions_after_a_restart() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let first_workspace = tempfile::tempdir().expect("create first valid Workspace");
+    let second_workspace = tempfile::tempdir().expect("create second valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "landing-selection-restart-test")
+        .expect("configure original server")
+        .with_data_dir(data_dir.path());
+    let (original_runtime, _original_provider) = ControlledProvider::new();
+    let original = server::spawn_with_provider(config.clone(), original_runtime)
+        .await
+        .expect("spawn original server");
+    let original_descriptor = original.descriptor().clone();
+    let client = reqwest::Client::new();
+
+    let initial = client
+        .post(format!("{}/v1/sessions", original_descriptor.base_url))
+        .bearer_auth(&original_descriptor.token)
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: first_workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Use the existing default".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session without a stored preference")
+        .error_for_status()
+        .expect("Session creation without a stored preference succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode Session without a stored preference");
+    assert_eq!(
+        initial.session.agent_selection, None,
+        "an absent preference must preserve the Provider's current default behavior"
+    );
+
+    let selected = controlled_selection("gpt-remembered", "high", "fast");
+    let confirmed = client
+        .put(format!(
+            "{}/v1/landing-agent-selection",
+            original_descriptor.base_url
+        ))
+        .bearer_auth(&original_descriptor.token)
+        .json(&selected)
+        .send()
+        .await
+        .expect("confirm landing Agent Selection")
+        .error_for_status()
+        .expect("landing Agent Selection confirmation succeeds")
+        .json::<AgentSelection>()
+        .await
+        .expect("decode confirmed landing Agent Selection");
+    assert_eq!(confirmed, selected);
+    original.shutdown().await.expect("stop original server");
+
+    let (replacement_runtime, _replacement_provider) = ControlledProvider::new();
+    let replacement = server::spawn_with_provider(config, replacement_runtime)
+        .await
+        .expect("spawn replacement server");
+    let replacement_descriptor = replacement.descriptor().clone();
+    let replacement_health = client
+        .get(format!("{}/health", replacement_descriptor.base_url))
+        .bearer_auth(&replacement_descriptor.token)
+        .send()
+        .await
+        .expect("read replacement server health")
+        .error_for_status()
+        .expect("replacement server health read succeeds")
+        .json::<Health>()
+        .await
+        .expect("decode replacement server health");
+    assert_eq!(
+        replacement_health.landing_agent_selection,
+        Some(selected.clone())
+    );
+
+    let created = client
+        .post(format!("{}/v1/sessions", replacement_descriptor.base_url))
+        .bearer_auth(&replacement_descriptor.token)
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: second_workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Reuse my remembered selection".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session with the persisted default")
+        .error_for_status()
+        .expect("Session creation with the persisted default succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode Session with the persisted default");
+    assert_eq!(created.session.agent_selection, Some(selected));
+
+    replacement
+        .shutdown()
+        .await
+        .expect("shut down replacement server");
 }
 
 #[tokio::test]

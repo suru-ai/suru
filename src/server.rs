@@ -12,7 +12,7 @@ use axum::{
     extract::{Path as AxumPath, Query, Request, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response, sse::Event, sse::Sse},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use fs2::FileExt;
 use futures_util::{StreamExt, stream};
@@ -29,8 +29,8 @@ use crate::RuntimeConfig;
 use crate::build_identity;
 use crate::model_catalog::ModelCatalogService;
 use crate::protocol::{
-    Activity, AdmitPromptRequest, CreateSessionRequest, LifecycleState, Message, MessageId,
-    MessageRole, MessageStatus, PROTOCOL_VERSION, ProviderId, RuntimeDescriptor,
+    Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, LifecycleState, Message,
+    MessageId, MessageRole, MessageStatus, PROTOCOL_VERSION, ProviderId, RuntimeDescriptor,
     SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity,
     ServerShutdown, SessionChange, SessionError, SessionErrorCode, SessionId, SessionUpdate,
     ShutdownReason, TurnId, UpdateAgentSelectionRequest,
@@ -44,7 +44,7 @@ use crate::sessions::{
     ListSessionsError, PromptAdmissionDisposition, PromptMutationError, SessionFeed, SessionStore,
     StoreOutcome,
 };
-use crate::storage::{SessionPersistenceWriter, SessionRepository};
+use crate::storage::{StorageRepository, StorageSink, StorageWriter};
 
 pub type ServerConfig = RuntimeConfig;
 
@@ -231,11 +231,43 @@ impl ShutdownController {
 }
 
 #[derive(Clone)]
+struct LandingAgentSelectionStore {
+    current: Arc<Mutex<Option<AgentSelection>>>,
+    storage: StorageSink,
+}
+
+impl LandingAgentSelectionStore {
+    fn new(current: Option<AgentSelection>, storage: StorageSink) -> Self {
+        Self {
+            current: Arc::new(Mutex::new(current)),
+            storage,
+        }
+    }
+
+    fn current(&self) -> Option<AgentSelection> {
+        self.current
+            .lock()
+            .expect("landing Agent Selection lock is not poisoned")
+            .clone()
+    }
+
+    fn confirm(&self, selection: AgentSelection) {
+        let mut current = self
+            .current
+            .lock()
+            .expect("landing Agent Selection lock is not poisoned");
+        self.storage.save_landing_agent_selection(selection.clone());
+        *current = Some(selection);
+    }
+}
+
+#[derive(Clone)]
 struct AppState {
     descriptor: Arc<RuntimeDescriptor>,
     sessions: SessionStore,
     providers: ProviderOrchestrator,
     model_catalog: ModelCatalogService,
+    landing_agent_selection: LandingAgentSelectionStore,
     shutdown: ShutdownController,
     provider_id: ProviderId,
 }
@@ -261,13 +293,17 @@ pub async fn spawn_with_provider(
         .context("another server already owns this channel")?;
     protect_current_user_file(&config.lock_path())?;
 
-    let repository = SessionRepository::open(config.data_dir())
+    let repository = StorageRepository::open(config.data_dir())
         .await
         .context("initialize Session repository")?;
     let persisted_sessions = repository
         .load_sessions()
         .await
         .context("load persisted Sessions")?;
+    let persisted_landing_agent_selection = repository
+        .landing_agent_selection()
+        .await
+        .context("load persisted landing Agent Selection")?;
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -298,9 +334,10 @@ pub async fn spawn_with_provider(
         provider_updates: provider_updates.clone(),
     };
     let provider_id = runtime.provider_id();
-    let (persistence_writer, persistence) =
-        SessionPersistenceWriter::spawn(repository, &persisted_sessions);
-    let sessions = SessionStore::new(persisted_sessions, persistence);
+    let (storage_writer, storage) = StorageWriter::spawn(repository, &persisted_sessions);
+    let sessions = SessionStore::new(persisted_sessions, storage.clone());
+    let landing_agent_selection =
+        LandingAgentSelectionStore::new(persisted_landing_agent_selection, storage);
     let model_catalog = ModelCatalogService::new([runtime.clone()]);
     let providers = ProviderOrchestrator::new(
         runtime,
@@ -313,6 +350,7 @@ pub async fn spawn_with_provider(
         sessions: sessions.clone(),
         providers: providers.clone(),
         model_catalog,
+        landing_agent_selection,
         shutdown: shutdown.clone(),
         provider_id,
     };
@@ -321,6 +359,10 @@ pub async fn spawn_with_provider(
         .route("/v1/events", get(events))
         .route("/v1/models", get(list_models))
         .route("/v1/models/refresh", post(refresh_models))
+        .route(
+            "/v1/landing-agent-selection",
+            put(confirm_landing_agent_selection),
+        )
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/sessions/{session_id}", get(read_session))
         .route(
@@ -365,17 +407,17 @@ pub async fn spawn_with_provider(
         let provider_shutdown_result = provider_shutdown_task
             .await
             .context("Provider shutdown task panicked");
-        let persistence_shutdown_result = persistence_writer
+        let storage_shutdown_result = storage_writer
             .shutdown()
             .await
-            .context("shut down Session persistence writer");
+            .context("shut down storage writer");
         if result.is_err() {
             task_lifecycle.send_replace(LifecycleState::Failed);
         }
         remove_own_descriptor(&descriptor_path, instance_id);
         result
             .and(provider_shutdown_result)
-            .and(persistence_shutdown_result)
+            .and(storage_shutdown_result)
     });
     lifecycle.send_if_modified(|state| {
         if *state == LifecycleState::Starting {
@@ -482,7 +524,39 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    Json(state.descriptor.health(state.shutdown.lifecycle())).into_response()
+    Json(
+        state
+            .descriptor
+            .health(state.shutdown.lifecycle())
+            .with_landing_agent_selection(state.landing_agent_selection.current()),
+    )
+    .into_response()
+}
+
+async fn confirm_landing_agent_selection(
+    State(state): State<AppState>,
+    request: Request,
+) -> Response {
+    let selection = match decode_session_command::<AgentSelection>(
+        &state,
+        request,
+        "Landing Agent Selection update",
+    )
+    .await
+    {
+        Ok(selection) => selection,
+        Err(response) => return response,
+    };
+    let selection = match normalize_agent_selection(
+        &state,
+        selection,
+        landing_agent_selection_provider_conflict_response,
+    ) {
+        Ok(selection) => selection,
+        Err(response) => return *response,
+    };
+    state.landing_agent_selection.confirm(selection.clone());
+    Json(selection).into_response()
 }
 
 async fn create_session(State(state): State<AppState>, request: Request) -> Response {
@@ -494,24 +568,27 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             Err(response) => return response,
         };
 
-    if request
-        .agent_selection
-        .as_ref()
-        .is_some_and(|selection| selection.provider != state.provider_id)
-    {
-        return agent_selection_provider_conflict_response();
-    }
-    if let Some(selection) = request.agent_selection.as_ref() {
-        request.agent_selection = match state.model_catalog.normalize_selection(selection) {
+    if let Some(selection) = request.agent_selection.take() {
+        request.agent_selection = match normalize_agent_selection(
+            &state,
+            selection,
+            landing_agent_selection_provider_conflict_response,
+        ) {
             Ok(selection) => Some(selection),
-            Err(message) => return invalid_agent_selection_response(message),
+            Err(response) => return *response,
         };
     } else {
-        request.agent_selection = state.model_catalog.default_selection(&state.provider_id);
+        request.agent_selection = state
+            .landing_agent_selection
+            .current()
+            .or_else(|| state.model_catalog.default_selection(&state.provider_id));
     }
 
     match state.sessions.create(request) {
         Ok(StoreOutcome::Created(snapshot)) => {
+            if let Some(selection) = snapshot.session.agent_selection.clone() {
+                state.landing_agent_selection.confirm(selection);
+            }
             state.providers.open_session(
                 snapshot.session.id,
                 snapshot.session.workspace.path.clone(),
@@ -549,12 +626,13 @@ async fn update_agent_selection(
         Ok(request) => request,
         Err(response) => return response,
     };
-    if request.selection.provider != state.provider_id {
-        return agent_selection_provider_conflict_response();
-    }
-    request.selection = match state.model_catalog.normalize_selection(&request.selection) {
+    request.selection = match normalize_agent_selection(
+        &state,
+        request.selection,
+        agent_selection_provider_conflict_response,
+    ) {
         Ok(selection) => selection,
-        Err(message) => return invalid_agent_selection_response(message),
+        Err(response) => return *response,
     };
     match state
         .sessions
@@ -567,6 +645,9 @@ async fn update_agent_selection(
                     .schedule_prompt(session_id, prompt_id)
                     .expect("stored Sessions retain their Provider actor");
             }
+            state
+                .landing_agent_selection
+                .confirm(mutation.selection.clone());
             Json(mutation.selection).into_response()
         }
         Err(AgentSelectionMutationError::SessionNotFound) => session_error_response(
@@ -591,6 +672,28 @@ fn agent_selection_provider_conflict_response() -> Response {
         SessionErrorCode::AgentSelectionProviderConflict,
         "An existing Session cannot change Provider",
     )
+}
+
+fn landing_agent_selection_provider_conflict_response() -> Response {
+    session_error_response(
+        StatusCode::CONFLICT,
+        SessionErrorCode::AgentSelectionProviderConflict,
+        "Landing Agent Selection must use a Provider available on this server",
+    )
+}
+
+fn normalize_agent_selection(
+    state: &AppState,
+    selection: AgentSelection,
+    provider_conflict_response: fn() -> Response,
+) -> std::result::Result<AgentSelection, Box<Response>> {
+    if selection.provider != state.provider_id {
+        return Err(Box::new(provider_conflict_response()));
+    }
+    state
+        .model_catalog
+        .normalize_selection(&selection)
+        .map_err(|message| Box::new(invalid_agent_selection_response(message)))
 }
 
 fn invalid_agent_selection_response(message: String) -> Response {

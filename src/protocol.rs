@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SESSION_SNAPSHOT_EVENT: &str = "session_snapshot";
 pub const SESSION_UPDATED_EVENT: &str = "session_updated";
@@ -685,6 +685,7 @@ pub struct ServerIdentity {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Health {
     pub lifecycle: LifecycleState,
+    pub landing_agent_selection: Option<AgentSelection>,
     #[serde(flatten)]
     pub identity: ServerIdentity,
 }
@@ -693,8 +694,17 @@ impl Health {
     pub fn new(identity: ServerIdentity, lifecycle: LifecycleState) -> Self {
         Self {
             lifecycle,
+            landing_agent_selection: None,
             identity,
         }
+    }
+
+    pub fn with_landing_agent_selection(
+        mut self,
+        landing_agent_selection: Option<AgentSelection>,
+    ) -> Self {
+        self.landing_agent_selection = landing_agent_selection;
+        self
     }
 }
 
@@ -720,6 +730,8 @@ struct HealthWire {
     lifecycle: LifecycleState,
     protocol_version: u32,
     build_identity: String,
+    #[serde(default)]
+    landing_agent_selection: Option<AgentSelection>,
 }
 
 impl<'de> Deserialize<'de> for Health {
@@ -736,7 +748,8 @@ impl<'de> Deserialize<'de> for Health {
                 build_identity: wire.build_identity,
             },
             wire.lifecycle,
-        ))
+        )
+        .with_landing_agent_selection(wire.landing_agent_selection))
     }
 }
 

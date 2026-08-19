@@ -195,6 +195,46 @@ async fn a_failed_embedded_database_migration_leaves_no_partial_schema() {
 }
 
 #[tokio::test]
+async fn an_unreadable_landing_agent_selection_falls_back_without_blocking_startup() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let config = ServerConfig::new(state_dir.path(), "unreadable-landing-selection-test")
+        .expect("configure server")
+        .with_data_dir(data_dir.path());
+    let database_path = config.data_dir().join("chidori.db");
+    let original = server::spawn(config.clone())
+        .await
+        .expect("spawn server to migrate database");
+    original.shutdown().await.expect("stop original server");
+    seed_database(
+        &database_path,
+        "INSERT INTO landing_agent_selection (singleton, selection) VALUES (1, 'not-json');",
+    );
+
+    let replacement = server::spawn(config)
+        .await
+        .expect("unreadable preference must not block startup");
+    let descriptor = replacement.descriptor().clone();
+    let health = reqwest::Client::new()
+        .get(format!("{}/health", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("read replacement health")
+        .error_for_status()
+        .expect("replacement health succeeds")
+        .json::<Health>()
+        .await
+        .expect("decode replacement health");
+    assert_eq!(health.landing_agent_selection, None);
+
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement server");
+}
+
+#[tokio::test]
 async fn authenticated_health_describes_the_ready_server() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let server = server::spawn(

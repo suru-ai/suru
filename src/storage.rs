@@ -1,4 +1,4 @@
-//! Durable Session state behind a domain-oriented repository seam.
+//! Durable server state behind a domain-oriented repository seam.
 
 use std::{
     collections::HashMap,
@@ -34,7 +34,7 @@ use crate::{
 };
 
 const DATABASE_FILE: &str = "chidori.db";
-const CURRENT_SCHEMA_VERSION: &str = "20260820010000";
+const CURRENT_SCHEMA_VERSION: &str = "20260820020000";
 const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(100);
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
@@ -49,6 +49,13 @@ diesel::table! {
         agent_selection_availability -> Text,
         status -> Text,
         revision -> BigInt,
+    }
+}
+
+diesel::table! {
+    landing_agent_selection (singleton) {
+        singleton -> Integer,
+        selection -> Text,
     }
 }
 
@@ -95,7 +102,7 @@ diesel::table! {
 }
 
 #[derive(Clone)]
-pub(crate) struct SessionRepository {
+pub(crate) struct StorageRepository {
     database_path: Arc<PathBuf>,
 }
 
@@ -106,7 +113,7 @@ pub(crate) struct PersistedSession {
 }
 
 #[derive(Debug)]
-pub(crate) enum SessionRepositoryError {
+pub(crate) enum StorageError {
     InvalidDatabasePath(PathBuf),
     Open {
         path: PathBuf,
@@ -126,6 +133,7 @@ pub(crate) enum SessionRepositoryError {
         session_id: SessionId,
         message: String,
     },
+    WriteLandingAgentSelection(String),
     BlockingTask {
         operation: &'static str,
         message: String,
@@ -133,7 +141,7 @@ pub(crate) enum SessionRepositoryError {
     WriterTask(String),
 }
 
-impl fmt::Display for SessionRepositoryError {
+impl fmt::Display for StorageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidDatabasePath(path) => {
@@ -164,6 +172,9 @@ impl fmt::Display for SessionRepositoryError {
                 session_id,
                 message,
             } => write!(formatter, "save Session {session_id}: {message}"),
+            Self::WriteLandingAgentSelection(message) => {
+                write!(formatter, "save landing Agent Selection: {message}")
+            }
             Self::BlockingTask { operation, message } => write!(
                 formatter,
                 "Session repository {operation} task failed: {message}"
@@ -175,10 +186,10 @@ impl fmt::Display for SessionRepositoryError {
     }
 }
 
-impl std::error::Error for SessionRepositoryError {}
+impl std::error::Error for StorageError {}
 
-impl SessionRepository {
-    pub(crate) async fn open(data_root: &Path) -> Result<Self, SessionRepositoryError> {
+impl StorageRepository {
+    pub(crate) async fn open(data_root: &Path) -> Result<Self, StorageError> {
         let repository = Self {
             database_path: Arc::new(data_root.join(DATABASE_FILE)),
         };
@@ -187,17 +198,30 @@ impl SessionRepository {
         Ok(repository)
     }
 
-    pub(crate) async fn load_sessions(
-        &self,
-    ) -> Result<Vec<PersistedSession>, SessionRepositoryError> {
+    pub(crate) async fn load_sessions(&self) -> Result<Vec<PersistedSession>, StorageError> {
         let database_path = self.database_path.as_ref().clone();
         on_blocking_task("loading", move || load_sessions(&database_path)).await
     }
 
-    fn save_sessions(
+    pub(crate) async fn landing_agent_selection(
         &self,
-        persisted: Vec<PersistedSession>,
-    ) -> Result<(), SessionRepositoryError> {
+    ) -> Result<Option<AgentSelection>, StorageError> {
+        let database_path = self.database_path.as_ref().clone();
+        on_blocking_task("reading landing Agent Selection", move || {
+            let mut connection = connect(&database_path)?;
+            let row = landing_agent_selection::table
+                .select(LandingAgentSelectionRow::as_select())
+                .first::<LandingAgentSelectionRow>(&mut connection)
+                .optional()
+                .map_err(|error| StorageError::Read(error.to_string()))?;
+            // A preference is best-effort stored state. If a future or damaged payload cannot
+            // decode, preserve startup and fall back to the Provider's current default.
+            Ok(row.and_then(LandingAgentSelectionRow::into_selection))
+        })
+        .await
+    }
+
+    fn save_sessions(&self, persisted: Vec<PersistedSession>) -> Result<(), StorageError> {
         if persisted.is_empty() {
             return Ok(());
         }
@@ -211,16 +235,29 @@ impl SessionRepository {
         }
         Ok(())
     }
+
+    fn save_landing_agent_selection(&self, selection: AgentSelection) -> Result<(), StorageError> {
+        let row = LandingAgentSelectionRow::from_selection(selection)?;
+        let mut connection = connect(&self.database_path)?;
+        diesel::insert_into(landing_agent_selection::table)
+            .values(&row)
+            .on_conflict(landing_agent_selection::singleton)
+            .do_update()
+            .set(&row)
+            .execute(&mut connection)
+            .map_err(|error| StorageError::WriteLandingAgentSelection(error.to_string()))?;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
-pub(crate) struct SessionPersistenceSink {
+pub(crate) struct StorageSink {
     commands: std_mpsc::Sender<WriterCommand>,
 }
 
-pub(crate) struct SessionPersistenceWriter {
+pub(crate) struct StorageWriter {
     commands: std_mpsc::Sender<WriterCommand>,
-    task: JoinHandle<Result<(), SessionRepositoryError>>,
+    task: JoinHandle<Result<(), StorageError>>,
 }
 
 enum WriterCommand {
@@ -230,6 +267,7 @@ enum WriterCommand {
         update: SessionUpdate,
         durability: Option<std_mpsc::SyncSender<Result<(), String>>>,
     },
+    SaveLandingAgentSelection(AgentSelection),
     Shutdown,
 }
 
@@ -238,11 +276,11 @@ struct WriterState {
     dirty: bool,
 }
 
-impl SessionPersistenceWriter {
+impl StorageWriter {
     pub(crate) fn spawn(
-        repository: SessionRepository,
+        repository: StorageRepository,
         restored: &[PersistedSession],
-    ) -> (Self, SessionPersistenceSink) {
+    ) -> (Self, StorageSink) {
         let (commands, receiver) = std_mpsc::channel();
         let mut sessions = restored
             .iter()
@@ -276,12 +314,12 @@ impl SessionPersistenceWriter {
                     }) => {
                         let session_id = update.session_id;
                         let state = sessions.get_mut(&session_id).ok_or_else(|| {
-                            SessionRepositoryError::WriterTask(format!(
+                            StorageError::WriterTask(format!(
                                 "received update for unknown Session {session_id}"
                             ))
                         })?;
                         apply_update(&mut state.persisted.snapshot, &update).map_err(|error| {
-                            SessionRepositoryError::WriterTask(format!(
+                            StorageError::WriterTask(format!(
                                 "project update for Session {session_id}: {error:#}"
                             ))
                         })?;
@@ -296,6 +334,9 @@ impl SessionPersistenceWriter {
                             }
                             result?;
                         }
+                    }
+                    Ok(WriterCommand::SaveLandingAgentSelection(selection)) => {
+                        repository.save_landing_agent_selection(selection)?;
                     }
                     Ok(WriterCommand::Shutdown) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                         flush_sessions(&repository, &mut sessions, None)?;
@@ -313,20 +354,20 @@ impl SessionPersistenceWriter {
                 commands: commands.clone(),
                 task,
             },
-            SessionPersistenceSink { commands },
+            StorageSink { commands },
         )
     }
 
-    pub(crate) async fn shutdown(self) -> Result<(), SessionRepositoryError> {
+    pub(crate) async fn shutdown(self) -> Result<(), StorageError> {
         let _ = self.commands.send(WriterCommand::Shutdown);
         tokio::task::spawn_blocking(move || self.task.join())
             .await
-            .map_err(|error| SessionRepositoryError::WriterTask(error.to_string()))?
-            .map_err(|_| SessionRepositoryError::WriterTask("writer thread panicked".to_owned()))?
+            .map_err(|error| StorageError::WriterTask(error.to_string()))?
+            .map_err(|_| StorageError::WriterTask("writer thread panicked".to_owned()))?
     }
 }
 
-impl SessionPersistenceSink {
+impl StorageSink {
     pub(crate) fn created(&self, summary: SessionSummary, snapshot: SessionSnapshot) {
         let _ = self.commands.send(WriterCommand::Create(PersistedSession {
             summary,
@@ -338,7 +379,7 @@ impl SessionPersistenceSink {
         &self,
         summary: SessionSummary,
         update: &SessionUpdate,
-    ) -> Result<(), SessionRepositoryError> {
+    ) -> Result<(), StorageError> {
         // The sender is the only streaming-path work. Projection, coalescing, and SQLite I/O all
         // happen in the background writer.
         let (durability, receipt) = if is_turn_boundary(update) {
@@ -353,28 +394,32 @@ impl SessionPersistenceSink {
                 update: update.clone(),
                 durability,
             })
-            .map_err(|_| {
-                SessionRepositoryError::WriterTask("writer is no longer running".to_owned())
-            })?;
+            .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))?;
         if let Some(receipt) = receipt {
             receipt
                 .recv()
                 .map_err(|_| {
-                    SessionRepositoryError::WriterTask(
+                    StorageError::WriterTask(
                         "writer stopped before confirming a Turn boundary".to_owned(),
                     )
                 })?
-                .map_err(SessionRepositoryError::WriterTask)?;
+                .map_err(StorageError::WriterTask)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn save_landing_agent_selection(&self, selection: AgentSelection) {
+        let _ = self
+            .commands
+            .send(WriterCommand::SaveLandingAgentSelection(selection));
     }
 }
 
 fn flush_sessions(
-    repository: &SessionRepository,
+    repository: &StorageRepository,
     sessions: &mut HashMap<SessionId, WriterState>,
     only: Option<SessionId>,
-) -> Result<(), SessionRepositoryError> {
+) -> Result<(), StorageError> {
     let dirty = sessions
         .iter()
         .filter(|(session_id, state)| {
@@ -402,6 +447,27 @@ fn is_turn_boundary(update: &SessionUpdate) -> bool {
         }
         _ => false,
     })
+}
+
+#[derive(AsChangeset, Insertable, Queryable, Selectable)]
+#[diesel(table_name = landing_agent_selection)]
+struct LandingAgentSelectionRow {
+    singleton: i32,
+    selection: String,
+}
+
+impl LandingAgentSelectionRow {
+    fn from_selection(selection: AgentSelection) -> Result<Self, StorageError> {
+        Ok(Self {
+            singleton: 1,
+            selection: serde_json::to_string(&selection)
+                .map_err(|error| StorageError::WriteLandingAgentSelection(error.to_string()))?,
+        })
+    }
+
+    fn into_selection(self) -> Option<AgentSelection> {
+        serde_json::from_str(&self.selection).ok()
+    }
 }
 
 #[derive(AsChangeset, Insertable, Queryable, Selectable)]
@@ -493,7 +559,7 @@ struct TranscriptPosition<'a> {
 }
 
 impl StoredRows {
-    fn from_session(persisted: PersistedSession) -> Result<Self, SessionRepositoryError> {
+    fn from_session(persisted: PersistedSession) -> Result<Self, StorageError> {
         let PersistedSession { summary, snapshot } = persisted;
         let session_id = snapshot.session.id;
         let id = session_id.to_string();
@@ -569,7 +635,7 @@ impl SessionRow {
     fn from_parts(
         summary: SessionSummary,
         revision: SessionRevision,
-    ) -> Result<Self, SessionRepositoryError> {
+    ) -> Result<Self, StorageError> {
         let session_id = summary.session.id;
         Ok(Self {
             id: session_id.to_string(),
@@ -598,9 +664,7 @@ impl SessionRow {
         })
     }
 
-    fn into_summary_and_revision(
-        self,
-    ) -> Result<(SessionSummary, SessionRevision), SessionRepositoryError> {
+    fn into_summary_and_revision(self) -> Result<(SessionSummary, SessionRevision), StorageError> {
         let session_id = self.id.clone();
         let id = parse_id(&session_id, "Session ID", SessionId::from_uuid)?;
         let workspace: StoredWorkspace = decode(&session_id, "Workspace", &self.workspace)?;
@@ -632,10 +696,7 @@ impl SessionRow {
 }
 
 impl PromptRow {
-    fn from_prompt(
-        position: RowPosition<'_>,
-        prompt: Prompt,
-    ) -> Result<Self, SessionRepositoryError> {
+    fn from_prompt(position: RowPosition<'_>, prompt: Prompt) -> Result<Self, StorageError> {
         Ok(Self {
             id: prompt.id.to_string(),
             session_id: position.stored_session_id.to_owned(),
@@ -657,7 +718,7 @@ impl PromptRow {
         })
     }
 
-    fn into_prompt(self) -> Result<Prompt, SessionRepositoryError> {
+    fn into_prompt(self) -> Result<Prompt, StorageError> {
         let session_id = self.session_id;
         let payload: StoredPromptPayload = decode(&session_id, "Prompt payload", &self.payload)?;
         Ok(Prompt {
@@ -675,7 +736,7 @@ impl PromptRow {
 }
 
 impl TurnRow {
-    fn from_turn(position: RowPosition<'_>, turn: Turn) -> Result<Self, SessionRepositoryError> {
+    fn from_turn(position: RowPosition<'_>, turn: Turn) -> Result<Self, StorageError> {
         Ok(Self {
             id: turn.id.to_string(),
             session_id: position.stored_session_id.to_owned(),
@@ -692,7 +753,7 @@ impl TurnRow {
         })
     }
 
-    fn into_turn(self) -> Result<Turn, SessionRepositoryError> {
+    fn into_turn(self) -> Result<Turn, StorageError> {
         let session_id = self.session_id;
         let payload: StoredTurnPayload = decode(&session_id, "Turn payload", &self.payload)?;
         Ok(Turn {
@@ -708,7 +769,7 @@ impl MessageRow {
     fn from_message(
         position: TranscriptPosition<'_>,
         message: Message,
-    ) -> Result<Self, SessionRepositoryError> {
+    ) -> Result<Self, StorageError> {
         Ok(Self {
             id: message.id.to_string(),
             session_id: position.row.stored_session_id.to_owned(),
@@ -735,7 +796,7 @@ impl MessageRow {
         })
     }
 
-    fn into_message(self) -> Result<(Message, i64), SessionRepositoryError> {
+    fn into_message(self) -> Result<(Message, i64), StorageError> {
         let session_id = self.session_id;
         let payload: StoredMessagePayload = decode(&session_id, "Message payload", &self.payload)?;
         Ok((
@@ -755,7 +816,7 @@ impl ActivityRow {
     fn from_activity(
         position: TranscriptPosition<'_>,
         activity: Activity,
-    ) -> Result<Self, SessionRepositoryError> {
+    ) -> Result<Self, StorageError> {
         let id = activity.id();
         let turn_id = activity.turn_id();
         Ok(Self {
@@ -780,7 +841,7 @@ impl ActivityRow {
         })
     }
 
-    fn into_activity(self) -> Result<(Activity, i64), SessionRepositoryError> {
+    fn into_activity(self) -> Result<(Activity, i64), StorageError> {
         let session_id = self.session_id;
         let id = parse_id(&self.id, "Activity ID", ActivityId::from_uuid)?;
         let turn_id = parse_id(&self.turn_id, "Activity Turn ID", TurnId::from_uuid)?;
@@ -1060,12 +1121,12 @@ impl From<StoredFileChange> for FileChange {
     }
 }
 
-fn load_sessions(database_path: &Path) -> Result<Vec<PersistedSession>, SessionRepositoryError> {
+fn load_sessions(database_path: &Path) -> Result<Vec<PersistedSession>, StorageError> {
     let mut connection = connect(database_path)?;
     sessions::table
         .select(SessionRow::as_select())
         .load::<SessionRow>(&mut connection)
-        .map_err(|error| SessionRepositoryError::Read(error.to_string()))?
+        .map_err(|error| StorageError::Read(error.to_string()))?
         .into_iter()
         .map(|row| load_session(&mut connection, row))
         .collect()
@@ -1074,7 +1135,7 @@ fn load_sessions(database_path: &Path) -> Result<Vec<PersistedSession>, SessionR
 fn load_session(
     connection: &mut SqliteConnection,
     row: SessionRow,
-) -> Result<PersistedSession, SessionRepositoryError> {
+) -> Result<PersistedSession, StorageError> {
     let stored_session_id = row.id.clone();
     let (summary, revision) = row.into_summary_and_revision()?;
     let prompt_rows = prompts::table
@@ -1082,25 +1143,25 @@ fn load_session(
         .order(prompts::row_order.asc())
         .select(PromptRow::as_select())
         .load(connection)
-        .map_err(|error| SessionRepositoryError::Read(error.to_string()))?;
+        .map_err(|error| StorageError::Read(error.to_string()))?;
     let turn_rows = turns::table
         .filter(turns::session_id.eq(&stored_session_id))
         .order(turns::row_order.asc())
         .select(TurnRow::as_select())
         .load(connection)
-        .map_err(|error| SessionRepositoryError::Read(error.to_string()))?;
+        .map_err(|error| StorageError::Read(error.to_string()))?;
     let message_rows = messages::table
         .filter(messages::session_id.eq(&stored_session_id))
         .order(messages::row_order.asc())
         .select(MessageRow::as_select())
         .load(connection)
-        .map_err(|error| SessionRepositoryError::Read(error.to_string()))?;
+        .map_err(|error| StorageError::Read(error.to_string()))?;
     let activity_rows = activities::table
         .filter(activities::session_id.eq(&stored_session_id))
         .order(activities::row_order.asc())
         .select(ActivityRow::as_select())
         .load(connection)
-        .map_err(|error| SessionRepositoryError::Read(error.to_string()))?;
+        .map_err(|error| StorageError::Read(error.to_string()))?;
 
     let prompts = prompt_rows
         .into_iter()
@@ -1158,10 +1219,7 @@ fn load_session(
     Ok(PersistedSession { summary, snapshot })
 }
 
-fn save_rows(
-    connection: &mut SqliteConnection,
-    rows: StoredRows,
-) -> Result<(), SessionRepositoryError> {
+fn save_rows(connection: &mut SqliteConnection, rows: StoredRows) -> Result<(), StorageError> {
     let session_id = rows.session_id;
     connection
         .transaction::<_, diesel::result::Error, _>(|connection| {
@@ -1205,39 +1263,38 @@ fn save_rows(
             }
             Ok(())
         })
-        .map_err(|error| SessionRepositoryError::Write {
+        .map_err(|error| StorageError::Write {
             session_id,
             message: error.to_string(),
         })
 }
 
-fn initialize_database(database_path: &Path) -> Result<(), SessionRepositoryError> {
+fn initialize_database(database_path: &Path) -> Result<(), StorageError> {
     let mut connection = connect(database_path)?;
     refuse_newer_schema(&mut connection)?;
     connection
         .run_pending_migrations(MIGRATIONS)
-        .map_err(|error| SessionRepositoryError::Migration(error.to_string()))?;
-    protect_current_user_file(database_path).map_err(|error| SessionRepositoryError::Open {
+        .map_err(|error| StorageError::Migration(error.to_string()))?;
+    protect_current_user_file(database_path).map_err(|error| StorageError::Open {
         path: database_path.to_owned(),
         message: error.to_string(),
     })
 }
 
-fn connect(database_path: &Path) -> Result<SqliteConnection, SessionRepositoryError> {
+fn connect(database_path: &Path) -> Result<SqliteConnection, StorageError> {
     let database_url = database_path
         .to_str()
-        .ok_or_else(|| SessionRepositoryError::InvalidDatabasePath(database_path.to_owned()))?;
-    let mut connection = SqliteConnection::establish(database_url).map_err(|error| {
-        SessionRepositoryError::Open {
+        .ok_or_else(|| StorageError::InvalidDatabasePath(database_path.to_owned()))?;
+    let mut connection =
+        SqliteConnection::establish(database_url).map_err(|error| StorageError::Open {
             path: database_path.to_owned(),
             message: error.to_string(),
-        }
-    })?;
+        })?;
     connection
         .batch_execute(
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
         )
-        .map_err(|error| SessionRepositoryError::Open {
+        .map_err(|error| StorageError::Open {
             path: database_path.to_owned(),
             message: error.to_string(),
         })?;
@@ -1256,12 +1313,12 @@ struct VersionRow {
     version: String,
 }
 
-fn refuse_newer_schema(connection: &mut SqliteConnection) -> Result<(), SessionRepositoryError> {
+fn refuse_newer_schema(connection: &mut SqliteConnection) -> Result<(), StorageError> {
     let migration_table = diesel::sql_query(
         "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name = '__diesel_schema_migrations'",
     )
     .get_result::<CountRow>(connection)
-    .map_err(|error| SessionRepositoryError::Read(error.to_string()))?;
+    .map_err(|error| StorageError::Read(error.to_string()))?;
     if migration_table.value == 0 {
         return Ok(());
     }
@@ -1270,11 +1327,11 @@ fn refuse_newer_schema(connection: &mut SqliteConnection) -> Result<(), SessionR
     )
     .get_result::<VersionRow>(connection)
     .optional()
-    .map_err(|error| SessionRepositoryError::Read(error.to_string()))?;
+    .map_err(|error| StorageError::Read(error.to_string()))?;
     if let Some(latest) = latest
         && latest.version.as_str() > CURRENT_SCHEMA_VERSION
     {
-        return Err(SessionRepositoryError::NewerSchema {
+        return Err(StorageError::NewerSchema {
             database_version: latest.version,
             binary_version: CURRENT_SCHEMA_VERSION,
         });
@@ -1284,46 +1341,38 @@ fn refuse_newer_schema(connection: &mut SqliteConnection) -> Result<(), SessionR
 
 async fn on_blocking_task<T>(
     operation: &'static str,
-    task: impl FnOnce() -> Result<T, SessionRepositoryError> + Send + 'static,
-) -> Result<T, SessionRepositoryError>
+    task: impl FnOnce() -> Result<T, StorageError> + Send + 'static,
+) -> Result<T, StorageError>
 where
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(task).await.map_err(|error| {
-        SessionRepositoryError::BlockingTask {
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|error| StorageError::BlockingTask {
             operation,
             message: error.to_string(),
-        }
-    })?
+        })?
 }
 
 fn usize_to_i64(
     session_id: SessionId,
     field: &'static str,
     value: usize,
-) -> Result<i64, SessionRepositoryError> {
-    i64::try_from(value).map_err(|error| SessionRepositoryError::Write {
+) -> Result<i64, StorageError> {
+    i64::try_from(value).map_err(|error| StorageError::Write {
         session_id,
         message: format!("encode {field}: {error}"),
     })
 }
 
-fn u64_to_i64(
-    session_id: SessionId,
-    field: &'static str,
-    value: u64,
-) -> Result<i64, SessionRepositoryError> {
-    i64::try_from(value).map_err(|error| SessionRepositoryError::Write {
+fn u64_to_i64(session_id: SessionId, field: &'static str, value: u64) -> Result<i64, StorageError> {
+    i64::try_from(value).map_err(|error| StorageError::Write {
         session_id,
         message: format!("encode {field}: {error}"),
     })
 }
 
-fn i64_to_u64(
-    session_id: &str,
-    field: &'static str,
-    value: i64,
-) -> Result<u64, SessionRepositoryError> {
+fn i64_to_u64(session_id: &str, field: &'static str, value: i64) -> Result<u64, StorageError> {
     u64::try_from(value).map_err(|error| invalid_session(session_id, field, error))
 }
 
@@ -1331,8 +1380,8 @@ fn encode<T: Serialize>(
     session_id: SessionId,
     field: &'static str,
     value: &T,
-) -> Result<String, SessionRepositoryError> {
-    serde_json::to_string(value).map_err(|error| SessionRepositoryError::Write {
+) -> Result<String, StorageError> {
+    serde_json::to_string(value).map_err(|error| StorageError::Write {
         session_id,
         message: format!("encode {field}: {error}"),
     })
@@ -1342,7 +1391,7 @@ fn decode<T: DeserializeOwned>(
     session_id: &str,
     field: &'static str,
     value: &str,
-) -> Result<T, SessionRepositoryError> {
+) -> Result<T, StorageError> {
     serde_json::from_str(value).map_err(|error| invalid_session(session_id, field, error))
 }
 
@@ -1350,7 +1399,7 @@ fn parse_id<T>(
     value: &str,
     field: &'static str,
     constructor: impl FnOnce(Uuid) -> T,
-) -> Result<T, SessionRepositoryError> {
+) -> Result<T, StorageError> {
     Uuid::parse_str(value)
         .map(constructor)
         .map_err(|error| invalid_session(value, field, error))
@@ -1360,8 +1409,8 @@ fn invalid_session(
     session_id: &str,
     field: &'static str,
     error: impl fmt::Display,
-) -> SessionRepositoryError {
-    SessionRepositoryError::InvalidSession {
+) -> StorageError {
+    StorageError::InvalidSession {
         session_id: session_id.to_owned(),
         message: format!("invalid {field}: {error}"),
     }
