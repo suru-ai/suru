@@ -334,7 +334,7 @@ pub async fn spawn_with_provider(
         provider_updates: provider_updates.clone(),
     };
     let provider_id = runtime.provider_id();
-    let (storage_writer, storage) = StorageWriter::spawn(repository, &persisted_sessions);
+    let (storage_writer, storage) = StorageWriter::spawn(repository, &persisted_sessions.readable);
     let sessions = SessionStore::new(persisted_sessions, storage.clone());
     let landing_agent_selection =
         LandingAgentSelectionStore::new(persisted_landing_agent_selection, storage);

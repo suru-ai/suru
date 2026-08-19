@@ -27,7 +27,7 @@ use crate::{
         ModelOptionId, ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId,
         PromptOrder, PromptStatus, ProviderId, Session, SessionId, SessionRevision,
         SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate,
-        TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        TranscriptItem, Turn, TurnId, TurnStatus, UnreadableSessionSummary, Workspace,
     },
     provider::ProviderResumeState,
     runtime::protect_current_user_file,
@@ -128,6 +128,12 @@ pub(crate) struct StoredResumeState {
     pub(crate) resume_state: ProviderResumeState,
 }
 
+#[derive(Default)]
+pub(crate) struct RestoredSessions {
+    pub(crate) readable: Vec<PersistedSession>,
+    pub(crate) unreadable: Vec<UnreadableSessionSummary>,
+}
+
 #[derive(Debug)]
 pub(crate) enum StorageError {
     InvalidDatabasePath(PathBuf),
@@ -214,7 +220,7 @@ impl StorageRepository {
         Ok(repository)
     }
 
-    pub(crate) async fn load_sessions(&self) -> Result<Vec<PersistedSession>, StorageError> {
+    pub(crate) async fn load_sessions(&self) -> Result<RestoredSessions, StorageError> {
         let database_path = self.database_path.as_ref().clone();
         on_blocking_task("loading", move || load_sessions(&database_path)).await
     }
@@ -782,6 +788,19 @@ impl SessionRow {
         let revision = SessionRevision(i64_to_u64(&session_id, "revision", self.revision)?);
         Ok((summary, revision))
     }
+
+    fn unreadable_summary(&self) -> Result<UnreadableSessionSummary, StorageError> {
+        let session_id = self.id.clone();
+        Ok(UnreadableSessionSummary {
+            id: parse_id(&session_id, "Session ID", SessionId::from_uuid)?,
+            title: self.title.clone(),
+            created_at: SessionTimestamp(i64_to_u64(&session_id, "created_at", self.created_at)?),
+            updated_at: SessionTimestamp(i64_to_u64(&session_id, "updated_at", self.updated_at)?),
+            workspace: serde_json::from_str::<StoredWorkspace>(&self.workspace)
+                .ok()
+                .map(Workspace::from),
+        })
+    }
 }
 
 impl PromptRow {
@@ -1210,15 +1229,22 @@ impl From<StoredFileChange> for FileChange {
     }
 }
 
-fn load_sessions(database_path: &Path) -> Result<Vec<PersistedSession>, StorageError> {
+fn load_sessions(database_path: &Path) -> Result<RestoredSessions, StorageError> {
     let mut connection = connect(database_path)?;
-    sessions::table
+    let rows = sessions::table
         .select(SessionRow::as_select())
         .load::<SessionRow>(&mut connection)
-        .map_err(|error| StorageError::Read(error.to_string()))?
-        .into_iter()
-        .map(|row| load_session(&mut connection, row))
-        .collect()
+        .map_err(|error| StorageError::Read(error.to_string()))?;
+    let mut restored = RestoredSessions::default();
+    for row in rows {
+        let unreadable = row.unreadable_summary()?;
+        match load_session(&mut connection, row) {
+            Ok(session) => restored.readable.push(session),
+            Err(StorageError::InvalidSession { .. }) => restored.unreadable.push(unreadable),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(restored)
 }
 
 fn load_session(

@@ -17,7 +17,8 @@ use crate::{
     protocol::{
         AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, LifecycleState,
         ModelCatalog, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionError, SessionId,
-        SessionSnapshot, SessionSummary, ShutdownReason, Turn, TurnId, UpdateAgentSelectionRequest,
+        SessionListItem, SessionSnapshot, ShutdownReason, Turn, TurnId,
+        UpdateAgentSelectionRequest,
     },
 };
 
@@ -234,7 +235,7 @@ impl ManagedClient {
         self.session_commands().read_session(session_id).await
     }
 
-    pub async fn list_sessions(&self, workspace: Option<&Path>) -> Result<Vec<SessionSummary>> {
+    pub async fn list_sessions(&self, workspace: Option<&Path>) -> Result<Vec<SessionListItem>> {
         self.session_commands().list_sessions(workspace).await
     }
 
@@ -435,7 +436,7 @@ impl SessionCommandClient {
     pub(crate) async fn list_sessions(
         &self,
         workspace: Option<&Path>,
-    ) -> Result<Vec<SessionSummary>> {
+    ) -> Result<Vec<SessionListItem>> {
         let descriptor = self.descriptor.borrow().clone();
         let request = self
             .http

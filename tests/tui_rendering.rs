@@ -10,9 +10,9 @@ use chidori::{
         ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
         ModelOptionKind, ModelOptionRole, ModelOptionValue, Prompt, PromptDelivery, PromptId,
         PromptOrder, PromptStatus, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
-        ServerIdentity, ServerShutdown, Session, SessionChange, SessionId, SessionRevision,
-        SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate,
-        ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        ServerIdentity, ServerShutdown, Session, SessionChange, SessionId, SessionListItem,
+        SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
+        SessionUpdate, ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{AgentOutput, ServerConfig},
     tui::{
@@ -6017,8 +6017,8 @@ fn session_summary(
     title: &str,
     status: SessionStatus,
     updated_at: u64,
-) -> SessionSummary {
-    SessionSummary {
+) -> SessionListItem {
+    SessionListItem::Readable(SessionSummary {
         session: Session {
             id: session_id,
             workspace: Workspace {
@@ -6031,7 +6031,7 @@ fn session_summary(
         title: title.to_owned(),
         created_at: SessionTimestamp(1),
         updated_at: SessionTimestamp(updated_at),
-    }
+    })
 }
 
 fn model_descriptor(
@@ -6076,10 +6076,11 @@ fn selected_session_snapshot(
     }
 }
 
-fn open_session_picker_with(application: &mut Application, sessions: Vec<SessionSummary>) {
+fn open_session_picker_with(application: &mut Application, sessions: Vec<SessionListItem>) {
     let workspace = sessions
         .first()
-        .map(|summary| summary.session.workspace.path.clone())
+        .and_then(SessionListItem::workspace)
+        .map(|workspace| workspace.path.clone())
         .unwrap_or_else(|| std::env::current_dir().expect("read current Workspace"));
     let request = expect_session_list_request(
         application

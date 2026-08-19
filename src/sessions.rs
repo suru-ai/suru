@@ -17,12 +17,13 @@ use crate::protocol::{
     AgentSelection, AgentSelectionOperationId, CreateSessionRequest, Message, MessageId,
     MessageRole, MessageStatus, ModelAvailability, ModelOptionValue, Prompt, PromptDelivery,
     PromptId, PromptOrder, PromptStatus, ProviderId, Session, SessionChange, SessionId,
-    SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-    SessionUpdate, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
+    SessionListItem, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary,
+    SessionTimestamp, SessionUpdate, Turn, TurnId, TurnStatus, UnreadableSessionSummary,
+    UpdateAgentSelectionRequest, Workspace,
 };
 use crate::provider::ProviderResumeState;
 use crate::session_projection::apply_update;
-use crate::storage::{PersistedSession, StorageSink, StoredResumeState};
+use crate::storage::{PersistedSession, RestoredSessions, StorageSink, StoredResumeState};
 
 const SESSION_UPDATE_CAPACITY: usize = 256;
 
@@ -77,6 +78,7 @@ pub(crate) enum StoreOutcome<T> {
 #[derive(Default)]
 struct SessionStoreState {
     sessions: HashMap<SessionId, SessionRecord>,
+    unreadable_sessions: HashMap<SessionId, UnreadableSessionSummary>,
     prompts: HashMap<PromptId, PromptOwner>,
     last_timestamp: Option<SessionTimestamp>,
 }
@@ -163,10 +165,15 @@ pub(crate) enum ListSessionsError {
 }
 
 impl SessionStore {
-    pub(crate) fn new(persisted_sessions: Vec<PersistedSession>, storage: StorageSink) -> Self {
+    pub(crate) fn new(restored: RestoredSessions, storage: StorageSink) -> Self {
+        let RestoredSessions {
+            readable: persisted_sessions,
+            unreadable,
+        } = restored;
         let last_timestamp = persisted_sessions
             .iter()
             .map(|persisted| persisted.summary.updated_at)
+            .chain(unreadable.iter().map(|summary| summary.updated_at))
             .max();
         let mut sessions = HashMap::new();
         let mut prompts = HashMap::new();
@@ -214,6 +221,10 @@ impl SessionStore {
         Self {
             state: Arc::new(Mutex::new(SessionStoreState {
                 sessions,
+                unreadable_sessions: unreadable
+                    .into_iter()
+                    .map(|summary| (summary.id, summary))
+                    .collect(),
                 prompts,
                 last_timestamp,
             })),
@@ -1368,7 +1379,7 @@ impl SessionStore {
     pub(crate) fn list(
         &self,
         workspace: Option<&Path>,
-    ) -> Result<Vec<SessionSummary>, ListSessionsError> {
+    ) -> Result<Vec<SessionListItem>, ListSessionsError> {
         let workspace = workspace
             .map(fs::canonicalize)
             .transpose()
@@ -1390,8 +1401,24 @@ impl SessionStore {
                     .as_ref()
                     .is_none_or(|path| summary.session.workspace.path == *path)
             })
+            .map(SessionListItem::Readable)
+            .chain(
+                state
+                    .unreadable_sessions
+                    .values()
+                    .filter(|summary| {
+                        workspace.as_ref().is_none_or(|path| {
+                            summary
+                                .workspace
+                                .as_ref()
+                                .is_none_or(|workspace| workspace.path == *path)
+                        })
+                    })
+                    .cloned()
+                    .map(SessionListItem::Unreadable),
+            )
             .collect::<Vec<_>>();
-        summaries.sort_unstable_by_key(|summary| Reverse(summary.updated_at));
+        summaries.sort_unstable_by_key(|summary| Reverse(summary.updated_at()));
         Ok(summaries)
     }
 }

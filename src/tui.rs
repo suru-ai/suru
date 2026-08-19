@@ -47,8 +47,9 @@ use crate::{
         Activity, AdmitPromptRequest, AgentSelection, AgentSelectionOperationId,
         CreateSessionRequest, FileChange, InitialPrompt, MessageId, MessageRole, ModelAvailability,
         ModelCatalog, ModelDescriptor, PromptDelivery, PromptId, PromptStatus, ServerIdentity,
-        SessionChange, SessionId, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-        ShutdownReason, TranscriptItem, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        SessionChange, SessionId, SessionListItem, SessionSnapshot, SessionStatus,
+        SessionTimestamp, ShutdownReason, TranscriptItem, TurnId, TurnStatus,
+        UpdateAgentSelectionRequest, Workspace,
     },
     theme::Theme,
 };
@@ -832,7 +833,7 @@ pub enum ApplicationEvent {
     SessionAttached(SessionSnapshot),
     SessionsListed {
         request: SessionListRequest,
-        sessions: Vec<SessionSummary>,
+        sessions: Vec<SessionListItem>,
     },
     SessionListingFailed {
         request: SessionListRequest,
@@ -2187,6 +2188,8 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
                     content,
                     if row.selected {
                         theme.selection.focused
+                    } else if row.unreadable {
+                        theme.text.subdued
                     } else {
                         theme.text.primary
                     },
@@ -2571,14 +2574,22 @@ fn model_picker_row_text(
 fn session_picker_row_text(row: SessionPickerRow<'_>, width: usize, now: u64) -> String {
     let marker = if row.selected { "› " } else { "  " };
     let compact = width < usize::from(NARROW_TERMINAL_WIDTH);
-    let status = match (compact, row.current, row.active) {
-        (_, false, false) => None,
-        (true, true, true) => Some("CA".to_owned()),
-        (true, true, false) => Some("C".to_owned()),
-        (true, false, true) => Some("A".to_owned()),
-        (false, true, true) => Some("[current, active]".to_owned()),
-        (false, true, false) => Some("[current]".to_owned()),
-        (false, false, true) => Some("[active]".to_owned()),
+    let status = if row.unreadable {
+        Some(if compact {
+            "U".to_owned()
+        } else {
+            "[unreadable]".to_owned()
+        })
+    } else {
+        match (compact, row.current, row.active) {
+            (_, false, false) => None,
+            (true, true, true) => Some("CA".to_owned()),
+            (true, true, false) => Some("C".to_owned()),
+            (true, false, true) => Some("A".to_owned()),
+            (false, true, true) => Some("[current, active]".to_owned()),
+            (false, true, false) => Some("[current]".to_owned()),
+            (false, false, true) => Some("[active]".to_owned()),
+        }
     };
     let age = if compact {
         relative_update_time_compact(row.updated_at, now)
@@ -4282,7 +4293,7 @@ fn spawn_agent_selection_update(
 enum SessionPickerResult {
     Listed {
         request: SessionListRequest,
-        sessions: Vec<SessionSummary>,
+        sessions: Vec<SessionListItem>,
     },
     ListingFailed {
         request: SessionListRequest,

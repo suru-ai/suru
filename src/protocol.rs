@@ -491,6 +491,65 @@ pub struct SessionSummary {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "readability",
+    content = "summary",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum SessionListItem {
+    Readable(SessionSummary),
+    Unreadable(UnreadableSessionSummary),
+}
+
+impl SessionListItem {
+    pub const fn id(&self) -> SessionId {
+        match self {
+            Self::Readable(summary) => summary.session.id,
+            Self::Unreadable(summary) => summary.id,
+        }
+    }
+
+    pub fn title(&self) -> &str {
+        match self {
+            Self::Readable(summary) => &summary.title,
+            Self::Unreadable(summary) => &summary.title,
+        }
+    }
+
+    pub const fn updated_at(&self) -> SessionTimestamp {
+        match self {
+            Self::Readable(summary) => summary.updated_at,
+            Self::Unreadable(summary) => summary.updated_at,
+        }
+    }
+
+    pub const fn readable(&self) -> Option<&SessionSummary> {
+        match self {
+            Self::Readable(summary) => Some(summary),
+            Self::Unreadable(_) => None,
+        }
+    }
+
+    pub const fn workspace(&self) -> Option<&Workspace> {
+        match self {
+            Self::Readable(summary) => Some(&summary.session.workspace),
+            Self::Unreadable(summary) => summary.workspace.as_ref(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnreadableSessionSummary {
+    pub id: SessionId,
+    pub title: String,
+    pub created_at: SessionTimestamp,
+    pub updated_at: SessionTimestamp,
+    pub workspace: Option<Workspace>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Prompt {
     pub id: PromptId,

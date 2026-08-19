@@ -2,7 +2,7 @@
 
 use std::{cmp::Reverse, path::Path};
 
-use crate::protocol::{SessionId, SessionStatus, SessionSummary, SessionTimestamp};
+use crate::protocol::{SessionId, SessionListItem, SessionStatus, SessionTimestamp};
 
 use super::{SessionListRequest, SessionListScope};
 
@@ -14,7 +14,7 @@ pub(super) struct SessionPicker {
     request_sequence: u64,
     pending_request: Option<SessionListRequest>,
     query: String,
-    sessions: Vec<SessionSummary>,
+    sessions: Vec<SessionListItem>,
     selected: Option<SessionId>,
     loading: bool,
     error: Option<String>,
@@ -27,6 +27,7 @@ pub(super) struct SessionPickerRow<'a> {
     pub(super) selected: bool,
     pub(super) current: bool,
     pub(super) active: bool,
+    pub(super) unreadable: bool,
     pub(super) updated_at: SessionTimestamp,
     pub(super) workspace: Option<&'a Path>,
 }
@@ -89,13 +90,13 @@ impl SessionPicker {
     pub(super) fn load(
         &mut self,
         request: &SessionListRequest,
-        mut sessions: Vec<SessionSummary>,
+        mut sessions: Vec<SessionListItem>,
         current: Option<SessionId>,
     ) {
         if !self.accepts(request) {
             return;
         }
-        sessions.sort_unstable_by_key(|summary| Reverse(summary.updated_at));
+        sessions.sort_unstable_by_key(|summary| Reverse(summary.updated_at()));
         self.sessions = sessions;
         self.loading = false;
         self.attaching = None;
@@ -175,15 +176,25 @@ impl SessionPicker {
     fn rows(&self, current: Option<SessionId>) -> impl Iterator<Item = SessionPickerRow<'_>> {
         self.sessions
             .iter()
-            .filter(|summary| fuzzy_title_matches(&self.query, &summary.title))
-            .map(move |summary| SessionPickerRow {
-                title: &summary.title,
-                selected: self.selected == Some(summary.session.id),
-                current: current == Some(summary.session.id),
-                active: summary.session.status == SessionStatus::Active,
-                updated_at: summary.updated_at,
-                workspace: matches!(self.scope, SessionListScope::AllWorkspaces)
-                    .then_some(summary.session.workspace.path.as_path()),
+            .filter(|summary| fuzzy_title_matches(&self.query, summary.title()))
+            .map(move |summary| {
+                let readable = summary.readable();
+                SessionPickerRow {
+                    title: summary.title(),
+                    selected: readable.is_some() && self.selected == Some(summary.id()),
+                    current: readable.is_some() && current == Some(summary.id()),
+                    active: readable
+                        .is_some_and(|summary| summary.session.status == SessionStatus::Active),
+                    unreadable: readable.is_none(),
+                    updated_at: summary.updated_at(),
+                    workspace: matches!(self.scope, SessionListScope::AllWorkspaces)
+                        .then(|| {
+                            summary
+                                .workspace()
+                                .map(|workspace| workspace.path.as_path())
+                        })
+                        .flatten(),
+                }
             })
     }
 
@@ -192,13 +203,10 @@ impl SessionPicker {
         capacity: usize,
         current: Option<SessionId>,
     ) -> impl Iterator<Item = SessionPickerRow<'_>> {
-        let visible = self.visible_ids();
-        let selected = self
-            .selected
-            .and_then(|selected| visible.iter().position(|id| *id == selected))
-            .unwrap_or(0);
+        let rows = self.rows(current).collect::<Vec<_>>();
+        let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
         let start = selected.saturating_add(1).saturating_sub(capacity);
-        self.rows(current).skip(start).take(capacity)
+        rows.into_iter().skip(start).take(capacity)
     }
 
     fn select_first_visible(&mut self) {
@@ -223,8 +231,8 @@ impl SessionPicker {
     fn visible_ids(&self) -> Vec<SessionId> {
         self.sessions
             .iter()
-            .filter(|summary| fuzzy_title_matches(&self.query, &summary.title))
-            .map(|summary| summary.session.id)
+            .filter(|summary| fuzzy_title_matches(&self.query, summary.title()))
+            .filter_map(|summary| summary.readable().map(|summary| summary.session.id))
             .collect()
     }
 

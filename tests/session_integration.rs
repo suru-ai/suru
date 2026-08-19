@@ -30,8 +30,9 @@ use chidori::{
         PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderCatalogStatus, ProviderId,
         ProviderModelCatalog, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
         ServerIdentity, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
-        SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionUpdate,
-        TranscriptItem, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        SessionListItem, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary,
+        SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest,
+        Workspace,
     },
     provider::{
         ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderFileChangeStatus,
@@ -43,6 +44,7 @@ use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
 use eventsource_stream::Eventsource;
 use futures_util::{StreamExt, future::join_all, stream};
+use ratatui::{Terminal, backend::TestBackend};
 use tokio::time::{Duration, timeout};
 
 #[path = "support/failing_provider.rs"]
@@ -72,6 +74,18 @@ fn controlled_selection(model: &str, effort: &str, speed: &str) -> AgentSelectio
             },
         ],
     }
+}
+
+fn readable_session_summaries(items: Vec<SessionListItem>) -> Vec<SessionSummary> {
+    items
+        .into_iter()
+        .map(|item| match item {
+            SessionListItem::Readable(summary) => summary,
+            SessionListItem::Unreadable(summary) => {
+                panic!("expected readable Session {}, got unreadable", summary.id)
+            }
+        })
+        .collect()
 }
 
 async fn next_session_update(
@@ -3291,9 +3305,10 @@ async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace
         .expect("list Sessions")
         .error_for_status()
         .expect("Session listing succeeds")
-        .json::<Vec<SessionSummary>>()
+        .json::<Vec<SessionListItem>>()
         .await
         .expect("decode Session summaries");
+    let summaries = readable_session_summaries(summaries);
     assert_eq!(
         summaries
             .iter()
@@ -3320,9 +3335,10 @@ async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace
         .expect("list Sessions for one Workspace")
         .error_for_status()
         .expect("filtered Session listing succeeds")
-        .json::<Vec<SessionSummary>>()
+        .json::<Vec<SessionListItem>>()
         .await
         .expect("decode filtered Session summaries");
+    let filtered = readable_session_summaries(filtered);
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].session.id, first.session.id);
     assert_eq!(filtered[0].title, "First Session");
@@ -3393,9 +3409,10 @@ async fn session_metadata_remains_listed_after_a_server_restart() {
         .expect("list Sessions before restart")
         .error_for_status()
         .expect("Session listing succeeds before restart")
-        .json::<Vec<SessionSummary>>()
+        .json::<Vec<SessionListItem>>()
         .await
         .expect("decode Session summaries before restart");
+    let before_restart = readable_session_summaries(before_restart);
     assert_eq!(before_restart.len(), 1);
     assert_eq!(before_restart[0].session.id, session.session.id);
     assert_eq!(before_restart[0].title, "Durable Session");
@@ -3423,9 +3440,10 @@ async fn session_metadata_remains_listed_after_a_server_restart() {
         .expect("list Sessions after restart")
         .error_for_status()
         .expect("Session listing succeeds after restart")
-        .json::<Vec<SessionSummary>>()
+        .json::<Vec<SessionListItem>>()
         .await
         .expect("decode Session summaries after restart");
+    let after_restart = readable_session_summaries(after_restart);
     assert_eq!(after_restart, before_restart);
 
     replacement
@@ -3671,6 +3689,117 @@ async fn persisted_session_without_resume_state_starts_a_fresh_provider_conversa
     .await;
     assert_eq!(reopened.turns.len(), 2);
     assert_eq!(reopened.turns[1].status, TurnStatus::Completed);
+
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement server");
+}
+
+#[tokio::test]
+async fn an_undecodable_stored_session_does_not_block_startup_and_remains_listed() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "unreadable-session-test")
+        .expect("configure original server")
+        .with_data_dir(data_dir.path());
+    let original = spawn_with_failing_provider(config.clone())
+        .await
+        .expect("spawn original server");
+    let created = reqwest::Client::new()
+        .post(format!("{}/v1/sessions", original.descriptor().base_url))
+        .bearer_auth(&original.descriptor().token)
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Keep this damaged Session visible".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+    original.shutdown().await.expect("stop original server");
+
+    let database_path = config.data_dir().join("chidori.db");
+    let mut database = SqliteConnection::establish(
+        database_path
+            .to_str()
+            .expect("fixture database path is valid UTF-8"),
+    )
+    .expect("open persisted Session fixture");
+    database
+        .batch_execute("UPDATE prompts SET payload = '{';")
+        .expect("doctor one stored Prompt payload");
+
+    let replacement = spawn_with_failing_provider(config)
+        .await
+        .expect("an unreadable Session must not block startup");
+    let listed = reqwest::Client::new()
+        .get(format!("{}/v1/sessions", replacement.descriptor().base_url))
+        .bearer_auth(&replacement.descriptor().token)
+        .send()
+        .await
+        .expect("list Sessions after restart")
+        .error_for_status()
+        .expect("Session listing succeeds after restart")
+        .json::<Vec<SessionListItem>>()
+        .await
+        .expect("decode Session listing");
+    assert_eq!(listed.len(), 1);
+    let SessionListItem::Unreadable(unreadable) = &listed[0] else {
+        panic!("doctored Session must be marked unreadable");
+    };
+    assert_eq!(unreadable.id, created.session.id);
+    assert_eq!(unreadable.title, "Keep this damaged Session visible");
+
+    let mut application = Application::new(workspace.path());
+    let ApplicationTransition::ListSessions(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionList,
+        )))
+        .expect("open Session picker")
+    else {
+        panic!("opening the Session picker must request Sessions");
+    };
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: listed,
+        })
+        .expect("load Session picker");
+    let mut terminal = Terminal::new(TestBackend::new(80, 15)).expect("create test terminal");
+    terminal
+        .draw(|frame| application.render(frame))
+        .expect("render Session picker");
+    let picker = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(80)
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(picker.contains("Keep this damaged Session visible"));
+    assert!(picker.contains("[unreadable]"));
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("unreadable Session owns no attachment action"),
+        ApplicationTransition::Continue
+    );
 
     replacement
         .shutdown()
@@ -4225,7 +4354,14 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
         .await
         .expect("discover Sessions through managed client");
     assert_eq!(summaries.len(), 1);
-    assert_eq!(summaries[0].session.id, created.session.id);
+    assert_eq!(
+        summaries[0]
+            .readable()
+            .expect("new Session is readable")
+            .session
+            .id,
+        created.session.id
+    );
 
     let mut attachment = client
         .attach_session(created.session.id)
@@ -4492,7 +4628,14 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
         .list_sessions(None)
         .await
         .expect("list Sessions before update");
-    assert_eq!(before_update[0].session.id, isolated.session.id);
+    assert_eq!(
+        before_update[0]
+            .readable()
+            .expect("new Session is readable")
+            .session
+            .id,
+        isolated.session.id
+    );
     let prompt_id = PromptId::new();
     let turn_id = TurnId::new();
     let update = session_events
@@ -4576,9 +4719,12 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
         .list_sessions(None)
         .await
         .expect("list Sessions after update");
-    assert_eq!(after_update[0].session.id, shared.session.id);
-    assert_eq!(after_update[0].session.status, SessionStatus::Active);
-    assert!(after_update[0].updated_at > after_update[0].created_at);
+    let updated_summary = after_update[0]
+        .readable()
+        .expect("updated Session is readable");
+    assert_eq!(updated_summary.session.id, shared.session.id);
+    assert_eq!(updated_summary.session.status, SessionStatus::Active);
+    assert!(updated_summary.updated_at > updated_summary.created_at);
 
     drop(isolated_attachment);
     drop(second_attachment);
