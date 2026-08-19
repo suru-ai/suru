@@ -428,7 +428,8 @@ async fn simultaneous_launchers_converge_on_one_authenticated_server() {
             tokio::task::spawn_blocking(move || {
                 Command::new(env!("CARGO_BIN_EXE_chidori"))
                     .args(["server", "start"])
-                    .env("CHIDORI_STATE_DIR", state_dir)
+                    .env("CHIDORI_STATE_DIR", &state_dir)
+                    .env("CHIDORI_DATA_DIR", &state_dir)
                     .env("CHIDORI_CHANNEL", channel)
                     .output()
                     .expect("run concurrent server start command")
@@ -1064,6 +1065,7 @@ async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
         Command::new("script")
             .args(["-qef", "/dev/null", "-c", &tui_command])
             .env("CHIDORI_STATE_DIR", state_dir.path())
+            .env("CHIDORI_DATA_DIR", state_dir.path())
             .env("CHIDORI_CHANNEL", channel)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1259,6 +1261,7 @@ impl AttachedTuiGuard {
             Command::new("script")
                 .args(["-qef", "/dev/null", "-c", tui_command])
                 .env("CHIDORI_STATE_DIR", state_dir)
+                .env("CHIDORI_DATA_DIR", state_dir)
                 .env("CHIDORI_CHANNEL", channel)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1309,7 +1312,8 @@ async fn run_server_cli(
     tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_chidori"))
             .args(["server", &command])
-            .env("CHIDORI_STATE_DIR", state_dir)
+            .env("CHIDORI_STATE_DIR", &state_dir)
+            .env("CHIDORI_DATA_DIR", &state_dir)
             .env("CHIDORI_CHANNEL", channel)
             .output()
             .expect("run server CLI command")
@@ -1325,6 +1329,7 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
     let output = Command::new(env!("CARGO_BIN_EXE_chidori"))
         .args(["server", "start"])
         .env("CHIDORI_STATE_DIR", state_dir.path())
+        .env("CHIDORI_DATA_DIR", state_dir.path())
         .env("CHIDORI_CHANNEL", channel)
         .output()
         .expect("run server start command");
@@ -1340,6 +1345,7 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
     let repeated = Command::new(env!("CARGO_BIN_EXE_chidori"))
         .args(["server", "start"])
         .env("CHIDORI_STATE_DIR", state_dir.path())
+        .env("CHIDORI_DATA_DIR", state_dir.path())
         .env("CHIDORI_CHANNEL", channel)
         .output()
         .expect("repeat server start command");

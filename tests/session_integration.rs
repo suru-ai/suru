@@ -40,6 +40,7 @@ use chidori::{
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
 use eventsource_stream::Eventsource;
 use futures_util::{StreamExt, future::join_all, stream};
 use tokio::time::{Duration, timeout};
@@ -3320,6 +3321,147 @@ async fn session_metadata_remains_listed_after_a_server_restart() {
         .shutdown()
         .await
         .expect("shut down replacement server");
+}
+
+#[tokio::test]
+async fn completed_transcript_is_readable_after_a_server_restart() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "transcript-restart-test")
+        .expect("configure original server")
+        .with_data_dir(data_dir.path());
+    let (original_runtime, mut original_provider) = ControlledProvider::new();
+    let original = server::spawn_with_provider(config.clone(), original_runtime)
+        .await
+        .expect("spawn original server");
+    let descriptor = original.descriptor().clone();
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Persist this whole Turn".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+
+    let start = timeout(Duration::from_secs(1), original_provider.next_start())
+        .await
+        .expect("Provider startup begins");
+    let mut provider_session = start.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-persisted", "high", "fast"),
+    });
+    timeout(Duration::from_secs(1), provider_session.next_turn())
+        .await
+        .expect("initial Turn reaches Provider")
+        .succeed();
+    for event in [
+        ProviderEvent::CommandStarted {
+            activity_id: ProviderActivityId::new("persisted-command"),
+            command: "cargo test".to_owned(),
+            cwd: Some(workspace.path().to_owned()),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("persisted-command"),
+            content: "first delta\n".to_owned(),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("persisted-command"),
+            content: "second delta\n".to_owned(),
+        },
+        ProviderEvent::CommandCompleted {
+            activity_id: ProviderActivityId::new("persisted-command"),
+            status: ProviderCommandStatus::Completed,
+            exit_status: Some(0),
+        },
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: "streamed ".to_owned(),
+        },
+        ProviderEvent::AgentMessageDelta {
+            content: "answer".to_owned(),
+        },
+        ProviderEvent::AgentMessageCompleted,
+        ProviderEvent::TurnCompleted,
+    ] {
+        provider_session.emit(event);
+    }
+    let completed = read_session_at_least_revision(
+        &client,
+        &descriptor,
+        created.session.id,
+        SessionRevision(12),
+    )
+    .await;
+    assert_eq!(completed.turns[0].status, TurnStatus::Completed);
+    assert_eq!(completed.messages[1].content, "streamed answer");
+    original.shutdown().await.expect("stop original server");
+
+    let database_path = config.data_dir().join("chidori.db");
+    let mut database = SqliteConnection::establish(
+        database_path
+            .to_str()
+            .expect("fixture database path is valid UTF-8"),
+    )
+    .expect("open persisted Transcript fixture");
+    database
+        .batch_execute(
+            r#"
+            UPDATE sessions
+            SET workspace = substr(workspace, 1, length(workspace) - 1) || ',"future_field":true}',
+                agent_selection = substr(agent_selection, 1, length(agent_selection) - 1) || ',"future_field":true}';
+            UPDATE prompts
+            SET payload = substr(payload, 1, length(payload) - 1) || ',"future_field":true}';
+            UPDATE turns
+            SET payload = substr(payload, 1, length(payload) - 1) || ',"future_field":true}';
+            UPDATE messages
+            SET payload = substr(payload, 1, length(payload) - 1) || ',"future_field":true}';
+            UPDATE activities
+            SET payload = substr(payload, 1, length(payload) - 1) || ',"future_field":true}';
+            "#,
+        )
+        .expect("add unknown fields to persisted JSON payloads");
+
+    let (replacement_runtime, _replacement_provider) = ControlledProvider::new();
+    let replacement = server::spawn_with_provider(config, replacement_runtime)
+        .await
+        .expect("spawn replacement server");
+    let reopened = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{}",
+            replacement.descriptor().base_url,
+            created.session.id
+        ))
+        .bearer_auth(&replacement.descriptor().token)
+        .send()
+        .await
+        .expect("reopen persisted Session")
+        .error_for_status()
+        .expect("persisted Session remains readable")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode reopened Session");
+    assert_eq!(reopened, completed);
+
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement server");
 }
 
 #[tokio::test]

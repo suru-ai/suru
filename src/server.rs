@@ -44,7 +44,7 @@ use crate::sessions::{
     ListSessionsError, PromptAdmissionDisposition, PromptMutationError, SessionFeed, SessionStore,
     StoreOutcome,
 };
-use crate::storage::{SessionMetadataWriter, SessionRepository};
+use crate::storage::{SessionPersistenceWriter, SessionRepository};
 
 pub type ServerConfig = RuntimeConfig;
 
@@ -264,10 +264,10 @@ pub async fn spawn_with_provider(
     let repository = SessionRepository::open(config.data_dir())
         .await
         .context("initialize Session repository")?;
-    let persisted_summaries = repository
-        .list_sessions()
+    let persisted_sessions = repository
+        .load_sessions()
         .await
-        .context("load persisted Session metadata")?;
+        .context("load persisted Sessions")?;
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -298,8 +298,9 @@ pub async fn spawn_with_provider(
         provider_updates: provider_updates.clone(),
     };
     let provider_id = runtime.provider_id();
-    let (metadata_writer, metadata) = SessionMetadataWriter::spawn(repository);
-    let sessions = SessionStore::new(persisted_summaries, metadata);
+    let (persistence_writer, persistence) =
+        SessionPersistenceWriter::spawn(repository, &persisted_sessions);
+    let sessions = SessionStore::new(persisted_sessions, persistence);
     let model_catalog = ModelCatalogService::new([runtime.clone()]);
     let providers = ProviderOrchestrator::new(
         runtime,
@@ -364,17 +365,17 @@ pub async fn spawn_with_provider(
         let provider_shutdown_result = provider_shutdown_task
             .await
             .context("Provider shutdown task panicked");
-        let metadata_shutdown_result = metadata_writer
+        let persistence_shutdown_result = persistence_writer
             .shutdown()
             .await
-            .context("shut down Session metadata writer");
+            .context("shut down Session persistence writer");
         if result.is_err() {
             task_lifecycle.send_replace(LifecycleState::Failed);
         }
         remove_own_descriptor(&descriptor_path, instance_id);
         result
             .and(provider_shutdown_result)
-            .and(metadata_shutdown_result)
+            .and(persistence_shutdown_result)
     });
     lifecycle.send_if_modified(|state| {
         if *state == LifecycleState::Starting {

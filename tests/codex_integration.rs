@@ -3,7 +3,7 @@
 #[allow(dead_code)]
 mod support;
 
-use std::{os::unix::fs::PermissionsExt, sync::Arc};
+use std::{os::unix::fs::PermissionsExt, process::Stdio, sync::Arc};
 
 use chidori::{
     managed_client::{
@@ -14,8 +14,9 @@ use chidori::{
         CreateSessionRequest, FileChange, InitialPrompt, MessageRole, MessageStatus,
         ModelAvailability, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionKind,
         ModelOptionRole, ModelOptionSelection, ModelOptionValue, PromptDelivery, PromptId,
-        PromptStatus, ProviderCatalogStatus, ProviderId, SessionChange, SessionId, SessionSnapshot,
-        SessionStatus, ShutdownReason, TranscriptItem, TurnId, TurnStatus, Workspace,
+        PromptStatus, ProviderCatalogStatus, ProviderId, RuntimeDescriptor, SessionChange,
+        SessionId, SessionSnapshot, SessionStatus, ShutdownReason, TranscriptItem, TurnId,
+        TurnStatus, Workspace,
     },
     provider::CodexRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -23,7 +24,10 @@ use chidori::{
 };
 use serde_json::Value;
 use sysinfo::{Pid, System};
-use tokio::time::{Duration, timeout};
+use tokio::{
+    process::{Child, Command},
+    time::{Duration, timeout},
+};
 
 use support::request_server_shutdown;
 
@@ -79,6 +83,47 @@ while IFS= read -r line; do
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-message","delta":" from Codex"}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"native-message","text":"Hello from Codex"},"futureField":true}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[],"futureField":true},"futureField":true}}'
+      ;;
+  esac
+done
+"#;
+
+const DURABILITY_CODEX_PREFIX: &str = r#"#!/bin/sh
+if [ "$1" != "app-server" ]; then
+  exit 64
+fi
+
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"durability-fixture"}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"durable-thread"},"model":"gpt-fixture","modelProvider":"fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+"#;
+
+const COMPLETED_TURN_DURABILITY_EVENTS: &str = r#"
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"durable-turn","status":"inProgress"}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"durable-thread","turnId":"durable-turn","item":{"type":"agentMessage","id":"durable-message","text":""}}}'
+      printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"durable-thread","turnId":"durable-turn","itemId":"durable-message","delta":"boundary durable"}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"durable-thread","turnId":"durable-turn","item":{"type":"agentMessage","id":"durable-message","text":"boundary durable"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"durable-thread","turn":{"id":"durable-turn","status":"completed","items":[]}}}'
+"#;
+
+const IDLE_FLUSH_DURABILITY_EVENTS: &str = r#"
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"durable-turn","status":"inProgress"}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"durable-thread","turnId":"durable-turn","item":{"type":"agentMessage","id":"durable-message","text":""}}}'
+      printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"durable-thread","turnId":"durable-turn","itemId":"durable-message","delta":"coalesced "}}'
+      printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"durable-thread","turnId":"durable-turn","itemId":"durable-message","delta":"tail"}}'
+      touch "$CODEX_FIXTURE_READY"
+      while :; do sleep 1; done
+"#;
+
+const DURABILITY_CODEX_SUFFIX: &str = r#"
       ;;
   esac
 done
@@ -2533,6 +2578,201 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
 }
 
 #[tokio::test]
+async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
+    let state_root = tempfile::tempdir().expect("create isolated state root");
+    let data_root = tempfile::tempdir().expect("create isolated data root");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let channel = "codex-abrupt-transcript-restart";
+    let config = ServerConfig::new(state_root.path(), channel)
+        .expect("configure isolated server")
+        .with_data_dir(data_root.path());
+    let descriptor_path = config.descriptor_path();
+
+    let boundary_codex = durability_codex(COMPLETED_TURN_DURABILITY_EVENTS);
+    let mut boundary_process = spawn_server_process(
+        state_root.path(),
+        data_root.path(),
+        channel,
+        boundary_codex.executable(),
+    );
+    let boundary_descriptor = wait_for_descriptor(&descriptor_path, None).await;
+    let mut boundary_client = ManagedClient::connect(
+        ManagedClientConfig::new(state_root.path(), channel)
+            .expect("configure boundary client")
+            .with_data_dir(data_root.path())
+            .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+    )
+    .await
+    .expect("connect boundary client");
+    receive_initial_state(&mut boundary_client).await;
+    let boundary_created = boundary_client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Commit this Turn boundary".to_owned(),
+            },
+        })
+        .await
+        .expect("create boundary Session");
+    let boundary_snapshot = timeout(Duration::from_secs(3), async {
+        loop {
+            let snapshot = boundary_client
+                .read_session(boundary_created.session.id)
+                .await
+                .expect("read boundary Session");
+            if snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Completed)
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first Turn reaches its durable boundary");
+    assert_eq!(
+        boundary_snapshot
+            .messages
+            .last()
+            .map(|message| message.content.as_str()),
+        Some("boundary durable")
+    );
+    drop(boundary_client);
+    kill_server_process(&mut boundary_process).await;
+
+    let idle_codex = durability_codex(IDLE_FLUSH_DURABILITY_EVENTS);
+    let mut idle_process = spawn_server_process(
+        state_root.path(),
+        data_root.path(),
+        channel,
+        idle_codex.executable(),
+    );
+    let idle_descriptor =
+        wait_for_descriptor(&descriptor_path, Some(boundary_descriptor.instance_id)).await;
+    let reopened_boundary = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{}",
+            idle_descriptor.base_url, boundary_created.session.id
+        ))
+        .bearer_auth(&idle_descriptor.token)
+        .send()
+        .await
+        .expect("read boundary Session after abrupt restart")
+        .error_for_status()
+        .expect("boundary Session remains readable")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode boundary Session after abrupt restart");
+    assert_eq!(reopened_boundary, boundary_snapshot);
+
+    let mut idle_client = ManagedClient::connect(
+        ManagedClientConfig::new(state_root.path(), channel)
+            .expect("configure idle client")
+            .with_data_dir(data_root.path())
+            .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+    )
+    .await
+    .expect("connect idle client");
+    receive_initial_state(&mut idle_client).await;
+    let idle_created = idle_client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Flush this streaming tail on idle".to_owned(),
+            },
+        })
+        .await
+        .expect("create idle-flush Session");
+    idle_codex.wait_until_ready().await;
+    let idle_snapshot = timeout(Duration::from_secs(3), async {
+        loop {
+            let snapshot = idle_client
+                .read_session(idle_created.session.id)
+                .await
+                .expect("read streaming Session");
+            if snapshot
+                .messages
+                .last()
+                .is_some_and(|message| message.content == "coalesced tail")
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both streaming deltas reach the in-memory Session");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    drop(idle_client);
+    kill_server_process(&mut idle_process).await;
+
+    let final_codex = durability_codex(COMPLETED_TURN_DURABILITY_EVENTS);
+    let mut final_process = spawn_server_process(
+        state_root.path(),
+        data_root.path(),
+        channel,
+        final_codex.executable(),
+    );
+    let final_descriptor =
+        wait_for_descriptor(&descriptor_path, Some(idle_descriptor.instance_id)).await;
+    let final_client = reqwest::Client::new();
+    let final_boundary = final_client
+        .get(format!(
+            "{}/v1/sessions/{}",
+            final_descriptor.base_url, boundary_created.session.id
+        ))
+        .bearer_auth(&final_descriptor.token)
+        .send()
+        .await
+        .expect("read completed Session after second abrupt restart")
+        .error_for_status()
+        .expect("completed Session remains readable")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode completed Session after second abrupt restart");
+    let final_idle = final_client
+        .get(format!(
+            "{}/v1/sessions/{}",
+            final_descriptor.base_url, idle_created.session.id
+        ))
+        .bearer_auth(&final_descriptor.token)
+        .send()
+        .await
+        .expect("read idle-flushed Session after abrupt restart")
+        .error_for_status()
+        .expect("idle-flushed Session remains readable")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode idle-flushed Session after abrupt restart");
+    assert_eq!(final_boundary, boundary_snapshot);
+    assert_eq!(final_idle, idle_snapshot);
+    assert_eq!(final_idle.turns[0].status, TurnStatus::Active);
+    assert_eq!(
+        final_idle
+            .messages
+            .last()
+            .map(|message| message.content.as_str()),
+        Some("coalesced tail")
+    );
+
+    request_server_shutdown(&final_descriptor, ShutdownReason::Manual).await;
+    timeout(Duration::from_secs(3), final_process.wait())
+        .await
+        .expect("replacement server exits after graceful cleanup")
+        .expect("reap replacement server");
+}
+
+#[tokio::test]
 async fn unknown_server_request_gets_method_not_found_without_corrupting_response_routing() {
     let fixture = ScriptedCodex::new(UNKNOWN_SERVER_REQUEST);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -3857,6 +4097,58 @@ async fn receive_initial_state(client: &mut ManagedClient) {
     ));
 }
 
+fn spawn_server_process(
+    state_root: &std::path::Path,
+    data_root: &std::path::Path,
+    channel: &str,
+    codex: &std::path::Path,
+) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chidori"));
+    command
+        .arg("__server")
+        .arg("--state-dir")
+        .arg(state_root)
+        .arg("--data-dir")
+        .arg(data_root)
+        .arg("--channel")
+        .arg(channel)
+        .env("CHIDORI_CODEX_PATH", codex)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command.spawn().expect("spawn isolated server process")
+}
+
+async fn wait_for_descriptor(
+    path: &std::path::Path,
+    previous: Option<uuid::Uuid>,
+) -> RuntimeDescriptor {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let descriptor = std::fs::File::open(path)
+                .ok()
+                .and_then(|file| serde_json::from_reader::<_, RuntimeDescriptor>(file).ok());
+            if let Some(descriptor) = descriptor
+                && previous.is_none_or(|instance| instance != descriptor.instance_id)
+            {
+                return descriptor;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server publishes a fresh runtime descriptor")
+}
+
+async fn kill_server_process(process: &mut Child) {
+    process.start_kill().expect("kill server process abruptly");
+    timeout(Duration::from_secs(3), process.wait())
+        .await
+        .expect("killed server process exits")
+        .expect("reap killed server process");
+}
+
 async fn wait_for_agent_output(client: &ManagedClient, session_id: SessionId) -> SessionSnapshot {
     timeout(Duration::from_secs(2), async {
         loop {
@@ -3908,6 +4200,12 @@ async fn wait_for_session_snapshot(
     })
     .await
     .unwrap_or_else(|_| panic!("{description}"))
+}
+
+fn durability_codex(turn_events: &str) -> ScriptedCodex {
+    ScriptedCodex::new(&format!(
+        "{DURABILITY_CODEX_PREFIX}{turn_events}{DURABILITY_CODEX_SUFFIX}"
+    ))
 }
 
 struct ScriptedCodex {

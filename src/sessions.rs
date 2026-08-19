@@ -21,14 +21,14 @@ use crate::protocol::{
     TurnStatus, UpdateAgentSelectionRequest, Workspace,
 };
 use crate::session_projection::apply_update;
-use crate::storage::SessionMetadataSink;
+use crate::storage::{PersistedSession, SessionPersistenceSink};
 
 const SESSION_UPDATE_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 pub(crate) struct SessionStore {
     state: Arc<Mutex<SessionStoreState>>,
-    metadata: SessionMetadataSink,
+    persistence: SessionPersistenceSink,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,7 +76,6 @@ pub(crate) enum StoreOutcome<T> {
 #[derive(Default)]
 struct SessionStoreState {
     sessions: HashMap<SessionId, SessionRecord>,
-    persisted_summaries: HashMap<SessionId, SessionSummary>,
     prompts: HashMap<PromptId, PromptOwner>,
     last_timestamp: Option<SessionTimestamp>,
 }
@@ -163,24 +162,58 @@ pub(crate) enum ListSessionsError {
 
 impl SessionStore {
     pub(crate) fn new(
-        persisted_summaries: Vec<SessionSummary>,
-        metadata: SessionMetadataSink,
+        persisted_sessions: Vec<PersistedSession>,
+        persistence: SessionPersistenceSink,
     ) -> Self {
-        let last_timestamp = persisted_summaries
+        let last_timestamp = persisted_sessions
             .iter()
-            .map(|summary| summary.updated_at)
+            .map(|persisted| persisted.summary.updated_at)
             .max();
+        let mut sessions = HashMap::new();
+        let mut prompts = HashMap::new();
+        for persisted in persisted_sessions {
+            let PersistedSession { summary, snapshot } = persisted;
+            let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
+            let next_prompt_order = snapshot
+                .prompts
+                .iter()
+                .map(|prompt| prompt.admission_order.0)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .map(PromptOrder)
+                .expect("persisted Prompt admission order space is not exhausted");
+            for prompt in &snapshot.prompts {
+                prompts.insert(
+                    prompt.id,
+                    PromptOwner {
+                        session_id: snapshot.session.id,
+                        text: prompt.text.clone(),
+                        agent_selection: None,
+                        origin: PromptOrigin::Admission(prompt.delivery),
+                    },
+                );
+            }
+            sessions.insert(
+                snapshot.session.id,
+                SessionRecord {
+                    snapshot,
+                    summary,
+                    updates,
+                    next_prompt_order,
+                    steer_targets: HashMap::new(),
+                    selection_operations: HashMap::new(),
+                    selection_retry_prompt: None,
+                },
+            );
+        }
         Self {
             state: Arc::new(Mutex::new(SessionStoreState {
-                sessions: HashMap::new(),
-                persisted_summaries: persisted_summaries
-                    .into_iter()
-                    .map(|summary| (summary.session.id, summary))
-                    .collect(),
-                prompts: HashMap::new(),
+                sessions,
+                prompts,
                 last_timestamp,
             })),
-            metadata,
+            persistence,
         }
     }
 
@@ -306,7 +339,8 @@ impl SessionStore {
                 selection_retry_prompt: None,
             },
         );
-        self.metadata.save(persisted_summary);
+        self.persistence
+            .created(persisted_summary, snapshot.clone());
         Ok(StoreOutcome::Created(snapshot))
     }
 
@@ -379,18 +413,19 @@ impl SessionStore {
             status: PromptStatus::Pending,
         };
         record
-            .publish(
+            .commit(
+                &self.persistence,
                 session_id,
                 vec![SessionChange::PromptAdded {
                     prompt: prompt.clone(),
                 }],
+                updated_at,
             )
             .expect("admission changes preserve Session invariants");
         record.next_prompt_order = next_prompt_order;
         if let Some(turn_id) = steer_target {
             record.steer_targets.insert(prompt.id, turn_id);
         }
-        self.metadata.save(record.metadata_changed_at(updated_at));
         state.prompts.insert(
             request.prompt.id,
             PromptOwner {
@@ -541,8 +576,7 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        let update = record.publish(session_id, changes)?;
-        self.metadata.save(record.metadata_changed_at(updated_at));
+        let update = record.commit(&self.persistence, session_id, changes, updated_at)?;
         Ok(Some(update))
     }
 
@@ -571,11 +605,12 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        let update = record.publish(
+        let update = record.commit(
+            &self.persistence,
             session_id,
             vec![SessionChange::AgentSelectionChanged { selection }],
+            updated_at,
         )?;
-        self.metadata.save(record.metadata_changed_at(updated_at));
         Ok(Some(update))
     }
 
@@ -634,11 +669,13 @@ impl SessionStore {
                 });
             }
             record
-                .publish(session_id, changes)
+                .commit(
+                    &self.persistence,
+                    session_id,
+                    changes,
+                    updated_at.expect("changed selection has a timestamp"),
+                )
                 .expect("Agent Selection commands preserve Session invariants");
-            self.metadata.save(
-                record.metadata_changed_at(updated_at.expect("changed selection has a timestamp")),
-            );
         }
         record
             .selection_operations
@@ -720,9 +757,8 @@ impl SessionStore {
                 .sessions
                 .get_mut(&session_id)
                 .expect("Session existence was checked while holding the store lock");
-            let update = record.publish(session_id, changes)?;
+            let update = record.commit(&self.persistence, session_id, changes, updated_at)?;
             record.selection_retry_prompt = Some(restored.id);
-            self.metadata.save(record.metadata_changed_at(updated_at));
             update
         };
         state.prompts.insert(
@@ -794,12 +830,11 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        record.publish(session_id, changes)?;
+        record.commit(&self.persistence, session_id, changes, updated_at)?;
         record.steer_targets.remove(&prompt_id);
         if record.selection_retry_prompt == Some(prompt_id) {
             record.selection_retry_prompt = None;
         }
-        self.metadata.save(record.metadata_changed_at(updated_at));
         Ok(Some(delivered))
     }
 
@@ -854,9 +889,8 @@ impl SessionStore {
             .expect("Session existence was checked while holding the store lock");
         let mut changes = Vec::with_capacity(2);
         append_steer_delivery_changes(&mut changes, &prompt, turn_id);
-        record.publish(session_id, changes)?;
+        record.commit(&self.persistence, session_id, changes, updated_at)?;
         record.steer_targets.remove(&prompt_id);
-        self.metadata.save(record.metadata_changed_at(updated_at));
         let mut delivered = prompt;
         delivered.status = PromptStatus::Delivered;
         Ok(Some(delivered))
@@ -887,7 +921,8 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        let update = record.publish(
+        let update = record.commit(
+            &self.persistence,
             session_id,
             vec![SessionChange::ActivityAdded {
                 activity: Activity::Error {
@@ -896,9 +931,9 @@ impl SessionStore {
                     text: message,
                 },
             }],
+            updated_at,
         )?;
         record.steer_targets.remove(&prompt_id);
-        self.metadata.save(record.metadata_changed_at(updated_at));
         Ok(Some(update))
     }
 
@@ -1029,11 +1064,10 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        record.publish(session_id, changes)?;
+        record.commit(&self.persistence, session_id, changes, updated_at)?;
         for prompt in pending_steers {
             record.steer_targets.remove(&prompt.id);
         }
-        self.metadata.save(record.metadata_changed_at(updated_at));
         Ok(next_turn)
     }
 
@@ -1054,9 +1088,7 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        let update = stored.publish(session_id, changes)?;
-        self.metadata.save(stored.metadata_changed_at(updated_at));
-        Ok(update)
+        stored.commit(&self.persistence, session_id, changes, updated_at)
     }
 
     pub(crate) fn publish_agent_output(
@@ -1089,11 +1121,7 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        let update = record.publish(session_id, vec![change])?;
-        record.summary.updated_at = updated_at;
-        // Streaming Provider output stays off the storage hot path. The next Turn boundary
-        // persists the final summary after all output has settled.
-        Ok(update)
+        record.commit(&self.persistence, session_id, vec![change], updated_at)
     }
 
     pub(crate) fn continuation_boundary(
@@ -1153,8 +1181,7 @@ impl SessionStore {
                 },
             ]);
         }
-        record.publish(session_id, changes)?;
-        self.metadata.save(record.metadata_changed_at(updated_at));
+        record.commit(&self.persistence, session_id, changes, updated_at)?;
         Ok(delivered
             .into_iter()
             .map(|mut prompt| {
@@ -1200,15 +1227,16 @@ impl SessionStore {
             .expect("Session existence was checked while holding the store lock");
         prompt.delivery = PromptDelivery::Steer;
         record
-            .publish(
+            .commit(
+                &self.persistence,
                 session_id,
                 vec![SessionChange::PromptDeliveryChanged {
                     prompt_id,
                     delivery: PromptDelivery::Steer,
                 }],
+                updated_at,
             )
             .expect("Prompt promotion preserves Session invariants");
-        self.metadata.save(record.metadata_changed_at(updated_at));
         Ok(prompt)
     }
 
@@ -1243,18 +1271,19 @@ impl SessionStore {
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
         record
-            .publish(
+            .commit(
+                &self.persistence,
                 session_id,
                 vec![SessionChange::PromptStatusChanged {
                     prompt_id,
                     status: PromptStatus::Cancelled,
                 }],
+                updated_at,
             )
             .expect("Prompt cancellation preserves Session invariants");
         if record.selection_retry_prompt == Some(prompt_id) {
             record.selection_retry_prompt = None;
         }
-        self.metadata.save(record.metadata_changed_at(updated_at));
         prompt.status = PromptStatus::Cancelled;
         Ok(prompt)
     }
@@ -1304,10 +1333,9 @@ impl SessionStore {
             .lock()
             .expect("Session store lock is not poisoned");
         let mut summaries = state
-            .persisted_summaries
+            .sessions
             .values()
-            .cloned()
-            .chain(state.sessions.values().map(|record| record.summary.clone()))
+            .map(|record| record.summary.clone())
             .filter(|summary| {
                 workspace
                     .as_ref()
@@ -1456,9 +1484,18 @@ impl PromptOwner {
 }
 
 impl SessionRecord {
-    fn metadata_changed_at(&mut self, updated_at: SessionTimestamp) -> SessionSummary {
+    fn commit(
+        &mut self,
+        persistence: &SessionPersistenceSink,
+        session_id: SessionId,
+        changes: Vec<SessionChange>,
+        updated_at: SessionTimestamp,
+    ) -> anyhow::Result<SessionUpdate> {
+        let update = self.publish(session_id, changes)?;
         self.summary.updated_at = updated_at;
-        self.summary.clone()
+        persistence.updated(self.summary.clone(), &update)?;
+        let _ = self.updates.send(update.clone());
+        Ok(update)
     }
 
     fn pending_selection_retry_prompt(&self) -> Option<PromptId> {
@@ -1568,7 +1605,6 @@ impl SessionRecord {
             .retain(|_, turn_id| !terminal_turns.contains(turn_id));
         self.snapshot = next;
         self.summary.session = self.snapshot.session.clone();
-        let _ = self.updates.send(update.clone());
         Ok(update)
     }
 }
