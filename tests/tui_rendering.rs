@@ -157,6 +157,20 @@ fn connected_application(workspace: &std::path::Path) -> Application {
     application
 }
 
+fn type_terminal_text(application: &mut Application, text: &str) {
+    for character in text.chars() {
+        assert_eq!(
+            application
+                .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )))
+                .expect("type terminal text"),
+            ApplicationTransition::Continue
+        );
+    }
+}
+
 fn connected_state(instance_id: Uuid, pid: u32) -> TuiState {
     let mut state = TuiState::default();
     state.apply(ManagedEvent::Connected(ready_health(instance_id, pid)));
@@ -217,17 +231,7 @@ fn slash_autocomplete_invokes_new_session_from_a_description_match() {
     let mut application = Application::new(workspace.path());
     let (_, _, _) = enter_active_session(&mut application, workspace.path());
 
-    for character in "/fresh".chars() {
-        assert_eq!(
-            application
-                .handle_terminal_event(InputEvent::Key(KeyEvent::new(
-                    KeyCode::Char(character),
-                    KeyModifiers::NONE,
-                )))
-                .expect("type slash command query"),
-            ApplicationTransition::Continue
-        );
-    }
+    type_terminal_text(&mut application, "/fresh");
 
     let autocomplete = rendered_application_rows(&application).join("\n");
     assert!(autocomplete.contains("/new"));
@@ -252,14 +256,7 @@ fn slash_autocomplete_invokes_new_session_from_a_description_match() {
 #[test]
 fn slash_autocomplete_keeps_the_landing_composer_visible_at_minimum_size() {
     let mut application = Application::default();
-    for character in "/n".chars() {
-        application
-            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
-                KeyCode::Char(character),
-                KeyModifiers::NONE,
-            )))
-            .expect("type slash query at minimum size");
-    }
+    type_terminal_text(&mut application, "/n");
 
     let buffer = rendered_application_buffer(&application, 28, 5);
     assert!(buffer_rows(&buffer).join("\n").contains("/new"));
@@ -328,14 +325,7 @@ fn new_session_keybinding_defers_creation_until_the_next_prompt() {
         ApplicationTransition::DetachSession
     );
 
-    for character in "Next Prompt".chars() {
-        application
-            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
-                KeyCode::Char(character),
-                KeyModifiers::NONE,
-            )))
-            .expect("type the next landing Prompt");
-    }
+    type_terminal_text(&mut application, "Next Prompt");
     let ApplicationTransition::CreateSession(request) = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::Enter,
@@ -400,14 +390,7 @@ fn dismissed_alias_is_submitted_literally_before_turn_interruption() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = Application::new(workspace.path());
     let (_, _, _) = enter_active_session(&mut application, workspace.path());
-    for character in "/clear".chars() {
-        application
-            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
-                KeyCode::Char(character),
-                KeyModifiers::NONE,
-            )))
-            .expect("type slash alias");
-    }
+    type_terminal_text(&mut application, "/clear");
     let canonical_result = rendered_application_rows(&application).join("\n");
     assert!(canonical_result.contains("/clear"));
     assert!(canonical_result.contains("/new"));

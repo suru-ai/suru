@@ -240,6 +240,27 @@ impl TuiState {
             .sync(self.composers.text(key), self.composers.cursor(key));
     }
 
+    fn edit_composer(&mut self, edit: impl FnOnce(&mut ComposerMemory, ComposerKey)) {
+        let key = self.composer_key();
+        edit(&mut self.composers, key);
+        self.submission_error = None;
+        self.sync_command_autocomplete();
+    }
+
+    fn navigate_composer(&mut self, navigate: impl FnOnce(&mut ComposerMemory, ComposerKey)) {
+        let key = self.composer_key();
+        navigate(&mut self.composers, key);
+        self.sync_command_autocomplete();
+    }
+
+    fn paste_into_composer(&mut self, text: &str) {
+        let key = self.composer_key();
+        self.composers.insert(key, text);
+        self.submission_error = None;
+        self.command_autocomplete
+            .dismiss_for_text(self.composers.text(key));
+    }
+
     pub fn apply(&mut self, event: ManagedEvent) {
         match event {
             ManagedEvent::Connecting => {
@@ -746,71 +767,52 @@ impl Application {
                 if self.state.composers.is_empty(key) {
                     return Ok(ApplicationTransition::Exit);
                 }
-                self.state.composers.clear(key);
-                self.state.submission_error = None;
-                self.state.sync_command_autocomplete();
+                self.state
+                    .edit_composer(|composers, key| composers.clear(key));
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::InsertText(text)) => {
-                let key = self.state.composer_key();
-                self.state.composers.insert(key, &text);
-                self.state.submission_error = None;
-                self.state.sync_command_autocomplete();
+                self.state
+                    .edit_composer(|composers, key| composers.insert(key, &text));
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::PasteText(text)) => {
-                let key = self.state.composer_key();
-                self.state.composers.insert(key, &text);
-                self.state.submission_error = None;
-                let text = self.state.composers.text(key);
-                self.state.command_autocomplete.suppress(text);
+                self.state.paste_into_composer(&text);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::InsertNewline) => {
-                let key = self.state.composer_key();
-                self.state.composers.insert(key, "\n");
-                self.state.submission_error = None;
-                self.state.sync_command_autocomplete();
+                self.state
+                    .edit_composer(|composers, key| composers.insert(key, "\n"));
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::DeleteBackward) => {
-                let key = self.state.composer_key();
-                self.state.composers.delete_backward(key);
-                self.state.submission_error = None;
-                self.state.sync_command_autocomplete();
+                self.state
+                    .edit_composer(|composers, key| composers.delete_backward(key));
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::DeleteForward) => {
-                let key = self.state.composer_key();
-                self.state.composers.delete_forward(key);
-                self.state.submission_error = None;
-                self.state.sync_command_autocomplete();
+                self.state
+                    .edit_composer(|composers, key| composers.delete_forward(key));
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::MoveCursorLeft) => {
-                let key = self.state.composer_key();
-                self.state.composers.move_left(key);
-                self.state.sync_command_autocomplete();
+                self.state
+                    .navigate_composer(|composers, key| composers.move_left(key));
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::MoveCursorRight) => {
-                let key = self.state.composer_key();
-                self.state.composers.move_right(key);
-                self.state.sync_command_autocomplete();
+                self.state
+                    .navigate_composer(|composers, key| composers.move_right(key));
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::HistoryPrevious) => {
-                let key = self.state.composer_key();
-                self.state.composers.history_previous(key);
-                self.state.submission_error = None;
-                self.state.sync_command_autocomplete();
+                self.state
+                    .edit_composer(|composers, key| composers.history_previous(key));
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::HistoryNext) => {
-                let key = self.state.composer_key();
-                self.state.composers.history_next(key);
-                self.state.submission_error = None;
-                self.state.sync_command_autocomplete();
+                self.state
+                    .edit_composer(|composers, key| composers.history_next(key));
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::ScrollTranscriptPageUp) => {
@@ -837,7 +839,7 @@ impl Application {
             ApplicationEvent::Command(CommandId::DismissAutocomplete) => {
                 let key = self.state.composer_key();
                 let text = self.state.composers.text(key);
-                self.state.command_autocomplete.dismiss(text);
+                self.state.command_autocomplete.dismiss_for_text(text);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::SelectAutocomplete) => {
@@ -1395,6 +1397,7 @@ fn render_command_autocomplete(
     } else {
         row_count.min(room_above.max(1))
     };
+    let row_capacity = height.saturating_sub(if bordered { 2 } else { 0 });
     let x = frame
         .area()
         .x
@@ -1404,7 +1407,7 @@ fn render_command_autocomplete(
     let content_width = width.saturating_sub(if bordered { 2 } else { 0 });
     let rows = state
         .command_autocomplete
-        .rows()
+        .visible_rows(usize::from(row_capacity))
         .map(|(selected, command)| {
             let slash = command
                 .slash

@@ -106,13 +106,9 @@ impl CommandAutocomplete {
         self.selected = self.selected.min(self.matches.len().saturating_sub(1));
     }
 
-    pub(super) fn suppress(&mut self, text: &str) {
+    pub(super) fn dismiss_for_text(&mut self, text: &str) {
         self.dismissed_text = Some(text.to_owned());
         self.hide();
-    }
-
-    pub(super) fn dismiss(&mut self, text: &str) {
-        self.suppress(text);
     }
 
     pub(super) fn is_visible(&self) -> bool {
@@ -145,6 +141,14 @@ impl CommandAutocomplete {
             .iter()
             .enumerate()
             .map(|(index, id)| (index == self.selected, descriptor(*id)))
+    }
+
+    pub(super) fn visible_rows(
+        &self,
+        capacity: usize,
+    ) -> impl Iterator<Item = (bool, &'static SemanticCommandDescriptor)> + '_ {
+        let start = self.selected.saturating_add(1).saturating_sub(capacity);
+        self.rows().skip(start).take(capacity)
     }
 
     fn hide(&mut self) {
