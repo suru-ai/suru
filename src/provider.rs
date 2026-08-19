@@ -6,7 +6,8 @@ use futures_util::Stream;
 use tokio::sync::watch;
 
 use crate::protocol::{
-    AgentIdentity, ModelDescriptor, ModelOptionKind, ModelOptionRole, ProviderId, SessionId,
+    AgentIdentity, FileChange, ModelDescriptor, ModelOptionKind, ModelOptionRole, ProviderId,
+    SessionId,
 };
 
 mod codex;
@@ -78,6 +79,12 @@ pub enum ProviderCommandStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderFileChangeStatus {
+    Completed,
+    Failed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderEvent {
     AgentMessageStarted,
@@ -98,6 +105,18 @@ pub enum ProviderEvent {
         activity_id: ProviderActivityId,
         status: ProviderCommandStatus,
         exit_status: Option<i32>,
+    },
+    FileChangeStarted {
+        activity_id: ProviderActivityId,
+        changes: Vec<FileChange>,
+    },
+    FileChangeUpdated {
+        activity_id: ProviderActivityId,
+        changes: Vec<FileChange>,
+    },
+    FileChangeCompleted {
+        activity_id: ProviderActivityId,
+        status: ProviderFileChangeStatus,
     },
     TurnCompleted,
     TurnInterrupted,

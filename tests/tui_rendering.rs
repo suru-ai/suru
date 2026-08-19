@@ -4,12 +4,12 @@ use chidori::{
         SessionSubscription,
     },
     protocol::{
-        Activity, ActivityId, ActivityStatus, AgentId, AgentIdentity, CreateSessionRequest, Health,
-        InitialPrompt, LifecycleState, Message, MessageId, MessageRole, MessageStatus, ModelId,
-        Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, ServerIdentity,
-        ServerShutdown, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
-        SessionStatus, SessionUpdate, ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus,
-        Workspace,
+        Activity, ActivityId, ActivityStatus, AgentId, AgentIdentity, CreateSessionRequest,
+        FileChange, FileChangeKind, Health, InitialPrompt, LifecycleState, Message, MessageId,
+        MessageRole, MessageStatus, ModelId, Prompt, PromptDelivery, PromptId, PromptOrder,
+        PromptStatus, ProviderId, ServerIdentity, ServerShutdown, Session, SessionChange,
+        SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionUpdate, ShutdownReason,
+        TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{AgentOutput, ServerConfig},
     tui::{
@@ -1341,6 +1341,79 @@ fn command_activities_render_active_successful_and_failed_states_at_responsive_w
             assert!(
                 compact.contains(expected),
                 "compact command Activity omitted {expected:?}:\n{compact}"
+            );
+        }
+    }
+}
+
+#[test]
+fn file_change_activities_render_active_successful_and_failed_states_at_responsive_widths() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let cases = [
+        (
+            ActivityStatus::Active,
+            "… Applying file changes",
+            Color::Cyan,
+        ),
+        (
+            ActivityStatus::Completed,
+            "✓ Applied file changes",
+            Color::Green,
+        ),
+        (
+            ActivityStatus::Failed,
+            "× Failed to apply file changes",
+            Color::Red,
+        ),
+    ];
+
+    for (status, heading, color) in cases {
+        let mut snapshot = failed_session_snapshot(
+            SessionId::new(),
+            PromptId::new(),
+            "Change these files",
+            workspace.path(),
+        );
+        let activity_id = snapshot.activities[0].id();
+        snapshot.activities[0] = Activity::FileChange {
+            id: activity_id,
+            turn_id: snapshot.turns[0].id,
+            status,
+            changes: vec![
+                FileChange {
+                    path: "src/protocol.rs".into(),
+                    kind: FileChangeKind::Update,
+                },
+                FileChange {
+                    path: "tests/new.rs".into(),
+                    kind: FileChangeKind::Add,
+                },
+                FileChange {
+                    path: "old.rs".into(),
+                    kind: FileChangeKind::Delete,
+                },
+            ],
+        };
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach Session with file-change Activity");
+
+        let desktop = rendered_application_buffer(&application, 100, 22);
+        let desktop_text = buffer_rows(&desktop).join("\n");
+        for expected in [heading, "M src/protocol.rs", "A tests/new.rs", "D old.rs"] {
+            assert!(
+                desktop_text.contains(expected),
+                "desktop file-change Activity omitted {expected:?}:\n{desktop_text}"
+            );
+        }
+        assert_eq!(text_cell(&desktop, heading).fg, color);
+
+        let compact = rendered_application_rows_at(&application, 43, 18).join("\n");
+        for expected in [heading, "M src/protocol.rs", "A tests/new.rs", "D old.rs"] {
+            assert!(
+                compact.contains(expected),
+                "compact file-change Activity omitted {expected:?}:\n{compact}"
             );
         }
     }

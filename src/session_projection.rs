@@ -159,6 +159,13 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 ) {
                     bail!("Session update added a command Activity outside its initial state");
                 }
+                if matches!(
+                    activity,
+                    Activity::FileChange { status, .. }
+                        if *status != ActivityStatus::Active
+                ) {
+                    bail!("Session update added a file-change Activity outside its initial state");
+                }
                 next.activities.push(activity.clone());
                 next.transcript.push(TranscriptItem::Activity {
                     activity_id: activity.id(),
@@ -210,6 +217,57 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 }
                 *current_status = *status;
                 *current_exit_status = *exit_status;
+            }
+            SessionChange::FileChangeUpdated {
+                activity_id,
+                changes,
+            } => {
+                let Some(activity) = next
+                    .activities
+                    .iter_mut()
+                    .find(|activity| activity.id() == *activity_id)
+                else {
+                    bail!("Session update referenced an unknown Activity");
+                };
+                let Activity::FileChange {
+                    status,
+                    changes: current_changes,
+                    ..
+                } = activity
+                else {
+                    bail!("Session update changed paths on a different Activity kind");
+                };
+                if *status != ActivityStatus::Active {
+                    bail!("Session update changed paths on a terminal file-change Activity");
+                }
+                *current_changes = changes.clone();
+            }
+            SessionChange::FileChangeStatusChanged {
+                activity_id,
+                status,
+            } => {
+                let Some(activity) = next
+                    .activities
+                    .iter_mut()
+                    .find(|activity| activity.id() == *activity_id)
+                else {
+                    bail!("Session update referenced an unknown Activity");
+                };
+                let Activity::FileChange {
+                    status: current_status,
+                    ..
+                } = activity
+                else {
+                    bail!("Session update completed a different Activity kind");
+                };
+                if *current_status != ActivityStatus::Active
+                    || !matches!(status, ActivityStatus::Completed | ActivityStatus::Failed)
+                {
+                    bail!(
+                        "Session update contained an invalid file-change Activity status transition"
+                    );
+                }
+                *current_status = *status;
             }
             SessionChange::TurnStatusChanged { turn_id, status } => {
                 let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {

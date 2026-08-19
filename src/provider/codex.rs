@@ -22,10 +22,12 @@ use tokio::{
 
 use super::{
     ProviderActivityId, ProviderCommandStatus, ProviderError, ProviderEvent, ProviderEventStream,
-    ProviderFuture, ProviderRuntime, ProviderSession, ProviderSessionConnection,
-    ProviderSessionRequest, ProviderTurnInput, wait_for_shutdown,
+    ProviderFileChangeStatus, ProviderFuture, ProviderRuntime, ProviderSession,
+    ProviderSessionConnection, ProviderSessionRequest, ProviderTurnInput, wait_for_shutdown,
 };
-use crate::protocol::{AgentId, AgentIdentity, ModelId, ProviderId, SessionId};
+use crate::protocol::{
+    AgentId, AgentIdentity, FileChange, FileChangeKind, ModelId, ProviderId, SessionId,
+};
 use crate::protocol::{
     ModelAvailability, ModelDescriptor, ModelOptionChoice, ModelOptionChoiceId,
     ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
@@ -612,6 +614,7 @@ async fn start_codex_thread(
         active_turn_id: None,
         active_agent_message: None,
         active_commands: HashMap::new(),
+        active_file_changes: HashMap::new(),
     }));
     let turn_start_changed = Arc::new(Notify::new());
     let session = Arc::new(CodexSession {
@@ -846,6 +849,7 @@ async fn start_native_turn(
                 native.active_turn_id = Some(turn_id);
                 native.active_agent_message = None;
                 native.active_commands.clear();
+                native.active_file_changes.clear();
                 Ok(())
             }
             Ok(_) => Err(codex_error(
@@ -880,6 +884,7 @@ struct NativeCorrelation {
     active_turn_id: Option<String>,
     active_agent_message: Option<ActiveNativeAgentMessage>,
     active_commands: HashMap<String, ActiveNativeCommand>,
+    active_file_changes: HashMap<String, ActiveNativeFileChange>,
 }
 
 struct ActiveNativeAgentMessage {
@@ -889,6 +894,10 @@ struct ActiveNativeAgentMessage {
 
 struct ActiveNativeCommand {
     streamed_output: String,
+}
+
+struct ActiveNativeFileChange {
+    changes: Vec<FileChange>,
 }
 
 enum NativeNotification {
@@ -931,6 +940,26 @@ enum NativeNotification {
         exit_status: Option<i32>,
         status: NativeCommandStatus,
     },
+    FileChangeStarted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        changes: Vec<NativeFileChange>,
+        status: NativeFileChangeStatus,
+    },
+    FileChangeUpdated {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        changes: Vec<NativeFileChange>,
+    },
+    FileChangeCompleted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        changes: Vec<NativeFileChange>,
+        status: NativeFileChangeStatus,
+    },
     TurnCompleted {
         thread_id: String,
         turn_id: String,
@@ -971,6 +1000,11 @@ enum NativeItem {
         #[serde(default, rename = "exitCode")]
         exit_code: Option<i32>,
     },
+    FileChange {
+        id: String,
+        changes: Vec<NativeFileChange>,
+        status: NativeFileChangeStatus,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -991,6 +1025,54 @@ enum NativeCommandStatus {
     Completed,
     Failed,
     Declined,
+}
+
+#[derive(Clone, Deserialize)]
+struct NativeFileChange {
+    path: PathBuf,
+    kind: NativeFileChangeKind,
+}
+
+impl From<NativeFileChange> for FileChange {
+    fn from(change: NativeFileChange) -> Self {
+        Self {
+            path: change.path,
+            kind: match change.kind {
+                NativeFileChangeKind::Add => FileChangeKind::Add,
+                NativeFileChangeKind::Delete => FileChangeKind::Delete,
+                NativeFileChangeKind::Update { .. } => FileChangeKind::Update,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum NativeFileChangeKind {
+    Add,
+    Delete,
+    Update {
+        #[serde(default, rename = "movePath")]
+        _move_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum NativeFileChangeStatus {
+    InProgress,
+    Completed,
+    Failed,
+    Declined,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileChangeUpdatedParams {
+    thread_id: String,
+    turn_id: String,
+    item_id: String,
+    changes: Vec<NativeFileChange>,
 }
 
 #[derive(Deserialize)]
@@ -1233,6 +1315,111 @@ fn project_native_notification(
             });
             Ok(projected)
         }
+        NativeNotification::FileChangeStarted {
+            thread_id,
+            turn_id,
+            item_id,
+            changes,
+            status,
+        } => {
+            if !is_active_native_turn(correlation, &thread_id, &turn_id) {
+                return Ok(Vec::new());
+            }
+            if !matches!(status, NativeFileChangeStatus::InProgress) {
+                return Err(codex_error(
+                    "Codex started file changes outside their active state",
+                ));
+            }
+            if correlation.active_commands.contains_key(&item_id)
+                || correlation.active_file_changes.contains_key(&item_id)
+            {
+                return Err(codex_error(
+                    "Codex reused an active file-change item identity",
+                ));
+            }
+            let changes = changes
+                .into_iter()
+                .map(FileChange::from)
+                .collect::<Vec<_>>();
+            correlation.active_file_changes.insert(
+                item_id.clone(),
+                ActiveNativeFileChange {
+                    changes: changes.clone(),
+                },
+            );
+            Ok(vec![ProviderEvent::FileChangeStarted {
+                activity_id: ProviderActivityId::new(item_id),
+                changes,
+            }])
+        }
+        NativeNotification::FileChangeUpdated {
+            thread_id,
+            turn_id,
+            item_id,
+            changes,
+        } => {
+            if !is_active_native_turn(correlation, &thread_id, &turn_id) {
+                return Ok(Vec::new());
+            }
+            let Some(file_change) = correlation.active_file_changes.get_mut(&item_id) else {
+                return Ok(Vec::new());
+            };
+            let changes = changes
+                .into_iter()
+                .map(FileChange::from)
+                .collect::<Vec<_>>();
+            file_change.changes.clone_from(&changes);
+            Ok(vec![ProviderEvent::FileChangeUpdated {
+                activity_id: ProviderActivityId::new(item_id),
+                changes,
+            }])
+        }
+        NativeNotification::FileChangeCompleted {
+            thread_id,
+            turn_id,
+            item_id,
+            changes,
+            status,
+        } => {
+            if !is_active_native_turn(correlation, &thread_id, &turn_id) {
+                return Ok(Vec::new());
+            }
+            let Some(file_change) = correlation.active_file_changes.get(&item_id) else {
+                return Err(codex_error(
+                    "Codex completed file changes before starting the Activity",
+                ));
+            };
+            let changes = changes
+                .into_iter()
+                .map(FileChange::from)
+                .collect::<Vec<_>>();
+            let paths_changed = file_change.changes != changes;
+            let status = match status {
+                NativeFileChangeStatus::Completed => ProviderFileChangeStatus::Completed,
+                NativeFileChangeStatus::Failed | NativeFileChangeStatus::Declined => {
+                    ProviderFileChangeStatus::Failed
+                }
+                NativeFileChangeStatus::InProgress => {
+                    return Err(codex_error(
+                        "Codex completed file changes while they were still active",
+                    ));
+                }
+            };
+            correlation.active_file_changes.remove(&item_id);
+            let activity_id = ProviderActivityId::new(item_id);
+            let mut projected = Vec::with_capacity(if paths_changed { 2 } else { 1 });
+            if paths_changed {
+                projected.push(ProviderEvent::FileChangeUpdated {
+                    activity_id: activity_id.clone(),
+                    changes,
+                });
+            }
+            projected.push(ProviderEvent::FileChangeCompleted {
+                activity_id,
+                status,
+            });
+            Ok(projected)
+        }
         NativeNotification::TurnCompleted {
             thread_id,
             turn_id,
@@ -1244,6 +1431,7 @@ fn project_native_notification(
             correlation.active_turn_id = None;
             correlation.active_agent_message = None;
             correlation.active_commands.clear();
+            correlation.active_file_changes.clear();
             Ok(vec![match outcome {
                 NativeTurnOutcome::Completed => ProviderEvent::TurnCompleted,
                 NativeTurnOutcome::Interrupted => ProviderEvent::TurnInterrupted,
@@ -1896,6 +2084,17 @@ fn decode_notification(
                     cwd,
                     status,
                 })),
+                NativeItem::FileChange {
+                    id,
+                    changes,
+                    status,
+                } => Ok(Some(NativeNotification::FileChangeStarted {
+                    thread_id: params.thread_id,
+                    turn_id: params.turn_id,
+                    item_id: id,
+                    changes,
+                    status,
+                })),
                 NativeItem::Unknown => Ok(None),
             }
         }
@@ -1915,6 +2114,15 @@ fn decode_notification(
                 turn_id: params.turn_id,
                 item_id: params.item_id,
                 delta: params.delta,
+            }))
+        }
+        "item/fileChange/patchUpdated" => {
+            let params: FileChangeUpdatedParams = decode_notification_params(method, params)?;
+            Ok(Some(NativeNotification::FileChangeUpdated {
+                thread_id: params.thread_id,
+                turn_id: params.turn_id,
+                item_id: params.item_id,
+                changes: params.changes,
             }))
         }
         "item/completed" => {
@@ -1940,6 +2148,17 @@ fn decode_notification(
                     item_id: id,
                     aggregated_output,
                     exit_status: exit_code,
+                    status,
+                })),
+                NativeItem::FileChange {
+                    id,
+                    changes,
+                    status,
+                } => Ok(Some(NativeNotification::FileChangeCompleted {
+                    thread_id: params.thread_id,
+                    turn_id: params.turn_id,
+                    item_id: id,
+                    changes,
                     status,
                 })),
                 NativeItem::Unknown => Ok(None),

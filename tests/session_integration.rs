@@ -22,14 +22,16 @@ use chidori::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-        CreateSessionRequest, InitialPrompt, LifecycleState, Message, MessageId, MessageRole,
-        MessageStatus, ModelId, PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId, PromptOrder,
-        PromptStatus, ProviderId, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
-        ServerIdentity, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
-        SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionUpdate,
-        TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        CreateSessionRequest, FileChange, FileChangeKind, InitialPrompt, LifecycleState, Message,
+        MessageId, MessageRole, MessageStatus, ModelId, PROTOCOL_VERSION, Prompt, PromptDelivery,
+        PromptId, PromptOrder, PromptStatus, ProviderId, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT,
+        SESSION_UPDATED_EVENT, ServerIdentity, Session, SessionChange, SessionError,
+        SessionErrorCode, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
+        SessionSummary, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
-    provider::{ProviderActivityId, ProviderCommandStatus, ProviderEvent},
+    provider::{
+        ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderFileChangeStatus,
+    },
     server::{self, AgentOutput, ServerConfig},
 };
 use eventsource_stream::Eventsource;
@@ -233,6 +235,30 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
             status: ProviderCommandStatus::Completed,
             exit_status: Some(0),
         },
+        ProviderEvent::FileChangeStarted {
+            activity_id: ProviderActivityId::new("fixture-file-change"),
+            changes: vec![FileChange {
+                path: "src/protocol.rs".into(),
+                kind: FileChangeKind::Update,
+            }],
+        },
+        ProviderEvent::FileChangeUpdated {
+            activity_id: ProviderActivityId::new("fixture-file-change"),
+            changes: vec![
+                FileChange {
+                    path: "src/protocol.rs".into(),
+                    kind: FileChangeKind::Update,
+                },
+                FileChange {
+                    path: "tests/session_protocol.rs".into(),
+                    kind: FileChangeKind::Add,
+                },
+            ],
+        },
+        ProviderEvent::FileChangeCompleted {
+            activity_id: ProviderActivityId::new("fixture-file-change"),
+            status: ProviderFileChangeStatus::Completed,
+        },
         ProviderEvent::AgentMessageStarted,
         ProviderEvent::AgentMessageDelta {
             content: "Hello".to_owned(),
@@ -253,7 +279,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         .read_session(created.session.id)
         .await
         .expect("read completed Session");
-    assert_eq!(completed.revision, SessionRevision(12));
+    assert_eq!(completed.revision, SessionRevision(15));
     assert_eq!(completed.session.agent, Some(identity));
     assert_eq!(completed.session.status, SessionStatus::Idle);
     assert_eq!(completed.prompts[0].status, PromptStatus::Delivered);
@@ -264,7 +290,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
     assert_eq!(completed.messages[1].role, MessageRole::Agent);
     assert_eq!(completed.messages[1].status, MessageStatus::Completed);
     assert_eq!(completed.messages[1].content, "Hello from the Provider");
-    assert_eq!(completed.activities.len(), 1);
+    assert_eq!(completed.activities.len(), 2);
     let Activity::Command {
         id: command_activity_id,
         status,
@@ -292,6 +318,49 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         1,
         "streaming command output must not duplicate transcript rows"
     );
+    let Activity::FileChange {
+        id: file_change_activity_id,
+        status: file_change_status,
+        changes,
+        ..
+    } = &completed.activities[1]
+    else {
+        panic!("Provider file change must project as file-change Activity");
+    };
+    assert_eq!(*file_change_status, ActivityStatus::Completed);
+    assert_eq!(
+        changes,
+        &[
+            FileChange {
+                path: "src/protocol.rs".into(),
+                kind: FileChangeKind::Update,
+            },
+            FileChange {
+                path: "tests/session_protocol.rs".into(),
+                kind: FileChangeKind::Add,
+            },
+        ]
+    );
+    assert_eq!(
+        completed
+            .transcript
+            .iter()
+            .filter(|item| matches!(item,
+                TranscriptItem::Activity { activity_id }
+                    if activity_id == file_change_activity_id))
+            .count(),
+        1,
+        "file-change updates must not duplicate transcript rows"
+    );
+    assert!(matches!(
+        completed.transcript.as_slice(),
+        [
+            TranscriptItem::Message { .. },
+            TranscriptItem::Activity { activity_id: command_id },
+            TranscriptItem::Activity { activity_id: file_change_id },
+            TranscriptItem::Message { .. },
+        ] if command_id == command_activity_id && file_change_id == file_change_activity_id
+    ));
 
     let failing_prompt_id = PromptId::new();
     let admitted = first
@@ -334,6 +403,16 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
     let first_start = next_session_update(&mut first_feed).await;
     let second_start = next_session_update(&mut second_feed).await;
     assert_eq!(first_start, second_start);
+    provider_session.emit(ProviderEvent::FileChangeStarted {
+        activity_id: ProviderActivityId::new("failed-file-change"),
+        changes: vec![FileChange {
+            path: "src/provider.rs".into(),
+            kind: FileChangeKind::Update,
+        }],
+    });
+    let first_file_change = next_session_update(&mut first_feed).await;
+    let second_file_change = next_session_update(&mut second_feed).await;
+    assert_eq!(first_file_change, second_file_change);
     provider_session.emit(ProviderEvent::TurnFailed {
         message: "Provider stopped while the command was running".to_owned(),
     });
@@ -360,6 +439,15 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
             exit_status: None,
             ..
         } if command == "cargo test --all")));
+    assert!(failed.activities.iter().any(|activity| matches!(activity,
+    Activity::FileChange {
+        status: ActivityStatus::Failed,
+        changes,
+        ..
+    } if changes == &[FileChange {
+        path: "src/provider.rs".into(),
+        kind: FileChangeKind::Update,
+    }])));
 
     drop(provider_session);
     drop(first_feed);

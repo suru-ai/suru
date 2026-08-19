@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SESSION_SNAPSHOT_EVENT: &str = "session_snapshot";
 pub const SESSION_UPDATED_EVENT: &str = "session_updated";
@@ -260,6 +260,21 @@ pub enum ActivityStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeKind {
+    Add,
+    Delete,
+    Update,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileChange {
+    pub path: PathBuf,
+    pub kind: FileChangeKind,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Activity {
@@ -282,12 +297,21 @@ pub enum Activity {
         output: String,
         exit_status: Option<i32>,
     },
+    FileChange {
+        id: ActivityId,
+        turn_id: TurnId,
+        status: ActivityStatus,
+        changes: Vec<FileChange>,
+    },
 }
 
 impl Activity {
     pub const fn id(&self) -> ActivityId {
         match self {
-            Self::Status { id, .. } | Self::Error { id, .. } | Self::Command { id, .. } => *id,
+            Self::Status { id, .. }
+            | Self::Error { id, .. }
+            | Self::Command { id, .. }
+            | Self::FileChange { id, .. } => *id,
         }
     }
 
@@ -295,7 +319,8 @@ impl Activity {
         match self {
             Self::Status { turn_id, .. }
             | Self::Error { turn_id, .. }
-            | Self::Command { turn_id, .. } => *turn_id,
+            | Self::Command { turn_id, .. }
+            | Self::FileChange { turn_id, .. } => *turn_id,
         }
     }
 }
@@ -415,6 +440,14 @@ pub enum SessionChange {
         activity_id: ActivityId,
         status: ActivityStatus,
         exit_status: Option<i32>,
+    },
+    FileChangeUpdated {
+        activity_id: ActivityId,
+        changes: Vec<FileChange>,
+    },
+    FileChangeStatusChanged {
+        activity_id: ActivityId,
+        status: ActivityStatus,
     },
     TurnStatusChanged {
         turn_id: TurnId,

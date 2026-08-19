@@ -41,10 +41,10 @@ use crate::{
         SessionProjection, SessionStreamError, SessionSubscription,
     },
     protocol::{
-        Activity, AdmitPromptRequest, AgentIdentity, CreateSessionRequest, InitialPrompt,
-        MessageId, MessageRole, PromptDelivery, PromptId, PromptStatus, ServerIdentity, SessionId,
-        SessionSnapshot, SessionStatus, ShutdownReason, TranscriptItem, TurnId, TurnStatus,
-        Workspace,
+        Activity, AdmitPromptRequest, AgentIdentity, CreateSessionRequest, FileChange,
+        FileChangeKind, InitialPrompt, MessageId, MessageRole, PromptDelivery, PromptId,
+        PromptStatus, ServerIdentity, SessionId, SessionSnapshot, SessionStatus, ShutdownReason,
+        TranscriptItem, TurnId, TurnStatus, Workspace,
     },
     theme::Theme,
 };
@@ -2304,6 +2304,9 @@ fn transcript_projection(
                         *exit_status,
                         theme,
                     ),
+                    Activity::FileChange {
+                        status, changes, ..
+                    } => push_file_change_activity(&mut lines, *status, changes, theme),
                 }
             }
         }
@@ -2347,6 +2350,35 @@ fn push_command_activity(
     }
     if !output.is_empty() {
         push_prefixed_lines(lines, "    ", output, theme.text.subdued);
+    }
+}
+
+fn push_file_change_activity(
+    lines: &mut Vec<Line<'static>>,
+    status: crate::protocol::ActivityStatus,
+    changes: &[FileChange],
+    theme: &Theme,
+) {
+    use crate::protocol::ActivityStatus;
+
+    let (marker, label, style) = match status {
+        ActivityStatus::Active => ("… ", "Applying file changes", theme.accent.primary),
+        ActivityStatus::Completed => ("✓ ", "Applied file changes", theme.feedback.success),
+        ActivityStatus::Failed => ("× ", "Failed to apply file changes", theme.feedback.error),
+    };
+    push_prefixed_lines(lines, &format!("  {marker}"), label, style);
+    for change in changes {
+        let marker = match change.kind {
+            FileChangeKind::Add => "A",
+            FileChangeKind::Delete => "D",
+            FileChangeKind::Update => "M",
+        };
+        push_prefixed_lines(
+            lines,
+            "    ",
+            &format!("{marker} {}", change.path.to_string_lossy()),
+            theme.text.subdued,
+        );
     }
 }
 

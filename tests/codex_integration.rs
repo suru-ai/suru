@@ -11,10 +11,10 @@ use chidori::{
     },
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, CreateSessionRequest,
-        InitialPrompt, MessageRole, MessageStatus, ModelAvailability, ModelId, ModelOptionKind,
-        ModelOptionRole, PromptDelivery, PromptId, PromptStatus, ProviderCatalogStatus, ProviderId,
-        SessionChange, SessionId, SessionSnapshot, SessionStatus, ShutdownReason, TranscriptItem,
-        TurnId, TurnStatus, Workspace,
+        FileChange, FileChangeKind, InitialPrompt, MessageRole, MessageStatus, ModelId,
+        ModelAvailability, ModelOptionKind, ModelOptionRole, PromptDelivery, PromptId, PromptStatus,
+        ProviderCatalogStatus, ProviderId, SessionChange, SessionId, SessionSnapshot, SessionStatus,
+        ShutdownReason, TranscriptItem, TurnId, TurnStatus, Workspace,
     },
     provider::CodexRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -67,6 +67,10 @@ while IFS= read -r line; do
       printf '%s\n' '{"method":"item/commandExecution/outputDelta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-command","delta":"running ","futureField":true}}'
       printf '%s\n' '{"method":"item/commandExecution/outputDelta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-command","delta":"tests\n"}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"commandExecution","id":"native-command","command":"cargo test --test codex_integration","cwd":"/fixture/work","status":"completed","aggregatedOutput":"running tests\nall green\n","exitCode":0,"futureField":true},"futureField":true}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"fileChange","id":"native-file-change","changes":[{"path":"src/protocol.rs","kind":{"type":"update","movePath":null},"diff":"private start patch"}],"status":"inProgress","futureField":{"opaque":true}},"futureField":true}}'
+      printf '%s\n' '{"method":"item/fileChange/patchUpdated","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"other-file-change","changes":[{"path":"wrong-session.txt","kind":{"type":"add"},"diff":"wrong item patch"}]}}'
+      printf '%s\n' '{"method":"item/fileChange/patchUpdated","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-file-change","changes":[{"path":"src/protocol.rs","kind":{"type":"update","movePath":"src/protocol_v2.rs"},"diff":"private updated patch"},{"path":"tests/session_protocol.rs","kind":{"type":"add"},"diff":"private added patch"}],"futureField":true}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"fileChange","id":"native-file-change","changes":[{"path":"src/protocol.rs","kind":{"type":"update","movePath":"src/protocol_v2.rs"},"diff":"private final patch"},{"path":"tests/session_protocol.rs","kind":{"type":"add"},"diff":"private final test patch"},{"path":"obsolete.txt","kind":{"type":"delete"},"diff":"private deleted patch"}],"status":"completed","futureField":{"native":true}},"futureField":true}}'
       printf '%s' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"native-message","text":"","futureField":true},"futureField":true'
       printf '%s\n' '}}'
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"other-message","delta":"wrong item content"}}'
@@ -1443,6 +1447,10 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     let mut streamed_command_id: Option<ActivityId> = None;
     let mut streamed_command_output = String::new();
     let mut saw_command_completion = false;
+    let mut streamed_file_change_id: Option<ActivityId> = None;
+    let mut streamed_file_changes = Vec::new();
+    let mut file_change_update_count = 0;
+    let mut saw_file_change_completion = false;
     timeout(Duration::from_secs(2), async {
         loop {
             let event = feed
@@ -1482,6 +1490,36 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
                             assert_eq!(Some(*activity_id), streamed_command_id);
                             saw_command_completion = true;
                         }
+                        SessionChange::ActivityAdded {
+                            activity:
+                                Activity::FileChange {
+                                    id,
+                                    status: ActivityStatus::Active,
+                                    changes,
+                                    ..
+                                },
+                        } => {
+                            assert!(
+                                streamed_file_change_id.replace(*id).is_none(),
+                                "SSE must add exactly one file-change Activity"
+                            );
+                            streamed_file_changes.clone_from(changes);
+                        }
+                        SessionChange::FileChangeUpdated {
+                            activity_id,
+                            changes,
+                        } => {
+                            assert_eq!(Some(*activity_id), streamed_file_change_id);
+                            streamed_file_changes.clone_from(changes);
+                            file_change_update_count += 1;
+                        }
+                        SessionChange::FileChangeStatusChanged {
+                            activity_id,
+                            status: ActivityStatus::Completed,
+                        } => {
+                            assert_eq!(Some(*activity_id), streamed_file_change_id);
+                            saw_file_change_completion = true;
+                        }
                         SessionChange::TurnStatusChanged {
                             status: TurnStatus::Completed,
                             ..
@@ -1503,6 +1541,26 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     assert!(streamed_command_id.is_some());
     assert_eq!(streamed_command_output, "running tests\nall green\n");
     assert!(saw_command_completion);
+    assert!(streamed_file_change_id.is_some());
+    assert_eq!(file_change_update_count, 2);
+    assert_eq!(
+        streamed_file_changes,
+        [
+            FileChange {
+                path: "src/protocol.rs".into(),
+                kind: FileChangeKind::Update,
+            },
+            FileChange {
+                path: "tests/session_protocol.rs".into(),
+                kind: FileChangeKind::Add,
+            },
+            FileChange {
+                path: "obsolete.txt".into(),
+                kind: FileChangeKind::Delete,
+            },
+        ]
+    );
+    assert!(saw_file_change_completion);
 
     let completed = client
         .read_session(created.session.id)
@@ -1511,6 +1569,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     let identity = completed
         .session
         .agent
+        .as_ref()
         .expect("effective Codex Agent is bound");
     assert_eq!(identity.agent, AgentId::new("codex"));
     assert_eq!(identity.provider, ProviderId::new("codex"));
@@ -1526,7 +1585,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     assert_eq!(agent_message.status, MessageStatus::Completed);
     assert_eq!(agent_message.content, "Hello from Codex");
     assert!(!agent_message.content.contains("fixture diagnostic"));
-    assert_eq!(completed.activities.len(), 1);
+    assert_eq!(completed.activities.len(), 2);
     let Activity::Command {
         id: command_activity_id,
         status,
@@ -1554,6 +1613,42 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         1,
         "Codex command deltas must update one transcript row"
     );
+    let Activity::FileChange {
+        id: file_change_activity_id,
+        status: file_change_status,
+        changes,
+        ..
+    } = &completed.activities[1]
+    else {
+        panic!("Codex file changes must project as file-change Activity");
+    };
+    assert_eq!(*file_change_status, ActivityStatus::Completed);
+    assert_eq!(changes, &streamed_file_changes);
+    assert_eq!(
+        completed
+            .transcript
+            .iter()
+            .filter(|item| matches!(item,
+                TranscriptItem::Activity { activity_id }
+                    if activity_id == file_change_activity_id))
+            .count(),
+        1,
+        "Codex file-change updates must update one transcript row"
+    );
+    let persisted = serde_json::to_string(&completed).expect("encode completed Session");
+    for excluded in [
+        "private start patch",
+        "private updated patch",
+        "private final patch",
+        "wrong item patch",
+        "futureField",
+        "opaque",
+    ] {
+        assert!(
+            !persisted.contains(excluded),
+            "Session transcript persisted excluded native content {excluded:?}"
+        );
+    }
 
     let requests = fixture.requests();
     let methods = requests

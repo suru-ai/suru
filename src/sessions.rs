@@ -124,11 +124,13 @@ pub(crate) enum ProviderTurnOutcome {
     Failed {
         streaming_message_id: Option<MessageId>,
         active_command_ids: Vec<ActivityId>,
+        active_file_change_ids: Vec<ActivityId>,
         message: String,
     },
     Interrupted {
         streaming_message_id: Option<MessageId>,
         active_command_ids: Vec<ActivityId>,
+        active_file_change_ids: Vec<ActivityId>,
     },
 }
 
@@ -566,9 +568,14 @@ impl SessionStore {
         turn_id: TurnId,
         streaming_message_id: Option<MessageId>,
         active_command_ids: Vec<ActivityId>,
+        active_file_change_ids: Vec<ActivityId>,
         message: String,
     ) -> anyhow::Result<SessionUpdate> {
-        let mut changes = terminal_output_changes(streaming_message_id, active_command_ids);
+        let mut changes = terminal_output_changes(
+            streaming_message_id,
+            active_command_ids,
+            active_file_change_ids,
+        );
         changes.extend([
             SessionChange::ActivityAdded {
                 activity: Activity::Error {
@@ -641,11 +648,13 @@ impl SessionStore {
             ProviderTurnOutcome::Failed {
                 streaming_message_id,
                 active_command_ids,
+                active_file_change_ids,
                 message,
             } => {
                 changes.extend(terminal_output_changes(
                     streaming_message_id,
                     active_command_ids,
+                    active_file_change_ids,
                 ));
                 changes.extend([
                     SessionChange::ActivityAdded {
@@ -664,10 +673,12 @@ impl SessionStore {
             ProviderTurnOutcome::Interrupted {
                 streaming_message_id,
                 active_command_ids,
+                active_file_change_ids,
             } => {
                 changes.extend(terminal_output_changes(
                     streaming_message_id,
                     active_command_ids,
+                    active_file_change_ids,
                 ));
                 changes.push(SessionChange::TurnStatusChanged {
                     turn_id,
@@ -973,9 +984,13 @@ impl SessionStore {
 fn terminal_output_changes(
     streaming_message_id: Option<MessageId>,
     active_command_ids: Vec<ActivityId>,
+    active_file_change_ids: Vec<ActivityId>,
 ) -> Vec<SessionChange> {
-    let mut changes =
-        Vec::with_capacity(active_command_ids.len() + usize::from(streaming_message_id.is_some()));
+    let mut changes = Vec::with_capacity(
+        active_command_ids.len()
+            + active_file_change_ids.len()
+            + usize::from(streaming_message_id.is_some()),
+    );
     if let Some(message_id) = streaming_message_id {
         changes.push(SessionChange::MessageCompleted { message_id });
     }
@@ -984,6 +999,12 @@ fn terminal_output_changes(
             activity_id,
             status: ActivityStatus::Failed,
             exit_status: None,
+        }
+    }));
+    changes.extend(active_file_change_ids.into_iter().map(|activity_id| {
+        SessionChange::FileChangeStatusChanged {
+            activity_id,
+            status: ActivityStatus::Failed,
         }
     }));
     changes
@@ -1206,12 +1227,14 @@ fn agent_output_turn_id(
             .ok_or_else(|| anyhow!("Agent output referenced an unknown Agent Message")),
         SessionChange::ActivityAdded { activity } => Ok(activity.turn_id()),
         SessionChange::CommandOutputAppended { activity_id, .. }
-        | SessionChange::CommandStatusChanged { activity_id, .. } => snapshot
+        | SessionChange::CommandStatusChanged { activity_id, .. }
+        | SessionChange::FileChangeUpdated { activity_id, .. }
+        | SessionChange::FileChangeStatusChanged { activity_id, .. } => snapshot
             .activities
             .iter()
             .find(|activity| activity.id() == *activity_id)
             .map(Activity::turn_id)
-            .ok_or_else(|| anyhow!("Agent output referenced an unknown command Activity")),
+            .ok_or_else(|| anyhow!("Agent output referenced an unknown Activity")),
         _ => Err(anyhow!("Session change is not Agent output")),
     }
 }

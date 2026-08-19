@@ -13,8 +13,8 @@ use tokio::{
 };
 
 use super::{
-    ProviderCommandStatus, ProviderEvent, ProviderEventStream, ProviderRuntime, ProviderSession,
-    ProviderSessionRequest, ProviderTurnInput, wait_for_shutdown,
+    ProviderCommandStatus, ProviderEvent, ProviderEventStream, ProviderFileChangeStatus,
+    ProviderRuntime, ProviderSession, ProviderSessionRequest, ProviderTurnInput, wait_for_shutdown,
 };
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus, PromptId,
@@ -93,11 +93,19 @@ struct ActiveProviderTurn {
     streaming_message_id: Option<MessageId>,
     interruption_acknowledged: bool,
     command_activities: HashMap<super::ProviderActivityId, ActivityId>,
+    file_change_activities: HashMap<super::ProviderActivityId, ActivityId>,
 }
 
 impl ActiveProviderTurn {
     fn take_command_activity_ids(&mut self) -> Vec<ActivityId> {
         self.command_activities
+            .drain()
+            .map(|(_, activity_id)| activity_id)
+            .collect()
+    }
+
+    fn take_file_change_activity_ids(&mut self) -> Vec<ActivityId> {
+        self.file_change_activities
             .drain()
             .map(|(_, activity_id)| activity_id)
             .collect()
@@ -247,8 +255,14 @@ impl ProviderOrchestrator {
         message: &str,
     ) -> InterruptTurnError {
         let _ = self.updates.apply(|| {
-            self.sessions
-                .fail_turn(session_id, turn_id, None, Vec::new(), message.to_owned())
+            self.sessions.fail_turn(
+                session_id,
+                turn_id,
+                None,
+                Vec::new(),
+                Vec::new(),
+                message.to_owned(),
+            )
         });
         InterruptTurnError::ProviderFailure(message.to_owned())
     }
@@ -414,6 +428,7 @@ async fn run_provider_session(
                         delivered.turn.id,
                         None,
                         Vec::new(),
+                        Vec::new(),
                         format!("Provider execution failed: {error}"),
                     )
                 });
@@ -427,6 +442,7 @@ async fn run_provider_session(
                 streaming_message_id: None,
                 interruption_acknowledged: false,
                 command_activities: HashMap::new(),
+                file_change_activities: HashMap::new(),
             });
             continue;
         }
@@ -529,12 +545,14 @@ async fn run_provider_session(
                         let message = format!("Provider interruption failed: {error}");
                         let streaming_message_id = current.streaming_message_id.take();
                         let active_command_ids = current.take_command_activity_ids();
+                        let active_file_change_ids = current.take_file_change_activity_ids();
                         let _ = updates.apply(|| {
                             sessions.fail_turn(
                                 session_id,
                                 current.turn_id,
                                 streaming_message_id,
                                 active_command_ids,
+                                active_file_change_ids,
                                 message.clone(),
                             )
                         });
@@ -570,6 +588,7 @@ async fn run_provider_session(
                                             delivered.turn.id,
                                             None,
                                             Vec::new(),
+                                            Vec::new(),
                                             format!("Provider execution failed: {error}"),
                                         )
                                     });
@@ -582,6 +601,7 @@ async fn run_provider_session(
                                         streaming_message_id: None,
                                         interruption_acknowledged: false,
                                         command_activities: HashMap::new(),
+                                        file_change_activities: HashMap::new(),
                                     });
                                 }
                             }
@@ -590,12 +610,14 @@ async fn run_provider_session(
                     Some(Err(error)) => {
                         let streaming_message_id = current.streaming_message_id.take();
                         let active_command_ids = current.take_command_activity_ids();
+                        let active_file_change_ids = current.take_file_change_activity_ids();
                         let _ = updates.apply(|| {
                             sessions.fail_turn(
                                 session_id,
                                 current.turn_id,
                                 streaming_message_id,
                                 active_command_ids,
+                                active_file_change_ids,
                                 format!("Provider execution failed: {error}"),
                             )
                         });
@@ -605,12 +627,14 @@ async fn run_provider_session(
                     None => {
                         let streaming_message_id = current.streaming_message_id.take();
                         let active_command_ids = current.take_command_activity_ids();
+                        let active_file_change_ids = current.take_file_change_activity_ids();
                         let _ = updates.apply(|| {
                             sessions.fail_turn(
                                 session_id,
                                 current.turn_id,
                                 streaming_message_id,
                                 active_command_ids,
+                                active_file_change_ids,
                                 "Provider execution failed: the Provider Session ended before the Turn completed."
                                     .to_owned(),
                             )
@@ -701,7 +725,9 @@ fn project_provider_event(
                 command,
                 cwd,
             } => {
-                if active.command_activities.contains_key(&activity_id) {
+                if active.command_activities.contains_key(&activity_id)
+                    || active.file_change_activities.contains_key(&activity_id)
+                {
                     Err(anyhow::anyhow!(
                         "Provider reused an active command Activity identity"
                     ))
@@ -786,8 +812,97 @@ fn project_provider_event(
                         ProviderEventProjection::Continue
                     })
             }
+            ProviderEvent::FileChangeStarted {
+                activity_id,
+                changes,
+            } => {
+                if active.command_activities.contains_key(&activity_id)
+                    || active.file_change_activities.contains_key(&activity_id)
+                {
+                    Err(anyhow::anyhow!(
+                        "Provider reused an active file-change Activity identity"
+                    ))
+                } else {
+                    let file_change_activity_id = ActivityId::new();
+                    sessions
+                        .publish_agent_output(
+                            session_id,
+                            SessionChange::ActivityAdded {
+                                activity: Activity::FileChange {
+                                    id: file_change_activity_id,
+                                    turn_id: active.turn_id,
+                                    status: ActivityStatus::Active,
+                                    changes,
+                                },
+                            },
+                        )
+                        .map(|_| {
+                            active
+                                .file_change_activities
+                                .insert(activity_id, file_change_activity_id);
+                            ProviderEventProjection::Continue
+                        })
+                }
+            }
+            ProviderEvent::FileChangeUpdated {
+                activity_id,
+                changes,
+            } => {
+                let Some(file_change_activity_id) =
+                    active.file_change_activities.get(&activity_id).copied()
+                else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        "Provider updated file changes before starting the Activity",
+                    );
+                };
+                sessions
+                    .publish_agent_output(
+                        session_id,
+                        SessionChange::FileChangeUpdated {
+                            activity_id: file_change_activity_id,
+                            changes,
+                        },
+                    )
+                    .map(|_| ProviderEventProjection::Continue)
+            }
+            ProviderEvent::FileChangeCompleted {
+                activity_id,
+                status,
+            } => {
+                let Some(file_change_activity_id) =
+                    active.file_change_activities.get(&activity_id).copied()
+                else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        "Provider completed file changes before starting the Activity",
+                    );
+                };
+                sessions
+                    .publish_agent_output(
+                        session_id,
+                        SessionChange::FileChangeStatusChanged {
+                            activity_id: file_change_activity_id,
+                            status: match status {
+                                ProviderFileChangeStatus::Completed => ActivityStatus::Completed,
+                                ProviderFileChangeStatus::Failed => ActivityStatus::Failed,
+                            },
+                        },
+                    )
+                    .map(|_| {
+                        active.file_change_activities.remove(&activity_id);
+                        ProviderEventProjection::Continue
+                    })
+            }
             ProviderEvent::TurnCompleted => {
-                if active.streaming_message_id.is_some() || !active.command_activities.is_empty() {
+                if active.streaming_message_id.is_some()
+                    || !active.command_activities.is_empty()
+                    || !active.file_change_activities.is_empty()
+                {
                     Err(anyhow::anyhow!(
                         "Provider completed the Turn before completing its streamed output"
                     ))
@@ -804,6 +919,7 @@ fn project_provider_event(
             ProviderEvent::TurnInterrupted => {
                 let streaming_message_id = active.streaming_message_id.take();
                 let active_command_ids = active.take_command_activity_ids();
+                let active_file_change_ids = active.take_file_change_activity_ids();
                 sessions
                     .finish_provider_turn(
                         session_id,
@@ -811,6 +927,7 @@ fn project_provider_event(
                         ProviderTurnOutcome::Interrupted {
                             streaming_message_id,
                             active_command_ids,
+                            active_file_change_ids,
                         },
                     )
                     .map(ProviderEventProjection::Terminal)
@@ -818,6 +935,7 @@ fn project_provider_event(
             ProviderEvent::TurnFailed { message } => {
                 let streaming_message_id = active.streaming_message_id.take();
                 let active_command_ids = active.take_command_activity_ids();
+                let active_file_change_ids = active.take_file_change_activity_ids();
                 sessions
                     .finish_provider_turn(
                         session_id,
@@ -825,6 +943,7 @@ fn project_provider_event(
                         ProviderTurnOutcome::Failed {
                             streaming_message_id,
                             active_command_ids,
+                            active_file_change_ids,
                             message,
                         },
                     )
@@ -868,6 +987,7 @@ fn finish_invalid_provider_event(
 ) -> ProviderEventProjection {
     let streaming_message_id = active.streaming_message_id.take();
     let active_command_ids = active.take_command_activity_ids();
+    let active_file_change_ids = active.take_file_change_activity_ids();
     let next_turn = sessions
         .finish_provider_turn(
             session_id,
@@ -875,6 +995,7 @@ fn finish_invalid_provider_event(
             ProviderTurnOutcome::Failed {
                 streaming_message_id,
                 active_command_ids,
+                active_file_change_ids,
                 message,
             },
         )

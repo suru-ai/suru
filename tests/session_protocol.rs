@@ -2,13 +2,13 @@ use std::path::PathBuf;
 
 use chidori::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-    CreateSessionRequest, InitialPrompt, Message, MessageId, MessageRole, MessageStatus,
-    ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
-    ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionValue,
-    Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session,
-    SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
-    SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, TranscriptItem, Turn, TurnId,
-    TurnStatus, Workspace,
+    CreateSessionRequest, FileChange, FileChangeKind, InitialPrompt, Message, MessageId,
+    MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
+    ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
+    ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
+    Session, SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision,
+    SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, TranscriptItem,
+    Turn, TurnId, TurnStatus, Workspace,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -335,6 +335,111 @@ fn command_activity_lifecycle_uses_typed_incremental_updates() {
     assert_eq!(
         serde_json::from_value::<[SessionUpdate; 3]>(expected)
             .expect("decode command Activity updates"),
+        updates
+    );
+}
+
+#[test]
+fn file_change_activity_lifecycle_uses_typed_incremental_updates() {
+    let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));
+    let activity_id = ActivityId::from_uuid(fixture_id("0198b27e-345a-700e-ae3b-d971c57fbe87"));
+    let updates = [
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(8),
+            changes: vec![SessionChange::ActivityAdded {
+                activity: Activity::FileChange {
+                    id: activity_id,
+                    turn_id,
+                    status: ActivityStatus::Active,
+                    changes: vec![FileChange {
+                        path: PathBuf::from("src/protocol.rs"),
+                        kind: FileChangeKind::Update,
+                    }],
+                },
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(9),
+            changes: vec![SessionChange::FileChangeUpdated {
+                activity_id,
+                changes: vec![
+                    FileChange {
+                        path: PathBuf::from("src/protocol.rs"),
+                        kind: FileChangeKind::Update,
+                    },
+                    FileChange {
+                        path: PathBuf::from("tests/session_protocol.rs"),
+                        kind: FileChangeKind::Add,
+                    },
+                ],
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(10),
+            changes: vec![SessionChange::FileChangeStatusChanged {
+                activity_id,
+                status: ActivityStatus::Completed,
+            }],
+        },
+    ];
+    let expected = json!([
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 8,
+            "changes": [{
+                "type": "activity_added",
+                "activity": {
+                    "id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                    "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+                    "kind": "file_change",
+                    "status": "active",
+                    "changes": [{
+                        "path": "src/protocol.rs",
+                        "kind": "update"
+                    }]
+                }
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 9,
+            "changes": [{
+                "type": "file_change_updated",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "changes": [
+                    {
+                        "path": "src/protocol.rs",
+                        "kind": "update"
+                    },
+                    {
+                        "path": "tests/session_protocol.rs",
+                        "kind": "add"
+                    }
+                ]
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 10,
+            "changes": [{
+                "type": "file_change_status_changed",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "status": "completed"
+            }]
+        }
+    ]);
+
+    assert_eq!(
+        serde_json::to_value(&updates).expect("encode file-change Activity updates"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<[SessionUpdate; 3]>(expected)
+            .expect("decode file-change Activity updates"),
         updates
     );
 }
