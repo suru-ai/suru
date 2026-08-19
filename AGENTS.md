@@ -4,12 +4,13 @@ You have access to the following codebases under ./references/ you should use fo
 - codex - OpenAI's CLI application for using thier models, use when building our Codex integration
 - copilot-sdk - GitHub Copilot SDK. Use for building the Copilot integrations
 
-To start we will only support the Codex and Copilot providers, but additional providers may be added at a later date.
-Try to build all functionality supporting both providers to avoid building interfaces that are not generic enough to
+## Development Notes
+- To start we will only support the Codex and Copilot providers, but additional providers may be added at a later date.
+- Build all functionality supporting both providers to avoid building interfaces that are not generic enough to
 support others down the line.
-
-This application is very early in development. Freely make breaking changes if they result in better code.
-Do not account for backwards compatibility with previous versions.
+- This application is very early in development. Freely make breaking changes if they result in better code.
+- Do not account for backwards compatibility with previous versions.
+- Build using interfaces designed for an eventual plugin architecture based on that of OpenCode.
 
 ## Plugins
 
