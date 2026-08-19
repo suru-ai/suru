@@ -260,19 +260,19 @@ pub enum ActivityStatus {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FileChangeKind {
-    Add,
-    Delete,
-    Update,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct FileChange {
-    pub path: PathBuf,
-    pub kind: FileChangeKind,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FileChange {
+    Add {
+        path: PathBuf,
+    },
+    Delete {
+        path: PathBuf,
+    },
+    Update {
+        path: PathBuf,
+        moved_to: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -400,7 +400,7 @@ pub struct SessionUpdate {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionChange {
     AgentBound {
         agent: AgentIdentity,

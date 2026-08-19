@@ -11,10 +11,10 @@ use chidori::{
     },
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, CreateSessionRequest,
-        FileChange, FileChangeKind, InitialPrompt, MessageRole, MessageStatus, ModelId,
-        ModelAvailability, ModelOptionKind, ModelOptionRole, PromptDelivery, PromptId, PromptStatus,
-        ProviderCatalogStatus, ProviderId, SessionChange, SessionId, SessionSnapshot, SessionStatus,
-        ShutdownReason, TranscriptItem, TurnId, TurnStatus, Workspace,
+        FileChange, InitialPrompt, MessageRole, MessageStatus, ModelAvailability, ModelId,
+        ModelOptionKind, ModelOptionRole, PromptDelivery, PromptId, PromptStatus,
+        ProviderCatalogStatus, ProviderId, SessionChange, SessionId, SessionSnapshot,
+        SessionStatus, ShutdownReason, TranscriptItem, TurnId, TurnStatus, Workspace,
     },
     provider::CodexRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -1546,17 +1546,15 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     assert_eq!(
         streamed_file_changes,
         [
-            FileChange {
+            FileChange::Update {
                 path: "src/protocol.rs".into(),
-                kind: FileChangeKind::Update,
+                moved_to: Some("src/protocol_v2.rs".into()),
             },
-            FileChange {
+            FileChange::Add {
                 path: "tests/session_protocol.rs".into(),
-                kind: FileChangeKind::Add,
             },
-            FileChange {
+            FileChange::Delete {
                 path: "obsolete.txt".into(),
-                kind: FileChangeKind::Delete,
             },
         ]
     );

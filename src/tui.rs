@@ -42,9 +42,9 @@ use crate::{
     },
     protocol::{
         Activity, AdmitPromptRequest, AgentIdentity, CreateSessionRequest, FileChange,
-        FileChangeKind, InitialPrompt, MessageId, MessageRole, PromptDelivery, PromptId,
-        PromptStatus, ServerIdentity, SessionId, SessionSnapshot, SessionStatus, ShutdownReason,
-        TranscriptItem, TurnId, TurnStatus, Workspace,
+        InitialPrompt, MessageId, MessageRole, PromptDelivery, PromptId, PromptStatus,
+        ServerIdentity, SessionId, SessionSnapshot, SessionStatus, ShutdownReason, TranscriptItem,
+        TurnId, TurnStatus, Workspace,
     },
     theme::Theme,
 };
@@ -2368,17 +2368,23 @@ fn push_file_change_activity(
     };
     push_prefixed_lines(lines, &format!("  {marker}"), label, style);
     for change in changes {
-        let marker = match change.kind {
-            FileChangeKind::Add => "A",
-            FileChangeKind::Delete => "D",
-            FileChangeKind::Update => "M",
+        let summary = match change {
+            FileChange::Add { path } => format!("A {}", path.to_string_lossy()),
+            FileChange::Delete { path } => format!("D {}", path.to_string_lossy()),
+            FileChange::Update {
+                path,
+                moved_to: Some(moved_to),
+            } => format!(
+                "R {} → {}",
+                path.to_string_lossy(),
+                moved_to.to_string_lossy()
+            ),
+            FileChange::Update {
+                path,
+                moved_to: None,
+            } => format!("M {}", path.to_string_lossy()),
         };
-        push_prefixed_lines(
-            lines,
-            "    ",
-            &format!("{marker} {}", change.path.to_string_lossy()),
-            theme.text.subdued,
-        );
+        push_prefixed_lines(lines, "    ", &summary, theme.text.subdued);
     }
 }
 

@@ -26,11 +26,9 @@ use super::{
     ProviderSessionConnection, ProviderSessionRequest, ProviderTurnInput, wait_for_shutdown,
 };
 use crate::protocol::{
-    AgentId, AgentIdentity, FileChange, FileChangeKind, ModelId, ProviderId, SessionId,
-};
-use crate::protocol::{
-    ModelAvailability, ModelDescriptor, ModelOptionChoice, ModelOptionChoiceId,
-    ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
+    AgentId, AgentIdentity, FileChange, ModelAvailability, ModelDescriptor, ModelId,
+    ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
+    ModelOptionRole, ProviderId, SessionId,
 };
 
 const CODEX_PATH_ENV: &str = "CHIDORI_CODEX_PATH";
@@ -1035,12 +1033,12 @@ struct NativeFileChange {
 
 impl From<NativeFileChange> for FileChange {
     fn from(change: NativeFileChange) -> Self {
-        Self {
-            path: change.path,
-            kind: match change.kind {
-                NativeFileChangeKind::Add => FileChangeKind::Add,
-                NativeFileChangeKind::Delete => FileChangeKind::Delete,
-                NativeFileChangeKind::Update { .. } => FileChangeKind::Update,
+        match change.kind {
+            NativeFileChangeKind::Add => Self::Add { path: change.path },
+            NativeFileChangeKind::Delete => Self::Delete { path: change.path },
+            NativeFileChangeKind::Update { move_path } => Self::Update {
+                path: change.path,
+                moved_to: move_path,
             },
         }
     }
@@ -1053,7 +1051,7 @@ enum NativeFileChangeKind {
     Delete,
     Update {
         #[serde(default, rename = "movePath")]
-        _move_path: Option<PathBuf>,
+        move_path: Option<PathBuf>,
     },
 }
 
@@ -1393,7 +1391,7 @@ fn project_native_notification(
                 .into_iter()
                 .map(FileChange::from)
                 .collect::<Vec<_>>();
-            let paths_changed = file_change.changes != changes;
+            let changes_changed = file_change.changes != changes;
             let status = match status {
                 NativeFileChangeStatus::Completed => ProviderFileChangeStatus::Completed,
                 NativeFileChangeStatus::Failed | NativeFileChangeStatus::Declined => {
@@ -1407,8 +1405,8 @@ fn project_native_notification(
             };
             correlation.active_file_changes.remove(&item_id);
             let activity_id = ProviderActivityId::new(item_id);
-            let mut projected = Vec::with_capacity(if paths_changed { 2 } else { 1 });
-            if paths_changed {
+            let mut projected = Vec::with_capacity(if changes_changed { 2 } else { 1 });
+            if changes_changed {
                 projected.push(ProviderEvent::FileChangeUpdated {
                     activity_id: activity_id.clone(),
                     changes,

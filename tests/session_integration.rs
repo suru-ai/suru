@@ -22,9 +22,9 @@ use chidori::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-        CreateSessionRequest, FileChange, FileChangeKind, InitialPrompt, LifecycleState, Message,
-        MessageId, MessageRole, MessageStatus, ModelId, PROTOCOL_VERSION, Prompt, PromptDelivery,
-        PromptId, PromptOrder, PromptStatus, ProviderId, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT,
+        CreateSessionRequest, FileChange, InitialPrompt, LifecycleState, Message, MessageId,
+        MessageRole, MessageStatus, ModelId, PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId,
+        PromptOrder, PromptStatus, ProviderId, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT,
         SESSION_UPDATED_EVENT, ServerIdentity, Session, SessionChange, SessionError,
         SessionErrorCode, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
         SessionSummary, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
@@ -237,21 +237,20 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         },
         ProviderEvent::FileChangeStarted {
             activity_id: ProviderActivityId::new("fixture-file-change"),
-            changes: vec![FileChange {
+            changes: vec![FileChange::Update {
                 path: "src/protocol.rs".into(),
-                kind: FileChangeKind::Update,
+                moved_to: Some("src/protocol_v2.rs".into()),
             }],
         },
         ProviderEvent::FileChangeUpdated {
             activity_id: ProviderActivityId::new("fixture-file-change"),
             changes: vec![
-                FileChange {
+                FileChange::Update {
                     path: "src/protocol.rs".into(),
-                    kind: FileChangeKind::Update,
+                    moved_to: Some("src/protocol_v2.rs".into()),
                 },
-                FileChange {
+                FileChange::Add {
                     path: "tests/session_protocol.rs".into(),
-                    kind: FileChangeKind::Add,
                 },
             ],
         },
@@ -331,13 +330,12 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
     assert_eq!(
         changes,
         &[
-            FileChange {
+            FileChange::Update {
                 path: "src/protocol.rs".into(),
-                kind: FileChangeKind::Update,
+                moved_to: Some("src/protocol_v2.rs".into()),
             },
-            FileChange {
+            FileChange::Add {
                 path: "tests/session_protocol.rs".into(),
-                kind: FileChangeKind::Add,
             },
         ]
     );
@@ -405,9 +403,9 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
     assert_eq!(first_start, second_start);
     provider_session.emit(ProviderEvent::FileChangeStarted {
         activity_id: ProviderActivityId::new("failed-file-change"),
-        changes: vec![FileChange {
+        changes: vec![FileChange::Update {
             path: "src/provider.rs".into(),
-            kind: FileChangeKind::Update,
+            moved_to: None,
         }],
     });
     let first_file_change = next_session_update(&mut first_feed).await;
@@ -444,9 +442,9 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         status: ActivityStatus::Failed,
         changes,
         ..
-    } if changes == &[FileChange {
+    } if changes == &[FileChange::Update {
         path: "src/provider.rs".into(),
-        kind: FileChangeKind::Update,
+        moved_to: None,
     }])));
 
     drop(provider_session);

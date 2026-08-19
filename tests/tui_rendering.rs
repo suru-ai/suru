@@ -5,10 +5,10 @@ use chidori::{
     },
     protocol::{
         Activity, ActivityId, ActivityStatus, AgentId, AgentIdentity, CreateSessionRequest,
-        FileChange, FileChangeKind, Health, InitialPrompt, LifecycleState, Message, MessageId,
-        MessageRole, MessageStatus, ModelId, Prompt, PromptDelivery, PromptId, PromptOrder,
-        PromptStatus, ProviderId, ServerIdentity, ServerShutdown, Session, SessionChange,
-        SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionUpdate, ShutdownReason,
+        FileChange, Health, InitialPrompt, LifecycleState, Message, MessageId, MessageRole,
+        MessageStatus, ModelId, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
+        ProviderId, ServerIdentity, ServerShutdown, Session, SessionChange, SessionId,
+        SessionRevision, SessionSnapshot, SessionStatus, SessionUpdate, ShutdownReason,
         TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{AgentOutput, ServerConfig},
@@ -1380,17 +1380,15 @@ fn file_change_activities_render_active_successful_and_failed_states_at_responsi
             turn_id: snapshot.turns[0].id,
             status,
             changes: vec![
-                FileChange {
-                    path: "src/protocol.rs".into(),
-                    kind: FileChangeKind::Update,
+                FileChange::Update {
+                    path: "src/a.rs".into(),
+                    moved_to: Some("src/b.rs".into()),
                 },
-                FileChange {
+                FileChange::Add {
                     path: "tests/new.rs".into(),
-                    kind: FileChangeKind::Add,
                 },
-                FileChange {
+                FileChange::Delete {
                     path: "old.rs".into(),
-                    kind: FileChangeKind::Delete,
                 },
             ],
         };
@@ -1401,7 +1399,12 @@ fn file_change_activities_render_active_successful_and_failed_states_at_responsi
 
         let desktop = rendered_application_buffer(&application, 100, 22);
         let desktop_text = buffer_rows(&desktop).join("\n");
-        for expected in [heading, "M src/protocol.rs", "A tests/new.rs", "D old.rs"] {
+        for expected in [
+            heading,
+            "R src/a.rs → src/b.rs",
+            "A tests/new.rs",
+            "D old.rs",
+        ] {
             assert!(
                 desktop_text.contains(expected),
                 "desktop file-change Activity omitted {expected:?}:\n{desktop_text}"
@@ -1410,7 +1413,12 @@ fn file_change_activities_render_active_successful_and_failed_states_at_responsi
         assert_eq!(text_cell(&desktop, heading).fg, color);
 
         let compact = rendered_application_rows_at(&application, 43, 18).join("\n");
-        for expected in [heading, "M src/protocol.rs", "A tests/new.rs", "D old.rs"] {
+        for expected in [
+            heading,
+            "R src/a.rs → src/b.rs",
+            "A tests/new.rs",
+            "D old.rs",
+        ] {
             assert!(
                 compact.contains(expected),
                 "compact file-change Activity omitted {expected:?}:\n{compact}"

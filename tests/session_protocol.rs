@@ -2,13 +2,13 @@ use std::path::PathBuf;
 
 use chidori::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-    CreateSessionRequest, FileChange, FileChangeKind, InitialPrompt, Message, MessageId,
-    MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
+    CreateSessionRequest, FileChange, InitialPrompt, Message, MessageId, MessageRole,
+    MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
     ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
     ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
     Session, SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision,
-    SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, TranscriptItem,
-    Turn, TurnId, TurnStatus, Workspace,
+    SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate,
+    TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -353,9 +353,9 @@ fn file_change_activity_lifecycle_uses_typed_incremental_updates() {
                     id: activity_id,
                     turn_id,
                     status: ActivityStatus::Active,
-                    changes: vec![FileChange {
+                    changes: vec![FileChange::Update {
                         path: PathBuf::from("src/protocol.rs"),
-                        kind: FileChangeKind::Update,
+                        moved_to: Some(PathBuf::from("src/protocol_v2.rs")),
                     }],
                 },
             }],
@@ -366,13 +366,12 @@ fn file_change_activity_lifecycle_uses_typed_incremental_updates() {
             changes: vec![SessionChange::FileChangeUpdated {
                 activity_id,
                 changes: vec![
-                    FileChange {
+                    FileChange::Update {
                         path: PathBuf::from("src/protocol.rs"),
-                        kind: FileChangeKind::Update,
+                        moved_to: Some(PathBuf::from("src/protocol_v2.rs")),
                     },
-                    FileChange {
+                    FileChange::Add {
                         path: PathBuf::from("tests/session_protocol.rs"),
-                        kind: FileChangeKind::Add,
                     },
                 ],
             }],
@@ -399,7 +398,8 @@ fn file_change_activity_lifecycle_uses_typed_incremental_updates() {
                     "status": "active",
                     "changes": [{
                         "path": "src/protocol.rs",
-                        "kind": "update"
+                        "kind": "update",
+                        "moved_to": "src/protocol_v2.rs"
                     }]
                 }
             }]
@@ -413,7 +413,8 @@ fn file_change_activity_lifecycle_uses_typed_incremental_updates() {
                 "changes": [
                     {
                         "path": "src/protocol.rs",
-                        "kind": "update"
+                        "kind": "update",
+                        "moved_to": "src/protocol_v2.rs"
                     },
                     {
                         "path": "tests/session_protocol.rs",
@@ -441,6 +442,25 @@ fn file_change_activity_lifecycle_uses_typed_incremental_updates() {
         serde_json::from_value::<[SessionUpdate; 3]>(expected)
             .expect("decode file-change Activity updates"),
         updates
+    );
+}
+
+#[test]
+fn file_change_updates_reject_opaque_public_protocol_fields() {
+    let update = json!({
+        "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+        "revision": 10,
+        "changes": [{
+            "type": "file_change_status_changed",
+            "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+            "status": "completed",
+            "provider_payload": { "opaque": true }
+        }]
+    });
+
+    assert!(
+        serde_json::from_value::<SessionUpdate>(update).is_err(),
+        "public Session changes must reject arbitrary Provider fields"
     );
 }
 

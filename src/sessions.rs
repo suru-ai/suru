@@ -122,16 +122,19 @@ pub(crate) enum DeliveredTurnStatus {
 pub(crate) enum ProviderTurnOutcome {
     Completed,
     Failed {
-        streaming_message_id: Option<MessageId>,
-        active_command_ids: Vec<ActivityId>,
-        active_file_change_ids: Vec<ActivityId>,
+        unfinished_output: UnfinishedProviderOutput,
         message: String,
     },
     Interrupted {
-        streaming_message_id: Option<MessageId>,
-        active_command_ids: Vec<ActivityId>,
-        active_file_change_ids: Vec<ActivityId>,
+        unfinished_output: UnfinishedProviderOutput,
     },
+}
+
+#[derive(Default)]
+pub(crate) struct UnfinishedProviderOutput {
+    pub(crate) streaming_message_id: Option<MessageId>,
+    pub(crate) active_command_ids: Vec<ActivityId>,
+    pub(crate) active_file_change_ids: Vec<ActivityId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -566,16 +569,10 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         turn_id: TurnId,
-        streaming_message_id: Option<MessageId>,
-        active_command_ids: Vec<ActivityId>,
-        active_file_change_ids: Vec<ActivityId>,
+        unfinished_output: UnfinishedProviderOutput,
         message: String,
     ) -> anyhow::Result<SessionUpdate> {
-        let mut changes = terminal_output_changes(
-            streaming_message_id,
-            active_command_ids,
-            active_file_change_ids,
-        );
+        let mut changes = terminal_output_changes(unfinished_output);
         changes.extend([
             SessionChange::ActivityAdded {
                 activity: Activity::Error {
@@ -646,16 +643,10 @@ impl SessionStore {
                 });
             }
             ProviderTurnOutcome::Failed {
-                streaming_message_id,
-                active_command_ids,
-                active_file_change_ids,
+                unfinished_output,
                 message,
             } => {
-                changes.extend(terminal_output_changes(
-                    streaming_message_id,
-                    active_command_ids,
-                    active_file_change_ids,
-                ));
+                changes.extend(terminal_output_changes(unfinished_output));
                 changes.extend([
                     SessionChange::ActivityAdded {
                         activity: Activity::Error {
@@ -670,16 +661,8 @@ impl SessionStore {
                     },
                 ]);
             }
-            ProviderTurnOutcome::Interrupted {
-                streaming_message_id,
-                active_command_ids,
-                active_file_change_ids,
-            } => {
-                changes.extend(terminal_output_changes(
-                    streaming_message_id,
-                    active_command_ids,
-                    active_file_change_ids,
-                ));
+            ProviderTurnOutcome::Interrupted { unfinished_output } => {
+                changes.extend(terminal_output_changes(unfinished_output));
                 changes.push(SessionChange::TurnStatusChanged {
                     turn_id,
                     status: TurnStatus::Interrupted,
@@ -981,11 +964,12 @@ impl SessionStore {
     }
 }
 
-fn terminal_output_changes(
-    streaming_message_id: Option<MessageId>,
-    active_command_ids: Vec<ActivityId>,
-    active_file_change_ids: Vec<ActivityId>,
-) -> Vec<SessionChange> {
+fn terminal_output_changes(unfinished: UnfinishedProviderOutput) -> Vec<SessionChange> {
+    let UnfinishedProviderOutput {
+        streaming_message_id,
+        active_command_ids,
+        active_file_change_ids,
+    } = unfinished;
     let mut changes = Vec::with_capacity(
         active_command_ids.len()
             + active_file_change_ids.len()
