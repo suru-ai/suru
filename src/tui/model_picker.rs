@@ -85,12 +85,9 @@ impl ModelPicker {
         if let Some(current) = current {
             return self.cached_model(&current.provider, &current.model);
         }
-        self.cached_providers
-            .iter()
-            .find(|provider| provider.provider.as_str() == "codex")
-            .and_then(default_model)
-            .or_else(|| self.cached_providers.iter().find_map(default_model))
-            .cloned()
+        let mut defaults = self.cached_providers.iter().filter_map(default_model);
+        let model = defaults.next()?;
+        defaults.next().is_none().then(|| model.clone())
     }
 
     pub(super) fn cached_model(

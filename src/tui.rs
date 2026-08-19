@@ -881,11 +881,6 @@ pub enum CommandId {
     PageNextModels,
     SelectModel,
     CloseModelPicker,
-    SelectPreviousModelOption,
-    SelectNextModelOption,
-    SelectModelOption,
-    ApplyModelOptions,
-    CloseModelOptions,
     InvokeSemantic(SemanticCommandId),
     InsertText(String),
     PasteText(String),
@@ -942,9 +937,9 @@ impl Application {
                 | CommandId::SubmitQueue
                 | CommandId::SelectSession
                 | CommandId::SelectModel
-                | CommandId::ApplyModelOptions
                 | CommandId::InvokeSemantic(SemanticCommandId::SessionList)
-                | CommandId::InvokeSemantic(SemanticCommandId::SessionNew),
+                | CommandId::InvokeSemantic(SemanticCommandId::SessionNew)
+                | CommandId::InvokeSemantic(SemanticCommandId::ModelOptionsApply),
             ) if self.state.selection_update_pending() => Ok(ApplicationTransition::Continue),
             ApplicationEvent::Command(CommandId::ClearOrExit) => {
                 let key = self.state.composer_key();
@@ -1132,32 +1127,6 @@ impl Application {
             }
             ApplicationEvent::Command(CommandId::CloseModelPicker) => {
                 self.state.model_picker.close();
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::SelectPreviousModelOption) => {
-                self.state.model_options.select_previous();
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::SelectNextModelOption) => {
-                self.state.model_options.select_next();
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::SelectModelOption) => {
-                self.state.model_options.choose();
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::ApplyModelOptions) => {
-                if self.state.model_options.is_choice_picker_open() {
-                    return Ok(ApplicationTransition::Continue);
-                }
-                let Some(selection) = self.state.model_options.apply() else {
-                    return Ok(ApplicationTransition::Continue);
-                };
-                self.state.model_options.close();
-                self.apply_agent_selection(selection)
-            }
-            ApplicationEvent::Command(CommandId::CloseModelOptions) => {
-                self.state.model_options.close();
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::InvokeSemantic(command)) => {
@@ -1460,6 +1429,32 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::ListModels(request))
             }
+            SemanticCommandId::ModelOptionsPrevious => {
+                self.state.model_options.select_previous();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ModelOptionsNext => {
+                self.state.model_options.select_next();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ModelOptionsSelect => {
+                self.state.model_options.choose();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ModelOptionsApply => {
+                if self.state.model_options.is_choice_picker_open() {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                let Some(selection) = self.state.model_options.apply() else {
+                    return Ok(ApplicationTransition::Continue);
+                };
+                self.state.model_options.close();
+                self.apply_agent_selection(selection)
+            }
+            SemanticCommandId::ModelOptionsCancel => {
+                self.state.model_options.close();
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::SessionList => {
                 let request = self.state.session_picker.open();
                 self.state.command_mode = CommandMode::Composer;
@@ -1512,7 +1507,7 @@ impl Application {
         })
     }
 
-    fn reconcile_model_options(&mut self, final_attempt: bool) {
+    fn reconcile_model_options(&mut self, catalog_request_settled: bool) {
         if self.state.model_options.is_open() {
             let current_model = self
                 .state
@@ -1522,7 +1517,7 @@ impl Application {
             if let Some((provider, model)) = current_model {
                 if let Some(refreshed) = self.state.model_picker.cached_model(&provider, &model) {
                     self.state.model_options.refresh(refreshed);
-                } else if final_attempt {
+                } else if catalog_request_settled {
                     self.state.model_options.mark_model_unavailable();
                 }
             }
@@ -1536,21 +1531,24 @@ impl Application {
             .model_picker
             .cached_model_for_options(current.as_ref())
         else {
-            if final_attempt {
+            if catalog_request_settled {
                 self.state.pending_model_options = false;
                 self.state.submission_error =
                     Some("No concrete Model is available; use /models to choose one".to_owned());
             }
             return;
         };
-        self.state.pending_model_options = false;
         if model.options.is_empty() {
+            if catalog_request_settled {
+                self.state.pending_model_options = false;
+            }
             self.state.submission_error = Some(format!(
                 "{} has no configurable options; use /models to choose another Model",
                 model.display_name
             ));
             return;
         }
+        self.state.pending_model_options = false;
         self.state.submission_error = None;
         self.state.model_options.open(model, current.as_ref());
     }
@@ -1671,15 +1669,21 @@ fn command_for_model_options_event(event: InputEvent) -> Option<CommandId> {
         return None;
     }
     match (key.code, key.modifiers) {
-        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-            Some(CommandId::SelectPreviousModelOption)
-        }
-        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
-            Some(CommandId::SelectNextModelOption)
-        }
-        (KeyCode::Enter, KeyModifiers::NONE) => Some(CommandId::SelectModelOption),
-        (KeyCode::Enter, KeyModifiers::CONTROL) => Some(CommandId::ApplyModelOptions),
-        (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::CloseModelOptions),
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(
+            CommandId::InvokeSemantic(SemanticCommandId::ModelOptionsPrevious),
+        ),
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(
+            CommandId::InvokeSemantic(SemanticCommandId::ModelOptionsNext),
+        ),
+        (KeyCode::Enter, KeyModifiers::NONE) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelOptionsSelect,
+        )),
+        (KeyCode::Enter, KeyModifiers::CONTROL) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelOptionsApply,
+        )),
+        (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelOptionsCancel,
+        )),
         _ => None,
     }
 }

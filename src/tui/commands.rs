@@ -8,6 +8,11 @@ const AUTOCOMPLETE_LIMIT: usize = 10;
 pub enum SemanticCommandId {
     ModelList,
     ModelOptions,
+    ModelOptionsPrevious,
+    ModelOptionsNext,
+    ModelOptionsSelect,
+    ModelOptionsApply,
+    ModelOptionsCancel,
     SessionList,
     SessionNew,
 }
@@ -17,6 +22,11 @@ impl SemanticCommandId {
         match self {
             Self::ModelList => "model.list",
             Self::ModelOptions => "model.options",
+            Self::ModelOptionsPrevious => "model.options.previous",
+            Self::ModelOptionsNext => "model.options.next",
+            Self::ModelOptionsSelect => "model.options.select",
+            Self::ModelOptionsApply => "model.options.apply",
+            Self::ModelOptionsCancel => "model.options.cancel",
             Self::SessionList => "session.list",
             Self::SessionNew => "session.new",
         }
@@ -79,6 +89,41 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             modifiers: KeyModifiers::NONE,
             label: "Ctrl+X O",
         }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ModelOptionsPrevious,
+        title: "Previous Model Option",
+        description: "Focus the previous Model Option or choice",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ModelOptionsNext,
+        title: "Next Model Option",
+        description: "Focus the next Model Option or choice",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ModelOptionsSelect,
+        title: "Select Model Option",
+        description: "Open or select the focused Model Option choice",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ModelOptionsApply,
+        title: "Apply Model Options",
+        description: "Apply the complete staged Agent Selection",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ModelOptionsCancel,
+        title: "Cancel Model Options",
+        description: "Discard every staged Model Option edit",
+        slash: None,
+        keybinding: None,
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::SessionList,

@@ -367,6 +367,10 @@ fn options_commands_dispatch_one_semantic_model_options_action() {
         chidori::tui::SemanticCommandId::ModelOptions.as_str(),
         "model.options"
     );
+    assert_eq!(
+        chidori::tui::SemanticCommandId::ModelOptionsApply.as_str(),
+        "model.options.apply"
+    );
 }
 
 #[test]
@@ -735,6 +739,49 @@ fn options_command_resolves_provider_default_and_explains_unavailable_configurat
     let status = rendered_application_rows(&missing).join("\n");
     assert!(status.contains("No concrete Model is available"));
     assert!(status.contains("/models"));
+
+    let mut ambiguous = Application::default();
+    let ApplicationTransition::ListModels(request) = ambiguous
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelOptions,
+        )))
+        .expect("invoke options without a selected Provider")
+    else {
+        panic!("options should request the catalog");
+    };
+    let provider_default = |provider: &str| {
+        let mut model = model_descriptor(
+            provider,
+            "default",
+            &format!("{provider} default"),
+            true,
+            ModelAvailability::Available,
+        );
+        model.options.push(ModelOptionDescriptor {
+            id: ModelOptionId::new("fast"),
+            label: "Fast".to_owned(),
+            description: None,
+            role: ModelOptionRole::Speed,
+            kind: ModelOptionKind::Toggle { default: false },
+        });
+        ProviderModelCatalog {
+            provider: ProviderId::new(provider),
+            models: vec![model],
+            status: ProviderCatalogStatus::Fresh,
+        }
+    };
+    ambiguous
+        .handle_event(ApplicationEvent::ModelsRefreshed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![provider_default("codex"), provider_default("copilot")],
+            },
+        })
+        .expect("finish ambiguous Provider resolution");
+    let status = rendered_application_rows(&ambiguous).join("\n");
+    assert!(!status.contains("Model Options"));
+    assert!(status.contains("No concrete Model is available"));
+    assert!(status.contains("/models"));
 }
 
 #[test]
@@ -793,6 +840,83 @@ fn stale_catalog_failure_does_not_end_newer_options_resolution() {
     assert!(screen.contains("Model Options"));
     assert!(screen.contains("Current Default"));
     assert!(!screen.contains("stale failure"));
+}
+
+#[test]
+fn refreshed_descriptors_replace_a_cached_no_options_status() {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(cached_request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker to seed cache")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    let plain = model_descriptor(
+        "codex",
+        "changing",
+        "Changing Model",
+        true,
+        ModelAvailability::Available,
+    );
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request: cached_request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![plain.clone()],
+                    status: ProviderCatalogStatus::Refreshing,
+                }],
+            },
+        })
+        .expect("seed cached Model without descriptors");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("close Model picker");
+
+    let ApplicationTransition::ListModels(options_request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelOptions,
+        )))
+        .expect("resolve options from stale cache")
+    else {
+        panic!("options should refresh the catalog");
+    };
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Changing Model has no configurable options")
+    );
+
+    let mut configurable = plain;
+    configurable.options.push(ModelOptionDescriptor {
+        id: ModelOptionId::new("fast"),
+        label: "Fast".to_owned(),
+        description: Some("Prefer low latency".to_owned()),
+        role: ModelOptionRole::Speed,
+        kind: ModelOptionKind::Toggle { default: false },
+    });
+    application
+        .handle_event(ApplicationEvent::ModelsRefreshed {
+            request: options_request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![configurable],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("replace stale no-options descriptor");
+    let screen = rendered_application_rows(&application).join("\n");
+    assert!(screen.contains("Model Options"));
+    assert!(screen.contains("Fast · Off"));
+    assert!(!screen.contains("has no configurable options"));
 }
 
 #[test]
