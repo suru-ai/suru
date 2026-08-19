@@ -7,6 +7,7 @@ const AUTOCOMPLETE_LIMIT: usize = 10;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SemanticCommandId {
     ModelList,
+    ModelOptions,
     SessionList,
     SessionNew,
 }
@@ -15,6 +16,7 @@ impl SemanticCommandId {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ModelList => "model.list",
+            Self::ModelOptions => "model.options",
             Self::SessionList => "session.list",
             Self::SessionNew => "session.new",
         }
@@ -60,6 +62,22 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             code: KeyCode::Char('m'),
             modifiers: KeyModifiers::NONE,
             label: "Ctrl+X M",
+        }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ModelOptions,
+        title: "Configure Model Options",
+        description: "Configure the current Model's options",
+        slash: Some(SlashCommand {
+            name: "options",
+            aliases: &["variants"],
+        }),
+        keybinding: Some(SemanticKeybinding {
+            prefix_code: KeyCode::Char('x'),
+            prefix_modifiers: KeyModifiers::CONTROL,
+            code: KeyCode::Char('o'),
+            modifiers: KeyModifiers::NONE,
+            label: "Ctrl+X O",
         }),
     },
     SemanticCommandDescriptor {

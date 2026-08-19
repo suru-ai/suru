@@ -78,6 +78,46 @@ pub(super) enum ModelPickerAction {
 }
 
 impl ModelPicker {
+    pub(super) fn cached_model_for_options(
+        &self,
+        current: Option<&AgentSelection>,
+    ) -> Option<ModelDescriptor> {
+        if let Some(current) = current {
+            return self.cached_model(&current.provider, &current.model);
+        }
+        self.cached_providers
+            .iter()
+            .find(|provider| provider.provider.as_str() == "codex")
+            .and_then(default_model)
+            .or_else(|| self.cached_providers.iter().find_map(default_model))
+            .cloned()
+    }
+
+    pub(super) fn cached_model(
+        &self,
+        provider: &ProviderId,
+        model: &ModelId,
+    ) -> Option<ModelDescriptor> {
+        self.cached_providers
+            .iter()
+            .find(|catalog| &catalog.provider == provider)?
+            .models
+            .iter()
+            .find(|descriptor| &descriptor.id == model)
+            .cloned()
+    }
+
+    pub(super) fn begin_refresh(&mut self) -> ModelListRequest {
+        self.request_sequence = self.request_sequence.wrapping_add(1);
+        let request = ModelListRequest::new(self.request_sequence);
+        self.active_request = Some(request.clone());
+        request
+    }
+
+    pub(super) fn is_active_request(&self, request: &ModelListRequest) -> bool {
+        self.active_request.as_ref() == Some(request)
+    }
+
     pub(super) fn open(
         &mut self,
         current: Option<&AgentSelection>,
@@ -88,9 +128,7 @@ impl ModelPicker {
         self.provider_scope = provider_scope;
         self.providers.clone_from(&self.cached_providers);
         self.cursor_moved = false;
-        self.request_sequence = self.request_sequence.wrapping_add(1);
-        let request = ModelListRequest::new(self.request_sequence);
-        self.active_request = Some(request.clone());
+        let request = self.begin_refresh();
         self.focus(current, false);
         request
     }
@@ -98,7 +136,6 @@ impl ModelPicker {
     pub(super) fn close(&mut self) {
         self.open = false;
         self.query.clear();
-        self.active_request = None;
         self.selected = None;
         self.cursor_moved = false;
     }
@@ -487,6 +524,10 @@ impl ModelPicker {
         }
         selectable
     }
+}
+
+fn default_model(provider: &ProviderModels) -> Option<&ModelDescriptor> {
+    provider.models.iter().find(|model| model.is_default)
 }
 
 fn normalize_catalog(mut catalog: Vec<ProviderModelCatalog>) -> Vec<ProviderModels> {

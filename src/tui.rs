@@ -2,6 +2,7 @@
 
 mod commands;
 mod markdown;
+mod model_options;
 mod model_picker;
 mod session_picker;
 mod slots;
@@ -45,10 +46,9 @@ use crate::{
     protocol::{
         Activity, AdmitPromptRequest, AgentSelection, AgentSelectionOperationId,
         CreateSessionRequest, FileChange, InitialPrompt, MessageId, MessageRole, ModelAvailability,
-        ModelCatalog, ModelDescriptor, ModelOptionKind, ModelOptionSelection, ModelOptionValue,
-        PromptDelivery, PromptId, PromptStatus, ServerIdentity, SessionChange, SessionId,
-        SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, ShutdownReason,
-        TranscriptItem, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        ModelCatalog, ModelDescriptor, PromptDelivery, PromptId, PromptStatus, ServerIdentity,
+        SessionChange, SessionId, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
+        ShutdownReason, TranscriptItem, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
     },
     theme::Theme,
 };
@@ -58,6 +58,7 @@ mod composer;
 pub use commands::SemanticCommandId;
 use commands::{CommandAutocomplete, command_for_leader_key, descriptor};
 use composer::{ComposerKey, ComposerMemory};
+use model_options::{ModelOptionChoiceRow, ModelOptions};
 use model_picker::{ModelPicker, ModelPickerAction, ModelPickerRow};
 use session_picker::{SessionPicker, SessionPickerRow};
 use slots::{
@@ -222,6 +223,8 @@ pub struct TuiState {
     pending_steers: Vec<PendingSteer>,
     command_mode: CommandMode,
     command_autocomplete: CommandAutocomplete,
+    pending_model_options: bool,
+    model_options: ModelOptions,
     model_picker: ModelPicker,
     session_picker: SessionPicker,
 }
@@ -302,6 +305,8 @@ impl TuiState {
             pending_steers: Vec::new(),
             command_mode: CommandMode::Composer,
             command_autocomplete: CommandAutocomplete::default(),
+            pending_model_options: false,
+            model_options: ModelOptions::default(),
             model_picker: ModelPicker::default(),
             session_picker: SessionPicker::new(workspace),
         }
@@ -876,6 +881,11 @@ pub enum CommandId {
     PageNextModels,
     SelectModel,
     CloseModelPicker,
+    SelectPreviousModelOption,
+    SelectNextModelOption,
+    SelectModelOption,
+    ApplyModelOptions,
+    CloseModelOptions,
     InvokeSemantic(SemanticCommandId),
     InsertText(String),
     PasteText(String),
@@ -932,6 +942,7 @@ impl Application {
                 | CommandId::SubmitQueue
                 | CommandId::SelectSession
                 | CommandId::SelectModel
+                | CommandId::ApplyModelOptions
                 | CommandId::InvokeSemantic(SemanticCommandId::SessionList)
                 | CommandId::InvokeSemantic(SemanticCommandId::SessionNew),
             ) if self.state.selection_update_pending() => Ok(ApplicationTransition::Continue),
@@ -1108,32 +1119,45 @@ impl Application {
                         ))
                     }
                     Some(ModelPickerAction::Select(model)) => {
-                        let selection = selection_with_advertised_defaults(&model);
                         self.state.model_picker.close();
-                        let Some(session_id) = self.session_id() else {
-                            self.state.landing_agent_selection = Some(selection);
+                        if !model.options.is_empty() {
+                            let current = self.state.agent_selection().cloned();
+                            self.state.model_options.open(model, current.as_ref());
                             return Ok(ApplicationTransition::Continue);
-                        };
-                        let operation_id = AgentSelectionOperationId::new();
-                        self.state.pending_agent_selection = Some(PendingAgentSelection {
-                            session_id,
-                            operation_id,
-                            selection: selection.clone(),
-                        });
-                        self.state.submission_error = None;
-                        Ok(ApplicationTransition::UpdateAgentSelection {
-                            session_id,
-                            request: UpdateAgentSelectionRequest {
-                                operation_id,
-                                selection,
-                            },
-                        })
+                        }
+                        self.apply_agent_selection(model.default_agent_selection())
                     }
                     None => Ok(ApplicationTransition::Continue),
                 }
             }
             ApplicationEvent::Command(CommandId::CloseModelPicker) => {
                 self.state.model_picker.close();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::SelectPreviousModelOption) => {
+                self.state.model_options.select_previous();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::SelectNextModelOption) => {
+                self.state.model_options.select_next();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::SelectModelOption) => {
+                self.state.model_options.choose();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::ApplyModelOptions) => {
+                if self.state.model_options.is_choice_picker_open() {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                let Some(selection) = self.state.model_options.apply() else {
+                    return Ok(ApplicationTransition::Continue);
+                };
+                self.state.model_options.close();
+                self.apply_agent_selection(selection)
+            }
+            ApplicationEvent::Command(CommandId::CloseModelOptions) => {
+                self.state.model_options.close();
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::InvokeSemantic(command)) => {
@@ -1322,22 +1346,34 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::ModelsListed { request, catalog } => {
+                let accepted = self.state.model_picker.is_active_request(&request);
                 let current = self.state.agent_selection().cloned();
                 self.state
                     .model_picker
                     .load(&request, catalog, current.as_ref());
+                if accepted {
+                    self.reconcile_model_options(false);
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::ModelsRefreshed { request, catalog } => {
+                let accepted = self.state.model_picker.is_active_request(&request);
                 let current = self.state.agent_selection().cloned();
                 self.state
                     .model_picker
                     .load(&request, catalog, current.as_ref());
                 self.state.model_picker.finish(&request);
+                if accepted {
+                    self.reconcile_model_options(true);
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::ModelListingFailed { request, error } => {
+                let accepted = self.state.model_picker.is_active_request(&request);
                 self.state.model_picker.fail(&request, error);
+                if accepted {
+                    self.reconcile_model_options(true);
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::AgentSelectionUpdated {
@@ -1416,6 +1452,14 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::ListModels(request))
             }
+            SemanticCommandId::ModelOptions => {
+                self.state.pending_model_options = true;
+                self.state.submission_error = None;
+                let request = self.state.model_picker.begin_refresh();
+                self.reconcile_model_options(false);
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::ListModels(request))
+            }
             SemanticCommandId::SessionList => {
                 let request = self.state.session_picker.open();
                 self.state.command_mode = CommandMode::Composer;
@@ -1444,6 +1488,73 @@ impl Application {
         }
     }
 
+    fn apply_agent_selection(
+        &mut self,
+        selection: AgentSelection,
+    ) -> Result<ApplicationTransition> {
+        let Some(session_id) = self.session_id() else {
+            self.state.landing_agent_selection = Some(selection);
+            return Ok(ApplicationTransition::Continue);
+        };
+        let operation_id = AgentSelectionOperationId::new();
+        self.state.pending_agent_selection = Some(PendingAgentSelection {
+            session_id,
+            operation_id,
+            selection: selection.clone(),
+        });
+        self.state.submission_error = None;
+        Ok(ApplicationTransition::UpdateAgentSelection {
+            session_id,
+            request: UpdateAgentSelectionRequest {
+                operation_id,
+                selection,
+            },
+        })
+    }
+
+    fn reconcile_model_options(&mut self, final_attempt: bool) {
+        if self.state.model_options.is_open() {
+            let current_model = self
+                .state
+                .model_options
+                .model()
+                .map(|model| (model.provider.clone(), model.id.clone()));
+            if let Some((provider, model)) = current_model {
+                if let Some(refreshed) = self.state.model_picker.cached_model(&provider, &model) {
+                    self.state.model_options.refresh(refreshed);
+                } else if final_attempt {
+                    self.state.model_options.mark_model_unavailable();
+                }
+            }
+        }
+        if !self.state.pending_model_options {
+            return;
+        }
+        let current = self.state.agent_selection().cloned();
+        let Some(model) = self
+            .state
+            .model_picker
+            .cached_model_for_options(current.as_ref())
+        else {
+            if final_attempt {
+                self.state.pending_model_options = false;
+                self.state.submission_error =
+                    Some("No concrete Model is available; use /models to choose one".to_owned());
+            }
+            return;
+        };
+        self.state.pending_model_options = false;
+        if model.options.is_empty() {
+            self.state.submission_error = Some(format!(
+                "{} has no configurable options; use /models to choose another Model",
+                model.display_name
+            ));
+            return;
+        }
+        self.state.submission_error = None;
+        self.state.model_options.open(model, current.as_ref());
+    }
+
     fn edit_session_picker(&mut self, edit: impl FnOnce(&mut SessionPicker)) {
         if !self.state.session_picker.is_attaching() {
             edit(&mut self.state.session_picker);
@@ -1455,6 +1566,12 @@ impl Application {
     }
 
     pub fn handle_terminal_event(&mut self, event: InputEvent) -> Result<ApplicationTransition> {
+        if self.state.model_options.is_open() {
+            return command_for_model_options_event(event)
+                .map_or(Ok(ApplicationTransition::Continue), |command| {
+                    self.handle_event(ApplicationEvent::Command(command))
+                });
+        }
         if self.state.model_picker.is_open() {
             return command_for_model_picker_event(event)
                 .map_or(Ok(ApplicationTransition::Continue), |command| {
@@ -1544,6 +1661,27 @@ fn command_for_session_picker_event(event: InputEvent) -> Option<CommandId> {
 
 fn command_for_model_picker_event(event: InputEvent) -> Option<CommandId> {
     command_for_picker_event(event, &MODEL_PICKER_COMMANDS)
+}
+
+fn command_for_model_options_event(event: InputEvent) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            Some(CommandId::SelectPreviousModelOption)
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            Some(CommandId::SelectNextModelOption)
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => Some(CommandId::SelectModelOption),
+        (KeyCode::Enter, KeyModifiers::CONTROL) => Some(CommandId::ApplyModelOptions),
+        (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::CloseModelOptions),
+        _ => None,
+    }
 }
 
 struct PickerCommandBindings {
@@ -1855,10 +1993,14 @@ fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlot
     if state.model_picker.is_open() && !state.reconnect_overlay_visible {
         render_model_picker(frame, state, &theme);
     }
+    if state.model_options.is_open() && !state.reconnect_overlay_visible {
+        render_model_options(frame, state, &theme);
+    }
     if state.reconnect_overlay_visible {
         render_reconnect_overlay(frame, &theme);
     } else if !state.session_picker.is_open()
         && !state.model_picker.is_open()
+        && !state.model_options.is_open()
         && state.composer_focused
         && matches!(state.command_mode, CommandMode::Composer)
     {
@@ -2069,6 +2211,169 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Models ")
+                .border_style(theme.border.default)
+                .style(theme.surface.overlay),
+        ),
+        area,
+    );
+}
+
+fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+    let area = centered_rect(
+        frame.area(),
+        frame.area().width.saturating_sub(4).min(76),
+        frame.area().height.saturating_sub(2).min(14),
+    );
+    let content_width = usize::from(area.width.saturating_sub(2));
+    let content_height = usize::from(area.height.saturating_sub(2));
+    let mut lines = Vec::with_capacity(content_height);
+    let model = state
+        .model_options
+        .model()
+        .expect("an open options screen has a Model");
+    if content_height >= 2 {
+        let unavailable = if model.availability == ModelAvailability::Unavailable {
+            " · unavailable"
+        } else {
+            ""
+        };
+        lines.push(Line::styled(
+            truncate_to_width(
+                &format!(
+                    "{} · Provider {}{unavailable}",
+                    model.display_name, model.provider
+                ),
+                content_width,
+            ),
+            theme.accent.primary.add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if state.model_options.is_choice_picker_open() {
+        let descriptor = state
+            .model_options
+            .selected_descriptor()
+            .expect("an open choice picker has a descriptor");
+        if content_height >= 3 {
+            lines.push(Line::styled(
+                truncate_to_width(
+                    descriptor
+                        .description
+                        .as_deref()
+                        .unwrap_or("Choose a value"),
+                    content_width,
+                ),
+                theme.text.subdued,
+            ));
+        }
+        let footer_rows = usize::from(content_height >= 3);
+        let capacity = content_height.saturating_sub(lines.len() + footer_rows);
+        let rows = state.model_options.choice_rows();
+        let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
+        let start = selected.saturating_add(1).saturating_sub(capacity);
+        lines.extend(
+            rows.into_iter()
+                .skip(start)
+                .take(capacity)
+                .map(|row| model_option_choice_line(row, content_width, theme)),
+        );
+        if footer_rows > 0 && lines.len() < content_height {
+            lines.push(Line::styled(
+                truncate_to_width("Enter choose · Esc cancel all edits", content_width),
+                theme.text.subdued,
+            ));
+        }
+        render_model_options_box(
+            frame,
+            area,
+            lines,
+            &format!(" {} Choices ", descriptor.label),
+            theme,
+        );
+        return;
+    }
+
+    let footer_rows = usize::from(content_height >= 3);
+    let capacity = content_height.saturating_sub(lines.len() + footer_rows);
+    let rows = state.model_options.rows();
+    let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
+    let start = selected.saturating_add(1).saturating_sub(capacity);
+    for row in rows.into_iter().skip(start).take(capacity) {
+        let marker = if row.selected { "› " } else { "  " };
+        let unavailable = if row.available { "" } else { " [unavailable]" };
+        let description = row
+            .description
+            .map_or_else(String::new, |description| format!(" · {description}"));
+        lines.push(Line::styled(
+            truncate_to_width(
+                &format!(
+                    "{marker}{} · {}{unavailable}{description}",
+                    row.label, row.value
+                ),
+                content_width,
+            ),
+            if row.selected {
+                theme.selection.focused
+            } else if row.available {
+                theme.text.primary
+            } else {
+                theme.text.subdued
+            },
+        ));
+    }
+    if footer_rows > 0 && lines.len() < content_height {
+        let controls = if state.model_options.is_valid() {
+            "Enter configure · Ctrl+Enter apply · Esc cancel"
+        } else {
+            "Enter configure · Apply unavailable · Esc cancel"
+        };
+        lines.push(Line::styled(
+            truncate_to_width(controls, content_width),
+            theme.text.subdued,
+        ));
+    }
+    render_model_options_box(frame, area, lines, " Model Options ", theme);
+}
+
+fn model_option_choice_line(
+    row: ModelOptionChoiceRow,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let marker = if row.selected { "› " } else { "  " };
+    let current = if row.current { " [current]" } else { "" };
+    let unavailable = if row.available { "" } else { " [unavailable]" };
+    let description = row
+        .description
+        .map_or_else(String::new, |description| format!(" · {description}"));
+    Line::styled(
+        truncate_to_width(
+            &format!("{marker}{}{current}{unavailable}{description}", row.label),
+            width,
+        ),
+        if row.selected {
+            theme.selection.focused
+        } else if row.available {
+            theme.text.primary
+        } else {
+            theme.text.subdued
+        },
+    )
+}
+
+fn render_model_options_box(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    title: &str,
+    theme: &Theme,
+) {
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title.to_owned())
                 .border_style(theme.border.default)
                 .style(theme.surface.overlay),
         ),
@@ -2722,28 +3027,6 @@ fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String
         Some(selection) => state
             .model_picker
             .selection_summary(selection, detail.shows_secondary()),
-    }
-}
-
-fn selection_with_advertised_defaults(model: &ModelDescriptor) -> AgentSelection {
-    AgentSelection {
-        provider: model.provider.clone(),
-        model: model.id.clone(),
-        options: model
-            .options
-            .iter()
-            .map(|option| ModelOptionSelection {
-                id: option.id.clone(),
-                value: match &option.kind {
-                    ModelOptionKind::Select { default, .. } => ModelOptionValue::Select {
-                        choice: default.clone(),
-                    },
-                    ModelOptionKind::Toggle { default } => {
-                        ModelOptionValue::Toggle { enabled: *default }
-                    }
-                },
-            })
-            .collect(),
     }
 }
 

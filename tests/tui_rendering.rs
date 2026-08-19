@@ -311,6 +311,867 @@ fn models_commands_dispatch_one_semantic_model_list_action() {
 }
 
 #[test]
+fn options_commands_dispatch_one_semantic_model_options_action() {
+    let mut canonical = Application::default();
+    type_terminal_text(&mut canonical, "/options");
+    assert!(
+        rendered_application_rows(&canonical)
+            .join("\n")
+            .contains("Configure Model Options")
+    );
+    assert!(matches!(
+        canonical
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("select /options"),
+        ApplicationTransition::ListModels(_)
+    ));
+
+    let mut alias = Application::default();
+    type_terminal_text(&mut alias, "/variants");
+    assert!(
+        rendered_application_rows(&alias)
+            .join("\n")
+            .contains("/options")
+    );
+    assert!(matches!(
+        alias
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("select /variants"),
+        ApplicationTransition::ListModels(_)
+    ));
+
+    let mut keybinding = Application::default();
+    keybinding
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("begin semantic leader keybinding");
+    assert!(matches!(
+        keybinding
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('o'),
+                KeyModifiers::NONE,
+            )))
+            .expect("invoke Model Options"),
+        ApplicationTransition::ListModels(_)
+    ));
+
+    assert_eq!(
+        chidori::tui::SemanticCommandId::ModelOptions.as_str(),
+        "model.options"
+    );
+}
+
+#[test]
+fn model_picker_hands_off_to_ordered_options_and_applies_complete_landing_selection() {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    let mut model = model_descriptor(
+        "codex",
+        "gpt-configurable",
+        "Configurable GPT",
+        true,
+        ModelAvailability::Available,
+    );
+    model.options = vec![
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("reasoning_effort"),
+            label: "Reasoning".to_owned(),
+            description: Some("Depth used to solve the Prompt".to_owned()),
+            role: ModelOptionRole::ReasoningEffort,
+            kind: ModelOptionKind::Select {
+                choices: vec![
+                    ModelOptionChoice {
+                        id: ModelOptionChoiceId::new("low"),
+                        label: "Low".to_owned(),
+                        description: Some("Respond quickly".to_owned()),
+                        availability: ModelAvailability::Available,
+                    },
+                    ModelOptionChoice {
+                        id: ModelOptionChoiceId::new("high"),
+                        label: "High".to_owned(),
+                        description: Some("Think deeply".to_owned()),
+                        availability: ModelAvailability::Available,
+                    },
+                ],
+                default: ModelOptionChoiceId::new("low"),
+            },
+        },
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("fast"),
+            label: "Fast".to_owned(),
+            description: Some("Prefer low latency".to_owned()),
+            role: ModelOptionRole::Speed,
+            kind: ModelOptionKind::Toggle { default: false },
+        },
+    ];
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![model],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("load configurable Model");
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("select configurable Model"),
+        ApplicationTransition::Continue
+    );
+    let options = rendered_application_rows(&application);
+    assert!(options.join("\n").contains("Model Options"));
+    assert!(options.join("\n").contains("Configurable GPT"));
+    assert!(options.join("\n").contains("Provider codex"));
+    assert!(rendered_row(&options, "Reasoning") < rendered_row(&options, "Fast"));
+    assert!(options.join("\n").contains("Reasoning · Low"));
+    assert!(options.join("\n").contains("Fast · Off"));
+    assert!(
+        options
+            .join("\n")
+            .contains("Depth used to solve the Prompt")
+    );
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("open Reasoning choices");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Think deeply")
+    );
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus High reasoning");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("stage High reasoning");
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus Fast option");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("open Fast choices");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus On");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("stage Fast On");
+
+    let staged = rendered_application_rows(&application).join("\n");
+    assert!(staged.contains("Reasoning · High"));
+    assert!(staged.contains("Fast · On"));
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::CONTROL,
+            )))
+            .expect("apply complete options"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("Model Options")
+    );
+
+    type_terminal_text(&mut application, "Create with options");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit landing selection")
+    else {
+        panic!("landing Prompt should create a Session");
+    };
+    assert_eq!(
+        request.agent_selection,
+        Some(AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("gpt-configurable"),
+            options: vec![
+                chidori::protocol::ModelOptionSelection {
+                    id: ModelOptionId::new("reasoning_effort"),
+                    value: ModelOptionValue::Select {
+                        choice: ModelOptionChoiceId::new("high"),
+                    },
+                },
+                chidori::protocol::ModelOptionSelection {
+                    id: ModelOptionId::new("fast"),
+                    value: ModelOptionValue::Toggle { enabled: true },
+                },
+            ],
+        })
+    );
+}
+
+#[test]
+fn options_command_resolves_provider_default_and_explains_unavailable_configuration() {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelOptions,
+        )))
+        .expect("invoke options without a concrete Model")
+    else {
+        panic!("options should resolve through the Model catalog");
+    };
+    let mut configurable = model_descriptor(
+        "codex",
+        "default-configurable",
+        "Default Configurable",
+        true,
+        ModelAvailability::Available,
+    );
+    configurable.options.push(ModelOptionDescriptor {
+        id: ModelOptionId::new("reasoning_effort"),
+        label: "Reasoning".to_owned(),
+        description: None,
+        role: ModelOptionRole::ReasoningEffort,
+        kind: ModelOptionKind::Select {
+            choices: vec![
+                ModelOptionChoice {
+                    id: ModelOptionChoiceId::new("medium"),
+                    label: "Medium".to_owned(),
+                    description: None,
+                    availability: ModelAvailability::Available,
+                },
+                ModelOptionChoice {
+                    id: ModelOptionChoiceId::new("high"),
+                    label: "High".to_owned(),
+                    description: None,
+                    availability: ModelAvailability::Available,
+                },
+            ],
+            default: ModelOptionChoiceId::new("medium"),
+        },
+    });
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![configurable],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("resolve the default configurable Model");
+    let resolved = rendered_application_rows(&application).join("\n");
+    assert!(resolved.contains("Model Options"));
+    assert!(resolved.contains("Default Configurable"));
+    assert!(resolved.contains("Reasoning · Medium"));
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("open default Reasoning choices");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus non-default reasoning");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("stage non-default reasoning");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Reasoning · High")
+    );
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("cancel default options without mutation");
+    type_terminal_text(&mut application, "No implicit mutation");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit after cancelling options")
+    else {
+        panic!("landing Prompt should create a Session");
+    };
+    assert_eq!(request.agent_selection, None);
+
+    let mut unavailable = Application::default();
+    let ApplicationTransition::ListModels(request) = unavailable
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelOptions,
+        )))
+        .expect("invoke unavailable options")
+    else {
+        panic!("options should resolve through the Model catalog");
+    };
+    unavailable
+        .handle_event(ApplicationEvent::ModelsRefreshed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![model_descriptor(
+                        "codex",
+                        "plain",
+                        "Plain Model",
+                        true,
+                        ModelAvailability::Available,
+                    )],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("resolve a Model without options");
+    let status = rendered_application_rows(&unavailable).join("\n");
+    assert!(!status.contains("Model Options"));
+    assert!(status.contains("Plain Model has no configurable options"));
+    assert!(status.contains("/models"));
+
+    assert!(matches!(
+        unavailable
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                chidori::tui::SemanticCommandId::ModelList,
+            )))
+            .expect("choose the same plain Model through /models"),
+        ApplicationTransition::ListModels(_)
+    ));
+    assert_eq!(
+        unavailable
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("apply a Model without descriptors immediately"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        !rendered_application_rows(&unavailable)
+            .join("\n")
+            .contains("Model Options")
+    );
+    type_terminal_text(&mut unavailable, "Use plain Model");
+    let ApplicationTransition::CreateSession(request) = unavailable
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit plain Model selection")
+    else {
+        panic!("landing Prompt should create a Session");
+    };
+    assert_eq!(
+        request.agent_selection,
+        Some(AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("plain"),
+            options: Vec::new(),
+        })
+    );
+
+    let mut missing = Application::default();
+    let ApplicationTransition::ListModels(request) = missing
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelOptions,
+        )))
+        .expect("invoke options without any available Model")
+    else {
+        panic!("options should request the catalog");
+    };
+    missing
+        .handle_event(ApplicationEvent::ModelsRefreshed {
+            request,
+            catalog: ModelCatalog {
+                providers: Vec::new(),
+            },
+        })
+        .expect("finish empty catalog resolution");
+    let status = rendered_application_rows(&missing).join("\n");
+    assert!(status.contains("No concrete Model is available"));
+    assert!(status.contains("/models"));
+}
+
+#[test]
+fn stale_catalog_failure_does_not_end_newer_options_resolution() {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(stale_request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelOptions,
+        )))
+        .expect("begin first options resolution")
+    else {
+        panic!("options should request the catalog");
+    };
+    let ApplicationTransition::ListModels(current_request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelOptions,
+        )))
+        .expect("replace options resolution")
+    else {
+        panic!("options should replace its catalog request");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelListingFailed {
+            request: stale_request,
+            error: "stale failure".to_owned(),
+        })
+        .expect("ignore stale failure");
+
+    let mut model = model_descriptor(
+        "codex",
+        "current-default",
+        "Current Default",
+        true,
+        ModelAvailability::Available,
+    );
+    model.options.push(ModelOptionDescriptor {
+        id: ModelOptionId::new("fast"),
+        label: "Fast".to_owned(),
+        description: None,
+        role: ModelOptionRole::Speed,
+        kind: ModelOptionKind::Toggle { default: false },
+    });
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request: current_request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![model],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("resolve the newest options request");
+    let screen = rendered_application_rows(&application).join("\n");
+    assert!(screen.contains("Model Options"));
+    assert!(screen.contains("Current Default"));
+    assert!(!screen.contains("stale failure"));
+}
+
+#[test]
+fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let authoritative = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-configurable"),
+        options: vec![
+            chidori::protocol::ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("low"),
+                },
+            },
+            chidori::protocol::ModelOptionSelection {
+                id: ModelOptionId::new("fast"),
+                value: ModelOptionValue::Toggle { enabled: false },
+            },
+        ],
+    };
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            selected_session_snapshot(session_id, workspace.path(), authoritative.clone()),
+        ))
+        .expect("attach selected Session");
+
+    let ApplicationTransition::ListModels(catalog_request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelOptions,
+        )))
+        .expect("open authoritative Model Options")
+    else {
+        panic!("options should request the Model catalog");
+    };
+    let mut model = model_descriptor(
+        "codex",
+        "gpt-configurable",
+        "Configurable GPT",
+        true,
+        ModelAvailability::Available,
+    );
+    model.options = vec![
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("reasoning_effort"),
+            label: "Reasoning".to_owned(),
+            description: None,
+            role: ModelOptionRole::ReasoningEffort,
+            kind: ModelOptionKind::Select {
+                choices: vec![
+                    ModelOptionChoice {
+                        id: ModelOptionChoiceId::new("low"),
+                        label: "Low".to_owned(),
+                        description: None,
+                        availability: ModelAvailability::Available,
+                    },
+                    ModelOptionChoice {
+                        id: ModelOptionChoiceId::new("high"),
+                        label: "High".to_owned(),
+                        description: None,
+                        availability: ModelAvailability::Available,
+                    },
+                ],
+                default: ModelOptionChoiceId::new("high"),
+            },
+        },
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("fast"),
+            label: "Fast".to_owned(),
+            description: None,
+            role: ModelOptionRole::Speed,
+            kind: ModelOptionKind::Toggle { default: true },
+        },
+    ];
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request: catalog_request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![model],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("load current Model Options");
+    let reopened = rendered_application_rows(&application).join("\n");
+    assert!(reopened.contains("Reasoning · Low"));
+    assert!(reopened.contains("Fast · Off"));
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("open Reasoning choices");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus High");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("stage High");
+
+    let ApplicationTransition::UpdateAgentSelection {
+        session_id: updated_session,
+        request,
+    } = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+        )))
+        .expect("apply one complete Agent Selection")
+    else {
+        panic!("Session options should produce one authoritative update");
+    };
+    assert_eq!(updated_session, session_id);
+    assert_eq!(
+        request.selection.options,
+        vec![
+            chidori::protocol::ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("high"),
+                },
+            },
+            chidori::protocol::ModelOptionSelection {
+                id: ModelOptionId::new("fast"),
+                value: ModelOptionValue::Toggle { enabled: false },
+            },
+        ]
+    );
+    let optimistic = rendered_application_rows_at(&application, 100, 16).join("\n");
+    assert!(optimistic.contains("Reasoning High"));
+    assert!(optimistic.contains("Fast Off"));
+    type_terminal_text(&mut application, "must wait");
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("block Prompt while options settle"),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                chidori::tui::SemanticCommandId::SessionList,
+            )))
+            .expect("block Session navigation while options settle"),
+        ApplicationTransition::Continue
+    );
+
+    application
+        .handle_event(ApplicationEvent::AgentSelectionUpdateFailed {
+            operation_id: request.operation_id,
+            error: "Options rejected".to_owned(),
+        })
+        .expect("reject complete options update");
+    assert!(
+        rendered_application_rows_at(&application, 100, 16)
+            .join("\n")
+            .contains("Options rejected")
+    );
+    assert!(matches!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                chidori::tui::SemanticCommandId::ModelOptions,
+            )))
+            .expect("reopen rolled-back options"),
+        ApplicationTransition::ListModels(_)
+    ));
+    let rolled_back = rendered_application_rows(&application).join("\n");
+    assert!(rolled_back.contains("Reasoning · Low"));
+    assert!(rolled_back.contains("Fast · Off"));
+}
+
+#[test]
+fn refreshed_options_keep_invalidated_choice_visible_and_disable_apply() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let current = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("changing"),
+        options: vec![
+            chidori::protocol::ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("high"),
+                },
+            },
+            chidori::protocol::ModelOptionSelection {
+                id: ModelOptionId::new("fast"),
+                value: ModelOptionValue::Toggle { enabled: false },
+            },
+        ],
+    };
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            selected_session_snapshot(session_id, workspace.path(), current),
+        ))
+        .expect("attach selected Session");
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            chidori::tui::SemanticCommandId::ModelOptions,
+        )))
+        .expect("open options")
+    else {
+        panic!("options should request the catalog");
+    };
+    let option = |choices: Vec<ModelOptionChoice>| ModelOptionDescriptor {
+        id: ModelOptionId::new("reasoning_effort"),
+        label: "Reasoning".to_owned(),
+        description: None,
+        role: ModelOptionRole::ReasoningEffort,
+        kind: ModelOptionKind::Select {
+            choices,
+            default: ModelOptionChoiceId::new("low"),
+        },
+    };
+    let low = || ModelOptionChoice {
+        id: ModelOptionChoiceId::new("low"),
+        label: "Low".to_owned(),
+        description: None,
+        availability: ModelAvailability::Available,
+    };
+    let high = ModelOptionChoice {
+        id: ModelOptionChoiceId::new("high"),
+        label: "High".to_owned(),
+        description: None,
+        availability: ModelAvailability::Available,
+    };
+    let mut initial = model_descriptor(
+        "codex",
+        "changing",
+        "Changing Model",
+        true,
+        ModelAvailability::Available,
+    );
+    initial.options = vec![
+        option(vec![low(), high]),
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("fast"),
+            label: "Fast".to_owned(),
+            description: None,
+            role: ModelOptionRole::Speed,
+            kind: ModelOptionKind::Toggle { default: false },
+        },
+    ];
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request: request.clone(),
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![initial.clone()],
+                    status: ProviderCatalogStatus::Refreshing,
+                }],
+            },
+        })
+        .expect("open cached options");
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus Fast");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("open Fast choices");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus On");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("stage Fast On");
+
+    let mut refreshed = initial;
+    refreshed.options[0] = option(vec![low()]);
+    application
+        .handle_event(ApplicationEvent::ModelsRefreshed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![refreshed],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("invalidate High reasoning");
+    let invalid = rendered_application_rows(&application).join("\n");
+    assert!(invalid.contains("Reasoning · high (unavailable) [unavailable]"));
+    assert!(invalid.contains("Fast · On"));
+    assert!(invalid.contains("Apply unavailable"));
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::CONTROL,
+            )))
+            .expect("refuse invalid complete selection"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Model Options")
+    );
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus invalid Reasoning");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("open choices including invalid current value");
+    let choices = rendered_application_rows(&application).join("\n");
+    assert!(choices.contains("high [current] [unavailable]"));
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("explicitly focus Low");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("replace invalid choice");
+    let ApplicationTransition::UpdateAgentSelection { request, .. } = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+        )))
+        .expect("apply repaired complete selection")
+    else {
+        panic!("valid repaired options should apply");
+    };
+    assert_eq!(
+        request.selection.options,
+        vec![
+            chidori::protocol::ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("low"),
+                },
+            },
+            chidori::protocol::ModelOptionSelection {
+                id: ModelOptionId::new("fast"),
+                value: ModelOptionValue::Toggle { enabled: true },
+            },
+        ]
+    );
+}
+
+#[test]
 fn landing_model_picker_groups_sorts_focuses_and_searches_models() {
     let mut application = Application::default();
     let ApplicationTransition::ListModels(request) = application
@@ -731,17 +1592,28 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
             KeyModifiers::NONE,
         )))
         .expect("focus New Model");
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("select configurable New Model"),
+        ApplicationTransition::Continue
+    );
+    let tiny_options = rendered_application_rows_at(&application, 28, 5).join("\n");
+    assert!(tiny_options.contains("Reasoning"));
     let ApplicationTransition::UpdateAgentSelection {
         session_id: updated_session,
         request,
     } = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::Enter,
-            KeyModifiers::NONE,
+            KeyModifiers::CONTROL,
         )))
-        .expect("select New Model")
+        .expect("apply New Model defaults")
     else {
-        panic!("selecting a Session Model should update Agent Selection");
+        panic!("applying a Session Model's options should update Agent Selection");
     };
     assert_eq!(updated_session, session_id);
     assert_eq!(request.selection.model, ModelId::new("new"));
@@ -902,6 +1774,15 @@ fn landing_model_selection_and_new_session_inherit_complete_agent_selection() {
                 KeyModifiers::NONE,
             )))
             .expect("select landing Model"),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::CONTROL,
+            )))
+            .expect("apply landing Model options"),
         ApplicationTransition::Continue
     );
     let wide = rendered_application_rows_at(&application, 100, 16).join("\n");
