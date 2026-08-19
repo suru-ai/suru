@@ -15,10 +15,10 @@ use tokio::sync::broadcast;
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
     AgentSelection, AgentSelectionOperationId, CreateSessionRequest, Message, MessageId,
-    MessageRole, MessageStatus, ModelAvailability, Prompt, PromptDelivery, PromptId, PromptOrder,
-    PromptStatus, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
-    SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, Turn, TurnId, TurnStatus,
-    UpdateAgentSelectionRequest, Workspace,
+    MessageRole, MessageStatus, ModelAvailability, ModelOptionValue, Prompt, PromptDelivery,
+    PromptId, PromptOrder, PromptStatus, Session, SessionChange, SessionId, SessionRevision,
+    SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, Turn, TurnId,
+    TurnStatus, UpdateAgentSelectionRequest, Workspace,
 };
 use crate::session_projection::apply_update;
 
@@ -440,33 +440,75 @@ impl SessionStore {
         }
         let update_authoritative =
             record.snapshot.session.agent_selection.as_ref() == Some(&requested.selection);
-        let requested_model = requested.selection.model.clone();
         let effective_agent = AgentIdentity {
             agent: agent_id,
             selection: selection.clone(),
         };
-        let mut changes = Vec::with_capacity(3);
+        let mut changes = Vec::new();
         if update_authoritative {
             changes.push(SessionChange::AgentSelectionChanged {
                 selection: selection.clone(),
             });
         }
-        changes.extend([
-            SessionChange::TurnAgentChanged {
-                turn_id,
-                agent: effective_agent,
-            },
-            SessionChange::ActivityAdded {
+        changes.push(SessionChange::TurnAgentChanged {
+            turn_id,
+            agent: effective_agent,
+        });
+        if requested.selection.model != selection.model {
+            changes.push(SessionChange::ActivityAdded {
                 activity: Activity::Status {
                     id: ActivityId::new(),
                     turn_id,
                     text: format!(
                         "Provider used Model `{}` instead of requested Model `{}`.",
-                        selection.model, requested_model
+                        selection.model, requested.selection.model
                     ),
                 },
-            },
-        ]);
+            });
+        }
+        for effective in &selection.options {
+            let requested_value = requested
+                .selection
+                .options
+                .iter()
+                .find(|candidate| candidate.id == effective.id)
+                .map(|candidate| &candidate.value);
+            if requested_value == Some(&effective.value) {
+                continue;
+            }
+            let requested_value = requested_value
+                .map(model_option_value_text)
+                .unwrap_or_else(|| "no value".to_owned());
+            changes.push(SessionChange::ActivityAdded {
+                activity: Activity::Status {
+                    id: ActivityId::new(),
+                    turn_id,
+                    text: format!(
+                        "Provider used Model Option `{}` value `{}` instead of requested value `{requested_value}`.",
+                        effective.id,
+                        model_option_value_text(&effective.value),
+                    ),
+                },
+            });
+        }
+        for omitted in requested.selection.options.iter().filter(|requested| {
+            !selection
+                .options
+                .iter()
+                .any(|effective| effective.id == requested.id)
+        }) {
+            changes.push(SessionChange::ActivityAdded {
+                activity: Activity::Status {
+                    id: ActivityId::new(),
+                    turn_id,
+                    text: format!(
+                        "Provider omitted requested Model Option `{}` value `{}`.",
+                        omitted.id,
+                        model_option_value_text(&omitted.value),
+                    ),
+                },
+            });
+        }
         let updated_at = state.next_timestamp();
         let record = state
             .sessions
@@ -1241,6 +1283,13 @@ impl SessionStore {
             .collect::<Vec<_>>();
         summaries.sort_unstable_by_key(|summary| Reverse(summary.updated_at));
         Ok(summaries)
+    }
+}
+
+fn model_option_value_text(value: &ModelOptionValue) -> String {
+    match value {
+        ModelOptionValue::Select { choice } => choice.to_string(),
+        ModelOptionValue::Toggle { enabled } => enabled.to_string(),
     }
 }
 

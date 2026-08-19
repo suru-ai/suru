@@ -24,6 +24,7 @@ use chidori::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
         AgentSelection, AgentSelectionOperationId, CreateSessionRequest, FileChange, InitialPrompt,
         LifecycleState, Message, MessageId, MessageRole, MessageStatus, ModelAvailability, ModelId,
+        ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue,
         PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
         RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity, Session,
         SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
@@ -46,6 +47,27 @@ mod provider_support;
 
 use failing_provider_support::spawn_with_failing_provider;
 use provider_support::ControlledProvider;
+
+fn controlled_selection(model: &str, effort: &str, speed: &str) -> AgentSelection {
+    AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new(model),
+        options: vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning-opaque"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new(effort),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("speed-opaque"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new(speed),
+                },
+            },
+        ],
+    }
+}
 
 async fn next_session_update(
     subscription: &mut chidori::managed_client::SessionSubscription,
@@ -1055,11 +1077,7 @@ async fn agent_selection_commands_are_idempotent_and_converge_across_clients() {
     }
 
     let operation_id = AgentSelectionOperationId::new();
-    let selected = AgentSelection {
-        provider: ProviderId::new("controlled"),
-        model: ModelId::new("gpt-selected"),
-        options: Vec::new(),
-    };
+    let selected = controlled_selection("gpt-selected", "high-native", "fast-native");
     let request = UpdateAgentSelectionRequest {
         operation_id,
         selection: selected.clone(),
@@ -1112,11 +1130,7 @@ async fn agent_selection_commands_are_idempotent_and_converge_across_clients() {
         .expect_err("reject conflicting operation identity reuse");
     assert!(conflict.to_string().contains("operation identity"));
 
-    let final_selection = AgentSelection {
-        provider: ProviderId::new("controlled"),
-        model: ModelId::new("gpt-final"),
-        options: Vec::new(),
-    };
+    let final_selection = controlled_selection("gpt-final", "low-native", "standard-native");
     second
         .update_agent_selection(
             created.session.id,
@@ -1287,11 +1301,7 @@ async fn turn_boundaries_capture_the_latest_selection_while_steers_keep_the_acti
     .await
     .expect("connect client");
     receive_managed_client_initial_state(&mut client).await;
-    let first_selection = AgentSelection {
-        provider: ProviderId::new("controlled"),
-        model: ModelId::new("model-a"),
-        options: Vec::new(),
-    };
+    let first_selection = controlled_selection("model-a", "high-native", "standard-native");
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: Some(first_selection.clone()),
@@ -1318,11 +1328,7 @@ async fn turn_boundaries_capture_the_latest_selection_while_steers_keep_the_acti
     assert_eq!(first_turn.selection(), &first_selection);
     first_turn.succeed();
 
-    let second_selection = AgentSelection {
-        provider: ProviderId::new("controlled"),
-        model: ModelId::new("model-b"),
-        options: Vec::new(),
-    };
+    let second_selection = controlled_selection("model-b", "low-native", "fast-native");
     client
         .update_agent_selection(
             created.session.id,
@@ -1362,11 +1368,7 @@ async fn turn_boundaries_capture_the_latest_selection_while_steers_keep_the_acti
         )
         .await
         .expect("queue next Prompt");
-    let final_selection = AgentSelection {
-        provider: ProviderId::new("controlled"),
-        model: ModelId::new("model-c"),
-        options: Vec::new(),
-    };
+    let final_selection = controlled_selection("model-c", "high-native", "fast-native");
     client
         .update_agent_selection(
             created.session.id,
@@ -1423,7 +1425,20 @@ async fn provider_effective_selection_reconciles_the_active_turn_with_visible_ac
     let requested = AgentSelection {
         provider: ProviderId::new("controlled"),
         model: ModelId::new("requested-model"),
-        options: Vec::new(),
+        options: vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning-opaque"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("high-opaque"),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("speed-opaque"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("standard-opaque"),
+                },
+            },
+        ],
     };
     let created = client
         .create_session(CreateSessionRequest {
@@ -1459,7 +1474,20 @@ async fn provider_effective_selection_reconciles_the_active_turn_with_visible_ac
     let effective = AgentSelection {
         provider: ProviderId::new("controlled"),
         model: ModelId::new("effective-model"),
-        options: Vec::new(),
+        options: vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning-opaque"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("low-opaque"),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("speed-opaque"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("fast-opaque"),
+                },
+            },
+        ],
     };
 
     provider_session.emit(ProviderEvent::AgentSelectionChanged {
@@ -1483,6 +1511,19 @@ async fn provider_effective_selection_reconciles_the_active_turn_with_visible_ac
                 && text.contains("requested-model")
                 && text.contains("effective-model")
     )));
+    for (option_id, requested_choice, effective_choice) in [
+        ("reasoning-opaque", "high-opaque", "low-opaque"),
+        ("speed-opaque", "standard-opaque", "fast-opaque"),
+    ] {
+        assert!(update.changes.iter().any(|change| matches!(
+            change,
+            SessionChange::ActivityAdded { activity: Activity::Status { turn_id: activity_turn_id, text, .. } }
+                if *activity_turn_id == turn_id
+                    && text.contains(option_id)
+                    && text.contains(requested_choice)
+                    && text.contains(effective_choice)
+        )));
+    }
     let reconciled = client
         .read_session(created.session.id)
         .await

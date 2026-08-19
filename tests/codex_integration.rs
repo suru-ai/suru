@@ -12,7 +12,8 @@ use chidori::{
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentSelection,
         CreateSessionRequest, FileChange, InitialPrompt, MessageRole, MessageStatus,
-        ModelAvailability, ModelId, ModelOptionKind, ModelOptionRole, PromptDelivery, PromptId,
+        ModelAvailability, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionKind,
+        ModelOptionRole, ModelOptionSelection, ModelOptionValue, PromptDelivery, PromptId,
         PromptStatus, ProviderCatalogStatus, ProviderId, SessionChange, SessionId, SessionSnapshot,
         SessionStatus, ShutdownReason, TranscriptItem, TurnId, TurnStatus, Workspace,
     },
@@ -99,7 +100,7 @@ while IFS= read -r line; do
       if [ "$attempt" -gt 1 ]; then
         printf '%s\n' '{"id":2,"error":{"code":-32001,"message":"temporary catalog outage"}}'
       else
-        printf '%s\n' '{"id":2,"result":{"data":[{"id":"gpt-opaque","displayName":"GPT Fixture","description":"Primary fixture model","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Faster"},{"reasoningEffort":"xhigh","description":"Deepest"}],"defaultReasoningEffort":"xhigh","serviceTiers":[],"defaultServiceTier":null,"isDefault":true},{"id":"hidden-model","displayName":"Hidden","description":"Not selectable","hidden":true,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","serviceTiers":[],"defaultServiceTier":null,"isDefault":false}],"nextCursor":"opaque-page-2"}}'
+        printf '%s\n' '{"id":2,"result":{"data":[{"id":"gpt-opaque","displayName":"GPT Fixture","description":"Primary fixture model","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Faster"},{"reasoningEffort":"xhigh","description":"Deepest"}],"defaultReasoningEffort":"xhigh","serviceTiers":[{"id":"flex-native","name":"Flex","description":"Flexible processing"},{"id":"fast-native","name":"Fast","description":"Priority processing"}],"defaultServiceTier":"flex-native","isDefault":true},{"id":"hidden-model","displayName":"Hidden","description":"Not selectable","hidden":true,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","serviceTiers":[],"defaultServiceTier":null,"isDefault":false}],"nextCursor":"opaque-page-2"}}'
       fi
       ;;
     *'"method":"model/list"'*'"cursor":"opaque-page-2"'*)
@@ -172,6 +173,24 @@ while IFS= read -r line; do
 done
 "#;
 
+const SELECTED_OPTION_REJECTION: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"failed","error":{"message":"selected service tier is unavailable","codexErrorInfo":"badRequest","additionalDetails":"{\"error\":{\"param\":\"serviceTier\"}}"},"items":[]}}}'
+      ;;
+  esac
+done
+"#;
+
 const NON_MODEL_BAD_REQUEST: &str = r#"#!/bin/sh
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
@@ -202,7 +221,26 @@ while IFS= read -r line; do
       ;;
     *'"method":"turn/start"'*)
       printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
-      printf '%s\n' '{"method":"thread/settings/updated","params":{"threadId":"native-thread","threadSettings":{"model":"effective-model"}}}'
+      printf '%s\n' '{"method":"thread/settings/updated","params":{"threadId":"native-thread","threadSettings":{"model":"effective-model","effort":"low","serviceTier":"flex"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
+      ;;
+  esac
+done
+"#;
+
+const THREAD_DEFAULT_OPTIONS_CODEX: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"provider-default","reasoningEffort":"medium","serviceTier":"fast"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"method":"thread/settings/updated","params":{"threadId":"native-thread","threadSettings":{"model":"provider-default","serviceTier":null}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
       ;;
   esac
@@ -760,7 +798,7 @@ async fn codex_model_catalog_is_paginated_normalized_and_kept_across_refresh_fai
     assert_eq!(catalog.models[0].id, ModelId::new("gpt-opaque"));
     assert_eq!(catalog.models[0].display_name, "GPT Fixture");
     assert_eq!(catalog.models[0].availability, ModelAvailability::Available);
-    assert_eq!(catalog.models[0].options.len(), 1);
+    assert_eq!(catalog.models[0].options.len(), 2);
     assert_eq!(
         catalog.models[0].options[0].role,
         ModelOptionRole::ReasoningEffort
@@ -776,6 +814,35 @@ async fn codex_model_catalog_is_paginated_normalized_and_kept_across_refresh_fai
         ["low", "xhigh"]
     );
     assert_eq!(default.as_str(), "xhigh");
+    assert_eq!(catalog.models[0].options[1].role, ModelOptionRole::Speed);
+    let ModelOptionKind::Select { choices, default } = &catalog.models[0].options[1].kind else {
+        panic!("speed is a Select option");
+    };
+    assert_eq!(
+        choices
+            .iter()
+            .map(|choice| choice.id.as_str())
+            .collect::<Vec<_>>(),
+        ["flex-native", "fast-native"]
+    );
+    assert_eq!(default.as_str(), "flex-native");
+    assert_eq!(
+        catalog.models[0].default_agent_selection().options,
+        vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("xhigh"),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("service_tier"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("flex-native"),
+                },
+            },
+        ]
+    );
     assert_eq!(catalog.models[1].options[0].role, ModelOptionRole::Speed);
     let ModelOptionKind::Select { choices, default } = &catalog.models[1].options[0].kind else {
         panic!("speed is a Select option");
@@ -1470,7 +1537,20 @@ async fn selected_model_is_lowered_to_codex_and_effective_model_is_projected_bac
     let requested = AgentSelection {
         provider: ProviderId::new("codex"),
         model: ModelId::new("requested-model"),
-        options: Vec::new(),
+        options: vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("high"),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("service_tier"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("fast"),
+                },
+            },
+        ],
     };
     let created = client
         .create_session(CreateSessionRequest {
@@ -1492,6 +1572,8 @@ async fn selected_model_is_lowered_to_codex_and_effective_model_is_projected_bac
         .find(|request| request["method"] == "turn/start")
         .expect("capture native turn/start");
     assert_eq!(turn_start["params"]["model"], "requested-model");
+    assert_eq!(turn_start["params"]["effort"], "high");
+    assert_eq!(turn_start["params"]["serviceTier"], "fast");
 
     let completed = timeout(Duration::from_secs(2), async {
         loop {
@@ -1514,7 +1596,20 @@ async fn selected_model_is_lowered_to_codex_and_effective_model_is_projected_bac
     let effective = AgentSelection {
         provider: ProviderId::new("codex"),
         model: ModelId::new("effective-model"),
-        options: Vec::new(),
+        options: vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("low"),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("service_tier"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("flex"),
+                },
+            },
+        ],
     };
     assert_eq!(completed.session.agent_selection, Some(effective.clone()));
     assert_eq!(
@@ -1529,6 +1624,220 @@ async fn selected_model_is_lowered_to_codex_and_effective_model_is_projected_bac
         Activity::Status { text, .. }
             if text.contains("requested-model") && text.contains("effective-model")
     )));
+    assert!(completed.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Status { text, .. }
+            if text.contains("reasoning_effort")
+                && text.contains("high")
+                && text.contains("low")
+    )));
+    assert!(completed.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Status { text, .. }
+            if text.contains("service_tier")
+                && text.contains("fast")
+                && text.contains("flex")
+    )));
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn codex_materializes_thread_options_and_handles_native_omission_and_clear() {
+    let fixture = ScriptedCodex::new(THREAD_DEFAULT_OPTIONS_CODEX);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-thread-default-options")
+            .expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-thread-default-options")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Use every effective default".to_owned(),
+            },
+        })
+        .await
+        .expect("create default Codex Session");
+    let completed = timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = client
+                .read_session(created.session.id)
+                .await
+                .expect("read default Codex Session");
+            if snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Completed)
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("default Codex Turn completes");
+    let expected = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("provider-default"),
+        options: vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("medium"),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("service_tier"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("default"),
+                },
+            },
+        ],
+    };
+    assert_eq!(completed.session.agent_selection, Some(expected.clone()));
+    assert_eq!(
+        completed.turns[0]
+            .agent
+            .as_ref()
+            .map(|agent| &agent.selection),
+        Some(&expected)
+    );
+    let turn_start = fixture
+        .requests()
+        .into_iter()
+        .find(|request| request["method"] == "turn/start")
+        .expect("capture default turn/start");
+    assert_eq!(turn_start["params"]["effort"], "medium");
+    assert_eq!(turn_start["params"]["serviceTier"], "fast");
+    assert!(completed.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Status { text, .. }
+            if text.contains("service_tier")
+                && text.contains("fast")
+                && text.contains("default")
+    )));
+    assert!(!completed.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Status { text, .. } if text.contains("reasoning_effort")
+    )));
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn codex_adapter_distinguishes_explicit_option_defaults_from_native_omission() {
+    let fixture = ScriptedCodex::new(SELECTED_MODEL_CODEX);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-option-defaults").expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-option-defaults")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+
+    client
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(AgentSelection {
+                provider: ProviderId::new("codex"),
+                model: ModelId::new("requested-model"),
+                options: vec![
+                    ModelOptionSelection {
+                        id: ModelOptionId::new("reasoning_effort"),
+                        value: ModelOptionValue::Select {
+                            choice: ModelOptionChoiceId::new("medium"),
+                        },
+                    },
+                    ModelOptionSelection {
+                        id: ModelOptionId::new("service_tier"),
+                        value: ModelOptionValue::Select {
+                            choice: ModelOptionChoiceId::new("default"),
+                        },
+                    },
+                ],
+            }),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Apply explicit defaults".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session with explicit defaults");
+    fixture.wait_for_method_count("turn/start", 1).await;
+    let explicit = fixture
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request["method"] == "turn/start"
+                && request["params"]["input"][0]["text"] == "Apply explicit defaults"
+        })
+        .expect("capture explicit-default turn/start");
+    assert_eq!(explicit["params"]["effort"], "medium");
+    assert!(
+        explicit["params"]
+            .as_object()
+            .is_some_and(|params| { params.get("serviceTier") == Some(&Value::Null) })
+    );
+
+    client
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(AgentSelection {
+                provider: ProviderId::new("codex"),
+                model: ModelId::new("requested-model"),
+                options: Vec::new(),
+            }),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Leave options omitted".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session without advertised options");
+    fixture.wait_for_method_count("turn/start", 2).await;
+    let omitted = fixture
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request["method"] == "turn/start"
+                && request["params"]["input"][0]["text"] == "Leave options omitted"
+        })
+        .expect("capture omitted-options turn/start");
+    let omitted = omitted["params"]
+        .as_object()
+        .expect("turn/start params are an object");
+    assert!(!omitted.contains_key("effort"));
+    assert!(!omitted.contains_key("serviceTier"));
 
     drop(client);
     server.shutdown().await.expect("shut down server");
@@ -1611,6 +1920,109 @@ async fn codex_model_rejection_never_falls_back_and_restores_the_prompt() {
     assert_eq!(failed.prompts[0].id, prompt_id);
     assert_ne!(failed.prompts[1].id, prompt_id);
     assert_eq!(failed.prompts[1].text, "Do not silently fall back");
+    assert_eq!(failed.prompts[1].status, PromptStatus::Pending);
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn codex_option_rejection_never_falls_back_and_restores_the_prompt() {
+    let fixture = ScriptedCodex::new(SELECTED_OPTION_REJECTION);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-selected-option-rejection")
+            .expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-selected-option-rejection")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let selection = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("valid-model"),
+        options: vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("high"),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("service_tier"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("retired-tier"),
+                },
+            },
+        ],
+    };
+    let prompt_id = PromptId::new();
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(selection.clone()),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: prompt_id,
+                text: "Do not silently replace the selected speed".to_owned(),
+            },
+        })
+        .await
+        .expect("create selected Codex Session");
+    let failed = timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = client
+                .read_session(created.session.id)
+                .await
+                .expect("read rejected Codex Session");
+            if snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Failed)
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Codex option rejection becomes visible");
+    let turn_start = fixture
+        .requests()
+        .into_iter()
+        .find(|request| request["method"] == "turn/start")
+        .expect("capture rejected turn/start");
+    assert_eq!(turn_start["params"]["model"], "valid-model");
+    assert_eq!(turn_start["params"]["effort"], "high");
+    assert_eq!(turn_start["params"]["serviceTier"], "retired-tier");
+    assert_eq!(failed.session.agent_selection, Some(selection.clone()));
+    assert_eq!(
+        failed.session.agent_selection_availability,
+        ModelAvailability::Unavailable
+    );
+    assert_eq!(
+        failed.turns[0].agent.as_ref().map(|agent| &agent.selection),
+        Some(&selection)
+    );
+    assert!(failed.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Error { text, .. } if text.contains("service tier is unavailable")
+    )));
+    assert_eq!(failed.prompts.len(), 2);
+    assert_eq!(failed.prompts[0].id, prompt_id);
+    assert_ne!(failed.prompts[1].id, prompt_id);
+    assert_eq!(
+        failed.prompts[1].text,
+        "Do not silently replace the selected speed"
+    );
     assert_eq!(failed.prompts[1].status, PromptStatus::Pending);
 
     drop(client);

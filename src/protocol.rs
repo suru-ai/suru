@@ -139,6 +139,37 @@ pub struct ModelDescriptor {
     pub options: Vec<ModelOptionDescriptor>,
 }
 
+impl ModelDescriptor {
+    pub fn default_agent_selection(&self) -> AgentSelection {
+        AgentSelection {
+            provider: self.provider.clone(),
+            model: self.id.clone(),
+            options: self
+                .options
+                .iter()
+                .map(|option| ModelOptionSelection {
+                    id: option.id.clone(),
+                    value: match &option.kind {
+                        ModelOptionKind::Select { default, .. } => ModelOptionValue::Select {
+                            choice: default.clone(),
+                        },
+                        ModelOptionKind::Toggle { default } => {
+                            ModelOptionValue::Toggle { enabled: *default }
+                        }
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    pub fn materialize_agent_selection(&self, current: Option<&AgentSelection>) -> AgentSelection {
+        current
+            .filter(|selection| selection.provider == self.provider && selection.model == self.id)
+            .cloned()
+            .unwrap_or_else(|| self.default_agent_selection())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelOptionValue {

@@ -895,3 +895,107 @@ fn model_descriptors_and_option_values_use_strict_typed_json() {
         .is_err()
     );
 }
+
+#[test]
+fn model_descriptors_materialize_complete_defaults_and_preserve_valid_same_model_options() {
+    let descriptor = ModelDescriptor {
+        provider: ProviderId::new("provider-opaque"),
+        id: ModelId::new("model-opaque"),
+        display_name: "Opaque Model".to_owned(),
+        description: "Advertises ordered independent options".to_owned(),
+        is_default: true,
+        availability: ModelAvailability::Available,
+        options: vec![
+            ModelOptionDescriptor {
+                id: ModelOptionId::new("reasoning-opaque"),
+                label: "Reasoning".to_owned(),
+                description: None,
+                role: ModelOptionRole::ReasoningEffort,
+                kind: ModelOptionKind::Select {
+                    choices: vec![
+                        ModelOptionChoice {
+                            id: ModelOptionChoiceId::new("low-opaque"),
+                            label: "Low".to_owned(),
+                            description: None,
+                            availability: ModelAvailability::Available,
+                        },
+                        ModelOptionChoice {
+                            id: ModelOptionChoiceId::new("high-opaque"),
+                            label: "High".to_owned(),
+                            description: None,
+                            availability: ModelAvailability::Available,
+                        },
+                    ],
+                    default: ModelOptionChoiceId::new("high-opaque"),
+                },
+            },
+            ModelOptionDescriptor {
+                id: ModelOptionId::new("speed-opaque"),
+                label: "Fast".to_owned(),
+                description: None,
+                role: ModelOptionRole::Speed,
+                kind: ModelOptionKind::Toggle { default: false },
+            },
+        ],
+    };
+    let defaults = descriptor.default_agent_selection();
+    assert_eq!(
+        defaults.options,
+        vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning-opaque"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("high-opaque"),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("speed-opaque"),
+                value: ModelOptionValue::Toggle { enabled: false },
+            },
+        ]
+    );
+
+    let other_model = AgentSelection {
+        provider: descriptor.provider.clone(),
+        model: ModelId::new("other-model"),
+        options: vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning-opaque"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("low-opaque"),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("speed-opaque"),
+                value: ModelOptionValue::Toggle { enabled: true },
+            },
+        ],
+    };
+    assert_eq!(
+        descriptor.materialize_agent_selection(Some(&other_model)),
+        defaults,
+        "switching Models uses the target Model's defaults"
+    );
+
+    let same_model = AgentSelection {
+        provider: descriptor.provider.clone(),
+        model: descriptor.id.clone(),
+        options: vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning-opaque"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("low-opaque"),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("speed-opaque"),
+                value: ModelOptionValue::Toggle { enabled: true },
+            },
+        ],
+    };
+    assert_eq!(
+        descriptor.materialize_agent_selection(Some(&same_model)),
+        same_model,
+        "reopening the same Model preserves its complete current options"
+    );
+}

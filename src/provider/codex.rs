@@ -29,7 +29,8 @@ use super::{
 use crate::protocol::{
     AgentId, AgentIdentity, AgentSelection, FileChange, ModelAvailability, ModelDescriptor,
     ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
-    ModelOptionKind, ModelOptionRole, ProviderId, SessionId,
+    ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue, ProviderId,
+    SessionId,
 };
 
 const CODEX_PATH_ENV: &str = "CHIDORI_CODEX_PATH";
@@ -42,6 +43,9 @@ const PROCESS_KILL_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_REMOTE_ERROR_CHARS: usize = 384;
 const UNSUPPORTED_INTERACTION_ERROR_CODE: i64 = -32000;
 const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
+const REASONING_EFFORT_OPTION_ID: &str = "reasoning_effort";
+const SERVICE_TIER_OPTION_ID: &str = "service_tier";
+const DEFAULT_SERVICE_TIER_CHOICE_ID: &str = "default";
 
 #[derive(Serialize)]
 struct ClientRequest<'a, T> {
@@ -144,6 +148,54 @@ struct TurnStartParams<'a> {
     thread_id: &'a str,
     input: [TextInput<'a>; 1],
     model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<Option<&'a str>>,
+}
+
+struct NativeTurnOptions<'a> {
+    effort: Option<&'a str>,
+    service_tier: Option<Option<&'a str>>,
+}
+
+fn lower_turn_options(selection: &AgentSelection) -> Result<NativeTurnOptions<'_>, ProviderError> {
+    let mut effort = None;
+    let mut service_tier = None;
+    for option in &selection.options {
+        let ModelOptionValue::Select { choice } = &option.value else {
+            return Err(ProviderError::selection_rejected(format!(
+                "Codex does not support toggle Model Option `{}`",
+                option.id
+            )));
+        };
+        match option.id.as_str() {
+            REASONING_EFFORT_OPTION_ID if effort.is_none() => {
+                effort = Some(choice.as_str());
+            }
+            SERVICE_TIER_OPTION_ID if service_tier.is_none() => {
+                service_tier = Some(
+                    (choice.as_str() != DEFAULT_SERVICE_TIER_CHOICE_ID).then(|| choice.as_str()),
+                );
+            }
+            REASONING_EFFORT_OPTION_ID | SERVICE_TIER_OPTION_ID => {
+                return Err(ProviderError::selection_rejected(format!(
+                    "Codex Model Option `{}` was selected more than once",
+                    option.id
+                )));
+            }
+            _ => {
+                return Err(ProviderError::selection_rejected(format!(
+                    "Codex does not support Model Option `{}`",
+                    option.id
+                )));
+            }
+        }
+    }
+    Ok(NativeTurnOptions {
+        effort,
+        service_tier,
+    })
 }
 
 #[derive(Serialize)]
@@ -331,7 +383,7 @@ fn normalize_model(model: NativeModel) -> ModelDescriptor {
     let mut options = Vec::new();
     if !model.supported_reasoning_efforts.is_empty() {
         options.push(ModelOptionDescriptor {
-            id: ModelOptionId::new("reasoning_effort"),
+            id: ModelOptionId::new(REASONING_EFFORT_OPTION_ID),
             label: "Reasoning effort".to_owned(),
             description: None,
             role: ModelOptionRole::ReasoningEffort,
@@ -368,7 +420,7 @@ fn normalize_model(model: NativeModel) -> ModelDescriptor {
             choices.insert(
                 0,
                 ModelOptionChoice {
-                    id: ModelOptionChoiceId::new("default"),
+                    id: ModelOptionChoiceId::new(DEFAULT_SERVICE_TIER_CHOICE_ID),
                     label: "Default".to_owned(),
                     description: None,
                     availability: ModelAvailability::Available,
@@ -376,7 +428,7 @@ fn normalize_model(model: NativeModel) -> ModelDescriptor {
             );
         }
         options.push(ModelOptionDescriptor {
-            id: ModelOptionId::new("service_tier"),
+            id: ModelOptionId::new(SERVICE_TIER_OPTION_ID),
             label: "Speed".to_owned(),
             description: None,
             role: ModelOptionRole::Speed,
@@ -608,6 +660,24 @@ async fn start_codex_thread(
         .expect("Codex Thread registry lock is not poisoned")
         .insert(request.session_id, CodexThreadId(started.thread.id.clone()));
 
+    let mut initial_options = Vec::new();
+    if let Some(effort) = started.reasoning_effort {
+        initial_options.push(ModelOptionSelection {
+            id: ModelOptionId::new(REASONING_EFFORT_OPTION_ID),
+            value: ModelOptionValue::Select {
+                choice: ModelOptionChoiceId::new(effort),
+            },
+        });
+    }
+    if let Some(service_tier) = started.service_tier {
+        initial_options.push(ModelOptionSelection {
+            id: ModelOptionId::new(SERVICE_TIER_OPTION_ID),
+            value: ModelOptionValue::Select {
+                choice: ModelOptionChoiceId::new(service_tier),
+            },
+        });
+    }
+
     let correlation = Arc::new(StdMutex::new(NativeCorrelation {
         thread_id: started.thread.id.clone(),
         turn_starting: false,
@@ -641,7 +711,7 @@ async fn start_codex_thread(
             selection: AgentSelection {
                 provider: ProviderId::new("codex"),
                 model: ModelId::new(started.model),
-                options: Vec::new(),
+                options: initial_options,
             },
         },
         session,
@@ -650,9 +720,14 @@ async fn start_codex_thread(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ThreadConnectionResult {
     thread: NativeThread,
     model: String,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    service_tier: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -818,6 +893,7 @@ async fn start_native_turn(
     turn_start_changed: Arc<Notify>,
 ) -> Result<(), ProviderError> {
     let started = async {
+        let options = lower_turn_options(&selection)?;
         let result = transport
             .request(
                 "turn/start",
@@ -828,6 +904,8 @@ async fn start_native_turn(
                         text: &prompt,
                     }],
                     model: selection.model.as_str(),
+                    effort: options.effort,
+                    service_tier: options.service_tier,
                 },
             )
             .await
@@ -913,6 +991,8 @@ enum NativeNotification {
     AgentSelectionChanged {
         thread_id: String,
         model: String,
+        effort: NativeField<Option<String>>,
+        service_tier: NativeField<Option<String>>,
     },
     AgentMessageStarted {
         thread_id: String,
@@ -1136,7 +1216,7 @@ enum NativeCodexErrorInfo {
     Other,
 }
 
-fn is_native_model_rejection(
+fn is_native_selection_rejection(
     message: &str,
     kind: &NativeTurnFailureKind,
     selection: &AgentSelection,
@@ -1145,37 +1225,69 @@ fn is_native_model_rejection(
         NativeTurnFailureKind::BadRequest { additional_details } => additional_details
             .as_deref()
             .and_then(|details| serde_json::from_str::<Value>(details).ok())
-            .is_some_and(|details| json_identifies_model_parameter(&details)),
+            .is_some_and(|details| json_identifies_agent_selection_parameter(&details)),
         NativeTurnFailureKind::Other => {
             let message = message.to_ascii_lowercase();
             let selected_model = selection.model.as_str().to_ascii_lowercase();
-            message.contains("model")
-                && message.contains(&selected_model)
-                && [
-                    "unavailable",
-                    "unsupported",
-                    "not available",
-                    "not found",
-                    "does not exist",
-                    "unknown",
-                    "invalid",
-                    "access",
-                    "denied",
-                    "retired",
-                ]
-                .iter()
-                .any(|reason| message.contains(reason))
+            let rejected = [
+                "unavailable",
+                "unsupported",
+                "not available",
+                "not found",
+                "does not exist",
+                "unknown",
+                "invalid",
+                "access",
+                "denied",
+                "retired",
+            ]
+            .iter()
+            .any(|reason| message.contains(reason));
+            let identifies_model = message.contains("model") && message.contains(&selected_model);
+            let identifies_option = selection.options.iter().any(|option| {
+                let option_id = option.id.as_str().to_ascii_lowercase();
+                let option_label = option_id.replace('_', " ");
+                let choice = match &option.value {
+                    ModelOptionValue::Select { choice } => choice.as_str(),
+                    ModelOptionValue::Toggle { enabled } => {
+                        if *enabled {
+                            "true"
+                        } else {
+                            "false"
+                        }
+                    }
+                };
+                message.contains(&option_id)
+                    || message.contains(&option_label)
+                    || message.contains(&choice.to_ascii_lowercase())
+            });
+            rejected && (identifies_model || identifies_option)
         }
     }
 }
 
-fn json_identifies_model_parameter(value: &Value) -> bool {
+fn json_identifies_agent_selection_parameter(value: &Value) -> bool {
     match value {
         Value::Object(fields) => {
-            fields.get("param").and_then(Value::as_str) == Some("model")
-                || fields.values().any(json_identifies_model_parameter)
+            fields
+                .get("param")
+                .and_then(Value::as_str)
+                .is_some_and(|parameter| {
+                    matches!(
+                        parameter,
+                        "model"
+                            | "effort"
+                            | "reasoningEffort"
+                            | "reasoning_effort"
+                            | "serviceTier"
+                            | "service_tier"
+                    )
+                })
+                || fields
+                    .values()
+                    .any(json_identifies_agent_selection_parameter)
         }
-        Value::Array(values) => values.iter().any(json_identifies_model_parameter),
+        Value::Array(values) => values.iter().any(json_identifies_agent_selection_parameter),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
     }
 }
@@ -1188,8 +1300,28 @@ struct ThreadSettingsUpdatedParams {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EffectiveThreadSettings {
     model: String,
+    #[serde(default, deserialize_with = "deserialize_native_field")]
+    effort: NativeField<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_native_field")]
+    service_tier: NativeField<Option<String>>,
+}
+
+#[derive(Default)]
+enum NativeField<T> {
+    #[default]
+    Omitted,
+    Present(T),
+}
+
+fn deserialize_native_field<'de, D, T>(deserializer: D) -> Result<NativeField<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(NativeField::Present)
 }
 
 struct GuardedEventReceiver {
@@ -1231,7 +1363,12 @@ fn project_native_notification(
     notification: NativeNotification,
 ) -> Result<Vec<ProviderEvent>, ProviderError> {
     match notification {
-        NativeNotification::AgentSelectionChanged { thread_id, model } => {
+        NativeNotification::AgentSelectionChanged {
+            thread_id,
+            model,
+            effort,
+            service_tier,
+        } => {
             if correlation.thread_id != thread_id || correlation.active_turn_id.is_none() {
                 return Ok(Vec::new());
             }
@@ -1247,6 +1384,18 @@ fn project_native_notification(
             };
             let mut effective = requested.clone();
             effective.model = ModelId::new(model);
+            apply_effective_select_option(
+                &mut effective,
+                REASONING_EFFORT_OPTION_ID,
+                effort,
+                None,
+            )?;
+            apply_effective_select_option(
+                &mut effective,
+                SERVICE_TIER_OPTION_ID,
+                service_tier,
+                Some(DEFAULT_SERVICE_TIER_CHOICE_ID),
+            )?;
             if effective == *requested {
                 return Ok(Vec::new());
             }
@@ -1544,7 +1693,7 @@ fn project_native_notification(
             }
             let selection_rejected = match (&outcome, &correlation.active_selection) {
                 (NativeTurnOutcome::Failed { message, kind }, Some(selection)) => {
-                    is_native_model_rejection(message, kind, selection)
+                    is_native_selection_rejection(message, kind, selection)
                 }
                 _ => false,
             };
@@ -1563,6 +1712,48 @@ fn project_native_notification(
             }])
         }
     }
+}
+
+fn apply_effective_select_option(
+    selection: &mut AgentSelection,
+    option_id: &str,
+    field: NativeField<Option<String>>,
+    cleared_choice: Option<&str>,
+) -> Result<(), ProviderError> {
+    let NativeField::Present(value) = field else {
+        return Ok(());
+    };
+    let choice = match (value, cleared_choice) {
+        (Some(choice), _) => choice,
+        (None, Some(choice)) => choice.to_owned(),
+        (None, None) => {
+            selection
+                .options
+                .retain(|option| option.id.as_str() != option_id);
+            return Ok(());
+        }
+    };
+    if choice.is_empty() {
+        return Err(codex_error(format!(
+            "Codex reported an empty effective value for Model Option `{option_id}`"
+        )));
+    }
+    let value = ModelOptionValue::Select {
+        choice: ModelOptionChoiceId::new(choice),
+    };
+    if let Some(option) = selection
+        .options
+        .iter_mut()
+        .find(|option| option.id.as_str() == option_id)
+    {
+        option.value = value;
+    } else {
+        selection.options.push(ModelOptionSelection {
+            id: ModelOptionId::new(option_id),
+            value,
+        });
+    }
+    Ok(())
 }
 
 fn is_active_native_turn(correlation: &NativeCorrelation, thread_id: &str, turn_id: &str) -> bool {
@@ -2189,6 +2380,8 @@ fn decode_notification(
             Ok(Some(NativeNotification::AgentSelectionChanged {
                 thread_id: params.thread_id,
                 model: params.thread_settings.model,
+                effort: params.thread_settings.effort,
+                service_tier: params.thread_settings.service_tier,
             }))
         }
         "item/started" => {
