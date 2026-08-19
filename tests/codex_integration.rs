@@ -1422,7 +1422,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         })
         .await
         .expect("create Session without waiting for Codex startup");
-    assert_eq!(created.session.agent, None);
+    assert_eq!(created.session.agent_selection, None);
     assert_eq!(created.session.status, SessionStatus::Idle);
     assert_eq!(created.prompts[0].status, PromptStatus::Pending);
     assert!(created.turns.is_empty());
@@ -1564,14 +1564,20 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         .read_session(created.session.id)
         .await
         .expect("read completed Session");
-    let identity = completed
+    let selection = completed
         .session
+        .agent_selection
+        .as_ref()
+        .expect("effective Codex Agent Selection is published");
+    assert_eq!(selection.provider, ProviderId::new("codex"));
+    assert_eq!(selection.model, ModelId::new("gpt-fixture"));
+    assert!(selection.options.is_empty());
+    let identity = completed.turns[0]
         .agent
         .as_ref()
-        .expect("effective Codex Agent is bound");
+        .expect("Codex Turn captures its effective Agent");
     assert_eq!(identity.agent, AgentId::new("codex"));
-    assert_eq!(identity.provider, ProviderId::new("codex"));
-    assert_eq!(identity.model, ModelId::new("gpt-fixture"));
+    assert_eq!(&identity.selection, selection);
     assert_eq!(completed.session.status, SessionStatus::Idle);
     assert_eq!(completed.prompts[0].status, PromptStatus::Delivered);
     assert_eq!(completed.turns[0].status, TurnStatus::Completed);
@@ -2369,12 +2375,17 @@ async fn installed_codex_launches_runs_one_text_turn_and_shuts_down() {
     .expect("installed Codex completes one text Turn");
 
     assert_eq!(completed.turns[0].status, TurnStatus::Completed);
-    let identity = completed
+    let selection = completed
         .session
+        .agent_selection
+        .expect("Codex publishes its effective Model");
+    let identity = completed.turns[0]
         .agent
-        .expect("Codex binds its effective Model");
+        .as_ref()
+        .expect("Codex Turn captures its effective Agent");
     assert_eq!(identity.agent, AgentId::new("codex"));
-    assert_eq!(identity.provider, ProviderId::new("codex"));
+    assert_eq!(identity.selection, selection);
+    assert_eq!(selection.provider, ProviderId::new("codex"));
     assert!(completed.messages.iter().any(|message| {
         message.role == MessageRole::Agent
             && message.status == MessageStatus::Completed
@@ -2452,7 +2463,10 @@ async fn codex_resumes_the_known_thread_after_active_process_loss() {
         )
         .await;
     assert_eq!(recovered.session.id, fixture.session_id);
-    assert_eq!(recovered.session.agent, failed.session.agent);
+    assert_eq!(
+        recovered.session.agent_selection,
+        failed.session.agent_selection
+    );
     assert_eq!(recovered.turns.len(), 2);
     assert_eq!(recovered.messages.len(), 3);
     assert_eq!(

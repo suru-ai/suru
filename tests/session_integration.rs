@@ -22,9 +22,9 @@ use chidori::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-        CreateSessionRequest, FileChange, InitialPrompt, LifecycleState, Message, MessageId,
-        MessageRole, MessageStatus, ModelId, PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId,
-        PromptOrder, PromptStatus, ProviderId, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT,
+        AgentSelection, CreateSessionRequest, FileChange, InitialPrompt, LifecycleState, Message,
+        MessageId, MessageRole, MessageStatus, ModelId, PROTOCOL_VERSION, Prompt, PromptDelivery,
+        PromptId, PromptOrder, PromptStatus, ProviderId, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT,
         SESSION_UPDATED_EVENT, ServerIdentity, Session, SessionChange, SessionError,
         SessionErrorCode, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
         SessionSummary, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
@@ -129,7 +129,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         .await
         .expect("create Session without waiting for Provider startup");
     assert_eq!(created.revision, SessionRevision::INITIAL);
-    assert_eq!(created.session.agent, None);
+    assert_eq!(created.session.agent_selection, None);
     assert_eq!(created.session.status, SessionStatus::Idle);
     assert_eq!(created.prompts.len(), 1);
     assert_eq!(created.prompts[0].status, PromptStatus::Pending);
@@ -162,8 +162,11 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
     assert_eq!(start.workspace(), workspace.path());
     let identity = AgentIdentity {
         agent: AgentId::new("codex"),
-        provider: ProviderId::new("codex"),
-        model: ModelId::new("gpt-5.6-codex"),
+        selection: AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("gpt-5.6-codex"),
+            options: Vec::new(),
+        },
     };
     let mut provider_session = start.succeed(identity.clone());
     let turn_request = timeout(Duration::from_secs(1), provider_session.next_turn())
@@ -171,14 +174,14 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         .expect("initial Prompt reaches the Provider Session");
     assert_eq!(turn_request.prompt(), "Explain the provider seam");
 
-    let first_binding = next_session_update(&mut first_feed).await;
-    let second_binding = next_session_update(&mut second_feed).await;
-    assert_eq!(first_binding, second_binding);
-    assert_eq!(first_binding.revision, SessionRevision(2));
+    let first_selection = next_session_update(&mut first_feed).await;
+    let second_selection = next_session_update(&mut second_feed).await;
+    assert_eq!(first_selection, second_selection);
+    assert_eq!(first_selection.revision, SessionRevision(2));
     assert_eq!(
-        first_binding.changes,
-        vec![SessionChange::AgentBound {
-            agent: identity.clone(),
+        first_selection.changes,
+        vec![SessionChange::AgentSelectionChanged {
+            selection: identity.selection.clone(),
         }]
     );
 
@@ -194,6 +197,10 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
             _ => None,
         })
         .expect("Prompt delivery creates a Turn");
+    assert!(first_delivery.changes.iter().any(|change| {
+        matches!(change, SessionChange::TurnAdded { turn }
+            if turn.agent.as_ref() == Some(&identity))
+    }));
     assert!(first_delivery.changes.iter().any(|change| {
         matches!(change, SessionChange::PromptStatusChanged {
             prompt_id: changed_prompt_id,
@@ -279,10 +286,14 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         .await
         .expect("read completed Session");
     assert_eq!(completed.revision, SessionRevision(15));
-    assert_eq!(completed.session.agent, Some(identity));
+    assert_eq!(
+        completed.session.agent_selection,
+        Some(identity.selection.clone())
+    );
     assert_eq!(completed.session.status, SessionStatus::Idle);
     assert_eq!(completed.prompts[0].status, PromptStatus::Delivered);
     assert_eq!(completed.turns.len(), 1);
+    assert_eq!(completed.turns[0].agent, Some(identity));
     assert_eq!(completed.turns[0].status, TurnStatus::Completed);
     assert_eq!(completed.messages.len(), 2);
     assert_eq!(completed.messages[0].role, MessageRole::User);
@@ -456,6 +467,105 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
 }
 
 #[tokio::test]
+async fn agent_selection_changes_do_not_rewrite_an_active_turn_identity() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "mutable-agent-selection-test")
+            .expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "mutable-agent-selection-test")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_managed_client_initial_state(&mut client).await;
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Keep this Turn on its effective Agent".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let initial_identity = AgentIdentity {
+        agent: AgentId::new("codex"),
+        selection: AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("gpt-initial"),
+            options: Vec::new(),
+        },
+    };
+    let mut provider_session = provider
+        .next_start()
+        .await
+        .succeed(initial_identity.clone());
+    provider_session.next_turn().await.succeed();
+
+    let mut feed = client
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe to active Session");
+    let SessionEvent::Snapshot(active) = feed
+        .next()
+        .await
+        .expect("Session snapshot arrives")
+        .expect("Session stream remains valid")
+    else {
+        panic!("Session stream starts with a snapshot");
+    };
+    assert_eq!(
+        active.session.agent_selection,
+        Some(initial_identity.selection.clone())
+    );
+    assert_eq!(active.turns[0].agent, Some(initial_identity.clone()));
+
+    let next_selection = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-next"),
+        options: Vec::new(),
+    };
+    let published = server
+        .session_event_sink()
+        .publish(
+            created.session.id,
+            vec![SessionChange::AgentSelectionChanged {
+                selection: next_selection.clone(),
+            }],
+        )
+        .expect("publish a later Agent Selection");
+    assert_eq!(next_session_update(&mut feed).await, published);
+
+    let changed = client
+        .read_session(created.session.id)
+        .await
+        .expect("read changed Session");
+    assert_eq!(changed.session.agent_selection, Some(next_selection));
+    assert_eq!(
+        changed.turns[0].agent,
+        Some(initial_identity),
+        "an active Turn retains the effective Agent it began with"
+    );
+
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    next_session_update(&mut feed).await;
+    drop(provider_session);
+    drop(feed);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn provider_session_steers_the_active_turn_only_after_provider_acceptance() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
@@ -502,8 +612,11 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
     let start = provider.next_start().await;
     let identity = AgentIdentity {
         agent: AgentId::new("codex"),
-        provider: ProviderId::new("codex"),
-        model: ModelId::new("controlled-model"),
+        selection: AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("controlled-model"),
+            options: Vec::new(),
+        },
     };
     let mut provider_session = start.succeed(identity);
     let initial_turn = provider_session.next_turn().await;
@@ -738,8 +851,11 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
     let retry = provider.next_start().await;
     let identity = AgentIdentity {
         agent: AgentId::new("codex"),
-        provider: ProviderId::new("codex"),
-        model: ModelId::new("gpt-5.6-codex"),
+        selection: AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("gpt-5.6-codex"),
+            options: Vec::new(),
+        },
     };
     let mut provider_session = retry.succeed(identity.clone());
     assert_eq!(
@@ -813,7 +929,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
         .read_session(created.session.id)
         .await
         .expect("read recovered Session");
-    assert_eq!(snapshot.session.agent, Some(identity));
+    assert_eq!(snapshot.session.agent_selection, Some(identity.selection));
     assert_eq!(snapshot.session.status, SessionStatus::Idle);
     assert_eq!(snapshot.turns.len(), 3);
     assert_eq!(snapshot.turns[0].status, TurnStatus::Failed);
@@ -868,7 +984,7 @@ async fn authenticated_creation_returns_pending_before_async_provider_failure() 
         snapshot.session.workspace.path,
         std::fs::canonicalize(&workspace).expect("canonicalize expected Workspace")
     );
-    assert_eq!(snapshot.session.agent, None);
+    assert_eq!(snapshot.session.agent_selection, None);
     assert_eq!(snapshot.session.status, SessionStatus::Idle);
     assert_eq!(snapshot.prompts.len(), 1);
     assert_eq!(snapshot.prompts[0].id, prompt_id);
@@ -1272,6 +1388,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                     turn: Turn {
                         id: active_turn_id,
                         prompt_id: active_prompt_id,
+                        agent: None,
                         status: TurnStatus::Active,
                     },
                 },
@@ -1316,6 +1433,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                         turn: Turn {
                             id: TurnId::new(),
                             prompt_id: rejected_prompt_id,
+                            agent: None,
                             status: TurnStatus::Active,
                         },
                     },
@@ -1503,8 +1621,11 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
     let start = provider.next_start().await;
     let mut provider_session = start.succeed(AgentIdentity {
         agent: AgentId::new("codex"),
-        provider: ProviderId::new("codex"),
-        model: ModelId::new("test-model"),
+        selection: AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("test-model"),
+            options: Vec::new(),
+        },
     });
     let turn_start = provider_session.next_turn().await;
     assert_eq!(turn_start.prompt(), "Long-running work");
@@ -1997,7 +2118,7 @@ async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace
     );
     assert_eq!(summaries[0].title, "Second Session");
     assert_eq!(summaries[0].session.workspace, second.session.workspace);
-    assert_eq!(summaries[0].session.agent, None);
+    assert_eq!(summaries[0].session.agent_selection, None);
     assert_eq!(summaries[0].session.status, SessionStatus::Idle);
     assert!(summaries[0].created_at <= summaries[0].updated_at);
     assert!(summaries[0].updated_at > summaries[1].updated_at);
@@ -2332,6 +2453,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
                     turn: Turn {
                         id: turn_id,
                         prompt_id,
+                        agent: None,
                         status: TurnStatus::Active,
                     },
                 },
@@ -2727,6 +2849,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
                     turn: Turn {
                         id: turn_id,
                         prompt_id,
+                        agent: None,
                         status: TurnStatus::Active,
                     },
                 },
@@ -2904,6 +3027,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
                     turn: Turn {
                         id: turn_id,
                         prompt_id,
+                        agent: None,
                         status: TurnStatus::Active,
                     },
                 },
@@ -3160,7 +3284,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             workspace: Workspace {
                 path: workspace.to_owned(),
             },
-            agent: None,
+            agent_selection: None,
             status: SessionStatus::Idle,
         },
         revision: SessionRevision::INITIAL,
@@ -3174,6 +3298,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
         turns: vec![Turn {
             id: turn_id,
             prompt_id,
+            agent: None,
             status: TurnStatus::Failed,
         }],
         messages: vec![Message {

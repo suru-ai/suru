@@ -17,8 +17,8 @@ use super::{
     ProviderRuntime, ProviderSession, ProviderSessionRequest, ProviderTurnInput, wait_for_shutdown,
 };
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus, PromptId,
-    SessionChange, SessionId, TurnId, TurnStatus,
+    Activity, ActivityId, ActivityStatus, AgentIdentity, Message, MessageId, MessageRole,
+    MessageStatus, PromptId, SessionChange, SessionId, TurnId, TurnStatus,
 };
 use crate::sessions::{
     DeliveredTurn, DeliveredTurnStatus, InterruptTurnError, ProviderTurnOutcome, SessionStore,
@@ -85,6 +85,7 @@ enum ProviderCommand {
 }
 
 struct ConnectedProviderSession {
+    identity: AgentIdentity,
     session: Arc<dyn ProviderSession>,
     events: ProviderEventStream,
 }
@@ -367,6 +368,7 @@ async fn run_provider_session(
                             sessions.deliver_prompt(
                                 session_id,
                                 prompt_id,
+                                None,
                                 DeliveredTurnStatus::Failed {
                                     message: format!("Provider startup failed: {error}"),
                                 },
@@ -378,16 +380,19 @@ async fn run_provider_session(
                     }
                 };
                 let (identity, session, events) = connection.into_parts();
-                let Some(bound) = updates.apply(|| sessions.bind_agent(session_id, identity))
+                let selection = identity.selection.clone();
+                let Some(selected) =
+                    updates.apply(|| sessions.update_agent_selection(session_id, selection))
                 else {
                     let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
                     break;
                 };
-                if let Err(error) = bound {
+                if let Err(error) = selected {
                     let _ = updates.apply(|| {
                         sessions.deliver_prompt(
                             session_id,
                             prompt_id,
+                            None,
                             DeliveredTurnStatus::Failed {
                                 message: format!("Provider startup failed: {error}"),
                             },
@@ -396,11 +401,25 @@ async fn run_provider_session(
                     let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
                     continue;
                 }
-                provider = Some(ConnectedProviderSession { session, events });
+                provider = Some(ConnectedProviderSession {
+                    identity,
+                    session,
+                    events,
+                });
             }
 
+            let identity = provider
+                .as_ref()
+                .expect("Provider connection exists before Prompt delivery")
+                .identity
+                .clone();
             let Some(delivered) = updates.apply(|| {
-                sessions.deliver_prompt(session_id, prompt_id, DeliveredTurnStatus::Active)
+                sessions.deliver_prompt(
+                    session_id,
+                    prompt_id,
+                    Some(identity),
+                    DeliveredTurnStatus::Active,
+                )
             }) else {
                 break;
             };
@@ -563,9 +582,14 @@ async fn run_provider_session(
                 };
                 match event {
                     Some(Ok(event)) => {
-                        if let ProviderEventProjection::Terminal(next_turn) =
-                            project_provider_event(&sessions, &updates, session_id, current, event)
-                        {
+                        let identity = provider
+                            .as_ref()
+                            .expect("Provider connection exists while its Turn is active")
+                            .identity
+                            .clone();
+                        if let ProviderEventProjection::Terminal(next_turn) = project_provider_event(
+                            &sessions, &updates, session_id, current, &identity, event,
+                        ) {
                             active = None;
                             if let Some(delivered) = next_turn {
                                 let started = tokio::select! {
@@ -642,6 +666,7 @@ fn project_provider_event(
     updates: &ProviderUpdateGate,
     session_id: SessionId,
     active: &mut ActiveProviderTurn,
+    next_agent: &AgentIdentity,
     event: ProviderEvent,
 ) -> ProviderEventProjection {
     let Some(projected) = updates.apply(|| {
@@ -676,6 +701,7 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
+                        next_agent,
                         "Provider sent Agent Message content before starting a Message",
                     );
                 };
@@ -695,6 +721,7 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
+                        next_agent,
                         "Provider completed an Agent Message before starting one",
                     );
                 };
@@ -752,6 +779,7 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
+                        next_agent,
                         "Provider sent command output before starting the Activity",
                     );
                 };
@@ -777,6 +805,7 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
+                        next_agent,
                         "Provider completed a command before starting the Activity",
                     );
                 };
@@ -840,6 +869,7 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
+                        next_agent,
                         "Provider updated file changes before starting the Activity",
                     );
                 };
@@ -864,6 +894,7 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
+                        next_agent,
                         "Provider completed file changes before starting the Activity",
                     );
                 };
@@ -896,6 +927,7 @@ fn project_provider_event(
                         .finish_provider_turn(
                             session_id,
                             active.turn_id,
+                            next_agent.clone(),
                             ProviderTurnOutcome::Completed,
                         )
                         .map(ProviderEventProjection::Terminal)
@@ -907,6 +939,7 @@ fn project_provider_event(
                     .finish_provider_turn(
                         session_id,
                         active.turn_id,
+                        next_agent.clone(),
                         ProviderTurnOutcome::Interrupted { unfinished_output },
                     )
                     .map(ProviderEventProjection::Terminal)
@@ -917,6 +950,7 @@ fn project_provider_event(
                     .finish_provider_turn(
                         session_id,
                         active.turn_id,
+                        next_agent.clone(),
                         ProviderTurnOutcome::Failed {
                             unfinished_output,
                             message,
@@ -931,6 +965,7 @@ fn project_provider_event(
                 sessions,
                 session_id,
                 active,
+                next_agent,
                 format!("Provider execution failed: {error}"),
             )
         })
@@ -944,12 +979,14 @@ fn fail_invalid_provider_event(
     sessions: &SessionStore,
     session_id: SessionId,
     active: &mut ActiveProviderTurn,
+    next_agent: &AgentIdentity,
     message: &str,
 ) -> ProviderEventProjection {
     finish_invalid_provider_event(
         sessions,
         session_id,
         active,
+        next_agent,
         format!("Provider execution failed: {message}"),
     )
 }
@@ -958,6 +995,7 @@ fn finish_invalid_provider_event(
     sessions: &SessionStore,
     session_id: SessionId,
     active: &mut ActiveProviderTurn,
+    next_agent: &AgentIdentity,
     message: String,
 ) -> ProviderEventProjection {
     let unfinished_output = active.take_unfinished_output();
@@ -965,6 +1003,7 @@ fn finish_invalid_provider_event(
         .finish_provider_turn(
             session_id,
             active.turn_id,
+            next_agent.clone(),
             ProviderTurnOutcome::Failed {
                 unfinished_output,
                 message,

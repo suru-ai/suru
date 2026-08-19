@@ -42,7 +42,7 @@ use crate::{
         SessionProjection, SessionStreamError, SessionSubscription,
     },
     protocol::{
-        Activity, AdmitPromptRequest, AgentIdentity, CreateSessionRequest, FileChange,
+        Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, FileChange,
         InitialPrompt, MessageId, MessageRole, PromptDelivery, PromptId, PromptStatus,
         ServerIdentity, SessionId, SessionSnapshot, SessionStatus, SessionSummary,
         SessionTimestamp, ShutdownReason, TranscriptItem, TurnId, TurnStatus, Workspace,
@@ -1966,7 +1966,7 @@ fn render_session(
     let agent = if snapshot.session.status == SessionStatus::Active && !detail.shows_secondary() {
         String::new()
     } else {
-        agent_context(snapshot.session.agent.as_ref(), detail)
+        agent_selection_context(snapshot.session.agent_selection.as_ref(), detail)
     };
     let footer = slots.prompt_footer(
         &PromptFooterSlotContext {
@@ -2226,14 +2226,16 @@ fn render_session_header(
     );
 }
 
-fn agent_context(agent: Option<&AgentIdentity>, detail: ResponsiveDetail) -> String {
-    match (agent, detail) {
+fn agent_selection_context(selection: Option<&AgentSelection>, detail: ResponsiveDetail) -> String {
+    match (selection, detail) {
         (None, _) => "Agent unavailable".to_owned(),
-        (Some(agent), ResponsiveDetail::CoreOnly) => format!("Agent {}", agent.agent),
-        (Some(agent), ResponsiveDetail::Secondary) => format!(
-            "Agent {} · Provider {} · Model {}",
-            agent.agent, agent.provider, agent.model
-        ),
+        (Some(selection), ResponsiveDetail::CoreOnly) => format!("Model {}", selection.model),
+        (Some(selection), ResponsiveDetail::Secondary) => {
+            format!(
+                "Model {} · Provider {}",
+                selection.model, selection.provider
+            )
+        }
     }
 }
 
@@ -3653,7 +3655,7 @@ mod tests {
                         workspace: Workspace {
                             path: PathBuf::from("/workspace"),
                         },
-                        agent: None,
+                        agent_selection: None,
                         status: SessionStatus::Idle,
                     },
                     revision: SessionRevision::INITIAL,

@@ -13,11 +13,11 @@ use anyhow::anyhow;
 use tokio::sync::broadcast;
 
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentIdentity, CreateSessionRequest,
-    Message, MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder,
-    PromptStatus, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
-    SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, Turn, TurnId, TurnStatus,
-    Workspace,
+    Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentIdentity, AgentSelection,
+    CreateSessionRequest, Message, MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery,
+    PromptId, PromptOrder, PromptStatus, Session, SessionChange, SessionId, SessionRevision,
+    SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, Turn, TurnId,
+    TurnStatus, Workspace,
 };
 use crate::session_projection::apply_update;
 
@@ -221,7 +221,7 @@ impl SessionStore {
                 workspace: Workspace {
                     path: workspace_path.clone(),
                 },
-                agent: None,
+                agent_selection: None,
                 status: SessionStatus::Idle,
             },
             revision: SessionRevision::INITIAL,
@@ -379,10 +379,10 @@ impl SessionStore {
             .map(|record| record.snapshot.clone())
     }
 
-    pub(crate) fn bind_agent(
+    pub(crate) fn update_agent_selection(
         &self,
         session_id: SessionId,
-        agent: AgentIdentity,
+        selection: AgentSelection,
     ) -> anyhow::Result<Option<SessionUpdate>> {
         let mut state = self
             .state
@@ -394,20 +394,20 @@ impl SessionStore {
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?
             .snapshot
             .session
-            .agent
+            .agent_selection
             .clone();
-        if current.as_ref() == Some(&agent) {
+        if current.as_ref() == Some(&selection) {
             return Ok(None);
-        }
-        if current.is_some() {
-            return Err(anyhow!("Session already has a different Agent binding"));
         }
         let updated_at = state.next_timestamp();
         let record = state
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        let update = record.publish(session_id, vec![SessionChange::AgentBound { agent }])?;
+        let update = record.publish(
+            session_id,
+            vec![SessionChange::AgentSelectionChanged { selection }],
+        )?;
         record.summary.updated_at = updated_at;
         Ok(Some(update))
     }
@@ -416,6 +416,7 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         prompt_id: PromptId,
+        agent: Option<AgentIdentity>,
         delivered_turn_status: DeliveredTurnStatus,
     ) -> anyhow::Result<Option<DeliveredTurn>> {
         let mut state = self
@@ -446,7 +447,7 @@ impl SessionStore {
             DeliveredTurnStatus::Active => (TurnStatus::Active, None),
             DeliveredTurnStatus::Failed { message } => (TurnStatus::Failed, Some(message)),
         };
-        let (delivered, mut changes) = prepare_prompt_delivery(prompt, turn_status);
+        let (delivered, mut changes) = prepare_prompt_delivery(prompt, agent, turn_status);
         if let Some(message) = failure_message {
             changes.push(SessionChange::ActivityAdded {
                 activity: Activity::Error {
@@ -593,6 +594,7 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         turn_id: TurnId,
+        next_agent: AgentIdentity,
         outcome: ProviderTurnOutcome,
     ) -> anyhow::Result<Option<DeliveredTurn>> {
         let mut state = self
@@ -671,7 +673,8 @@ impl SessionStore {
         }
 
         let next_turn = next_queued_prompt.map(|prompt| {
-            let (delivered, delivery_changes) = prepare_prompt_delivery(prompt, TurnStatus::Active);
+            let (delivered, delivery_changes) =
+                prepare_prompt_delivery(prompt, Some(next_agent), TurnStatus::Active);
             changes.extend(delivery_changes);
             delivered
         });
@@ -1018,11 +1021,13 @@ fn append_steer_delivery_changes(
 
 fn prepare_prompt_delivery(
     prompt: Prompt,
+    agent: Option<AgentIdentity>,
     turn_status: TurnStatus,
 ) -> (DeliveredTurn, Vec<SessionChange>) {
     let turn = Turn {
         id: TurnId::new(),
         prompt_id: prompt.id,
+        agent,
         status: turn_status,
     };
     let changes = vec![

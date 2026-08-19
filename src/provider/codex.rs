@@ -26,9 +26,9 @@ use super::{
     ProviderSessionConnection, ProviderSessionRequest, ProviderTurnInput, wait_for_shutdown,
 };
 use crate::protocol::{
-    AgentId, AgentIdentity, FileChange, ModelAvailability, ModelDescriptor, ModelId,
-    ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
-    ModelOptionRole, ProviderId, SessionId,
+    AgentId, AgentIdentity, AgentSelection, FileChange, ModelAvailability, ModelDescriptor,
+    ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
+    ModelOptionKind, ModelOptionRole, ProviderId, SessionId,
 };
 
 const CODEX_PATH_ENV: &str = "CHIDORI_CODEX_PATH";
@@ -635,8 +635,11 @@ async fn start_codex_thread(
     Ok(ProviderSessionConnection::new(
         AgentIdentity {
             agent: AgentId::new("codex"),
-            provider: ProviderId::new("codex"),
-            model: ModelId::new(started.model),
+            selection: AgentSelection {
+                provider: ProviderId::new("codex"),
+                model: ModelId::new(started.model),
+                options: Vec::new(),
+            },
         },
         session,
         events,

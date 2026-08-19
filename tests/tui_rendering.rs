@@ -4,12 +4,12 @@ use chidori::{
         SessionSubscription,
     },
     protocol::{
-        Activity, ActivityId, ActivityStatus, AgentId, AgentIdentity, CreateSessionRequest,
-        FileChange, Health, InitialPrompt, LifecycleState, Message, MessageId, MessageRole,
-        MessageStatus, ModelId, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
-        ProviderId, ServerIdentity, ServerShutdown, Session, SessionChange, SessionId,
-        SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-        SessionUpdate, ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        Activity, ActivityId, ActivityStatus, AgentSelection, CreateSessionRequest, FileChange,
+        Health, InitialPrompt, LifecycleState, Message, MessageId, MessageRole, MessageStatus,
+        ModelId, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
+        ServerIdentity, ServerShutdown, Session, SessionChange, SessionId, SessionRevision,
+        SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate,
+        ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{AgentOutput, ServerConfig},
     tui::{
@@ -1545,6 +1545,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                     turn: Turn {
                         id: turn_id,
                         prompt_id,
+                        agent: None,
                         status: TurnStatus::Active,
                     },
                 },
@@ -1893,10 +1894,10 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
         workspace.path(),
     );
     active_snapshot.session.status = SessionStatus::Active;
-    active_snapshot.session.agent = Some(AgentIdentity {
-        agent: AgentId::new("codex"),
+    active_snapshot.session.agent_selection = Some(AgentSelection {
         provider: ProviderId::new("openai"),
         model: ModelId::new("gpt-5"),
+        options: Vec::new(),
     });
     active_snapshot.turns[0].status = TurnStatus::Active;
     let activity_id = active_snapshot.activities[0].id();
@@ -1926,7 +1927,6 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
         "Keep the draft visible",
         "active",
         "Esc interrupt",
-        "Agent codex",
         "Provider openai",
         "Model gpt-5",
         "Enter submit",
@@ -1969,7 +1969,7 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
     let mut idle = Application::new(workspace.path());
     let mut idle_snapshot = active_snapshot;
     idle_snapshot.session.status = SessionStatus::Idle;
-    idle_snapshot.session.agent = None;
+    idle_snapshot.session.agent_selection = None;
     idle.handle_event(ApplicationEvent::SessionAttached(idle_snapshot))
         .expect("attach unavailable-Agent Session");
     let idle_frame = rendered_application_rows_at(&idle, 80, 12).join("\n");
@@ -3141,6 +3141,7 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                         turn: Turn {
                             id: delivered_turn_id,
                             prompt_id: request.prompt.id,
+                            agent: None,
                             status: TurnStatus::Active,
                         },
                     },
@@ -3548,6 +3549,7 @@ fn enter_active_session(
     snapshot.turns.push(Turn {
         id: turn_id,
         prompt_id,
+        agent: None,
         status: TurnStatus::Active,
     });
     snapshot.messages.push(Message {
@@ -3580,7 +3582,7 @@ fn failed_session_snapshot(
             workspace: Workspace {
                 path: workspace.to_owned(),
             },
-            agent: None,
+            agent_selection: None,
             status: SessionStatus::Idle,
         },
         revision: SessionRevision::INITIAL,
@@ -3605,7 +3607,7 @@ fn session_summary(
             workspace: Workspace {
                 path: workspace.to_owned(),
             },
-            agent: None,
+            agent_selection: None,
             status,
         },
         title: title.to_owned(),
@@ -3654,7 +3656,7 @@ fn navigable_session_snapshot(
             workspace: Workspace {
                 path: workspace.to_owned(),
             },
-            agent: None,
+            agent_selection: None,
             status: SessionStatus::Idle,
         },
         revision: SessionRevision::INITIAL,
@@ -3679,6 +3681,7 @@ fn navigable_session_snapshot(
         snapshot.turns.push(Turn {
             id: turn_id,
             prompt_id,
+            agent: None,
             status: TurnStatus::Completed,
         });
         snapshot.messages.extend([
@@ -3746,6 +3749,7 @@ impl FailedTurnFixture {
             turn: Turn {
                 id: turn_id,
                 prompt_id,
+                agent: None,
                 status: TurnStatus::Failed,
             },
             message: Message {

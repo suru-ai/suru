@@ -2,19 +2,71 @@ use std::path::PathBuf;
 
 use chidori::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-    CreateSessionRequest, FileChange, InitialPrompt, Message, MessageId, MessageRole,
-    MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
+    AgentSelection, CreateSessionRequest, FileChange, InitialPrompt, Message, MessageId,
+    MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
     ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
-    ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
-    Session, SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision,
-    SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate,
-    TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+    ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder,
+    PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
+    SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
+    SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
 };
 use serde_json::json;
 use uuid::Uuid;
 
 fn fixture_id(value: &str) -> Uuid {
     Uuid::parse_str(value).expect("parse fixture identity")
+}
+
+#[test]
+fn agent_selection_round_trips_complete_typed_model_options() {
+    let selection = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-5.6-codex"),
+        options: vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("high"),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("fast_mode"),
+                value: ModelOptionValue::Toggle { enabled: true },
+            },
+        ],
+    };
+    let expected = json!({
+        "provider": "codex",
+        "model": "gpt-5.6-codex",
+        "options": [
+            {
+                "id": "reasoning_effort",
+                "value": { "type": "select", "choice": "high" }
+            },
+            {
+                "id": "fast_mode",
+                "value": { "type": "toggle", "enabled": true }
+            }
+        ]
+    });
+
+    assert_eq!(
+        serde_json::to_value(&selection).expect("encode Agent Selection"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<AgentSelection>(expected).expect("decode Agent Selection"),
+        selection
+    );
+    assert!(
+        serde_json::from_value::<AgentSelection>(json!({
+            "provider": "codex",
+            "model": "gpt-5.6-codex",
+            "options": [{ "id": "reasoning_effort", "value": 3 }]
+        }))
+        .is_err(),
+        "Model Option values reject arbitrary JSON"
+    );
 }
 
 #[test]
@@ -25,10 +77,10 @@ fn session_summary_round_trips_with_discovery_metadata() {
             workspace: Workspace {
                 path: PathBuf::from("/work/chidori"),
             },
-            agent: Some(AgentIdentity {
-                agent: AgentId::new("coding"),
+            agent_selection: Some(AgentSelection {
                 provider: ProviderId::new("codex"),
                 model: ModelId::new("gpt-5"),
+                options: Vec::new(),
             }),
             status: SessionStatus::Active,
         },
@@ -40,10 +92,10 @@ fn session_summary_round_trips_with_discovery_metadata() {
         "id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
         "title": "Explain this workspace",
         "workspace": { "path": "/work/chidori" },
-        "agent": {
-            "agent": "coding",
+        "agent_selection": {
             "provider": "codex",
-            "model": "gpt-5"
+            "model": "gpt-5",
+            "options": []
         },
         "status": "active",
         "created_at": 1_755_497_600_000_u64,
@@ -68,10 +120,15 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             workspace: Workspace {
                 path: PathBuf::from("/work/chidori"),
             },
-            agent: Some(AgentIdentity {
-                agent: AgentId::new("coding"),
+            agent_selection: Some(AgentSelection {
                 provider: ProviderId::new("codex"),
                 model: ModelId::new("gpt-5"),
+                options: vec![ModelOptionSelection {
+                    id: ModelOptionId::new("reasoning_effort"),
+                    value: ModelOptionValue::Select {
+                        choice: ModelOptionChoiceId::new("high"),
+                    },
+                }],
             }),
             status: SessionStatus::Idle,
         },
@@ -86,6 +143,19 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         turns: vec![Turn {
             id: TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d")),
             prompt_id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
+            agent: Some(AgentIdentity {
+                agent: AgentId::new("coding"),
+                selection: AgentSelection {
+                    provider: ProviderId::new("codex"),
+                    model: ModelId::new("gpt-5"),
+                    options: vec![ModelOptionSelection {
+                        id: ModelOptionId::new("reasoning_effort"),
+                        value: ModelOptionValue::Select {
+                            choice: ModelOptionChoiceId::new("high"),
+                        },
+                    }],
+                },
+            }),
             status: TurnStatus::Failed,
         }],
         messages: vec![Message {
@@ -117,10 +187,13 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         "session": {
             "id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
             "workspace": { "path": "/work/chidori" },
-            "agent": {
-                "agent": "coding",
+            "agent_selection": {
                 "provider": "codex",
-                "model": "gpt-5"
+                "model": "gpt-5",
+                "options": [{
+                    "id": "reasoning_effort",
+                    "value": { "type": "select", "choice": "high" }
+                }]
             },
             "status": "idle"
         },
@@ -135,6 +208,17 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         "turns": [{
             "id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
             "prompt_id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
+            "agent": {
+                "agent": "coding",
+                "selection": {
+                    "provider": "codex",
+                    "model": "gpt-5",
+                    "options": [{
+                        "id": "reasoning_effort",
+                        "value": { "type": "select", "choice": "high" }
+                    }]
+                }
+            },
             "status": "failed"
         }],
         "messages": [{
@@ -465,16 +549,16 @@ fn file_change_updates_reject_opaque_public_protocol_fields() {
 }
 
 #[test]
-fn agent_binding_is_a_typed_session_change() {
+fn agent_selection_change_is_typed_and_replaceable() {
     let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
     let update = SessionUpdate {
         session_id,
         revision: SessionRevision(2),
-        changes: vec![SessionChange::AgentBound {
-            agent: AgentIdentity {
-                agent: AgentId::new("codex"),
+        changes: vec![SessionChange::AgentSelectionChanged {
+            selection: AgentSelection {
                 provider: ProviderId::new("codex"),
                 model: ModelId::new("gpt-5.6-codex"),
+                options: Vec::new(),
             },
         }],
     };
@@ -482,22 +566,38 @@ fn agent_binding_is_a_typed_session_change() {
         "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
         "revision": 2,
         "changes": [{
-            "type": "agent_bound",
-            "agent": {
-                "agent": "codex",
+            "type": "agent_selection_changed",
+            "selection": {
                 "provider": "codex",
-                "model": "gpt-5.6-codex"
+                "model": "gpt-5.6-codex",
+                "options": []
             }
         }]
     });
 
     assert_eq!(
-        serde_json::to_value(&update).expect("encode Agent-binding update"),
+        serde_json::to_value(&update).expect("encode Agent Selection update"),
         expected
     );
     assert_eq!(
-        serde_json::from_value::<SessionUpdate>(expected).expect("decode Agent-binding update"),
+        serde_json::from_value::<SessionUpdate>(expected).expect("decode Agent Selection update"),
         update
+    );
+    assert!(
+        serde_json::from_value::<SessionUpdate>(json!({
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 2,
+            "changes": [{
+                "type": "agent_bound",
+                "agent": {
+                    "agent": "codex",
+                    "provider": "codex",
+                    "model": "gpt-5.6-codex"
+                }
+            }]
+        }))
+        .is_err(),
+        "the removed one-time Agent binding is not a compatibility path"
     );
 }
 

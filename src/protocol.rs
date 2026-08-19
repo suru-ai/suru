@@ -201,10 +201,24 @@ pub struct Workspace {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentIdentity {
-    pub agent: AgentId,
+pub struct ModelOptionSelection {
+    pub id: ModelOptionId,
+    pub value: ModelOptionValue,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSelection {
     pub provider: ProviderId,
     pub model: ModelId,
+    pub options: Vec<ModelOptionSelection>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentIdentity {
+    pub agent: AgentId,
+    pub selection: AgentSelection,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -330,7 +344,7 @@ impl Activity {
 pub struct Session {
     pub id: SessionId,
     pub workspace: Workspace,
-    pub agent: Option<AgentIdentity>,
+    pub agent_selection: Option<AgentSelection>,
     pub status: SessionStatus,
 }
 
@@ -359,6 +373,7 @@ pub struct Prompt {
 pub struct Turn {
     pub id: TurnId,
     pub prompt_id: PromptId,
+    pub agent: Option<AgentIdentity>,
     pub status: TurnStatus,
 }
 
@@ -402,8 +417,8 @@ pub struct SessionUpdate {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionChange {
-    AgentBound {
-        agent: AgentIdentity,
+    AgentSelectionChanged {
+        selection: AgentSelection,
     },
     PromptAdded {
         prompt: Prompt,
