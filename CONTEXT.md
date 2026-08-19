@@ -51,3 +51,15 @@ _Avoid_: Message, notification
 **Tool**:
 A provider-operated capability that performs work for an agent. User-visible Tool execution is represented as Activity.
 _Avoid_: Function, action
+
+**Transcript**:
+The ordered, user-visible history of a Session: its Messages and Activities in presentation order.
+_Avoid_: History, log, conversation
+
+**Resume State**:
+Provider-owned data, opaque to Chidori, that lets a Session continue with its Provider after a restart. Without it a restored Session is viewable but cannot continue where it left off.
+_Avoid_: Thread mapping, provider cache
+
+**Channel**:
+The build variant (release or a development channel) whose sessions and runtime state are kept separate so development runs never touch real data.
+_Avoid_: Environment, profile
