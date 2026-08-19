@@ -8,6 +8,9 @@ To start we will only support the Codex and Copilot providers, but additional pr
 Try to build all functionality supporting both providers to avoid building interfaces that are not generic enough to
 support others down the line.
 
+This application is very early in development. Freely make breaking changes if they result in better code.
+Do not account for backwards compatibility with previous versions.
+
 ## Plugins
 
 Use OpenCode's TUI plugin architecture as the reference when designing core UI extension seams. For now, keep named
