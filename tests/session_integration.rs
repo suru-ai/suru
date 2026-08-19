@@ -2643,6 +2643,143 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
 }
 
 #[tokio::test]
+async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), "managed-session-switch-test")
+            .expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "managed-session-switch-test")
+            .expect("configure managed client"),
+    )
+    .await
+    .expect("connect managed client");
+    receive_managed_client_initial_state(&mut client).await;
+
+    let first = client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "First Session".to_owned(),
+            },
+        })
+        .await
+        .expect("create first Session");
+    let first = read_session_at_least_revision(
+        &reqwest::Client::new(),
+        server.descriptor(),
+        first.session.id,
+        SessionRevision(2),
+    )
+    .await;
+    let second = client
+        .create_session(CreateSessionRequest {
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Second Session".to_owned(),
+            },
+        })
+        .await
+        .expect("create second Session");
+    let second = read_session_at_least_revision(
+        &reqwest::Client::new(),
+        server.descriptor(),
+        second.session.id,
+        SessionRevision(2),
+    )
+    .await;
+
+    let mut first_attachment = client
+        .attach_session(first.session.id)
+        .await
+        .expect("attach first Session");
+    assert!(matches!(
+        first_attachment.next().await,
+        Some(Ok(SessionEvent::Snapshot(_)))
+    ));
+    let prompt_id = PromptId::new();
+    let turn_id = TurnId::new();
+    server
+        .session_event_sink()
+        .publish(
+            first.session.id,
+            vec![
+                SessionChange::PromptAdded {
+                    prompt: Prompt {
+                        id: prompt_id,
+                        text: "Keep working while detached".to_owned(),
+                        delivery: PromptDelivery::Steer,
+                        admission_order: PromptOrder(2),
+                        status: PromptStatus::Delivered,
+                    },
+                },
+                SessionChange::TurnAdded {
+                    turn: Turn {
+                        id: turn_id,
+                        prompt_id,
+                        status: TurnStatus::Active,
+                    },
+                },
+                SessionChange::MessageAdded {
+                    message: Message {
+                        id: MessageId::new(),
+                        turn_id,
+                        role: MessageRole::User,
+                        status: MessageStatus::Completed,
+                        content: "Keep working while detached".to_owned(),
+                    },
+                },
+                SessionChange::SessionStatusChanged {
+                    status: SessionStatus::Active,
+                },
+            ],
+        )
+        .expect("start active Turn");
+    assert!(matches!(
+        first_attachment.next().await,
+        Some(Ok(SessionEvent::Updated(_)))
+    ));
+
+    drop(first_attachment);
+    let mut second_attachment = client
+        .attach_session(second.session.id)
+        .await
+        .expect("switch attachment to second Session");
+    assert!(matches!(
+        second_attachment.next().await,
+        Some(Ok(SessionEvent::Snapshot(_)))
+    ));
+    let still_active = client
+        .read_session(first.session.id)
+        .await
+        .expect("read detached first Session");
+    assert_eq!(still_active.session.status, SessionStatus::Active);
+    assert_eq!(
+        still_active
+            .turns
+            .iter()
+            .find(|turn| turn.id == turn_id)
+            .expect("active Turn remains in detached Session")
+            .status,
+        TurnStatus::Active
+    );
+
+    drop(second_attachment);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn two_clients_converge_on_one_session_without_observing_another_session() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");

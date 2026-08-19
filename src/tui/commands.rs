@@ -6,12 +6,14 @@ const AUTOCOMPLETE_LIMIT: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SemanticCommandId {
+    SessionList,
     SessionNew,
 }
 
 impl SemanticCommandId {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::SessionList => "session.list",
             Self::SessionNew => "session.new",
         }
     }
@@ -41,22 +43,40 @@ pub(super) struct SemanticKeybinding {
     pub(super) label: &'static str,
 }
 
-const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[SemanticCommandDescriptor {
-    id: SemanticCommandId::SessionNew,
-    title: "New Session",
-    description: "Open a fresh landing composer without ending the current Session",
-    slash: Some(SlashCommand {
-        name: "new",
-        aliases: &["clear"],
-    }),
-    keybinding: Some(SemanticKeybinding {
-        prefix_code: KeyCode::Char('x'),
-        prefix_modifiers: KeyModifiers::CONTROL,
-        code: KeyCode::Char('n'),
-        modifiers: KeyModifiers::NONE,
-        label: "Ctrl+X N",
-    }),
-}];
+const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SessionList,
+        title: "Switch Session",
+        description: "Search and attach to a live Session",
+        slash: Some(SlashCommand {
+            name: "sessions",
+            aliases: &["resume", "continue"],
+        }),
+        keybinding: Some(SemanticKeybinding {
+            prefix_code: KeyCode::Char('x'),
+            prefix_modifiers: KeyModifiers::CONTROL,
+            code: KeyCode::Char('l'),
+            modifiers: KeyModifiers::NONE,
+            label: "Ctrl+X L",
+        }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SessionNew,
+        title: "New Session",
+        description: "Open a fresh landing composer without ending the current Session",
+        slash: Some(SlashCommand {
+            name: "new",
+            aliases: &["clear"],
+        }),
+        keybinding: Some(SemanticKeybinding {
+            prefix_code: KeyCode::Char('x'),
+            prefix_modifiers: KeyModifiers::CONTROL,
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::NONE,
+            label: "Ctrl+X N",
+        }),
+    },
+];
 
 pub(super) fn descriptor(id: SemanticCommandId) -> &'static SemanticCommandDescriptor {
     SEMANTIC_COMMANDS

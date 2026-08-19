@@ -2,6 +2,7 @@
 
 mod commands;
 mod markdown;
+mod session_picker;
 mod slots;
 
 use std::{
@@ -11,7 +12,7 @@ use std::{
     io::{Stdout, stdout},
     path::{Path, PathBuf},
     pin::Pin,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Result, anyhow};
@@ -43,8 +44,8 @@ use crate::{
     protocol::{
         Activity, AdmitPromptRequest, AgentIdentity, CreateSessionRequest, FileChange,
         InitialPrompt, MessageId, MessageRole, PromptDelivery, PromptId, PromptStatus,
-        ServerIdentity, SessionId, SessionSnapshot, SessionStatus, ShutdownReason, TranscriptItem,
-        TurnId, TurnStatus, Workspace,
+        ServerIdentity, SessionId, SessionSnapshot, SessionStatus, SessionSummary,
+        SessionTimestamp, ShutdownReason, TranscriptItem, TurnId, TurnStatus, Workspace,
     },
     theme::Theme,
 };
@@ -54,6 +55,7 @@ mod composer;
 pub use commands::SemanticCommandId;
 use commands::{CommandAutocomplete, command_for_leader_key, descriptor};
 use composer::{ComposerKey, ComposerMemory};
+use session_picker::{SessionPicker, SessionPickerRow};
 use slots::{
     HomeFooterSlotContext, PromptContextSlotContext, PromptFooterSlotContext,
     PromptStatusSlotContext, RenderSlots, RenderedSlot, SessionComposerTopSlotContext, SlotText,
@@ -66,6 +68,44 @@ const MINIMUM_TERMINAL_HEIGHT: u16 = 5;
 const LANDING_BRAND_MINIMUM_HEIGHT: u16 = 9;
 const SESSION_HEADER_MINIMUM_HEIGHT: u16 = 8;
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionListScope {
+    CurrentWorkspace(PathBuf),
+    AllWorkspaces,
+}
+
+impl SessionListScope {
+    fn workspace_filter(&self) -> Option<&Path> {
+        match self {
+            Self::CurrentWorkspace(workspace) => Some(workspace),
+            Self::AllWorkspaces => None,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::CurrentWorkspace(_) => "Current Workspace",
+            Self::AllWorkspaces => "All Workspaces",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionListRequest {
+    id: u64,
+    scope: SessionListScope,
+}
+
+impl SessionListRequest {
+    fn new(id: u64, scope: SessionListScope) -> Self {
+        Self { id, scope }
+    }
+
+    pub fn scope(&self) -> &SessionListScope {
+        &self.scope
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResponsiveDetail {
@@ -164,6 +204,7 @@ pub struct TuiState {
     pending_steers: Vec<PendingSteer>,
     command_mode: CommandMode,
     command_autocomplete: CommandAutocomplete,
+    session_picker: SessionPicker,
 }
 
 #[derive(Clone, Debug)]
@@ -213,12 +254,13 @@ impl Default for TuiState {
 
 impl TuiState {
     fn new(workspace: impl AsRef<Path>) -> Self {
+        let workspace = workspace.as_ref().to_owned();
         Self {
             identity: None,
             recovery: None,
             manually_stopped: false,
             fatal_error: None,
-            workspace: workspace.as_ref().to_owned(),
+            workspace: workspace.clone(),
             composers: ComposerMemory::default(),
             session_interactions: HashMap::new(),
             composer_focused: true,
@@ -231,6 +273,7 @@ impl TuiState {
             pending_steers: Vec::new(),
             command_mode: CommandMode::Composer,
             command_autocomplete: CommandAutocomplete::default(),
+            session_picker: SessionPicker::new(workspace),
         }
     }
 
@@ -684,8 +727,20 @@ pub enum ApplicationEvent {
     Session(SessionEvent),
     SessionSubscriptionEnded,
     PromptAdmissionSucceeded(PromptId),
-    PromptAdmissionFailed { prompt_id: PromptId, error: String },
+    PromptAdmissionFailed {
+        prompt_id: PromptId,
+        error: String,
+    },
     SessionAttached(SessionSnapshot),
+    SessionsListed {
+        request: SessionListRequest,
+        sessions: Vec<SessionSummary>,
+    },
+    SessionListingFailed {
+        request: SessionListRequest,
+        error: String,
+    },
+    SessionAttachmentFailed(String),
     SessionCreated(SessionSnapshot),
     SessionOperationFailed(String),
 }
@@ -718,6 +773,15 @@ pub enum CommandId {
     SelectNextAutocomplete,
     DismissAutocomplete,
     SelectAutocomplete,
+    InsertSessionSearch(String),
+    DeleteSessionSearchBackward,
+    SelectPreviousSession,
+    SelectNextSession,
+    PagePreviousSessions,
+    PageNextSessions,
+    ToggleSessionScope,
+    SelectSession,
+    CloseSessionPicker,
     InvokeSemantic(SemanticCommandId),
     InsertText(String),
     PasteText(String),
@@ -747,6 +811,8 @@ pub enum ApplicationTransition {
         turn_id: TurnId,
     },
     SubscribeSession(SessionId),
+    AttachSession(SessionId),
+    ListSessions(SessionListRequest),
 }
 
 impl Application {
@@ -850,6 +916,49 @@ impl Application {
                 self.state.composers.clear(key);
                 self.state.sync_command_autocomplete();
                 self.invoke_semantic(command)
+            }
+            ApplicationEvent::Command(CommandId::InsertSessionSearch(text)) => {
+                self.edit_session_picker(|picker| picker.insert(&text));
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::DeleteSessionSearchBackward) => {
+                self.edit_session_picker(SessionPicker::delete_backward);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::SelectPreviousSession) => {
+                self.edit_session_picker(SessionPicker::select_previous);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::SelectNextSession) => {
+                self.edit_session_picker(SessionPicker::select_next);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::PagePreviousSessions) => {
+                self.edit_session_picker(SessionPicker::page_previous);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::PageNextSessions) => {
+                self.edit_session_picker(SessionPicker::page_next);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::ToggleSessionScope) => {
+                if self.state.session_picker.is_attaching() {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                let request = self.state.session_picker.toggle_scope();
+                Ok(ApplicationTransition::ListSessions(request))
+            }
+            ApplicationEvent::Command(CommandId::SelectSession) => {
+                Ok(self.state.session_picker.begin_attachment().map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::AttachSession,
+                ))
+            }
+            ApplicationEvent::Command(CommandId::CloseSessionPicker) => {
+                if !self.state.session_picker.is_attaching() {
+                    self.state.session_picker.close();
+                }
+                Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::InvokeSemantic(command)) => {
                 self.invoke_semantic(command)
@@ -1019,8 +1128,25 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::SessionAttached(snapshot) => {
+                let closes_picker = self.state.session_picker.attaching_to(snapshot.session.id);
                 self.state.apply_attached_session(snapshot)?;
+                if closes_picker {
+                    self.state.session_picker.close();
+                }
                 Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SessionsListed { request, sessions } => {
+                let current = self.session_id();
+                self.state.session_picker.load(&request, sessions, current);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SessionListingFailed { request, error } => {
+                self.state.session_picker.fail_listing(&request, error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SessionAttachmentFailed(error) => {
+                let request = self.state.session_picker.fail_attachment(error);
+                Ok(ApplicationTransition::ListSessions(request))
             }
             ApplicationEvent::SessionCreated(snapshot) => {
                 self.state.apply_created_session(snapshot)?;
@@ -1035,6 +1161,11 @@ impl Application {
 
     fn invoke_semantic(&mut self, command: SemanticCommandId) -> Result<ApplicationTransition> {
         match command {
+            SemanticCommandId::SessionList => {
+                let request = self.state.session_picker.open();
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::ListSessions(request))
+            }
             SemanticCommandId::SessionNew => {
                 let source = self.state.composer_key();
                 self.state.composers.clear(source);
@@ -1053,11 +1184,23 @@ impl Application {
         }
     }
 
+    fn edit_session_picker(&mut self, edit: impl FnOnce(&mut SessionPicker)) {
+        if !self.state.session_picker.is_attaching() {
+            edit(&mut self.state.session_picker);
+        }
+    }
+
     pub fn render(&self, frame: &mut Frame<'_>) {
         render_with_slots(frame, &self.state, &self.slots);
     }
 
     pub fn handle_terminal_event(&mut self, event: InputEvent) -> Result<ApplicationTransition> {
+        if self.state.session_picker.is_open() {
+            return command_for_session_picker_event(event)
+                .map_or(Ok(ApplicationTransition::Continue), |command| {
+                    self.handle_event(ApplicationEvent::Command(command))
+                });
+        }
         if self.state.command_autocomplete.is_visible()
             && let Some(command) = command_for_autocomplete_event(event.clone())
         {
@@ -1125,6 +1268,36 @@ fn command_for_autocomplete_event(event: InputEvent) -> Option<CommandId> {
         }
         (KeyCode::Enter | KeyCode::Tab, KeyModifiers::NONE) => Some(CommandId::SelectAutocomplete),
         (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::DismissAutocomplete),
+        _ => None,
+    }
+}
+
+fn command_for_session_picker_event(event: InputEvent) -> Option<CommandId> {
+    match event {
+        InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,
+        InputEvent::Key(key) => match (key.code, key.modifiers) {
+            (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                Some(CommandId::SelectPreviousSession)
+            }
+            (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                Some(CommandId::SelectNextSession)
+            }
+            (KeyCode::PageUp, KeyModifiers::NONE) => Some(CommandId::PagePreviousSessions),
+            (KeyCode::PageDown, KeyModifiers::NONE) => Some(CommandId::PageNextSessions),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => Some(CommandId::ToggleSessionScope),
+            (KeyCode::Enter, KeyModifiers::NONE) => Some(CommandId::SelectSession),
+            (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::CloseSessionPicker),
+            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                Some(CommandId::DeleteSessionSearchBackward)
+            }
+            (KeyCode::Char(character), modifiers)
+                if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                Some(CommandId::InsertSessionSearch(character.to_string()))
+            }
+            _ => None,
+        },
+        InputEvent::Paste(text) => Some(CommandId::InsertSessionSearch(text)),
         _ => None,
     }
 }
@@ -1365,10 +1538,209 @@ fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlot
     if state.command_autocomplete.is_visible() && !state.reconnect_overlay_visible {
         render_command_autocomplete(frame, state, composer.area, &theme);
     }
+    if state.session_picker.is_open() && !state.reconnect_overlay_visible {
+        render_session_picker(frame, state, &theme);
+    }
     if state.reconnect_overlay_visible {
         render_reconnect_overlay(frame, &theme);
-    } else if state.composer_focused && matches!(state.command_mode, CommandMode::Composer) {
+    } else if !state.session_picker.is_open()
+        && state.composer_focused
+        && matches!(state.command_mode, CommandMode::Composer)
+    {
         frame.set_cursor_position(composer.cursor);
+    }
+}
+
+fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+    let area = centered_rect(
+        frame.area(),
+        frame.area().width.saturating_sub(4).min(72),
+        frame.area().height.saturating_sub(2).min(12),
+    );
+    let content_width = area.width.saturating_sub(2);
+    let content_height = area.height.saturating_sub(2);
+    let mut lines = Vec::with_capacity(usize::from(content_height));
+    let shows_search_and_footer = content_height >= 3;
+    let error_in_title = content_height <= 3
+        && !state.session_picker.is_loading()
+        && state.session_picker.error().is_some();
+    if shows_search_and_footer {
+        lines.push(Line::styled(
+            truncate_to_width(
+                &format!("Search: {}", state.session_picker.query()),
+                usize::from(content_width),
+            ),
+            theme.text.subdued,
+        ));
+    }
+    if let Some(error) = state.session_picker.error()
+        && !error_in_title
+        && lines.len() < usize::from(content_height)
+    {
+        lines.push(Line::styled(
+            truncate_to_width(&format!("Error: {error}"), usize::from(content_width)),
+            theme.feedback.error,
+        ));
+    }
+    if state.session_picker.is_loading() && lines.len() < usize::from(content_height) {
+        lines.push(Line::styled("Loading Sessions…", theme.text.subdued));
+    } else {
+        let current = state.session.as_ref().map(SessionProjection::session_id);
+        let footer_rows = usize::from(shows_search_and_footer);
+        let row_capacity = usize::from(content_height).saturating_sub(lines.len() + footer_rows);
+        let now = current_time_millis();
+        let rows = state
+            .session_picker
+            .visible_rows(row_capacity, current)
+            .map(|row| {
+                let content = session_picker_row_text(row, usize::from(content_width), now);
+                Line::styled(
+                    content,
+                    if row.selected {
+                        theme.selection.focused
+                    } else {
+                        theme.text.primary
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() && lines.len() < usize::from(content_height).saturating_sub(footer_rows)
+        {
+            lines.push(Line::styled("No Sessions found", theme.text.subdued));
+        } else {
+            lines.extend(rows);
+        }
+    }
+    if shows_search_and_footer && lines.len() < usize::from(content_height) {
+        let scope = state.session_picker.scope().label();
+        let status = if state.session_picker.is_attaching() {
+            "Attaching…"
+        } else {
+            "Ctrl+A scope · Enter attach · Esc close"
+        };
+        lines.push(Line::styled(
+            truncate_to_width(&format!("{scope} · {status}"), usize::from(content_width)),
+            theme.text.subdued,
+        ));
+    }
+    let title = if error_in_title {
+        format!(
+            " Sessions · Error: {} ",
+            state
+                .session_picker
+                .error()
+                .expect("error title requires a picker error")
+        )
+    } else {
+        " Sessions ".to_owned()
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(theme.border.default)
+                .style(theme.surface.overlay),
+        ),
+        area,
+    );
+}
+
+fn session_picker_row_text(row: SessionPickerRow<'_>, width: usize, now: u64) -> String {
+    let marker = if row.selected { "› " } else { "  " };
+    let compact = width < usize::from(NARROW_TERMINAL_WIDTH);
+    let status = match (compact, row.current, row.active) {
+        (_, false, false) => None,
+        (true, true, true) => Some("CA".to_owned()),
+        (true, true, false) => Some("C".to_owned()),
+        (true, false, true) => Some("A".to_owned()),
+        (false, true, true) => Some("[current, active]".to_owned()),
+        (false, true, false) => Some("[current]".to_owned()),
+        (false, false, true) => Some("[active]".to_owned()),
+    };
+    let age = if compact {
+        relative_update_time_compact(row.updated_at, now)
+    } else {
+        relative_update_time(row.updated_at, now)
+    };
+    let separator = if compact { " " } else { " · " };
+    let mut metadata = status.into_iter().chain([age]).collect::<Vec<_>>();
+    let marker_width = marker.width();
+    let available = width.saturating_sub(marker_width);
+    let fixed_metadata_width = metadata.join(separator).width();
+    if let Some(workspace) = row.workspace {
+        let minimum_title_width = usize::from(available > 0);
+        let path_budget = available
+            .saturating_sub(minimum_title_width)
+            .saturating_sub(separator.width())
+            .saturating_sub(fixed_metadata_width)
+            .saturating_sub(separator.width());
+        if path_budget > 0 {
+            metadata.push(truncate_from_left_to_width(
+                workspace.to_string_lossy().as_ref(),
+                path_budget,
+            ));
+        }
+    }
+    let metadata = metadata.join(separator);
+    let title_width = available
+        .saturating_sub(metadata.width())
+        .saturating_sub(separator.width());
+    let title = truncate_to_width(row.title, title_width);
+    truncate_to_width(&format!("{marker}{title}{separator}{metadata}"), width)
+}
+
+fn truncate_from_left_to_width(value: &str, width: usize) -> String {
+    if value.width() <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    let suffix_width = width - 1;
+    let mut suffix = String::new();
+    let mut used = 0_usize;
+    for character in value.chars().rev() {
+        let character_width = character.width().unwrap_or(1);
+        if used.saturating_add(character_width) > suffix_width {
+            break;
+        }
+        suffix.insert(0, character);
+        used += character_width;
+    }
+    format!("…{suffix}")
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn relative_update_time(updated_at: SessionTimestamp, now: u64) -> String {
+    let elapsed_seconds = now.saturating_sub(updated_at.0) / 1_000;
+    match elapsed_seconds {
+        0..=59 => "now".to_owned(),
+        60..=3_599 => format!("{}m ago", elapsed_seconds / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed_seconds / 3_600),
+        _ => format!("{}d ago", elapsed_seconds / 86_400),
+    }
+}
+
+fn relative_update_time_compact(updated_at: SessionTimestamp, now: u64) -> String {
+    let elapsed_seconds = now.saturating_sub(updated_at.0) / 1_000;
+    match elapsed_seconds {
+        0..=59 => "now".to_owned(),
+        60..=3_599 => format!("{}m", elapsed_seconds / 60),
+        3_600..=86_399 => format!("{}h", elapsed_seconds / 3_600),
+        _ => format!("{}d", elapsed_seconds / 86_400),
     }
 }
 
@@ -2472,6 +2844,9 @@ async fn run_loop(
     let mut reconnect_grace: Option<Pin<Box<tokio::time::Sleep>>> = None;
     let (submission_tx, mut submission_rx) = tokio::sync::mpsc::unbounded_channel();
     let (subscription_tx, mut subscription_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (picker_tx, mut picker_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut session_list_task: Option<(SessionListRequest, tokio::task::JoinHandle<()>)> = None;
+    let mut session_attachment_task: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         terminal.draw(|frame| application.render(frame))?;
@@ -2505,7 +2880,9 @@ async fn run_loop(
                             | ApplicationTransition::PromotePrompt { .. }
                             | ApplicationTransition::CancelPrompt { .. }
                             | ApplicationTransition::InterruptTurn { .. }
-                            | ApplicationTransition::SubscribeSession(_) => {
+                            | ApplicationTransition::SubscribeSession(_)
+                            | ApplicationTransition::AttachSession(_)
+                            | ApplicationTransition::ListSessions(_) => {
                                 unreachable!("managed events do not issue Session commands");
                             }
                         }
@@ -2591,6 +2968,52 @@ async fn run_loop(
                     }
                 }
             }
+            picker = picker_rx.recv() => {
+                let Some(picker) = picker else {
+                    return Err(anyhow!("Session picker task channel stopped unexpectedly"));
+                };
+                match picker {
+                    SessionPickerResult::Listed { request, sessions } => {
+                        finish_session_listing(&mut session_list_task, &request);
+                        application.handle_event(ApplicationEvent::SessionsListed {
+                            request,
+                            sessions,
+                        })?;
+                    }
+                    SessionPickerResult::ListingFailed { request, error } => {
+                        finish_session_listing(&mut session_list_task, &request);
+                        application.handle_event(ApplicationEvent::SessionListingFailed {
+                            request,
+                            error,
+                        })?;
+                    }
+                    SessionPickerResult::Attached {
+                        snapshot,
+                        subscription,
+                    } => {
+                        session_attachment_task = None;
+                        application.handle_event(ApplicationEvent::SessionAttached(*snapshot))?;
+                        session_subscription = Some(subscription);
+                        if let Some((_, task)) = session_subscription_task.take() {
+                            task.abort();
+                        }
+                    }
+                    SessionPickerResult::AttachmentFailed(error) => {
+                        session_attachment_task = None;
+                        let transition = application.handle_event(
+                            ApplicationEvent::SessionAttachmentFailed(error),
+                        )?;
+                        if let ApplicationTransition::ListSessions(request) = transition {
+                            replace_session_listing(
+                                &mut session_list_task,
+                                client.session_commands(),
+                                request,
+                                picker_tx.clone(),
+                            );
+                        }
+                    }
+                }
+            }
             input_event = input.next() => {
                 match input_event {
                     Some(Ok(event)) => {
@@ -2663,6 +3086,23 @@ async fn run_loop(
                                 ApplicationTransition::SubscribeSession(_) => {
                                     unreachable!("terminal input cannot end a Session subscription")
                                 }
+                                ApplicationTransition::AttachSession(session_id) => {
+                                    if session_attachment_task.is_none() {
+                                        session_attachment_task = Some(spawn_session_attachment(
+                                            client.session_commands(),
+                                            session_id,
+                                            picker_tx.clone(),
+                                        ));
+                                    }
+                                }
+                                ApplicationTransition::ListSessions(request) => {
+                                    replace_session_listing(
+                                        &mut session_list_task,
+                                        client.session_commands(),
+                                        request,
+                                        picker_tx.clone(),
+                                    );
+                                }
                             }
                     }
                     Some(Err(error)) => return Err(error.into()),
@@ -2679,6 +3119,93 @@ enum SubmissionResult {
     Failed { prompt_id: PromptId, error: String },
     OperationSucceeded,
     OperationFailed(String),
+}
+
+enum SessionPickerResult {
+    Listed {
+        request: SessionListRequest,
+        sessions: Vec<SessionSummary>,
+    },
+    ListingFailed {
+        request: SessionListRequest,
+        error: String,
+    },
+    Attached {
+        snapshot: Box<SessionSnapshot>,
+        subscription: SessionSubscription,
+    },
+    AttachmentFailed(String),
+}
+
+fn replace_session_listing(
+    active: &mut Option<(SessionListRequest, tokio::task::JoinHandle<()>)>,
+    commands: SessionCommandClient,
+    request: SessionListRequest,
+    results: tokio::sync::mpsc::UnboundedSender<SessionPickerResult>,
+) {
+    if let Some((_, task)) = active.take() {
+        task.abort();
+    }
+    let task = spawn_session_listing(commands, request.clone(), results);
+    *active = Some((request, task));
+}
+
+fn finish_session_listing(
+    active: &mut Option<(SessionListRequest, tokio::task::JoinHandle<()>)>,
+    completed: &SessionListRequest,
+) {
+    if active
+        .as_ref()
+        .is_some_and(|(request, _)| request == completed)
+    {
+        *active = None;
+    }
+}
+
+fn spawn_session_listing(
+    commands: SessionCommandClient,
+    request: SessionListRequest,
+    results: tokio::sync::mpsc::UnboundedSender<SessionPickerResult>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = match commands
+            .list_sessions(request.scope.workspace_filter())
+            .await
+        {
+            Ok(sessions) => SessionPickerResult::Listed { request, sessions },
+            Err(error) => SessionPickerResult::ListingFailed {
+                request,
+                error: error.to_string(),
+            },
+        };
+        let _ = results.send(result);
+    })
+}
+
+fn spawn_session_attachment(
+    commands: SessionCommandClient,
+    session_id: SessionId,
+    results: tokio::sync::mpsc::UnboundedSender<SessionPickerResult>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = async {
+            let mut subscription = commands.attach_session(session_id).await?;
+            let event = subscription
+                .next()
+                .await
+                .ok_or_else(|| anyhow!("target Session subscription ended before hydration"))??;
+            let SessionEvent::Snapshot(snapshot) = event else {
+                return Err(anyhow!("target Session updated before hydration"));
+            };
+            Ok::<_, anyhow::Error>(SessionPickerResult::Attached {
+                snapshot: Box::new(snapshot),
+                subscription,
+            })
+        }
+        .await
+        .unwrap_or_else(|error| SessionPickerResult::AttachmentFailed(error.to_string()));
+        let _ = results.send(result);
+    })
 }
 
 enum SessionOperation {
