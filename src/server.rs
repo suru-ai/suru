@@ -30,17 +30,19 @@ use crate::build_identity;
 use crate::model_catalog::ModelCatalogService;
 use crate::protocol::{
     Activity, AdmitPromptRequest, CreateSessionRequest, LifecycleState, Message, MessageId,
-    MessageRole, MessageStatus, PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
-    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionChange,
-    SessionError, SessionErrorCode, SessionId, SessionUpdate, ShutdownReason, TurnId,
+    MessageRole, MessageStatus, PROTOCOL_VERSION, ProviderId, RuntimeDescriptor,
+    SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity,
+    ServerShutdown, SessionChange, SessionError, SessionErrorCode, SessionId, SessionUpdate,
+    ShutdownReason, TurnId, UpdateAgentSelectionRequest,
 };
 use crate::provider::{
     CodexRuntime, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, wait_for_shutdown,
 };
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
-    AdmitPromptError, CreateSessionError, InterruptTurnError, ListSessionsError,
-    PromptAdmissionDisposition, PromptMutationError, SessionFeed, SessionStore, StoreOutcome,
+    AdmitPromptError, AgentSelectionMutationError, CreateSessionError, InterruptTurnError,
+    ListSessionsError, PromptAdmissionDisposition, PromptMutationError, SessionFeed, SessionStore,
+    StoreOutcome,
 };
 
 pub type ServerConfig = RuntimeConfig;
@@ -234,6 +236,7 @@ struct AppState {
     providers: ProviderOrchestrator,
     model_catalog: ModelCatalogService,
     shutdown: ShutdownController,
+    provider_id: ProviderId,
 }
 
 pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
@@ -285,6 +288,7 @@ pub async fn spawn_with_provider(
         provider_shutdown,
         provider_updates: provider_updates.clone(),
     };
+    let provider_id = runtime.provider_id();
     let sessions = SessionStore::default();
     let model_catalog = ModelCatalogService::new([runtime.clone()]);
     let providers = ProviderOrchestrator::new(
@@ -299,6 +303,7 @@ pub async fn spawn_with_provider(
         providers: providers.clone(),
         model_catalog,
         shutdown: shutdown.clone(),
+        provider_id,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -307,6 +312,10 @@ pub async fn spawn_with_provider(
         .route("/v1/models/refresh", post(refresh_models))
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/sessions/{session_id}", get(read_session))
+        .route(
+            "/v1/sessions/{session_id}/agent-selection",
+            post(update_agent_selection),
+        )
         .route("/v1/sessions/{session_id}/prompts", post(admit_prompt))
         .route(
             "/v1/sessions/{session_id}/prompts/{prompt_id}/promote",
@@ -468,6 +477,14 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             Err(response) => return response,
         };
 
+    if request
+        .agent_selection
+        .as_ref()
+        .is_some_and(|selection| selection.provider != state.provider_id)
+    {
+        return agent_selection_provider_conflict_response();
+    }
+
     match state.sessions.create(request) {
         Ok(StoreOutcome::Created(snapshot)) => {
             state.providers.open_session(
@@ -490,6 +507,61 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         ),
         Err(CreateSessionError::PromptConflict) => prompt_conflict_response(),
     }
+}
+
+async fn update_agent_selection(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    request: Request,
+) -> Response {
+    let request = match decode_session_command::<UpdateAgentSelectionRequest>(
+        &state,
+        request,
+        "Agent Selection update",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if request.selection.provider != state.provider_id {
+        return agent_selection_provider_conflict_response();
+    }
+    match state
+        .sessions
+        .apply_agent_selection_command(session_id, request)
+    {
+        Ok(mutation) => {
+            if let Some(prompt_id) = mutation.retry_prompt_id {
+                state
+                    .providers
+                    .schedule_prompt(session_id, prompt_id)
+                    .expect("stored Sessions retain their Provider actor");
+            }
+            Json(mutation.selection).into_response()
+        }
+        Err(AgentSelectionMutationError::SessionNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        Err(AgentSelectionMutationError::OperationConflict) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::AgentSelectionOperationConflict,
+            "Agent Selection operation identity was already used with different content",
+        ),
+        Err(AgentSelectionMutationError::ProviderConflict) => {
+            agent_selection_provider_conflict_response()
+        }
+    }
+}
+
+fn agent_selection_provider_conflict_response() -> Response {
+    session_error_response(
+        StatusCode::CONFLICT,
+        SessionErrorCode::AgentSelectionProviderConflict,
+        "An existing Session cannot change Provider",
+    )
 }
 
 async fn admit_prompt(

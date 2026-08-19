@@ -3,7 +3,8 @@ use std::sync::Arc;
 use chidori::protocol::{AgentIdentity, ModelDescriptor, ProviderId};
 use chidori::provider::{
     ProviderError, ProviderEvent, ProviderEventStream, ProviderFuture, ProviderRuntime,
-    ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderTurnInput,
+    ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
+    ProviderTurnInput,
 };
 use futures_util::stream;
 use tokio::sync::{mpsc, oneshot};
@@ -35,7 +36,11 @@ pub struct PromptOperation {
 }
 
 pub type TurnStart = PromptOperation;
-pub type TurnSteer = PromptOperation;
+
+pub struct TurnSteer {
+    input: ProviderSteerInput,
+    response: oneshot::Sender<Result<(), ProviderError>>,
+}
 
 pub struct TurnInterrupt {
     response: oneshot::Sender<Result<(), ProviderError>>,
@@ -137,6 +142,10 @@ impl PromptOperation {
         &self.input.prompt
     }
 
+    pub fn selection(&self) -> &chidori::protocol::AgentSelection {
+        &self.input.selection
+    }
+
     pub fn succeed(self) {
         self.response
             .send(Ok(()))
@@ -147,6 +156,30 @@ impl PromptOperation {
         self.response
             .send(Err(ProviderError::new(message)))
             .unwrap_or_else(|_| panic!("Provider Prompt operation response remains connected"));
+    }
+
+    pub fn reject_selection(self, message: impl Into<String>) {
+        self.response
+            .send(Err(ProviderError::selection_rejected(message)))
+            .unwrap_or_else(|_| panic!("Provider Prompt operation response remains connected"));
+    }
+}
+
+impl TurnSteer {
+    pub fn prompt(&self) -> &str {
+        &self.input.prompt
+    }
+
+    pub fn succeed(self) {
+        self.response
+            .send(Ok(()))
+            .unwrap_or_else(|_| panic!("Provider steer operation response remains connected"));
+    }
+
+    pub fn fail(self, message: impl Into<String>) {
+        self.response
+            .send(Err(ProviderError::new(message)))
+            .unwrap_or_else(|_| panic!("Provider steer operation response remains connected"));
     }
 }
 
@@ -210,6 +243,24 @@ fn dispatch_prompt_operation(
     })
 }
 
+fn dispatch_steer_operation(
+    operations: mpsc::UnboundedSender<TurnSteer>,
+    input: ProviderSteerInput,
+) -> ProviderFuture<'static, ()> {
+    Box::pin(async move {
+        let (response_tx, response_rx) = oneshot::channel();
+        operations
+            .send(TurnSteer {
+                input,
+                response: response_tx,
+            })
+            .map_err(|_| ProviderError::new("test Provider Session disconnected"))?;
+        response_rx
+            .await
+            .map_err(|_| ProviderError::new("test Provider steering was abandoned"))?
+    })
+}
+
 impl ProviderSession for ControlledSessionHandle {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         dispatch_prompt_operation(
@@ -219,12 +270,8 @@ impl ProviderSession for ControlledSessionHandle {
         )
     }
 
-    fn steer_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
-        dispatch_prompt_operation(
-            self.steers.clone(),
-            input,
-            "test Provider steering was abandoned",
-        )
+    fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
+        dispatch_steer_operation(self.steers.clone(), input)
     }
 
     fn interrupt_turn(&self) -> ProviderFuture<'_, ()> {

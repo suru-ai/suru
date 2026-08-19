@@ -13,11 +13,12 @@ use anyhow::anyhow;
 use tokio::sync::broadcast;
 
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentIdentity, AgentSelection,
-    CreateSessionRequest, Message, MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery,
-    PromptId, PromptOrder, PromptStatus, Session, SessionChange, SessionId, SessionRevision,
-    SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, Turn, TurnId,
-    TurnStatus, Workspace,
+    Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
+    AgentSelection, AgentSelectionOperationId, CreateSessionRequest, Message, MessageId,
+    MessageRole, MessageStatus, ModelAvailability, Prompt, PromptDelivery, PromptId, PromptOrder,
+    PromptStatus, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
+    SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, Turn, TurnId, TurnStatus,
+    UpdateAgentSelectionRequest, Workspace,
 };
 use crate::session_projection::apply_update;
 
@@ -49,6 +50,13 @@ pub(crate) enum PromptMutationError {
     PromptNotPending,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgentSelectionMutationError {
+    SessionNotFound,
+    OperationConflict,
+    ProviderConflict,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InterruptTurnError {
     SessionNotFound,
@@ -76,11 +84,14 @@ struct SessionRecord {
     updates: broadcast::Sender<SessionUpdate>,
     next_prompt_order: PromptOrder,
     steer_targets: HashMap<PromptId, TurnId>,
+    selection_operations: HashMap<AgentSelectionOperationId, AgentSelection>,
+    selection_retry_prompt: Option<PromptId>,
 }
 
 struct PromptOwner {
     session_id: SessionId,
     text: String,
+    agent_selection: Option<AgentSelection>,
     origin: PromptOrigin,
 }
 
@@ -100,6 +111,11 @@ pub(crate) struct SessionFeed {
 pub(crate) struct PromptAdmission {
     pub(crate) prompt: Prompt,
     pub(crate) disposition: PromptAdmissionDisposition,
+}
+
+pub(crate) struct AgentSelectionMutation {
+    pub(crate) selection: AgentSelection,
+    pub(crate) retry_prompt_id: Option<PromptId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,7 +237,8 @@ impl SessionStore {
                 workspace: Workspace {
                     path: workspace_path.clone(),
                 },
-                agent_selection: None,
+                agent_selection: request.agent_selection.clone(),
+                agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,
             },
             revision: SessionRevision::INITIAL,
@@ -244,6 +261,7 @@ impl SessionStore {
             PromptOwner {
                 session_id,
                 text: request.prompt.text,
+                agent_selection: request.agent_selection,
                 origin: PromptOrigin::SessionCreation {
                     requested_workspace: request.workspace.path,
                     canonical_workspace: workspace_path,
@@ -258,6 +276,8 @@ impl SessionStore {
                 updates,
                 next_prompt_order: PromptOrder(2),
                 steer_targets: HashMap::new(),
+                selection_operations: HashMap::new(),
+                selection_retry_prompt: None,
             },
         );
         Ok(StoreOutcome::Created(snapshot))
@@ -349,6 +369,7 @@ impl SessionStore {
             PromptOwner {
                 session_id,
                 text: request.prompt.text,
+                agent_selection: None,
                 origin: PromptOrigin::Admission(request.delivery),
             },
         );
@@ -379,7 +400,84 @@ impl SessionStore {
             .map(|record| record.snapshot.clone())
     }
 
-    pub(crate) fn update_agent_selection(
+    pub(crate) fn reconcile_effective_agent_selection(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        agent_id: AgentId,
+        selection: AgentSelection,
+    ) -> anyhow::Result<Option<SessionUpdate>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let record = state
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+        let turn = record
+            .snapshot
+            .turns
+            .iter()
+            .find(|turn| turn.id == turn_id)
+            .ok_or_else(|| anyhow!("Effective Agent Selection referenced an unknown Turn"))?;
+        if turn.status != TurnStatus::Active {
+            return Err(anyhow!(
+                "Effective Agent Selection referenced a terminal Turn"
+            ));
+        }
+        let requested = turn
+            .agent
+            .as_ref()
+            .ok_or_else(|| anyhow!("Effective Agent Selection referenced an unbound Turn"))?;
+        if requested.agent != agent_id || requested.selection.provider != selection.provider {
+            return Err(anyhow!(
+                "Effective Agent Selection changed the Provider identity of an active Turn"
+            ));
+        }
+        if requested.selection == selection {
+            return Ok(None);
+        }
+        let update_authoritative =
+            record.snapshot.session.agent_selection.as_ref() == Some(&requested.selection);
+        let requested_model = requested.selection.model.clone();
+        let effective_agent = AgentIdentity {
+            agent: agent_id,
+            selection: selection.clone(),
+        };
+        let mut changes = Vec::with_capacity(3);
+        if update_authoritative {
+            changes.push(SessionChange::AgentSelectionChanged {
+                selection: selection.clone(),
+            });
+        }
+        changes.extend([
+            SessionChange::TurnAgentChanged {
+                turn_id,
+                agent: effective_agent,
+            },
+            SessionChange::ActivityAdded {
+                activity: Activity::Status {
+                    id: ActivityId::new(),
+                    turn_id,
+                    text: format!(
+                        "Provider used Model `{}` instead of requested Model `{}`.",
+                        selection.model, requested_model
+                    ),
+                },
+            },
+        ]);
+        let updated_at = state.next_timestamp();
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
+        let update = record.publish(session_id, changes)?;
+        record.summary.updated_at = updated_at;
+        Ok(Some(update))
+    }
+
+    pub(crate) fn initialize_agent_selection(
         &self,
         session_id: SessionId,
         selection: AgentSelection,
@@ -388,15 +486,15 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let current = state
+        if state
             .sessions
             .get(&session_id)
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?
             .snapshot
             .session
             .agent_selection
-            .clone();
-        if current.as_ref() == Some(&selection) {
+            .is_some()
+        {
             return Ok(None);
         }
         let updated_at = state.next_timestamp();
@@ -412,18 +510,174 @@ impl SessionStore {
         Ok(Some(update))
     }
 
+    pub(crate) fn apply_agent_selection_command(
+        &self,
+        session_id: SessionId,
+        request: UpdateAgentSelectionRequest,
+    ) -> Result<AgentSelectionMutation, AgentSelectionMutationError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let record = state
+            .sessions
+            .get(&session_id)
+            .ok_or(AgentSelectionMutationError::SessionNotFound)?;
+        if let Some(previous) = record.selection_operations.get(&request.operation_id) {
+            return if previous == &request.selection {
+                Ok(AgentSelectionMutation {
+                    selection: previous.clone(),
+                    retry_prompt_id: None,
+                })
+            } else {
+                Err(AgentSelectionMutationError::OperationConflict)
+            };
+        }
+        if record
+            .snapshot
+            .session
+            .agent_selection
+            .as_ref()
+            .is_some_and(|current| current.provider != request.selection.provider)
+        {
+            return Err(AgentSelectionMutationError::ProviderConflict);
+        }
+        let selection_changed =
+            record.snapshot.session.agent_selection.as_ref() != Some(&request.selection);
+        let availability_changed =
+            record.snapshot.session.agent_selection_availability != ModelAvailability::Available;
+        let changed = selection_changed || availability_changed;
+        let updated_at = changed.then(|| state.next_timestamp());
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
+        if changed {
+            let mut changes = Vec::with_capacity(2);
+            if selection_changed {
+                changes.push(SessionChange::AgentSelectionChanged {
+                    selection: request.selection.clone(),
+                });
+            }
+            if availability_changed {
+                changes.push(SessionChange::AgentSelectionAvailabilityChanged {
+                    availability: ModelAvailability::Available,
+                });
+            }
+            record
+                .publish(session_id, changes)
+                .expect("Agent Selection commands preserve Session invariants");
+            record.summary.updated_at = updated_at.expect("changed selection has a timestamp");
+        }
+        record
+            .selection_operations
+            .insert(request.operation_id, request.selection.clone());
+        Ok(AgentSelectionMutation {
+            selection: request.selection,
+            retry_prompt_id: record.pending_selection_retry_prompt(),
+        })
+    }
+
+    pub(crate) fn reject_agent_selection(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        unfinished_output: UnfinishedProviderOutput,
+        message: String,
+    ) -> anyhow::Result<SessionUpdate> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let (prompt, mark_unavailable, admission_order) = {
+            let record = state
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+            let turn = record
+                .snapshot
+                .turns
+                .iter()
+                .find(|turn| turn.id == turn_id)
+                .ok_or_else(|| anyhow!("Selection rejection referenced an unknown Turn"))?;
+            if turn.status != TurnStatus::Active {
+                return Err(anyhow!("Selection rejection referenced a terminal Turn"));
+            }
+            let prompt = record
+                .snapshot
+                .prompts
+                .iter()
+                .find(|prompt| prompt.id == turn.prompt_id)
+                .expect("every Turn retains its originating Prompt");
+            let mark_unavailable = turn.agent.as_ref().is_some_and(|agent| {
+                record.snapshot.session.agent_selection.as_ref() == Some(&agent.selection)
+            });
+            (prompt.clone(), mark_unavailable, record.next_prompt_order)
+        };
+        let restored = Prompt {
+            id: PromptId::new(),
+            text: prompt.text,
+            delivery: PromptDelivery::Queue,
+            admission_order,
+            status: PromptStatus::Pending,
+        };
+        let mut changes = terminal_output_changes(unfinished_output);
+        changes.extend([
+            SessionChange::ActivityAdded {
+                activity: Activity::Error {
+                    id: ActivityId::new(),
+                    turn_id,
+                    text: message,
+                },
+            },
+            SessionChange::TurnStatusChanged {
+                turn_id,
+                status: TurnStatus::Failed,
+            },
+        ]);
+        if mark_unavailable {
+            changes.push(SessionChange::AgentSelectionAvailabilityChanged {
+                availability: ModelAvailability::Unavailable,
+            });
+        }
+        changes.push(SessionChange::PromptAdded {
+            prompt: restored.clone(),
+        });
+        let updated_at = state.next_timestamp();
+        let update = {
+            let record = state
+                .sessions
+                .get_mut(&session_id)
+                .expect("Session existence was checked while holding the store lock");
+            let update = record.publish(session_id, changes)?;
+            record.selection_retry_prompt = Some(restored.id);
+            record.summary.updated_at = updated_at;
+            update
+        };
+        state.prompts.insert(
+            restored.id,
+            PromptOwner {
+                session_id,
+                text: restored.text,
+                agent_selection: None,
+                origin: PromptOrigin::Admission(restored.delivery),
+            },
+        );
+        Ok(update)
+    }
+
     pub(crate) fn deliver_prompt(
         &self,
         session_id: SessionId,
         prompt_id: PromptId,
-        agent: Option<AgentIdentity>,
+        agent_id: Option<AgentId>,
         delivered_turn_status: DeliveredTurnStatus,
     ) -> anyhow::Result<Option<DeliveredTurn>> {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let prompt = {
+        let (prompt, agent) = {
             let record = state
                 .sessions
                 .get(&session_id)
@@ -440,7 +694,15 @@ impl SessionStore {
             if prompt.status != PromptStatus::Pending {
                 return Ok(None);
             }
-            prompt.clone()
+            let agent = agent_id.and_then(|agent| {
+                record
+                    .snapshot
+                    .session
+                    .agent_selection
+                    .clone()
+                    .map(|selection| AgentIdentity { agent, selection })
+            });
+            (prompt.clone(), agent)
         };
         let updated_at = state.next_timestamp();
         let (turn_status, failure_message) = match delivered_turn_status {
@@ -463,6 +725,9 @@ impl SessionStore {
             .expect("Session existence was checked while holding the store lock");
         record.publish(session_id, changes)?;
         record.steer_targets.remove(&prompt_id);
+        if record.selection_retry_prompt == Some(prompt_id) {
+            record.selection_retry_prompt = None;
+        }
         record.summary.updated_at = updated_at;
         Ok(Some(delivered))
     }
@@ -594,14 +859,14 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         turn_id: TurnId,
-        next_agent: AgentIdentity,
+        agent_id: AgentId,
         outcome: ProviderTurnOutcome,
     ) -> anyhow::Result<Option<DeliveredTurn>> {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let (pending_steers, next_queued_prompt) = {
+        let (pending_steers, next_queued_prompt, next_agent) = {
             let record = state
                 .sessions
                 .get(&session_id)
@@ -630,7 +895,16 @@ impl SessionStore {
                 })
                 .min_by_key(|prompt| prompt.admission_order)
                 .cloned();
-            (pending_steers, next_queued_prompt)
+            let next_agent = record
+                .snapshot
+                .session
+                .agent_selection
+                .clone()
+                .map(|selection| AgentIdentity {
+                    agent: agent_id,
+                    selection,
+                });
+            (pending_steers, next_queued_prompt, next_agent)
         };
 
         let mut changes = Vec::with_capacity(pending_steers.len() * 2 + 6);
@@ -674,7 +948,7 @@ impl SessionStore {
 
         let next_turn = next_queued_prompt.map(|prompt| {
             let (delivered, delivery_changes) =
-                prepare_prompt_delivery(prompt, Some(next_agent), TurnStatus::Active);
+                prepare_prompt_delivery(prompt, next_agent, TurnStatus::Active);
             changes.extend(delivery_changes);
             delivered
         });
@@ -904,6 +1178,9 @@ impl SessionStore {
                 }],
             )
             .expect("Prompt cancellation preserves Session invariants");
+        if record.selection_retry_prompt == Some(prompt_id) {
+            record.selection_retry_prompt = None;
+        }
         record.summary.updated_at = updated_at;
         prompt.status = PromptStatus::Cancelled;
         Ok(prompt)
@@ -1061,6 +1338,7 @@ fn snapshot_for_owner(state: &SessionStoreState, owner: &PromptOwner) -> Session
 impl PromptOwner {
     fn matches_requested_creation(&self, request: &CreateSessionRequest) -> bool {
         self.text == request.prompt.text
+            && self.agent_selection == request.agent_selection
             && matches!(
                 &self.origin,
                 PromptOrigin::SessionCreation {
@@ -1071,7 +1349,7 @@ impl PromptOwner {
     }
 
     fn canonical_creation_workspace(&self, request: &CreateSessionRequest) -> Option<PathBuf> {
-        if self.text != request.prompt.text {
+        if self.text != request.prompt.text || self.agent_selection != request.agent_selection {
             return None;
         }
         match &self.origin {
@@ -1096,6 +1374,15 @@ impl PromptOwner {
 }
 
 impl SessionRecord {
+    fn pending_selection_retry_prompt(&self) -> Option<PromptId> {
+        let prompt_id = self.selection_retry_prompt?;
+        self.snapshot
+            .prompts
+            .iter()
+            .any(|prompt| prompt.id == prompt_id && prompt.status == PromptStatus::Pending)
+            .then_some(prompt_id)
+    }
+
     fn next_pending_steer(&self, turn_id: TurnId) -> anyhow::Result<Option<Prompt>> {
         if active_turn_id(&self.snapshot)? != Some(turn_id) {
             return Ok(None);

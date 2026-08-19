@@ -6,10 +6,10 @@ use chidori::{
     protocol::{
         Activity, ActivityId, ActivityStatus, AgentSelection, CreateSessionRequest, FileChange,
         Health, InitialPrompt, LifecycleState, Message, MessageId, MessageRole, MessageStatus,
-        ModelId, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
-        ServerIdentity, ServerShutdown, Session, SessionChange, SessionId, SessionRevision,
-        SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate,
-        ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        ModelAvailability, ModelId, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
+        ProviderId, ServerIdentity, ServerShutdown, Session, SessionChange, SessionId,
+        SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
+        SessionUpdate, ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{AgentOutput, ServerConfig},
     tui::{
@@ -1504,6 +1504,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
 
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -3583,6 +3584,7 @@ fn failed_session_snapshot(
                 path: workspace.to_owned(),
             },
             agent_selection: None,
+            agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
         },
         revision: SessionRevision::INITIAL,
@@ -3608,6 +3610,7 @@ fn session_summary(
                 path: workspace.to_owned(),
             },
             agent_selection: None,
+            agent_selection_availability: ModelAvailability::Available,
             status,
         },
         title: title.to_owned(),
@@ -3657,6 +3660,7 @@ fn navigable_session_snapshot(
                 path: workspace.to_owned(),
             },
             agent_selection: None,
+            agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
         },
         revision: SessionRevision::INITIAL,

@@ -10,10 +10,10 @@ use chidori::{
         ManagedClient, ManagedClientConfig, ManagedEvent, SessionEvent, SessionSubscription,
     },
     protocol::{
-        Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, CreateSessionRequest,
-        FileChange, InitialPrompt, MessageRole, MessageStatus, ModelAvailability, ModelId,
-        ModelOptionKind, ModelOptionRole, PromptDelivery, PromptId, PromptStatus,
-        ProviderCatalogStatus, ProviderId, SessionChange, SessionId, SessionSnapshot,
+        Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentSelection,
+        CreateSessionRequest, FileChange, InitialPrompt, MessageRole, MessageStatus,
+        ModelAvailability, ModelId, ModelOptionKind, ModelOptionRole, PromptDelivery, PromptId,
+        PromptStatus, ProviderCatalogStatus, ProviderId, SessionChange, SessionId, SessionSnapshot,
         SessionStatus, ShutdownReason, TranscriptItem, TurnId, TurnStatus, Workspace,
     },
     provider::CodexRuntime,
@@ -139,6 +139,7 @@ exit 0
 
 const TURN_REQUEST_ERROR: &str = r#"#!/bin/sh
 while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -148,6 +149,61 @@ while IFS= read -r line; do
       ;;
     *'"method":"turn/start"'*)
       printf '%s\n' '{"id":3,"error":{"code":-32001,"message":"fixture rejected Turn startup"}}'
+      ;;
+  esac
+done
+"#;
+
+const SELECTED_MODEL_REJECTION: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"failed","error":{"message":"selection rejected by fixture","codexErrorInfo":"badRequest","additionalDetails":"{\"error\":{\"param\":\"model\"}}"},"items":[]}}}'
+      ;;
+  esac
+done
+"#;
+
+const NON_MODEL_BAD_REQUEST: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"failed","error":{"message":"fixture rejected the input","codexErrorInfo":"badRequest","additionalDetails":"{\"error\":{\"param\":\"input\"}}"},"items":[]}}}'
+      ;;
+  esac
+done
+"#;
+
+const SELECTED_MODEL_CODEX: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"provider-default"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"method":"thread/settings/updated","params":{"threadId":"native-thread","threadSettings":{"model":"effective-model"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
       ;;
   esac
 done
@@ -574,6 +630,7 @@ impl SteeringFixture {
         receive_initial_state(&mut client).await;
         let created = client
             .create_session(CreateSessionRequest {
+                agent_selection: None,
                 workspace: Workspace {
                     path: workspace.path().to_owned(),
                 },
@@ -820,6 +877,7 @@ async fn scripted_codex_delivers_the_authoritative_queue_once_in_admission_order
 
     let created = author
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -1392,6 +1450,239 @@ done
 "#;
 
 #[tokio::test]
+async fn selected_model_is_lowered_to_codex_and_effective_model_is_projected_back() {
+    let fixture = ScriptedCodex::new(SELECTED_MODEL_CODEX);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-selected-model").expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-selected-model")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let requested = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("requested-model"),
+        options: Vec::new(),
+    };
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(requested),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Use the requested native Model".to_owned(),
+            },
+        })
+        .await
+        .expect("create selected Codex Session");
+    fixture.wait_for_method("turn/start").await;
+    let turn_start = fixture
+        .requests()
+        .into_iter()
+        .find(|request| request["method"] == "turn/start")
+        .expect("capture native turn/start");
+    assert_eq!(turn_start["params"]["model"], "requested-model");
+
+    let completed = timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = client
+                .read_session(created.session.id)
+                .await
+                .expect("read selected Codex Session");
+            if snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Completed)
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("effective Codex Model is projected");
+    let effective = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("effective-model"),
+        options: Vec::new(),
+    };
+    assert_eq!(completed.session.agent_selection, Some(effective.clone()));
+    assert_eq!(
+        completed.turns[0]
+            .agent
+            .as_ref()
+            .map(|agent| &agent.selection),
+        Some(&effective)
+    );
+    assert!(completed.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Status { text, .. }
+            if text.contains("requested-model") && text.contains("effective-model")
+    )));
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn codex_model_rejection_never_falls_back_and_restores_the_prompt() {
+    let fixture = ScriptedCodex::new(SELECTED_MODEL_REJECTION);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-selected-model-rejection")
+            .expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-selected-model-rejection")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let selection = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("rejected-model"),
+        options: Vec::new(),
+    };
+    let prompt_id = PromptId::new();
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(selection.clone()),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: prompt_id,
+                text: "Do not silently fall back".to_owned(),
+            },
+        })
+        .await
+        .expect("create selected Codex Session");
+    let failed = timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = client
+                .read_session(created.session.id)
+                .await
+                .expect("read rejected Codex Session");
+            if snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Failed)
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Codex rejection becomes visible");
+    let turn_starts = fixture
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "turn/start")
+        .collect::<Vec<_>>();
+    assert_eq!(turn_starts.len(), 1);
+    assert_eq!(turn_starts[0]["params"]["model"], "rejected-model");
+    assert_eq!(failed.session.agent_selection, Some(selection));
+    assert_eq!(
+        failed.session.agent_selection_availability,
+        ModelAvailability::Unavailable
+    );
+    assert_eq!(failed.turns[0].status, TurnStatus::Failed);
+    assert!(failed.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Error { text, .. } if text.contains("selection rejected by fixture")
+    )));
+    assert_eq!(failed.prompts.len(), 2);
+    assert_eq!(failed.prompts[0].id, prompt_id);
+    assert_ne!(failed.prompts[1].id, prompt_id);
+    assert_eq!(failed.prompts[1].text, "Do not silently fall back");
+    assert_eq!(failed.prompts[1].status, PromptStatus::Pending);
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn generic_codex_turn_rejection_does_not_mark_the_model_unavailable() {
+    let fixture = ScriptedCodex::new(NON_MODEL_BAD_REQUEST);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-generic-turn-rejection")
+            .expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-generic-turn-rejection")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(AgentSelection {
+                provider: ProviderId::new("codex"),
+                model: ModelId::new("valid-model"),
+                options: Vec::new(),
+            }),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Fail for a reason unrelated to Model selection".to_owned(),
+            },
+        })
+        .await
+        .expect("create selected Codex Session");
+    let failed = timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = client
+                .read_session(created.session.id)
+                .await
+                .expect("read failed Codex Session");
+            if snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Failed)
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("generic rejection becomes visible");
+
+    assert_eq!(
+        failed.session.agent_selection_availability,
+        ModelAvailability::Available
+    );
+    assert_eq!(failed.prompts.len(), 1);
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     let fixture = ScriptedCodex::new(SCRIPTED_CODEX);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -1412,6 +1703,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -1681,7 +1973,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         requests[3]["params"]["input"],
         serde_json::json!([{ "type": "text", "text": "Explain the native harness" }])
     );
-    assert!(requests[3]["params"].get("model").is_none());
+    assert_eq!(requests[3]["params"]["model"], "gpt-fixture");
 
     drop(feed);
     drop(client);
@@ -1709,6 +2001,7 @@ async fn unknown_server_request_gets_method_not_found_without_corrupting_respons
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -1820,6 +2113,7 @@ async fn scripted_codex_interrupt_acknowledges_before_trailing_output_and_termin
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2097,6 +2391,7 @@ async fn server_shutdown_interrupts_active_codex_and_allows_cooperative_exit() {
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2188,6 +2483,7 @@ async fn server_shutdown_interrupts_a_turn_whose_start_response_is_pending() {
     receive_initial_state(&mut client).await;
     client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2238,6 +2534,7 @@ async fn server_shutdown_releases_pending_rpc_and_forces_an_unresponsive_codex_t
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2288,6 +2585,7 @@ async fn server_shutdown_closes_transport_with_a_startup_request_pending() {
     receive_initial_state(&mut client).await;
     client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2336,6 +2634,7 @@ async fn installed_codex_launches_runs_one_text_turn_and_shuts_down() {
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2630,6 +2929,7 @@ impl RecoveryFixture {
         receive_initial_state(&mut client).await;
         let created = client
             .create_session(CreateSessionRequest {
+                agent_selection: None,
                 workspace: Workspace {
                     path: workspace.path().to_owned(),
                 },
@@ -2731,6 +3031,7 @@ async fn assert_provider_failure(
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2808,6 +3109,7 @@ async fn assert_interruption_failure(script: &str, channel: &str, expected_error
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2902,6 +3204,7 @@ async fn run_terminal_fixture(
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },

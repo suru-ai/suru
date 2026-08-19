@@ -21,6 +21,9 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
             SessionChange::AgentSelectionChanged { selection } => {
                 next.session.agent_selection = Some(selection.clone());
             }
+            SessionChange::AgentSelectionAvailabilityChanged { availability } => {
+                next.session.agent_selection_availability = *availability;
+            }
             SessionChange::PromptAdded { prompt } => {
                 if next.prompts.iter().any(|existing| existing.id == prompt.id) {
                     bail!("Session update reused a Prompt identity");
@@ -81,6 +84,23 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update reused a Turn identity");
                 }
                 next.turns.push(turn.clone());
+            }
+            SessionChange::TurnAgentChanged { turn_id, agent } => {
+                let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {
+                    bail!("Session update referenced an unknown Turn");
+                };
+                if turn.status != TurnStatus::Active {
+                    bail!("Session update changed the Agent on a terminal Turn");
+                }
+                let Some(current) = turn.agent.as_ref() else {
+                    bail!("Session update changed the Agent on an unbound Turn");
+                };
+                if current.agent != agent.agent
+                    || current.selection.provider != agent.selection.provider
+                {
+                    bail!("Session update changed the Provider identity of an active Turn");
+                }
+                turn.agent = Some(agent.clone());
             }
             SessionChange::MessageAdded { message } => {
                 if !next.turns.iter().any(|turn| turn.id == message.turn_id) {

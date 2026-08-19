@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SESSION_SNAPSHOT_EVENT: &str = "session_snapshot";
 pub const SESSION_UPDATED_EVENT: &str = "session_updated";
@@ -47,6 +47,7 @@ session_identity!(PromptId);
 session_identity!(TurnId);
 session_identity!(MessageId);
 session_identity!(ActivityId);
+session_identity!(AgentSelectionOperationId);
 
 macro_rules! named_identity {
     ($name:ident) => {
@@ -345,6 +346,7 @@ pub struct Session {
     pub id: SessionId,
     pub workspace: Workspace,
     pub agent_selection: Option<AgentSelection>,
+    pub agent_selection_availability: ModelAvailability,
     pub status: SessionStatus,
 }
 
@@ -420,6 +422,9 @@ pub enum SessionChange {
     AgentSelectionChanged {
         selection: AgentSelection,
     },
+    AgentSelectionAvailabilityChanged {
+        availability: ModelAvailability,
+    },
     PromptAdded {
         prompt: Prompt,
     },
@@ -433,6 +438,10 @@ pub enum SessionChange {
     },
     TurnAdded {
         turn: Turn,
+    },
+    TurnAgentChanged {
+        turn_id: TurnId,
+        agent: AgentIdentity,
     },
     MessageAdded {
         message: Message,
@@ -483,6 +492,7 @@ pub struct InitialPrompt {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateSessionRequest {
+    pub agent_selection: Option<AgentSelection>,
     pub workspace: Workspace,
     pub prompt: InitialPrompt,
 }
@@ -492,6 +502,13 @@ pub struct CreateSessionRequest {
 pub struct AdmitPromptRequest {
     pub prompt: InitialPrompt,
     pub delivery: PromptDelivery,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAgentSelectionRequest {
+    pub operation_id: AgentSelectionOperationId,
+    pub selection: AgentSelection,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -507,6 +524,8 @@ pub enum SessionErrorCode {
     TurnNotFound,
     TurnNotActive,
     TurnInterruptionFailed,
+    AgentSelectionOperationConflict,
+    AgentSelectionProviderConflict,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

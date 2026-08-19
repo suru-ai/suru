@@ -22,12 +22,13 @@ use chidori::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-        AgentSelection, CreateSessionRequest, FileChange, InitialPrompt, LifecycleState, Message,
-        MessageId, MessageRole, MessageStatus, ModelId, PROTOCOL_VERSION, Prompt, PromptDelivery,
-        PromptId, PromptOrder, PromptStatus, ProviderId, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT,
-        SESSION_UPDATED_EVENT, ServerIdentity, Session, SessionChange, SessionError,
-        SessionErrorCode, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
-        SessionSummary, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        AgentSelection, AgentSelectionOperationId, CreateSessionRequest, FileChange, InitialPrompt,
+        LifecycleState, Message, MessageId, MessageRole, MessageStatus, ModelAvailability, ModelId,
+        PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
+        RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity, Session,
+        SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
+        SessionStatus, SessionSummary, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
+        UpdateAgentSelectionRequest, Workspace,
     },
     provider::{
         ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderFileChangeStatus,
@@ -118,6 +119,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
     let prompt_id = PromptId::new();
     let created = first
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -488,6 +490,7 @@ async fn agent_selection_changes_do_not_rewrite_an_active_turn_identity() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -585,6 +588,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
     receive_managed_client_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -791,6 +795,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
     let initial_prompt_id = PromptId::new();
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -945,6 +950,744 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
 }
 
 #[tokio::test]
+async fn session_creation_makes_the_landing_agent_selection_authoritative() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, _provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "selected-session-create-test")
+            .expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let selection = AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("gpt-selected"),
+        options: Vec::new(),
+    };
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&serde_json::json!({
+            "workspace": { "path": workspace.path() },
+            "prompt": {
+                "id": PromptId::new(),
+                "text": "Begin with my landing selection"
+            },
+            "agent_selection": selection,
+        }))
+        .send()
+        .await
+        .expect("create selected Session");
+
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let created = response
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode selected Session");
+    assert_eq!(created.session.agent_selection, Some(selection));
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn agent_selection_commands_are_idempotent_and_converge_across_clients() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, _provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "selection-command-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut first = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "selection-command-test")
+            .expect("configure first client"),
+    )
+    .await
+    .expect("connect first client");
+    let mut second = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "selection-command-test")
+            .expect("configure second client"),
+    )
+    .await
+    .expect("connect second client");
+    receive_managed_client_initial_state(&mut first).await;
+    receive_managed_client_initial_state(&mut second).await;
+    let initial = AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("gpt-initial"),
+        options: Vec::new(),
+    };
+    let created = first
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(initial),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Wait for a selected Turn".to_owned(),
+            },
+        })
+        .await
+        .expect("create selected Session");
+    let mut first_feed = first
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe first client");
+    let mut second_feed = second
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe second client");
+    for feed in [&mut first_feed, &mut second_feed] {
+        assert!(matches!(
+            feed.next()
+                .await
+                .expect("snapshot arrives")
+                .expect("valid feed"),
+            SessionEvent::Snapshot(_)
+        ));
+    }
+
+    let operation_id = AgentSelectionOperationId::new();
+    let selected = AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("gpt-selected"),
+        options: Vec::new(),
+    };
+    let request = UpdateAgentSelectionRequest {
+        operation_id,
+        selection: selected.clone(),
+    };
+    assert_eq!(
+        first
+            .update_agent_selection(created.session.id, request.clone())
+            .await
+            .expect("accept Agent Selection"),
+        selected
+    );
+    let first_update = next_session_update(&mut first_feed).await;
+    let second_update = next_session_update(&mut second_feed).await;
+    assert_eq!(first_update, second_update);
+    assert_eq!(first_update.revision, SessionRevision(2));
+    assert_eq!(
+        first_update.changes,
+        vec![SessionChange::AgentSelectionChanged {
+            selection: selected.clone(),
+        }]
+    );
+
+    assert_eq!(
+        first
+            .update_agent_selection(created.session.id, request)
+            .await
+            .expect("retry exact Agent Selection operation"),
+        selected
+    );
+    assert!(
+        timeout(Duration::from_millis(50), first_feed.next())
+            .await
+            .is_err(),
+        "an exact operation retry must not publish another revision"
+    );
+
+    let conflict = first
+        .update_agent_selection(
+            created.session.id,
+            UpdateAgentSelectionRequest {
+                operation_id,
+                selection: AgentSelection {
+                    provider: ProviderId::new("controlled"),
+                    model: ModelId::new("gpt-conflict"),
+                    options: Vec::new(),
+                },
+            },
+        )
+        .await
+        .expect_err("reject conflicting operation identity reuse");
+    assert!(conflict.to_string().contains("operation identity"));
+
+    let final_selection = AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("gpt-final"),
+        options: Vec::new(),
+    };
+    second
+        .update_agent_selection(
+            created.session.id,
+            UpdateAgentSelectionRequest {
+                operation_id: AgentSelectionOperationId::new(),
+                selection: final_selection.clone(),
+            },
+        )
+        .await
+        .expect("accept second client's selection");
+    let first_final = next_session_update(&mut first_feed).await;
+    let second_final = next_session_update(&mut second_feed).await;
+    assert_eq!(first_final, second_final);
+    assert_eq!(first_final.revision, SessionRevision(3));
+    assert_eq!(
+        first
+            .read_session(created.session.id)
+            .await
+            .expect("read converged Session")
+            .session
+            .agent_selection,
+        Some(final_selection)
+    );
+
+    drop(first_feed);
+    drop(second_feed);
+    drop(first);
+    drop(second);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn concurrent_clients_converge_in_server_acceptance_order() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, _provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "concurrent-selection-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut first = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "concurrent-selection-test")
+            .expect("configure first client"),
+    )
+    .await
+    .expect("connect first client");
+    let mut second = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "concurrent-selection-test")
+            .expect("configure second client"),
+    )
+    .await
+    .expect("connect second client");
+    receive_managed_client_initial_state(&mut first).await;
+    receive_managed_client_initial_state(&mut second).await;
+    let created = first
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(AgentSelection {
+                provider: ProviderId::new("controlled"),
+                model: ModelId::new("initial"),
+                options: Vec::new(),
+            }),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Wait while clients select concurrently".to_owned(),
+            },
+        })
+        .await
+        .expect("create selected Session");
+    let mut first_feed = first
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe first client");
+    let mut second_feed = second
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe second client");
+    for feed in [&mut first_feed, &mut second_feed] {
+        feed.next()
+            .await
+            .expect("snapshot arrives")
+            .expect("snapshot is valid");
+    }
+    let first_selection = AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("first-client"),
+        options: Vec::new(),
+    };
+    let second_selection = AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("second-client"),
+        options: Vec::new(),
+    };
+
+    let (first_result, second_result) = tokio::join!(
+        first.update_agent_selection(
+            created.session.id,
+            UpdateAgentSelectionRequest {
+                operation_id: AgentSelectionOperationId::new(),
+                selection: first_selection,
+            },
+        ),
+        second.update_agent_selection(
+            created.session.id,
+            UpdateAgentSelectionRequest {
+                operation_id: AgentSelectionOperationId::new(),
+                selection: second_selection,
+            },
+        ),
+    );
+    first_result.expect("first concurrent command is accepted");
+    second_result.expect("second concurrent command is accepted");
+    let first_updates = [
+        next_session_update(&mut first_feed).await,
+        next_session_update(&mut first_feed).await,
+    ];
+    let second_updates = [
+        next_session_update(&mut second_feed).await,
+        next_session_update(&mut second_feed).await,
+    ];
+    assert_eq!(first_updates, second_updates);
+    assert_eq!(first_updates[0].revision, SessionRevision(2));
+    assert_eq!(first_updates[1].revision, SessionRevision(3));
+    let accepted_last = first_updates[1]
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            SessionChange::AgentSelectionChanged { selection } => Some(selection.clone()),
+            _ => None,
+        })
+        .expect("last accepted command publishes its Selection");
+    assert_eq!(
+        first
+            .read_session(created.session.id)
+            .await
+            .expect("read converged Session")
+            .session
+            .agent_selection,
+        Some(accepted_last)
+    );
+
+    drop(first_feed);
+    drop(second_feed);
+    drop(first);
+    drop(second);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn turn_boundaries_capture_the_latest_selection_while_steers_keep_the_active_turn() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "selection-turn-order-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "selection-turn-order-test")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_managed_client_initial_state(&mut client).await;
+    let first_selection = AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("model-a"),
+        options: Vec::new(),
+    };
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(first_selection.clone()),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Begin on A".to_owned(),
+            },
+        })
+        .await
+        .expect("create selected Session");
+    let default_identity = AgentIdentity {
+        agent: AgentId::new("controlled"),
+        selection: AgentSelection {
+            provider: ProviderId::new("controlled"),
+            model: ModelId::new("provider-default"),
+            options: Vec::new(),
+        },
+    };
+    let mut provider_session = provider.next_start().await.succeed(default_identity);
+    let first_turn = provider_session.next_turn().await;
+    assert_eq!(first_turn.selection(), &first_selection);
+    first_turn.succeed();
+
+    let second_selection = AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("model-b"),
+        options: Vec::new(),
+    };
+    client
+        .update_agent_selection(
+            created.session.id,
+            UpdateAgentSelectionRequest {
+                operation_id: AgentSelectionOperationId::new(),
+                selection: second_selection,
+            },
+        )
+        .await
+        .expect("select B while A is active");
+    client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Steer the A Turn".to_owned(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit steer Prompt");
+    let steer = provider_session.next_steer().await;
+    assert_eq!(steer.prompt(), "Steer the A Turn");
+    steer.succeed();
+    client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Queue a new Turn".to_owned(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("queue next Prompt");
+    let final_selection = AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("model-c"),
+        options: Vec::new(),
+    };
+    client
+        .update_agent_selection(
+            created.session.id,
+            UpdateAgentSelectionRequest {
+                operation_id: AgentSelectionOperationId::new(),
+                selection: final_selection.clone(),
+            },
+        )
+        .await
+        .expect("select C before queued Turn begins");
+
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    let queued_turn = provider_session.next_turn().await;
+    assert_eq!(queued_turn.prompt(), "Queue a new Turn");
+    assert_eq!(queued_turn.selection(), &final_selection);
+    queued_turn.succeed();
+    let active = client
+        .read_session(created.session.id)
+        .await
+        .expect("read both Turn identities");
+    assert_eq!(
+        active.turns[0].agent.as_ref().map(|agent| &agent.selection),
+        Some(&first_selection)
+    );
+    assert_eq!(
+        active.turns[1].agent.as_ref().map(|agent| &agent.selection),
+        Some(&final_selection)
+    );
+
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    drop(provider_session);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn provider_effective_selection_reconciles_the_active_turn_with_visible_activity() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "effective-selection-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "effective-selection-test")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_managed_client_initial_state(&mut client).await;
+    let requested = AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("requested-model"),
+        options: Vec::new(),
+    };
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(requested.clone()),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Use the selected Model".to_owned(),
+            },
+        })
+        .await
+        .expect("create selected Session");
+    let mut provider_session = provider.next_start().await.succeed(AgentIdentity {
+        agent: AgentId::new("controlled"),
+        selection: requested.clone(),
+    });
+    provider_session.next_turn().await.succeed();
+    let mut feed = client
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe to active Session");
+    let SessionEvent::Snapshot(before) = feed
+        .next()
+        .await
+        .expect("snapshot arrives")
+        .expect("snapshot is valid")
+    else {
+        panic!("feed begins with a snapshot");
+    };
+    let turn_id = before.turns[0].id;
+    let effective = AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("effective-model"),
+        options: Vec::new(),
+    };
+
+    provider_session.emit(ProviderEvent::AgentSelectionChanged {
+        selection: effective.clone(),
+    });
+    let update = next_session_update(&mut feed).await;
+    assert_eq!(update.revision, SessionRevision(before.revision.0 + 1));
+    assert!(update.changes.iter().any(|change| matches!(
+        change,
+        SessionChange::AgentSelectionChanged { selection } if selection == &effective
+    )));
+    assert!(update.changes.iter().any(|change| matches!(
+        change,
+        SessionChange::TurnAgentChanged { turn_id: changed_turn_id, agent }
+            if *changed_turn_id == turn_id && agent.selection == effective
+    )));
+    assert!(update.changes.iter().any(|change| matches!(
+        change,
+        SessionChange::ActivityAdded { activity: Activity::Status { turn_id: activity_turn_id, text, .. } }
+            if *activity_turn_id == turn_id
+                && text.contains("requested-model")
+                && text.contains("effective-model")
+    )));
+    let reconciled = client
+        .read_session(created.session.id)
+        .await
+        .expect("read reconciled Session");
+    assert_eq!(reconciled.session.agent_selection, Some(effective.clone()));
+    assert_eq!(
+        reconciled.turns[0]
+            .agent
+            .as_ref()
+            .map(|agent| &agent.selection),
+        Some(&effective)
+    );
+
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    drop(feed);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "selection-rejection-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "selection-rejection-test")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_managed_client_initial_state(&mut client).await;
+    let selection = AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("unavailable-model"),
+        options: Vec::new(),
+    };
+    let original_prompt_id = PromptId::new();
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(selection.clone()),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: original_prompt_id,
+                text: "Retry me deliberately".to_owned(),
+            },
+        })
+        .await
+        .expect("create selected Session");
+    let mut provider_session = provider.next_start().await.succeed(AgentIdentity {
+        agent: AgentId::new("controlled"),
+        selection: selection.clone(),
+    });
+    let turn = provider_session.next_turn().await;
+    assert_eq!(turn.selection(), &selection);
+    turn.reject_selection("selected Model is unavailable");
+
+    let failed = timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = client
+                .read_session(created.session.id)
+                .await
+                .expect("read rejected Session");
+            if snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Failed)
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("selection rejection is projected");
+    assert_eq!(failed.session.agent_selection, Some(selection.clone()));
+    assert_eq!(
+        failed.session.agent_selection_availability,
+        ModelAvailability::Unavailable
+    );
+    assert_eq!(failed.turns.len(), 1);
+    assert_eq!(failed.turns[0].status, TurnStatus::Failed);
+    assert!(failed.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Error { turn_id, text, .. }
+            if *turn_id == failed.turns[0].id
+                && text.contains("selected Model is unavailable")
+    )));
+    assert_eq!(failed.prompts.len(), 2);
+    assert_eq!(failed.prompts[0].id, original_prompt_id);
+    assert_eq!(failed.prompts[0].status, PromptStatus::Delivered);
+    assert_ne!(failed.prompts[1].id, original_prompt_id);
+    assert_eq!(failed.prompts[1].text, "Retry me deliberately");
+    assert_eq!(failed.prompts[1].status, PromptStatus::Pending);
+    assert_eq!(failed.messages.len(), 1, "failed Turn history is retained");
+
+    let first_retry_prompt_id = failed.prompts[1].id;
+    let repeated_operation_id = AgentSelectionOperationId::new();
+    client
+        .update_agent_selection(
+            created.session.id,
+            UpdateAgentSelectionRequest {
+                operation_id: repeated_operation_id,
+                selection: selection.clone(),
+            },
+        )
+        .await
+        .expect("deliberately retry the same Model once");
+    let repeated = timeout(Duration::from_secs(1), provider_session.next_turn())
+        .await
+        .expect("first use of the operation schedules the restored Prompt");
+    assert_eq!(repeated.prompt(), "Retry me deliberately");
+    repeated.reject_selection("selected Model remains unavailable");
+
+    let failed_again = timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = client
+                .read_session(created.session.id)
+                .await
+                .expect("read repeatedly rejected Session");
+            if snapshot.turns.len() == 2
+                && snapshot.turns[1].status == TurnStatus::Failed
+                && snapshot.prompts.len() == 3
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("repeated selection rejection is projected");
+    assert_eq!(failed_again.turns[1].prompt_id, first_retry_prompt_id);
+    let retry_prompt_id = failed_again.prompts[2].id;
+
+    client
+        .update_agent_selection(
+            created.session.id,
+            UpdateAgentSelectionRequest {
+                operation_id: repeated_operation_id,
+                selection: selection.clone(),
+            },
+        )
+        .await
+        .expect("retry the exact prior Agent Selection operation");
+    assert!(
+        timeout(Duration::from_millis(100), provider_session.next_turn())
+            .await
+            .is_err(),
+        "an exact operation retry must not schedule a rejected Prompt"
+    );
+
+    let retry_selection = AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("available-model"),
+        options: Vec::new(),
+    };
+    client
+        .update_agent_selection(
+            created.session.id,
+            UpdateAgentSelectionRequest {
+                operation_id: AgentSelectionOperationId::new(),
+                selection: retry_selection.clone(),
+            },
+        )
+        .await
+        .expect("select an available Model for deliberate retry");
+    let retry = timeout(Duration::from_secs(1), provider_session.next_turn())
+        .await
+        .expect("restored Prompt is scheduled after Agent Selection recovery");
+    assert_eq!(retry.prompt(), "Retry me deliberately");
+    assert_eq!(retry.selection(), &retry_selection);
+    retry.succeed();
+
+    let retried = client
+        .read_session(created.session.id)
+        .await
+        .expect("read retried Session");
+    assert_eq!(retried.turns.len(), 3);
+    assert_eq!(retried.turns[2].prompt_id, retry_prompt_id);
+    assert_eq!(retried.turns[2].status, TurnStatus::Active);
+    assert_eq!(
+        retried.turns[2]
+            .agent
+            .as_ref()
+            .map(|agent| &agent.selection),
+        Some(&retry_selection)
+    );
+    assert_eq!(
+        retried.session.agent_selection_availability,
+        ModelAvailability::Available
+    );
+
+    drop(provider_session);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn authenticated_creation_returns_pending_before_async_provider_failure() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace_parent = tempfile::tempdir().expect("create workspace parent");
@@ -963,6 +1706,7 @@ async fn authenticated_creation_returns_pending_before_async_provider_failure() 
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace_parent.path().join(".").join("workspace"),
             },
@@ -1038,6 +1782,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
     let client = reqwest::Client::new();
     let prompt_id = PromptId::new();
     let request = CreateSessionRequest {
+        agent_selection: None,
         workspace: Workspace {
             path: workspace.path().to_owned(),
         },
@@ -1081,6 +1826,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
 
     for conflicting in [
         CreateSessionRequest {
+            agent_selection: None,
             workspace: request.workspace.clone(),
             prompt: InitialPrompt {
                 id: prompt_id,
@@ -1088,6 +1834,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
             },
         },
         CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: other_workspace.path().to_owned(),
             },
@@ -1151,6 +1898,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -1350,6 +2098,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -1607,6 +2356,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
 
     let created = first
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -1866,6 +2616,7 @@ async fn consecutive_prompt_admissions_and_failures_do_not_collapse_revisions() 
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -1976,6 +2727,7 @@ async fn authenticated_clients_can_read_a_session_by_id() {
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2059,6 +2811,7 @@ async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace
     let client = reqwest::Client::new();
 
     let create = |path: &std::path::Path, text: &str| CreateSessionRequest {
+        agent_selection: None,
         workspace: Workspace {
             path: path.to_owned(),
         },
@@ -2164,6 +2917,7 @@ async fn a_new_server_instance_does_not_expose_the_replaced_instances_sessions()
         .post(format!("{}/v1/sessions", original_descriptor.base_url))
         .bearer_auth(&original_descriptor.token)
         .json(&CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2220,6 +2974,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
     let unauthenticated = client
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .json(&CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2237,6 +2992,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2262,6 +3018,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().join("missing"),
             },
@@ -2304,6 +3061,7 @@ async fn authenticated_session_stream_starts_with_a_complete_revisioned_snapshot
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2401,6 +3159,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2572,6 +3331,7 @@ async fn active_session_stream_does_not_delay_graceful_server_shutdown() {
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2637,6 +3397,7 @@ async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_clie
 
     let created = first_client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2714,6 +3475,7 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
     receive_managed_client_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2784,6 +3546,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
 
     let first = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2803,6 +3566,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
     .await;
     let second = client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2929,6 +3693,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
 
     let shared = first_client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -2941,6 +3706,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
         .expect("create shared Session");
     let isolated = first_client
         .create_session(CreateSessionRequest {
+            agent_selection: None,
             workspace: Workspace {
                 path: workspace.path().to_owned(),
             },
@@ -3285,6 +4051,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
                 path: workspace.to_owned(),
             },
             agent_selection: None,
+            agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
         },
         revision: SessionRevision::INITIAL,

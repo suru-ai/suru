@@ -23,7 +23,8 @@ use tokio::{
 use super::{
     ProviderActivityId, ProviderCommandStatus, ProviderError, ProviderEvent, ProviderEventStream,
     ProviderFileChangeStatus, ProviderFuture, ProviderRuntime, ProviderSession,
-    ProviderSessionConnection, ProviderSessionRequest, ProviderTurnInput, wait_for_shutdown,
+    ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
+    wait_for_shutdown,
 };
 use crate::protocol::{
     AgentId, AgentIdentity, AgentSelection, FileChange, ModelAvailability, ModelDescriptor,
@@ -142,6 +143,7 @@ struct ThreadResumeParams<'a> {
 struct TurnStartParams<'a> {
     thread_id: &'a str,
     input: [TextInput<'a>; 1],
+    model: &'a str,
 }
 
 #[derive(Serialize)]
@@ -610,6 +612,7 @@ async fn start_codex_thread(
         thread_id: started.thread.id.clone(),
         turn_starting: false,
         active_turn_id: None,
+        active_selection: None,
         active_agent_message: None,
         active_commands: HashMap::new(),
         active_file_changes: HashMap::new(),
@@ -687,6 +690,7 @@ impl ProviderSession for CodexSession {
             let task = tokio::spawn(start_native_turn(
                 self.thread_id.clone(),
                 input.prompt,
+                input.selection,
                 self.transport.clone(),
                 self.correlation.clone(),
                 self.turn_start_changed.clone(),
@@ -696,7 +700,7 @@ impl ProviderSession for CodexSession {
         })
     }
 
-    fn steer_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
+    fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             let turn_id = self
                 .correlation
@@ -808,6 +812,7 @@ impl ProviderSession for CodexSession {
 async fn start_native_turn(
     thread_id: String,
     prompt: String,
+    selection: AgentSelection,
     transport: JsonRpcTransport,
     correlation: Arc<StdMutex<NativeCorrelation>>,
     turn_start_changed: Arc<Notify>,
@@ -822,6 +827,7 @@ async fn start_native_turn(
                         kind: "text",
                         text: &prompt,
                     }],
+                    model: selection.model.as_str(),
                 },
             )
             .await
@@ -848,6 +854,7 @@ async fn start_native_turn(
         match started {
             Ok(turn_id) if native.active_turn_id.is_none() => {
                 native.active_turn_id = Some(turn_id);
+                native.active_selection = Some(selection);
                 native.active_agent_message = None;
                 native.active_commands.clear();
                 native.active_file_changes.clear();
@@ -883,6 +890,7 @@ struct NativeCorrelation {
     thread_id: String,
     turn_starting: bool,
     active_turn_id: Option<String>,
+    active_selection: Option<AgentSelection>,
     active_agent_message: Option<ActiveNativeAgentMessage>,
     active_commands: HashMap<String, ActiveNativeCommand>,
     active_file_changes: HashMap<String, ActiveNativeFileChange>,
@@ -902,6 +910,10 @@ struct ActiveNativeFileChange {
 }
 
 enum NativeNotification {
+    AgentSelectionChanged {
+        thread_id: String,
+        model: String,
+    },
     AgentMessageStarted {
         thread_id: String,
         turn_id: String,
@@ -971,7 +983,15 @@ enum NativeNotification {
 enum NativeTurnOutcome {
     Completed,
     Interrupted,
-    Failed { message: String },
+    Failed {
+        message: String,
+        kind: NativeTurnFailureKind,
+    },
+}
+
+enum NativeTurnFailureKind {
+    BadRequest { additional_details: Option<String> },
+    Other,
 }
 
 #[derive(Deserialize)]
@@ -1099,8 +1119,77 @@ enum NativeTurnStatus {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeTurnError {
     message: String,
+    #[serde(default)]
+    codex_error_info: Option<NativeCodexErrorInfo>,
+    #[serde(default)]
+    additional_details: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum NativeCodexErrorInfo {
+    BadRequest,
+    #[serde(other)]
+    Other,
+}
+
+fn is_native_model_rejection(
+    message: &str,
+    kind: &NativeTurnFailureKind,
+    selection: &AgentSelection,
+) -> bool {
+    match kind {
+        NativeTurnFailureKind::BadRequest { additional_details } => additional_details
+            .as_deref()
+            .and_then(|details| serde_json::from_str::<Value>(details).ok())
+            .is_some_and(|details| json_identifies_model_parameter(&details)),
+        NativeTurnFailureKind::Other => {
+            let message = message.to_ascii_lowercase();
+            let selected_model = selection.model.as_str().to_ascii_lowercase();
+            message.contains("model")
+                && message.contains(&selected_model)
+                && [
+                    "unavailable",
+                    "unsupported",
+                    "not available",
+                    "not found",
+                    "does not exist",
+                    "unknown",
+                    "invalid",
+                    "access",
+                    "denied",
+                    "retired",
+                ]
+                .iter()
+                .any(|reason| message.contains(reason))
+        }
+    }
+}
+
+fn json_identifies_model_parameter(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            fields.get("param").and_then(Value::as_str) == Some("model")
+                || fields.values().any(json_identifies_model_parameter)
+        }
+        Value::Array(values) => values.iter().any(json_identifies_model_parameter),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadSettingsUpdatedParams {
+    thread_id: String,
+    thread_settings: EffectiveThreadSettings,
+}
+
+#[derive(Deserialize)]
+struct EffectiveThreadSettings {
+    model: String,
 }
 
 struct GuardedEventReceiver {
@@ -1142,6 +1231,30 @@ fn project_native_notification(
     notification: NativeNotification,
 ) -> Result<Vec<ProviderEvent>, ProviderError> {
     match notification {
+        NativeNotification::AgentSelectionChanged { thread_id, model } => {
+            if correlation.thread_id != thread_id || correlation.active_turn_id.is_none() {
+                return Ok(Vec::new());
+            }
+            if model.is_empty() {
+                return Err(codex_error(
+                    "Codex reported an empty effective Model for the active Turn",
+                ));
+            }
+            let Some(requested) = correlation.active_selection.as_ref() else {
+                return Err(codex_error(
+                    "Codex reported effective settings before accepting the active Turn",
+                ));
+            };
+            let mut effective = requested.clone();
+            effective.model = ModelId::new(model);
+            if effective == *requested {
+                return Ok(Vec::new());
+            }
+            correlation.active_selection = Some(effective.clone());
+            Ok(vec![ProviderEvent::AgentSelectionChanged {
+                selection: effective,
+            }])
+        }
         NativeNotification::AgentMessageStarted {
             thread_id,
             turn_id,
@@ -1429,14 +1542,24 @@ fn project_native_notification(
             if !is_active_native_turn(correlation, &thread_id, &turn_id) {
                 return Ok(Vec::new());
             }
+            let selection_rejected = match (&outcome, &correlation.active_selection) {
+                (NativeTurnOutcome::Failed { message, kind }, Some(selection)) => {
+                    is_native_model_rejection(message, kind, selection)
+                }
+                _ => false,
+            };
             correlation.active_turn_id = None;
+            correlation.active_selection = None;
             correlation.active_agent_message = None;
             correlation.active_commands.clear();
             correlation.active_file_changes.clear();
             Ok(vec![match outcome {
                 NativeTurnOutcome::Completed => ProviderEvent::TurnCompleted,
                 NativeTurnOutcome::Interrupted => ProviderEvent::TurnInterrupted,
-                NativeTurnOutcome::Failed { message } => ProviderEvent::TurnFailed { message },
+                NativeTurnOutcome::Failed { message, .. } if selection_rejected => {
+                    ProviderEvent::AgentSelectionRejected { message }
+                }
+                NativeTurnOutcome::Failed { message, .. } => ProviderEvent::TurnFailed { message },
             }])
         }
     }
@@ -2061,6 +2184,13 @@ fn decode_notification(
     params: Option<&Value>,
 ) -> Result<Option<NativeNotification>, ProviderError> {
     match method {
+        "thread/settings/updated" => {
+            let params: ThreadSettingsUpdatedParams = decode_notification_params(method, params)?;
+            Ok(Some(NativeNotification::AgentSelectionChanged {
+                thread_id: params.thread_id,
+                model: params.thread_settings.model,
+            }))
+        }
         "item/started" => {
             let params: ItemNotificationParams = decode_notification_params(method, params)?;
             match params.item {
@@ -2180,6 +2310,23 @@ fn decode_notification(
                             .unwrap_or("Codex Turn failed"),
                         "Codex Turn failed",
                     ),
+                    kind: match params
+                        .turn
+                        .error
+                        .as_ref()
+                        .and_then(|error| error.codex_error_info.as_ref())
+                    {
+                        Some(NativeCodexErrorInfo::BadRequest) => {
+                            NativeTurnFailureKind::BadRequest {
+                                additional_details: params
+                                    .turn
+                                    .error
+                                    .as_ref()
+                                    .and_then(|error| error.additional_details.clone()),
+                            }
+                        }
+                        Some(NativeCodexErrorInfo::Other) | None => NativeTurnFailureKind::Other,
+                    },
                 },
             };
             Ok(Some(NativeNotification::TurnCompleted {
@@ -2235,12 +2382,15 @@ fn codex_error(message: impl AsRef<str>) -> ProviderError {
 
 fn codex_error_context(context: &str, error: ProviderError) -> ProviderError {
     let session_lost = error.is_session_lost();
-    let contextual = codex_error(format!("{context}: {error}"));
+    let selection_rejected = error.is_selection_rejected();
+    let mut contextual = codex_error(format!("{context}: {error}"));
     if session_lost {
-        contextual.mark_session_lost()
-    } else {
-        contextual
+        contextual = contextual.mark_session_lost();
     }
+    if selection_rejected {
+        contextual = contextual.mark_selection_rejected();
+    }
+    contextual
 }
 
 fn terminate_transport(state: &TransportState, error: ProviderError) {

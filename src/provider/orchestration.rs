@@ -14,7 +14,8 @@ use tokio::{
 
 use super::{
     ProviderCommandStatus, ProviderEvent, ProviderEventStream, ProviderFileChangeStatus,
-    ProviderRuntime, ProviderSession, ProviderSessionRequest, ProviderTurnInput, wait_for_shutdown,
+    ProviderRuntime, ProviderSession, ProviderSessionRequest, ProviderSteerInput,
+    ProviderTurnInput, wait_for_shutdown,
 };
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AgentIdentity, Message, MessageId, MessageRole,
@@ -382,7 +383,7 @@ async fn run_provider_session(
                 let (identity, session, events) = connection.into_parts();
                 let selection = identity.selection.clone();
                 let Some(selected) =
-                    updates.apply(|| sessions.update_agent_selection(session_id, selection))
+                    updates.apply(|| sessions.initialize_agent_selection(session_id, selection))
                 else {
                     let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
                     break;
@@ -417,7 +418,7 @@ async fn run_provider_session(
                 sessions.deliver_prompt(
                     session_id,
                     prompt_id,
-                    Some(identity),
+                    Some(identity.agent.clone()),
                     DeliveredTurnStatus::Active,
                 )
             }) else {
@@ -433,30 +434,22 @@ async fn run_provider_session(
                 .expect("Provider connection exists before Prompt delivery")
                 .session
                 .clone();
+            let (turn_id, input) = provider_turn_start(delivered);
             let started = tokio::select! {
                 biased;
                 _ = wait_for_shutdown(&mut shutdown) => break 'actor,
-                started = provider_session.start_turn(ProviderTurnInput {
-                    prompt: delivered.prompt.text,
-                }) => started,
+                started = provider_session.start_turn(input) => started,
             };
             if let Err(error) = started {
                 let session_lost = error.is_session_lost();
-                let _ = updates.apply(|| {
-                    sessions.fail_turn(
-                        session_id,
-                        delivered.turn.id,
-                        UnfinishedProviderOutput::default(),
-                        format!("Provider execution failed: {error}"),
-                    )
-                });
+                project_turn_start_failure(&sessions, &updates, session_id, turn_id, &error);
                 if session_lost {
                     provider = None;
                 }
                 continue;
             }
             active = Some(ActiveProviderTurn {
-                turn_id: delivered.turn.id,
+                turn_id,
                 streaming_message_id: None,
                 interruption_acknowledged: false,
                 command_activities: HashMap::new(),
@@ -501,7 +494,7 @@ async fn run_provider_session(
                 let steered = tokio::select! {
                     biased;
                     _ = wait_for_shutdown(&mut shutdown) => break 'actor,
-                    steered = provider_session.steer_turn(ProviderTurnInput {
+                    steered = provider_session.steer_turn(ProviderSteerInput {
                         prompt: prompt.text.clone(),
                     }) => steered,
                 };
@@ -592,29 +585,23 @@ async fn run_provider_session(
                         ) {
                             active = None;
                             if let Some(delivered) = next_turn {
+                                let (turn_id, input) = provider_turn_start(delivered);
                                 let started = tokio::select! {
                                     biased;
                                     _ = wait_for_shutdown(&mut shutdown) => break 'actor,
-                                    started = provider_session.start_turn(ProviderTurnInput {
-                                        prompt: delivered.prompt.text,
-                                    }) => started,
+                                    started = provider_session.start_turn(input) => started,
                                 };
                                 if let Err(error) = started {
                                     let session_lost = error.is_session_lost();
-                                    let _ = updates.apply(|| {
-                                        sessions.fail_turn(
-                                            session_id,
-                                            delivered.turn.id,
-                                            UnfinishedProviderOutput::default(),
-                                            format!("Provider execution failed: {error}"),
-                                        )
-                                    });
+                                    project_turn_start_failure(
+                                        &sessions, &updates, session_id, turn_id, &error,
+                                    );
                                     if session_lost {
                                         provider = None;
                                     }
                                 } else {
                                     active = Some(ActiveProviderTurn {
-                                        turn_id: delivered.turn.id,
+                                        turn_id,
                                         streaming_message_id: None,
                                         interruption_acknowledged: false,
                                         command_activities: HashMap::new(),
@@ -661,6 +648,50 @@ async fn run_provider_session(
     }
 }
 
+fn provider_turn_start(delivered: DeliveredTurn) -> (TurnId, ProviderTurnInput) {
+    let turn_id = delivered.turn.id;
+    let selection = delivered
+        .turn
+        .agent
+        .expect("a connected Provider delivers a selected Turn")
+        .selection;
+    (
+        turn_id,
+        ProviderTurnInput {
+            prompt: delivered.prompt.text,
+            selection,
+        },
+    )
+}
+
+fn project_turn_start_failure(
+    sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
+    session_id: SessionId,
+    turn_id: TurnId,
+    error: &super::ProviderError,
+) {
+    let selection_rejected = error.is_selection_rejected();
+    let _ = updates.apply(|| {
+        let message = format!("Provider execution failed: {error}");
+        if selection_rejected {
+            sessions.reject_agent_selection(
+                session_id,
+                turn_id,
+                UnfinishedProviderOutput::default(),
+                message,
+            )
+        } else {
+            sessions.fail_turn(
+                session_id,
+                turn_id,
+                UnfinishedProviderOutput::default(),
+                message,
+            )
+        }
+    });
+}
+
 fn project_provider_event(
     sessions: &SessionStore,
     updates: &ProviderUpdateGate,
@@ -671,6 +702,14 @@ fn project_provider_event(
 ) -> ProviderEventProjection {
     let Some(projected) = updates.apply(|| {
         let projection = match event {
+            ProviderEvent::AgentSelectionChanged { selection } => sessions
+                .reconcile_effective_agent_selection(
+                    session_id,
+                    active.turn_id,
+                    next_agent.agent.clone(),
+                    selection,
+                )
+                .map(|_| ProviderEventProjection::Continue),
             ProviderEvent::AgentMessageStarted => {
                 if active.streaming_message_id.is_some() {
                     Err(anyhow::anyhow!(
@@ -927,7 +966,7 @@ fn project_provider_event(
                         .finish_provider_turn(
                             session_id,
                             active.turn_id,
-                            next_agent.clone(),
+                            next_agent.agent.clone(),
                             ProviderTurnOutcome::Completed,
                         )
                         .map(ProviderEventProjection::Terminal)
@@ -939,10 +978,16 @@ fn project_provider_event(
                     .finish_provider_turn(
                         session_id,
                         active.turn_id,
-                        next_agent.clone(),
+                        next_agent.agent.clone(),
                         ProviderTurnOutcome::Interrupted { unfinished_output },
                     )
                     .map(ProviderEventProjection::Terminal)
+            }
+            ProviderEvent::AgentSelectionRejected { message } => {
+                let unfinished_output = active.take_unfinished_output();
+                sessions
+                    .reject_agent_selection(session_id, active.turn_id, unfinished_output, message)
+                    .map(|_| ProviderEventProjection::Terminal(None))
             }
             ProviderEvent::TurnFailed { message } => {
                 let unfinished_output = active.take_unfinished_output();
@@ -950,7 +995,7 @@ fn project_provider_event(
                     .finish_provider_turn(
                         session_id,
                         active.turn_id,
-                        next_agent.clone(),
+                        next_agent.agent.clone(),
                         ProviderTurnOutcome::Failed {
                             unfinished_output,
                             message,
@@ -1003,7 +1048,7 @@ fn finish_invalid_provider_event(
         .finish_provider_turn(
             session_id,
             active.turn_id,
-            next_agent.clone(),
+            next_agent.agent.clone(),
             ProviderTurnOutcome::Failed {
                 unfinished_output,
                 message,

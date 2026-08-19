@@ -1001,6 +1001,7 @@ impl Application {
                     prompt: prompt.clone(),
                 });
                 Ok(ApplicationTransition::CreateSession(CreateSessionRequest {
+                    agent_selection: None,
                     workspace: Workspace {
                         path: self.state.workspace.clone(),
                     },
@@ -3539,7 +3540,8 @@ mod tests {
     use super::slots::{Placement, RenderSlots, TestContribution};
     use super::{Application, ApplicationEvent, SessionEvent};
     use crate::protocol::{
-        Session, SessionId, SessionRevision, SessionSnapshot, SessionStatus, Workspace,
+        ModelAvailability, Session, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
+        Workspace,
     };
 
     fn rendered_buffer(application: &Application) -> Buffer {
@@ -3656,6 +3658,7 @@ mod tests {
                             path: PathBuf::from("/workspace"),
                         },
                         agent_selection: None,
+                        agent_selection_availability: ModelAvailability::Available,
                         status: SessionStatus::Idle,
                     },
                     revision: SessionRevision::INITIAL,

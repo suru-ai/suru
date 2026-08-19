@@ -2,13 +2,14 @@ use std::path::PathBuf;
 
 use chidori::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-    AgentSelection, CreateSessionRequest, FileChange, InitialPrompt, Message, MessageId,
-    MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
-    ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
-    ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder,
-    PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
-    SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-    SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+    AgentSelection, AgentSelectionOperationId, CreateSessionRequest, FileChange, InitialPrompt,
+    Message, MessageId, MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId,
+    ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
+    ModelOptionRole, ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId,
+    PromptOrder, PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode,
+    SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
+    SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest,
+    Workspace,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -82,6 +83,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
                 model: ModelId::new("gpt-5"),
                 options: Vec::new(),
             }),
+            agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Active,
         },
         title: "Explain this workspace".to_owned(),
@@ -97,6 +99,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
             "model": "gpt-5",
             "options": []
         },
+        "agent_selection_availability": "available",
         "status": "active",
         "created_at": 1_755_497_600_000_u64,
         "updated_at": 1_755_497_600_321_u64
@@ -130,6 +133,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                     },
                 }],
             }),
+            agent_selection_availability: ModelAvailability::Unavailable,
             status: SessionStatus::Idle,
         },
         revision: SessionRevision(7),
@@ -195,6 +199,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                     "value": { "type": "select", "choice": "high" }
                 }]
             },
+            "agent_selection_availability": "unavailable",
             "status": "idle"
         },
         "revision": 7,
@@ -604,6 +609,7 @@ fn agent_selection_change_is_typed_and_replaceable() {
 #[test]
 fn initial_session_command_round_trips_through_json() {
     let command = CreateSessionRequest {
+        agent_selection: None,
         workspace: Workspace {
             path: PathBuf::from("/work/chidori"),
         },
@@ -613,6 +619,7 @@ fn initial_session_command_round_trips_through_json() {
         },
     };
     let expected = json!({
+        "agent_selection": null,
         "workspace": { "path": "/work/chidori" },
         "prompt": {
             "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
@@ -627,6 +634,51 @@ fn initial_session_command_round_trips_through_json() {
     assert_eq!(
         serde_json::from_value::<CreateSessionRequest>(expected).expect("decode command"),
         command
+    );
+}
+
+#[test]
+fn agent_selection_command_round_trips_with_its_operation_identity() {
+    let command = UpdateAgentSelectionRequest {
+        operation_id: AgentSelectionOperationId::from_uuid(fixture_id(
+            "0198b27e-3aa1-72dd-9ec8-65398d17ec16",
+        )),
+        selection: AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("gpt-5.6-codex"),
+            options: Vec::new(),
+        },
+    };
+    let expected = json!({
+        "operation_id": "0198b27e-3aa1-72dd-9ec8-65398d17ec16",
+        "selection": {
+            "provider": "codex",
+            "model": "gpt-5.6-codex",
+            "options": []
+        }
+    });
+
+    assert_eq!(
+        serde_json::to_value(&command).expect("encode Agent Selection command"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<UpdateAgentSelectionRequest>(expected)
+            .expect("decode Agent Selection command"),
+        command
+    );
+    assert!(
+        serde_json::from_value::<UpdateAgentSelectionRequest>(json!({
+            "operation_id": "0198b27e-3aa1-72dd-9ec8-65398d17ec16",
+            "selection": {
+                "provider": "codex",
+                "model": "gpt-5.6-codex",
+                "options": []
+            },
+            "unexpected": true
+        }))
+        .is_err(),
+        "Agent Selection commands reject unknown fields"
     );
 }
 

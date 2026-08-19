@@ -6,8 +6,8 @@ use futures_util::Stream;
 use tokio::sync::watch;
 
 use crate::protocol::{
-    AgentIdentity, FileChange, ModelDescriptor, ModelOptionKind, ModelOptionRole, ProviderId,
-    SessionId,
+    AgentIdentity, AgentSelection, FileChange, ModelDescriptor, ModelOptionKind, ModelOptionRole,
+    ProviderId, SessionId,
 };
 
 mod codex;
@@ -25,6 +25,13 @@ pub type ProviderEventStream =
 pub struct ProviderError {
     message: String,
     session_lost: bool,
+    kind: ProviderErrorKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderErrorKind {
+    Failure,
+    SelectionRejected,
 }
 
 impl ProviderError {
@@ -32,6 +39,15 @@ impl ProviderError {
         Self {
             message: message.into(),
             session_lost: false,
+            kind: ProviderErrorKind::Failure,
+        }
+    }
+
+    pub fn selection_rejected(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            session_lost: false,
+            kind: ProviderErrorKind::SelectionRejected,
         }
     }
 
@@ -42,6 +58,15 @@ impl ProviderError {
 
     pub(crate) fn is_session_lost(&self) -> bool {
         self.session_lost
+    }
+
+    pub(crate) fn mark_selection_rejected(mut self) -> Self {
+        self.kind = ProviderErrorKind::SelectionRejected;
+        self
+    }
+
+    pub(crate) fn is_selection_rejected(&self) -> bool {
+        self.kind == ProviderErrorKind::SelectionRejected
     }
 }
 
@@ -61,6 +86,12 @@ pub struct ProviderSessionRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderTurnInput {
+    pub prompt: String,
+    pub selection: AgentSelection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderSteerInput {
     pub prompt: String,
 }
 
@@ -87,6 +118,9 @@ pub enum ProviderFileChangeStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderEvent {
+    AgentSelectionChanged {
+        selection: AgentSelection,
+    },
     AgentMessageStarted,
     AgentMessageDelta {
         content: String,
@@ -120,6 +154,9 @@ pub enum ProviderEvent {
     },
     TurnCompleted,
     TurnInterrupted,
+    AgentSelectionRejected {
+        message: String,
+    },
     TurnFailed {
         message: String,
     },
@@ -189,7 +226,7 @@ pub(crate) fn validate_models(models: &[ModelDescriptor]) -> Result<(), Provider
 pub trait ProviderSession: Send + Sync + 'static {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()>;
 
-    fn steer_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()>;
+    fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()>;
 
     fn interrupt_turn(&self) -> ProviderFuture<'_, ()>;
 

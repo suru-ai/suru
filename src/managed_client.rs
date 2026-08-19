@@ -15,9 +15,9 @@ use tokio::{
 use crate::{
     RuntimeConfig,
     protocol::{
-        AdmitPromptRequest, CreateSessionRequest, Health, LifecycleState, ModelCatalog, Prompt,
-        PromptId, RuntimeDescriptor, ServerShutdown, SessionError, SessionId, SessionSnapshot,
-        SessionSummary, ShutdownReason, Turn, TurnId,
+        AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, LifecycleState,
+        ModelCatalog, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionError, SessionId,
+        SessionSnapshot, SessionSummary, ShutdownReason, Turn, TurnId, UpdateAgentSelectionRequest,
     },
 };
 
@@ -172,6 +172,16 @@ impl ManagedClient {
             .await
     }
 
+    pub async fn update_agent_selection(
+        &self,
+        session_id: SessionId,
+        request: UpdateAgentSelectionRequest,
+    ) -> Result<AgentSelection> {
+        self.session_commands()
+            .update_agent_selection(session_id, request)
+            .await
+    }
+
     pub async fn subscribe_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
         self.session_commands().subscribe_session(session_id).await
     }
@@ -264,6 +274,19 @@ impl SessionCommandClient {
             &format!("/v1/sessions/{session_id}/prompts"),
             &request,
             "Prompt admission",
+        )
+        .await
+    }
+
+    pub(crate) async fn update_agent_selection(
+        &self,
+        session_id: SessionId,
+        request: UpdateAgentSelectionRequest,
+    ) -> Result<AgentSelection> {
+        self.post_session_command(
+            &format!("/v1/sessions/{session_id}/agent-selection"),
+            &request,
+            "Agent Selection update",
         )
         .await
     }
