@@ -211,9 +211,16 @@ pub(crate) fn validate_models(models: &[ModelDescriptor]) -> Result<(), Provider
                         model.id, option.id
                     )));
                 }
-                if !choices.iter().any(|choice| choice.id == *default) {
+                let Some(default_choice) = choices.iter().find(|choice| choice.id == *default)
+                else {
                     return Err(ProviderError::new(format!(
                         "Model `{}` option `{}` has a default that is not one of its choices",
+                        model.id, option.id
+                    )));
+                };
+                if default_choice.availability != crate::protocol::ModelAvailability::Available {
+                    return Err(ProviderError::new(format!(
+                        "Model `{}` option `{}` has an unavailable default",
                         model.id, option.id
                     )));
                 }

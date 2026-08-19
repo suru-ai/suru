@@ -150,18 +150,48 @@ struct TurnStartParams<'a> {
     model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     effort: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    service_tier: Option<Option<&'a str>>,
+    #[serde(
+        skip_serializing_if = "NativeServiceTierOverride::is_omitted",
+        serialize_with = "serialize_native_service_tier"
+    )]
+    service_tier: NativeServiceTierOverride<'a>,
 }
 
 struct NativeTurnOptions<'a> {
     effort: Option<&'a str>,
-    service_tier: Option<Option<&'a str>>,
+    service_tier: NativeServiceTierOverride<'a>,
+}
+
+enum NativeServiceTierOverride<'a> {
+    Omitted,
+    Clear,
+    Value(&'a str),
+}
+
+impl NativeServiceTierOverride<'_> {
+    fn is_omitted(&self) -> bool {
+        matches!(self, Self::Omitted)
+    }
+}
+
+fn serialize_native_service_tier<S>(
+    service_tier: &NativeServiceTierOverride<'_>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match service_tier {
+        NativeServiceTierOverride::Omitted | NativeServiceTierOverride::Clear => {
+            serializer.serialize_none()
+        }
+        NativeServiceTierOverride::Value(value) => serializer.serialize_str(value),
+    }
 }
 
 fn lower_turn_options(selection: &AgentSelection) -> Result<NativeTurnOptions<'_>, ProviderError> {
     let mut effort = None;
-    let mut service_tier = None;
+    let mut service_tier = NativeServiceTierOverride::Omitted;
     for option in &selection.options {
         let ModelOptionValue::Select { choice } = &option.value else {
             return Err(ProviderError::selection_rejected(format!(
@@ -173,10 +203,12 @@ fn lower_turn_options(selection: &AgentSelection) -> Result<NativeTurnOptions<'_
             REASONING_EFFORT_OPTION_ID if effort.is_none() => {
                 effort = Some(choice.as_str());
             }
-            SERVICE_TIER_OPTION_ID if service_tier.is_none() => {
-                service_tier = Some(
-                    (choice.as_str() != DEFAULT_SERVICE_TIER_CHOICE_ID).then(|| choice.as_str()),
-                );
+            SERVICE_TIER_OPTION_ID if service_tier.is_omitted() => {
+                service_tier = if choice.as_str() == DEFAULT_SERVICE_TIER_CHOICE_ID {
+                    NativeServiceTierOverride::Clear
+                } else {
+                    NativeServiceTierOverride::Value(choice.as_str())
+                };
             }
             REASONING_EFFORT_OPTION_ID | SERVICE_TIER_OPTION_ID => {
                 return Err(ProviderError::selection_rejected(format!(
@@ -661,7 +693,7 @@ async fn start_codex_thread(
         .insert(request.session_id, CodexThreadId(started.thread.id.clone()));
 
     let mut initial_options = Vec::new();
-    if let Some(effort) = started.reasoning_effort {
+    if let NativeField::Present(Some(effort)) = started.reasoning_effort {
         initial_options.push(ModelOptionSelection {
             id: ModelOptionId::new(REASONING_EFFORT_OPTION_ID),
             value: ModelOptionValue::Select {
@@ -669,11 +701,13 @@ async fn start_codex_thread(
             },
         });
     }
-    if let Some(service_tier) = started.service_tier {
+    if let NativeField::Present(service_tier) = started.service_tier {
         initial_options.push(ModelOptionSelection {
             id: ModelOptionId::new(SERVICE_TIER_OPTION_ID),
             value: ModelOptionValue::Select {
-                choice: ModelOptionChoiceId::new(service_tier),
+                choice: ModelOptionChoiceId::new(
+                    service_tier.unwrap_or_else(|| DEFAULT_SERVICE_TIER_CHOICE_ID.to_owned()),
+                ),
             },
         });
     }
@@ -724,10 +758,10 @@ async fn start_codex_thread(
 struct ThreadConnectionResult {
     thread: NativeThread,
     model: String,
-    #[serde(default)]
-    reasoning_effort: Option<String>,
-    #[serde(default)]
-    service_tier: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_native_field")]
+    reasoning_effort: NativeField<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_native_field")]
+    service_tier: NativeField<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -1388,13 +1422,13 @@ fn project_native_notification(
                 &mut effective,
                 REASONING_EFFORT_OPTION_ID,
                 effort,
-                None,
+                NativeClearMapping::RemoveOption,
             )?;
             apply_effective_select_option(
                 &mut effective,
                 SERVICE_TIER_OPTION_ID,
                 service_tier,
-                Some(DEFAULT_SERVICE_TIER_CHOICE_ID),
+                NativeClearMapping::Select(DEFAULT_SERVICE_TIER_CHOICE_ID),
             )?;
             if effective == *requested {
                 return Ok(Vec::new());
@@ -1718,15 +1752,15 @@ fn apply_effective_select_option(
     selection: &mut AgentSelection,
     option_id: &str,
     field: NativeField<Option<String>>,
-    cleared_choice: Option<&str>,
+    clear: NativeClearMapping,
 ) -> Result<(), ProviderError> {
     let NativeField::Present(value) = field else {
         return Ok(());
     };
-    let choice = match (value, cleared_choice) {
+    let choice = match (value, clear) {
         (Some(choice), _) => choice,
-        (None, Some(choice)) => choice.to_owned(),
-        (None, None) => {
+        (None, NativeClearMapping::Select(choice)) => choice.to_owned(),
+        (None, NativeClearMapping::RemoveOption) => {
             selection
                 .options
                 .retain(|option| option.id.as_str() != option_id);
@@ -1754,6 +1788,11 @@ fn apply_effective_select_option(
         });
     }
     Ok(())
+}
+
+enum NativeClearMapping {
+    RemoveOption,
+    Select(&'static str),
 }
 
 fn is_active_native_turn(correlation: &NativeCorrelation, thread_id: &str, turn_id: &str) -> bool {

@@ -5,7 +5,8 @@ use tokio::sync::watch;
 
 use crate::{
     protocol::{
-        ModelCatalog, ModelDescriptor, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
+        AgentSelection, ModelCatalog, ModelDescriptor, ProviderCatalogStatus, ProviderId,
+        ProviderModelCatalog,
     },
     provider::{ProviderError, ProviderRuntime, validate_models},
 };
@@ -57,6 +58,41 @@ impl ModelCatalogService {
         ModelCatalog {
             providers: join_all(self.providers.iter().map(ProviderCatalog::refresh)).await,
         }
+    }
+
+    pub(crate) fn default_selection(&self, provider: &ProviderId) -> Option<AgentSelection> {
+        self.cached_models(provider)?
+            .iter()
+            .find(|model| model.is_default)
+            .map(ModelDescriptor::default_agent_selection)
+    }
+
+    pub(crate) fn normalize_selection(
+        &self,
+        selection: &AgentSelection,
+    ) -> Result<AgentSelection, String> {
+        let Some(model) = self.cached_models(&selection.provider).and_then(|models| {
+            models
+                .iter()
+                .find(|model| model.id == selection.model)
+                .cloned()
+        }) else {
+            return Ok(selection.clone());
+        };
+        model
+            .materialize_agent_selection(Some(selection))
+            .map_err(|error| error.to_string())
+    }
+
+    fn cached_models(&self, provider: &ProviderId) -> Option<Vec<ModelDescriptor>> {
+        self.providers
+            .iter()
+            .find(|catalog| &catalog.provider == provider)?
+            .state
+            .lock()
+            .expect("Model catalog lock is not poisoned")
+            .models
+            .clone()
     }
 }
 

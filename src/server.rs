@@ -469,7 +469,7 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
 }
 
 async fn create_session(State(state): State<AppState>, request: Request) -> Response {
-    let request =
+    let mut request =
         match decode_session_command::<CreateSessionRequest>(&state, request, "Session creation")
             .await
         {
@@ -483,6 +483,14 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         .is_some_and(|selection| selection.provider != state.provider_id)
     {
         return agent_selection_provider_conflict_response();
+    }
+    if let Some(selection) = request.agent_selection.as_ref() {
+        request.agent_selection = match state.model_catalog.normalize_selection(selection) {
+            Ok(selection) => Some(selection),
+            Err(message) => return invalid_agent_selection_response(message),
+        };
+    } else {
+        request.agent_selection = state.model_catalog.default_selection(&state.provider_id);
     }
 
     match state.sessions.create(request) {
@@ -514,7 +522,7 @@ async fn update_agent_selection(
     AxumPath(session_id): AxumPath<SessionId>,
     request: Request,
 ) -> Response {
-    let request = match decode_session_command::<UpdateAgentSelectionRequest>(
+    let mut request = match decode_session_command::<UpdateAgentSelectionRequest>(
         &state,
         request,
         "Agent Selection update",
@@ -527,6 +535,10 @@ async fn update_agent_selection(
     if request.selection.provider != state.provider_id {
         return agent_selection_provider_conflict_response();
     }
+    request.selection = match state.model_catalog.normalize_selection(&request.selection) {
+        Ok(selection) => selection,
+        Err(message) => return invalid_agent_selection_response(message),
+    };
     match state
         .sessions
         .apply_agent_selection_command(session_id, request)
@@ -561,6 +573,14 @@ fn agent_selection_provider_conflict_response() -> Response {
         StatusCode::CONFLICT,
         SessionErrorCode::AgentSelectionProviderConflict,
         "An existing Session cannot change Provider",
+    )
+}
+
+fn invalid_agent_selection_response(message: String) -> Response {
+    session_error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        SessionErrorCode::InvalidCommand,
+        format!("Agent Selection is invalid: {message}"),
     )
 }
 

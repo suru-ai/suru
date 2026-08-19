@@ -972,7 +972,9 @@ fn model_descriptors_materialize_complete_defaults_and_preserve_valid_same_model
         ],
     };
     assert_eq!(
-        descriptor.materialize_agent_selection(Some(&other_model)),
+        descriptor
+            .materialize_agent_selection(Some(&other_model))
+            .expect("switching Models materializes defaults"),
         defaults,
         "switching Models uses the target Model's defaults"
     );
@@ -994,8 +996,39 @@ fn model_descriptors_materialize_complete_defaults_and_preserve_valid_same_model
         ],
     };
     assert_eq!(
-        descriptor.materialize_agent_selection(Some(&same_model)),
+        descriptor
+            .materialize_agent_selection(Some(&same_model))
+            .expect("same-Model options are valid"),
         same_model,
         "reopening the same Model preserves its complete current options"
+    );
+
+    let incomplete = AgentSelection {
+        options: same_model.options[..1].to_vec(),
+        ..same_model.clone()
+    };
+    assert!(
+        descriptor
+            .materialize_agent_selection(Some(&incomplete))
+            .is_err(),
+        "same-Model options are never silently replaced with defaults"
+    );
+    let unavailable = AgentSelection {
+        options: vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning-opaque"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("retired-opaque"),
+                },
+            },
+            same_model.options[1].clone(),
+        ],
+        ..same_model
+    };
+    assert!(
+        descriptor
+            .materialize_agent_selection(Some(&unavailable))
+            .is_err(),
+        "unavailable same-Model choices remain an explicit error"
     );
 }

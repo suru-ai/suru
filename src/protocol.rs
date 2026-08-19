@@ -139,6 +139,33 @@ pub struct ModelDescriptor {
     pub options: Vec<ModelOptionDescriptor>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentSelectionMaterializationError {
+    IncompleteOptions { option: ModelOptionId },
+    InvalidOptionValue { option: ModelOptionId },
+}
+
+impl fmt::Display for AgentSelectionMaterializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IncompleteOptions { option } => {
+                write!(
+                    formatter,
+                    "Model Option `{option}` is missing or duplicated"
+                )
+            }
+            Self::InvalidOptionValue { option } => {
+                write!(
+                    formatter,
+                    "Model Option `{option}` has an unavailable value"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for AgentSelectionMaterializationError {}
+
 impl ModelDescriptor {
     pub fn default_agent_selection(&self) -> AgentSelection {
         AgentSelection {
@@ -147,26 +174,95 @@ impl ModelDescriptor {
             options: self
                 .options
                 .iter()
-                .map(|option| ModelOptionSelection {
-                    id: option.id.clone(),
-                    value: match &option.kind {
-                        ModelOptionKind::Select { default, .. } => ModelOptionValue::Select {
-                            choice: default.clone(),
-                        },
-                        ModelOptionKind::Toggle { default } => {
-                            ModelOptionValue::Toggle { enabled: *default }
-                        }
-                    },
-                })
+                .map(ModelOptionDescriptor::default_selection)
                 .collect(),
         }
     }
 
-    pub fn materialize_agent_selection(&self, current: Option<&AgentSelection>) -> AgentSelection {
-        current
+    pub fn materialize_agent_selection(
+        &self,
+        current: Option<&AgentSelection>,
+    ) -> Result<AgentSelection, AgentSelectionMaterializationError> {
+        let Some(current) = current
             .filter(|selection| selection.provider == self.provider && selection.model == self.id)
-            .cloned()
-            .unwrap_or_else(|| self.default_agent_selection())
+        else {
+            return Ok(self.default_agent_selection());
+        };
+        let options = self
+            .options
+            .iter()
+            .map(|descriptor| {
+                let mut matching = current
+                    .options
+                    .iter()
+                    .filter(|selection| selection.id == descriptor.id);
+                let selection = matching.next().ok_or_else(|| {
+                    AgentSelectionMaterializationError::IncompleteOptions {
+                        option: descriptor.id.clone(),
+                    }
+                })?;
+                if matching.next().is_some() {
+                    return Err(AgentSelectionMaterializationError::IncompleteOptions {
+                        option: descriptor.id.clone(),
+                    });
+                }
+                if !descriptor.value_is_available(&selection.value) {
+                    return Err(AgentSelectionMaterializationError::InvalidOptionValue {
+                        option: descriptor.id.clone(),
+                    });
+                }
+                Ok(selection.clone())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if current.options.len() != self.options.len() {
+            let option = current
+                .options
+                .iter()
+                .find(|selection| {
+                    !self
+                        .options
+                        .iter()
+                        .any(|descriptor| descriptor.id == selection.id)
+                })
+                .map(|selection| selection.id.clone())
+                .or_else(|| self.options.first().map(|descriptor| descriptor.id.clone()))
+                .expect("different option counts expose an extra or expected option");
+            return Err(AgentSelectionMaterializationError::IncompleteOptions { option });
+        }
+        Ok(AgentSelection {
+            provider: self.provider.clone(),
+            model: self.id.clone(),
+            options,
+        })
+    }
+}
+
+impl ModelOptionDescriptor {
+    fn default_selection(&self) -> ModelOptionSelection {
+        ModelOptionSelection {
+            id: self.id.clone(),
+            value: match &self.kind {
+                ModelOptionKind::Select { default, .. } => ModelOptionValue::Select {
+                    choice: default.clone(),
+                },
+                ModelOptionKind::Toggle { default } => {
+                    ModelOptionValue::Toggle { enabled: *default }
+                }
+            },
+        }
+    }
+
+    fn value_is_available(&self, value: &ModelOptionValue) -> bool {
+        match (&self.kind, value) {
+            (ModelOptionKind::Toggle { .. }, ModelOptionValue::Toggle { .. }) => true,
+            (ModelOptionKind::Select { choices, .. }, ModelOptionValue::Select { choice }) => {
+                choices.iter().any(|candidate| {
+                    candidate.id == *choice
+                        && candidate.availability == ModelAvailability::Available
+                })
+            }
+            _ => false,
+        }
     }
 }
 
