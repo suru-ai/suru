@@ -64,6 +64,7 @@ impl TranscriptCache {
             generation,
             session_id: snapshot.session.id,
             revision: snapshot.revision,
+            theme: *theme,
             width,
             provisional_fingerprint: provisional_fingerprint(provisional),
         };
@@ -88,6 +89,7 @@ struct ViewKey {
     generation: u64,
     session_id: SessionId,
     revision: SessionRevision,
+    theme: Theme,
     width: u16,
     provisional_fingerprint: u64,
 }
@@ -191,6 +193,7 @@ fn rebuild(
         .filter(|view| {
             view.key.generation == key.generation
                 && view.key.session_id == key.session_id
+                && view.key.theme == key.theme
                 && view.key.width == key.width
         })
         .map(|view| {
@@ -624,7 +627,7 @@ fn push_styled_prefixed_lines(
     base_style: Style,
     theme: &Theme,
 ) {
-    let mut style = base_style;
+    let mut style = SgrStyle::new(base_style);
     let mut hyperlink_active = false;
     let mut spans = vec![Span::styled(prefix.to_owned(), base_style)];
     let mut line_has_content = false;
@@ -634,11 +637,11 @@ fn push_styled_prefixed_lines(
             ContentToken::Text(text) if !text.is_empty() => {
                 spans.push(Span::styled(
                     text,
-                    activity_content_style(style, hyperlink_active, theme),
+                    activity_content_style(style.rendered, hyperlink_active, theme),
                 ));
                 line_has_content = true;
             }
-            ContentToken::Sgr(sequence) => apply_sgr(&sequence, &mut style, base_style),
+            ContentToken::Sgr(sequence) => apply_sgr(&sequence, &mut style, base_style, theme),
             ContentToken::LinkStart(target) => {
                 projection.links.push(TranscriptLink { target });
                 hyperlink_active = true;
@@ -647,7 +650,7 @@ fn push_styled_prefixed_lines(
             ContentToken::Tab => {
                 spans.push(Span::styled(
                     "    ",
-                    activity_content_style(style, hyperlink_active, theme),
+                    activity_content_style(style.rendered, hyperlink_active, theme),
                 ));
                 line_has_content = true;
             }
@@ -666,6 +669,65 @@ fn push_styled_prefixed_lines(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum AnsiForeground {
+    Normal(u16),
+    Bright,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SgrStyle {
+    rendered: Style,
+    ansi_foreground: Option<AnsiForeground>,
+    bold_active: bool,
+}
+
+impl SgrStyle {
+    fn new(base_style: Style) -> Self {
+        Self {
+            rendered: base_style,
+            ansi_foreground: None,
+            bold_active: false,
+        }
+    }
+
+    fn reset(&mut self, base_style: Style) {
+        *self = Self::new(base_style);
+    }
+
+    fn set_bold(&mut self, theme: &Theme) {
+        self.bold_active = true;
+        self.rendered = self.rendered.add_modifier(Modifier::BOLD);
+        if let Some(AnsiForeground::Normal(index)) = self.ansi_foreground {
+            self.rendered.fg = theme.ansi.color(index, true);
+        }
+    }
+
+    fn reset_intensity(&mut self, theme: &Theme) {
+        self.bold_active = false;
+        self.rendered = self
+            .rendered
+            .remove_modifier(Modifier::BOLD | Modifier::DIM);
+        if let Some(AnsiForeground::Normal(index)) = self.ansi_foreground {
+            self.rendered.fg = theme.ansi.color(index, false);
+        }
+    }
+
+    fn set_normal_foreground(&mut self, index: u16, theme: &Theme) {
+        self.ansi_foreground = Some(AnsiForeground::Normal(index));
+        self.rendered.fg = theme.ansi.color(index, self.bold_active);
+    }
+
+    fn set_bright_foreground(&mut self, index: u16, theme: &Theme) {
+        self.ansi_foreground = Some(AnsiForeground::Bright);
+        self.rendered.fg = theme.ansi.color(index, true);
+    }
+
+    fn clear_ansi_foreground(&mut self) {
+        self.ansi_foreground = None;
+    }
+}
+
 fn activity_content_style(style: Style, hyperlink_active: bool, theme: &Theme) -> Style {
     if hyperlink_active {
         style.patch(theme.markdown.link)
@@ -674,7 +736,7 @@ fn activity_content_style(style: Style, hyperlink_active: bool, theme: &Theme) -
     }
 }
 
-fn apply_sgr(sequence: &str, style: &mut Style, base_style: Style) {
+fn apply_sgr(sequence: &str, style: &mut SgrStyle, base_style: Style, theme: &Theme) {
     let Some(parameters) = sequence
         .strip_prefix("\x1b[")
         .and_then(|sequence| sequence.strip_suffix('m'))
@@ -689,7 +751,10 @@ fn apply_sgr(sequence: &str, style: &mut Style, base_style: Style) {
     let mut index = 0;
     while index < parameters.len() {
         if parameters[index].contains(':') {
-            apply_colon_color(parameters[index], style);
+            if parameters[index].starts_with("38:") {
+                style.clear_ansi_foreground();
+            }
+            apply_colon_color(parameters[index], &mut style.rendered);
             index += 1;
             continue;
         }
@@ -698,30 +763,34 @@ fn apply_sgr(sequence: &str, style: &mut Style, base_style: Style) {
             continue;
         };
         match parameter {
-            0 => *style = base_style,
-            1 => *style = style.add_modifier(Modifier::BOLD),
-            2 => *style = style.add_modifier(Modifier::DIM),
-            3 => *style = style.add_modifier(Modifier::ITALIC),
-            4 => *style = style.add_modifier(Modifier::UNDERLINED),
-            7 => *style = style.add_modifier(Modifier::REVERSED),
-            22 => *style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
-            23 => *style = style.remove_modifier(Modifier::ITALIC),
-            24 => *style = style.remove_modifier(Modifier::UNDERLINED),
-            27 => *style = style.remove_modifier(Modifier::REVERSED),
-            30..=37 => style.fg = ansi_color(parameter - 30, false),
+            0 => style.reset(base_style),
+            1 => style.set_bold(theme),
+            2 => style.rendered = style.rendered.add_modifier(Modifier::DIM),
+            3 => style.rendered = style.rendered.add_modifier(Modifier::ITALIC),
+            4 => style.rendered = style.rendered.add_modifier(Modifier::UNDERLINED),
+            7 => style.rendered = style.rendered.add_modifier(Modifier::REVERSED),
+            22 => style.reset_intensity(theme),
+            23 => style.rendered = style.rendered.remove_modifier(Modifier::ITALIC),
+            24 => style.rendered = style.rendered.remove_modifier(Modifier::UNDERLINED),
+            27 => style.rendered = style.rendered.remove_modifier(Modifier::REVERSED),
+            30..=37 => style.set_normal_foreground(parameter - 30, theme),
             38 => {
-                index = apply_extended_color(&parameters, index, &mut style.fg);
+                style.clear_ansi_foreground();
+                index = apply_extended_color(&parameters, index, &mut style.rendered.fg);
                 continue;
             }
-            39 => style.fg = base_style.fg,
-            40..=47 => style.bg = ansi_color(parameter - 40, false),
+            39 => {
+                style.clear_ansi_foreground();
+                style.rendered.fg = base_style.fg;
+            }
+            40..=47 => style.rendered.bg = theme.ansi.color(parameter - 40, false),
             48 => {
-                index = apply_extended_color(&parameters, index, &mut style.bg);
+                index = apply_extended_color(&parameters, index, &mut style.rendered.bg);
                 continue;
             }
-            49 => style.bg = base_style.bg,
-            90..=97 => style.fg = ansi_color(parameter - 90, true),
-            100..=107 => style.bg = ansi_color(parameter - 100, true),
+            49 => style.rendered.bg = base_style.bg,
+            90..=97 => style.set_bright_foreground(parameter - 90, theme),
+            100..=107 => style.rendered.bg = theme.ansi.color(parameter - 100, true),
             _ => {}
         }
         index += 1;
@@ -826,28 +895,6 @@ fn sgr_byte(parameter: &str) -> Option<u8> {
     parameter.parse().ok()
 }
 
-fn ansi_color(index: u16, bright: bool) -> Option<Color> {
-    Some(match (bright, index) {
-        (false, 0) => Color::Black,
-        (false, 1) => Color::Red,
-        (false, 2) => Color::Green,
-        (false, 3) => Color::Yellow,
-        (false, 4) => Color::Blue,
-        (false, 5) => Color::Magenta,
-        (false, 6) => Color::Cyan,
-        (false, 7) => Color::Gray,
-        (true, 0) => Color::DarkGray,
-        (true, 1) => Color::LightRed,
-        (true, 2) => Color::LightGreen,
-        (true, 3) => Color::LightYellow,
-        (true, 4) => Color::LightBlue,
-        (true, 5) => Color::LightMagenta,
-        (true, 6) => Color::LightCyan,
-        (true, 7) => Color::White,
-        _ => return None,
-    })
-}
-
 fn wrapped_line_count(line: &Line<'static>, width: u16) -> usize {
     Paragraph::new(line.clone())
         .wrap(Wrap { trim: false })
@@ -928,12 +975,152 @@ fn split_line_at_character_midpoint(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use ratatui::{style::Color, text::Line};
+
     use crate::{
-        protocol::{Activity, ActivityId, ActivityStatus, TurnId},
+        protocol::{
+            Activity, ActivityId, ActivityStatus, ModelAvailability, Session, SessionRevision,
+            SessionSnapshot, SessionStatus, TranscriptItem, TurnId, Workspace,
+        },
         theme::Theme,
     };
 
-    use super::render_activity;
+    use super::{TranscriptCache, render_activity};
+
+    #[test]
+    fn activity_base_ansi_colors_follow_theme_palette() {
+        let activity = Activity::Command {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Completed,
+            command: "show colors".to_owned(),
+            cwd: None,
+            output: "\x1b[31;44mnormal\x1b[91;104mbright".to_owned(),
+            exit_status: Some(0),
+        };
+        let mut theme = Theme::system();
+        theme.ansi.normal.red = Color::Rgb(1, 2, 3);
+        theme.ansi.normal.blue = Color::Rgb(4, 5, 6);
+        theme.ansi.bright.red = Color::Rgb(7, 8, 9);
+        theme.ansi.bright.blue = Color::Rgb(10, 11, 12);
+        let mut lines = Vec::new();
+        let mut links = Vec::new();
+
+        render_activity(&mut lines, &mut links, &activity, &theme);
+
+        let spans = &lines.last().expect("render command output").spans;
+        let normal = spans
+            .iter()
+            .find(|span| span.content == "normal")
+            .expect("render normal ANSI colors");
+        assert_eq!(normal.style.fg, Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(normal.style.bg, Some(Color::Rgb(4, 5, 6)));
+        let bright = spans
+            .iter()
+            .find(|span| span.content == "bright")
+            .expect("render bright ANSI colors");
+        assert_eq!(bright.style.fg, Some(Color::Rgb(7, 8, 9)));
+        assert_eq!(bright.style.bg, Some(Color::Rgb(10, 11, 12)));
+    }
+
+    #[test]
+    fn bold_promotes_only_normal_ansi_foregrounds_to_bright_palette() {
+        let activity = Activity::Command {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Completed,
+            command: "show bold colors".to_owned(),
+            cwd: None,
+            output: concat!(
+                "\x1b[1;31mcolor after bold ",
+                "\x1b[22mnormal after 22 ",
+                "\x1b[1mbold after color ",
+                "\x1b[22;91mexplicit bright\x1b[22m stays bright ",
+                "\x1b[0;1;41mbold background"
+            )
+            .to_owned(),
+            exit_status: Some(0),
+        };
+        let mut theme = Theme::system();
+        theme.ansi.normal.red = Color::Rgb(1, 0, 0);
+        theme.ansi.bright.red = Color::Rgb(2, 0, 0);
+        let mut lines = Vec::new();
+        let mut links = Vec::new();
+
+        render_activity(&mut lines, &mut links, &activity, &theme);
+
+        let spans = &lines.last().expect("render command output").spans;
+        let style_for = |content| {
+            spans
+                .iter()
+                .find(|span| span.content == content)
+                .unwrap_or_else(|| panic!("render {content:?}"))
+                .style
+        };
+        assert_eq!(style_for("color after bold ").fg, Some(Color::Rgb(2, 0, 0)));
+        assert_eq!(style_for("normal after 22 ").fg, Some(Color::Rgb(1, 0, 0)));
+        assert_eq!(style_for("bold after color ").fg, Some(Color::Rgb(2, 0, 0)));
+        assert_eq!(style_for("explicit bright").fg, Some(Color::Rgb(2, 0, 0)));
+        assert_eq!(style_for(" stays bright ").fg, Some(Color::Rgb(2, 0, 0)));
+        assert_eq!(style_for("bold background").bg, Some(Color::Rgb(1, 0, 0)));
+    }
+
+    #[test]
+    fn transcript_cache_rebuilds_when_only_the_theme_changes() {
+        let activity = Activity::Command {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Completed,
+            command: "show theme".to_owned(),
+            cwd: None,
+            output: "\x1b[31mthemed output".to_owned(),
+            exit_status: Some(0),
+        };
+        let snapshot = SessionSnapshot {
+            session: Session {
+                id: crate::protocol::SessionId::new(),
+                workspace: Workspace {
+                    path: PathBuf::from("/workspace"),
+                },
+                agent_selection: None,
+                agent_selection_availability: ModelAvailability::Available,
+                status: SessionStatus::Idle,
+            },
+            revision: SessionRevision::INITIAL,
+            prompts: Vec::new(),
+            turns: Vec::new(),
+            messages: Vec::new(),
+            activities: vec![activity.clone()],
+            transcript: vec![TranscriptItem::Activity {
+                activity_id: activity.id(),
+            }],
+        };
+        let cache = TranscriptCache::default();
+        let mut first_theme = Theme::system();
+        first_theme.ansi.normal.red = Color::Rgb(1, 2, 3);
+        let first = cache.view(0, &snapshot, &[], &first_theme, 80);
+        let first_lines = first.window(0, 10).0;
+        drop(first);
+        let mut second_theme = first_theme;
+        second_theme.ansi.normal.red = Color::Rgb(4, 5, 6);
+
+        let second = cache.view(0, &snapshot, &[], &second_theme, 80);
+        let second_lines = second.window(0, 10).0;
+
+        let themed_color = |lines: &[Line<'static>]| {
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == "themed output")
+                .expect("render themed output")
+                .style
+                .fg
+        };
+        assert_eq!(themed_color(&first_lines), Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(themed_color(&second_lines), Some(Color::Rgb(4, 5, 6)));
+    }
 
     #[test]
     fn activity_projection_retains_osc_8_link_targets() {

@@ -334,7 +334,7 @@ fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
     assert_no_control_cells(&buffer);
     assert_ne!(text_cell(&buffer, "Build finished").fg, Color::Green);
     assert_ne!(text_cell(&buffer, "Prompt section 1").fg, Color::Red);
-    assert_eq!(text_cell(&buffer, "test result").fg, Color::Red);
+    assert_eq!(text_cell(&buffer, "test result").fg, Color::LightRed);
     assert!(
         text_cell(&buffer, "test result")
             .modifier
@@ -347,6 +347,73 @@ fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
             .contains(Modifier::BOLD)
     );
     assert_eq!(text_cell(&buffer, ". 78 passed").fg, Color::DarkGray);
+}
+
+#[test]
+fn all_base_ansi_foregrounds_and_backgrounds_render_through_the_theme_palette() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
+    let activity_id = ActivityId::new();
+    let mut output = String::new();
+    for (prefix, first_code) in [("nfg", 30), ("bfg", 90)] {
+        for offset in 0..8 {
+            output.push_str(&format!("\x1b[{}m{prefix}{offset} ", first_code + offset));
+        }
+        output.push('\n');
+    }
+    for (prefix, first_code) in [("nbg", 40), ("bbg", 100)] {
+        output.push_str("\x1b[0m");
+        for offset in 0..8 {
+            output.push_str(&format!("\x1b[{}m{prefix}{offset} ", first_code + offset));
+        }
+        output.push('\n');
+    }
+    snapshot.activities.push(Activity::Command {
+        id: activity_id,
+        turn_id: snapshot.turns[0].id,
+        status: ActivityStatus::Completed,
+        command: "show ANSI palette".to_owned(),
+        cwd: None,
+        output,
+        exit_status: Some(0),
+    });
+    snapshot
+        .transcript
+        .push(TranscriptItem::Activity { activity_id });
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach Session with every base ANSI color");
+
+    let buffer = rendered_application_buffer(&application, 160, 30);
+    let normal = [
+        Color::Black,
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Gray,
+    ];
+    let bright = [
+        Color::DarkGray,
+        Color::LightRed,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::LightCyan,
+        Color::White,
+    ];
+    for (index, expected) in normal.into_iter().enumerate() {
+        assert_eq!(text_cell(&buffer, &format!("nfg{index}")).fg, expected);
+        assert_eq!(text_cell(&buffer, &format!("nbg{index}")).bg, expected);
+    }
+    for (index, expected) in bright.into_iter().enumerate() {
+        assert_eq!(text_cell(&buffer, &format!("bfg{index}")).fg, expected);
+        assert_eq!(text_cell(&buffer, &format!("bbg{index}")).bg, expected);
+    }
 }
 
 #[test]
