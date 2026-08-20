@@ -632,6 +632,23 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
             status: ProviderCommandStatus::Completed,
             exit_status: Some(0),
         },
+        ProviderEvent::CommandStarted {
+            activity_id: ProviderActivityId::new("redrawn-command"),
+            command: "redraw a styled progress bar".to_owned(),
+            cwd: Some(workspace.path().to_owned()),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("redrawn-command"),
+            content: (0..2_048)
+                .map(|frame| format!("\r\x1b[31m{frame:4} [{}]", "#".repeat(32)))
+                .chain(["\r\x1b[32mdone\x1b[0m\n".to_owned()])
+                .collect::<String>(),
+        },
+        ProviderEvent::CommandCompleted {
+            activity_id: ProviderActivityId::new("redrawn-command"),
+            status: ProviderCommandStatus::Completed,
+            exit_status: Some(0),
+        },
         ProviderEvent::AgentMessageStarted,
         ProviderEvent::AgentMessageDelta {
             content: "\x1b[1;3".to_owned(),
@@ -652,7 +669,7 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
         &client,
         &descriptor,
         created.session.id,
-        SessionRevision(18),
+        SessionRevision(21),
     )
     .await;
     let Activity::Command { output, .. } = &completed.activities[0] else {
@@ -686,10 +703,15 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
     else {
         panic!("third Provider command projects as command Activity");
     };
-    assert_eq!(
-        progress_output,
-        "\x1b[31m\x1b[32m100%\x1b[0m\nplain\nmulti\nline"
-    );
+    assert_eq!(progress_output, "\x1b[32m100%\x1b[0m\nplain\nmulti\nline");
+    let Activity::Command {
+        output: redrawn_output,
+        ..
+    } = &completed.activities[3]
+    else {
+        panic!("fourth Provider command projects as command Activity");
+    };
+    assert_eq!(redrawn_output, "\x1b[32mdone\x1b[0m\n");
     assert_eq!(completed.messages[1].content, "\x1b[1;32mHello    world\n");
 
     server.shutdown().await.expect("shut down server");
