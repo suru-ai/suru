@@ -143,6 +143,9 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 {
                     bail!("Session update can only append to a streaming Agent Message");
                 }
+                if message.truncated {
+                    bail!("Session update appended content past the cap that truncated a Message");
+                }
                 message.content.push_str(content);
             }
             SessionChange::MessageTruncated { message_id } => {
@@ -222,11 +225,20 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 else {
                     bail!("Session update referenced an unknown Activity");
                 };
-                let Activity::Command { status, output, .. } = activity else {
+                let Activity::Command {
+                    status,
+                    output,
+                    output_truncated,
+                    ..
+                } = activity
+                else {
                     bail!("Session update appended command output to a different Activity kind");
                 };
                 if *status != ActivityStatus::Active {
                     bail!("Session update appended output to a terminal command Activity");
+                }
+                if *output_truncated {
+                    bail!("Session update appended output past the cap that truncated a command");
                 }
                 output.push_str(content);
             }

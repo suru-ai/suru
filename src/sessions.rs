@@ -1250,7 +1250,9 @@ impl SessionStore {
 
     /// Publishes Agent output whose changes describe one step of a Provider
     /// stream, as a single update so a client never observes content apart
-    /// from the truncation that ended it.
+    /// from the truncation that ended it. A step that produced no change at
+    /// all leaves the Session where it stands, since committing nothing would
+    /// still spend a revision on it.
     pub(crate) fn publish_agent_output_changes(
         &self,
         session_id: SessionId,
@@ -1265,6 +1267,13 @@ impl SessionStore {
                 .sessions
                 .get(&session_id)
                 .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+            if changes.is_empty() {
+                return Ok(SessionUpdate {
+                    session_id,
+                    revision: record.snapshot.revision,
+                    changes,
+                });
+            }
             for change in &changes {
                 let turn_id = agent_output_turn_id(&record.snapshot, change)?;
                 let turn = record

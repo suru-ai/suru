@@ -4157,12 +4157,31 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
             status: ProviderCommandStatus::Completed,
             exit_status: Some(0),
         },
+        ProviderEvent::CommandStarted {
+            activity_id: ProviderActivityId::new("capped-command"),
+            command: "emit unbounded output".to_owned(),
+            cwd: Some(workspace.path().to_owned()),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("capped-command"),
+            content: "z".repeat(70 * 1024),
+        },
+        ProviderEvent::CommandCompleted {
+            activity_id: ProviderActivityId::new("capped-command"),
+            status: ProviderCommandStatus::Completed,
+            exit_status: Some(0),
+        },
         ProviderEvent::AgentMessageStarted,
         ProviderEvent::AgentMessageDelta {
             content: "streamed ".to_owned(),
         },
         ProviderEvent::AgentMessageDelta {
             content: "answer".to_owned(),
+        },
+        ProviderEvent::AgentMessageCompleted,
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: "w".repeat(600 * 1024),
         },
         ProviderEvent::AgentMessageCompleted,
         ProviderEvent::TurnCompleted,
@@ -4173,7 +4192,7 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
         &client,
         &descriptor,
         created.session.id,
-        SessionRevision(12),
+        SessionRevision(18),
     )
     .await;
     assert_eq!(completed.turns[0].status, TurnStatus::Completed);
@@ -4225,6 +4244,24 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
         .await
         .expect("decode reopened Session");
     assert_eq!(reopened, completed);
+    let Activity::Command {
+        output_truncated, ..
+    } = &reopened.activities[1]
+    else {
+        panic!("the capped Provider command projects as command Activity");
+    };
+    assert!(
+        output_truncated,
+        "a command whose output was capped stays truncated across a restart"
+    );
+    assert!(
+        !reopened.messages[1].truncated,
+        "a Message that ran to its end stays untruncated across a restart"
+    );
+    assert!(
+        reopened.messages[2].truncated,
+        "a Message whose content was capped stays truncated across a restart"
+    );
 
     replacement
         .shutdown()

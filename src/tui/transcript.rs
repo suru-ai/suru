@@ -566,9 +566,9 @@ fn push_command_activity(
     }
 }
 
-/// Renders the marker for capped content as its own line, in a style Suru
-/// applies rather than one the stream can set, so a reader can tell Suru
-/// dropped the rest rather than the Provider ending there.
+/// Renders the truncation marker as its own line, styled from Suru's typed
+/// signal rather than from anything the stream carried, so a reader can tell
+/// Suru dropped the rest rather than the Provider ending there.
 fn push_truncation_marker(
     lines: &mut Vec<Line<'static>>,
     stream: CappedStream,

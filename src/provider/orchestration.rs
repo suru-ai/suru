@@ -856,20 +856,6 @@ fn project_turn_start_failure(
     });
 }
 
-/// Publishes the changes normalization produced, which is nothing at all when
-/// a delta carried no storable content and left the stream short of its cap.
-fn publish_normalized_output(
-    sessions: &SessionStore,
-    session_id: SessionId,
-    changes: Vec<SessionChange>,
-) -> Result<()> {
-    if changes.is_empty() {
-        return Ok(());
-    }
-    sessions.publish_agent_output_changes(session_id, changes)?;
-    Ok(())
-}
-
 fn project_provider_event(
     sessions: &SessionStore,
     updates: &ProviderUpdateGate,
@@ -929,12 +915,12 @@ fn project_provider_event(
                     );
                 };
                 let content = message.normalizer.push(&content);
-                publish_normalized_output(
-                    sessions,
-                    session_id,
-                    message_content_changes(message.id, content),
-                )
-                .map(|()| ProviderEventProjection::Continue)
+                sessions
+                    .publish_agent_output_changes(
+                        session_id,
+                        message_content_changes(message.id, content),
+                    )
+                    .map(|_| ProviderEventProjection::Continue)
             }
             ProviderEvent::AgentMessageCompleted => {
                 let Some(message) = active.streaming_message.take() else {
@@ -1012,12 +998,12 @@ fn project_provider_event(
                     );
                 };
                 let content = command.output_normalizer.push(&content);
-                publish_normalized_output(
-                    sessions,
-                    session_id,
-                    command_output_changes(command.id, content),
-                )
-                .map(|()| ProviderEventProjection::Continue)
+                sessions
+                    .publish_agent_output_changes(
+                        session_id,
+                        command_output_changes(command.id, content),
+                    )
+                    .map(|_| ProviderEventProjection::Continue)
             }
             ProviderEvent::CommandCompleted {
                 activity_id,
@@ -1035,8 +1021,7 @@ fn project_provider_event(
                 };
                 let command_activity_id = command.id;
                 let trailing_output = command.output_normalizer.finish();
-                if let Err(error) = publish_normalized_output(
-                    sessions,
+                if let Err(error) = sessions.publish_agent_output_changes(
                     session_id,
                     command_output_changes(command_activity_id, trailing_output),
                 ) {
