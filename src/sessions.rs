@@ -162,8 +162,15 @@ pub(crate) enum ProviderTurnOutcome {
 #[derive(Default)]
 pub(crate) struct UnfinishedProviderOutput {
     pub(crate) streaming_message_id: Option<MessageId>,
-    pub(crate) active_command_ids: Vec<ActivityId>,
+    pub(crate) active_commands: Vec<UnfinishedCommand>,
     pub(crate) active_file_change_ids: Vec<ActivityId>,
+}
+
+/// A command Activity still running when its Turn settled, carrying the
+/// trailing output its normalizer held back as an unterminated line.
+pub(crate) struct UnfinishedCommand {
+    pub(crate) activity_id: ActivityId,
+    pub(crate) trailing_output: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1494,24 +1501,30 @@ fn model_option_value_text(value: &ModelOptionValue) -> String {
 fn terminal_output_changes(unfinished: UnfinishedProviderOutput) -> Vec<SessionChange> {
     let UnfinishedProviderOutput {
         streaming_message_id,
-        active_command_ids,
+        active_commands,
         active_file_change_ids,
     } = unfinished;
     let mut changes = Vec::with_capacity(
-        active_command_ids.len()
+        active_commands.len() * 2
             + active_file_change_ids.len()
             + usize::from(streaming_message_id.is_some()),
     );
     if let Some(message_id) = streaming_message_id {
         changes.push(SessionChange::MessageCompleted { message_id });
     }
-    changes.extend(active_command_ids.into_iter().map(|activity_id| {
-        SessionChange::CommandStatusChanged {
-            activity_id,
+    for command in active_commands {
+        if !command.trailing_output.is_empty() {
+            changes.push(SessionChange::CommandOutputAppended {
+                activity_id: command.activity_id,
+                content: command.trailing_output,
+            });
+        }
+        changes.push(SessionChange::CommandStatusChanged {
+            activity_id: command.activity_id,
             status: ActivityStatus::Failed,
             exit_status: None,
-        }
-    }));
+        });
+    }
     changes.extend(active_file_change_ids.into_iter().map(|activity_id| {
         SessionChange::FileChangeStatusChanged {
             activity_id,

@@ -733,6 +733,125 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
 }
 
 #[tokio::test]
+async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "interrupted-output-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "interrupted-output-test")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Report progress".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let session_id = created.session.id;
+    let start = provider.next_start().await;
+    let mut provider_session = start.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-normalized", "high", "fast"),
+    });
+    provider_session.next_turn().await.succeed();
+    let active = client
+        .read_session(session_id)
+        .await
+        .expect("read delivered initial Prompt");
+    let active_turn_id = active.turns[0].id;
+    let mut observer = client
+        .attach_session(session_id)
+        .await
+        .expect("attach to the active Session");
+    let SessionEvent::Snapshot(_) = observer
+        .next()
+        .await
+        .expect("observer receives snapshot")
+        .expect("observer snapshot is valid")
+    else {
+        panic!("attachment must begin with a Session snapshot");
+    };
+
+    for event in [
+        ProviderEvent::CommandStarted {
+            activity_id: ProviderActivityId::new("interrupted-command"),
+            command: "report progress".to_owned(),
+            cwd: Some(workspace.path().to_owned()),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("interrupted-command"),
+            content: "\x1b[31mstarting\nprogress 10%".to_owned(),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("interrupted-command"),
+            content: "\r\x1b[32mprogress 90%\x1b[1;3".to_owned(),
+        },
+    ] {
+        provider_session.emit(event);
+    }
+
+    let (acknowledged, ()) =
+        tokio::join!(client.interrupt_turn(session_id, active_turn_id), async {
+            provider_session.next_interrupt().await.succeed();
+        });
+    acknowledged.expect("Provider acknowledges interruption");
+    provider_session.emit(ProviderEvent::TurnInterrupted);
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let SessionEvent::Updated(update) = observer
+                .next()
+                .await
+                .expect("observer stream remains open")
+                .expect("Session update is valid")
+            else {
+                panic!("attachment sends exactly one Session snapshot");
+            };
+            if update.changes.iter().any(|change| {
+                matches!(
+                    change,
+                    SessionChange::TurnStatusChanged {
+                        status: TurnStatus::Interrupted,
+                        ..
+                    }
+                )
+            }) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("interruption update arrives");
+
+    let interrupted = client
+        .read_session(session_id)
+        .await
+        .expect("read interrupted Session");
+    let Activity::Command { output, status, .. } = &interrupted.activities[0] else {
+        panic!("Provider command projects as command Activity");
+    };
+    assert_eq!(output, "\x1b[31mstarting\n\x1b[0m\x1b[32mprogress 90%");
+    assert_eq!(*status, ActivityStatus::Failed);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn agent_selection_changes_do_not_rewrite_an_active_turn_identity() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");

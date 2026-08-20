@@ -24,7 +24,7 @@ use crate::protocol::{
 };
 use crate::sessions::{
     DeliveredTurn, DeliveredTurnStatus, InterruptTurnError, ProviderTurnOutcome, SessionStore,
-    UnfinishedProviderOutput,
+    UnfinishedCommand, UnfinishedProviderOutput,
 };
 
 /// The most characters of Provider-sent output Suru stores for one command; the
@@ -162,10 +162,13 @@ impl ActiveProviderTurn {
     fn take_unfinished_output(&mut self) -> UnfinishedProviderOutput {
         UnfinishedProviderOutput {
             streaming_message_id: self.streaming_message.take().map(|message| message.id),
-            active_command_ids: self
+            active_commands: self
                 .command_activities
                 .drain()
-                .map(|(_, command)| command.id)
+                .map(|(_, mut command)| UnfinishedCommand {
+                    activity_id: command.id,
+                    trailing_output: command.output_normalizer.finish(),
+                })
                 .collect(),
             active_file_change_ids: self
                 .file_change_activities
