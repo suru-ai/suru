@@ -511,6 +511,140 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
 }
 
 #[tokio::test]
+async fn provider_streams_store_only_printable_text_newlines_and_sgr() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "provider-output-normalization-test")
+            .expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let client = reqwest::Client::new();
+    let descriptor = server.descriptor().clone();
+    let created = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Normalize provider output".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+
+    let start = timeout(Duration::from_secs(1), provider.next_start())
+        .await
+        .expect("Provider startup begins");
+    let mut provider_session = start.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-normalized", "high", "fast"),
+    });
+    timeout(Duration::from_secs(1), provider_session.next_turn())
+        .await
+        .expect("initial Turn reaches Provider")
+        .succeed();
+
+    for event in [
+        ProviderEvent::CommandStarted {
+            activity_id: ProviderActivityId::new("normalized-command"),
+            command: "printf output".to_owned(),
+            cwd: Some(workspace.path().to_owned()),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("normalized-command"),
+            content: "plain\t\x1b[38;5;".to_owned(),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("normalized-command"),
+            content: "42mgreen\x1b]0;discarded".to_owned(),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("normalized-command"),
+            content: " title\x07\r\x1b[2Kdone\x7f\n".to_owned(),
+        },
+        ProviderEvent::CommandCompleted {
+            activity_id: ProviderActivityId::new("normalized-command"),
+            status: ProviderCommandStatus::Completed,
+            exit_status: Some(0),
+        },
+        ProviderEvent::CommandStarted {
+            activity_id: ProviderActivityId::new("truncated-command"),
+            command: "emit oversized styled output".to_owned(),
+            cwd: Some(workspace.path().to_owned()),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("truncated-command"),
+            content: format!("\x1b[31m{}\x1b[", "x".repeat(65_520)),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("truncated-command"),
+            content: format!("{}mignored", "1".repeat(32)),
+        },
+        ProviderEvent::CommandCompleted {
+            activity_id: ProviderActivityId::new("truncated-command"),
+            status: ProviderCommandStatus::Completed,
+            exit_status: Some(0),
+        },
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: "\x1b[1;3".to_owned(),
+        },
+        ProviderEvent::AgentMessageDelta {
+            content: "2mHello\t\x1bPdiscarded".to_owned(),
+        },
+        ProviderEvent::AgentMessageDelta {
+            content: " payload\x1b\\\rworld\x07\n".to_owned(),
+        },
+        ProviderEvent::AgentMessageCompleted,
+        ProviderEvent::TurnCompleted,
+    ] {
+        provider_session.emit(event);
+    }
+
+    let completed = read_session_at_least_revision(
+        &client,
+        &descriptor,
+        created.session.id,
+        SessionRevision(17),
+    )
+    .await;
+    let Activity::Command { output, .. } = &completed.activities[0] else {
+        panic!("Provider command projects as command Activity");
+    };
+    assert_eq!(output, "plain    \x1b[38;5;42mgreendone\n");
+    let Activity::Command {
+        output: truncated_output,
+        ..
+    } = &completed.activities[1]
+    else {
+        panic!("second Provider command projects as command Activity");
+    };
+    let truncated_text = truncated_output
+        .strip_prefix("\x1b[31m")
+        .and_then(|output| output.strip_suffix("\x1b[0m"))
+        .expect("truncated styled output is bounded by complete SGR sequences");
+    assert_eq!(truncated_text.len(), 65_520);
+    assert!(truncated_text.chars().all(|character| character == 'x'));
+    assert_eq!(completed.messages[1].content, "\x1b[1;32mHello    world\n");
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn agent_selection_changes_do_not_rewrite_an_active_turn_identity() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");

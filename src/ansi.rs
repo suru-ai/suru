@@ -166,9 +166,114 @@ impl AnsiScanner {
     }
 }
 
+/// Stateful normalization for provider text that may arrive in arbitrary
+/// streaming chunks. The emitted form is safe to persist as transcript data:
+/// printable text, newlines, and complete SGR sequences only.
+#[derive(Debug, Default)]
+pub(crate) struct ProviderTextNormalizer {
+    scanner: AnsiScanner,
+    remaining_chars: Option<usize>,
+    style_may_be_active: bool,
+    truncated: bool,
+}
+
+impl ProviderTextNormalizer {
+    pub(crate) fn with_max_chars(max_chars: usize) -> Self {
+        Self {
+            remaining_chars: Some(max_chars),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn push(&mut self, chunk: &str) -> String {
+        if self.truncated {
+            return String::new();
+        }
+        let mut normalized = String::with_capacity(chunk.len());
+        for fragment in self.scanner.feed(chunk) {
+            match fragment {
+                Fragment::Text(text) => self.push_text(&text, &mut normalized),
+                Fragment::Sgr(sequence) => self.push_sgr(&sequence, &mut normalized),
+                Fragment::Control('\t') => self.push_text("    ", &mut normalized),
+                Fragment::Control('\n') => self.push_text("\n", &mut normalized),
+                Fragment::Csi(_)
+                | Fragment::Osc(_)
+                | Fragment::Dcs(_)
+                | Fragment::Apc(_)
+                | Fragment::Escape(_)
+                | Fragment::Control(_) => {}
+            }
+            if self.truncated {
+                break;
+            }
+        }
+        normalized
+    }
+
+    fn push_text(&mut self, text: &str, normalized: &mut String) {
+        let Some(remaining) = self.remaining_chars.as_mut() else {
+            normalized.push_str(text);
+            return;
+        };
+        let mut characters = text.chars();
+        normalized.extend(characters.by_ref().take(*remaining));
+        let emitted = text.chars().count().min(*remaining);
+        *remaining -= emitted;
+        if characters.next().is_some() {
+            self.mark_truncated(normalized);
+        }
+    }
+
+    fn push_sgr(&mut self, sequence: &str, normalized: &mut String) {
+        let sequence_chars = sequence.chars().count();
+        if let Some(remaining) = self.remaining_chars.as_mut() {
+            if sequence_chars > *remaining {
+                self.mark_truncated(normalized);
+                return;
+            }
+            *remaining -= sequence_chars;
+        }
+        normalized.push_str(sequence);
+        update_style_state(sequence, &mut self.style_may_be_active);
+    }
+
+    fn mark_truncated(&mut self, normalized: &mut String) {
+        self.truncated = true;
+        if self.style_may_be_active {
+            normalized.push_str("\x1b[0m");
+            self.style_may_be_active = false;
+        }
+    }
+}
+
+pub(crate) fn normalize_provider_text(text: &str) -> String {
+    ProviderTextNormalizer::default().push(text)
+}
+
+fn update_style_state(sequence: &str, style_may_be_active: &mut bool) {
+    let Some(parameters) = sequence
+        .strip_prefix("\x1b[")
+        .and_then(|sequence| sequence.strip_suffix('m'))
+    else {
+        return;
+    };
+    for parameter in parameters.split(';') {
+        let parameter = parameter.split(':').next().unwrap_or_default();
+        let parameter = if parameter.is_empty() {
+            Some(0)
+        } else {
+            parameter.parse::<u16>().ok()
+        };
+        match parameter {
+            Some(0) => *style_may_be_active = false,
+            Some(_) | None => *style_may_be_active = true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AnsiScanner, Fragment};
+    use super::{AnsiScanner, Fragment, ProviderTextNormalizer};
 
     #[test]
     fn classifies_sgr_separately_from_text() {
@@ -315,5 +420,23 @@ mod tests {
                 assert_eq!(actual, vec![expected.clone()], "split at byte {split}");
             }
         }
+    }
+
+    #[test]
+    fn provider_text_truncation_never_splits_sgr_and_resets_active_style() {
+        let mut normalizer = ProviderTextNormalizer::with_max_chars(10);
+
+        assert_eq!(
+            normalizer.push("\x1b[31m1234\x1b[38;5;42m5678"),
+            "\x1b[31m1234\x1b[0m"
+        );
+        assert_eq!(normalizer.push("ignored"), "");
+    }
+
+    #[test]
+    fn provider_text_truncation_resets_styles_outside_the_rendered_subset() {
+        let mut normalizer = ProviderTextNormalizer::with_max_chars(6);
+
+        assert_eq!(normalizer.push("\x1b[53mxoverflow"), "\x1b[53mx\x1b[0m");
     }
 }

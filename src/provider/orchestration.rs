@@ -17,6 +17,7 @@ use super::{
     ProviderRuntime, ProviderSession, ProviderSessionRequest, ProviderSteerInput,
     ProviderTurnInput,
 };
+use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AgentIdentity, Message, MessageId, MessageRole,
     MessageStatus, PromptId, SessionChange, SessionId, TurnId, TurnStatus,
@@ -25,6 +26,8 @@ use crate::sessions::{
     DeliveredTurn, DeliveredTurnStatus, InterruptTurnError, ProviderTurnOutcome, SessionStore,
     UnfinishedProviderOutput,
 };
+
+const MAX_STORED_COMMAND_OUTPUT_CHARS: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct ProviderOrchestrator {
@@ -125,20 +128,30 @@ struct ConnectedProviderSession {
 
 struct ActiveProviderTurn {
     turn_id: TurnId,
-    streaming_message_id: Option<MessageId>,
+    streaming_message: Option<ActiveProviderMessage>,
     interruption_acknowledged: bool,
-    command_activities: HashMap<super::ProviderActivityId, ActivityId>,
+    command_activities: HashMap<super::ProviderActivityId, ActiveProviderCommand>,
     file_change_activities: HashMap<super::ProviderActivityId, ActivityId>,
+}
+
+struct ActiveProviderMessage {
+    id: MessageId,
+    normalizer: ProviderTextNormalizer,
+}
+
+struct ActiveProviderCommand {
+    id: ActivityId,
+    output_normalizer: ProviderTextNormalizer,
 }
 
 impl ActiveProviderTurn {
     fn take_unfinished_output(&mut self) -> UnfinishedProviderOutput {
         UnfinishedProviderOutput {
-            streaming_message_id: self.streaming_message_id.take(),
+            streaming_message_id: self.streaming_message.take().map(|message| message.id),
             active_command_ids: self
                 .command_activities
                 .drain()
-                .map(|(_, activity_id)| activity_id)
+                .map(|(_, command)| command.id)
                 .collect(),
             active_file_change_ids: self
                 .file_change_activities
@@ -443,7 +456,9 @@ async fn run_provider_session(
                                 prompt_id,
                                 None,
                                 DeliveredTurnStatus::Failed {
-                                    message: format!("Provider startup failed: {error}"),
+                                    message: normalize_provider_text(&format!(
+                                        "Provider startup failed: {error}"
+                                    )),
                                 },
                             )
                         }) else {
@@ -463,9 +478,9 @@ async fn run_provider_session(
                             prompt_id,
                             None,
                             DeliveredTurnStatus::Failed {
-                                message: format!(
+                                message: normalize_provider_text(&format!(
                                     "Provider startup failed: save Resume State: {error}"
-                                ),
+                                )),
                             },
                         )
                     });
@@ -486,7 +501,9 @@ async fn run_provider_session(
                             prompt_id,
                             None,
                             DeliveredTurnStatus::Failed {
-                                message: format!("Provider startup failed: {error}"),
+                                message: normalize_provider_text(&format!(
+                                    "Provider startup failed: {error}"
+                                )),
                             },
                         )
                     });
@@ -541,7 +558,7 @@ async fn run_provider_session(
             }
             active = Some(ActiveProviderTurn {
                 turn_id,
-                streaming_message_id: None,
+                streaming_message: None,
                 interruption_acknowledged: false,
                 command_activities: HashMap::new(),
                 file_change_activities: HashMap::new(),
@@ -601,7 +618,9 @@ async fn run_provider_session(
                                 session_id,
                                 current.turn_id,
                                 prompt.id,
-                                format!("Provider steering failed: {error}"),
+                                normalize_provider_text(&format!(
+                                    "Provider steering failed: {error}"
+                                )),
                             )
                         });
                     }
@@ -644,7 +663,9 @@ async fn run_provider_session(
                         let _ = response.send(Ok(target));
                     }
                     Err(error) => {
-                        let message = format!("Provider interruption failed: {error}");
+                        let message = normalize_provider_text(&format!(
+                            "Provider interruption failed: {error}"
+                        ));
                         let unfinished_output = current.take_unfinished_output();
                         let _ = updates.apply(|| {
                             sessions.fail_turn(
@@ -693,7 +714,7 @@ async fn run_provider_session(
                                 } else {
                                     active = Some(ActiveProviderTurn {
                                         turn_id,
-                                        streaming_message_id: None,
+                                        streaming_message: None,
                                         interruption_acknowledged: false,
                                         command_activities: HashMap::new(),
                                         file_change_activities: HashMap::new(),
@@ -709,7 +730,9 @@ async fn run_provider_session(
                                 session_id,
                                 current.turn_id,
                                 unfinished_output,
-                                format!("Provider execution failed: {error}"),
+                                normalize_provider_text(&format!(
+                                    "Provider execution failed: {error}"
+                                )),
                             )
                         });
                         active = None;
@@ -764,7 +787,7 @@ fn project_turn_start_failure(
 ) {
     let selection_rejected = error.is_selection_rejected();
     let _ = updates.apply(|| {
-        let message = format!("Provider execution failed: {error}");
+        let message = normalize_provider_text(&format!("Provider execution failed: {error}"));
         if selection_rejected {
             sessions.reject_agent_selection(
                 session_id,
@@ -802,13 +825,16 @@ fn project_provider_event(
                 )
                 .map(|_| ProviderEventProjection::Continue),
             ProviderEvent::AgentMessageStarted => {
-                if active.streaming_message_id.is_some() {
+                if active.streaming_message.is_some() {
                     Err(anyhow::anyhow!(
                         "Provider started a second Agent Message before completing the first"
                     ))
                 } else {
                     let message_id = MessageId::new();
-                    active.streaming_message_id = Some(message_id);
+                    active.streaming_message = Some(ActiveProviderMessage {
+                        id: message_id,
+                        normalizer: ProviderTextNormalizer::default(),
+                    });
                     sessions
                         .publish_agent_output(
                             session_id,
@@ -826,7 +852,7 @@ fn project_provider_event(
                 }
             }
             ProviderEvent::AgentMessageDelta { content } => {
-                let Some(message_id) = active.streaming_message_id else {
+                let Some(message) = active.streaming_message.as_mut() else {
                     return fail_invalid_provider_event(
                         sessions,
                         session_id,
@@ -835,18 +861,23 @@ fn project_provider_event(
                         "Provider sent Agent Message content before starting a Message",
                     );
                 };
-                sessions
-                    .publish_agent_output(
-                        session_id,
-                        SessionChange::MessageContentAppended {
-                            message_id,
-                            content,
-                        },
-                    )
-                    .map(|_| ProviderEventProjection::Continue)
+                let content = message.normalizer.push(&content);
+                if content.is_empty() {
+                    Ok(ProviderEventProjection::Continue)
+                } else {
+                    sessions
+                        .publish_agent_output(
+                            session_id,
+                            SessionChange::MessageContentAppended {
+                                message_id: message.id,
+                                content,
+                            },
+                        )
+                        .map(|_| ProviderEventProjection::Continue)
+                }
             }
             ProviderEvent::AgentMessageCompleted => {
-                let Some(message_id) = active.streaming_message_id.take() else {
+                let Some(message) = active.streaming_message.take() else {
                     return fail_invalid_provider_event(
                         sessions,
                         session_id,
@@ -858,7 +889,9 @@ fn project_provider_event(
                 sessions
                     .publish_agent_output(
                         session_id,
-                        SessionChange::MessageCompleted { message_id },
+                        SessionChange::MessageCompleted {
+                            message_id: message.id,
+                        },
                     )
                     .map(|_| ProviderEventProjection::Continue)
             }
@@ -883,7 +916,7 @@ fn project_provider_event(
                                     id: command_activity_id,
                                     turn_id: active.turn_id,
                                     status: ActivityStatus::Active,
-                                    command,
+                                    command: normalize_provider_text(&command),
                                     cwd,
                                     output: String::new(),
                                     exit_status: None,
@@ -891,9 +924,15 @@ fn project_provider_event(
                             },
                         )
                         .map(|_| {
-                            active
-                                .command_activities
-                                .insert(activity_id, command_activity_id);
+                            active.command_activities.insert(
+                                activity_id,
+                                ActiveProviderCommand {
+                                    id: command_activity_id,
+                                    output_normalizer: ProviderTextNormalizer::with_max_chars(
+                                        MAX_STORED_COMMAND_OUTPUT_CHARS,
+                                    ),
+                                },
+                            );
                             ProviderEventProjection::Continue
                         })
                 }
@@ -902,9 +941,7 @@ fn project_provider_event(
                 activity_id,
                 content,
             } => {
-                let Some(command_activity_id) =
-                    active.command_activities.get(&activity_id).copied()
-                else {
+                let Some(command) = active.command_activities.get_mut(&activity_id) else {
                     return fail_invalid_provider_event(
                         sessions,
                         session_id,
@@ -913,23 +950,30 @@ fn project_provider_event(
                         "Provider sent command output before starting the Activity",
                     );
                 };
-                sessions
-                    .publish_agent_output(
-                        session_id,
-                        SessionChange::CommandOutputAppended {
-                            activity_id: command_activity_id,
-                            content,
-                        },
-                    )
-                    .map(|_| ProviderEventProjection::Continue)
+                let content = command.output_normalizer.push(&content);
+                if content.is_empty() {
+                    Ok(ProviderEventProjection::Continue)
+                } else {
+                    sessions
+                        .publish_agent_output(
+                            session_id,
+                            SessionChange::CommandOutputAppended {
+                                activity_id: command.id,
+                                content,
+                            },
+                        )
+                        .map(|_| ProviderEventProjection::Continue)
+                }
             }
             ProviderEvent::CommandCompleted {
                 activity_id,
                 status,
                 exit_status,
             } => {
-                let Some(command_activity_id) =
-                    active.command_activities.get(&activity_id).copied()
+                let Some(command_activity_id) = active
+                    .command_activities
+                    .get(&activity_id)
+                    .map(|command| command.id)
                 else {
                     return fail_invalid_provider_event(
                         sessions,
@@ -1045,7 +1089,7 @@ fn project_provider_event(
                     })
             }
             ProviderEvent::TurnCompleted => {
-                if active.streaming_message_id.is_some()
+                if active.streaming_message.is_some()
                     || !active.command_activities.is_empty()
                     || !active.file_change_activities.is_empty()
                 {
@@ -1077,7 +1121,12 @@ fn project_provider_event(
             ProviderEvent::AgentSelectionRejected { message } => {
                 let unfinished_output = active.take_unfinished_output();
                 sessions
-                    .reject_agent_selection(session_id, active.turn_id, unfinished_output, message)
+                    .reject_agent_selection(
+                        session_id,
+                        active.turn_id,
+                        unfinished_output,
+                        normalize_provider_text(&message),
+                    )
                     .map(|_| ProviderEventProjection::Terminal(None))
             }
             ProviderEvent::TurnFailed { message } => {
@@ -1089,7 +1138,7 @@ fn project_provider_event(
                         next_agent.agent.clone(),
                         ProviderTurnOutcome::Failed {
                             unfinished_output,
-                            message,
+                            message: normalize_provider_text(&message),
                         },
                     )
                     .map(ProviderEventProjection::Terminal)
@@ -1102,7 +1151,7 @@ fn project_provider_event(
                 session_id,
                 active,
                 next_agent,
-                format!("Provider execution failed: {error}"),
+                normalize_provider_text(&format!("Provider execution failed: {error}")),
             )
         })
     }) else {
