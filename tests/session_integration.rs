@@ -852,6 +852,289 @@ async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
 }
 
 #[tokio::test]
+async fn stopping_a_provider_actor_settles_the_command_it_left_in_flight() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "actor-shutdown-settle-test")
+            .expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "actor-shutdown-settle-test")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Report progress".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let session_id = created.session.id;
+    let start = provider.next_start().await;
+    let mut provider_session = start.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-normalized", "high", "fast"),
+    });
+    provider_session.next_turn().await.succeed();
+    let mut observer = client
+        .attach_session(session_id)
+        .await
+        .expect("attach to the active Session");
+    let SessionEvent::Snapshot(_) = observer
+        .next()
+        .await
+        .expect("observer receives snapshot")
+        .expect("observer snapshot is valid")
+    else {
+        panic!("attachment must begin with a Session snapshot");
+    };
+
+    for event in [
+        ProviderEvent::CommandStarted {
+            activity_id: ProviderActivityId::new("abandoned-command"),
+            command: "report progress".to_owned(),
+            cwd: Some(workspace.path().to_owned()),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("abandoned-command"),
+            content: "starting\nprogress 90%".to_owned(),
+        },
+    ] {
+        provider_session.emit(event);
+    }
+    // The delta that carries the pending line is the one that publishes the line
+    // before it, so its update arriving proves the normalizer holds the rest.
+    let command_activity_id = timeout(Duration::from_secs(1), async {
+        loop {
+            for change in next_session_update(&mut observer).await.changes {
+                if let SessionChange::CommandOutputAppended { activity_id, .. } = change {
+                    return activity_id;
+                }
+            }
+        }
+    })
+    .await
+    .expect("command output reaches the Session");
+
+    client
+        .delete_session(session_id)
+        .await
+        .expect("delete the Session its Provider actor still owns");
+
+    let settle_changes = timeout(Duration::from_secs(1), async {
+        let mut changes = Vec::new();
+        loop {
+            changes.extend(next_session_update(&mut observer).await.changes);
+            if changes.iter().any(|change| {
+                matches!(
+                    change,
+                    SessionChange::TurnStatusChanged {
+                        status: TurnStatus::Failed,
+                        ..
+                    }
+                )
+            }) {
+                return changes;
+            }
+        }
+    })
+    .await
+    .expect("stopping the Provider actor settles the Turn");
+
+    let output_index = settle_changes
+        .iter()
+        .position(|change| {
+            change
+                == &SessionChange::CommandOutputAppended {
+                    activity_id: command_activity_id,
+                    content: "progress 90%".to_owned(),
+                }
+        })
+        .expect("the pending output line is stored before the Session goes away");
+    let settled_index = settle_changes
+        .iter()
+        .position(|change| {
+            change
+                == &SessionChange::CommandStatusChanged {
+                    activity_id: command_activity_id,
+                    status: ActivityStatus::Failed,
+                    exit_status: None,
+                }
+        })
+        .expect("the in-flight command Activity settles");
+    assert!(
+        output_index < settled_index,
+        "stored output must reach a command Activity before it settles: {settle_changes:?}"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn interrupting_a_turn_without_a_provider_actor_settles_its_in_flight_command() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config =
+        ServerConfig::new(state_dir.path(), "actorless-interrupt-test").expect("configure server");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let original = server::spawn_with_provider(config.clone(), runtime)
+        .await
+        .expect("spawn original server");
+    let original_descriptor = original.descriptor().clone();
+    let http = reqwest::Client::new();
+
+    let created = http
+        .post(format!("{}/v1/sessions", original_descriptor.base_url))
+        .bearer_auth(&original_descriptor.token)
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Report progress".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+    let session_id = created.session.id;
+    let start = provider.next_start().await;
+    let mut provider_session = start.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-normalized", "high", "fast"),
+    });
+    provider_session.next_turn().await.succeed();
+    provider_session.emit(ProviderEvent::CommandStarted {
+        activity_id: ProviderActivityId::new("abandoned-command"),
+        command: "report progress".to_owned(),
+        cwd: Some(workspace.path().to_owned()),
+    });
+    let running = timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = read_session_at_least_revision(
+                &http,
+                &original_descriptor,
+                session_id,
+                SessionRevision::INITIAL,
+            )
+            .await;
+            if !snapshot.activities.is_empty() {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the command Activity reaches the Session");
+    let turn_id = running.turns[0].id;
+    let command_activity_id = running.activities[0].id();
+    original.shutdown().await.expect("stop original server");
+
+    let (replacement_runtime, _replacement_provider) = ControlledProvider::new();
+    let replacement = server::spawn_with_provider(config, replacement_runtime)
+        .await
+        .expect("spawn replacement server");
+    let replacement_descriptor = replacement.descriptor().clone();
+    let restored = http
+        .get(format!(
+            "{}/v1/sessions/{session_id}",
+            replacement_descriptor.base_url
+        ))
+        .bearer_auth(&replacement_descriptor.token)
+        .send()
+        .await
+        .expect("read restored Session")
+        .error_for_status()
+        .expect("restored Session remains readable")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode restored Session");
+    assert_eq!(
+        restored.turns[0].status,
+        TurnStatus::Active,
+        "a restart leaves the Turn it cut off active and without a Provider actor"
+    );
+    let Activity::Command { status, .. } = &restored.activities[0] else {
+        panic!("Provider command projects as command Activity");
+    };
+    assert_eq!(*status, ActivityStatus::Active);
+
+    let refused = http
+        .post(format!(
+            "{}/v1/sessions/{session_id}/turns/{turn_id}/interrupt",
+            replacement_descriptor.base_url
+        ))
+        .bearer_auth(&replacement_descriptor.token)
+        .send()
+        .await
+        .expect("request interruption of the restored Turn");
+    assert_eq!(refused.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        refused
+            .json::<SessionError>()
+            .await
+            .expect("decode interruption failure")
+            .code,
+        SessionErrorCode::TurnInterruptionFailed
+    );
+
+    let interrupted = http
+        .get(format!(
+            "{}/v1/sessions/{session_id}",
+            replacement_descriptor.base_url
+        ))
+        .bearer_auth(&replacement_descriptor.token)
+        .send()
+        .await
+        .expect("read the failed Session")
+        .error_for_status()
+        .expect("the failed Session remains readable")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode the failed Session");
+    assert_eq!(interrupted.turns[0].status, TurnStatus::Failed);
+    assert_eq!(interrupted.session.status, SessionStatus::Idle);
+    let Some(Activity::Command { status, .. }) = interrupted
+        .activities
+        .iter()
+        .find(|activity| activity.id() == command_activity_id)
+    else {
+        panic!("the command Activity survives the failed interruption");
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Failed,
+        "an interruption that never reaches a Provider actor still settles what it left in flight"
+    );
+
+    replacement
+        .shutdown()
+        .await
+        .expect("shut down replacement server");
+}
+
+#[tokio::test]
 async fn agent_selection_changes_do_not_rewrite_an_active_turn_identity() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");

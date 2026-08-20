@@ -151,27 +151,20 @@ pub(crate) enum DeliveredTurnStatus {
 pub(crate) enum ProviderTurnOutcome {
     Completed,
     Failed {
-        unfinished_output: UnfinishedProviderOutput,
+        trailing_output: TrailingCommandOutput,
         message: String,
     },
     Interrupted {
-        unfinished_output: UnfinishedProviderOutput,
+        trailing_output: TrailingCommandOutput,
     },
 }
 
-#[derive(Default)]
-pub(crate) struct UnfinishedProviderOutput {
-    pub(crate) streaming_message_id: Option<MessageId>,
-    pub(crate) active_commands: Vec<UnfinishedCommand>,
-    pub(crate) active_file_change_ids: Vec<ActivityId>,
-}
-
-/// A command Activity still running when its Turn settled, carrying the
-/// trailing output its normalizer held back as an unterminated line.
-pub(crate) struct UnfinishedCommand {
-    pub(crate) activity_id: ActivityId,
-    pub(crate) trailing_output: String,
-}
+/// The unterminated line each in-flight command's normalizer held back when its
+/// Turn settled, keyed by the command Activity it belongs to. Only the Provider
+/// actor holds those normalizers, while which streams are still in flight is the
+/// store's own knowledge, so a settle path that cannot reach the actor carries
+/// an empty one and still settles every stream the Turn left open.
+pub(crate) type TrailingCommandOutput = HashMap<ActivityId, String>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ListSessionsError {
@@ -818,14 +811,14 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         turn_id: TurnId,
-        unfinished_output: UnfinishedProviderOutput,
+        trailing_output: TrailingCommandOutput,
         message: String,
     ) -> anyhow::Result<SessionUpdate> {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let (prompt, mark_unavailable, admission_order) = {
+        let (prompt, mark_unavailable, admission_order, mut changes) = {
             let record = state
                 .sessions
                 .get(&session_id)
@@ -848,7 +841,12 @@ impl SessionStore {
             let mark_unavailable = turn.agent.as_ref().is_some_and(|agent| {
                 record.snapshot.session.agent_selection.as_ref() == Some(&agent.selection)
             });
-            (prompt.clone(), mark_unavailable, record.next_prompt_order)
+            (
+                prompt.clone(),
+                mark_unavailable,
+                record.next_prompt_order,
+                settle_in_flight_changes(&record.snapshot, turn_id, trailing_output),
+            )
         };
         let restored = Prompt {
             id: PromptId::new(),
@@ -857,7 +855,6 @@ impl SessionStore {
             admission_order,
             status: PromptStatus::Pending,
         };
-        let mut changes = terminal_output_changes(unfinished_output);
         changes.extend([
             SessionChange::ActivityAdded {
                 activity: Activity::Error {
@@ -1069,10 +1066,18 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         turn_id: TurnId,
-        unfinished_output: UnfinishedProviderOutput,
+        trailing_output: TrailingCommandOutput,
         message: String,
     ) -> anyhow::Result<SessionUpdate> {
-        let mut changes = terminal_output_changes(unfinished_output);
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let record = state
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+        let mut changes = settle_in_flight_changes(&record.snapshot, turn_id, trailing_output);
         changes.extend([
             SessionChange::ActivityAdded {
                 activity: Activity::Error {
@@ -1086,7 +1091,12 @@ impl SessionStore {
                 status: TurnStatus::Failed,
             },
         ]);
-        self.publish(session_id, changes)
+        let updated_at = state.next_timestamp();
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
+        record.commit(&self.storage, session_id, changes, updated_at)
     }
 
     pub(crate) fn finish_provider_turn(
@@ -1100,12 +1110,40 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let (pending_steers, next_queued_prompt, next_agent) = {
+        let (trailing_output, failure_message, status) = match outcome {
+            ProviderTurnOutcome::Completed => {
+                (TrailingCommandOutput::new(), None, TurnStatus::Completed)
+            }
+            ProviderTurnOutcome::Failed {
+                trailing_output,
+                message,
+            } => (trailing_output, Some(message), TurnStatus::Failed),
+            ProviderTurnOutcome::Interrupted { trailing_output } => {
+                (trailing_output, None, TurnStatus::Interrupted)
+            }
+        };
+        let (pending_steers, next_queued_prompt, next_agent, settle_changes) = {
             let record = state
                 .sessions
                 .get(&session_id)
                 .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
             if active_turn_id(&record.snapshot)? != Some(turn_id) {
+                // The store has moved past this Turn, so another settle path reached it
+                // first. Settling a Turn settles its in-flight streams in the same commit,
+                // and a Provider actor stays reachable until it has settled the Turn it
+                // was running, so the flushed output arriving here should find nothing
+                // left to land on. Store what it does still find rather than trusting
+                // that and discarding it unseen.
+                let salvaged = settle_in_flight_changes(&record.snapshot, turn_id, trailing_output);
+                if salvaged.is_empty() {
+                    return Ok(None);
+                }
+                let updated_at = state.next_timestamp();
+                let record = state
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("Session existence was checked while holding the store lock");
+                record.commit(&self.storage, session_id, salvaged, updated_at)?;
                 return Ok(None);
             }
             let mut pending_steers = record
@@ -1138,47 +1176,29 @@ impl SessionStore {
                     agent: agent_id,
                     selection,
                 });
-            (pending_steers, next_queued_prompt, next_agent)
+            (
+                pending_steers,
+                next_queued_prompt,
+                next_agent,
+                settle_in_flight_changes(&record.snapshot, turn_id, trailing_output),
+            )
         };
 
-        let mut changes = Vec::with_capacity(pending_steers.len() * 2 + 6);
+        let mut changes = Vec::with_capacity(pending_steers.len() * 2 + settle_changes.len() + 6);
         for prompt in &pending_steers {
             append_steer_delivery_changes(&mut changes, prompt, turn_id);
         }
-        match outcome {
-            ProviderTurnOutcome::Completed => {
-                changes.push(SessionChange::TurnStatusChanged {
+        changes.extend(settle_changes);
+        if let Some(message) = failure_message {
+            changes.push(SessionChange::ActivityAdded {
+                activity: Activity::Error {
+                    id: ActivityId::new(),
                     turn_id,
-                    status: TurnStatus::Completed,
-                });
-            }
-            ProviderTurnOutcome::Failed {
-                unfinished_output,
-                message,
-            } => {
-                changes.extend(terminal_output_changes(unfinished_output));
-                changes.extend([
-                    SessionChange::ActivityAdded {
-                        activity: Activity::Error {
-                            id: ActivityId::new(),
-                            turn_id,
-                            text: message,
-                        },
-                    },
-                    SessionChange::TurnStatusChanged {
-                        turn_id,
-                        status: TurnStatus::Failed,
-                    },
-                ]);
-            }
-            ProviderTurnOutcome::Interrupted { unfinished_output } => {
-                changes.extend(terminal_output_changes(unfinished_output));
-                changes.push(SessionChange::TurnStatusChanged {
-                    turn_id,
-                    status: TurnStatus::Interrupted,
-                });
-            }
+                    text: message,
+                },
+            });
         }
+        changes.push(SessionChange::TurnStatusChanged { turn_id, status });
 
         let next_turn = next_queued_prompt.map(|prompt| {
             let (delivered, delivery_changes) =
@@ -1498,39 +1518,68 @@ fn model_option_value_text(value: &ModelOptionValue) -> String {
     }
 }
 
-fn terminal_output_changes(unfinished: UnfinishedProviderOutput) -> Vec<SessionChange> {
-    let UnfinishedProviderOutput {
-        streaming_message_id,
-        active_commands,
-        active_file_change_ids,
-    } = unfinished;
-    let mut changes = Vec::with_capacity(
-        active_commands.len() * 2
-            + active_file_change_ids.len()
-            + usize::from(streaming_message_id.is_some()),
+/// The changes that settle everything a Turn left in flight: its streaming Agent
+/// Message completes, and each command or file-change Activity still Active
+/// fails, every command first storing the trailing output its normalizer
+/// flushed. Reading the in-flight set from the Session's own snapshot rather
+/// than from the caller keeps every settle path equivalent, including the ones
+/// that never reach the Provider actor holding that Turn. A Turn that completes
+/// normally has nothing in flight — a Provider that leaves a stream open is
+/// refused its completion — so this settles nothing on that path.
+fn settle_in_flight_changes(
+    snapshot: &SessionSnapshot,
+    turn_id: TurnId,
+    mut trailing_output: TrailingCommandOutput,
+) -> Vec<SessionChange> {
+    let mut changes = Vec::new();
+    changes.extend(
+        snapshot
+            .messages
+            .iter()
+            .filter(|message| {
+                message.turn_id == turn_id
+                    && message.role == MessageRole::Agent
+                    && message.status == MessageStatus::Streaming
+            })
+            .map(|message| SessionChange::MessageCompleted {
+                message_id: message.id,
+            }),
     );
-    if let Some(message_id) = streaming_message_id {
-        changes.push(SessionChange::MessageCompleted { message_id });
-    }
-    for command in active_commands {
-        if !command.trailing_output.is_empty() {
-            changes.push(SessionChange::CommandOutputAppended {
-                activity_id: command.activity_id,
-                content: command.trailing_output,
-            });
+    for activity in &snapshot.activities {
+        if activity.turn_id() != turn_id {
+            continue;
         }
-        changes.push(SessionChange::CommandStatusChanged {
-            activity_id: command.activity_id,
-            status: ActivityStatus::Failed,
-            exit_status: None,
-        });
-    }
-    changes.extend(active_file_change_ids.into_iter().map(|activity_id| {
-        SessionChange::FileChangeStatusChanged {
-            activity_id,
-            status: ActivityStatus::Failed,
+        match activity {
+            Activity::Command {
+                id,
+                status: ActivityStatus::Active,
+                ..
+            } => {
+                if let Some(content) = trailing_output.remove(id)
+                    && !content.is_empty()
+                {
+                    changes.push(SessionChange::CommandOutputAppended {
+                        activity_id: *id,
+                        content,
+                    });
+                }
+                changes.push(SessionChange::CommandStatusChanged {
+                    activity_id: *id,
+                    status: ActivityStatus::Failed,
+                    exit_status: None,
+                });
+            }
+            Activity::FileChange {
+                id,
+                status: ActivityStatus::Active,
+                ..
+            } => changes.push(SessionChange::FileChangeStatusChanged {
+                activity_id: *id,
+                status: ActivityStatus::Failed,
+            }),
+            _ => {}
         }
-    }));
+    }
     changes
 }
 
@@ -1834,5 +1883,171 @@ impl SessionStoreState {
         }));
         self.last_timestamp = Some(timestamp);
         timestamp
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::protocol::TranscriptItem;
+
+    use super::*;
+
+    fn settling_snapshot(
+        turn_id: TurnId,
+        activities: Vec<Activity>,
+        messages: Vec<Message>,
+    ) -> SessionSnapshot {
+        SessionSnapshot {
+            session: Session {
+                id: SessionId::new(),
+                workspace: Workspace {
+                    path: PathBuf::from("/workspace"),
+                },
+                agent_selection: None,
+                agent_selection_availability: ModelAvailability::Available,
+                status: SessionStatus::Active,
+            },
+            revision: SessionRevision::INITIAL,
+            prompts: Vec::new(),
+            turns: vec![Turn {
+                id: turn_id,
+                prompt_id: PromptId::new(),
+                agent: None,
+                status: TurnStatus::Active,
+            }],
+            transcript: messages
+                .iter()
+                .map(|message| TranscriptItem::Message {
+                    message_id: message.id,
+                })
+                .chain(activities.iter().map(|activity| TranscriptItem::Activity {
+                    activity_id: activity.id(),
+                }))
+                .collect(),
+            messages,
+            activities,
+        }
+    }
+
+    fn command(turn_id: TurnId, status: ActivityStatus) -> Activity {
+        Activity::Command {
+            id: ActivityId::new(),
+            turn_id,
+            status,
+            command: "report progress".to_owned(),
+            cwd: None,
+            output: String::new(),
+            exit_status: None,
+        }
+    }
+
+    #[test]
+    fn settling_a_turn_terminates_the_in_flight_streams_its_snapshot_still_shows() {
+        let turn_id = TurnId::new();
+        let running = command(turn_id, ActivityStatus::Active);
+        let file_change = Activity::FileChange {
+            id: ActivityId::new(),
+            turn_id,
+            status: ActivityStatus::Active,
+            changes: Vec::new(),
+        };
+        let streaming = Message {
+            id: MessageId::new(),
+            turn_id,
+            role: MessageRole::Agent,
+            status: MessageStatus::Streaming,
+            content: String::new(),
+        };
+        let snapshot = settling_snapshot(
+            turn_id,
+            vec![running.clone(), file_change.clone()],
+            vec![streaming.clone()],
+        );
+
+        let changes = settle_in_flight_changes(&snapshot, turn_id, TrailingCommandOutput::new());
+
+        assert_eq!(
+            changes,
+            vec![
+                SessionChange::MessageCompleted {
+                    message_id: streaming.id,
+                },
+                SessionChange::CommandStatusChanged {
+                    activity_id: running.id(),
+                    status: ActivityStatus::Failed,
+                    exit_status: None,
+                },
+                SessionChange::FileChangeStatusChanged {
+                    activity_id: file_change.id(),
+                    status: ActivityStatus::Failed,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn settling_a_turn_stores_flushed_command_output_before_the_command_settles() {
+        let turn_id = TurnId::new();
+        let running = command(turn_id, ActivityStatus::Active);
+        let snapshot = settling_snapshot(turn_id, vec![running.clone()], Vec::new());
+
+        let changes = settle_in_flight_changes(
+            &snapshot,
+            turn_id,
+            TrailingCommandOutput::from([(running.id(), "progress 90%".to_owned())]),
+        );
+
+        assert_eq!(
+            changes,
+            vec![
+                SessionChange::CommandOutputAppended {
+                    activity_id: running.id(),
+                    content: "progress 90%".to_owned(),
+                },
+                SessionChange::CommandStatusChanged {
+                    activity_id: running.id(),
+                    status: ActivityStatus::Failed,
+                    exit_status: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn settling_a_turn_leaves_settled_streams_and_other_turns_alone() {
+        let turn_id = TurnId::new();
+        let other_turn_id = TurnId::new();
+        let settled = command(turn_id, ActivityStatus::Completed);
+        let elsewhere = command(other_turn_id, ActivityStatus::Active);
+        let completed = Message {
+            id: MessageId::new(),
+            turn_id,
+            role: MessageRole::Agent,
+            status: MessageStatus::Completed,
+            content: "done".to_owned(),
+        };
+        let user = Message {
+            id: MessageId::new(),
+            turn_id,
+            role: MessageRole::User,
+            status: MessageStatus::Completed,
+            content: "report progress".to_owned(),
+        };
+        let snapshot = settling_snapshot(
+            turn_id,
+            vec![settled.clone(), elsewhere.clone()],
+            vec![user, completed],
+        );
+
+        let changes = settle_in_flight_changes(
+            &snapshot,
+            turn_id,
+            TrailingCommandOutput::from([(settled.id(), "lost".to_owned())]),
+        );
+
+        assert!(
+            changes.is_empty(),
+            "a Turn with nothing in flight settles nothing: {changes:?}"
+        );
     }
 }

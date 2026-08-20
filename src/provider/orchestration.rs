@@ -25,7 +25,7 @@ use crate::protocol::{
 };
 use crate::sessions::{
     DeliveredTurn, DeliveredTurnStatus, InterruptTurnError, ProviderTurnOutcome, SessionStore,
-    UnfinishedCommand, UnfinishedProviderOutput,
+    TrailingCommandOutput,
 };
 
 /// The most characters of Provider-sent output Suru stores for one command; the
@@ -62,7 +62,10 @@ struct ProviderActors {
 struct ProviderActor {
     commands: mpsc::UnboundedSender<ProviderCommand>,
     shutdown: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    /// Taken by whoever waits for this actor to stop, and left registered until
+    /// it has: an actor that is still settling its Turn must stay reachable, or
+    /// a caller that finds no actor settles that Turn out from under it.
+    task: Option<JoinHandle<()>>,
 }
 
 struct ProviderShutdown {
@@ -151,8 +154,10 @@ struct ActiveProviderTurn {
 
 /// An Agent Message the Provider is still streaming. Its normalizer buffers no
 /// unterminated line, so settling the Turn may drop it; give this one line
-/// overwrite and [`ActiveProviderTurn::take_unfinished_output`] must drain it
-/// the way it drains command output.
+/// overwrite and the settle paths must gain a place to carry its drained
+/// content, the way [`TrailingCommandOutput`] carries a command's. The store
+/// completes the Message from its own snapshot and cannot reach what the
+/// normalizer holds.
 struct ActiveProviderMessage {
     id: MessageId,
     normalizer: ProviderTextNormalizer,
@@ -164,23 +169,15 @@ struct ActiveProviderCommand {
 }
 
 impl ActiveProviderTurn {
-    fn take_unfinished_output(&mut self) -> UnfinishedProviderOutput {
-        UnfinishedProviderOutput {
-            streaming_message_id: self.streaming_message.take().map(|message| message.id),
-            active_commands: self
-                .command_activities
-                .drain()
-                .map(|(_, mut command)| UnfinishedCommand {
-                    activity_id: command.id,
-                    trailing_output: command.output_normalizer.finish(),
-                })
-                .collect(),
-            active_file_change_ids: self
-                .file_change_activities
-                .drain()
-                .map(|(_, activity_id)| activity_id)
-                .collect(),
-        }
+    /// Drains what the Turn's streams hold that only this actor knows: the
+    /// unterminated line each command normalizer buffered. The Session store
+    /// settles the streams themselves from its own snapshot, so forgetting a
+    /// stream here costs its pending line, not its Transcript row.
+    fn take_trailing_output(&mut self) -> TrailingCommandOutput {
+        self.command_activities
+            .drain()
+            .map(|(_, mut command)| (command.id, command.output_normalizer.finish()))
+            .collect()
     }
 }
 
@@ -265,7 +262,7 @@ impl ProviderOrchestrator {
             ProviderActor {
                 commands: commands_tx.clone(),
                 shutdown: session_shutdown,
-                task,
+                task: Some(task),
             },
         );
         Ok(commands_tx)
@@ -344,6 +341,11 @@ impl ProviderOrchestrator {
         })?
     }
 
+    /// Fails a Turn whose Provider actor could not be reached, settling whatever
+    /// it left in flight. It carries no trailing output because it has no
+    /// normalizer to drain: an actor stays registered until it has stopped, so
+    /// either no actor ever ran this Turn in this process, or the one that did
+    /// has already settled it and this failure finds nothing left to settle.
     fn fail_unavailable_interruption(
         &self,
         session_id: SessionId,
@@ -354,7 +356,7 @@ impl ProviderOrchestrator {
             self.sessions.fail_turn(
                 session_id,
                 turn_id,
-                UnfinishedProviderOutput::default(),
+                TrailingCommandOutput::new(),
                 message.to_owned(),
             )
         });
@@ -362,17 +364,25 @@ impl ProviderOrchestrator {
     }
 
     pub(crate) async fn close_session(&self, session_id: SessionId) {
-        let actor = self
-            .actors
+        let task = {
+            let mut actors = self
+                .actors
+                .lock()
+                .expect("Provider actor registry lock is not poisoned");
+            let Some(actor) = actors.entries.get_mut(&session_id) else {
+                return;
+            };
+            actor.shutdown.send_replace(true);
+            actor.task.take()
+        };
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+        self.actors
             .lock()
             .expect("Provider actor registry lock is not poisoned")
             .entries
             .remove(&session_id);
-        let Some(actor) = actor else {
-            return;
-        };
-        actor.shutdown.send_replace(true);
-        let _ = actor.task.await;
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -401,8 +411,10 @@ impl ProviderOrchestrator {
             return;
         };
 
-        for actor in actors {
-            let _ = actor.task.await;
+        for mut actor in actors {
+            if let Some(task) = actor.task.take() {
+                let _ = task.await;
+            }
         }
         let _ = timeout(Duration::from_secs(2), self.runtime.shutdown()).await;
         self.shutdown_complete.send_replace(true);
@@ -671,7 +683,16 @@ async fn run_provider_session(
                 }
                 let interrupted = tokio::select! {
                     biased;
-                    _ = shutdown.wait() => break 'actor,
+                    // Answer the caller before leaving, so it reports the interruption
+                    // failure rather than inventing one that would race this actor's
+                    // settling of the Turn on its way out.
+                    _ = shutdown.wait() => {
+                        let _ = response.send(Err(InterruptTurnError::ProviderFailure(
+                            "Provider interruption failed: the Provider Session is shutting down."
+                                .to_owned(),
+                        )));
+                        break 'actor;
+                    }
                     interrupted = provider_session.interrupt_turn() => interrupted,
                 };
                 match interrupted {
@@ -681,15 +702,7 @@ async fn run_provider_session(
                     }
                     Err(error) => {
                         let message = failure_message("Provider interruption failed", &error);
-                        let unfinished_output = current.take_unfinished_output();
-                        let _ = updates.apply(|| {
-                            sessions.fail_turn(
-                                session_id,
-                                current.turn_id,
-                                unfinished_output,
-                                message.clone(),
-                            )
-                        });
+                        fail_active_turn(&sessions, &updates, session_id, current, message.clone());
                         active = None;
                         provider = None;
                         let _ = response.send(Err(InterruptTurnError::ProviderFailure(message)));
@@ -739,29 +752,25 @@ async fn run_provider_session(
                         }
                     }
                     Some(Err(error)) => {
-                        let unfinished_output = current.take_unfinished_output();
-                        let _ = updates.apply(|| {
-                            sessions.fail_turn(
-                                session_id,
-                                current.turn_id,
-                                unfinished_output,
-                                failure_message("Provider execution failed", &error),
-                            )
-                        });
+                        fail_active_turn(
+                            &sessions,
+                            &updates,
+                            session_id,
+                            current,
+                            failure_message("Provider execution failed", &error),
+                        );
                         active = None;
                         provider = None;
                     }
                     None => {
-                        let unfinished_output = current.take_unfinished_output();
-                        let _ = updates.apply(|| {
-                            sessions.fail_turn(
-                                session_id,
-                                current.turn_id,
-                                unfinished_output,
-                                "Provider execution failed: the Provider Session ended before the Turn completed."
-                                    .to_owned(),
-                            )
-                        });
+                        fail_active_turn(
+                            &sessions,
+                            &updates,
+                            session_id,
+                            current,
+                            "Provider execution failed: the Provider Session ended before the Turn completed."
+                                .to_owned(),
+                        );
                         active = None;
                         provider = None;
                     }
@@ -770,9 +779,42 @@ async fn run_provider_session(
         }
     }
 
+    // The actor holds the only handle to its Turn's normalizers, so settle the Turn
+    // here rather than dropping them: whatever stopped this actor also stopped the
+    // Turn, and nothing else will finish the streams it left in flight. It fails
+    // rather than settling an acknowledged interruption, because a Turn settled as
+    // interrupted delivers the next queued Prompt, and this actor is in no state to
+    // run it.
+    if let Some(mut current) = active {
+        fail_active_turn(
+            &sessions,
+            &updates,
+            session_id,
+            &mut current,
+            "Provider execution failed: Suru stopped the Provider Session before the Turn completed."
+                .to_owned(),
+        );
+    }
+
     if let Some(connected) = provider {
         let _ = timeout(Duration::from_secs(2), connected.session.shutdown()).await;
     }
+}
+
+/// Fails the Turn this actor was running, flushing the pending line each of its
+/// command normalizers still holds. The store settles the streams the Turn
+/// leaves in flight from its own snapshot; only these lines are the actor's to
+/// hand over.
+fn fail_active_turn(
+    sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
+    session_id: SessionId,
+    active: &mut ActiveProviderTurn,
+    message: String,
+) {
+    let turn_id = active.turn_id;
+    let trailing_output = active.take_trailing_output();
+    let _ = updates.apply(|| sessions.fail_turn(session_id, turn_id, trailing_output, message));
 }
 
 fn provider_turn_start(delivered: DeliveredTurn) -> (TurnId, ProviderTurnInput) {
@@ -805,16 +847,11 @@ fn project_turn_start_failure(
             sessions.reject_agent_selection(
                 session_id,
                 turn_id,
-                UnfinishedProviderOutput::default(),
+                TrailingCommandOutput::new(),
                 message,
             )
         } else {
-            sessions.fail_turn(
-                session_id,
-                turn_id,
-                UnfinishedProviderOutput::default(),
-                message,
-            )
+            sessions.fail_turn(session_id, turn_id, TrailingCommandOutput::new(), message)
         }
     });
 }
@@ -1138,36 +1175,36 @@ fn project_provider_event(
                 }
             }
             ProviderEvent::TurnInterrupted => {
-                let unfinished_output = active.take_unfinished_output();
+                let trailing_output = active.take_trailing_output();
                 sessions
                     .finish_provider_turn(
                         session_id,
                         active.turn_id,
                         next_agent.agent.clone(),
-                        ProviderTurnOutcome::Interrupted { unfinished_output },
+                        ProviderTurnOutcome::Interrupted { trailing_output },
                     )
                     .map(ProviderEventProjection::Terminal)
             }
             ProviderEvent::AgentSelectionRejected { message } => {
-                let unfinished_output = active.take_unfinished_output();
+                let trailing_output = active.take_trailing_output();
                 sessions
                     .reject_agent_selection(
                         session_id,
                         active.turn_id,
-                        unfinished_output,
+                        trailing_output,
                         normalize_provider_text(&message),
                     )
                     .map(|_| ProviderEventProjection::Terminal(None))
             }
             ProviderEvent::TurnFailed { message } => {
-                let unfinished_output = active.take_unfinished_output();
+                let trailing_output = active.take_trailing_output();
                 sessions
                     .finish_provider_turn(
                         session_id,
                         active.turn_id,
                         next_agent.agent.clone(),
                         ProviderTurnOutcome::Failed {
-                            unfinished_output,
+                            trailing_output,
                             message: normalize_provider_text(&message),
                         },
                     )
@@ -1221,14 +1258,14 @@ fn finish_invalid_provider_event(
     next_agent: &AgentIdentity,
     message: String,
 ) -> ProviderEventProjection {
-    let unfinished_output = active.take_unfinished_output();
+    let trailing_output = active.take_trailing_output();
     let next_turn = sessions
         .finish_provider_turn(
             session_id,
             active.turn_id,
             next_agent.agent.clone(),
             ProviderTurnOutcome::Failed {
-                unfinished_output,
+                trailing_output,
                 message,
             },
         )
