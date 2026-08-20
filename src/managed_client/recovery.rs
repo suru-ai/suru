@@ -1,6 +1,6 @@
 //! Managed connection establishment, replacement, and crash recovery orchestration.
 
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use anyhow::{Result, anyhow};
 use tokio::sync::{mpsc, watch};
@@ -12,6 +12,7 @@ use super::{
     event_stream::{self, StreamOutcome},
     launcher,
     lifecycle::{self, Registration},
+    session_catalog_stream,
 };
 
 const INITIAL_RECOVERY_BACKOFF: Duration = Duration::from_millis(50);
@@ -20,7 +21,13 @@ const MAX_RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
 struct ActiveConnection {
     descriptor: RuntimeDescriptor,
     health: Health,
-    response: reqwest::Response,
+    lifecycle_response: reqwest::Response,
+    catalog_response: reqwest::Response,
+}
+
+struct ManagedStreamResponses {
+    lifecycle: reqwest::Response,
+    catalog: reqwest::Response,
 }
 
 pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient> {
@@ -51,33 +58,50 @@ async fn establish_connection(
     deadline: tokio::time::Instant,
 ) -> Result<ActiveConnection> {
     let Registration { descriptor, health } = launcher::ensure_server(config, deadline).await?;
-    let response =
-        match tokio::time::timeout_at(deadline, event_stream::open(http, &descriptor)).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) if error.status().is_some() => {
-                return Err(launcher::startup_error(
-                    config,
-                    &format!("server rejected the initial event stream: {error}"),
-                ));
-            }
-            Ok(Err(error)) => {
-                return Err(launcher::startup_error(
-                    config,
-                    &format!("could not open the initial event stream: {error}"),
-                ));
-            }
-            Err(_) => {
-                return Err(launcher::startup_error(
-                    config,
-                    "initial event stream did not open within 15s",
-                ));
-            }
-        };
+    let streams = open_managed_streams(http, &descriptor, deadline)
+        .await
+        .map_err(|error| launcher::startup_error(config, &error.to_string()))?;
     Ok(ActiveConnection {
         descriptor,
         health,
-        response,
+        lifecycle_response: streams.lifecycle,
+        catalog_response: streams.catalog,
     })
+}
+
+async fn open_managed_streams(
+    http: &reqwest::Client,
+    descriptor: &RuntimeDescriptor,
+    deadline: tokio::time::Instant,
+) -> Result<ManagedStreamResponses> {
+    let lifecycle = open_required_stream(
+        deadline,
+        "event stream",
+        event_stream::open(http, descriptor),
+    )
+    .await?;
+    let catalog = open_required_stream(
+        deadline,
+        "Session catalog stream",
+        session_catalog_stream::open(http, descriptor),
+    )
+    .await?;
+    Ok(ManagedStreamResponses { lifecycle, catalog })
+}
+
+async fn open_required_stream(
+    deadline: tokio::time::Instant,
+    name: &str,
+    opening: impl std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+) -> Result<reqwest::Response> {
+    match tokio::time::timeout_at(deadline, opening).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) if error.status().is_some() => {
+            Err(anyhow!("server rejected the initial {name}: {error}"))
+        }
+        Ok(Err(error)) => Err(anyhow!("could not open the initial {name}: {error}")),
+        Err(_) => Err(anyhow!("initial {name} did not open within 15s")),
+    }
 }
 
 async fn run_managed_client(
@@ -87,31 +111,98 @@ async fn run_managed_client(
     events: mpsc::Sender<ManagedEvent>,
     descriptor: watch::Sender<RuntimeDescriptor>,
 ) {
+    let mut known_session_ids: Option<HashSet<_>> = None;
     if events.send(ManagedEvent::Connecting).await.is_err() {
         return;
     }
     loop {
         descriptor.send_replace(connection.descriptor.clone());
+        let active_descriptor = connection.descriptor.clone();
         let active_instance_id = connection.descriptor.instance_id;
         let active_build_identity = connection.health.build_identity.clone();
-        if events
-            .send(ManagedEvent::Connected(connection.health))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let replaced_instance_id =
-            match event_stream::consume(connection.response, &events, active_instance_id).await {
-                Ok(StreamOutcome::Disconnected) => None,
-                Ok(StreamOutcome::ManualShutdown) => return,
-                Ok(StreamOutcome::Replacement { instance_id }) => Some(instance_id),
-                Ok(StreamOutcome::ReceiverClosed) => return,
-                Err(error) => {
-                    let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
+        let (catalog_hydrated, catalog_hydration) = tokio::sync::oneshot::channel();
+        let catalog = session_catalog_stream::consume(
+            connection.catalog_response,
+            &events,
+            &mut known_session_ids,
+            catalog_hydrated,
+        );
+        tokio::pin!(catalog);
+        let stream_result = tokio::select! {
+            biased;
+            outcome = &mut catalog => Some(ActiveStreamResult::Catalog(outcome)),
+            hydrated = catalog_hydration => {
+                if hydrated.is_err() {
                     return;
                 }
-            };
+                None
+            }
+        };
+        let stream_result = match stream_result {
+            Some(stream_result) => stream_result,
+            None => {
+                if events
+                    .send(ManagedEvent::Connected(connection.health))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let lifecycle = event_stream::consume(
+                    connection.lifecycle_response,
+                    &events,
+                    active_instance_id,
+                );
+                tokio::pin!(lifecycle);
+                tokio::select! {
+                    biased;
+                    outcome = &mut lifecycle => ActiveStreamResult::Lifecycle(outcome),
+                    outcome = &mut catalog => {
+                        if matches!(
+                            outcome,
+                            Ok(session_catalog_stream::StreamOutcome::Disconnected)
+                        ) {
+                            let health = lifecycle::inspect_descriptor_health(&active_descriptor);
+                            tokio::pin!(health);
+                            tokio::select! {
+                                biased;
+                                lifecycle = &mut lifecycle => {
+                                    ActiveStreamResult::Lifecycle(lifecycle)
+                                }
+                                health = &mut health => match health {
+                                    Ok(health) if health.lifecycle == LifecycleState::Ready => {
+                                        ActiveStreamResult::Catalog(outcome)
+                                    }
+                                    Ok(_) | Err(_) => {
+                                        ActiveStreamResult::Lifecycle(lifecycle.await)
+                                    }
+                                }
+                            }
+                        } else {
+                            ActiveStreamResult::Catalog(outcome)
+                        }
+                    },
+                }
+            }
+        };
+        let replaced_instance_id = match stream_result {
+            ActiveStreamResult::Lifecycle(Ok(StreamOutcome::Disconnected)) => None,
+            ActiveStreamResult::Lifecycle(Ok(StreamOutcome::ManualShutdown)) => return,
+            ActiveStreamResult::Lifecycle(Ok(StreamOutcome::Replacement { instance_id })) => {
+                Some(instance_id)
+            }
+            ActiveStreamResult::Lifecycle(Ok(StreamOutcome::ReceiverClosed))
+            | ActiveStreamResult::Catalog(Ok(
+                session_catalog_stream::StreamOutcome::ReceiverClosed,
+            )) => return,
+            ActiveStreamResult::Catalog(Ok(
+                session_catalog_stream::StreamOutcome::Disconnected,
+            )) => None,
+            ActiveStreamResult::Lifecycle(Err(error)) | ActiveStreamResult::Catalog(Err(error)) => {
+                let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
+                return;
+            }
+        };
 
         if let Some(replaced_instance_id) = replaced_instance_id {
             if events
@@ -214,6 +305,11 @@ enum ConnectionProbe {
     Incompatible(u32),
 }
 
+enum ActiveStreamResult {
+    Lifecycle(Result<StreamOutcome>),
+    Catalog(Result<session_catalog_stream::StreamOutcome>),
+}
+
 enum ConnectionWait {
     Ready(Box<ActiveConnection>),
     Incompatible(u32),
@@ -265,15 +361,14 @@ async fn probe_protocol_compatible_connection(
     if health.protocol_version != PROTOCOL_VERSION {
         return ConnectionProbe::Incompatible(health.protocol_version);
     }
-    let Ok(Ok(response)) =
-        tokio::time::timeout_at(deadline, event_stream::open(http, &descriptor)).await
-    else {
+    let Ok(streams) = open_managed_streams(http, &descriptor, deadline).await else {
         return ConnectionProbe::Pending;
     };
     ConnectionProbe::Ready(Box::new(ActiveConnection {
         descriptor,
         health,
-        response,
+        lifecycle_response: streams.lifecycle,
+        catalog_response: streams.catalog,
     }))
 }
 

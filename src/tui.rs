@@ -414,11 +414,81 @@ impl TuiState {
                     self.fatal_error = None;
                 }
             }
+            ManagedEvent::SessionDeleted(deleted) => {
+                self.session_picker.remove(deleted.session_id);
+                self.remove_deleted_session(deleted.session_id);
+            }
+            ManagedEvent::SessionCatalogReconciled(snapshot) => {
+                self.session_picker.retain_catalog(&snapshot.session_ids);
+                if let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id)
+                    && !snapshot.session_ids.contains(&session_id)
+                {
+                    self.remove_deleted_session(session_id);
+                }
+            }
             ManagedEvent::Fatal(error) => {
                 self.reconnect_overlay_visible = false;
                 self.fatal_error = Some(error);
             }
         }
+    }
+
+    fn remove_deleted_session(&mut self, deleted_session_id: SessionId) {
+        if !self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.session_id() == deleted_session_id)
+        {
+            return;
+        }
+        self.composers.discard_session(deleted_session_id);
+        self.session_interactions.remove(&deleted_session_id);
+        self.pending_steers
+            .retain(|steer| steer.session_id != deleted_session_id);
+        if self.pending_submission.as_ref().is_some_and(|submission| {
+            matches!(
+                submission.target,
+                SubmissionTarget::AdmitPrompt(session_id, _)
+                    if session_id == deleted_session_id
+            )
+        }) {
+            self.pending_submission = None;
+        }
+        self.failed_submissions.retain(|_, submission| {
+            !matches!(
+                submission.target,
+                SubmissionTarget::AdmitPrompt(session_id, _)
+                    if session_id == deleted_session_id
+            )
+        });
+        if self
+            .pending_agent_selection
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == deleted_session_id)
+        {
+            self.pending_agent_selection = None;
+        }
+        if self
+            .queued_agent_selection
+            .as_ref()
+            .is_some_and(|(session_id, _)| *session_id == deleted_session_id)
+        {
+            self.queued_agent_selection = None;
+        }
+        if self
+            .confirmed_agent_selection
+            .as_ref()
+            .is_some_and(|(session_id, _)| *session_id == deleted_session_id)
+        {
+            self.confirmed_agent_selection = None;
+        }
+        self.session = None;
+        self.session_events_blocked = true;
+        self.command_mode = CommandMode::Composer;
+        self.submission_error = Some("Session ended because it was deleted".to_owned());
+        self.model_picker
+            .refocus(self.landing_agent_selection.as_ref());
+        self.sync_command_autocomplete();
     }
 
     fn apply_session(&mut self, event: SessionEvent) -> Result<()> {
@@ -862,6 +932,10 @@ pub enum ApplicationEvent {
         error: String,
     },
     SessionAttachmentFailed(String),
+    SessionDeletionFailed {
+        session_id: SessionId,
+        error: String,
+    },
     SessionCreated(SessionSnapshot),
     SessionOperationFailed(String),
 }
@@ -922,6 +996,7 @@ pub enum ApplicationTransition {
     Exit,
     SessionEnded,
     DetachSession,
+    DeleteSession(SessionId),
     CreateSession(CreateSessionRequest),
     AdmitPrompt {
         session_id: SessionId,
@@ -1094,7 +1169,7 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::ToggleSessionScope) => {
-                if self.state.session_picker.is_attaching() {
+                if self.state.session_picker.is_busy() {
                     return Ok(ApplicationTransition::Continue);
                 }
                 let request = self.state.session_picker.toggle_scope();
@@ -1107,7 +1182,7 @@ impl Application {
                 ))
             }
             ApplicationEvent::Command(CommandId::CloseSessionPicker) => {
-                if !self.state.session_picker.is_attaching() {
+                if !self.state.session_picker.is_busy() {
                     self.state.session_picker.close();
                 }
                 Ok(ApplicationTransition::Continue)
@@ -1462,6 +1537,10 @@ impl Application {
                 let request = self.state.session_picker.fail_attachment(error);
                 Ok(ApplicationTransition::ListSessions(request))
             }
+            ApplicationEvent::SessionDeletionFailed { session_id, error } => {
+                self.state.session_picker.fail_deletion(session_id, error);
+                Ok(ApplicationTransition::Continue)
+            }
             ApplicationEvent::SessionCreated(snapshot) => {
                 self.state.apply_created_session(snapshot)?;
                 Ok(ApplicationTransition::Continue)
@@ -1556,6 +1635,12 @@ impl Application {
                 let request = self.state.session_picker.open();
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::ListSessions(request))
+            }
+            SemanticCommandId::SessionDelete => {
+                Ok(self.state.session_picker.begin_deletion().map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::DeleteSession,
+                ))
             }
             SemanticCommandId::SessionNew => {
                 let inherited_selection = self.state.agent_selection().cloned();
@@ -1680,7 +1765,7 @@ impl Application {
     }
 
     fn edit_session_picker(&mut self, edit: impl FnOnce(&mut SessionPicker)) {
-        if !self.state.session_picker.is_attaching() {
+        if !self.state.session_picker.is_busy() {
             edit(&mut self.state.session_picker);
         }
     }
@@ -1783,6 +1868,13 @@ fn command_for_autocomplete_event(event: InputEvent) -> Option<CommandId> {
 }
 
 fn command_for_session_picker_event(event: InputEvent) -> Option<CommandId> {
+    if let InputEvent::Key(key) = &event
+        && key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('d')
+        && key.modifiers == KeyModifiers::CONTROL
+    {
+        return Some(CommandId::InvokeSemantic(SemanticCommandId::SessionDelete));
+    }
     command_for_picker_event(event, &SESSION_PICKER_COMMANDS)
 }
 
@@ -2207,8 +2299,10 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
         let scope = state.session_picker.scope().label();
         let status = if state.session_picker.is_attaching() {
             "Attaching…"
+        } else if state.session_picker.is_deleting() {
+            "Deleting…"
         } else {
-            "Ctrl+A scope · Enter attach · Esc close"
+            "Ctrl+A scope · Enter attach · Ctrl+D delete · Esc close"
         };
         lines.push(Line::styled(
             truncate_to_width(&format!("{scope} · {status}"), usize::from(content_width)),
@@ -2573,6 +2667,9 @@ fn model_picker_row_text(
 
 fn session_picker_row_text(row: SessionPickerRow<'_>, width: usize, now: u64) -> String {
     let marker = if row.selected { "› " } else { "  " };
+    if row.confirming_delete {
+        return truncate_to_width(&format!("{marker}Press Ctrl+D again to confirm"), width);
+    }
     let compact = width < usize::from(NARROW_TERMINAL_WIDTH);
     let status = if row.unreadable {
         Some(if compact {
@@ -3814,6 +3911,7 @@ async fn run_loop(
                             }
                             ApplicationTransition::CreateSession(_)
                             | ApplicationTransition::DetachSession
+                            | ApplicationTransition::DeleteSession(_)
                             | ApplicationTransition::AdmitPrompt { .. }
                             | ApplicationTransition::PromotePrompt { .. }
                             | ApplicationTransition::CancelPrompt { .. }
@@ -3906,6 +4004,12 @@ async fn run_loop(
                     SubmissionResult::OperationSucceeded => {}
                     SubmissionResult::OperationFailed(error) => {
                         application.handle_event(ApplicationEvent::SessionOperationFailed(error))?;
+                    }
+                    SubmissionResult::SessionDeletionFailed { session_id, error } => {
+                        application.handle_event(ApplicationEvent::SessionDeletionFailed {
+                            session_id,
+                            error,
+                        })?;
                     }
                     SubmissionResult::LandingAgentSelectionConfirmed(selection) => {
                         let transition = application.handle_event(
@@ -4087,6 +4191,13 @@ async fn run_loop(
                                         submission_tx.clone(),
                                     );
                                 }
+                                ApplicationTransition::DeleteSession(session_id) => {
+                                    spawn_session_operation(
+                                        client.session_commands(),
+                                        SessionOperation::DeleteSession { session_id },
+                                        submission_tx.clone(),
+                                    );
+                                }
                                 ApplicationTransition::SubscribeSession(_) => {
                                     unreachable!("terminal input cannot end a Session subscription")
                                 }
@@ -4155,6 +4266,10 @@ enum SubmissionResult {
     },
     OperationSucceeded,
     OperationFailed(String),
+    SessionDeletionFailed {
+        session_id: SessionId,
+        error: String,
+    },
     LandingAgentSelectionConfirmed(AgentSelection),
     LandingAgentSelectionConfirmationFailed(String),
     AgentSelectionUpdated {
@@ -4388,6 +4503,9 @@ fn spawn_session_attachment(
 }
 
 enum SessionOperation {
+    DeleteSession {
+        session_id: SessionId,
+    },
     PromotePrompt {
         session_id: SessionId,
         prompt_id: PromptId,
@@ -4402,38 +4520,61 @@ enum SessionOperation {
     },
 }
 
+impl SessionOperation {
+    async fn run(self, commands: SessionCommandClient) -> SubmissionResult {
+        match self {
+            Self::DeleteSession { session_id } => match commands.delete_session(session_id).await {
+                Ok(()) => SubmissionResult::OperationSucceeded,
+                Err(error) => SubmissionResult::SessionDeletionFailed {
+                    session_id,
+                    error: error.to_string(),
+                },
+            },
+            Self::PromotePrompt {
+                session_id,
+                prompt_id,
+            } => operation_result(
+                commands
+                    .promote_prompt(session_id, prompt_id)
+                    .await
+                    .map(|_| ()),
+            ),
+            Self::CancelPrompt {
+                session_id,
+                prompt_id,
+            } => operation_result(
+                commands
+                    .cancel_prompt(session_id, prompt_id)
+                    .await
+                    .map(|_| ()),
+            ),
+            Self::InterruptTurn {
+                session_id,
+                turn_id,
+            } => operation_result(
+                commands
+                    .interrupt_turn(session_id, turn_id)
+                    .await
+                    .map(|_| ()),
+            ),
+        }
+    }
+}
+
+fn operation_result(result: anyhow::Result<()>) -> SubmissionResult {
+    match result {
+        Ok(()) => SubmissionResult::OperationSucceeded,
+        Err(error) => SubmissionResult::OperationFailed(error.to_string()),
+    }
+}
+
 fn spawn_session_operation(
     commands: SessionCommandClient,
     operation: SessionOperation,
     results: tokio::sync::mpsc::UnboundedSender<SubmissionResult>,
 ) {
     tokio::spawn(async move {
-        let result = match operation {
-            SessionOperation::PromotePrompt {
-                session_id,
-                prompt_id,
-            } => commands
-                .promote_prompt(session_id, prompt_id)
-                .await
-                .map(|_| ()),
-            SessionOperation::CancelPrompt {
-                session_id,
-                prompt_id,
-            } => commands
-                .cancel_prompt(session_id, prompt_id)
-                .await
-                .map(|_| ()),
-            SessionOperation::InterruptTurn {
-                session_id,
-                turn_id,
-            } => commands
-                .interrupt_turn(session_id, turn_id)
-                .await
-                .map(|_| ()),
-        };
-        let result = result
-            .map(|()| SubmissionResult::OperationSucceeded)
-            .unwrap_or_else(|error| SubmissionResult::OperationFailed(error.to_string()));
+        let result = operation.run(commands).await;
         let _ = results.send(result);
     });
 }

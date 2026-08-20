@@ -31,18 +31,19 @@ use crate::model_catalog::ModelCatalogService;
 use crate::protocol::{
     Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, LifecycleState, Message,
     MessageId, MessageRole, MessageStatus, PROTOCOL_VERSION, ProviderId, RuntimeDescriptor,
-    SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity,
-    ServerShutdown, SessionChange, SessionError, SessionErrorCode, SessionId, SessionUpdate,
-    ShutdownReason, TurnId, UpdateAgentSelectionRequest,
+    SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
+    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown,
+    SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode, SessionId,
+    SessionRevision, SessionUpdate, ShutdownReason, TurnId, UpdateAgentSelectionRequest,
 };
 use crate::provider::{
     CodexRuntime, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, wait_for_shutdown,
 };
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
-    AdmitPromptError, AgentSelectionMutationError, CreateSessionError, InterruptTurnError,
-    ListSessionsError, PromptAdmissionDisposition, PromptMutationError, SessionFeed, SessionStore,
-    StoreOutcome,
+    AdmitPromptError, AgentSelectionMutationError, CreateSessionError, DeleteSessionError,
+    InterruptTurnError, ListSessionsError, PromptAdmissionDisposition, PromptMutationError,
+    SessionCatalogFeed, SessionFeed, SessionStore, StoreOutcome,
 };
 use crate::storage::{StorageRepository, StorageSink, StorageWriter};
 
@@ -357,6 +358,7 @@ pub async fn spawn_with_provider(
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/events", get(events))
+        .route("/v1/session-events", get(session_catalog_events))
         .route("/v1/models", get(list_models))
         .route("/v1/models/refresh", post(refresh_models))
         .route(
@@ -364,7 +366,10 @@ pub async fn spawn_with_provider(
             put(confirm_landing_agent_selection),
         )
         .route("/v1/sessions", get(list_sessions).post(create_session))
-        .route("/v1/sessions/{session_id}", get(read_session))
+        .route(
+            "/v1/sessions/{session_id}",
+            get(read_session).delete(delete_session),
+        )
         .route(
             "/v1/sessions/{session_id}/agent-selection",
             post(update_agent_selection),
@@ -517,6 +522,44 @@ fn event_stream(
     });
 
     first.chain(updates)
+}
+
+async fn session_catalog_events(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let shutdown = state.shutdown.subscribe_to_intent();
+    if state.shutdown.lifecycle() != LifecycleState::Ready || shutdown.borrow().is_some() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    Sse::new(session_catalog_event_stream(
+        state.sessions.subscribe_catalog(),
+        shutdown,
+        Duration::from_secs(10),
+    ))
+    .into_response()
+}
+
+fn session_catalog_event_stream(
+    feed: SessionCatalogFeed,
+    shutdown: watch::Receiver<Option<ServerShutdown>>,
+    keepalive_interval: Duration,
+) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
+    let revision = feed.snapshot.revision;
+    snapshot_first_event_stream(
+        feed.snapshot,
+        revision,
+        feed.updates,
+        shutdown,
+        keepalive_interval,
+        RevisionedEventProtocol {
+            event_names: RevisionedEventNames {
+                snapshot: SESSION_CATALOG_SNAPSHOT_EVENT,
+                update: SESSION_CATALOG_UPDATED_EVENT,
+            },
+            update_revision: |update| update.revision,
+        },
+    )
 }
 
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -895,6 +938,26 @@ async fn read_session(
     }
 }
 
+async fn delete_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    state.providers.close_session(session_id).await;
+    match state.sessions.delete(session_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(DeleteSessionError::SessionNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        Err(DeleteSessionError::Storage(_)) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 async fn session_events(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<SessionId>,
@@ -929,22 +992,88 @@ fn session_event_stream(
     shutdown: watch::Receiver<Option<ServerShutdown>>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
-    let snapshot = feed.snapshot;
-    let delivered_revision = snapshot.revision;
+    let revision = feed.snapshot.revision;
+    snapshot_first_event_stream(
+        feed.snapshot,
+        revision,
+        feed.updates,
+        shutdown,
+        keepalive_interval,
+        RevisionedEventProtocol {
+            event_names: RevisionedEventNames {
+                snapshot: SESSION_SNAPSHOT_EVENT,
+                update: SESSION_UPDATED_EVENT,
+            },
+            update_revision: |update| update.revision,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct RevisionedEventNames {
+    snapshot: &'static str,
+    update: &'static str,
+}
+
+struct RevisionedEventProtocol<Update, Revision> {
+    event_names: RevisionedEventNames,
+    update_revision: fn(&Update) -> Revision,
+}
+
+trait StreamRevision: Copy {
+    fn immediately_follows(self, previous: Self) -> bool;
+    fn event_id(self) -> String;
+}
+
+impl StreamRevision for SessionRevision {
+    fn immediately_follows(self, previous: Self) -> bool {
+        SessionRevision::immediately_follows(self, previous)
+    }
+
+    fn event_id(self) -> String {
+        self.0.to_string()
+    }
+}
+
+impl StreamRevision for SessionCatalogRevision {
+    fn immediately_follows(self, previous: Self) -> bool {
+        SessionCatalogRevision::immediately_follows(self, previous)
+    }
+
+    fn event_id(self) -> String {
+        self.0.to_string()
+    }
+}
+
+fn snapshot_first_event_stream<Snapshot, Update, Revision>(
+    snapshot: Snapshot,
+    snapshot_revision: Revision,
+    updates: broadcast::Receiver<Update>,
+    shutdown: watch::Receiver<Option<ServerShutdown>>,
+    keepalive_interval: Duration,
+    protocol: RevisionedEventProtocol<Update, Revision>,
+) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>>
+where
+    Snapshot: serde::Serialize,
+    Update: Clone + serde::Serialize,
+    Revision: StreamRevision,
+{
+    let event_names = protocol.event_names;
+    let update_revision = protocol.update_revision;
     let snapshot_event = Event::default()
-        .event(SESSION_SNAPSHOT_EVENT)
-        .id(snapshot.revision.0.to_string())
+        .event(event_names.snapshot)
+        .id(snapshot_revision.event_id())
         .json_data(snapshot)
-        .expect("Session snapshots always serialize");
+        .expect("snapshot payloads always serialize");
     stream::once(async move { Ok::<_, std::convert::Infallible>(snapshot_event) }).chain(
         stream::unfold(
             (
                 tokio::time::interval_at(Instant::now() + keepalive_interval, keepalive_interval),
                 shutdown,
-                feed.updates,
-                delivered_revision,
+                updates,
+                snapshot_revision,
             ),
-            |(mut keepalive, mut shutdown, mut updates, delivered_revision)| async move {
+            move |(mut keepalive, mut shutdown, mut updates, delivered_revision)| async move {
                 if shutdown.borrow().is_some() {
                     return None;
                 }
@@ -959,15 +1088,15 @@ fn session_event_stream(
                             Ok(update) => update,
                             Err(broadcast::error::RecvError::Closed | broadcast::error::RecvError::Lagged(_)) => return None,
                         };
-                        if !update.revision.immediately_follows(delivered_revision) {
+                        let next_revision = update_revision(&update);
+                        if !next_revision.immediately_follows(delivered_revision) {
                             return None;
                         }
-                        let next_revision = update.revision;
                         let event = Event::default()
-                            .event(SESSION_UPDATED_EVENT)
-                            .id(update.revision.0.to_string())
+                            .event(event_names.update)
+                            .id(next_revision.event_id())
                             .json_data(update)
-                            .expect("Session updates always serialize");
+                            .expect("update payloads always serialize");
                         Some((
                             Ok::<_, std::convert::Infallible>(event),
                             (keepalive, shutdown, updates, next_revision),

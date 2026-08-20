@@ -258,6 +258,17 @@ impl StorageRepository {
         Ok(())
     }
 
+    fn delete_session(&self, session_id: SessionId) -> Result<(), StorageError> {
+        let mut connection = connect(&self.database_path)?;
+        diesel::delete(sessions::table.filter(sessions::id.eq(session_id.to_string())))
+            .execute(&mut connection)
+            .map_err(|error| StorageError::Write {
+                session_id,
+                message: error.to_string(),
+            })?;
+        Ok(())
+    }
+
     fn save_landing_agent_selection(&self, selection: AgentSelection) -> Result<(), StorageError> {
         let row = LandingAgentSelectionRow::from_selection(selection)?;
         let mut connection = connect(&self.database_path)?;
@@ -312,6 +323,10 @@ enum WriterCommand {
         summary: SessionSummary,
         update: SessionUpdate,
         durability: Option<std_mpsc::SyncSender<Result<(), String>>>,
+    },
+    Delete {
+        session_id: SessionId,
+        durability: std_mpsc::SyncSender<Result<(), String>>,
     },
     SaveLandingAgentSelection(AgentSelection),
     SaveResumeState {
@@ -385,6 +400,18 @@ impl StorageWriter {
                             }
                             result?;
                         }
+                    }
+                    Ok(WriterCommand::Delete {
+                        session_id,
+                        durability,
+                    }) => {
+                        let result = repository.delete_session(session_id);
+                        if result.is_ok() {
+                            sessions.remove(&session_id);
+                        }
+                        let _ = durability
+                            .send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                        result?;
                     }
                     Ok(WriterCommand::SaveLandingAgentSelection(selection)) => {
                         repository.save_landing_agent_selection(selection)?;
@@ -493,6 +520,24 @@ impl StorageSink {
             .recv()
             .map_err(|_| {
                 StorageError::WriterTask("writer stopped before confirming Resume State".to_owned())
+            })?
+            .map_err(StorageError::WriterTask)
+    }
+
+    pub(crate) fn deleted(&self, session_id: SessionId) -> Result<(), StorageError> {
+        let (durability, receipt) = std_mpsc::sync_channel(0);
+        self.commands
+            .send(WriterCommand::Delete {
+                session_id,
+                durability,
+            })
+            .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))?;
+        receipt
+            .recv()
+            .map_err(|_| {
+                StorageError::WriterTask(
+                    "writer stopped before confirming Session deletion".to_owned(),
+                )
             })?
             .map_err(StorageError::WriterTask)
     }

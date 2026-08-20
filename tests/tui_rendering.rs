@@ -10,10 +10,11 @@ use chidori::{
         ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
         ModelOptionKind, ModelOptionRole, ModelOptionValue, Prompt, PromptDelivery, PromptId,
         PromptOrder, PromptStatus, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
-        ServerIdentity, ServerShutdown, Session, SessionChange, SessionId, SessionListItem,
-        SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-        SessionUpdate, ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus,
-        UnreadableSessionSummary, Workspace,
+        ServerIdentity, ServerShutdown, Session, SessionCatalogRevision, SessionCatalogSnapshot,
+        SessionChange, SessionDeleted, SessionId, SessionListItem, SessionRevision,
+        SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate,
+        ShutdownReason, TranscriptItem, Turn, TurnId, TurnStatus, UnreadableSessionSummary,
+        Workspace,
     },
     server::{AgentOutput, ServerConfig},
     tui::{
@@ -3076,6 +3077,119 @@ fn session_picker_orders_marks_focuses_and_wraps_live_sessions() {
             .expect("select wrapped Session row"),
         ApplicationTransition::AttachSession(newest_id)
     );
+}
+
+#[test]
+fn session_picker_requires_confirmation_and_removes_authoritatively_deleted_session() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = connected_application(workspace.path());
+    let selected_id = SessionId::new();
+    let remaining_id = SessionId::new();
+    open_session_picker_with(
+        &mut application,
+        vec![
+            session_summary(
+                selected_id,
+                workspace.path(),
+                "Delete this Session",
+                SessionStatus::Idle,
+                20,
+            ),
+            session_summary(
+                remaining_id,
+                workspace.path(),
+                "Keep this Session",
+                SessionStatus::Idle,
+                10,
+            ),
+        ],
+    );
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            )))
+            .expect("request Session deletion confirmation"),
+        ApplicationTransition::Continue
+    );
+    let confirming = rendered_application_rows(&application).join("\n");
+    assert!(confirming.contains("Press Ctrl+D again to confirm"));
+    assert!(confirming.contains("Keep this Session"));
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            )))
+            .expect("confirm Session deletion"),
+        ApplicationTransition::DeleteSession(selected_id)
+    );
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SessionDeleted(
+            SessionDeleted {
+                session_id: selected_id,
+            },
+        )))
+        .expect("apply authoritative Session deletion");
+
+    let deleted = rendered_application_rows(&application).join("\n");
+    assert!(!deleted.contains("Delete this Session"));
+    assert!(deleted.contains("Keep this Session"));
+}
+
+#[test]
+fn reconnect_catalog_removes_a_missed_current_session_deletion() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = connected_application(workspace.path());
+    let (current_id, _, _) = enter_active_session(&mut application, workspace.path());
+    let remaining_id = SessionId::new();
+    open_session_picker_with(
+        &mut application,
+        vec![
+            session_summary(
+                current_id,
+                workspace.path(),
+                "Current Session",
+                SessionStatus::Active,
+                20,
+            ),
+            session_summary(
+                remaining_id,
+                workspace.path(),
+                "Remaining Session",
+                SessionStatus::Idle,
+                10,
+            ),
+        ],
+    );
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Managed(
+                ManagedEvent::SessionCatalogReconciled(SessionCatalogSnapshot {
+                    revision: SessionCatalogRevision::INITIAL,
+                    session_ids: vec![remaining_id],
+                }),
+            ))
+            .expect("reconcile deletion missed during a catalog disconnect"),
+        ApplicationTransition::SessionEnded
+    );
+    let picker = rendered_application_rows(&application).join("\n");
+    assert!(!picker.contains("Current Session"));
+    assert!(picker.contains("Remaining Session"));
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("close Session picker");
+    let landing = rendered_application_rows(&application).join("\n");
+    assert!(!landing.contains("Long-running work"));
+    assert!(landing.contains("Session ended because it was deleted"));
 }
 
 #[test]

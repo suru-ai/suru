@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
     sync::{mpsc, watch},
@@ -16,9 +16,9 @@ use crate::{
     RuntimeConfig,
     protocol::{
         AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, LifecycleState,
-        ModelCatalog, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionError, SessionId,
-        SessionListItem, SessionSnapshot, ShutdownReason, Turn, TurnId,
-        UpdateAgentSelectionRequest,
+        ModelCatalog, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
+        SessionDeleted, SessionError, SessionId, SessionListItem, SessionSnapshot, ShutdownReason,
+        Turn, TurnId, UpdateAgentSelectionRequest,
     },
 };
 
@@ -26,6 +26,7 @@ mod event_stream;
 mod launcher;
 mod lifecycle;
 mod recovery;
+mod session_catalog_stream;
 mod session_projection;
 mod session_stream;
 
@@ -91,6 +92,8 @@ pub enum ManagedEvent {
     Connected(Health),
     Recovering(RecoveryStatus),
     ServerShutdown(ServerShutdown),
+    SessionDeleted(SessionDeleted),
+    SessionCatalogReconciled(SessionCatalogSnapshot),
     Fatal(String),
 }
 
@@ -233,6 +236,10 @@ impl ManagedClient {
 
     pub async fn read_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
         self.session_commands().read_session(session_id).await
+    }
+
+    pub async fn delete_session(&self, session_id: SessionId) -> Result<()> {
+        self.session_commands().delete_session(session_id).await
     }
 
     pub async fn list_sessions(&self, workspace: Option<&Path>) -> Result<Vec<SessionListItem>> {
@@ -433,6 +440,18 @@ impl SessionCommandClient {
         decode_api_response(response, "Session read").await
     }
 
+    pub(crate) async fn delete_session(&self, session_id: SessionId) -> Result<()> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .delete(format!("{}/v1/sessions/{session_id}", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Session deletion")?;
+        decode_empty_api_response(response, "Session deletion").await
+    }
+
     pub(crate) async fn list_sessions(
         &self,
         workspace: Option<&Path>,
@@ -468,12 +487,22 @@ where
             .await
             .with_context(|| format!("decode {operation} response"));
     }
-    let status = response.status();
-    let error = response.json::<SessionError>().await.ok();
-    match error {
-        Some(error) => bail!(error.message),
-        None => bail!("{operation} failed with HTTP {status}"),
+    Err(decode_api_error(response, operation).await)
+}
+
+async fn decode_empty_api_response(response: reqwest::Response, operation: &str) -> Result<()> {
+    if response.status().is_success() {
+        return Ok(());
     }
+    Err(decode_api_error(response, operation).await)
+}
+
+async fn decode_api_error(response: reqwest::Response, operation: &str) -> anyhow::Error {
+    let status = response.status();
+    response.json::<SessionError>().await.map_or_else(
+        |_| anyhow!("{operation} failed with HTTP {status}"),
+        |error| anyhow!(error.message),
+    )
 }
 
 pub async fn start_server(config: &ManagedClientConfig) -> Result<Health> {

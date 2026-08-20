@@ -24,7 +24,8 @@ use chidori::{
     },
     protocol::{
         Health, LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
-        ServerIdentity, ServerShutdown, ShutdownReason,
+        SESSION_CATALOG_SNAPSHOT_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision,
+        SessionCatalogSnapshot, ShutdownReason,
     },
     server::{self, ServerConfig},
 };
@@ -1721,6 +1722,7 @@ impl ReadinessFixture {
         let app = Router::new()
             .route("/health", get(readiness_health))
             .route("/v1/events", get(readiness_events))
+            .route("/v1/session-events", get(readiness_catalog_events))
             .with_state(state);
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
@@ -1804,6 +1806,19 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
             Sse::new(stream::iter(events)).into_response()
         }
     }
+}
+
+async fn readiness_catalog_events(
+    State(state): State<ReadinessState>,
+    headers: HeaderMap,
+) -> Response {
+    if !fixture_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if *state.lifecycle.lock().expect("lock lifecycle") != LifecycleState::Ready {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    empty_catalog_stream()
 }
 
 fn protocol_violation_events(_state: &ReadinessState, violation: ProtocolViolation) -> Vec<Event> {
@@ -1921,6 +1936,7 @@ impl BuildReplacementFixture {
         let app = Router::new()
             .route("/health", get(build_replacement_health))
             .route("/v1/events", get(build_replacement_events))
+            .route("/v1/session-events", get(build_replacement_catalog_events))
             .route("/v1/server/stop", post(build_replacement_stop))
             .with_state(state);
         let instance_id = descriptor
@@ -2019,6 +2035,52 @@ async fn build_replacement_events(
         },
     );
     Sse::new(first.chain(shutdowns)).into_response()
+}
+
+async fn build_replacement_catalog_events(
+    State(state): State<BuildReplacementState>,
+    headers: HeaderMap,
+) -> Response {
+    let descriptor = state
+        .descriptor
+        .lock()
+        .expect("lock old-build descriptor")
+        .clone();
+    if !fixture_authenticated(&headers, &descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    catalog_stream_until_shutdown(state.shutdown_intent.subscribe())
+}
+
+fn empty_catalog_stream() -> Response {
+    Sse::new(empty_catalog_snapshot().chain(stream::pending())).into_response()
+}
+
+fn empty_catalog_snapshot() -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
+    let snapshot = SessionCatalogSnapshot {
+        revision: SessionCatalogRevision::INITIAL,
+        session_ids: Vec::new(),
+    };
+    stream::once(async move {
+        Ok::<_, Infallible>(
+            Event::default()
+                .event(SESSION_CATALOG_SNAPSHOT_EVENT)
+                .id(snapshot.revision.0.to_string())
+                .json_data(snapshot)
+                .expect("serialize empty Session catalog snapshot"),
+        )
+    })
+}
+
+fn catalog_stream_until_shutdown(shutdown: watch::Receiver<Option<ServerShutdown>>) -> Response {
+    let end = stream::unfold(shutdown, |mut shutdown| async move {
+        shutdown.changed().await.ok()?;
+        None::<(
+            Result<Event, Infallible>,
+            watch::Receiver<Option<ServerShutdown>>,
+        )>
+    });
+    Sse::new(empty_catalog_snapshot().chain(end)).into_response()
 }
 
 async fn build_replacement_stop(

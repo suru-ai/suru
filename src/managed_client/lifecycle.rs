@@ -70,10 +70,14 @@ pub(super) async fn inspect_registration(
 pub(super) async fn probe(config: &ManagedClientConfig) -> Result<Registration> {
     let descriptor = read_descriptor(&config.descriptor_path())?;
     validate_loopback_url(&descriptor.base_url)?;
-    let health = inspect_health(&descriptor)
-        .await
-        .map_err(|error| anyhow!(error.reason()))?;
+    let health = inspect_descriptor_health(&descriptor).await?;
     Ok(Registration { descriptor, health })
+}
+
+pub(super) async fn inspect_descriptor_health(descriptor: &RuntimeDescriptor) -> Result<Health> {
+    inspect_health(descriptor)
+        .await
+        .map_err(|error| anyhow!(error.reason()))
 }
 
 pub(super) async fn shutdown_registered_instance(

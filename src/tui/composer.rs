@@ -80,6 +80,10 @@ impl ComposerMemory {
         self.composer_mut(key).clear();
     }
 
+    pub(super) fn discard_session(&mut self, session_id: SessionId) {
+        self.composers.remove(&ComposerKey::Session(session_id));
+    }
+
     pub(super) fn begin_submission(&mut self, key: ComposerKey) -> InitialPrompt {
         self.composer_mut(key).begin_submission()
     }

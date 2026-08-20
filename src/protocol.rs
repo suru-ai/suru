@@ -3,8 +3,10 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
+pub const SESSION_CATALOG_SNAPSHOT_EVENT: &str = "session_catalog_snapshot";
+pub const SESSION_CATALOG_UPDATED_EVENT: &str = "session_catalog_updated";
 pub const SESSION_SNAPSHOT_EVENT: &str = "session_snapshot";
 pub const SESSION_UPDATED_EVENT: &str = "session_updated";
 
@@ -313,6 +315,18 @@ impl SessionRevision {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
+pub struct SessionCatalogRevision(pub u64);
+
+impl SessionCatalogRevision {
+    pub const INITIAL: Self = Self(1);
+
+    pub fn immediately_follows(self, previous: Self) -> bool {
+        previous.0.checked_add(1) == Some(self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct PromptOrder(pub u64);
 
 impl PromptOrder {
@@ -547,6 +561,27 @@ pub struct UnreadableSessionSummary {
     pub created_at: SessionTimestamp,
     pub updated_at: SessionTimestamp,
     pub workspace: Option<Workspace>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCatalogSnapshot {
+    pub revision: SessionCatalogRevision,
+    pub session_ids: Vec<SessionId>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionCatalogChange {
+    Created { session_id: SessionId },
+    Deleted { session_id: SessionId },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCatalogUpdate {
+    pub revision: SessionCatalogRevision,
+    pub change: SessionCatalogChange,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -890,4 +925,10 @@ pub enum ShutdownReason {
 pub struct ServerShutdown {
     pub instance_id: Uuid,
     pub reason: ShutdownReason,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionDeleted {
+    pub session_id: SessionId,
 }

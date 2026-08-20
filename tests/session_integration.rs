@@ -19,7 +19,7 @@ use axum::{
 };
 use chidori::{
     build_identity,
-    managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
+    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, SessionEvent},
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
         AgentSelection, AgentSelectionOperationId, CreateSessionRequest, FileChange, Health,
@@ -28,11 +28,12 @@ use chidori::{
         ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
         ModelOptionRole, ModelOptionSelection, ModelOptionValue, PROTOCOL_VERSION, Prompt,
         PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderCatalogStatus, ProviderId,
-        ProviderModelCatalog, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
-        ServerIdentity, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
-        SessionListItem, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary,
-        SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest,
-        Workspace,
+        ProviderModelCatalog, RuntimeDescriptor, SESSION_CATALOG_SNAPSHOT_EVENT,
+        SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity, Session,
+        SessionCatalogRevision, SessionCatalogSnapshot, SessionChange, SessionDeleted,
+        SessionError, SessionErrorCode, SessionId, SessionListItem, SessionRevision,
+        SessionSnapshot, SessionStatus, SessionSummary, SessionUpdate, TranscriptItem, Turn,
+        TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
     },
     provider::{
         ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderFileChangeStatus,
@@ -4375,6 +4376,129 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
 }
 
 #[tokio::test]
+async fn managed_clients_observe_durable_session_deletion() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "managed-session-delete-test")
+        .expect("configure server")
+        .with_data_dir(data_dir.path());
+    let server = spawn_with_failing_provider(config.clone())
+        .await
+        .expect("spawn server");
+    let mut deleting_client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "managed-session-delete-test")
+            .expect("configure deleting client")
+            .with_data_dir(data_dir.path()),
+    )
+    .await
+    .expect("connect deleting client");
+    let mut observing_client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "managed-session-delete-test")
+            .expect("configure observing client")
+            .with_data_dir(data_dir.path()),
+    )
+    .await
+    .expect("connect observing client");
+    receive_managed_client_initial_state(&mut deleting_client).await;
+    receive_managed_client_initial_state(&mut observing_client).await;
+
+    let created = deleting_client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Delete this Session and its Transcript".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let session_id = created.session.id;
+    let settled = read_session_at_least_revision(
+        &reqwest::Client::new(),
+        server.descriptor(),
+        session_id,
+        SessionRevision(2),
+    )
+    .await;
+    assert!(!settled.transcript.is_empty());
+    let mut subscription = observing_client
+        .attach_session(session_id)
+        .await
+        .expect("observe Session before deletion");
+    assert!(matches!(
+        subscription.next().await,
+        Some(Ok(SessionEvent::Snapshot(_)))
+    ));
+
+    deleting_client
+        .delete_session(session_id)
+        .await
+        .expect("delete Session through managed client");
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), observing_client.next())
+            .await
+            .expect("deletion reaches connected client"),
+        Some(ManagedEvent::SessionDeleted(SessionDeleted { session_id }))
+    );
+    let stream_error = timeout(Duration::from_secs(1), subscription.next())
+        .await
+        .expect("deleted Session stream terminates")
+        .expect("deleted Session stream reports its terminal rejection")
+        .expect_err("deleted Session cannot be reattached");
+    assert!(!stream_error.is_recoverable());
+    assert!(
+        deleting_client
+            .list_sessions(None)
+            .await
+            .expect("list Sessions after deletion")
+            .is_empty()
+    );
+    assert!(
+        deleting_client.read_session(session_id).await.is_err(),
+        "deleted Session and its Transcript are no longer readable"
+    );
+
+    drop(subscription);
+    drop(observing_client);
+    drop(deleting_client);
+    server.shutdown().await.expect("stop original server");
+
+    let replacement = spawn_with_failing_provider(config)
+        .await
+        .expect("restart server");
+    let mut replacement_client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "managed-session-delete-test")
+            .expect("configure replacement client")
+            .with_data_dir(data_dir.path()),
+    )
+    .await
+    .expect("connect replacement client");
+    receive_managed_client_initial_state(&mut replacement_client).await;
+    assert!(
+        replacement_client
+            .list_sessions(None)
+            .await
+            .expect("list Sessions after restart")
+            .is_empty()
+    );
+    assert!(
+        replacement_client.read_session(session_id).await.is_err(),
+        "deleted Session stays gone after restart"
+    );
+
+    drop(replacement_client);
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement server");
+}
+
+#[tokio::test]
 async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
@@ -5001,6 +5125,7 @@ impl MalformedSessionStreamFixture {
         let app = Router::new()
             .route("/health", get(malformed_fixture_health))
             .route("/v1/events", get(malformed_fixture_server_events))
+            .route("/v1/session-events", get(malformed_fixture_catalog_events))
             .route(
                 "/v1/sessions/{session_id}/events",
                 get(malformed_fixture_session_events),
@@ -5041,6 +5166,13 @@ async fn malformed_fixture_server_events(
     let first =
         stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) });
     Sse::new(first.chain(stream::pending())).into_response()
+}
+
+async fn malformed_fixture_catalog_events(
+    State(state): State<Arc<MalformedSessionStreamState>>,
+    headers: HeaderMap,
+) -> Response {
+    fixture_catalog_events_response(&headers, &state.descriptor.token, state.snapshot.session.id)
 }
 
 async fn malformed_fixture_session_events(
@@ -5158,6 +5290,10 @@ impl ReconnectingSessionStreamFixture {
             .route("/health", get(reconnecting_fixture_health))
             .route("/v1/events", get(reconnecting_fixture_server_events))
             .route(
+                "/v1/session-events",
+                get(reconnecting_fixture_catalog_events),
+            )
+            .route(
                 "/v1/sessions/{session_id}/events",
                 get(reconnecting_fixture_session_events),
             )
@@ -5197,6 +5333,40 @@ async fn reconnecting_fixture_server_events(
     Sse::new(
         stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) })
             .chain(stream::pending()),
+    )
+    .into_response()
+}
+
+async fn reconnecting_fixture_catalog_events(
+    State(state): State<Arc<ReconnectingSessionStreamState>>,
+    headers: HeaderMap,
+) -> Response {
+    fixture_catalog_events_response(&headers, &state.descriptor.token, state.initial.session.id)
+}
+
+fn fixture_catalog_events_response(
+    headers: &HeaderMap,
+    token: &str,
+    session_id: SessionId,
+) -> Response {
+    if !fixture_authenticated(headers, token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let snapshot = SessionCatalogSnapshot {
+        revision: SessionCatalogRevision::INITIAL,
+        session_ids: vec![session_id],
+    };
+    Sse::new(
+        stream::once(async move {
+            Ok::<_, Infallible>(
+                Event::default()
+                    .event(SESSION_CATALOG_SNAPSHOT_EVENT)
+                    .id(snapshot.revision.0.to_string())
+                    .json_data(snapshot)
+                    .expect("serialize fixture Session catalog snapshot"),
+            )
+        })
+        .chain(stream::pending()),
     )
     .into_response()
 }

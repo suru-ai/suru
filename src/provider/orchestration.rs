@@ -15,7 +15,7 @@ use tokio::{
 use super::{
     ProviderCommandStatus, ProviderEvent, ProviderEventStream, ProviderFileChangeStatus,
     ProviderRuntime, ProviderSession, ProviderSessionRequest, ProviderSteerInput,
-    ProviderTurnInput, wait_for_shutdown,
+    ProviderTurnInput,
 };
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AgentIdentity, Message, MessageId, MessageRole,
@@ -43,7 +43,39 @@ struct ProviderActors {
 
 struct ProviderActor {
     commands: mpsc::UnboundedSender<ProviderCommand>,
+    shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
+}
+
+struct ProviderShutdown {
+    server: watch::Receiver<bool>,
+    session: watch::Receiver<bool>,
+}
+
+impl ProviderShutdown {
+    fn requested(&self) -> bool {
+        *self.server.borrow() || *self.session.borrow()
+    }
+
+    async fn wait(&mut self) {
+        loop {
+            if self.requested() {
+                return;
+            }
+            tokio::select! {
+                changed = self.server.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                changed = self.session.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -180,19 +212,24 @@ impl ProviderOrchestrator {
         }
         let runtime = self.runtime.clone();
         let sessions = self.sessions.clone();
+        let (session_shutdown, session_shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(run_provider_session(
             runtime,
             sessions,
             session_id,
             workspace,
             commands_rx,
-            self.shutdown.clone(),
+            ProviderShutdown {
+                server: self.shutdown.clone(),
+                session: session_shutdown_rx,
+            },
             self.updates.clone(),
         ));
         actors.entries.insert(
             session_id,
             ProviderActor {
                 commands: commands_tx.clone(),
+                shutdown: session_shutdown,
                 task,
             },
         );
@@ -289,6 +326,20 @@ impl ProviderOrchestrator {
         InterruptTurnError::ProviderFailure(message.to_owned())
     }
 
+    pub(crate) async fn close_session(&self, session_id: SessionId) {
+        let actor = self
+            .actors
+            .lock()
+            .expect("Provider actor registry lock is not poisoned")
+            .entries
+            .remove(&session_id);
+        let Some(actor) = actor else {
+            return;
+        };
+        actor.shutdown.send_replace(true);
+        let _ = actor.task.await;
+    }
+
     pub(crate) async fn shutdown(&self) {
         let actors = {
             let mut registry = self
@@ -329,7 +380,7 @@ async fn run_provider_session(
     session_id: SessionId,
     workspace: PathBuf,
     mut commands: mpsc::UnboundedReceiver<ProviderCommand>,
-    mut shutdown: watch::Receiver<bool>,
+    mut shutdown: ProviderShutdown,
     updates: ProviderUpdateGate,
 ) {
     let mut provider: Option<ConnectedProviderSession> = None;
@@ -337,21 +388,21 @@ async fn run_provider_session(
     let provider_id = runtime.provider_id();
 
     'actor: loop {
-        if *shutdown.borrow() {
+        if shutdown.requested() {
             break;
         }
         if active.is_none() {
             let input = if let Some(connected) = provider.as_mut() {
                 tokio::select! {
                     biased;
-                    _ = wait_for_shutdown(&mut shutdown) => break,
+                    _ = shutdown.wait() => break,
                     event = connected.events.next() => ProviderInput::Event(event),
                     command = commands.recv() => ProviderInput::Command(command),
                 }
             } else {
                 tokio::select! {
                     biased;
-                    _ = wait_for_shutdown(&mut shutdown) => break,
+                    _ = shutdown.wait() => break,
                     command = commands.recv() => ProviderInput::Command(command),
                 }
             };
@@ -376,7 +427,7 @@ async fn run_provider_session(
             if provider.is_none() {
                 let connection = tokio::select! {
                     biased;
-                    _ = wait_for_shutdown(&mut shutdown) => break 'actor,
+                    _ = shutdown.wait() => break 'actor,
                     connection = runtime.start_session(ProviderSessionRequest {
                         session_id,
                         workspace: workspace.clone(),
@@ -477,7 +528,7 @@ async fn run_provider_session(
             let (turn_id, input) = provider_turn_start(delivered);
             let started = tokio::select! {
                 biased;
-                _ = wait_for_shutdown(&mut shutdown) => break 'actor,
+                _ = shutdown.wait() => break 'actor,
                 started = provider_session.start_turn(input) => started,
             };
             if let Err(error) = started {
@@ -512,7 +563,7 @@ async fn run_provider_session(
                 // Preserve the Provider's terminal boundary when both it and a later command
                 // became ready while an RPC was in flight.
                 biased;
-                _ = wait_for_shutdown(&mut shutdown) => break 'actor,
+                _ = shutdown.wait() => break 'actor,
                 event = events.next() => ProviderInput::Event(event),
                 command = commands.recv() => ProviderInput::Command(command),
             }
@@ -533,7 +584,7 @@ async fn run_provider_session(
                 };
                 let steered = tokio::select! {
                     biased;
-                    _ = wait_for_shutdown(&mut shutdown) => break 'actor,
+                    _ = shutdown.wait() => break 'actor,
                     steered = provider_session.steer_turn(ProviderSteerInput {
                         prompt: prompt.text.clone(),
                     }) => steered,
@@ -584,7 +635,7 @@ async fn run_provider_session(
                 }
                 let interrupted = tokio::select! {
                     biased;
-                    _ = wait_for_shutdown(&mut shutdown) => break 'actor,
+                    _ = shutdown.wait() => break 'actor,
                     interrupted = provider_session.interrupt_turn() => interrupted,
                 };
                 match interrupted {
@@ -628,7 +679,7 @@ async fn run_provider_session(
                                 let (turn_id, input) = provider_turn_start(delivered);
                                 let started = tokio::select! {
                                     biased;
-                                    _ = wait_for_shutdown(&mut shutdown) => break 'actor,
+                                    _ = shutdown.wait() => break 'actor,
                                     started = provider_session.start_turn(input) => started,
                                 };
                                 if let Err(error) = started {

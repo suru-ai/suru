@@ -19,6 +19,8 @@ pub(super) struct SessionPicker {
     loading: bool,
     error: Option<String>,
     attaching: Option<SessionId>,
+    confirming_delete: Option<SessionId>,
+    deleting: Option<SessionId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -30,6 +32,7 @@ pub(super) struct SessionPickerRow<'a> {
     pub(super) unreadable: bool,
     pub(super) updated_at: SessionTimestamp,
     pub(super) workspace: Option<&'a Path>,
+    pub(super) confirming_delete: bool,
 }
 
 impl SessionPicker {
@@ -46,6 +49,8 @@ impl SessionPicker {
             loading: false,
             error: None,
             attaching: None,
+            confirming_delete: None,
+            deleting: None,
         }
     }
 
@@ -64,6 +69,8 @@ impl SessionPicker {
         self.loading = false;
         self.error = None;
         self.attaching = None;
+        self.confirming_delete = None;
+        self.deleting = None;
         self.pending_request = None;
     }
 
@@ -100,6 +107,7 @@ impl SessionPicker {
         self.sessions = sessions;
         self.loading = false;
         self.attaching = None;
+        self.confirming_delete = None;
         self.pending_request = None;
         self.selected = current
             .filter(|current| self.visible_ids().contains(current))
@@ -113,6 +121,7 @@ impl SessionPicker {
         self.loading = false;
         self.error = Some(error);
         self.attaching = None;
+        self.confirming_delete = None;
         self.pending_request = None;
     }
 
@@ -122,16 +131,19 @@ impl SessionPicker {
     }
 
     pub(super) fn insert(&mut self, text: &str) {
+        self.confirming_delete = None;
         self.query.push_str(text);
         self.select_first_visible();
     }
 
     pub(super) fn delete_backward(&mut self) {
+        self.confirming_delete = None;
         self.query.pop();
         self.select_first_visible();
     }
 
     pub(super) fn toggle_scope(&mut self) -> SessionListRequest {
+        self.confirming_delete = None;
         self.scope = match &self.scope {
             SessionListScope::CurrentWorkspace(_) => SessionListScope::AllWorkspaces,
             SessionListScope::AllWorkspaces => {
@@ -159,6 +171,7 @@ impl SessionPicker {
     }
 
     pub(super) fn begin_attachment(&mut self) -> Option<SessionId> {
+        self.confirming_delete = None;
         let selected = self.selected?;
         self.sessions
             .iter()
@@ -171,6 +184,83 @@ impl SessionPicker {
 
     pub(super) fn is_attaching(&self) -> bool {
         self.attaching.is_some()
+    }
+
+    pub(super) fn is_deleting(&self) -> bool {
+        self.deleting.is_some()
+    }
+
+    pub(super) fn is_busy(&self) -> bool {
+        self.is_attaching() || self.is_deleting()
+    }
+
+    pub(super) fn begin_deletion(&mut self) -> Option<SessionId> {
+        if self.deleting.is_some() {
+            return None;
+        }
+        let selected = self.selected?;
+        if self.confirming_delete != Some(selected) {
+            self.confirming_delete = Some(selected);
+            self.error = None;
+            return None;
+        }
+        self.confirming_delete = None;
+        self.deleting = Some(selected);
+        Some(selected)
+    }
+
+    pub(super) fn remove(&mut self, session_id: SessionId) {
+        let selected = self.selected == Some(session_id);
+        self.sessions.retain(|summary| summary.id() != session_id);
+        if self.confirming_delete == Some(session_id) {
+            self.confirming_delete = None;
+        }
+        if self.attaching == Some(session_id) {
+            self.attaching = None;
+        }
+        if self.deleting == Some(session_id) {
+            self.deleting = None;
+        }
+        if selected {
+            self.select_first_visible();
+        }
+    }
+
+    pub(super) fn retain_catalog(&mut self, session_ids: &[SessionId]) {
+        self.sessions
+            .retain(|summary| session_ids.contains(&summary.id()));
+        if self
+            .selected
+            .is_some_and(|selected| !session_ids.contains(&selected))
+        {
+            self.select_first_visible();
+        }
+        if self
+            .confirming_delete
+            .is_some_and(|session_id| !session_ids.contains(&session_id))
+        {
+            self.confirming_delete = None;
+        }
+        if self
+            .attaching
+            .is_some_and(|session_id| !session_ids.contains(&session_id))
+        {
+            self.attaching = None;
+        }
+        if self
+            .deleting
+            .is_some_and(|session_id| !session_ids.contains(&session_id))
+        {
+            self.deleting = None;
+        }
+    }
+
+    pub(super) fn fail_deletion(&mut self, session_id: SessionId, error: String) {
+        if self.deleting != Some(session_id) {
+            return;
+        }
+        self.deleting = None;
+        self.error = Some(error);
     }
 
     pub(super) fn attaching_to(&self, session_id: SessionId) -> bool {
@@ -198,6 +288,7 @@ impl SessionPicker {
                                 .map(|workspace| workspace.path.as_path())
                         })
                         .flatten(),
+                    confirming_delete: self.confirming_delete == Some(summary.id()),
                 }
             })
     }
@@ -218,6 +309,7 @@ impl SessionPicker {
     }
 
     fn move_selection(&mut self, distance: isize) {
+        self.confirming_delete = None;
         let visible = self.visible_ids();
         if visible.is_empty() {
             self.selected = None;
@@ -248,6 +340,8 @@ impl SessionPicker {
         self.selected = None;
         self.loading = true;
         self.attaching = None;
+        self.confirming_delete = None;
+        self.deleting = None;
         request
     }
 

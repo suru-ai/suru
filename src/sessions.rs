@@ -16,7 +16,8 @@ use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
     AgentSelection, AgentSelectionOperationId, CreateSessionRequest, Message, MessageId,
     MessageRole, MessageStatus, ModelAvailability, ModelOptionValue, Prompt, PromptDelivery,
-    PromptId, PromptOrder, PromptStatus, ProviderId, Session, SessionChange, SessionId,
+    PromptId, PromptOrder, PromptStatus, ProviderId, Session, SessionCatalogChange,
+    SessionCatalogRevision, SessionCatalogSnapshot, SessionCatalogUpdate, SessionChange, SessionId,
     SessionListItem, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary,
     SessionTimestamp, SessionUpdate, Turn, TurnId, TurnStatus, UnreadableSessionSummary,
     UpdateAgentSelectionRequest, Workspace,
@@ -75,12 +76,13 @@ pub(crate) enum StoreOutcome<T> {
     Existing(T),
 }
 
-#[derive(Default)]
 struct SessionStoreState {
     sessions: HashMap<SessionId, SessionRecord>,
     unreadable_sessions: HashMap<SessionId, UnreadableSessionSummary>,
     prompts: HashMap<PromptId, PromptOwner>,
     last_timestamp: Option<SessionTimestamp>,
+    catalog_revision: SessionCatalogRevision,
+    catalog_updates: broadcast::Sender<SessionCatalogUpdate>,
 }
 
 struct SessionRecord {
@@ -112,6 +114,11 @@ enum PromptOrigin {
 pub(crate) struct SessionFeed {
     pub(crate) snapshot: SessionSnapshot,
     pub(crate) updates: broadcast::Receiver<SessionUpdate>,
+}
+
+pub(crate) struct SessionCatalogFeed {
+    pub(crate) snapshot: SessionCatalogSnapshot,
+    pub(crate) updates: broadcast::Receiver<SessionCatalogUpdate>,
 }
 
 pub(crate) struct PromptAdmission {
@@ -162,6 +169,12 @@ pub(crate) struct UnfinishedProviderOutput {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ListSessionsError {
     InvalidWorkspace,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DeleteSessionError {
+    SessionNotFound,
+    Storage(String),
 }
 
 impl SessionStore {
@@ -218,15 +231,19 @@ impl SessionStore {
                 },
             );
         }
+        let (catalog_updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
+        let unreadable_sessions = unreadable
+            .into_iter()
+            .map(|summary| (summary.id, summary))
+            .collect();
         Self {
             state: Arc::new(Mutex::new(SessionStoreState {
                 sessions,
-                unreadable_sessions: unreadable
-                    .into_iter()
-                    .map(|summary| (summary.id, summary))
-                    .collect(),
+                unreadable_sessions,
                 prompts,
                 last_timestamp,
+                catalog_revision: SessionCatalogRevision::INITIAL,
+                catalog_updates,
             })),
             storage,
         }
@@ -356,6 +373,7 @@ impl SessionStore {
             },
         );
         self.storage.created(persisted_summary, snapshot.clone());
+        state.publish_catalog_change(SessionCatalogChange::Created { session_id });
         Ok(StoreOutcome::Created(snapshot))
     }
 
@@ -468,6 +486,27 @@ impl SessionStore {
         })
     }
 
+    pub(crate) fn subscribe_catalog(&self) -> SessionCatalogFeed {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let mut session_ids = state
+            .sessions
+            .keys()
+            .chain(state.unreadable_sessions.keys())
+            .copied()
+            .collect::<Vec<_>>();
+        session_ids.sort_unstable_by_key(ToString::to_string);
+        SessionCatalogFeed {
+            snapshot: SessionCatalogSnapshot {
+                revision: state.catalog_revision,
+                session_ids,
+            },
+            updates: state.catalog_updates.subscribe(),
+        }
+    }
+
     pub(crate) fn snapshot(&self, session_id: SessionId) -> Option<SessionSnapshot> {
         self.state
             .lock()
@@ -519,6 +558,28 @@ impl SessionStore {
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?
             .resume_states
             .insert(provider, resume_state);
+        Ok(())
+    }
+
+    pub(crate) fn delete(&self, session_id: SessionId) -> Result<(), DeleteSessionError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        if !state.sessions.contains_key(&session_id)
+            && !state.unreadable_sessions.contains_key(&session_id)
+        {
+            return Err(DeleteSessionError::SessionNotFound);
+        }
+        self.storage
+            .deleted(session_id)
+            .map_err(|error| DeleteSessionError::Storage(error.to_string()))?;
+        state.sessions.remove(&session_id);
+        state.unreadable_sessions.remove(&session_id);
+        state
+            .prompts
+            .retain(|_, owner| owner.session_id != session_id);
+        state.publish_catalog_change(SessionCatalogChange::Deleted { session_id });
         Ok(())
     }
 
@@ -1736,6 +1797,19 @@ fn derived_session_status(snapshot: &SessionSnapshot) -> anyhow::Result<SessionS
 }
 
 impl SessionStoreState {
+    fn publish_catalog_change(&mut self, change: SessionCatalogChange) {
+        self.catalog_revision = SessionCatalogRevision(
+            self.catalog_revision
+                .0
+                .checked_add(1)
+                .expect("Session catalog revision space is not exhausted"),
+        );
+        let _ = self.catalog_updates.send(SessionCatalogUpdate {
+            revision: self.catalog_revision,
+            change,
+        });
+    }
+
     fn next_timestamp(&mut self) -> SessionTimestamp {
         let current = SystemTime::now()
             .duration_since(UNIX_EPOCH)

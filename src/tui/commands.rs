@@ -15,6 +15,7 @@ pub enum SemanticCommandId {
     ModelOptionsCancel,
     ModelOptionReasoningCycle,
     SessionList,
+    SessionDelete,
     SessionNew,
 }
 
@@ -30,6 +31,7 @@ impl SemanticCommandId {
             Self::ModelOptionsCancel => "model.options.cancel",
             Self::ModelOptionReasoningCycle => "model.option.reasoning.cycle",
             Self::SessionList => "session.list",
+            Self::SessionDelete => "session.delete",
             Self::SessionNew => "session.new",
         }
     }
@@ -154,6 +156,13 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             modifiers: KeyModifiers::NONE,
             label: "Ctrl+X L",
         }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SessionDelete,
+        title: "Delete Session",
+        description: "Delete the selected Session and everything it owns",
+        slash: None,
+        keybinding: None,
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::SessionNew,
