@@ -22,10 +22,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    ansi::{
-        AnsiScanner, FragmentRole, TRUNCATION_MARKER, sgr_parameter_code, sgr_parameters,
-        split_truncation_marker,
-    },
+    ansi::{AnsiScanner, CappedStream, FragmentRole, sgr_parameter_code, sgr_parameters},
     protocol::{
         Activity, ActivityId, FileChange, InitialPrompt, Message, MessageId, MessageRole, PromptId,
         SessionId, SessionRevision, SessionSnapshot, TranscriptItem,
@@ -510,21 +507,26 @@ fn push_command_activity(
             theme.text.subdued,
         );
     }
-    let (output, truncated) = split_truncation_marker(output);
+    let (output, truncated) = CappedStream::CommandOutput.split_truncation_marker(output);
     if !output.is_empty() {
         push_styled_prefixed_lines(projection, "    ", output, theme.text.subdued, theme);
     }
     if truncated {
-        push_truncation_marker(projection.lines, "    ", theme);
+        push_truncation_marker(projection.lines, CappedStream::CommandOutput, "    ", theme);
     }
 }
 
 /// Renders the marker the normalizer left on capped content as its own line, in
 /// a style Suru applies rather than one the stream can set, so a reader can tell
 /// Suru dropped the rest rather than the Provider ending there.
-fn push_truncation_marker(lines: &mut Vec<Line<'static>>, indent: &str, theme: &Theme) {
+fn push_truncation_marker(
+    lines: &mut Vec<Line<'static>>,
+    stream: CappedStream,
+    indent: &str,
+    theme: &Theme,
+) {
     lines.push(Line::styled(
-        format!("{indent}{TRUNCATION_MARKER}"),
+        format!("{indent}{}", stream.truncation_marker()),
         theme.text.subdued.add_modifier(Modifier::ITALIC),
     ));
 }
@@ -610,7 +612,7 @@ fn wrapped_content_lines(content: &str, width: usize) -> Vec<String> {
 }
 
 fn push_agent_message(lines: &mut Vec<Line<'static>>, content: &str, theme: &Theme) {
-    let (content, truncated) = split_truncation_marker(content);
+    let (content, truncated) = CappedStream::Message.split_truncation_marker(content);
     let content = sanitize_content(content);
     for mut line in markdown::render(&content, theme) {
         if !line.spans.is_empty() {
@@ -619,7 +621,7 @@ fn push_agent_message(lines: &mut Vec<Line<'static>>, content: &str, theme: &The
         lines.push(line);
     }
     if truncated {
-        push_truncation_marker(lines, "  ", theme);
+        push_truncation_marker(lines, CappedStream::Message, "  ", theme);
     }
     if !content.is_empty() || truncated {
         lines.push(Line::default());
@@ -984,7 +986,7 @@ mod tests {
     };
 
     use crate::{
-        ansi::TRUNCATION_MARKER,
+        ansi::CappedStream,
         protocol::{
             Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus,
             ModelAvailability, Session, SessionRevision, SessionSnapshot, SessionStatus,
@@ -1136,7 +1138,10 @@ mod tests {
             status: ActivityStatus::Completed,
             command: "emit oversized output".to_owned(),
             cwd: None,
-            output: format!("\x1b[31mkept output\x1b[0m\n{TRUNCATION_MARKER}"),
+            output: format!(
+                "\x1b[31mkept output\x1b[0m\n{}",
+                CappedStream::CommandOutput.truncation_marker()
+            ),
             exit_status: Some(0),
         };
         let theme = Theme::system();
@@ -1152,7 +1157,7 @@ mod tests {
                 .iter()
                 .map(|span| &*span.content)
                 .collect::<String>(),
-            format!("    {TRUNCATION_MARKER}")
+            format!("    {}", CappedStream::CommandOutput.truncation_marker())
         );
         assert!(
             marker.style.add_modifier.contains(Modifier::ITALIC),
@@ -1174,7 +1179,10 @@ mod tests {
             turn_id: TurnId::new(),
             role: MessageRole::Agent,
             status: MessageStatus::Completed,
-            content: format!("```\nfenced code\n{TRUNCATION_MARKER}"),
+            content: format!(
+                "```\nfenced code\n{}",
+                CappedStream::Message.truncation_marker()
+            ),
         };
         let theme = Theme::system();
         let mut lines = Vec::new();
@@ -1184,9 +1192,10 @@ mod tests {
         let marker = lines
             .iter()
             .find(|line| {
-                line.spans
-                    .iter()
-                    .any(|span| span.content.contains(TRUNCATION_MARKER))
+                line.spans.iter().any(|span| {
+                    span.content
+                        .contains(CappedStream::Message.truncation_marker())
+                })
             })
             .expect("render the truncation marker");
         assert!(

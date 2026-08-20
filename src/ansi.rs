@@ -250,19 +250,39 @@ const MAX_TRACKED_SGR_ATTRIBUTES: usize = 32;
 const SGR_RESET: &str = "\x1b[0m";
 const HYPERLINK_CLOSE: &str = "\x1b]8;;\x1b\\";
 
-/// Closes a stream that its cap cut short, so a reader can tell stored content
-/// is not everything the Provider sent. It sits on a line of its own and stays
-/// plain text, which keeps it legible to any client and lets one that knows the
-/// marker lift it out of the content and style it as its own.
-pub(crate) const TRUNCATION_MARKER: &str = "[output truncated]";
+/// A kind of Provider stream Suru stores under a cap. The kind decides what a
+/// truncation marker names, so the marker ends the thing the reader was
+/// reading rather than a word that only fits one of the two.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CappedStream {
+    /// Agent prose stored as the content of a Message.
+    Message,
+    /// The output a command wrote, stored on its Activity.
+    CommandOutput,
+}
 
-/// Splits stored content into what the Provider sent and whether a cap cut the
-/// stream short, so a client can render the marker in its own style instead of
-/// as Provider content.
-pub(crate) fn split_truncation_marker(content: &str) -> (&str, bool) {
-    match content.strip_suffix(TRUNCATION_MARKER) {
-        Some(content) => (content.strip_suffix('\n').unwrap_or(content), true),
-        None => (content, false),
+impl CappedStream {
+    /// Closes a stream that its cap cut short, so a reader can tell stored
+    /// content is not everything the Provider sent. Both markers are decided
+    /// here so the two stream kinds cannot drift apart in wording. A marker
+    /// sits on a line of its own and stays plain text, which keeps it legible
+    /// to any client and lets one that knows the marker lift it out of the
+    /// content and style it as its own.
+    pub(crate) const fn truncation_marker(self) -> &'static str {
+        match self {
+            Self::Message => "[Message truncated]",
+            Self::CommandOutput => "[output truncated]",
+        }
+    }
+
+    /// Splits stored content into what the Provider sent and whether a cap cut
+    /// the stream short, so a client can render the marker in its own style
+    /// instead of as Provider content.
+    pub(crate) fn split_truncation_marker(self, content: &str) -> (&str, bool) {
+        match content.strip_suffix(self.truncation_marker()) {
+            Some(content) => (content.strip_suffix('\n').unwrap_or(content), true),
+            None => (content, false),
+        }
     }
 }
 
@@ -273,13 +293,23 @@ pub(crate) fn split_truncation_marker(content: &str) -> (&str, bool) {
 #[derive(Debug, Default)]
 pub(crate) struct ProviderTextNormalizer {
     scanner: AnsiScanner,
-    remaining_chars: Option<usize>,
+    cap: Option<StreamCap>,
     formatting: Formatting,
     truncated: bool,
     /// Whether the emitted stream stands part way through a line, which decides
     /// if the truncation marker needs a newline to reach one of its own.
     mid_line: bool,
     overwrite_line: Option<OverwriteLine>,
+}
+
+/// The budget a capped stream stores within, together with the kind of stream
+/// it is. Pairing them means only a normalizer that can actually truncate
+/// carries a stream kind, and one that does carries the kind whose word its
+/// marker will use.
+#[derive(Debug)]
+struct StreamCap {
+    stream: CappedStream,
+    remaining_chars: usize,
 }
 
 /// A line withheld from the emitted output until a newline, or the end of the
@@ -373,17 +403,31 @@ fn split_to_fit(text: &str, limit: Option<usize>) -> (&str, bool) {
 }
 
 impl ProviderTextNormalizer {
-    pub(crate) fn with_max_chars(max_chars: usize) -> Self {
+    pub(crate) fn capped(stream: CappedStream, max_chars: usize) -> Self {
         Self {
-            remaining_chars: Some(max_chars),
+            cap: Some(StreamCap {
+                stream,
+                remaining_chars: max_chars,
+            }),
             ..Self::default()
         }
     }
 
-    pub(crate) fn with_line_overwrite(max_chars: usize) -> Self {
-        let mut normalizer = Self::with_max_chars(max_chars);
+    pub(crate) fn capped_with_line_overwrite(stream: CappedStream, max_chars: usize) -> Self {
+        let mut normalizer = Self::capped(stream, max_chars);
         normalizer.overwrite_line = Some(OverwriteLine::default());
         normalizer
+    }
+
+    /// How much of the cap is left, or `None` for a stream that stores without
+    /// bound and so can never reach a truncation marker.
+    fn remaining_chars(&self) -> Option<usize> {
+        self.cap.as_ref().map(|cap| cap.remaining_chars)
+    }
+
+    /// The same budget as [`Self::remaining_chars`], to charge against.
+    fn remaining_chars_mut(&mut self) -> Option<&mut usize> {
+        self.cap.as_mut().map(|cap| &mut cap.remaining_chars)
     }
 
     pub(crate) fn push(&mut self, chunk: &str) -> String {
@@ -410,8 +454,8 @@ impl ProviderTextNormalizer {
 
     /// Ends the stream, committing the line withheld from the emitted output.
     /// Every path that settles a normalizer built with
-    /// [`Self::with_line_overwrite`] must call this, or the unterminated line
-    /// the normalizer is holding back is lost.
+    /// [`Self::capped_with_line_overwrite`] must call this, or the unterminated
+    /// line the normalizer is holding back is lost.
     pub(crate) fn finish(&mut self) -> String {
         if self.truncated {
             return String::new();
@@ -430,7 +474,7 @@ impl ProviderTextNormalizer {
     }
 
     fn push_text(&mut self, text: &str, normalized: &mut String) {
-        let limit = self.remaining_chars;
+        let limit = self.remaining_chars();
         let formatting = &self.formatting;
         if let Some(line) = self.overwrite_line.as_mut() {
             if text.is_empty() {
@@ -476,14 +520,15 @@ impl ProviderTextNormalizer {
     /// should follow it. An overwrite line always follows it: a sequence that
     /// no longer fits the line still applies to the frames that replace it.
     fn push_formatting_sequence(&mut self, sequence: &str, normalized: &mut String) -> bool {
+        let limit = self.remaining_chars();
         if let Some(line) = self.overwrite_line.as_mut() {
             if !line.overwrite_pending {
-                line.stored.push_sequence(sequence, self.remaining_chars);
+                line.stored.push_sequence(sequence, limit);
             }
             return true;
         }
         let sequence_chars = sequence.chars().count();
-        if let Some(remaining) = self.remaining_chars.as_mut() {
+        if let Some(remaining) = self.remaining_chars_mut() {
             if sequence_chars > *remaining {
                 self.mark_truncated(normalized);
                 return false;
@@ -499,7 +544,7 @@ impl ProviderTextNormalizer {
             self.commit_line(normalized);
             return;
         }
-        let Some(remaining) = self.remaining_chars.as_mut() else {
+        let Some(remaining) = self.remaining_chars_mut() else {
             self.emit("\n", normalized);
             return;
         };
@@ -521,7 +566,7 @@ impl ProviderTextNormalizer {
         self.emit(&stored.content, normalized);
         let fits = !stored.overflowed
             && self
-                .remaining_chars
+                .remaining_chars()
                 .is_none_or(|remaining| stored.chars < remaining);
         self.spend(stored.chars);
         if !fits {
@@ -545,7 +590,7 @@ impl ProviderTextNormalizer {
     }
 
     fn spend(&mut self, chars: usize) {
-        if let Some(remaining) = self.remaining_chars.as_mut() {
+        if let Some(remaining) = self.remaining_chars_mut() {
             *remaining = remaining.saturating_sub(chars);
         }
     }
@@ -561,15 +606,22 @@ impl ProviderTextNormalizer {
     }
 
     /// Ends the stream at its cap, closing any styling the stored content left
-    /// open and marking that the rest of the stream was dropped.
+    /// open and marking that the rest of the stream was dropped. Only a stream
+    /// with a cap can overflow one, so the cap is always there to name the
+    /// marker.
     fn mark_truncated(&mut self, normalized: &mut String) {
+        debug_assert!(self.cap.is_some(), "an uncapped stream cannot overflow");
+        let Some(cap) = self.cap.as_ref() else {
+            return;
+        };
+        let marker = cap.stream.truncation_marker();
         self.truncated = true;
         normalized.push_str(&self.formatting.closers());
         self.formatting = Formatting::default();
         if self.mid_line {
             normalized.push('\n');
         }
-        normalized.push_str(TRUNCATION_MARKER);
+        normalized.push_str(marker);
         self.mid_line = true;
     }
 }
@@ -813,8 +865,8 @@ fn extended_color_length(parameters: &[&str], index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnsiScanner, Fragment, FragmentRole, ProviderTextNormalizer, sgr_parameter_code,
-        sgr_parameters, split_truncation_marker,
+        AnsiScanner, CappedStream, Fragment, FragmentRole, ProviderTextNormalizer,
+        sgr_parameter_code, sgr_parameters,
     };
 
     fn roles(text: &str) -> Vec<FragmentRole> {
@@ -1032,7 +1084,7 @@ mod tests {
 
     #[test]
     fn provider_text_truncation_never_splits_sgr_and_resets_active_style() {
-        let mut normalizer = ProviderTextNormalizer::with_max_chars(10);
+        let mut normalizer = ProviderTextNormalizer::capped(CappedStream::CommandOutput, 10);
 
         assert_eq!(
             normalizer.push("\x1b[31m1234\x1b[38;5;42m5678"),
@@ -1043,7 +1095,7 @@ mod tests {
 
     #[test]
     fn provider_text_truncation_resets_styles_outside_the_rendered_subset() {
-        let mut normalizer = ProviderTextNormalizer::with_max_chars(6);
+        let mut normalizer = ProviderTextNormalizer::capped(CappedStream::CommandOutput, 6);
 
         assert_eq!(
             normalizer.push("\x1b[53mxoverflow"),
@@ -1053,24 +1105,62 @@ mod tests {
 
     #[test]
     fn truncation_marker_starts_a_line_without_leaving_a_blank_one() {
-        let mut normalizer = ProviderTextNormalizer::with_max_chars(4);
+        let mut normalizer = ProviderTextNormalizer::capped(CappedStream::CommandOutput, 4);
 
         assert_eq!(normalizer.push("abc\ndropped"), "abc\n[output truncated]");
     }
 
     #[test]
     fn truncation_marker_splits_back_out_of_stored_content() {
-        let mut normalizer = ProviderTextNormalizer::with_max_chars(3);
+        let mut normalizer = ProviderTextNormalizer::capped(CappedStream::CommandOutput, 3);
         let stored = normalizer.push("kept, then dropped");
 
-        assert_eq!(split_truncation_marker(&stored), ("kep", true));
+        assert_eq!(
+            CappedStream::CommandOutput.split_truncation_marker(&stored),
+            ("kep", true)
+        );
     }
 
     #[test]
     fn content_that_ran_to_its_end_splits_back_unchanged() {
         assert_eq!(
-            split_truncation_marker("whole stream"),
+            CappedStream::Message.split_truncation_marker("whole stream"),
             ("whole stream", false)
+        );
+    }
+
+    #[test]
+    fn a_capped_message_ends_with_a_marker_that_names_a_message() {
+        let mut normalizer = ProviderTextNormalizer::capped(CappedStream::Message, 4);
+
+        assert_eq!(
+            normalizer.push("kept, then dropped"),
+            "kept\n[Message truncated]"
+        );
+    }
+
+    #[test]
+    fn a_capped_command_ends_with_a_marker_that_names_output() {
+        let mut normalizer = ProviderTextNormalizer::capped(CappedStream::CommandOutput, 4);
+
+        assert_eq!(
+            normalizer.push("kept, then dropped"),
+            "kept\n[output truncated]"
+        );
+    }
+
+    #[test]
+    fn a_stream_kind_splits_back_only_the_marker_that_names_it() {
+        let mut normalizer = ProviderTextNormalizer::capped(CappedStream::Message, 3);
+        let stored = normalizer.push("kept, then dropped");
+
+        assert_eq!(
+            CappedStream::Message.split_truncation_marker(&stored),
+            ("kep", true)
+        );
+        assert_eq!(
+            CappedStream::CommandOutput.split_truncation_marker(&stored),
+            (stored.as_str(), false)
         );
     }
 
@@ -1095,7 +1185,8 @@ mod tests {
     #[test]
     fn provider_text_truncation_closes_an_active_hyperlink() {
         let open = "\x1b]8;;https://example.com\x1b\\";
-        let mut normalizer = ProviderTextNormalizer::with_max_chars(open.chars().count() + 3);
+        let mut normalizer =
+            ProviderTextNormalizer::capped(CappedStream::CommandOutput, open.chars().count() + 3);
 
         assert_eq!(
             normalizer.push(&format!("{open}abcdef")),
@@ -1143,7 +1234,8 @@ mod tests {
 
     #[test]
     fn overwritten_line_frames_do_not_consume_the_stored_output_budget() {
-        let mut normalizer = ProviderTextNormalizer::with_line_overwrite(64);
+        let mut normalizer =
+            ProviderTextNormalizer::capped_with_line_overwrite(CappedStream::CommandOutput, 64);
         let mut actual = String::new();
 
         for percent in 0..1_000 {
@@ -1156,7 +1248,8 @@ mod tests {
 
     #[test]
     fn overwritten_line_keeps_only_the_style_applying_to_surviving_text() {
-        let mut normalizer = ProviderTextNormalizer::with_line_overwrite(1_024);
+        let mut normalizer =
+            ProviderTextNormalizer::capped_with_line_overwrite(CappedStream::CommandOutput, 1_024);
 
         assert_eq!(
             normalizer.push("\x1b[1;31mfirst frame\r\x1b[32msecond\n"),
@@ -1166,7 +1259,8 @@ mod tests {
 
     #[test]
     fn overwritten_line_clears_styles_that_the_previous_line_left_active() {
-        let mut normalizer = ProviderTextNormalizer::with_line_overwrite(1_024);
+        let mut normalizer =
+            ProviderTextNormalizer::capped_with_line_overwrite(CappedStream::CommandOutput, 1_024);
 
         assert_eq!(
             normalizer.push("\x1b[1mbold\n\x1b[22mplain\rfinal\n"),
@@ -1178,7 +1272,8 @@ mod tests {
     fn overwritten_line_reopens_and_closes_hyperlinks_around_surviving_text() {
         let open = "\x1b]8;;https://example.com\x1b\\";
         let close = "\x1b]8;;\x1b\\";
-        let mut normalizer = ProviderTextNormalizer::with_line_overwrite(1_024);
+        let mut normalizer =
+            ProviderTextNormalizer::capped_with_line_overwrite(CappedStream::CommandOutput, 1_024);
 
         assert_eq!(
             normalizer.push(&format!("{open}linked\rstill linked\n")),
@@ -1192,7 +1287,8 @@ mod tests {
 
     #[test]
     fn overwritten_line_recovers_a_budget_spent_by_a_discarded_frame() {
-        let mut normalizer = ProviderTextNormalizer::with_line_overwrite(16);
+        let mut normalizer =
+            ProviderTextNormalizer::capped_with_line_overwrite(CappedStream::CommandOutput, 16);
 
         assert_eq!(
             normalizer.push("a very long first frame\rshort\n"),
@@ -1203,7 +1299,8 @@ mod tests {
 
     #[test]
     fn line_overwrite_charges_output_that_is_never_overwritten_as_before() {
-        let mut normalizer = ProviderTextNormalizer::with_line_overwrite(10);
+        let mut normalizer =
+            ProviderTextNormalizer::capped_with_line_overwrite(CappedStream::CommandOutput, 10);
 
         assert_eq!(normalizer.push("\x1b[31m1234\x1b[38;5;42m5678"), "");
         assert_eq!(
@@ -1215,7 +1312,8 @@ mod tests {
 
     #[test]
     fn line_overwrite_truncates_a_committed_line_that_exhausts_the_budget() {
-        let mut normalizer = ProviderTextNormalizer::with_line_overwrite(6);
+        let mut normalizer =
+            ProviderTextNormalizer::capped_with_line_overwrite(CappedStream::CommandOutput, 6);
 
         assert_eq!(
             normalizer.push("\x1b[53mxoverflow\n"),
@@ -1226,7 +1324,8 @@ mod tests {
 
     #[test]
     fn line_overwrite_keeps_a_line_that_exactly_fills_the_budget() {
-        let mut normalizer = ProviderTextNormalizer::with_line_overwrite(6);
+        let mut normalizer =
+            ProviderTextNormalizer::capped_with_line_overwrite(CappedStream::CommandOutput, 6);
 
         assert_eq!(normalizer.push("123456"), "");
         assert_eq!(normalizer.finish(), "123456");
@@ -1234,7 +1333,8 @@ mod tests {
 
     #[test]
     fn overwritten_line_bounds_the_styles_tracked_for_unrecognized_parameters() {
-        let mut normalizer = ProviderTextNormalizer::with_line_overwrite(1_024);
+        let mut normalizer =
+            ProviderTextNormalizer::capped_with_line_overwrite(CappedStream::CommandOutput, 1_024);
 
         let unrecognized = (200..400)
             .map(|parameter| format!("\x1b[{parameter}m"))
@@ -1252,7 +1352,8 @@ mod tests {
 
     #[test]
     fn overwritten_line_drops_styles_that_a_later_frame_turned_off() {
-        let mut normalizer = ProviderTextNormalizer::with_line_overwrite(1_024);
+        let mut normalizer =
+            ProviderTextNormalizer::capped_with_line_overwrite(CappedStream::CommandOutput, 1_024);
 
         assert_eq!(
             normalizer.push("\x1b[4;53;38;5;42mstyled\r\x1b[24;55msurvivor\n"),
@@ -1262,7 +1363,8 @@ mod tests {
 
     #[test]
     fn line_overwrite_stores_formatting_that_arrived_after_a_discarded_frame() {
-        let mut normalizer = ProviderTextNormalizer::with_line_overwrite(1_024);
+        let mut normalizer =
+            ProviderTextNormalizer::capped_with_line_overwrite(CappedStream::CommandOutput, 1_024);
 
         assert_eq!(
             normalizer.push("\x1b[31mred\r\x1b[32m\nplain\n"),
@@ -1272,7 +1374,8 @@ mod tests {
 
     #[test]
     fn line_overwrite_rebuilds_from_the_formatting_the_stored_line_ends_with() {
-        let mut normalizer = ProviderTextNormalizer::with_line_overwrite(1_024);
+        let mut normalizer =
+            ProviderTextNormalizer::capped_with_line_overwrite(CappedStream::CommandOutput, 1_024);
 
         assert_eq!(
             normalizer.push("\x1b[31mred\r\x1b[32m\nnext\rX\n"),

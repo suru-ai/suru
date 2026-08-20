@@ -18,7 +18,7 @@ use super::{
     ProviderRuntime, ProviderSession, ProviderSessionRequest, ProviderSteerInput,
     ProviderTurnInput,
 };
-use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
+use crate::ansi::{CappedStream, ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AgentIdentity, Message, MessageId, MessageRole,
     MessageStatus, PromptId, SessionChange, SessionId, TurnId, TurnStatus,
@@ -883,7 +883,8 @@ fn project_provider_event(
                     let message_id = MessageId::new();
                     active.streaming_message = Some(ActiveProviderMessage {
                         id: message_id,
-                        normalizer: ProviderTextNormalizer::with_max_chars(
+                        normalizer: ProviderTextNormalizer::capped(
+                            CappedStream::Message,
                             MAX_STORED_MESSAGE_CHARS,
                         ),
                     });
@@ -980,9 +981,11 @@ fn project_provider_event(
                                 activity_id,
                                 ActiveProviderCommand {
                                     id: command_activity_id,
-                                    output_normalizer: ProviderTextNormalizer::with_line_overwrite(
-                                        MAX_STORED_COMMAND_OUTPUT_CHARS,
-                                    ),
+                                    output_normalizer:
+                                        ProviderTextNormalizer::capped_with_line_overwrite(
+                                            CappedStream::CommandOutput,
+                                            MAX_STORED_COMMAND_OUTPUT_CHARS,
+                                        ),
                                 },
                             );
                             ProviderEventProjection::Continue

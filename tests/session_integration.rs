@@ -724,7 +724,7 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
     let truncated_prose = completed.messages[2]
         .content
         .strip_prefix("\x1b[31m")
-        .and_then(|content| content.strip_suffix("\x1b[0m\n[output truncated]"))
+        .and_then(|content| content.strip_suffix("\x1b[0m\n[Message truncated]"))
         .expect("a truncated Message is bounded by complete SGR sequences and marked");
     assert_eq!(truncated_prose.len(), 524_270);
     assert!(truncated_prose.chars().all(|character| character == 'y'));
