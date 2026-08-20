@@ -102,6 +102,11 @@ pub(super) struct TranscriptView {
     line_starts: Vec<usize>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct TranscriptLink {
+    pub(super) target: String,
+}
+
 impl TranscriptView {
     pub(super) fn row_count(&self) -> usize {
         self.row_count
@@ -109,6 +114,13 @@ impl TranscriptView {
 
     pub(super) fn message_starts(&self) -> &[MessageStart] {
         &self.message_starts
+    }
+
+    /// Parsed hyperlink targets retained for future semantic commands and
+    /// pointer hit-testing.
+    #[allow(dead_code)]
+    pub(super) fn links(&self) -> impl Iterator<Item = &TranscriptLink> {
+        self.items.iter().flat_map(|item| item.links.iter())
     }
 
     /// Extracts the lines needed to render `viewport_rows` rows starting at
@@ -159,6 +171,7 @@ struct ItemView {
     key: ItemKey,
     fingerprint: u64,
     lines: Vec<Line<'static>>,
+    links: Vec<TranscriptLink>,
     /// Wrapped row count per line at the view width, so layout is a prefix sum
     /// instead of a re-wrap.
     rows_per_line: Vec<usize>,
@@ -211,7 +224,7 @@ fn rebuild(
                     message_fingerprint(message),
                     Some(message.id),
                     width,
-                    |lines| render_message(lines, message, theme, width),
+                    |lines, _links| render_message(lines, message, theme, width),
                 ));
             }
             TranscriptItem::Activity { activity_id } => {
@@ -224,7 +237,7 @@ fn rebuild(
                     activity_fingerprint(activity),
                     None,
                     width,
-                    |lines| render_activity(lines, activity, theme),
+                    |lines, links| render_activity(lines, links, activity, theme),
                 ));
             }
         }
@@ -236,7 +249,7 @@ fn rebuild(
             prompt.text.len() as u64,
             None,
             width,
-            |lines| push_user_message(lines, &prompt.text, theme, width),
+            |lines, _links| push_user_message(lines, &prompt.text, theme, width),
         ));
     }
 
@@ -273,7 +286,7 @@ fn reuse_or_render(
     fingerprint: u64,
     message_id: Option<MessageId>,
     width: u16,
-    render: impl FnOnce(&mut Vec<Line<'static>>),
+    render: impl FnOnce(&mut Vec<Line<'static>>, &mut Vec<TranscriptLink>),
 ) -> ItemView {
     if let Some(item) = reusable.remove(&key)
         && item.fingerprint == fingerprint
@@ -281,7 +294,8 @@ fn reuse_or_render(
         return item;
     }
     let mut rendered = Vec::new();
-    render(&mut rendered);
+    let mut links = Vec::new();
+    render(&mut rendered, &mut links);
     let mut lines = Vec::with_capacity(rendered.len());
     for line in rendered {
         split_oversized_line(line, width, &mut lines);
@@ -294,6 +308,7 @@ fn reuse_or_render(
         key,
         fingerprint,
         lines,
+        links,
         rows_per_line,
         start_line: 0,
         message_id,
@@ -357,13 +372,15 @@ fn provisional_fingerprint(provisional: &[&InitialPrompt]) -> u64 {
 enum ContentToken {
     Text(String),
     Sgr(String),
+    LinkStart(String),
+    LinkEnd,
     Tab,
     LineBreak,
 }
 
-/// Reduces Session content to printable text, layout controls, and SGR style
-/// transitions. Every escape/control sequence omitted here stays invisible in
-/// both the strip-only and styled rendering paths.
+/// Reduces Session content to printable text, layout controls, and supported
+/// style/link transitions. Every escape/control sequence omitted here stays
+/// invisible in both the strip-only and styled rendering paths.
 fn content_tokens(text: &str) -> impl Iterator<Item = ContentToken> {
     AnsiScanner::default()
         .feed(text)
@@ -371,6 +388,10 @@ fn content_tokens(text: &str) -> impl Iterator<Item = ContentToken> {
         .filter_map(|fragment| match fragment {
             Fragment::Text(text) => Some(ContentToken::Text(text)),
             Fragment::Sgr(sequence) => Some(ContentToken::Sgr(sequence)),
+            Fragment::Osc8(hyperlink) => Some(match hyperlink.target() {
+                Some(target) => ContentToken::LinkStart(target.to_owned()),
+                None => ContentToken::LinkEnd,
+            }),
             Fragment::Control('\t') => Some(ContentToken::Tab),
             Fragment::Control('\n') => Some(ContentToken::LineBreak),
             Fragment::Csi(_)
@@ -399,7 +420,7 @@ fn sanitize_content(text: &str) -> std::borrow::Cow<'_, str> {
             ContentToken::Text(text) => out.push_str(&text),
             ContentToken::Tab => out.push_str("    "),
             ContentToken::LineBreak => out.push('\n'),
-            ContentToken::Sgr(_) => {}
+            ContentToken::Sgr(_) | ContentToken::LinkStart(_) | ContentToken::LinkEnd => {}
         }
     }
     std::borrow::Cow::Owned(out)
@@ -412,14 +433,24 @@ fn render_message(lines: &mut Vec<Line<'static>>, message: &Message, theme: &The
     }
 }
 
-fn render_activity(lines: &mut Vec<Line<'static>>, activity: &Activity, theme: &Theme) {
+fn render_activity(
+    lines: &mut Vec<Line<'static>>,
+    links: &mut Vec<TranscriptLink>,
+    activity: &Activity,
+    theme: &Theme,
+) {
+    let mut projection = ActivityProjection { lines, links };
     match activity {
         Activity::Status { text, .. } => {
-            push_styled_prefixed_lines(lines, "  ", text, theme.text.subdued)
+            push_styled_prefixed_lines(&mut projection, "  ", text, theme.text.subdued, theme)
         }
-        Activity::Error { text, .. } => {
-            push_styled_prefixed_lines(lines, "  Error: ", text, theme.feedback.error)
-        }
+        Activity::Error { text, .. } => push_styled_prefixed_lines(
+            &mut projection,
+            "  Error: ",
+            text,
+            theme.feedback.error,
+            theme,
+        ),
         Activity::Command {
             status,
             command,
@@ -428,7 +459,7 @@ fn render_activity(lines: &mut Vec<Line<'static>>, activity: &Activity, theme: &
             exit_status,
             ..
         } => push_command_activity(
-            lines,
+            &mut projection,
             *status,
             command,
             cwd.as_deref(),
@@ -438,12 +469,17 @@ fn render_activity(lines: &mut Vec<Line<'static>>, activity: &Activity, theme: &
         ),
         Activity::FileChange {
             status, changes, ..
-        } => push_file_change_activity(lines, *status, changes, theme),
+        } => push_file_change_activity(projection.lines, *status, changes, theme),
     }
 }
 
+struct ActivityProjection<'a> {
+    lines: &'a mut Vec<Line<'static>>,
+    links: &'a mut Vec<TranscriptLink>,
+}
+
 fn push_command_activity(
-    lines: &mut Vec<Line<'static>>,
+    projection: &mut ActivityProjection<'_>,
     status: crate::protocol::ActivityStatus,
     command: &str,
     cwd: Option<&std::path::Path>,
@@ -464,17 +500,17 @@ fn push_command_activity(
         }
         _ => command.to_owned(),
     };
-    push_prefixed_lines(lines, &format!("  {marker}"), &command, style);
+    push_prefixed_lines(projection.lines, &format!("  {marker}"), &command, style);
     if let Some(cwd) = cwd {
         push_prefixed_lines(
-            lines,
+            projection.lines,
             "    in ",
             cwd.to_string_lossy().as_ref(),
             theme.text.subdued,
         );
     }
     if !output.is_empty() {
-        push_styled_prefixed_lines(lines, "    ", output, theme.text.subdued);
+        push_styled_prefixed_lines(projection, "    ", output, theme.text.subdued, theme);
     }
 }
 
@@ -582,28 +618,43 @@ fn push_prefixed_lines(lines: &mut Vec<Line<'static>>, prefix: &str, content: &s
 }
 
 fn push_styled_prefixed_lines(
-    lines: &mut Vec<Line<'static>>,
+    projection: &mut ActivityProjection<'_>,
     prefix: &str,
     content: &str,
     base_style: Style,
+    theme: &Theme,
 ) {
     let mut style = base_style;
+    let mut hyperlink_active = false;
     let mut spans = vec![Span::styled(prefix.to_owned(), base_style)];
     let mut line_has_content = false;
 
     for token in content_tokens(content) {
         match token {
             ContentToken::Text(text) if !text.is_empty() => {
-                spans.push(Span::styled(text, style));
+                spans.push(Span::styled(
+                    text,
+                    activity_content_style(style, hyperlink_active, theme),
+                ));
                 line_has_content = true;
             }
             ContentToken::Sgr(sequence) => apply_sgr(&sequence, &mut style, base_style),
+            ContentToken::LinkStart(target) => {
+                projection.links.push(TranscriptLink { target });
+                hyperlink_active = true;
+            }
+            ContentToken::LinkEnd => hyperlink_active = false,
             ContentToken::Tab => {
-                spans.push(Span::styled("    ", style));
+                spans.push(Span::styled(
+                    "    ",
+                    activity_content_style(style, hyperlink_active, theme),
+                ));
                 line_has_content = true;
             }
             ContentToken::LineBreak => {
-                lines.push(Line::from(std::mem::take(&mut spans)));
+                projection
+                    .lines
+                    .push(Line::from(std::mem::take(&mut spans)));
                 spans.push(Span::styled("  ", base_style));
                 line_has_content = false;
             }
@@ -611,7 +662,15 @@ fn push_styled_prefixed_lines(
         }
     }
     if line_has_content {
-        lines.push(Line::from(spans));
+        projection.lines.push(Line::from(spans));
+    }
+}
+
+fn activity_content_style(style: Style, hyperlink_active: bool, theme: &Theme) -> Style {
+    if hyperlink_active {
+        style.patch(theme.markdown.link)
+    } else {
+        style
     }
 }
 
@@ -865,4 +924,43 @@ fn split_line_at_character_midpoint(
             spans: right_spans,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        protocol::{Activity, ActivityId, ActivityStatus, TurnId},
+        theme::Theme,
+    };
+
+    use super::render_activity;
+
+    #[test]
+    fn activity_projection_retains_osc_8_link_targets() {
+        let activity = Activity::Command {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Completed,
+            command: "show targets".to_owned(),
+            cwd: None,
+            output: concat!(
+                "\x1b]8;id=first;https://example.com/first\x07first\x1b]8;;\x07 ",
+                "\x1b]8;;file:///tmp/second\x1b\\second\x1b]8;;\x1b\\"
+            )
+            .to_owned(),
+            exit_status: Some(0),
+        };
+        let mut lines = Vec::new();
+        let mut links = Vec::new();
+
+        render_activity(&mut lines, &mut links, &activity, &Theme::system());
+
+        assert_eq!(
+            links
+                .into_iter()
+                .map(|link| link.target)
+                .collect::<Vec<_>>(),
+            ["https://example.com/first", "file:///tmp/second"]
+        );
+    }
 }

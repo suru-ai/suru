@@ -511,7 +511,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
 }
 
 #[tokio::test]
-async fn provider_streams_store_only_printable_text_newlines_and_sgr() {
+async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let (runtime, mut provider) = ControlledProvider::new();
@@ -574,7 +574,18 @@ async fn provider_streams_store_only_printable_text_newlines_and_sgr() {
         },
         ProviderEvent::CommandOutputDelta {
             activity_id: ProviderActivityId::new("normalized-command"),
-            content: " title\x07\r\x1b[2Kdone\x7f\n".to_owned(),
+            content: " title\x07\r\x1b[2Kdone\x7f\n\x1b]8;id=docs;https://example".to_owned(),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("normalized-command"),
+            content: concat!(
+                ".com/bel\x07BEL\x1b]8;;\x07 ",
+                "\x1b]8;;https://example.com/st\x1b\\ST\x1b]8;;\x1b\\ ",
+                "\x1b]0;discarded title\x07kept ",
+                "\x1b]8;malformed\x07safe",
+                "\x1b]8;;https://example.com/unterminated"
+            )
+            .to_owned(),
         },
         ProviderEvent::CommandCompleted {
             activity_id: ProviderActivityId::new("normalized-command"),
@@ -641,13 +652,20 @@ async fn provider_streams_store_only_printable_text_newlines_and_sgr() {
         &client,
         &descriptor,
         created.session.id,
-        SessionRevision(17),
+        SessionRevision(18),
     )
     .await;
     let Activity::Command { output, .. } = &completed.activities[0] else {
         panic!("Provider command projects as command Activity");
     };
-    assert_eq!(output, "\x1b[38;5;42mdone\n");
+    assert_eq!(
+        output,
+        concat!(
+            "\x1b[38;5;42mdone\n",
+            "\x1b]8;id=docs;https://example.com/bel\x07BEL\x1b]8;;\x07 ",
+            "\x1b]8;;https://example.com/st\x1b\\ST\x1b]8;;\x1b\\ kept safe"
+        )
+    );
     let Activity::Command {
         output: truncated_output,
         ..

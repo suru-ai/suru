@@ -3,11 +3,50 @@ pub(crate) enum Fragment {
     Text(String),
     Sgr(String),
     Csi(String),
+    Osc8(Osc8),
     Osc(String),
     Dcs(String),
     Apc(String),
     Escape(String),
     Control(char),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Osc8 {
+    sequence: String,
+    target: Option<String>,
+}
+
+impl Osc8 {
+    fn parse(sequence: String) -> Result<Self, String> {
+        let Some(payload) = sequence.strip_prefix("\x1b]").and_then(|sequence| {
+            sequence
+                .strip_suffix('\x07')
+                .or_else(|| sequence.strip_suffix("\x1b\\"))
+        }) else {
+            return Err(sequence);
+        };
+        let mut fields = payload.splitn(3, ';');
+        if fields.next() != Some("8") || fields.next().is_none() {
+            return Err(sequence);
+        }
+        let Some(target) = fields.next() else {
+            return Err(sequence);
+        };
+        if payload.chars().any(char::is_control) {
+            return Err(sequence);
+        }
+        let target = (!target.is_empty()).then(|| target.to_owned());
+        Ok(Self { sequence, target })
+    }
+
+    pub(crate) fn sequence(&self) -> &str {
+        &self.sequence
+    }
+
+    pub(crate) fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -43,7 +82,7 @@ impl StringKind {
 
     fn into_fragment(self, sequence: String) -> Fragment {
         match self {
-            Self::Osc => Fragment::Osc(sequence),
+            Self::Osc => Osc8::parse(sequence).map_or_else(Fragment::Osc, Fragment::Osc8),
             Self::Dcs => Fragment::Dcs(sequence),
             Self::Apc => Fragment::Apc(sequence),
         }
@@ -168,12 +207,14 @@ impl AnsiScanner {
 
 /// Stateful normalization for provider text that may arrive in arbitrary
 /// streaming chunks. The emitted form is safe to persist as transcript data:
-/// printable text, newlines, and complete SGR sequences only.
+/// printable text, newlines, complete SGR sequences, and complete OSC 8
+/// hyperlinks only.
 #[derive(Debug, Default)]
 pub(crate) struct ProviderTextNormalizer {
     scanner: AnsiScanner,
     remaining_chars: Option<usize>,
     style_may_be_active: bool,
+    hyperlink_active: bool,
     truncated: bool,
     overwrite_line: Option<OverwriteLine>,
 }
@@ -181,7 +222,7 @@ pub(crate) struct ProviderTextNormalizer {
 #[derive(Debug, Default)]
 struct OverwriteLine {
     content: String,
-    sgr: String,
+    formatting_prefix: String,
     overwrite_pending: bool,
 }
 
@@ -208,6 +249,7 @@ impl ProviderTextNormalizer {
             match fragment {
                 Fragment::Text(text) => self.push_text(&text, &mut normalized),
                 Fragment::Sgr(sequence) => self.push_sgr(&sequence, &mut normalized),
+                Fragment::Osc8(hyperlink) => self.push_osc8(&hyperlink, &mut normalized),
                 Fragment::Control('\t') => self.push_text("    ", &mut normalized),
                 Fragment::Control('\n') => self.push_newline(&mut normalized),
                 Fragment::Control('\r') => self.overwrite_line(),
@@ -248,21 +290,33 @@ impl ProviderTextNormalizer {
     }
 
     fn push_sgr(&mut self, sequence: &str, normalized: &mut String) {
+        if self.push_formatting_sequence(sequence, normalized) {
+            update_style_state(sequence, &mut self.style_may_be_active);
+        }
+    }
+
+    fn push_osc8(&mut self, hyperlink: &Osc8, normalized: &mut String) {
+        if self.push_formatting_sequence(hyperlink.sequence(), normalized) {
+            self.hyperlink_active = hyperlink.target().is_some();
+        }
+    }
+
+    fn push_formatting_sequence(&mut self, sequence: &str, normalized: &mut String) -> bool {
         let sequence_chars = sequence.chars().count();
         if let Some(remaining) = self.remaining_chars.as_mut() {
             if sequence_chars > *remaining {
                 self.mark_truncated(normalized);
-                return;
+                return false;
             }
             *remaining -= sequence_chars;
         }
         if let Some(line) = self.overwrite_line.as_mut() {
             line.content.push_str(sequence);
-            line.sgr.push_str(sequence);
+            line.formatting_prefix.push_str(sequence);
         } else {
             normalized.push_str(sequence);
         }
-        update_style_state(sequence, &mut self.style_may_be_active);
+        true
     }
 
     fn push_newline(&mut self, normalized: &mut String) {
@@ -277,7 +331,7 @@ impl ProviderTextNormalizer {
             line.content.push('\n');
             normalized.push_str(&line.content);
             line.content.clear();
-            line.sgr.clear();
+            line.formatting_prefix.clear();
             line.overwrite_pending = false;
         } else {
             normalized.push('\n');
@@ -293,7 +347,7 @@ impl ProviderTextNormalizer {
     fn push_visible(&mut self, text: &str, normalized: &mut String) {
         if let Some(line) = self.overwrite_line.as_mut() {
             if line.overwrite_pending && !text.is_empty() {
-                line.content.clone_from(&line.sgr);
+                line.content.clone_from(&line.formatting_prefix);
                 line.overwrite_pending = false;
             }
             line.content.push_str(text);
@@ -305,6 +359,10 @@ impl ProviderTextNormalizer {
     fn mark_truncated(&mut self, normalized: &mut String) {
         self.truncated = true;
         normalized.push_str(&self.finish());
+        if self.hyperlink_active {
+            normalized.push_str("\x1b]8;;\x1b\\");
+            self.hyperlink_active = false;
+        }
         if self.style_may_be_active {
             normalized.push_str("\x1b[0m");
             self.style_may_be_active = false;
@@ -504,5 +562,72 @@ mod tests {
         let mut normalizer = ProviderTextNormalizer::with_max_chars(6);
 
         assert_eq!(normalizer.push("\x1b[53mxoverflow"), "\x1b[53mx\x1b[0m");
+    }
+
+    #[test]
+    fn provider_text_preserves_complete_osc_8_hyperlinks() {
+        let mut normalizer = ProviderTextNormalizer::default();
+
+        assert_eq!(
+            normalizer.push(concat!(
+                "before ",
+                "\x1b]8;id=docs;https://example.com/bel\x07BEL\x1b]8;;\x07 ",
+                "\x1b]8;;https://example.com/st\x1b\\ST\x1b]8;;\x1b\\ after"
+            )),
+            concat!(
+                "before ",
+                "\x1b]8;id=docs;https://example.com/bel\x07BEL\x1b]8;;\x07 ",
+                "\x1b]8;;https://example.com/st\x1b\\ST\x1b]8;;\x1b\\ after"
+            )
+        );
+    }
+
+    #[test]
+    fn provider_text_truncation_closes_an_active_hyperlink() {
+        let open = "\x1b]8;;https://example.com\x1b\\";
+        let mut normalizer = ProviderTextNormalizer::with_max_chars(open.chars().count() + 3);
+
+        assert_eq!(
+            normalizer.push(&format!("{open}abcdef")),
+            format!("{open}abc\x1b]8;;\x1b\\")
+        );
+        assert_eq!(normalizer.push("ignored"), "");
+    }
+
+    #[test]
+    fn provider_text_resumes_osc_8_hyperlinks_at_every_byte_boundary() {
+        let input = "\x1b]8;id=split;https://example.com\x1b\\linked\x1b]8;;\x1b\\";
+
+        for split in 0..=input.len() {
+            let mut normalizer = ProviderTextNormalizer::default();
+            let mut actual = normalizer.push(&input[..split]);
+            actual.push_str(&normalizer.push(&input[split..]));
+            assert_eq!(actual, input, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn provider_text_drops_malformed_and_non_8_osc_sequences() {
+        let mut normalizer = ProviderTextNormalizer::default();
+
+        assert_eq!(
+            normalizer.push(concat!(
+                "before",
+                "\x1b]8;missing-target\x07",
+                "\x1b]0;terminal title\x1b\\",
+                "after"
+            )),
+            "beforeafter"
+        );
+    }
+
+    #[test]
+    fn provider_text_drops_an_unterminated_osc_8_across_deltas() {
+        let mut normalizer = ProviderTextNormalizer::default();
+        let mut actual = normalizer.push("before\x1b]8;;https://example");
+        actual.push_str(&normalizer.push(".com/unterminated"));
+        actual.push_str(&normalizer.finish());
+
+        assert_eq!(actual, "before");
     }
 }

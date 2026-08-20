@@ -485,6 +485,41 @@ fn activity_sgr_styles_patch_over_each_activity_base_style() {
 }
 
 #[test]
+fn command_output_osc_8_hyperlinks_render_with_link_style() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
+    let activity = Activity::Command {
+        id: ActivityId::new(),
+        turn_id: snapshot.turns[0].id,
+        status: ActivityStatus::Completed,
+        command: "show links".to_owned(),
+        cwd: None,
+        output: concat!(
+            "BEL: \x1b]8;id=bel;https://example.com/bel\x07bel link\x1b]8;;\x07 ",
+            "ST: \x1b]8;;https://example.com/st\x1b\\st link\x1b]8;;\x1b\\"
+        )
+        .to_owned(),
+        exit_status: Some(0),
+    };
+    snapshot.transcript.push(TranscriptItem::Activity {
+        activity_id: activity.id(),
+    });
+    snapshot.activities.push(activity);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach Session with OSC 8-linked command output");
+
+    let buffer = rendered_application_buffer(&application, 100, 24);
+    for link_text in ["bel link", "st link"] {
+        let cell = text_cell(&buffer, link_text);
+        assert_eq!(cell.fg, Color::Blue);
+        assert!(cell.modifier.contains(Modifier::UNDERLINED));
+    }
+    assert_no_control_cells(&buffer);
+}
+
+#[test]
 fn connected_application_uses_the_persisted_landing_agent_selection() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let selected = AgentSelection {
