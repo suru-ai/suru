@@ -221,35 +221,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "chidori"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "blake3",
- "clap",
- "crossterm",
- "diesel",
- "diesel_migrations",
- "dirs",
- "eventsource-stream",
- "fs2",
- "futures-util",
- "libc",
- "pulldown-cmark",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "sysinfo",
- "tempfile",
- "tokio",
- "unicode-width 0.2.0",
- "uuid",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "clap"
 version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1763,6 +1734,35 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "suru"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "blake3",
+ "clap",
+ "crossterm",
+ "diesel",
+ "diesel_migrations",
+ "dirs",
+ "eventsource-stream",
+ "fs2",
+ "futures-util",
+ "libc",
+ "pulldown-cmark",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "tokio",
+ "unicode-width 0.2.0",
+ "uuid",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "syn"

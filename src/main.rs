@@ -1,17 +1,17 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chidori::{
+use clap::{Parser, Subcommand};
+use suru::{
     managed_client::{
         ManagedClient, ManagedClientConfig, ServerStatus, server_status, start_server, stop_server,
     },
     server::{self, ServerConfig},
     tui,
 };
-use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "chidori", version, about)]
+#[command(name = "suru", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
             let config = default_client_config()?;
             let health = start_server(&config).await?;
             println!(
-                "Chidori server ready (pid {}, instance {})",
+                "Suru server ready (pid {}, instance {})",
                 health.identity.pid, health.identity.instance_id
             );
             Ok(())
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
         }) => {
             let health = stop_server(&default_client_config()?).await?;
             println!(
-                "Chidori server stopped (pid {}, instance {})",
+                "Suru server stopped (pid {}, instance {})",
                 health.identity.pid, health.identity.instance_id
             );
             Ok(())
@@ -89,27 +89,27 @@ async fn main() -> Result<()> {
         None => {
             let client = ManagedClient::connect(default_client_config()?)
                 .await
-                .context("prepare the managed Chidori server connection")?;
+                .context("prepare the managed Suru server connection")?;
             tui::run(client).await
         }
     }
 }
 
 fn default_client_config() -> Result<ManagedClientConfig> {
-    let state_base_dir = match std::env::var_os("CHIDORI_STATE_DIR") {
+    let state_base_dir = match std::env::var_os("SURU_STATE_DIR") {
         Some(path) => PathBuf::from(path),
         None => dirs::state_dir()
             .or_else(dirs::data_local_dir)
             .context("determine the current user's state directory")?
-            .join("chidori"),
+            .join("suru"),
     };
-    let data_base_dir = match std::env::var_os("CHIDORI_DATA_DIR") {
+    let data_base_dir = match std::env::var_os("SURU_DATA_DIR") {
         Some(path) => PathBuf::from(path),
         None => dirs::data_local_dir()
             .context("determine the current user's data directory")?
-            .join("chidori"),
+            .join("suru"),
     };
-    let channel = std::env::var("CHIDORI_CHANNEL").unwrap_or_else(|_| {
+    let channel = std::env::var("SURU_CHANNEL").unwrap_or_else(|_| {
         if cfg!(debug_assertions) {
             "debug".to_owned()
         } else {

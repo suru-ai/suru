@@ -10,7 +10,7 @@ Sessions, their Transcripts, Agent Selections, and provider Resume State are per
 
 ## Consequences
 
-- The database lives in the XDG data dir (`~/.local/share/chidori/chidori.db` in release); development builds insert a Channel path segment. The state dir adopts the same rule (release omits the segment) so one path convention covers both roots.
+- The database lives in the XDG data dir (`~/.local/share/suru/suru.db` in release); development builds insert a Channel path segment. The state dir adopts the same rule (release omits the segment) so one path convention covers both roots.
 - Config never lives in the database: the database is machine-owned state, config is human-edited input designed separately.
 - Provider credentials never live in the database; provider auth remains delegated to provider binaries.
 - Resume State is stored per (Session, Provider) as an opaque JSON payload so future providers need no schema change.

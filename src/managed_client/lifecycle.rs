@@ -108,7 +108,7 @@ pub(super) async fn shutdown_registered_instance(
     match response {
         Ok(Ok(response)) if response.status() == reqwest::StatusCode::CONFLICT => {
             if !policy.transition_races_are_expected {
-                bail!("registered Chidori server changed before it could be stopped");
+                bail!("registered Suru server changed before it could be stopped");
             }
         }
         Ok(Ok(response)) => {
@@ -175,14 +175,14 @@ fn shutdown_policy(reason: ShutdownReason, deadline: tokio::time::Instant) -> Sh
             transition_races_are_expected: false,
             wait_for_channel_release: false,
             action: "manual stop",
-            timeout_message: "Chidori server did not stop within 5s",
+            timeout_message: "Suru server did not stop within 5s",
         },
         ShutdownReason::Replacement => ShutdownPolicy {
             request_deadline: deadline,
             transition_races_are_expected: true,
             wait_for_channel_release: true,
             action: "replacement stop",
-            timeout_message: "mismatched Chidori server did not release the channel before startup timed out",
+            timeout_message: "mismatched Suru server did not release the channel before startup timed out",
         },
     }
 }
@@ -228,7 +228,7 @@ async fn inspect_health(
 
 fn read_descriptor(path: &Path) -> Result<RuntimeDescriptor> {
     let file = File::open(path)
-        .with_context(|| format!("no running Chidori server was found at {path:?}"))?;
+        .with_context(|| format!("no running Suru server was found at {path:?}"))?;
     serde_json::from_reader(file).context("decode runtime descriptor")
 }
 

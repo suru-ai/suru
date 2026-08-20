@@ -1,4 +1,10 @@
-use chidori::{
+use diesel::{
+    Connection, QueryableByName, RunQueryDsl, SqliteConnection, connection::SimpleConnection,
+    sql_types::BigInt,
+};
+use eventsource_stream::Eventsource;
+use futures_util::StreamExt;
+use suru::{
     build_identity,
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, stop_server},
     protocol::{
@@ -7,12 +13,6 @@ use chidori::{
     },
     server::{self, ServerConfig},
 };
-use diesel::{
-    Connection, QueryableByName, RunQueryDsl, SqliteConnection, connection::SimpleConnection,
-    sql_types::BigInt,
-};
-use eventsource_stream::Eventsource;
-use futures_util::StreamExt;
 use tokio::time::{Duration, timeout};
 
 mod support;
@@ -52,14 +52,14 @@ fn sqlite_count(path: &std::path::Path, query: &str) -> i64 {
 #[test]
 fn build_identity_changes_with_executable_contents() {
     let directory = tempfile::tempdir().expect("create build identity fixture directory");
-    let executable = directory.path().join("chidori-fixture");
+    let executable = directory.path().join("suru-fixture");
     std::fs::write(&executable, b"first compiled executable")
         .expect("write first executable contents");
-    let first = chidori::build_identity::for_executable(&executable)
+    let first = suru::build_identity::for_executable(&executable)
         .expect("identify first executable contents");
 
     std::fs::write(&executable, b"rebuilt executable").expect("write rebuilt executable contents");
-    let rebuilt = chidori::build_identity::for_executable(&executable)
+    let rebuilt = suru::build_identity::for_executable(&executable)
         .expect("identify rebuilt executable contents");
 
     assert_ne!(first, rebuilt);
@@ -128,7 +128,7 @@ async fn server_refuses_a_database_schema_newer_than_the_binary() {
     let config = ServerConfig::new(state_dir.path(), "newer-schema-test")
         .expect("configure server")
         .with_data_dir(data_dir.path());
-    let database_path = config.data_dir().join("chidori.db");
+    let database_path = config.data_dir().join("suru.db");
     seed_database(
         &database_path,
         "
@@ -146,7 +146,7 @@ async fn server_refuses_a_database_schema_newer_than_the_binary() {
         .expect("newer database schema must stop server startup");
     let message = format!("{error:#}");
     assert!(
-        message.contains("schema 99999999999999 is newer than this Chidori binary"),
+        message.contains("schema 99999999999999 is newer than this Suru binary"),
         "startup error should explain the unsafe downgrade: {message}"
     );
 }
@@ -158,7 +158,7 @@ async fn a_failed_embedded_database_migration_leaves_no_partial_schema() {
     let config = ServerConfig::new(state_dir.path(), "migration-atomicity-test")
         .expect("configure server")
         .with_data_dir(data_dir.path());
-    let database_path = config.data_dir().join("chidori.db");
+    let database_path = config.data_dir().join("suru.db");
     seed_database(
         &database_path,
         "
@@ -201,7 +201,7 @@ async fn an_unreadable_landing_agent_selection_falls_back_without_blocking_start
     let config = ServerConfig::new(state_dir.path(), "unreadable-landing-selection-test")
         .expect("configure server")
         .with_data_dir(data_dir.path());
-    let database_path = config.data_dir().join("chidori.db");
+    let database_path = config.data_dir().join("suru.db");
     let original = server::spawn(config.clone())
         .await
         .expect("spawn server to migrate database");
@@ -784,13 +784,13 @@ async fn descriptor_replacement_never_exposes_a_partial_publication() {
     let runtime_dir = state_dir.path().join("atomic-publication-test");
     std::fs::create_dir_all(&runtime_dir).expect("create runtime directory");
     let descriptor_path = config.descriptor_path();
-    let stale = chidori::protocol::RuntimeDescriptor {
+    let stale = suru::protocol::RuntimeDescriptor {
         base_url: "http://127.0.0.1:9".to_owned(),
         token: "stale-token".to_owned(),
         identity: ServerIdentity {
             instance_id: uuid::Uuid::new_v4(),
             pid: 1,
-            protocol_version: chidori::protocol::PROTOCOL_VERSION,
+            protocol_version: suru::protocol::PROTOCOL_VERSION,
             build_identity: "stale-build".to_owned(),
         },
     };
@@ -804,7 +804,7 @@ async fn descriptor_replacement_never_exposes_a_partial_publication() {
         let stop = stop.clone();
         std::thread::spawn(move || -> Result<Vec<uuid::Uuid>, String> {
             let mut observed = Vec::new();
-            let first: chidori::protocol::RuntimeDescriptor = serde_json::from_reader(
+            let first: suru::protocol::RuntimeDescriptor = serde_json::from_reader(
                 std::fs::File::open(&descriptor_path)
                     .map_err(|error| format!("open initial descriptor: {error}"))?,
             )
@@ -812,7 +812,7 @@ async fn descriptor_replacement_never_exposes_a_partial_publication() {
             observed.push(first.instance_id);
             ready.wait();
             while !stop.load(Ordering::SeqCst) {
-                let descriptor: chidori::protocol::RuntimeDescriptor = serde_json::from_reader(
+                let descriptor: suru::protocol::RuntimeDescriptor = serde_json::from_reader(
                     std::fs::File::open(&descriptor_path)
                         .map_err(|error| format!("open descriptor during publication: {error}"))?,
                 )

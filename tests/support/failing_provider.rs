@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chidori::{
+use suru::{
     protocol::{ModelDescriptor, ProviderId},
     provider::{
         ProviderError, ProviderFuture, ProviderRuntime, ProviderSessionConnection,

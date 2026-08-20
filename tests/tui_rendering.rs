@@ -1,4 +1,13 @@
-use chidori::{
+use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{
+    Frame, Terminal,
+    backend::TestBackend,
+    buffer::{Buffer, Cell},
+    layout::Position,
+    style::{Color, Modifier},
+};
+use std::time::Duration;
+use suru::{
     managed_client::{
         ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus, SessionEvent,
         SessionSubscription,
@@ -22,15 +31,6 @@ use chidori::{
         SessionListScope, TuiState, command_for_terminal_event, render,
     },
 };
-use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{
-    Frame, Terminal,
-    backend::TestBackend,
-    buffer::{Buffer, Cell},
-    layout::Position,
-    style::{Color, Modifier},
-};
-use std::time::Duration;
 use uuid::Uuid;
 
 #[path = "support/failing_provider.rs"]
@@ -141,7 +141,7 @@ fn ready_health(instance_id: Uuid, pid: u32) -> Health {
             instance_id,
             pid,
             protocol_version: 1,
-            build_identity: "chidori@test".to_owned(),
+            build_identity: "suru@test".to_owned(),
         },
         LifecycleState::Ready,
     )
@@ -392,11 +392,11 @@ fn options_commands_dispatch_one_semantic_model_options_action() {
     ));
 
     assert_eq!(
-        chidori::tui::SemanticCommandId::ModelOptions.as_str(),
+        suru::tui::SemanticCommandId::ModelOptions.as_str(),
         "model.options"
     );
     assert_eq!(
-        chidori::tui::SemanticCommandId::ModelOptionsApply.as_str(),
+        suru::tui::SemanticCommandId::ModelOptionsApply.as_str(),
         "model.options.apply"
     );
 }
@@ -406,7 +406,7 @@ fn model_picker_hands_off_to_ordered_options_and_applies_complete_landing_select
     let mut application = Application::default();
     let ApplicationTransition::ListModels(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelList,
+            suru::tui::SemanticCommandId::ModelList,
         )))
         .expect("open Model picker")
     else {
@@ -567,13 +567,13 @@ fn model_picker_hands_off_to_ordered_options_and_applies_complete_landing_select
             provider: ProviderId::new("codex"),
             model: ModelId::new("gpt-configurable"),
             options: vec![
-                chidori::protocol::ModelOptionSelection {
+                suru::protocol::ModelOptionSelection {
                     id: ModelOptionId::new("reasoning_effort"),
                     value: ModelOptionValue::Select {
                         choice: ModelOptionChoiceId::new("high"),
                     },
                 },
-                chidori::protocol::ModelOptionSelection {
+                suru::protocol::ModelOptionSelection {
                     id: ModelOptionId::new("fast"),
                     value: ModelOptionValue::Toggle { enabled: true },
                 },
@@ -587,7 +587,7 @@ fn options_command_resolves_provider_default_and_explains_unavailable_configurat
     let mut application = Application::default();
     let ApplicationTransition::ListModels(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelOptions,
+            suru::tui::SemanticCommandId::ModelOptions,
         )))
         .expect("invoke options without a concrete Model")
     else {
@@ -681,7 +681,7 @@ fn options_command_resolves_provider_default_and_explains_unavailable_configurat
     let mut unavailable = Application::default();
     let ApplicationTransition::ListModels(request) = unavailable
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelOptions,
+            suru::tui::SemanticCommandId::ModelOptions,
         )))
         .expect("invoke unavailable options")
     else {
@@ -713,7 +713,7 @@ fn options_command_resolves_provider_default_and_explains_unavailable_configurat
     assert!(matches!(
         unavailable
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::ModelList,
+                suru::tui::SemanticCommandId::ModelList,
             )))
             .expect("choose the same plain Model through /models"),
         ApplicationTransition::ListModels(_)
@@ -751,7 +751,7 @@ fn options_command_resolves_provider_default_and_explains_unavailable_configurat
     let mut missing = Application::default();
     let ApplicationTransition::ListModels(request) = missing
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelOptions,
+            suru::tui::SemanticCommandId::ModelOptions,
         )))
         .expect("invoke options without any available Model")
     else {
@@ -772,7 +772,7 @@ fn options_command_resolves_provider_default_and_explains_unavailable_configurat
     let mut ambiguous = Application::default();
     let ApplicationTransition::ListModels(request) = ambiguous
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelOptions,
+            suru::tui::SemanticCommandId::ModelOptions,
         )))
         .expect("invoke options without a selected Provider")
     else {
@@ -818,7 +818,7 @@ fn stale_catalog_failure_does_not_end_newer_options_resolution() {
     let mut application = Application::default();
     let ApplicationTransition::ListModels(stale_request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelOptions,
+            suru::tui::SemanticCommandId::ModelOptions,
         )))
         .expect("begin first options resolution")
     else {
@@ -826,7 +826,7 @@ fn stale_catalog_failure_does_not_end_newer_options_resolution() {
     };
     let ApplicationTransition::ListModels(current_request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelOptions,
+            suru::tui::SemanticCommandId::ModelOptions,
         )))
         .expect("replace options resolution")
     else {
@@ -876,7 +876,7 @@ fn refreshed_descriptors_replace_a_cached_no_options_status() {
     let mut application = Application::default();
     let ApplicationTransition::ListModels(cached_request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelList,
+            suru::tui::SemanticCommandId::ModelList,
         )))
         .expect("open Model picker to seed cache")
     else {
@@ -910,7 +910,7 @@ fn refreshed_descriptors_replace_a_cached_no_options_status() {
 
     let ApplicationTransition::ListModels(options_request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelOptions,
+            suru::tui::SemanticCommandId::ModelOptions,
         )))
         .expect("resolve options from stale cache")
     else {
@@ -956,13 +956,13 @@ fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
         provider: ProviderId::new("codex"),
         model: ModelId::new("gpt-configurable"),
         options: vec![
-            chidori::protocol::ModelOptionSelection {
+            suru::protocol::ModelOptionSelection {
                 id: ModelOptionId::new("reasoning_effort"),
                 value: ModelOptionValue::Select {
                     choice: ModelOptionChoiceId::new("low"),
                 },
             },
-            chidori::protocol::ModelOptionSelection {
+            suru::protocol::ModelOptionSelection {
                 id: ModelOptionId::new("fast"),
                 value: ModelOptionValue::Toggle { enabled: false },
             },
@@ -977,7 +977,7 @@ fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
 
     let ApplicationTransition::ListModels(catalog_request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelOptions,
+            suru::tui::SemanticCommandId::ModelOptions,
         )))
         .expect("open authoritative Model Options")
     else {
@@ -1073,13 +1073,13 @@ fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
     assert_eq!(
         request.selection.options,
         vec![
-            chidori::protocol::ModelOptionSelection {
+            suru::protocol::ModelOptionSelection {
                 id: ModelOptionId::new("reasoning_effort"),
                 value: ModelOptionValue::Select {
                     choice: ModelOptionChoiceId::new("high"),
                 },
             },
-            chidori::protocol::ModelOptionSelection {
+            suru::protocol::ModelOptionSelection {
                 id: ModelOptionId::new("fast"),
                 value: ModelOptionValue::Toggle { enabled: false },
             },
@@ -1098,7 +1098,7 @@ fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
     assert_eq!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionList,
+                suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("block Session navigation while options settle"),
         ApplicationTransition::Continue
@@ -1118,7 +1118,7 @@ fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
     assert!(matches!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::ModelOptions,
+                suru::tui::SemanticCommandId::ModelOptions,
             )))
             .expect("reopen rolled-back options"),
         ApplicationTransition::ListModels(_)
@@ -1180,13 +1180,13 @@ fn cycling_selection(effort: &str) -> AgentSelection {
         provider: ProviderId::new("codex"),
         model: ModelId::new("gpt-cycle"),
         options: vec![
-            chidori::protocol::ModelOptionSelection {
+            suru::protocol::ModelOptionSelection {
                 id: ModelOptionId::new("reasoning_effort"),
                 value: ModelOptionValue::Select {
                     choice: ModelOptionChoiceId::new(effort),
                 },
             },
-            chidori::protocol::ModelOptionSelection {
+            suru::protocol::ModelOptionSelection {
                 id: ModelOptionId::new("fast"),
                 value: ModelOptionValue::Toggle { enabled: false },
             },
@@ -1197,7 +1197,7 @@ fn cycling_selection(effort: &str) -> AgentSelection {
 fn warm_model_catalog(application: &mut Application, model: ModelDescriptor) {
     let ApplicationTransition::ListModels(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelList,
+            suru::tui::SemanticCommandId::ModelList,
         )))
         .expect("open Model picker to warm the catalog")
     else {
@@ -1245,11 +1245,11 @@ fn ctrl_t_dispatches_one_semantic_reasoning_cycle_without_a_slash_name() {
             KeyModifiers::CONTROL,
         ))),
         Some(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelOptionReasoningCycle,
+            suru::tui::SemanticCommandId::ModelOptionReasoningCycle,
         ))
     );
     assert_eq!(
-        chidori::tui::SemanticCommandId::ModelOptionReasoningCycle.as_str(),
+        suru::tui::SemanticCommandId::ModelOptionReasoningCycle.as_str(),
         "model.option.reasoning.cycle"
     );
 
@@ -1364,7 +1364,7 @@ fn reasoning_cycle_without_a_cached_catalog_requests_models_and_reports() {
     assert!(matches!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionList,
+                suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("navigate after the concise report"),
         ApplicationTransition::ListSessions(_)
@@ -1419,7 +1419,7 @@ fn rapid_reasoning_cycles_coalesce_to_one_serialized_latest_selection() {
     assert_eq!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionList,
+                suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("block Session navigation while selections settle"),
         ApplicationTransition::Continue
@@ -1456,7 +1456,7 @@ fn rapid_reasoning_cycles_coalesce_to_one_serialized_latest_selection() {
     assert!(matches!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionList,
+                suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("navigate once every selection settled"),
         ApplicationTransition::ListSessions(_)
@@ -1552,7 +1552,7 @@ fn stale_selection_results_cannot_overwrite_newer_intent_or_roll_back() {
     assert!(matches!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionList,
+                suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("navigate after the rollback"),
         ApplicationTransition::ListSessions(_)
@@ -1560,7 +1560,7 @@ fn stale_selection_results_cannot_overwrite_newer_intent_or_roll_back() {
     assert!(matches!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::ModelOptions,
+                suru::tui::SemanticCommandId::ModelOptions,
             )))
             .expect("reopen rolled-back options"),
         ApplicationTransition::ListModels(_)
@@ -1674,13 +1674,13 @@ fn refreshed_options_keep_invalidated_choice_visible_and_disable_apply() {
         provider: ProviderId::new("codex"),
         model: ModelId::new("changing"),
         options: vec![
-            chidori::protocol::ModelOptionSelection {
+            suru::protocol::ModelOptionSelection {
                 id: ModelOptionId::new("reasoning_effort"),
                 value: ModelOptionValue::Select {
                     choice: ModelOptionChoiceId::new("high"),
                 },
             },
-            chidori::protocol::ModelOptionSelection {
+            suru::protocol::ModelOptionSelection {
                 id: ModelOptionId::new("fast"),
                 value: ModelOptionValue::Toggle { enabled: false },
             },
@@ -1694,7 +1694,7 @@ fn refreshed_options_keep_invalidated_choice_visible_and_disable_apply() {
         .expect("attach selected Session");
     let ApplicationTransition::ListModels(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelOptions,
+            suru::tui::SemanticCommandId::ModelOptions,
         )))
         .expect("open options")
     else {
@@ -1848,13 +1848,13 @@ fn refreshed_options_keep_invalidated_choice_visible_and_disable_apply() {
     assert_eq!(
         request.selection.options,
         vec![
-            chidori::protocol::ModelOptionSelection {
+            suru::protocol::ModelOptionSelection {
                 id: ModelOptionId::new("reasoning_effort"),
                 value: ModelOptionValue::Select {
                     choice: ModelOptionChoiceId::new("low"),
                 },
             },
-            chidori::protocol::ModelOptionSelection {
+            suru::protocol::ModelOptionSelection {
                 id: ModelOptionId::new("fast"),
                 value: ModelOptionValue::Toggle { enabled: true },
             },
@@ -1867,7 +1867,7 @@ fn landing_model_picker_groups_sorts_focuses_and_searches_models() {
     let mut application = Application::default();
     let ApplicationTransition::ListModels(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelList,
+            suru::tui::SemanticCommandId::ModelList,
         )))
         .expect("open Model picker")
     else {
@@ -1963,7 +1963,7 @@ fn landing_model_picker_groups_sorts_focuses_and_searches_models() {
     assert!(matches!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::ModelList,
+                suru::tui::SemanticCommandId::ModelList,
             )))
             .expect("reopen cached picker and request background refresh"),
         ApplicationTransition::ListModels(_)
@@ -1978,7 +1978,7 @@ fn open_model_picker_merges_refreshes_stably_and_isolates_provider_failures() {
     let mut application = Application::default();
     let ApplicationTransition::ListModels(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelList,
+            suru::tui::SemanticCommandId::ModelList,
         )))
         .expect("open Model picker")
     else {
@@ -2104,7 +2104,7 @@ fn open_model_picker_merges_refreshes_stably_and_isolates_provider_failures() {
     assert!(matches!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::ModelList,
+                suru::tui::SemanticCommandId::ModelList,
             )))
             .expect("reopen from the latest normalized cache"),
         ApplicationTransition::ListModels(_)
@@ -2119,7 +2119,7 @@ fn model_picker_refresh_failure_preserves_the_visible_selection() {
     let mut application = Application::default();
     let ApplicationTransition::ListModels(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelList,
+            suru::tui::SemanticCommandId::ModelList,
         )))
         .expect("open Model picker")
     else {
@@ -2185,7 +2185,7 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
         .expect("attach selected Session");
     let ApplicationTransition::ListModels(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelList,
+            suru::tui::SemanticCommandId::ModelList,
         )))
         .expect("open Session Model picker")
     else {
@@ -2311,13 +2311,13 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
     assert_eq!(
         request.selection.options,
         vec![
-            chidori::protocol::ModelOptionSelection {
+            suru::protocol::ModelOptionSelection {
                 id: ModelOptionId::new("reasoning_effort"),
                 value: ModelOptionValue::Select {
                     choice: ModelOptionChoiceId::new("high"),
                 },
             },
-            chidori::protocol::ModelOptionSelection {
+            suru::protocol::ModelOptionSelection {
                 id: ModelOptionId::new("fast"),
                 value: ModelOptionValue::Toggle { enabled: true },
             },
@@ -2331,7 +2331,7 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
     assert!(matches!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::ModelList,
+                suru::tui::SemanticCommandId::ModelList,
             )))
             .expect("reopen picker around optimistic Model"),
         ApplicationTransition::ListModels(_)
@@ -2369,7 +2369,7 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
     assert_eq!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionList,
+                suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("block navigation during optimistic selection"),
         ApplicationTransition::Continue
@@ -2377,7 +2377,7 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
     assert_eq!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionNew,
+                suru::tui::SemanticCommandId::SessionNew,
             )))
             .expect("block /new during optimistic selection"),
         ApplicationTransition::Continue
@@ -2418,7 +2418,7 @@ fn landing_model_selection_and_new_session_inherit_complete_agent_selection() {
     let mut application = Application::new(workspace.path());
     let ApplicationTransition::ListModels(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelList,
+            suru::tui::SemanticCommandId::ModelList,
         )))
         .expect("open landing Model picker")
     else {
@@ -2501,7 +2501,7 @@ fn landing_model_selection_and_new_session_inherit_complete_agent_selection() {
     let inherited = AgentSelection {
         provider: ProviderId::new("codex"),
         model: ModelId::new("inherited"),
-        options: vec![chidori::protocol::ModelOptionSelection {
+        options: vec![suru::protocol::ModelOptionSelection {
             id: ModelOptionId::new("reasoning_effort"),
             value: ModelOptionValue::Select {
                 choice: ModelOptionChoiceId::new("medium"),
@@ -2517,7 +2517,7 @@ fn landing_model_selection_and_new_session_inherit_complete_agent_selection() {
     assert_eq!(
         attached
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionNew,
+                suru::tui::SemanticCommandId::SessionNew,
             )))
             .expect("start inherited /new flow"),
         ApplicationTransition::DetachSession
@@ -2554,7 +2554,7 @@ fn open_model_picker_refocuses_on_an_authoritative_multi_client_update() {
         .expect("attach observing client");
     let ApplicationTransition::ListModels(request) = observer
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            chidori::tui::SemanticCommandId::ModelList,
+            suru::tui::SemanticCommandId::ModelList,
         )))
         .expect("open observer Model picker")
     else {
@@ -2736,7 +2736,7 @@ fn new_session_keybinding_defers_creation_until_the_next_prompt() {
     assert_eq!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionNew,
+                suru::tui::SemanticCommandId::SessionNew,
             )))
             .expect("return to landing through the same semantic command"),
         ApplicationTransition::DetachSession
@@ -2777,7 +2777,7 @@ fn new_session_releases_a_detached_prompt_after_its_admission_succeeds() {
     assert_eq!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionNew,
+                suru::tui::SemanticCommandId::SessionNew,
             )))
             .expect("detach while admission remains in flight"),
         ApplicationTransition::DetachSession
@@ -3005,7 +3005,7 @@ fn session_picker_orders_marks_focuses_and_wraps_live_sessions() {
     let request = expect_session_list_request(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionList,
+                suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("open Session picker"),
         SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
@@ -3569,7 +3569,7 @@ fn session_picker_stays_searchable_at_supported_small_terminal_sizes() {
     let request = expect_session_list_request(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionList,
+                suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("open Session picker"),
         SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
@@ -3740,7 +3740,7 @@ fn session_picker_reserves_required_metadata_before_truncating_long_titles() {
     let current_request = expect_session_list_request(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionList,
+                suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("open Session picker"),
         SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
@@ -4313,7 +4313,7 @@ fn connecting_view_exposes_connection_state_before_a_snapshot_arrives() {
 
     assert!(screen.contains("What would you like to work on?"));
     assert!(screen.contains("Type a Prompt and press Enter"));
-    assert!(screen.contains("Connecting to Chidori server..."));
+    assert!(screen.contains("Connecting to Suru server..."));
 }
 
 #[test]
@@ -4419,7 +4419,7 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
 
     let wide = rendered_application_rows_at(&application, 80, 16).join("\n");
     for content in [
-        "Chidori",
+        "Suru",
         "What would you like to work on?",
         "Keep the composer usable",
         "Agent unavailable",
@@ -4435,7 +4435,7 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
 
     let narrow = rendered_application_rows_at(&application, 43, 10).join("\n");
     for core in [
-        "Chidori",
+        "Suru",
         "What would you like to work on?",
         "Keep the composer usable",
         "Agent unavailable",
@@ -4454,7 +4454,7 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
     }
 
     let short = rendered_application_rows_at(&application, 80, 6).join("\n");
-    assert!(!short.contains("Chidori"));
+    assert!(!short.contains("Suru"));
     assert!(short.contains("What would you like to work on?"));
     assert!(short.contains("Keep the composer usable"));
     assert!(short.contains("Connected"));
@@ -4500,7 +4500,7 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
 
     let wide = rendered_application_rows_at(&application, 100, 16).join("\n");
     for content in [
-        "Chidori",
+        "Suru",
         "Workspace",
         workspace.path().to_string_lossy().as_ref(),
         "Connected",
@@ -4520,7 +4520,7 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
 
     let narrow = rendered_application_rows_at(&application, 43, 10).join("\n");
     for core in [
-        "Chidori",
+        "Suru",
         "Connected",
         "Keep the transcript visible",
         "Keep the draft visible",
@@ -4540,7 +4540,7 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
     }
 
     let short = rendered_application_rows_at(&application, 100, 6).join("\n");
-    assert!(!short.contains("Chidori"));
+    assert!(!short.contains("Suru"));
     assert!(!short.contains("Workspace"));
     assert!(short.contains("Working"));
     assert!(short.contains("Keep the draft visible"));
@@ -4836,14 +4836,14 @@ fn reconnect_overlay_waits_for_the_grace_period_and_blocks_composer_input() {
     assert!(brief.contains("Recovering"));
     assert!(brief.contains("Keep the Session visible"));
     assert!(brief.contains("Preserve this draft"));
-    assert!(!brief.contains("Reconnecting to Chidori"));
+    assert!(!brief.contains("Reconnecting to Suru"));
     assert!(!brief.contains("Your Session will resume automatically"));
 
     application
         .handle_event(ApplicationEvent::ReconnectGraceElapsed)
         .expect("show delayed reconnect overlay");
     let prolonged = rendered_application_rows_at(&application, 80, 15).join("\n");
-    assert!(prolonged.contains("Reconnecting to Chidori"));
+    assert!(prolonged.contains("Reconnecting to Suru"));
     assert!(prolonged.contains("Your Session will resume automatically"));
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -4857,7 +4857,7 @@ fn reconnect_overlay_waits_for_the_grace_period_and_blocks_composer_input() {
         )))
         .expect("reconnect to surviving server");
     let recovered = rendered_application_rows_at(&application, 80, 15).join("\n");
-    assert!(!recovered.contains("Reconnecting to Chidori"));
+    assert!(!recovered.contains("Reconnecting to Suru"));
     assert!(recovered.contains("Keep the Session visible"));
     assert!(recovered.contains("Preserve this draft"));
     assert!(!recovered.contains("must stay blocked"));
@@ -6250,7 +6250,7 @@ fn open_session_picker_with(application: &mut Application, sessions: Vec<Session
     let request = expect_session_list_request(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                chidori::tui::SemanticCommandId::SessionList,
+                suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("open Session picker"),
         SessionListScope::CurrentWorkspace(workspace),

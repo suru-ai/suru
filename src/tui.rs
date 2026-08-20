@@ -2899,7 +2899,7 @@ fn render_landing(
     let mut row = panel.y;
     if show_brand {
         frame.render_widget(
-            Paragraph::new("Chidori")
+            Paragraph::new("Suru")
                 .alignment(Alignment::Center)
                 .style(theme.accent.primary.add_modifier(Modifier::BOLD)),
             Rect::new(panel.x, row, panel.width, 1),
@@ -3233,7 +3233,7 @@ fn render_session_header(
     let connection = connection_status_text(state, ResponsiveDetail::CoreOnly);
     let connection_width = connection.width().min(usize::from(area.width));
     let left_width = usize::from(area.width).saturating_sub(connection_width.saturating_add(2));
-    let brand = truncate_to_width("Chidori", left_width);
+    let brand = truncate_to_width("Suru", left_width);
     let orientation_width = left_width.saturating_sub(brand.width());
     let orientation = if detail.shows_secondary() {
         truncate_to_width(
@@ -3410,13 +3410,13 @@ fn render_reconnect_overlay(frame: &mut Frame<'_>, theme: &Theme) {
     frame.render_widget(Clear, area);
     let details = if area.width >= 42 {
         vec![
-            Line::styled("Reconnecting to Chidori…", theme.feedback.warning),
+            Line::styled("Reconnecting to Suru…", theme.feedback.warning),
             Line::default(),
             Line::styled("Your Session will resume automatically", theme.text.subdued),
         ]
     } else {
         vec![
-            Line::styled("Reconnecting to Chidori…", theme.feedback.warning),
+            Line::styled("Reconnecting to Suru…", theme.feedback.warning),
             Line::styled("Your Session will", theme.text.subdued),
             Line::styled("resume automatically", theme.text.subdued),
         ]
@@ -4765,7 +4765,7 @@ fn status_text(state: &TuiState) -> String {
     }
     let connection = match &state.identity {
         Some(identity) => format!("Connected | {}", server_identity_text(identity)),
-        None => "Connecting to Chidori server...".to_owned(),
+        None => "Connecting to Suru server...".to_owned(),
     };
     if matches!(
         state

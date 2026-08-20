@@ -5,7 +5,8 @@ mod support;
 
 use std::{os::unix::fs::PermissionsExt, process::Stdio, sync::Arc};
 
-use chidori::{
+use serde_json::Value;
+use suru::{
     managed_client::{
         ManagedClient, ManagedClientConfig, ManagedEvent, SessionEvent, SessionSubscription,
     },
@@ -22,7 +23,6 @@ use chidori::{
     server::{self, RunningServer, ServerConfig},
     tui::{Application, ApplicationEvent},
 };
-use serde_json::Value;
 use sysinfo::{Pid, System};
 use tokio::{
     process::{Child, Command},
@@ -1247,7 +1247,7 @@ async fn scripted_codex_delivers_the_authoritative_queue_once_in_admission_order
         requests
             .iter()
             .all(|request| request["method"] != "turn/queue"),
-        "Chidori must not submit Prompts to Codex's queue API"
+        "Suru must not submit Prompts to Codex's queue API"
     );
 
     drop(feed);
@@ -2616,7 +2616,7 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
         ManagedClientConfig::new(state_root.path(), channel)
             .expect("configure boundary client")
             .with_data_dir(data_root.path())
-            .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
     )
     .await
     .expect("connect boundary client");
@@ -2691,7 +2691,7 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
         ManagedClientConfig::new(state_root.path(), channel)
             .expect("configure idle client")
             .with_data_dir(data_root.path())
-            .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
     )
     .await
     .expect("connect idle client");
@@ -3116,7 +3116,7 @@ async fn scripted_codex_interrupt_acknowledges_before_trailing_output_and_termin
                     .filter(|change| {
                         matches!(
                             change,
-                            chidori::protocol::SessionChange::TurnStatusChanged {
+                            suru::protocol::SessionChange::TurnStatusChanged {
                                 turn_id: changed_turn_id,
                                 status: TurnStatus::Interrupted,
                             } if *changed_turn_id == turn_id
@@ -3331,7 +3331,7 @@ async fn server_shutdown_interrupts_active_codex_and_allows_cooperative_exit() {
             },
             prompt: InitialPrompt {
                 id: PromptId::new(),
-                text: "Keep working until Chidori shuts down".to_owned(),
+                text: "Keep working until Suru shuts down".to_owned(),
             },
         })
         .await
@@ -3544,10 +3544,10 @@ async fn server_shutdown_closes_transport_with_a_startup_request_pending() {
 }
 
 #[tokio::test]
-#[ignore = "set CHIDORI_CODEX_SMOKE=1 to use the installed authenticated Codex binary"]
+#[ignore = "set SURU_CODEX_SMOKE=1 to use the installed authenticated Codex binary"]
 async fn installed_codex_launches_runs_one_text_turn_and_shuts_down() {
-    if std::env::var_os("CHIDORI_CODEX_SMOKE").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        eprintln!("skipping: set CHIDORI_CODEX_SMOKE=1 to opt in");
+    if std::env::var_os("SURU_CODEX_SMOKE").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        eprintln!("skipping: set SURU_CODEX_SMOKE=1 to opt in");
         return;
     }
 
@@ -3709,7 +3709,7 @@ async fn codex_resumes_the_known_thread_after_active_process_loss() {
             .filter(|message| message.content == "Lose the first app-server")
             .count(),
         1,
-        "resume must not project native history into the Chidori transcript"
+        "resume must not project native history into the Suru transcript"
     );
     assert_eq!(
         recovered
@@ -4245,7 +4245,7 @@ fn spawn_server_process(
     channel: &str,
     codex: &std::path::Path,
 ) -> Child {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_chidori"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_suru"));
     command
         .arg("__server")
         .arg("--state-dir")
@@ -4254,7 +4254,7 @@ fn spawn_server_process(
         .arg(data_root)
         .arg("--channel")
         .arg(channel)
-        .env("CHIDORI_CODEX_PATH", codex)
+        .env("SURU_CODEX_PATH", codex)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

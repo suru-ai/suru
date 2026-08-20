@@ -1,6 +1,6 @@
-# Chidori
+# Suru
 
-Chidori is an interactive workspace in which a user collaborates with an AI agent through a conversation.
+Suru is an interactive workspace in which a user collaborates with an AI agent through a conversation.
 
 ## Language
 
@@ -57,7 +57,7 @@ The ordered, user-visible history of a Session: its Messages and Activities in p
 _Avoid_: History, log, conversation
 
 **Resume State**:
-Provider-owned data, opaque to Chidori, that lets a Session continue with its Provider after a restart. Without it a restored Session is viewable but cannot continue where it left off.
+Provider-owned data, opaque to Suru, that lets a Session continue with its Provider after a restart. Without it a restored Session is viewable but cannot continue where it left off.
 _Avoid_: Thread mapping, provider cache
 
 **Channel**:

@@ -17,7 +17,12 @@ use axum::{
     response::{IntoResponse, Response, sse::Event, sse::Sse},
     routing::get,
 };
-use chidori::{
+use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
+use eventsource_stream::Eventsource;
+use futures_util::{StreamExt, future::join_all, stream};
+use ratatui::{Terminal, backend::TestBackend};
+use suru::{
     build_identity,
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, SessionEvent},
     protocol::{
@@ -41,11 +46,6 @@ use chidori::{
     server::{self, AgentOutput, ServerConfig},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
-use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
-use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
-use eventsource_stream::Eventsource;
-use futures_util::{StreamExt, future::join_all, stream};
-use ratatui::{Terminal, backend::TestBackend};
 use tokio::time::{Duration, timeout};
 
 #[path = "support/failing_provider.rs"]
@@ -90,7 +90,7 @@ fn readable_session_summaries(items: Vec<SessionListItem>) -> Vec<SessionSummary
 }
 
 async fn next_session_update(
-    subscription: &mut chidori::managed_client::SessionSubscription,
+    subscription: &mut suru::managed_client::SessionSubscription,
 ) -> SessionUpdate {
     let SessionEvent::Updated(update) = timeout(Duration::from_secs(1), subscription.next())
         .await
@@ -3542,7 +3542,7 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
     assert_eq!(completed.messages[1].content, "streamed answer");
     original.shutdown().await.expect("stop original server");
 
-    let database_path = config.data_dir().join("chidori.db");
+    let database_path = config.data_dir().join("suru.db");
     let mut database = SqliteConnection::establish(
         database_path
             .to_str()
@@ -3731,7 +3731,7 @@ async fn an_undecodable_stored_session_does_not_block_startup_and_remains_listed
         .expect("decode created Session");
     original.shutdown().await.expect("stop original server");
 
-    let database_path = config.data_dir().join("chidori.db");
+    let database_path = config.data_dir().join("suru.db");
     let mut database = SqliteConnection::establish(
         database_path
             .to_str()
@@ -4847,11 +4847,11 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
 async fn receive_managed_client_initial_state(client: &mut ManagedClient) {
     assert!(matches!(
         client.next().await,
-        Some(chidori::managed_client::ManagedEvent::Connecting)
+        Some(suru::managed_client::ManagedEvent::Connecting)
     ));
     assert!(matches!(
         client.next().await,
-        Some(chidori::managed_client::ManagedEvent::Connected(_))
+        Some(suru::managed_client::ManagedEvent::Connected(_))
     ));
 }
 

@@ -32,7 +32,7 @@ pub(super) async fn ensure_server(
         .map_err(|error| {
             startup_error(
                 config,
-                &format!("could not identify the Chidori server executable: {error:#}"),
+                &format!("could not identify the Suru server executable: {error:#}"),
             )
         })?;
     let mut spawned = None;
@@ -42,7 +42,7 @@ pub(super) async fn ensure_server(
             Err(_) => {
                 return Err(startup_error(
                     config,
-                    "detached Chidori server did not become ready within 15s",
+                    "detached Suru server did not become ready within 15s",
                 ));
             }
         };
@@ -59,7 +59,7 @@ pub(super) async fn ensure_server(
                         deadline,
                     )
                     .await?;
-                    anyhow!("registered Chidori server is being replaced")
+                    anyhow!("registered Suru server is being replaced")
                 }
                 LifecycleState::Ready
                     if registration.health.protocol_version != PROTOCOL_VERSION =>
@@ -67,20 +67,20 @@ pub(super) async fn ensure_server(
                     return Err(startup_error(
                         config,
                         &format!(
-                            "registered Chidori server protocol version {} is incompatible with client protocol version {PROTOCOL_VERSION}",
+                            "registered Suru server protocol version {} is incompatible with client protocol version {PROTOCOL_VERSION}",
                             registration.health.protocol_version
                         ),
                     ));
                 }
                 LifecycleState::Ready => return Ok(registration),
                 LifecycleState::Starting => {
-                    anyhow!("registered Chidori server is still starting")
+                    anyhow!("registered Suru server is still starting")
                 }
-                LifecycleState::Stopping => anyhow!("registered Chidori server is stopping"),
+                LifecycleState::Stopping => anyhow!("registered Suru server is stopping"),
                 LifecycleState::Failed => {
                     return Err(startup_error(
                         config,
-                        "registered Chidori server reported failed startup",
+                        "registered Suru server reported failed startup",
                     ));
                 }
             },
@@ -89,9 +89,7 @@ pub(super) async fn ensure_server(
                     spawned = Some(spawn_detached(config).map_err(|spawn_error| {
                         startup_error(
                             config,
-                            &format!(
-                                "could not launch the detached Chidori server: {spawn_error:#}"
-                            ),
+                            &format!("could not launch the detached Suru server: {spawn_error:#}"),
                         )
                     })?);
                 }
@@ -111,7 +109,7 @@ pub(super) async fn ensure_server(
                 return Err(startup_error(
                     config,
                     &format!(
-                        "detached Chidori server exited before becoming ready ({})",
+                        "detached Suru server exited before becoming ready ({})",
                         describe_exit(status)
                     ),
                 ));
@@ -120,7 +118,7 @@ pub(super) async fn ensure_server(
         if tokio::time::Instant::now() >= deadline {
             return Err(startup_error(
                 config,
-                &format!("detached Chidori server did not become ready within 15s: {error:#}"),
+                &format!("detached Suru server did not become ready within 15s: {error:#}"),
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -157,7 +155,7 @@ fn spawn_detached(config: &ManagedClientConfig) -> Result<Child> {
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     configure_detached_process(&mut command);
-    command.spawn().context("spawn detached Chidori server")
+    command.spawn().context("spawn detached Suru server")
 }
 
 fn describe_exit(status: ExitStatus) -> String {

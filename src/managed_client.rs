@@ -46,8 +46,7 @@ impl ManagedClientConfig {
     pub fn new(state_base_dir: impl AsRef<Path>, channel: impl Into<String>) -> Result<Self> {
         Ok(Self {
             runtime: RuntimeConfig::new(state_base_dir, channel)?,
-            server_executable: std::env::current_exe()
-                .context("find current Chidori executable")?,
+            server_executable: std::env::current_exe().context("find current Suru executable")?,
         })
     }
 
@@ -130,34 +129,31 @@ pub enum ServerStatus {
 impl std::fmt::Display for ServerStatus {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Missing => write!(
-                formatter,
-                "Chidori server missing (no runtime registration)"
-            ),
+            Self::Missing => write!(formatter, "Suru server missing (no runtime registration)"),
             Self::Starting(health) => write!(
                 formatter,
-                "Chidori server starting (pid {}, instance {})",
+                "Suru server starting (pid {}, instance {})",
                 health.pid, health.instance_id
             ),
             Self::Ready(health) => write!(
                 formatter,
-                "Chidori server ready (pid {}, instance {})",
+                "Suru server ready (pid {}, instance {})",
                 health.pid, health.instance_id
             ),
             Self::Stopping(health) => write!(
                 formatter,
-                "Chidori server stopping (pid {}, instance {})",
+                "Suru server stopping (pid {}, instance {})",
                 health.pid, health.instance_id
             ),
             Self::Failed(health) => write!(
                 formatter,
-                "Chidori server failed (pid {}, instance {})",
+                "Suru server failed (pid {}, instance {})",
                 health.pid, health.instance_id
             ),
             Self::Stale(reason) => {
-                write!(formatter, "Chidori server registration stale: {reason}")
+                write!(formatter, "Suru server registration stale: {reason}")
             }
-            Self::Unreachable(reason) => write!(formatter, "Chidori server unreachable: {reason}"),
+            Self::Unreachable(reason) => write!(formatter, "Suru server unreachable: {reason}"),
         }
     }
 }
@@ -534,14 +530,14 @@ pub async fn server_status(config: &ManagedClientConfig) -> Result<ServerStatus>
 pub async fn stop_server(config: &ManagedClientConfig) -> Result<Health> {
     let registration = match lifecycle::inspect_registration(config).await? {
         lifecycle::RegistrationInspection::Missing => {
-            bail!("cannot stop missing Chidori server")
+            bail!("cannot stop missing Suru server")
         }
         lifecycle::RegistrationInspection::Live(registration) => registration,
         lifecycle::RegistrationInspection::Stale(reason) => {
-            bail!("cannot stop stale Chidori server registration: {reason}")
+            bail!("cannot stop stale Suru server registration: {reason}")
         }
         lifecycle::RegistrationInspection::Unreachable(reason) => {
-            bail!("cannot stop unreachable Chidori server: {reason}")
+            bail!("cannot stop unreachable Suru server: {reason}")
         }
     };
     let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;

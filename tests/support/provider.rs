@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use chidori::protocol::{AgentIdentity, ModelDescriptor, ProviderId};
-use chidori::provider::{
+use futures_util::stream;
+use suru::protocol::{AgentIdentity, ModelDescriptor, ProviderId};
+use suru::provider::{
     ProviderError, ProviderEvent, ProviderEventStream, ProviderFuture, ProviderRuntime,
     ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
     ProviderTurnInput,
 };
-use futures_util::stream;
 use tokio::sync::{mpsc, oneshot};
 
 pub struct ControlledProvider {
@@ -74,7 +74,7 @@ impl StartRequest {
         &self.request.workspace
     }
 
-    pub fn resume_state(&self) -> Option<&chidori::provider::ProviderResumeState> {
+    pub fn resume_state(&self) -> Option<&suru::provider::ProviderResumeState> {
         self.request.resume_state.as_ref()
     }
 
@@ -147,7 +147,7 @@ impl PromptOperation {
         &self.input.prompt
     }
 
-    pub fn selection(&self) -> &chidori::protocol::AgentSelection {
+    pub fn selection(&self) -> &suru::protocol::AgentSelection {
         &self.input.selection
     }
 

@@ -34,7 +34,7 @@ use crate::{
     session_projection::apply_update,
 };
 
-const DATABASE_FILE: &str = "chidori.db";
+const DATABASE_FILE: &str = "suru.db";
 const CURRENT_SCHEMA_VERSION: &str = "20260820030000";
 const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(100);
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
@@ -177,7 +177,7 @@ impl fmt::Display for StorageError {
                 binary_version,
             } => write!(
                 formatter,
-                "Session database schema {database_version} is newer than this Chidori binary (latest supported schema {binary_version})"
+                "Session database schema {database_version} is newer than this Suru binary (latest supported schema {binary_version})"
             ),
             Self::Migration(message) => {
                 write!(formatter, "apply Session database migrations: {message}")

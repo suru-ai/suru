@@ -1,4 +1,4 @@
-use chidori::{
+use suru::{
     managed_client::{ManagedClient, ManagedEvent},
     protocol::{Health, RuntimeDescriptor, ServerShutdown, ShutdownReason},
 };

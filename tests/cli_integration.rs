@@ -17,7 +17,9 @@ use axum::{
     response::{IntoResponse, Response, sse::Event, sse::Sse},
     routing::{get, post},
 };
-use chidori::{
+use fs2::FileExt;
+use futures_util::{StreamExt, stream};
+use suru::{
     build_identity,
     managed_client::{
         ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus, start_server,
@@ -29,8 +31,6 @@ use chidori::{
     },
     server::{self, ServerConfig},
 };
-use fs2::FileExt;
-use futures_util::{StreamExt, stream};
 use sysinfo::{Pid, System};
 use tokio::sync::{oneshot, watch};
 use tokio::time::{Duration, timeout};
@@ -43,9 +43,9 @@ use support::{
     write_runtime_descriptor,
 };
 
-fn chidori_binary_build_identity() -> String {
-    build_identity::for_executable(env!("CARGO_BIN_EXE_chidori"))
-        .expect("identify the tested Chidori executable")
+fn suru_binary_build_identity() -> String {
+    build_identity::for_executable(env!("CARGO_BIN_EXE_suru"))
+        .expect("identify the tested Suru executable")
 }
 
 fn inert_server_executable(state_dir: &std::path::Path) -> PathBuf {
@@ -66,12 +66,11 @@ fn inert_server_build_identity(state_dir: &std::path::Path) -> String {
 async fn launching_current_build_replaces_an_authenticated_mismatched_server() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "build-replacement-test";
-    let fixture =
-        BuildReplacementFixture::spawn(state_dir.path(), channel, "chidori@old-build").await;
+    let fixture = BuildReplacementFixture::spawn(state_dir.path(), channel, "suru@old-build").await;
     let previous = fixture.descriptor();
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure replacement launcher")
-        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
 
     let replacement = start_server(&config)
         .await
@@ -79,7 +78,7 @@ async fn launching_current_build_replaces_an_authenticated_mismatched_server() {
 
     assert_ne!(replacement.instance_id, previous.instance_id);
     assert_ne!(replacement.pid, previous.pid);
-    assert_eq!(replacement.build_identity, chidori_binary_build_identity());
+    assert_eq!(replacement.build_identity, suru_binary_build_identity());
     let shutdown = fixture
         .shutdown_request()
         .expect("old server receives replacement request");
@@ -121,7 +120,7 @@ async fn attached_client_reconnects_to_the_replacement() {
 
     let current_config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure current-build managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
     let replacement = start_server(&current_config)
         .await
         .expect("launch current build replacement");
@@ -194,7 +193,7 @@ async fn attached_old_client_surfaces_a_strict_fatal_error_for_an_incompatible_r
     let incompatible = BuildReplacementFixture::spawn_with_protocol(
         state_dir.path(),
         channel,
-        "chidori@incompatible-build",
+        "suru@incompatible-build",
         PROTOCOL_VERSION + 1,
     )
     .await;
@@ -235,13 +234,13 @@ async fn launcher_replaces_a_build_and_protocol_mismatch_before_connecting() {
     let mismatched = BuildReplacementFixture::spawn_with_protocol(
         state_dir.path(),
         channel,
-        "chidori@old-incompatible-build",
+        "suru@old-incompatible-build",
         PROTOCOL_VERSION - 1,
     )
     .await;
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure current launcher")
-        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
 
     let previous = mismatched.descriptor();
     let mut client = ManagedClient::connect(config)
@@ -251,7 +250,7 @@ async fn launcher_replaces_a_build_and_protocol_mismatch_before_connecting() {
 
     assert_ne!(replacement.instance_id, previous.instance_id);
     assert_ne!(replacement.pid, previous.pid);
-    assert_eq!(replacement.build_identity, chidori_binary_build_identity());
+    assert_eq!(replacement.build_identity, suru_binary_build_identity());
     assert_eq!(replacement.protocol_version, PROTOCOL_VERSION);
     let shutdown = mismatched
         .shutdown_request()
@@ -274,20 +273,20 @@ async fn launcher_rejects_a_protocol_incompatible_matching_build_without_replaci
     let incompatible = BuildReplacementFixture::spawn_with_protocol(
         state_dir.path(),
         channel,
-        &chidori_binary_build_identity(),
+        &suru_binary_build_identity(),
         PROTOCOL_VERSION - 1,
     )
     .await;
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure current launcher")
-        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
 
     let error = start_server(&config)
         .await
         .expect_err("matching build with an incompatible protocol cannot be reused")
         .to_string();
 
-    assert!(error.contains("registered Chidori server protocol version"));
+    assert!(error.contains("registered Suru server protocol version"));
     assert!(error.contains("incompatible"));
     assert!(incompatible.shutdown_request().is_none());
 }
@@ -296,12 +295,11 @@ async fn launcher_rejects_a_protocol_incompatible_matching_build_without_replaci
 async fn simultaneous_replacement_launchers_converge_on_one_new_instance() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "replacement-race-test";
-    let fixture =
-        BuildReplacementFixture::spawn(state_dir.path(), channel, "chidori@old-build").await;
+    let fixture = BuildReplacementFixture::spawn(state_dir.path(), channel, "suru@old-build").await;
     let previous_instance_id = fixture.descriptor().instance_id;
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure replacement launchers")
-        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
     let launchers = (0..8)
         .map(|_| {
             let config = config.clone();
@@ -335,7 +333,7 @@ async fn launcher_retries_after_losing_election_to_a_mismatched_build() {
     let lock = BuildReplacementFixture::acquire_channel_lock(state_dir.path(), channel);
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure current launcher")
-        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
     let launching = tokio::spawn({
         let config = config.clone();
         async move { start_server(&config).await }
@@ -357,7 +355,7 @@ async fn launcher_retries_after_losing_election_to_a_mismatched_build() {
     let mismatched = BuildReplacementFixture::spawn_with_lock(
         state_dir.path(),
         channel,
-        "chidori@other-racing-build",
+        "suru@other-racing-build",
         PROTOCOL_VERSION,
         lock,
     )
@@ -369,7 +367,7 @@ async fn launcher_retries_after_losing_election_to_a_mismatched_build() {
         .expect("launcher retries its current build after the transition");
 
     assert_ne!(replacement.instance_id, mismatched.descriptor().instance_id);
-    assert_eq!(replacement.build_identity, chidori_binary_build_identity());
+    assert_eq!(replacement.build_identity, suru_binary_build_identity());
     assert_eq!(
         mismatched
             .shutdown_request()
@@ -386,17 +384,16 @@ async fn mismatched_build_in_another_channel_is_not_replaced() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let old_channel = "isolated-old-build";
     let current_channel = "isolated-current-build";
-    let old =
-        BuildReplacementFixture::spawn(state_dir.path(), old_channel, "chidori@old-build").await;
+    let old = BuildReplacementFixture::spawn(state_dir.path(), old_channel, "suru@old-build").await;
     let current = start_server(
         &ManagedClientConfig::new(state_dir.path(), current_channel)
             .expect("configure isolated channel")
-            .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
     )
     .await
     .expect("start current build in another channel");
 
-    assert_eq!(current.build_identity, chidori_binary_build_identity());
+    assert_eq!(current.build_identity, suru_binary_build_identity());
     assert!(old.shutdown_request().is_none());
     let old_health = reqwest::Client::new()
         .get(format!("{}/health", old.descriptor().base_url))
@@ -415,7 +412,7 @@ async fn simultaneous_launchers_converge_on_one_authenticated_server() {
     let channel = "concurrent-election-test";
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
 
     let client_launches = (0..4)
         .map(|_| {
@@ -427,11 +424,11 @@ async fn simultaneous_launchers_converge_on_one_authenticated_server() {
         .map(|_| {
             let state_dir = state_dir.path().to_path_buf();
             tokio::task::spawn_blocking(move || {
-                Command::new(env!("CARGO_BIN_EXE_chidori"))
+                Command::new(env!("CARGO_BIN_EXE_suru"))
                     .args(["server", "start"])
-                    .env("CHIDORI_STATE_DIR", &state_dir)
-                    .env("CHIDORI_DATA_DIR", &state_dir)
-                    .env("CHIDORI_CHANNEL", channel)
+                    .env("SURU_STATE_DIR", &state_dir)
+                    .env("SURU_DATA_DIR", &state_dir)
+                    .env("SURU_CHANNEL", channel)
                     .output()
                     .expect("run concurrent server start command")
             })
@@ -480,7 +477,7 @@ async fn managed_clients_recover_from_a_crash_and_converge_on_one_replacement() 
     let channel = "crash-recovery-test";
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
     let mut first = ManagedClient::connect(config.clone())
         .await
         .expect("connect first managed client");
@@ -714,7 +711,7 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let unrelated_channel = "unrelated-live-process";
     let mut unrelated = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_chidori"))
+        Command::new(env!("CARGO_BIN_EXE_suru"))
             .arg("__server")
             .arg("--state-dir")
             .arg(state_dir.path())
@@ -771,7 +768,7 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
             .expect("configure managed client")
-            .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
     )
     .await
     .expect("recover from stale descriptor");
@@ -809,7 +806,7 @@ async fn managed_client_recovers_from_malformed_and_partially_written_descriptor
         let mut client = ManagedClient::connect(
             ManagedClientConfig::new(state_dir.path(), channel)
                 .expect("configure managed client")
-                .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+                .with_server_executable(env!("CARGO_BIN_EXE_suru")),
         )
         .await
         .expect("recover from invalid runtime descriptor");
@@ -848,7 +845,7 @@ async fn reuse_requires_an_authenticated_matching_server_identity() {
         let mut client = ManagedClient::connect(
             ManagedClientConfig::new(state_dir.path(), channel)
                 .expect("configure managed client")
-                .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+                .with_server_executable(env!("CARGO_BIN_EXE_suru")),
         )
         .await
         .expect("replace unauthenticated or identity-inconsistent registration");
@@ -1001,7 +998,7 @@ async fn server_stop_notifies_attached_clients_and_remains_stopped() {
     let mut managed = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
             .expect("configure attached managed client")
-            .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
     )
     .await
     .expect("attach managed client before manual stop");
@@ -1058,16 +1055,16 @@ async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
         ProtocolViolation::UnknownEvent,
     )
     .await;
-    let binary = env!("CARGO_BIN_EXE_chidori").replace('\'', "'\\''");
+    let binary = env!("CARGO_BIN_EXE_suru").replace('\'', "'\\''");
     let tui_command = format!(
-        "stty rows 24 cols 80; original_stty=$(stty -g); '{binary}'; chidori_status=$?; restored_stty=$(stty -g); if [ \"$original_stty\" = \"$restored_stty\" ]; then printf '\\n__CHIDORI_STTY_RESTORED__\\n'; else printf '\\n__CHIDORI_STTY_CHANGED__:%s:%s\\n' \"$original_stty\" \"$restored_stty\"; fi; exit $chidori_status"
+        "stty rows 24 cols 80; original_stty=$(stty -g); '{binary}'; suru_status=$?; restored_stty=$(stty -g); if [ \"$original_stty\" = \"$restored_stty\" ]; then printf '\\n__SURU_STTY_RESTORED__\\n'; else printf '\\n__SURU_STTY_CHANGED__:%s:%s\\n' \"$original_stty\" \"$restored_stty\"; fi; exit $suru_status"
     );
     let mut tui = AttachedTuiGuard(Some(
         Command::new("script")
             .args(["-qef", "/dev/null", "-c", &tui_command])
-            .env("CHIDORI_STATE_DIR", state_dir.path())
-            .env("CHIDORI_DATA_DIR", state_dir.path())
-            .env("CHIDORI_CHANNEL", channel)
+            .env("SURU_STATE_DIR", state_dir.path())
+            .env("SURU_DATA_DIR", state_dir.path())
+            .env("SURU_CHANNEL", channel)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1122,7 +1119,7 @@ async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
         "fatal TUI did not bracket its active lifetime with paste mode: {screen:?}"
     );
     assert!(
-        screen.contains("__CHIDORI_STTY_RESTORED__"),
+        screen.contains("__SURU_STTY_RESTORED__"),
         "fatal TUI did not restore its original terminal mode: {screen:?}"
     );
 }
@@ -1195,7 +1192,7 @@ async fn clean_tui_exit_restores_the_terminal() {
 
     let binary = AttachedTuiGuard::escaped_binary();
     let tui_command = format!(
-        "stty rows 24 cols 80; original_stty=$(stty -g); '{binary}'; chidori_status=$?; restored_stty=$(stty -g); if [ \"$original_stty\" = \"$restored_stty\" ]; then printf '\\n__CHIDORI_STTY_RESTORED__\\n'; else printf '\\n__CHIDORI_STTY_CHANGED__:%s:%s\\n' \"$original_stty\" \"$restored_stty\"; fi; exit $chidori_status"
+        "stty rows 24 cols 80; original_stty=$(stty -g); '{binary}'; suru_status=$?; restored_stty=$(stty -g); if [ \"$original_stty\" = \"$restored_stty\" ]; then printf '\\n__SURU_STTY_RESTORED__\\n'; else printf '\\n__SURU_STTY_CHANGED__:%s:%s\\n' \"$original_stty\" \"$restored_stty\"; fi; exit $suru_status"
     );
     let mut tui = AttachedTuiGuard::spawn_shell_command(state_dir.path(), channel, &tui_command);
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1235,7 +1232,7 @@ async fn clean_tui_exit_restores_the_terminal() {
     assert!(screen.contains("\u{1b}[?2004h"));
     assert!(screen.contains("\u{1b}[?2004l"));
     assert!(
-        screen.contains("__CHIDORI_STTY_RESTORED__"),
+        screen.contains("__SURU_STTY_RESTORED__"),
         "clean exit did not restore raw mode: {screen:?}"
     );
 
@@ -1254,16 +1251,16 @@ impl AttachedTuiGuard {
     }
 
     fn escaped_binary() -> String {
-        env!("CARGO_BIN_EXE_chidori").replace('\'', "'\\''")
+        env!("CARGO_BIN_EXE_suru").replace('\'', "'\\''")
     }
 
     fn spawn_shell_command(state_dir: &std::path::Path, channel: &str, tui_command: &str) -> Self {
         Self(Some(
             Command::new("script")
                 .args(["-qef", "/dev/null", "-c", tui_command])
-                .env("CHIDORI_STATE_DIR", state_dir)
-                .env("CHIDORI_DATA_DIR", state_dir)
-                .env("CHIDORI_CHANNEL", channel)
+                .env("SURU_STATE_DIR", state_dir)
+                .env("SURU_DATA_DIR", state_dir)
+                .env("SURU_CHANNEL", channel)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1311,11 +1308,11 @@ async fn run_server_cli(
     let channel = channel.to_owned();
     let command = command.to_owned();
     tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_chidori"))
+        Command::new(env!("CARGO_BIN_EXE_suru"))
             .args(["server", &command])
-            .env("CHIDORI_STATE_DIR", &state_dir)
-            .env("CHIDORI_DATA_DIR", &state_dir)
-            .env("CHIDORI_CHANNEL", channel)
+            .env("SURU_STATE_DIR", &state_dir)
+            .env("SURU_DATA_DIR", &state_dir)
+            .env("SURU_CHANNEL", channel)
             .output()
             .expect("run server CLI command")
     })
@@ -1327,11 +1324,11 @@ async fn run_server_cli(
 async fn server_start_returns_after_a_detached_server_is_ready() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "detached-start-test";
-    let output = Command::new(env!("CARGO_BIN_EXE_chidori"))
+    let output = Command::new(env!("CARGO_BIN_EXE_suru"))
         .args(["server", "start"])
-        .env("CHIDORI_STATE_DIR", state_dir.path())
-        .env("CHIDORI_DATA_DIR", state_dir.path())
-        .env("CHIDORI_CHANNEL", channel)
+        .env("SURU_STATE_DIR", state_dir.path())
+        .env("SURU_DATA_DIR", state_dir.path())
+        .env("SURU_CHANNEL", channel)
         .output()
         .expect("run server start command");
 
@@ -1343,11 +1340,11 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
     let descriptor_path = state_dir.path().join(channel).join("runtime.json");
     let first_descriptor = read_runtime_descriptor(&descriptor_path);
 
-    let repeated = Command::new(env!("CARGO_BIN_EXE_chidori"))
+    let repeated = Command::new(env!("CARGO_BIN_EXE_suru"))
         .args(["server", "start"])
-        .env("CHIDORI_STATE_DIR", state_dir.path())
-        .env("CHIDORI_DATA_DIR", state_dir.path())
-        .env("CHIDORI_CHANNEL", channel)
+        .env("SURU_STATE_DIR", state_dir.path())
+        .env("SURU_DATA_DIR", state_dir.path())
+        .env("SURU_CHANNEL", channel)
         .output()
         .expect("repeat server start command");
     assert!(
@@ -1365,7 +1362,7 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
             .expect("configure managed client")
-            .with_server_executable(env!("CARGO_BIN_EXE_chidori")),
+            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
     )
     .await
     .expect("connect after start command has exited");
@@ -1387,11 +1384,11 @@ fn build_profile_selects_isolated_default_state_and_data_roots() {
     } else {
         ("release", "debug")
     };
-    let output = Command::new(env!("CARGO_BIN_EXE_chidori"))
+    let output = Command::new(env!("CARGO_BIN_EXE_suru"))
         .args(["server", "start"])
-        .env("CHIDORI_STATE_DIR", state_dir.path())
-        .env("CHIDORI_DATA_DIR", data_dir.path())
-        .env_remove("CHIDORI_CHANNEL")
+        .env("SURU_STATE_DIR", state_dir.path())
+        .env("SURU_DATA_DIR", data_dir.path())
+        .env_remove("SURU_CHANNEL")
         .output()
         .expect("start server on the build profile's default channel");
 
@@ -1416,7 +1413,7 @@ async fn managed_client_starts_a_missing_server_before_streaming_initial_state()
     let channel = "managed-auto-start-test";
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
 
     let mut client = ManagedClient::connect(config)
         .await
@@ -1435,7 +1432,7 @@ async fn sequential_managed_clients_reuse_the_persistent_server() {
     let channel = "managed-reuse-test";
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
 
     let mut first = ManagedClient::connect(config.clone())
         .await
@@ -1503,7 +1500,7 @@ async fn managed_client_reports_a_registered_failed_lifecycle() {
         Err(error) => error.to_string(),
     };
 
-    assert!(error.contains("registered Chidori server reported failed startup"));
+    assert!(error.contains("registered Suru server reported failed startup"));
     assert!(!fixture.events_opened.load(Ordering::SeqCst));
 }
 
@@ -1521,7 +1518,7 @@ async fn managed_client_reports_a_bounded_log_tail_when_startup_fails() {
     .expect("seed oversized server log");
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_chidori"));
+        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
 
     let result = timeout(Duration::from_secs(2), ManagedClient::connect(config))
         .await
@@ -1531,7 +1528,7 @@ async fn managed_client_reports_a_bounded_log_tail_when_startup_fails() {
         Err(error) => format!("{error:#}"),
     };
 
-    assert!(error.contains("detached Chidori server exited before becoming ready"));
+    assert!(error.contains("detached Suru server exited before becoming ready"));
     assert!(error.contains("Recent server log"));
     assert!(error.contains("open server election lock"));
     assert!(!error.contains("discarded-prefix"));
@@ -1658,7 +1655,7 @@ impl ReadinessFixture {
             channel,
             LifecycleState::Ready,
             FixtureEventBehavior::ProtocolViolation(violation),
-            chidori_binary_build_identity(),
+            suru_binary_build_identity(),
         )
         .await
     }

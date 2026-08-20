@@ -32,7 +32,7 @@ use crate::protocol::{
     ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue, ProviderId,
 };
 
-const CODEX_PATH_ENV: &str = "CHIDORI_CODEX_PATH";
+const CODEX_PATH_ENV: &str = "SURU_CODEX_PATH";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
@@ -295,7 +295,7 @@ struct ClientError {
     message: String,
 }
 
-/// Launches one Codex app-server process for each Chidori Session.
+/// Launches one Codex app-server process for each Suru Session.
 #[derive(Clone, Debug)]
 pub struct CodexRuntime {
     executable: OsString,
@@ -599,8 +599,8 @@ async fn start_initialized_codex_transport(
             "initialize",
             &InitializeParams {
                 client_info: ClientInfo {
-                    name: "chidori",
-                    title: "Chidori",
+                    name: "suru",
+                    title: "Suru",
                     version: env!("CARGO_PKG_VERSION"),
                 },
                 capabilities: InitializeCapabilities {
@@ -2320,7 +2320,7 @@ async fn route_message(
                     writer,
                     id,
                     UNSUPPORTED_INTERACTION_ERROR_CODE,
-                    format!("Chidori does not support interactive request `{method}`"),
+                    format!("Suru does not support interactive request `{method}`"),
                 )
                 .await?;
                 return Err(codex_error(format!(
@@ -2331,7 +2331,7 @@ async fn route_message(
                 writer,
                 id,
                 METHOD_NOT_FOUND_ERROR_CODE,
-                format!("Chidori does not recognize server request `{method}`"),
+                format!("Suru does not recognize server request `{method}`"),
             )
             .await?;
             return Ok(());

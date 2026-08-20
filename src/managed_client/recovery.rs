@@ -239,7 +239,7 @@ async fn run_managed_client(
                 ConnectionWait::TimedOut => {
                     let _ = events
                         .send(ManagedEvent::Fatal(
-                            "replacement Chidori server did not become ready within 15s".to_owned(),
+                            "replacement Suru server did not become ready within 15s".to_owned(),
                         ))
                         .await;
                     return;
@@ -280,9 +280,7 @@ async fn run_managed_client(
                             .await;
                         return;
                     }
-                    ConnectionWait::TimedOut => {
-                        Err(anyhow!("compatible Chidori server is not ready"))
-                    }
+                    ConnectionWait::TimedOut => Err(anyhow!("compatible Suru server is not ready")),
                 }
             };
             match recovery {

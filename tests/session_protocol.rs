@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use chidori::protocol::{
+use serde_json::json;
+use suru::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
     AgentSelection, AgentSelectionOperationId, CreateSessionRequest, FileChange, InitialPrompt,
     Message, MessageId, MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId,
@@ -11,7 +12,6 @@ use chidori::protocol::{
     SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest,
     Workspace,
 };
-use serde_json::json;
 use uuid::Uuid;
 
 fn fixture_id(value: &str) -> Uuid {
@@ -76,7 +76,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         session: Session {
             id: SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
             workspace: Workspace {
-                path: PathBuf::from("/work/chidori"),
+                path: PathBuf::from("/work/suru"),
             },
             agent_selection: Some(AgentSelection {
                 provider: ProviderId::new("codex"),
@@ -93,7 +93,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
     let expected = json!({
         "id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
         "title": "Explain this workspace",
-        "workspace": { "path": "/work/chidori" },
+        "workspace": { "path": "/work/suru" },
         "agent_selection": {
             "provider": "codex",
             "model": "gpt-5",
@@ -121,7 +121,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         session: Session {
             id: SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
             workspace: Workspace {
-                path: PathBuf::from("/work/chidori"),
+                path: PathBuf::from("/work/suru"),
             },
             agent_selection: Some(AgentSelection {
                 provider: ProviderId::new("codex"),
@@ -190,7 +190,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
     let expected = json!({
         "session": {
             "id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
-            "workspace": { "path": "/work/chidori" },
+            "workspace": { "path": "/work/suru" },
             "agent_selection": {
                 "provider": "codex",
                 "model": "gpt-5",
@@ -354,7 +354,7 @@ fn command_activity_lifecycle_uses_typed_incremental_updates() {
                     turn_id,
                     status: ActivityStatus::Active,
                     command: "cargo test --test session_protocol".to_owned(),
-                    cwd: Some(PathBuf::from("/work/chidori")),
+                    cwd: Some(PathBuf::from("/work/suru")),
                     output: String::new(),
                     exit_status: None,
                 },
@@ -390,7 +390,7 @@ fn command_activity_lifecycle_uses_typed_incremental_updates() {
                     "kind": "command",
                     "status": "active",
                     "command": "cargo test --test session_protocol",
-                    "cwd": "/work/chidori",
+                    "cwd": "/work/suru",
                     "output": "",
                     "exit_status": null
                 }
@@ -611,7 +611,7 @@ fn initial_session_command_round_trips_through_json() {
     let command = CreateSessionRequest {
         agent_selection: None,
         workspace: Workspace {
-            path: PathBuf::from("/work/chidori"),
+            path: PathBuf::from("/work/suru"),
         },
         prompt: InitialPrompt {
             id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
@@ -620,7 +620,7 @@ fn initial_session_command_round_trips_through_json() {
     };
     let expected = json!({
         "agent_selection": null,
-        "workspace": { "path": "/work/chidori" },
+        "workspace": { "path": "/work/suru" },
         "prompt": {
             "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
             "text": "Explain this workspace"
