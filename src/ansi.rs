@@ -212,6 +212,22 @@ const MAX_TRACKED_SGR_ATTRIBUTES: usize = 32;
 const SGR_RESET: &str = "\x1b[0m";
 const HYPERLINK_CLOSE: &str = "\x1b]8;;\x1b\\";
 
+/// Closes a stream that its cap cut short, so a reader can tell stored content
+/// is not everything the Provider sent. It sits on a line of its own and stays
+/// plain text, which keeps it legible to any client and lets one that knows the
+/// marker lift it out of the content and style it as its own.
+pub(crate) const TRUNCATION_MARKER: &str = "[output truncated]";
+
+/// Splits stored content into what the Provider sent and whether a cap cut the
+/// stream short, so a client can render the marker in its own style instead of
+/// as Provider content.
+pub(crate) fn split_truncation_marker(content: &str) -> (&str, bool) {
+    match content.strip_suffix(TRUNCATION_MARKER) {
+        Some(content) => (content.strip_suffix('\n').unwrap_or(content), true),
+        None => (content, false),
+    }
+}
+
 /// Stateful normalization for provider text that may arrive in arbitrary
 /// streaming chunks. The emitted form is safe to persist as transcript data:
 /// printable text, newlines, complete SGR sequences, and complete OSC 8
@@ -222,6 +238,9 @@ pub(crate) struct ProviderTextNormalizer {
     remaining_chars: Option<usize>,
     formatting: Formatting,
     truncated: bool,
+    /// Whether the emitted stream stands part way through a line, which decides
+    /// if the truncation marker needs a newline to reach one of its own.
+    mid_line: bool,
     overwrite_line: Option<OverwriteLine>,
 }
 
@@ -364,7 +383,8 @@ impl ProviderTextNormalizer {
             return String::new();
         };
         let stored = line.take();
-        let mut normalized = stored.content;
+        let mut normalized = String::new();
+        self.emit(&stored.content, &mut normalized);
         self.spend(stored.chars);
         if stored.overflowed {
             self.mark_truncated(&mut normalized);
@@ -384,7 +404,7 @@ impl ProviderTextNormalizer {
             return;
         }
         let (visible, overflowed) = split_to_fit(text, limit);
-        normalized.push_str(visible);
+        self.emit(visible, normalized);
         self.spend(visible.chars().count());
         if overflowed {
             self.mark_truncated(normalized);
@@ -443,7 +463,7 @@ impl ProviderTextNormalizer {
             return;
         }
         let Some(remaining) = self.remaining_chars.as_mut() else {
-            normalized.push('\n');
+            self.emit("\n", normalized);
             return;
         };
         if *remaining == 0 {
@@ -451,7 +471,7 @@ impl ProviderTextNormalizer {
             return;
         }
         *remaining -= 1;
-        normalized.push('\n');
+        self.emit("\n", normalized);
     }
 
     /// Charges the surviving line against the budget and emits it, since a
@@ -461,7 +481,7 @@ impl ProviderTextNormalizer {
             return;
         };
         let stored = line.take();
-        normalized.push_str(&stored.content);
+        self.emit(&stored.content, normalized);
         let fits = !stored.overflowed
             && self
                 .remaining_chars
@@ -472,7 +492,7 @@ impl ProviderTextNormalizer {
             return;
         }
         self.spend(1);
-        normalized.push('\n');
+        self.emit("\n", normalized);
         if let Some(line) = self.overwrite_line.as_mut() {
             line.committed_formatting = line.stored_formatting.clone();
         }
@@ -490,10 +510,27 @@ impl ProviderTextNormalizer {
         }
     }
 
+    /// Emits content that carries the stream along a line, tracking where that
+    /// leaves it so a truncation marker knows whether it needs a newline first.
+    fn emit(&mut self, content: &str, normalized: &mut String) {
+        if content.is_empty() {
+            return;
+        }
+        self.mid_line = !content.ends_with('\n');
+        normalized.push_str(content);
+    }
+
+    /// Ends the stream at its cap, closing any styling the stored content left
+    /// open and marking that the rest of the stream was dropped.
     fn mark_truncated(&mut self, normalized: &mut String) {
         self.truncated = true;
         normalized.push_str(&self.formatting.closers());
         self.formatting = Formatting::default();
+        if self.mid_line {
+            normalized.push('\n');
+        }
+        normalized.push_str(TRUNCATION_MARKER);
+        self.mid_line = true;
     }
 }
 
@@ -722,7 +759,7 @@ fn extended_color_length(parameters: &[&str], index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnsiScanner, Fragment, ProviderTextNormalizer};
+    use super::{AnsiScanner, Fragment, ProviderTextNormalizer, split_truncation_marker};
 
     #[test]
     fn classifies_sgr_separately_from_text() {
@@ -877,7 +914,7 @@ mod tests {
 
         assert_eq!(
             normalizer.push("\x1b[31m1234\x1b[38;5;42m5678"),
-            "\x1b[31m1234\x1b[0m"
+            "\x1b[31m1234\x1b[0m\n[output truncated]"
         );
         assert_eq!(normalizer.push("ignored"), "");
     }
@@ -886,7 +923,33 @@ mod tests {
     fn provider_text_truncation_resets_styles_outside_the_rendered_subset() {
         let mut normalizer = ProviderTextNormalizer::with_max_chars(6);
 
-        assert_eq!(normalizer.push("\x1b[53mxoverflow"), "\x1b[53mx\x1b[0m");
+        assert_eq!(
+            normalizer.push("\x1b[53mxoverflow"),
+            "\x1b[53mx\x1b[0m\n[output truncated]"
+        );
+    }
+
+    #[test]
+    fn truncation_marker_starts_a_line_without_leaving_a_blank_one() {
+        let mut normalizer = ProviderTextNormalizer::with_max_chars(4);
+
+        assert_eq!(normalizer.push("abc\ndropped"), "abc\n[output truncated]");
+    }
+
+    #[test]
+    fn truncation_marker_splits_back_out_of_stored_content() {
+        let mut normalizer = ProviderTextNormalizer::with_max_chars(3);
+        let stored = normalizer.push("kept, then dropped");
+
+        assert_eq!(split_truncation_marker(&stored), ("kep", true));
+    }
+
+    #[test]
+    fn content_that_ran_to_its_end_splits_back_unchanged() {
+        assert_eq!(
+            split_truncation_marker("whole stream"),
+            ("whole stream", false)
+        );
     }
 
     #[test]
@@ -914,7 +977,7 @@ mod tests {
 
         assert_eq!(
             normalizer.push(&format!("{open}abcdef")),
-            format!("{open}abc\x1b]8;;\x1b\\")
+            format!("{open}abc\x1b]8;;\x1b\\\n[output truncated]")
         );
         assert_eq!(normalizer.push("ignored"), "");
     }
@@ -1021,7 +1084,10 @@ mod tests {
         let mut normalizer = ProviderTextNormalizer::with_line_overwrite(10);
 
         assert_eq!(normalizer.push("\x1b[31m1234\x1b[38;5;42m5678"), "");
-        assert_eq!(normalizer.finish(), "\x1b[31m1234\x1b[0m");
+        assert_eq!(
+            normalizer.finish(),
+            "\x1b[31m1234\x1b[0m\n[output truncated]"
+        );
         assert_eq!(normalizer.push("ignored"), "");
     }
 
@@ -1029,7 +1095,10 @@ mod tests {
     fn line_overwrite_truncates_a_committed_line_that_exhausts_the_budget() {
         let mut normalizer = ProviderTextNormalizer::with_line_overwrite(6);
 
-        assert_eq!(normalizer.push("\x1b[53mxoverflow\n"), "\x1b[53mx\x1b[0m");
+        assert_eq!(
+            normalizer.push("\x1b[53mxoverflow\n"),
+            "\x1b[53mx\x1b[0m\n[output truncated]"
+        );
         assert_eq!(normalizer.push("ignored"), "");
     }
 

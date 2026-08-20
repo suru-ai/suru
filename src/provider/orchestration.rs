@@ -27,7 +27,21 @@ use crate::sessions::{
     UnfinishedProviderOutput,
 };
 
+/// The most characters of Provider-sent output Suru stores for one command; the
+/// truncation marker Suru appends past the cap is its own and is not charged
+/// against it. Command output is machine-generated and can run without bound, so
+/// the cap sits well above the output a reader would scroll through while
+/// keeping a single Activity small enough to load, project, and re-render on
+/// every frame.
 const MAX_STORED_COMMAND_OUTPUT_CHARS: usize = 64 * 1024;
+
+/// The most characters of Provider-sent content Suru stores for one agent
+/// Message, on the same terms as the command-output cap. Agent prose is written
+/// to be read, so real Messages sit orders of magnitude below this; the cap only
+/// stops a Provider that streams deltas without end from growing stored content
+/// without bound. It is far more generous than the command-output cap because
+/// cutting an explanation short costs a reader more than cutting a log short.
+const MAX_STORED_MESSAGE_CHARS: usize = 512 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct ProviderOrchestrator {
@@ -833,7 +847,9 @@ fn project_provider_event(
                     let message_id = MessageId::new();
                     active.streaming_message = Some(ActiveProviderMessage {
                         id: message_id,
-                        normalizer: ProviderTextNormalizer::default(),
+                        normalizer: ProviderTextNormalizer::with_max_chars(
+                            MAX_STORED_MESSAGE_CHARS,
+                        ),
                     });
                     sessions
                         .publish_agent_output(

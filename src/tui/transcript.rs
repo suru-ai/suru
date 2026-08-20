@@ -22,7 +22,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    ansi::{AnsiScanner, Fragment},
+    ansi::{AnsiScanner, Fragment, TRUNCATION_MARKER, split_truncation_marker},
     protocol::{
         Activity, ActivityId, FileChange, InitialPrompt, Message, MessageId, MessageRole, PromptId,
         SessionId, SessionRevision, SessionSnapshot, TranscriptItem,
@@ -512,9 +512,23 @@ fn push_command_activity(
             theme.text.subdued,
         );
     }
+    let (output, truncated) = split_truncation_marker(output);
     if !output.is_empty() {
         push_styled_prefixed_lines(projection, "    ", output, theme.text.subdued, theme);
     }
+    if truncated {
+        push_truncation_marker(projection.lines, "    ", theme);
+    }
+}
+
+/// Renders the marker the normalizer left on capped content as its own line, in
+/// a style Suru applies rather than one the stream can set, so a reader can tell
+/// Suru dropped the rest rather than the Provider ending there.
+fn push_truncation_marker(lines: &mut Vec<Line<'static>>, indent: &str, theme: &Theme) {
+    lines.push(Line::styled(
+        format!("{indent}{TRUNCATION_MARKER}"),
+        theme.text.subdued.add_modifier(Modifier::ITALIC),
+    ));
 }
 
 fn push_file_change_activity(
@@ -598,6 +612,7 @@ fn wrapped_content_lines(content: &str, width: usize) -> Vec<String> {
 }
 
 fn push_agent_message(lines: &mut Vec<Line<'static>>, content: &str, theme: &Theme) {
+    let (content, truncated) = split_truncation_marker(content);
     let content = sanitize_content(content);
     for mut line in markdown::render(&content, theme) {
         if !line.spans.is_empty() {
@@ -605,7 +620,10 @@ fn push_agent_message(lines: &mut Vec<Line<'static>>, content: &str, theme: &The
         }
         lines.push(line);
     }
-    if !content.is_empty() {
+    if truncated {
+        push_truncation_marker(lines, "  ", theme);
+    }
+    if !content.is_empty() || truncated {
         lines.push(Line::default());
     }
 }
@@ -977,17 +995,22 @@ fn split_line_at_character_midpoint(
 mod tests {
     use std::path::PathBuf;
 
-    use ratatui::{style::Color, text::Line};
+    use ratatui::{
+        style::{Color, Modifier},
+        text::Line,
+    };
 
     use crate::{
+        ansi::TRUNCATION_MARKER,
         protocol::{
-            Activity, ActivityId, ActivityStatus, ModelAvailability, Session, SessionRevision,
-            SessionSnapshot, SessionStatus, TranscriptItem, TurnId, Workspace,
+            Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus,
+            ModelAvailability, Session, SessionRevision, SessionSnapshot, SessionStatus,
+            TranscriptItem, TurnId, Workspace,
         },
         theme::Theme,
     };
 
-    use super::{TranscriptCache, render_activity};
+    use super::{TranscriptCache, render_activity, render_message};
 
     #[test]
     fn activity_base_ansi_colors_follow_theme_palette() {
@@ -1120,6 +1143,80 @@ mod tests {
         };
         assert_eq!(themed_color(&first_lines), Some(Color::Rgb(1, 2, 3)));
         assert_eq!(themed_color(&second_lines), Some(Color::Rgb(4, 5, 6)));
+    }
+
+    #[test]
+    fn command_output_truncation_marker_renders_apart_from_the_output() {
+        let activity = Activity::Command {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Completed,
+            command: "emit oversized output".to_owned(),
+            cwd: None,
+            output: format!("\x1b[31mkept output\x1b[0m\n{TRUNCATION_MARKER}"),
+            exit_status: Some(0),
+        };
+        let theme = Theme::system();
+        let mut lines = Vec::new();
+        let mut links = Vec::new();
+
+        render_activity(&mut lines, &mut links, &activity, &theme);
+
+        let marker = lines.last().expect("render the truncation marker");
+        assert_eq!(
+            marker
+                .spans
+                .iter()
+                .map(|span| &*span.content)
+                .collect::<String>(),
+            format!("    {TRUNCATION_MARKER}")
+        );
+        assert!(
+            marker.style.add_modifier.contains(Modifier::ITALIC),
+            "the marker carries a style command output cannot: {marker:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content == "kept output"),
+            "output before the marker still renders: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn agent_message_truncation_marker_renders_outside_the_markdown_body() {
+        let message = Message {
+            id: MessageId::new(),
+            turn_id: TurnId::new(),
+            role: MessageRole::Agent,
+            status: MessageStatus::Completed,
+            content: format!("```\nfenced code\n{TRUNCATION_MARKER}"),
+        };
+        let theme = Theme::system();
+        let mut lines = Vec::new();
+
+        render_message(&mut lines, &message, &theme, 80);
+
+        let marker = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains(TRUNCATION_MARKER))
+            })
+            .expect("render the truncation marker");
+        assert!(
+            marker.style.add_modifier.contains(Modifier::ITALIC),
+            "the marker keeps its own style outside the rendered Markdown: {marker:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content.contains("fenced code")),
+            "Message content before the marker still renders: {lines:?}"
+        );
     }
 
     #[test]

@@ -660,6 +660,14 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
             content: " payload\x1b\\\rworld\x07\n".to_owned(),
         },
         ProviderEvent::AgentMessageCompleted,
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: format!("\x1b[31m{}\x1b[", "y".repeat(524_270)),
+        },
+        ProviderEvent::AgentMessageDelta {
+            content: format!("{}mignored", "1".repeat(32)),
+        },
+        ProviderEvent::AgentMessageCompleted,
         ProviderEvent::TurnCompleted,
     ] {
         provider_session.emit(event);
@@ -669,7 +677,7 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
         &client,
         &descriptor,
         created.session.id,
-        SessionRevision(21),
+        SessionRevision(25),
     )
     .await;
     let Activity::Command { output, .. } = &completed.activities[0] else {
@@ -692,8 +700,8 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
     };
     let truncated_text = truncated_output
         .strip_prefix("\x1b[31m")
-        .and_then(|output| output.strip_suffix("\x1b[0m"))
-        .expect("truncated styled output is bounded by complete SGR sequences");
+        .and_then(|output| output.strip_suffix("\x1b[0m\n[output truncated]"))
+        .expect("truncated styled output is bounded by complete SGR sequences and marked");
     assert_eq!(truncated_text.len(), 65_520);
     assert!(truncated_text.chars().all(|character| character == 'x'));
     let Activity::Command {
@@ -713,6 +721,13 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
     };
     assert_eq!(redrawn_output, "\x1b[32mdone\x1b[0m\n");
     assert_eq!(completed.messages[1].content, "\x1b[1;32mHello    world\n");
+    let truncated_prose = completed.messages[2]
+        .content
+        .strip_prefix("\x1b[31m")
+        .and_then(|content| content.strip_suffix("\x1b[0m\n[output truncated]"))
+        .expect("a truncated Message is bounded by complete SGR sequences and marked");
+    assert_eq!(truncated_prose.len(), 524_270);
+    assert!(truncated_prose.chars().all(|character| character == 'y'));
 
     server.shutdown().await.expect("shut down server");
 }
