@@ -12,7 +12,6 @@ use super::{
     state::CommandId,
 };
 
-
 pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
     match event {
         InputEvent::Mouse(mouse) => match mouse.kind {

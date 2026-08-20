@@ -10,6 +10,15 @@ use std::{
     time::Duration,
 };
 
+use crate::{
+    managed_client::{
+        ManagedClient, SessionCommandClient, SessionEvent, SessionStreamError, SessionSubscription,
+    },
+    protocol::{
+        AgentSelection, AgentSelectionOperationId, ModelCatalog, PromptId, SessionId,
+        SessionListItem, SessionSnapshot, TurnId, UpdateAgentSelectionRequest,
+    },
+};
 use anyhow::{Result, anyhow};
 use crossterm::{
     cursor::{Hide, Show},
@@ -22,22 +31,12 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
-use crate::{
-    managed_client::{
-        ManagedClient, SessionCommandClient, SessionEvent, SessionStreamError, SessionSubscription,
-    },
-    protocol::{
-        AgentSelection, AgentSelectionOperationId, ModelCatalog, PromptId, SessionId,
-        SessionListItem, SessionSnapshot, TurnId, UpdateAgentSelectionRequest,
-    },
-};
 
 use super::state::{
     Application, ApplicationEvent, ApplicationTransition, ModelListRequest, SessionListRequest,
 };
 
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
-
 
 pub async fn run(client: ManagedClient) -> Result<()> {
     let workspace =
@@ -896,7 +895,6 @@ async fn wait_for_reconnect_grace(grace: &mut Option<Pin<Box<tokio::time::Sleep>
     }
 }
 
-
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
@@ -980,7 +978,6 @@ impl Drop for TerminalSession {
         let _ = disable_raw_mode();
     }
 }
-
 
 #[cfg(test)]
 mod tests {

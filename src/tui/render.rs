@@ -15,8 +15,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     managed_client::SessionProjection,
     protocol::{
-        ModelAvailability, ModelDescriptor, ServerIdentity, SessionSnapshot,
-        SessionStatus, SessionTimestamp,
+        ModelAvailability, ModelDescriptor, ServerIdentity, SessionSnapshot, SessionStatus,
+        SessionTimestamp,
     },
     theme::Theme,
 };
@@ -64,7 +64,6 @@ impl ResponsiveDetail {
         self == Self::Secondary
     }
 }
-
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     render_with_slots(frame, state, &RenderSlots::builtins());
@@ -1355,7 +1354,6 @@ fn wrapped_composer_lines(text: &str, width: u16) -> Text<'static> {
     lines.push(Line::from(line));
     Text::from(lines)
 }
-
 
 fn terminal_is_too_small(area: Rect) -> bool {
     area.width < MINIMUM_TERMINAL_WIDTH || area.height < MINIMUM_TERMINAL_HEIGHT

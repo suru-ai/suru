@@ -16,8 +16,7 @@ use crate::{
     protocol::{
         AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
         InitialPrompt, MessageId, ModelCatalog, PromptDelivery, PromptId, PromptStatus,
-        ServerIdentity, SessionChange, SessionId, SessionListItem, SessionSnapshot,
-        ShutdownReason,
+        ServerIdentity, SessionChange, SessionId, SessionListItem, SessionSnapshot, ShutdownReason,
         TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
     },
     theme::Theme,
@@ -28,9 +27,9 @@ use super::{
     composer::{ComposerKey, ComposerMemory},
     keymap::{
         command_for_autocomplete_event, command_for_interrupt_confirmation_event,
-        command_for_model_options_event, command_for_model_picker_event,
+        command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
         command_for_queued_prompt_event, command_for_session_picker_event,
-        command_for_leader_event, command_for_terminal_event,
+        command_for_terminal_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction},
@@ -91,8 +90,6 @@ impl SessionListRequest {
         &self.scope
     }
 }
-
-
 
 #[derive(Clone, Debug)]
 pub(super) struct SessionInteraction {
@@ -809,6 +806,21 @@ impl TuiState {
     }
 }
 
+/// Which neighbour a queued Prompt selection command moves to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueuedPromptStep {
+    Previous,
+    Next,
+}
+
+/// Whether the catalog request behind a Model listing result has finished, so
+/// pending Model Options either wait for more or give up with a message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatalogRequest {
+    Outstanding,
+    Settled,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum TranscriptDirection {
     Up,
@@ -993,367 +1005,9 @@ impl Application {
 
     pub fn handle_event(&mut self, event: ApplicationEvent) -> Result<ApplicationTransition> {
         match event {
-            ApplicationEvent::Command(_) if self.state.reconnect_overlay_visible => {
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(
-                CommandId::SubmitSteer
-                | CommandId::SubmitQueue
-                | CommandId::SelectSession
-                | CommandId::SelectModel
-                | CommandId::InvokeSemantic(SemanticCommandId::SessionList)
-                | CommandId::InvokeSemantic(SemanticCommandId::SessionNew)
-                | CommandId::InvokeSemantic(SemanticCommandId::ModelOptionsApply),
-            ) if self.state.selection_update_pending() => Ok(ApplicationTransition::Continue),
-            ApplicationEvent::Command(CommandId::ClearOrExit) => {
-                let key = self.state.composer_key();
-                if self.state.composers.is_empty(key) {
-                    return Ok(ApplicationTransition::Exit);
-                }
-                self.state
-                    .edit_composer(|composers, key| composers.clear(key));
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::InsertText(text)) => {
-                self.state
-                    .edit_composer(|composers, key| composers.insert(key, &text));
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::PasteText(text)) => {
-                self.state.paste_into_composer(&text);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::InsertNewline) => {
-                self.state
-                    .edit_composer(|composers, key| composers.insert(key, "\n"));
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::DeleteBackward) => {
-                self.state
-                    .edit_composer(|composers, key| composers.delete_backward(key));
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::DeleteForward) => {
-                self.state
-                    .edit_composer(|composers, key| composers.delete_forward(key));
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::MoveCursorLeft) => {
-                self.state
-                    .navigate_composer(|composers, key| composers.move_left(key));
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::MoveCursorRight) => {
-                self.state
-                    .navigate_composer(|composers, key| composers.move_right(key));
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::HistoryPrevious) => {
-                self.state
-                    .edit_composer(|composers, key| composers.history_previous(key));
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::HistoryNext) => {
-                self.state
-                    .edit_composer(|composers, key| composers.history_next(key));
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::ScrollTranscriptPageUp) => {
-                self.state.navigate_transcript_page(TranscriptDirection::Up);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::ScrollTranscriptPageDown) => {
-                self.state
-                    .navigate_transcript_page(TranscriptDirection::Down);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::ScrollTranscriptLinesUp) => {
-                self.state
-                    .navigate_transcript_lines(TranscriptDirection::Up);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::ScrollTranscriptLinesDown) => {
-                self.state
-                    .navigate_transcript_lines(TranscriptDirection::Down);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::FollowLatest) => {
-                self.state.follow_latest();
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::SelectPreviousAutocomplete) => {
-                self.state.command_autocomplete.select_previous();
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::SelectNextAutocomplete) => {
-                self.state.command_autocomplete.select_next();
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::DismissAutocomplete) => {
-                let key = self.state.composer_key();
-                let text = self.state.composers.text(key);
-                self.state.command_autocomplete.dismiss_for_text(text);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::SelectAutocomplete) => {
-                let Some(command) = self.state.command_autocomplete.selected() else {
-                    return Ok(ApplicationTransition::Continue);
-                };
-                if self.state.selection_update_pending()
-                    && matches!(
-                        command,
-                        SemanticCommandId::SessionList | SemanticCommandId::SessionNew
-                    )
-                {
-                    return Ok(ApplicationTransition::Continue);
-                }
-                let key = self.state.composer_key();
-                self.state.composers.clear(key);
-                self.state.sync_command_autocomplete();
-                self.invoke_semantic(command)
-            }
-            ApplicationEvent::Command(CommandId::InsertSessionSearch(text)) => {
-                self.edit_session_picker(|picker| picker.insert(&text));
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::DeleteSessionSearchBackward) => {
-                self.edit_session_picker(SessionPicker::delete_backward);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::SelectPreviousSession) => {
-                self.edit_session_picker(SessionPicker::select_previous);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::SelectNextSession) => {
-                self.edit_session_picker(SessionPicker::select_next);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::PagePreviousSessions) => {
-                self.edit_session_picker(SessionPicker::page_previous);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::PageNextSessions) => {
-                self.edit_session_picker(SessionPicker::page_next);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::ToggleSessionScope) => {
-                if self.state.session_picker.is_busy() {
-                    return Ok(ApplicationTransition::Continue);
-                }
-                let request = self.state.session_picker.toggle_scope();
-                Ok(ApplicationTransition::ListSessions(request))
-            }
-            ApplicationEvent::Command(CommandId::SelectSession) => {
-                Ok(self.state.session_picker.begin_attachment().map_or(
-                    ApplicationTransition::Continue,
-                    ApplicationTransition::AttachSession,
-                ))
-            }
-            ApplicationEvent::Command(CommandId::CloseSessionPicker) => {
-                if !self.state.session_picker.is_busy() {
-                    self.state.session_picker.close();
-                }
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::InsertModelSearch(text)) => {
-                self.state.model_picker.insert(&text);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::DeleteModelSearchBackward) => {
-                self.state.model_picker.delete_backward();
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::SelectPreviousModel) => {
-                self.state.model_picker.select_previous();
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::SelectNextModel) => {
-                self.state.model_picker.select_next();
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::PagePreviousModels) => {
-                self.state.model_picker.page_previous();
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::PageNextModels) => {
-                self.state.model_picker.page_next();
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::SelectModel) => {
-                match self.state.model_picker.choose() {
-                    Some(ModelPickerAction::Retry) => {
-                        Ok(self.state.model_picker.begin_retry().map_or(
-                            ApplicationTransition::Continue,
-                            ApplicationTransition::ListModels,
-                        ))
-                    }
-                    Some(ModelPickerAction::Select(model)) => {
-                        self.state.model_picker.close();
-                        if !model.options.is_empty() {
-                            let current = self.state.agent_selection().cloned();
-                            self.state.model_options.open(model, current.as_ref());
-                            return Ok(ApplicationTransition::Continue);
-                        }
-                        self.apply_agent_selection(model.default_agent_selection())
-                    }
-                    None => Ok(ApplicationTransition::Continue),
-                }
-            }
-            ApplicationEvent::Command(CommandId::CloseModelPicker) => {
-                self.state.model_picker.close();
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::InvokeSemantic(command)) => {
-                self.invoke_semantic(command)
-            }
-            ApplicationEvent::Command(
-                command @ (CommandId::SubmitSteer | CommandId::SubmitQueue),
-            ) => {
-                if self.state.pending_submission.is_some() {
-                    return Ok(ApplicationTransition::Continue);
-                }
-                let delivery = if command == CommandId::SubmitQueue {
-                    PromptDelivery::Queue
-                } else {
-                    PromptDelivery::Steer
-                };
-                let key = self.state.composer_key();
-                if self.state.composers.text(key).trim().is_empty() {
-                    self.state.submission_error =
-                        Some("Prompt must contain non-whitespace text".to_owned());
-                    return Ok(ApplicationTransition::Continue);
-                }
-                let prompt = self.state.composers.begin_submission(key);
-                self.state.sync_command_autocomplete();
-                self.state.failed_submissions.remove(&prompt.id);
-                self.state.submission_error = None;
-                if let ComposerKey::Session(session_id) = key {
-                    self.state.pending_submission = Some(PendingSubmission {
-                        source: key,
-                        target: SubmissionTarget::AdmitPrompt(session_id, delivery),
-                        prompt: prompt.clone(),
-                    });
-                    return Ok(ApplicationTransition::AdmitPrompt {
-                        session_id,
-                        request: AdmitPromptRequest { prompt, delivery },
-                    });
-                }
-                self.state.pending_submission = Some(PendingSubmission {
-                    source: key,
-                    target: SubmissionTarget::CreateSession,
-                    prompt: prompt.clone(),
-                });
-                Ok(ApplicationTransition::CreateSession(CreateSessionRequest {
-                    agent_selection: self.state.landing_agent_selection.clone(),
-                    workspace: Workspace {
-                        path: self.state.workspace.clone(),
-                    },
-                    prompt,
-                }))
-            }
-            ApplicationEvent::Command(CommandId::BeginLeader) => {
-                self.state.command_mode = CommandMode::Leader;
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::OpenQueuedPrompts) => {
-                let Some(session_id) = self.session_id() else {
-                    self.state.command_mode = CommandMode::Composer;
-                    return Ok(ApplicationTransition::Continue);
-                };
-                self.state.command_mode = self.state.queued_prompts(session_id).first().map_or(
-                    CommandMode::Composer,
-                    |prompt| CommandMode::QueuedPrompts {
-                        selected: prompt.id,
-                    },
-                );
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(
-                command @ (CommandId::SelectPreviousQueuedPrompt
-                | CommandId::SelectNextQueuedPrompt),
-            ) => {
-                let (Some(session_id), CommandMode::QueuedPrompts { selected }) =
-                    (self.session_id(), self.state.command_mode)
-                else {
-                    return Ok(ApplicationTransition::Continue);
-                };
-                let queued = self.state.queued_prompts(session_id);
-                if let Some(index) = queued.iter().position(|prompt| prompt.id == selected) {
-                    let next = if command == CommandId::SelectPreviousQueuedPrompt {
-                        index.saturating_sub(1)
-                    } else {
-                        (index + 1).min(queued.len().saturating_sub(1))
-                    };
-                    self.state.command_mode = CommandMode::QueuedPrompts {
-                        selected: queued[next].id,
-                    };
-                }
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(
-                command @ (CommandId::PromoteSelectedPrompt | CommandId::CancelSelectedPrompt),
-            ) => {
-                let (Some(session_id), CommandMode::QueuedPrompts { selected }) =
-                    (self.session_id(), self.state.command_mode)
-                else {
-                    return Ok(ApplicationTransition::Continue);
-                };
-                self.state.command_mode = CommandMode::Composer;
-                Ok(if command == CommandId::PromoteSelectedPrompt {
-                    ApplicationTransition::PromotePrompt {
-                        session_id,
-                        prompt_id: selected,
-                    }
-                } else {
-                    ApplicationTransition::CancelPrompt {
-                        session_id,
-                        prompt_id: selected,
-                    }
-                })
-            }
-            ApplicationEvent::Command(CommandId::RequestInterrupt) => {
-                if let Some(turn_id) = self.state.active_turn_id() {
-                    self.state.command_mode = CommandMode::InterruptConfirmation { turn_id };
-                }
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Command(CommandId::ConfirmInterrupt) => {
-                let (Some(session_id), CommandMode::InterruptConfirmation { turn_id }) =
-                    (self.session_id(), self.state.command_mode)
-                else {
-                    return Ok(ApplicationTransition::Continue);
-                };
-                self.state.command_mode = CommandMode::Composer;
-                Ok(ApplicationTransition::InterruptTurn {
-                    session_id,
-                    turn_id,
-                })
-            }
-            ApplicationEvent::Command(CommandId::CloseCommandMode) => {
-                self.state.command_mode = CommandMode::Composer;
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::ReconnectGraceElapsed => {
-                if self.state.recovery.is_some() {
-                    self.state.reconnect_overlay_visible = true;
-                }
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::Managed(ManagedEvent::Fatal(error)) => Err(anyhow!(error)),
-            ApplicationEvent::Managed(event @ ManagedEvent::ServerShutdown(_)) => {
-                self.state.apply(event);
-                Ok(ApplicationTransition::Exit)
-            }
-            ApplicationEvent::Managed(event) => {
-                let had_session = self.state.session.is_some();
-                self.state.apply(event);
-                self.state.reconcile_command_mode();
-                if had_session && self.state.session.is_none() {
-                    Ok(ApplicationTransition::SessionEnded)
-                } else {
-                    Ok(ApplicationTransition::Continue)
-                }
-            }
+            ApplicationEvent::Command(command) => self.handle_command(command),
+            ApplicationEvent::ReconnectGraceElapsed => Ok(self.elapse_reconnect_grace()),
+            ApplicationEvent::Managed(event) => self.handle_managed_event(event),
             ApplicationEvent::Session(event) => {
                 self.state.apply_session(event)?;
                 Ok(ApplicationTransition::Continue)
@@ -1363,20 +1017,29 @@ impl Application {
                 .map_or(ApplicationTransition::Continue, |session_id| {
                     ApplicationTransition::SubscribeSession(session_id)
                 })),
+            ApplicationEvent::SessionCreated(snapshot) => {
+                self.state.apply_created_session(snapshot)?;
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SessionAttached(snapshot) => self.attach_session(snapshot),
+            ApplicationEvent::SessionAttachmentFailed(error) => {
+                let request = self.state.session_picker.fail_attachment(error);
+                Ok(ApplicationTransition::ListSessions(request))
+            }
+            ApplicationEvent::SessionDeletionFailed { session_id, error } => {
+                self.state.session_picker.fail_deletion(session_id, error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SessionOperationFailed(error) => {
+                self.state.submission_error = Some(error);
+                Ok(ApplicationTransition::Continue)
+            }
             ApplicationEvent::PromptAdmissionSucceeded(prompt_id) => {
                 self.state.acknowledge_pending_submission(prompt_id);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::PromptAdmissionFailed { prompt_id, error } => {
                 self.state.fail_pending_submission(prompt_id, error);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::SessionAttached(snapshot) => {
-                let closes_picker = self.state.session_picker.attaching_to(snapshot.session.id);
-                self.state.apply_attached_session(snapshot)?;
-                if closes_picker {
-                    self.state.session_picker.close();
-                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::SessionsListed { request, sessions } => {
@@ -1389,135 +1052,580 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::ModelsListed { request, catalog } => {
-                let accepted = self.state.model_picker.is_active_request(&request);
-                let current = self.state.agent_selection().cloned();
-                self.state
-                    .model_picker
-                    .load(&request, catalog, current.as_ref());
-                if accepted {
-                    self.reconcile_model_options(false);
-                }
-                Ok(ApplicationTransition::Continue)
+                Ok(self.load_model_catalog(&request, catalog, CatalogRequest::Outstanding))
             }
             ApplicationEvent::ModelsRefreshed { request, catalog } => {
-                let accepted = self.state.model_picker.is_active_request(&request);
-                let current = self.state.agent_selection().cloned();
-                self.state
-                    .model_picker
-                    .load(&request, catalog, current.as_ref());
-                self.state.model_picker.finish(&request);
-                if accepted {
-                    self.reconcile_model_options(true);
-                }
-                Ok(ApplicationTransition::Continue)
+                Ok(self.load_model_catalog(&request, catalog, CatalogRequest::Settled))
             }
             ApplicationEvent::ModelListingFailed { request, error } => {
-                let accepted = self.state.model_picker.is_active_request(&request);
-                self.state.model_picker.fail(&request, error);
-                if accepted {
-                    self.reconcile_model_options(true);
-                }
-                Ok(ApplicationTransition::Continue)
+                Ok(self.fail_model_catalog(&request, error))
             }
             ApplicationEvent::LandingAgentSelectionConfirmed(selection) => {
-                if self.state.pending_landing_agent_selection.take().is_none() {
-                    return Ok(ApplicationTransition::Continue);
-                }
-                self.state.confirmed_landing_agent_selection = Some(selection.clone());
-                self.state.submission_error = None;
-                if let Some(queued) = self.state.queued_landing_agent_selection.take()
-                    && queued != selection
-                {
-                    return Ok(self.begin_landing_agent_selection_confirmation(queued));
-                }
-                self.state.landing_agent_selection = Some(selection);
-                Ok(ApplicationTransition::Continue)
+                Ok(self.confirm_landing_agent_selection(selection))
             }
             ApplicationEvent::LandingAgentSelectionConfirmationFailed(error) => {
-                if self.state.pending_landing_agent_selection.take().is_none() {
-                    return Ok(ApplicationTransition::Continue);
-                }
-                if let Some(queued) = self.state.queued_landing_agent_selection.take() {
-                    return Ok(self.begin_landing_agent_selection_confirmation(queued));
-                }
-                self.state.landing_agent_selection =
-                    self.state.confirmed_landing_agent_selection.clone();
-                self.state.submission_error = Some(error);
-                Ok(ApplicationTransition::Continue)
+                Ok(self.fail_landing_agent_selection(error))
             }
             ApplicationEvent::AgentSelectionUpdated {
                 operation_id,
                 selection,
-            } => {
-                if self
-                    .state
-                    .pending_agent_selection
-                    .as_ref()
-                    .is_some_and(|pending| pending.operation_id == operation_id)
-                {
-                    let session_id = self
-                        .state
-                        .pending_agent_selection
-                        .take()
-                        .expect("matching pending Agent Selection exists")
-                        .session_id;
-                    self.state.submission_error = None;
-                    if let Some((queued_session, queued)) = self.state.queued_agent_selection.take()
-                        && queued_session == session_id
-                        && queued != selection
-                    {
-                        self.state.confirmed_agent_selection = Some((session_id, selection));
-                        return self.begin_agent_selection_update(queued_session, queued);
-                    }
-                    self.state.confirmed_agent_selection = Some((session_id, selection));
-                }
-                Ok(ApplicationTransition::Continue)
-            }
+            } => self.settle_agent_selection_update(operation_id, selection),
             ApplicationEvent::AgentSelectionUpdateFailed {
                 operation_id,
                 error,
-            } => {
-                if self
-                    .state
-                    .pending_agent_selection
-                    .as_ref()
-                    .is_some_and(|pending| pending.operation_id == operation_id)
-                {
-                    let session_id = self
-                        .state
-                        .pending_agent_selection
-                        .take()
-                        .expect("matching pending Agent Selection exists")
-                        .session_id;
-                    if let Some((queued_session, queued)) = self.state.queued_agent_selection.take()
-                        && queued_session == session_id
-                    {
-                        // A newer queued selection supersedes this failure.
-                        return self.begin_agent_selection_update(queued_session, queued);
-                    }
-                    // Keep any prior confirmed acceptance: it is newer
-                    // authoritative state than the snapshot base.
-                    self.state.submission_error = Some(error);
+            } => self.fail_agent_selection_update(operation_id, error),
+        }
+    }
+
+    /// Routes a command to the handler for the surface it acts on. The match is
+    /// exhaustive so a newly added [`CommandId`] cannot be silently dropped.
+    fn handle_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
+        if self.state.reconnect_overlay_visible || self.defers_for_agent_selection(&command) {
+            return Ok(ApplicationTransition::Continue);
+        }
+        match command {
+            CommandId::SubmitSteer => Ok(self.submit_prompt(PromptDelivery::Steer)),
+            CommandId::SubmitQueue => Ok(self.submit_prompt(PromptDelivery::Queue)),
+            CommandId::InvokeSemantic(command) => self.invoke_semantic(command),
+            command @ (CommandId::ClearOrExit
+            | CommandId::InsertText(_)
+            | CommandId::PasteText(_)
+            | CommandId::InsertNewline
+            | CommandId::DeleteBackward
+            | CommandId::DeleteForward
+            | CommandId::MoveCursorLeft
+            | CommandId::MoveCursorRight
+            | CommandId::HistoryPrevious
+            | CommandId::HistoryNext) => Ok(self.handle_composer_command(command)),
+            command @ (CommandId::ScrollTranscriptPageUp
+            | CommandId::ScrollTranscriptPageDown
+            | CommandId::ScrollTranscriptLinesUp
+            | CommandId::ScrollTranscriptLinesDown
+            | CommandId::FollowLatest) => Ok(self.handle_transcript_command(command)),
+            command @ (CommandId::SelectPreviousAutocomplete
+            | CommandId::SelectNextAutocomplete
+            | CommandId::DismissAutocomplete
+            | CommandId::SelectAutocomplete) => self.handle_autocomplete_command(command),
+            command @ (CommandId::InsertSessionSearch(_)
+            | CommandId::DeleteSessionSearchBackward
+            | CommandId::SelectPreviousSession
+            | CommandId::SelectNextSession
+            | CommandId::PagePreviousSessions
+            | CommandId::PageNextSessions
+            | CommandId::ToggleSessionScope
+            | CommandId::SelectSession
+            | CommandId::CloseSessionPicker) => Ok(self.handle_session_picker_command(command)),
+            command @ (CommandId::InsertModelSearch(_)
+            | CommandId::DeleteModelSearchBackward
+            | CommandId::SelectPreviousModel
+            | CommandId::SelectNextModel
+            | CommandId::PagePreviousModels
+            | CommandId::PageNextModels
+            | CommandId::SelectModel
+            | CommandId::CloseModelPicker) => self.handle_model_picker_command(command),
+            command @ (CommandId::BeginLeader
+            | CommandId::OpenQueuedPrompts
+            | CommandId::SelectPreviousQueuedPrompt
+            | CommandId::SelectNextQueuedPrompt
+            | CommandId::PromoteSelectedPrompt
+            | CommandId::CancelSelectedPrompt
+            | CommandId::RequestInterrupt
+            | CommandId::ConfirmInterrupt
+            | CommandId::CloseCommandMode) => Ok(self.handle_command_mode_command(command)),
+        }
+    }
+
+    /// Commands that begin a Turn or retarget the Agent wait for an in-flight
+    /// Agent Selection update instead of racing it.
+    fn defers_for_agent_selection(&self, command: &CommandId) -> bool {
+        self.state.selection_update_pending()
+            && matches!(
+                command,
+                CommandId::SubmitSteer
+                    | CommandId::SubmitQueue
+                    | CommandId::SelectSession
+                    | CommandId::SelectModel
+                    | CommandId::InvokeSemantic(
+                        SemanticCommandId::SessionList
+                            | SemanticCommandId::SessionNew
+                            | SemanticCommandId::ModelOptionsApply
+                    )
+            )
+    }
+
+    /// Handles the composer editing commands routed here; any other command
+    /// leaves the composer untouched.
+    fn handle_composer_command(&mut self, command: CommandId) -> ApplicationTransition {
+        match command {
+            CommandId::ClearOrExit => {
+                let key = self.state.composer_key();
+                if self.state.composers.is_empty(key) {
+                    return ApplicationTransition::Exit;
                 }
+                self.state
+                    .edit_composer(|composers, key| composers.clear(key));
+            }
+            CommandId::InsertText(text) => self
+                .state
+                .edit_composer(|composers, key| composers.insert(key, &text)),
+            CommandId::PasteText(text) => self.state.paste_into_composer(&text),
+            CommandId::InsertNewline => self
+                .state
+                .edit_composer(|composers, key| composers.insert(key, "\n")),
+            CommandId::DeleteBackward => self
+                .state
+                .edit_composer(|composers, key| composers.delete_backward(key)),
+            CommandId::DeleteForward => self
+                .state
+                .edit_composer(|composers, key| composers.delete_forward(key)),
+            CommandId::MoveCursorLeft => self
+                .state
+                .navigate_composer(|composers, key| composers.move_left(key)),
+            CommandId::MoveCursorRight => self
+                .state
+                .navigate_composer(|composers, key| composers.move_right(key)),
+            CommandId::HistoryPrevious => self
+                .state
+                .edit_composer(|composers, key| composers.history_previous(key)),
+            CommandId::HistoryNext => self
+                .state
+                .edit_composer(|composers, key| composers.history_next(key)),
+            _ => {}
+        }
+        ApplicationTransition::Continue
+    }
+
+    /// Handles the transcript navigation commands routed here; any other
+    /// command leaves the viewport where it is.
+    fn handle_transcript_command(&mut self, command: CommandId) -> ApplicationTransition {
+        match command {
+            CommandId::ScrollTranscriptPageUp => {
+                self.state.navigate_transcript_page(TranscriptDirection::Up);
+            }
+            CommandId::ScrollTranscriptPageDown => {
+                self.state
+                    .navigate_transcript_page(TranscriptDirection::Down);
+            }
+            CommandId::ScrollTranscriptLinesUp => {
+                self.state
+                    .navigate_transcript_lines(TranscriptDirection::Up);
+            }
+            CommandId::ScrollTranscriptLinesDown => {
+                self.state
+                    .navigate_transcript_lines(TranscriptDirection::Down);
+            }
+            CommandId::FollowLatest => self.state.follow_latest(),
+            _ => {}
+        }
+        ApplicationTransition::Continue
+    }
+
+    /// Handles the slash command autocomplete commands routed here; any other
+    /// command leaves the suggestion list alone.
+    fn handle_autocomplete_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
+        match command {
+            CommandId::SelectPreviousAutocomplete => {
+                self.state.command_autocomplete.select_previous();
+            }
+            CommandId::SelectNextAutocomplete => self.state.command_autocomplete.select_next(),
+            CommandId::DismissAutocomplete => {
+                let key = self.state.composer_key();
+                let text = self.state.composers.text(key);
+                self.state.command_autocomplete.dismiss_for_text(text);
+            }
+            CommandId::SelectAutocomplete => return self.accept_autocomplete(),
+            _ => {}
+        }
+        Ok(ApplicationTransition::Continue)
+    }
+
+    fn accept_autocomplete(&mut self) -> Result<ApplicationTransition> {
+        let Some(command) = self.state.command_autocomplete.selected() else {
+            return Ok(ApplicationTransition::Continue);
+        };
+        if self.state.selection_update_pending()
+            && matches!(
+                command,
+                SemanticCommandId::SessionList | SemanticCommandId::SessionNew
+            )
+        {
+            return Ok(ApplicationTransition::Continue);
+        }
+        let key = self.state.composer_key();
+        self.state.composers.clear(key);
+        self.state.sync_command_autocomplete();
+        self.invoke_semantic(command)
+    }
+
+    /// Handles the Session picker commands routed here; any other command
+    /// leaves the picker alone.
+    fn handle_session_picker_command(&mut self, command: CommandId) -> ApplicationTransition {
+        match command {
+            CommandId::InsertSessionSearch(text) => {
+                self.edit_session_picker(|picker| picker.insert(&text));
+            }
+            CommandId::DeleteSessionSearchBackward => {
+                self.edit_session_picker(SessionPicker::delete_backward);
+            }
+            CommandId::SelectPreviousSession => {
+                self.edit_session_picker(SessionPicker::select_previous);
+            }
+            CommandId::SelectNextSession => self.edit_session_picker(SessionPicker::select_next),
+            CommandId::PagePreviousSessions => {
+                self.edit_session_picker(SessionPicker::page_previous);
+            }
+            CommandId::PageNextSessions => self.edit_session_picker(SessionPicker::page_next),
+            CommandId::ToggleSessionScope => {
+                if self.state.session_picker.is_busy() {
+                    return ApplicationTransition::Continue;
+                }
+                let request = self.state.session_picker.toggle_scope();
+                return ApplicationTransition::ListSessions(request);
+            }
+            CommandId::SelectSession => {
+                return self.state.session_picker.begin_attachment().map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::AttachSession,
+                );
+            }
+            CommandId::CloseSessionPicker => self.edit_session_picker(SessionPicker::close),
+            _ => {}
+        }
+        ApplicationTransition::Continue
+    }
+
+    /// Handles the Model picker commands routed here; any other command leaves
+    /// the picker alone.
+    fn handle_model_picker_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
+        match command {
+            CommandId::InsertModelSearch(text) => self.state.model_picker.insert(&text),
+            CommandId::DeleteModelSearchBackward => self.state.model_picker.delete_backward(),
+            CommandId::SelectPreviousModel => self.state.model_picker.select_previous(),
+            CommandId::SelectNextModel => self.state.model_picker.select_next(),
+            CommandId::PagePreviousModels => self.state.model_picker.page_previous(),
+            CommandId::PageNextModels => self.state.model_picker.page_next(),
+            CommandId::CloseModelPicker => self.state.model_picker.close(),
+            CommandId::SelectModel => return self.choose_model(),
+            _ => {}
+        }
+        Ok(ApplicationTransition::Continue)
+    }
+
+    fn choose_model(&mut self) -> Result<ApplicationTransition> {
+        match self.state.model_picker.choose() {
+            Some(ModelPickerAction::Retry) => Ok(self.state.model_picker.begin_retry().map_or(
+                ApplicationTransition::Continue,
+                ApplicationTransition::ListModels,
+            )),
+            Some(ModelPickerAction::Select(model)) => {
+                self.state.model_picker.close();
+                if model.options.is_empty() {
+                    return self.apply_agent_selection(model.default_agent_selection());
+                }
+                let current = self.state.agent_selection().cloned();
+                self.state.model_options.open(model, current.as_ref());
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::SessionAttachmentFailed(error) => {
-                let request = self.state.session_picker.fail_attachment(error);
-                Ok(ApplicationTransition::ListSessions(request))
+            None => Ok(ApplicationTransition::Continue),
+        }
+    }
+
+    /// Handles the leader, queued Prompt, and interrupt confirmation commands
+    /// routed here; any other command leaves the command mode alone.
+    fn handle_command_mode_command(&mut self, command: CommandId) -> ApplicationTransition {
+        match command {
+            CommandId::BeginLeader => self.state.command_mode = CommandMode::Leader,
+            CommandId::CloseCommandMode => self.state.command_mode = CommandMode::Composer,
+            CommandId::OpenQueuedPrompts => self.open_queued_prompts(),
+            CommandId::SelectPreviousQueuedPrompt => {
+                self.select_queued_prompt(QueuedPromptStep::Previous);
             }
-            ApplicationEvent::SessionDeletionFailed { session_id, error } => {
-                self.state.session_picker.fail_deletion(session_id, error);
-                Ok(ApplicationTransition::Continue)
+            CommandId::SelectNextQueuedPrompt => {
+                self.select_queued_prompt(QueuedPromptStep::Next);
             }
-            ApplicationEvent::SessionCreated(snapshot) => {
-                self.state.apply_created_session(snapshot)?;
-                Ok(ApplicationTransition::Continue)
+            CommandId::PromoteSelectedPrompt => {
+                return self.settle_selected_prompt(|session_id, prompt_id| {
+                    ApplicationTransition::PromotePrompt {
+                        session_id,
+                        prompt_id,
+                    }
+                });
             }
-            ApplicationEvent::SessionOperationFailed(error) => {
-                self.state.submission_error = Some(error);
-                Ok(ApplicationTransition::Continue)
+            CommandId::CancelSelectedPrompt => {
+                return self.settle_selected_prompt(|session_id, prompt_id| {
+                    ApplicationTransition::CancelPrompt {
+                        session_id,
+                        prompt_id,
+                    }
+                });
+            }
+            CommandId::RequestInterrupt => {
+                if let Some(turn_id) = self.state.active_turn_id() {
+                    self.state.command_mode = CommandMode::InterruptConfirmation { turn_id };
+                }
+            }
+            CommandId::ConfirmInterrupt => return self.confirm_interrupt(),
+            _ => {}
+        }
+        ApplicationTransition::Continue
+    }
+
+    fn open_queued_prompts(&mut self) {
+        let Some(session_id) = self.session_id() else {
+            self.state.command_mode = CommandMode::Composer;
+            return;
+        };
+        self.state.command_mode =
+            self.state
+                .queued_prompts(session_id)
+                .first()
+                .map_or(CommandMode::Composer, |prompt| CommandMode::QueuedPrompts {
+                    selected: prompt.id,
+                });
+    }
+
+    fn select_queued_prompt(&mut self, step: QueuedPromptStep) {
+        let (Some(session_id), CommandMode::QueuedPrompts { selected }) =
+            (self.session_id(), self.state.command_mode)
+        else {
+            return;
+        };
+        let queued = self.state.queued_prompts(session_id);
+        let Some(index) = queued.iter().position(|prompt| prompt.id == selected) else {
+            return;
+        };
+        let next = match step {
+            QueuedPromptStep::Previous => index.saturating_sub(1),
+            QueuedPromptStep::Next => (index + 1).min(queued.len().saturating_sub(1)),
+        };
+        self.state.command_mode = CommandMode::QueuedPrompts {
+            selected: queued[next].id,
+        };
+    }
+
+    fn settle_selected_prompt(
+        &mut self,
+        settle: impl FnOnce(SessionId, PromptId) -> ApplicationTransition,
+    ) -> ApplicationTransition {
+        let (Some(session_id), CommandMode::QueuedPrompts { selected }) =
+            (self.session_id(), self.state.command_mode)
+        else {
+            return ApplicationTransition::Continue;
+        };
+        self.state.command_mode = CommandMode::Composer;
+        settle(session_id, selected)
+    }
+
+    fn confirm_interrupt(&mut self) -> ApplicationTransition {
+        let (Some(session_id), CommandMode::InterruptConfirmation { turn_id }) =
+            (self.session_id(), self.state.command_mode)
+        else {
+            return ApplicationTransition::Continue;
+        };
+        self.state.command_mode = CommandMode::Composer;
+        ApplicationTransition::InterruptTurn {
+            session_id,
+            turn_id,
+        }
+    }
+
+    fn submit_prompt(&mut self, delivery: PromptDelivery) -> ApplicationTransition {
+        if self.state.pending_submission.is_some() {
+            return ApplicationTransition::Continue;
+        }
+        let key = self.state.composer_key();
+        if self.state.composers.text(key).trim().is_empty() {
+            self.state.submission_error =
+                Some("Prompt must contain non-whitespace text".to_owned());
+            return ApplicationTransition::Continue;
+        }
+        let prompt = self.state.composers.begin_submission(key);
+        self.state.sync_command_autocomplete();
+        self.state.failed_submissions.remove(&prompt.id);
+        self.state.submission_error = None;
+        if let ComposerKey::Session(session_id) = key {
+            self.state.pending_submission = Some(PendingSubmission {
+                source: key,
+                target: SubmissionTarget::AdmitPrompt(session_id, delivery),
+                prompt: prompt.clone(),
+            });
+            return ApplicationTransition::AdmitPrompt {
+                session_id,
+                request: AdmitPromptRequest { prompt, delivery },
+            };
+        }
+        self.state.pending_submission = Some(PendingSubmission {
+            source: key,
+            target: SubmissionTarget::CreateSession,
+            prompt: prompt.clone(),
+        });
+        ApplicationTransition::CreateSession(CreateSessionRequest {
+            agent_selection: self.state.landing_agent_selection.clone(),
+            workspace: Workspace {
+                path: self.state.workspace.clone(),
+            },
+            prompt,
+        })
+    }
+
+    fn elapse_reconnect_grace(&mut self) -> ApplicationTransition {
+        if self.state.recovery.is_some() {
+            self.state.reconnect_overlay_visible = true;
+        }
+        ApplicationTransition::Continue
+    }
+
+    fn handle_managed_event(&mut self, event: ManagedEvent) -> Result<ApplicationTransition> {
+        match event {
+            ManagedEvent::Fatal(error) => Err(anyhow!(error)),
+            event @ ManagedEvent::ServerShutdown(_) => {
+                self.state.apply(event);
+                Ok(ApplicationTransition::Exit)
+            }
+            event => {
+                let had_session = self.state.session.is_some();
+                self.state.apply(event);
+                self.state.reconcile_command_mode();
+                if had_session && self.state.session.is_none() {
+                    Ok(ApplicationTransition::SessionEnded)
+                } else {
+                    Ok(ApplicationTransition::Continue)
+                }
             }
         }
+    }
+
+    fn attach_session(&mut self, snapshot: SessionSnapshot) -> Result<ApplicationTransition> {
+        let closes_picker = self.state.session_picker.attaching_to(snapshot.session.id);
+        self.state.apply_attached_session(snapshot)?;
+        if closes_picker {
+            self.state.session_picker.close();
+        }
+        Ok(ApplicationTransition::Continue)
+    }
+
+    fn load_model_catalog(
+        &mut self,
+        request: &ModelListRequest,
+        catalog: ModelCatalog,
+        state: CatalogRequest,
+    ) -> ApplicationTransition {
+        let accepted = self.state.model_picker.is_active_request(request);
+        let current = self.state.agent_selection().cloned();
+        self.state
+            .model_picker
+            .load(request, catalog, current.as_ref());
+        if state == CatalogRequest::Settled {
+            self.state.model_picker.finish(request);
+        }
+        if accepted {
+            self.reconcile_model_options(state);
+        }
+        ApplicationTransition::Continue
+    }
+
+    fn fail_model_catalog(
+        &mut self,
+        request: &ModelListRequest,
+        error: String,
+    ) -> ApplicationTransition {
+        let accepted = self.state.model_picker.is_active_request(request);
+        self.state.model_picker.fail(request, error);
+        if accepted {
+            self.reconcile_model_options(CatalogRequest::Settled);
+        }
+        ApplicationTransition::Continue
+    }
+
+    fn confirm_landing_agent_selection(
+        &mut self,
+        selection: AgentSelection,
+    ) -> ApplicationTransition {
+        if self.state.pending_landing_agent_selection.take().is_none() {
+            return ApplicationTransition::Continue;
+        }
+        self.state.confirmed_landing_agent_selection = Some(selection.clone());
+        self.state.submission_error = None;
+        if let Some(queued) = self.state.queued_landing_agent_selection.take()
+            && queued != selection
+        {
+            return self.begin_landing_agent_selection_confirmation(queued);
+        }
+        self.state.landing_agent_selection = Some(selection);
+        ApplicationTransition::Continue
+    }
+
+    fn fail_landing_agent_selection(&mut self, error: String) -> ApplicationTransition {
+        if self.state.pending_landing_agent_selection.take().is_none() {
+            return ApplicationTransition::Continue;
+        }
+        if let Some(queued) = self.state.queued_landing_agent_selection.take() {
+            return self.begin_landing_agent_selection_confirmation(queued);
+        }
+        self.state.landing_agent_selection = self.state.confirmed_landing_agent_selection.clone();
+        self.state.submission_error = Some(error);
+        ApplicationTransition::Continue
+    }
+
+    /// Settles the in-flight Agent Selection update named by `operation_id`,
+    /// reporting the Session it targeted. `None` means a newer operation has
+    /// already replaced it, so the result is stale.
+    fn take_pending_agent_selection(
+        &mut self,
+        operation_id: AgentSelectionOperationId,
+    ) -> Option<SessionId> {
+        let settles = self
+            .state
+            .pending_agent_selection
+            .as_ref()
+            .is_some_and(|pending| pending.operation_id == operation_id);
+        settles.then(|| {
+            self.state
+                .pending_agent_selection
+                .take()
+                .expect("matching pending Agent Selection exists")
+                .session_id
+        })
+    }
+
+    fn settle_agent_selection_update(
+        &mut self,
+        operation_id: AgentSelectionOperationId,
+        selection: AgentSelection,
+    ) -> Result<ApplicationTransition> {
+        let Some(session_id) = self.take_pending_agent_selection(operation_id) else {
+            return Ok(ApplicationTransition::Continue);
+        };
+        self.state.submission_error = None;
+        if let Some((queued_session, queued)) = self.state.queued_agent_selection.take()
+            && queued_session == session_id
+            && queued != selection
+        {
+            self.state.confirmed_agent_selection = Some((session_id, selection));
+            return self.begin_agent_selection_update(queued_session, queued);
+        }
+        self.state.confirmed_agent_selection = Some((session_id, selection));
+        Ok(ApplicationTransition::Continue)
+    }
+
+    fn fail_agent_selection_update(
+        &mut self,
+        operation_id: AgentSelectionOperationId,
+        error: String,
+    ) -> Result<ApplicationTransition> {
+        let Some(session_id) = self.take_pending_agent_selection(operation_id) else {
+            return Ok(ApplicationTransition::Continue);
+        };
+        if let Some((queued_session, queued)) = self.state.queued_agent_selection.take()
+            && queued_session == session_id
+        {
+            // A newer queued selection supersedes this failure.
+            return self.begin_agent_selection_update(queued_session, queued);
+        }
+        // Keep any prior confirmed acceptance: it is newer authoritative state
+        // than the snapshot base.
+        self.state.submission_error = Some(error);
+        Ok(ApplicationTransition::Continue)
     }
 
     fn invoke_semantic(&mut self, command: SemanticCommandId) -> Result<ApplicationTransition> {
@@ -1549,7 +1657,7 @@ impl Application {
                 self.state.pending_model_options = true;
                 self.state.submission_error = None;
                 let request = self.state.model_picker.begin_refresh();
-                self.reconcile_model_options(false);
+                self.reconcile_model_options(CatalogRequest::Outstanding);
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::ListModels(request))
             }
@@ -1687,7 +1795,7 @@ impl Application {
         })
     }
 
-    fn reconcile_model_options(&mut self, catalog_request_settled: bool) {
+    fn reconcile_model_options(&mut self, request: CatalogRequest) {
         if self.state.model_options.is_open() {
             let current_model = self
                 .state
@@ -1697,7 +1805,7 @@ impl Application {
             if let Some((provider, model)) = current_model {
                 if let Some(refreshed) = self.state.model_picker.cached_model(&provider, &model) {
                     self.state.model_options.refresh(refreshed);
-                } else if catalog_request_settled {
+                } else if request == CatalogRequest::Settled {
                     self.state.model_options.mark_model_unavailable();
                 }
             }
@@ -1711,7 +1819,7 @@ impl Application {
             .model_picker
             .cached_model_for_options(current.as_ref())
         else {
-            if catalog_request_settled {
+            if request == CatalogRequest::Settled {
                 self.state.pending_model_options = false;
                 self.state.submission_error =
                     Some("No concrete Model is available; use /models to choose one".to_owned());
@@ -1719,7 +1827,7 @@ impl Application {
             return;
         };
         if model.options.is_empty() {
-            if catalog_request_settled {
+            if request == CatalogRequest::Settled {
                 self.state.pending_model_options = false;
             }
             self.state.submission_error = Some(format!(
