@@ -14,20 +14,37 @@ pub(crate) enum Fragment {
 enum State {
     #[default]
     Ground,
-    Escape(String),
+    Escape {
+        sequence: String,
+        has_intermediate: bool,
+    },
     Csi(String),
-    Osc {
+    String {
+        kind: StringKind,
         sequence: String,
         escape_pending: bool,
     },
-    Dcs {
-        sequence: String,
-        escape_pending: bool,
-    },
-    Apc {
-        sequence: String,
-        escape_pending: bool,
-    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StringKind {
+    Osc,
+    Dcs,
+    Apc,
+}
+
+impl StringKind {
+    fn is_terminated_by(self, character: char, escape_pending: bool) -> bool {
+        (matches!(self, Self::Osc) && character == '\x07') || (escape_pending && character == '\\')
+    }
+
+    fn into_fragment(self, sequence: String) -> Fragment {
+        match self {
+            Self::Osc => Fragment::Osc(sequence),
+            Self::Dcs => Fragment::Dcs(sequence),
+            Self::Apc => Fragment::Apc(sequence),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -45,7 +62,10 @@ impl AnsiScanner {
                     if !text.is_empty() {
                         fragments.push(Fragment::Text(std::mem::take(&mut text)));
                     }
-                    self.state = State::Escape(character.to_string());
+                    self.state = State::Escape {
+                        sequence: character.to_string(),
+                        has_intermediate: false,
+                    };
                 }
                 State::Ground if character.is_control() || character == '\x7f' => {
                     if !text.is_empty() {
@@ -54,30 +74,43 @@ impl AnsiScanner {
                     fragments.push(Fragment::Control(character));
                 }
                 State::Ground => text.push(character),
-                State::Escape(mut sequence) => {
+                State::Escape {
+                    mut sequence,
+                    has_intermediate,
+                } => {
                     sequence.push(character);
-                    match character {
-                        '[' => self.state = State::Csi(sequence),
-                        ']' => {
-                            self.state = State::Osc {
+                    match (has_intermediate, character) {
+                        (false, '[') => self.state = State::Csi(sequence),
+                        (false, ']') => {
+                            self.state = State::String {
+                                kind: StringKind::Osc,
                                 sequence,
                                 escape_pending: false,
                             };
                         }
-                        'P' => {
-                            self.state = State::Dcs {
+                        (false, 'P') => {
+                            self.state = State::String {
+                                kind: StringKind::Dcs,
                                 sequence,
                                 escape_pending: false,
                             };
                         }
-                        '_' => {
-                            self.state = State::Apc {
+                        (false, '_') => {
+                            self.state = State::String {
+                                kind: StringKind::Apc,
                                 sequence,
                                 escape_pending: false,
                             };
                         }
-                        '\u{20}'..='\u{2f}' => self.state = State::Escape(sequence),
-                        '\u{30}'..='\u{7e}' => fragments.push(Fragment::Escape(sequence)),
+                        (_, '\u{20}'..='\u{2f}') => {
+                            self.state = State::Escape {
+                                sequence,
+                                has_intermediate: true,
+                            };
+                        }
+                        (_, '\u{30}'..='\u{7e}') => {
+                            fragments.push(Fragment::Escape(sequence));
+                        }
                         _ => {}
                     }
                 }
@@ -93,43 +126,17 @@ impl AnsiScanner {
                         self.state = State::Csi(sequence);
                     }
                 }
-                State::Osc {
+                State::String {
+                    kind,
                     mut sequence,
                     escape_pending,
                 } => {
                     sequence.push(character);
-                    if character == '\x07' || (escape_pending && character == '\\') {
-                        fragments.push(Fragment::Osc(sequence));
+                    if kind.is_terminated_by(character, escape_pending) {
+                        fragments.push(kind.into_fragment(sequence));
                     } else {
-                        self.state = State::Osc {
-                            sequence,
-                            escape_pending: character == '\x1b',
-                        };
-                    }
-                }
-                State::Dcs {
-                    mut sequence,
-                    escape_pending,
-                } => {
-                    sequence.push(character);
-                    if escape_pending && character == '\\' {
-                        fragments.push(Fragment::Dcs(sequence));
-                    } else {
-                        self.state = State::Dcs {
-                            sequence,
-                            escape_pending: character == '\x1b',
-                        };
-                    }
-                }
-                State::Apc {
-                    mut sequence,
-                    escape_pending,
-                } => {
-                    sequence.push(character);
-                    if escape_pending && character == '\\' {
-                        fragments.push(Fragment::Apc(sequence));
-                    } else {
-                        self.state = State::Apc {
+                        self.state = State::String {
+                            kind,
                             sequence,
                             escape_pending: character == '\x1b',
                         };
@@ -213,6 +220,22 @@ mod tests {
             vec![
                 Fragment::Escape("\x1b(B".to_owned()),
                 Fragment::Escape("\x1b7".to_owned()),
+                Fragment::Text("after".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn escape_introducer_bytes_are_finals_after_an_intermediate() {
+        let mut scanner = AnsiScanner::default();
+
+        assert_eq!(
+            scanner.feed("\x1b([\x1b(]\x1b(P\x1b(_after"),
+            vec![
+                Fragment::Escape("\x1b([".to_owned()),
+                Fragment::Escape("\x1b(]".to_owned()),
+                Fragment::Escape("\x1b(P".to_owned()),
+                Fragment::Escape("\x1b(_".to_owned()),
                 Fragment::Text("after".to_owned()),
             ]
         );
