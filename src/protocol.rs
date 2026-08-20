@@ -454,6 +454,9 @@ pub enum Activity {
         command: String,
         cwd: Option<PathBuf>,
         output: String,
+        /// Whether Suru's cap cut the stored output short of what the Provider
+        /// sent, so a client can say so without reading it out of `output`.
+        output_truncated: bool,
         exit_status: Option<i32>,
     },
     FileChange {
@@ -611,6 +614,9 @@ pub struct Message {
     pub role: MessageRole,
     pub status: MessageStatus,
     pub content: String,
+    /// Whether Suru's cap cut the stored content short of what the Provider
+    /// sent, so a client can say so without reading it out of `content`.
+    pub truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -674,6 +680,9 @@ pub enum SessionChange {
         message_id: MessageId,
         content: String,
     },
+    MessageTruncated {
+        message_id: MessageId,
+    },
     MessageCompleted {
         message_id: MessageId,
     },
@@ -683,6 +692,9 @@ pub enum SessionChange {
     CommandOutputAppended {
         activity_id: ActivityId,
         content: String,
+    },
+    CommandOutputTruncated {
+        activity_id: ActivityId,
     },
     CommandStatusChanged {
         activity_id: ActivityId,

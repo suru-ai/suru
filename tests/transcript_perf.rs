@@ -80,6 +80,7 @@ fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
                 role: MessageRole::User,
                 status: MessageStatus::Completed,
                 content: format!("User question for section {section} with a bit of extra text"),
+                truncated: false,
             },
             Message {
                 id: agent_message_id,
@@ -87,6 +88,7 @@ fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
                 role: MessageRole::Agent,
                 status: MessageStatus::Completed,
                 content: agent_markdown(section),
+                truncated: false,
             },
         ]);
         snapshot.activities.push(Activity::Command {
@@ -96,6 +98,7 @@ fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
             command: format!("cargo build --package section-{section}"),
             cwd: None,
             output: command_output(),
+            output_truncated: false,
             exit_status: Some(0),
         });
         snapshot.transcript.extend([

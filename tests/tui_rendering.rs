@@ -313,6 +313,7 @@ fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
             "\x1bPdevice payload\x1b\\\x1b_hidden app data\x1b\\\0\x7fline"
         )
         .to_owned(),
+        output_truncated: false,
         exit_status: Some(0),
     });
     snapshot
@@ -376,6 +377,7 @@ fn all_base_ansi_foregrounds_and_backgrounds_render_through_the_theme_palette() 
         command: "show ANSI palette".to_owned(),
         cwd: None,
         output,
+        output_truncated: false,
         exit_status: Some(0),
     });
     snapshot
@@ -430,6 +432,7 @@ fn escape_laden_transcript_stays_clean_after_scroll_and_session_switch() {
         command: "artifact-repro".to_owned(),
         cwd: None,
         output: "artifact marker \x1b[31mred\x1b[0m\x1b[2K\x1b]0;title\x07".to_owned(),
+        output_truncated: false,
         exit_status: Some(0),
     });
     escaped
@@ -503,6 +506,7 @@ fn activity_sgr_styles_patch_over_each_activity_base_style() {
                 "\x1b[2mdim text\x1b[0m \x1b[3mitalic text\x1b[0m"
             )
             .to_owned(),
+            output_truncated: false,
             exit_status: Some(0),
         },
     ];
@@ -567,6 +571,7 @@ fn command_output_osc_8_hyperlinks_render_with_link_style() {
             "ST: \x1b]8;;https://example.com/st\x1b\\st link\x1b]8;;\x1b\\"
         )
         .to_owned(),
+        output_truncated: false,
         exit_status: Some(0),
     };
     snapshot.transcript.push(TranscriptItem::Activity {
@@ -4533,6 +4538,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                         role: MessageRole::User,
                         status: MessageStatus::Completed,
                         content: "Continue with an active Agent".to_owned(),
+                        truncated: false,
                     },
                 },
             ],
@@ -4996,6 +5002,7 @@ fn command_activities_render_active_successful_and_failed_states_at_responsive_w
             command: "cargo test".to_owned(),
             cwd: Some("/fixture/work".into()),
             output: "running tests\ntest result available\n".to_owned(),
+            output_truncated: false,
             exit_status,
         };
         let mut application = connected_application(workspace.path());
@@ -5135,6 +5142,7 @@ fn streaming_command_updates_reuse_one_projected_transcript_row() {
         command: "cargo test".to_owned(),
         cwd: None,
         output: String::new(),
+        output_truncated: false,
         exit_status: None,
     };
     let initial_revision = snapshot.revision;
@@ -6129,6 +6137,7 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                             role: MessageRole::User,
                             status: MessageStatus::Completed,
                             content: request.prompt.text.clone(),
+                            truncated: false,
                         },
                     },
                 ],
@@ -6535,6 +6544,7 @@ fn enter_active_session(
         role: MessageRole::User,
         status: MessageStatus::Completed,
         content: "Long-running work".to_owned(),
+        truncated: false,
     });
     snapshot
         .transcript
@@ -6714,6 +6724,7 @@ fn navigable_session_snapshot(
                 role: MessageRole::User,
                 status: MessageStatus::Completed,
                 content: format!("Prompt section {section}"),
+                truncated: false,
             },
             Message {
                 id: agent_message_id,
@@ -6723,6 +6734,7 @@ fn navigable_session_snapshot(
                 content: format!(
                     "## Agent section {section}\n\nA multiline Markdown response for section {section}."
                 ),
+                truncated: false,
             },
         ]);
         snapshot.transcript.extend([
@@ -6781,6 +6793,7 @@ impl FailedTurnFixture {
                 role: MessageRole::User,
                 status: MessageStatus::Completed,
                 content: text.to_owned(),
+                truncated: false,
             },
             activity: Activity::Error {
                 id: ActivityId::new(),

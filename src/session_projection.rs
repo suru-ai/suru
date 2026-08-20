@@ -120,6 +120,9 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 if message.role == MessageRole::User && message.status != MessageStatus::Completed {
                     bail!("User Messages cannot stream");
                 }
+                if message.truncated {
+                    bail!("Session update added a Message outside its initial state");
+                }
                 next.messages.push(message.clone());
                 next.transcript.push(TranscriptItem::Message {
                     message_id: message.id,
@@ -141,6 +144,20 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update can only append to a streaming Agent Message");
                 }
                 message.content.push_str(content);
+            }
+            SessionChange::MessageTruncated { message_id } => {
+                let Some(message) = next
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == *message_id)
+                else {
+                    bail!("Session update referenced an unknown Message");
+                };
+                if message.role != MessageRole::Agent || message.status != MessageStatus::Streaming
+                {
+                    bail!("Session update can only truncate a streaming Agent Message");
+                }
+                message.truncated = true;
             }
             SessionChange::MessageCompleted { message_id } => {
                 let Some(message) = next
@@ -172,10 +189,12 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     Activity::Command {
                         status,
                         output,
+                        output_truncated,
                         exit_status,
                         ..
                     } if *status != ActivityStatus::Active
                         || !output.is_empty()
+                        || *output_truncated
                         || exit_status.is_some()
                 ) {
                     bail!("Session update added a command Activity outside its initial state");
@@ -210,6 +229,27 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update appended output to a terminal command Activity");
                 }
                 output.push_str(content);
+            }
+            SessionChange::CommandOutputTruncated { activity_id } => {
+                let Some(activity) = next
+                    .activities
+                    .iter_mut()
+                    .find(|activity| activity.id() == *activity_id)
+                else {
+                    bail!("Session update referenced an unknown Activity");
+                };
+                let Activity::Command {
+                    status,
+                    output_truncated,
+                    ..
+                } = activity
+                else {
+                    bail!("Session update truncated the output of a different Activity kind");
+                };
+                if *status != ActivityStatus::Active {
+                    bail!("Session update truncated the output of a terminal command Activity");
+                }
+                *output_truncated = true;
             }
             SessionChange::CommandStatusChanged {
                 activity_id,

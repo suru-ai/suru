@@ -693,15 +693,20 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
     );
     let Activity::Command {
         output: truncated_output,
+        output_truncated,
         ..
     } = &completed.activities[1]
     else {
         panic!("second Provider command projects as command Activity");
     };
+    assert!(
+        output_truncated,
+        "the cap that cut the stream short is stored as a typed signal"
+    );
     let truncated_text = truncated_output
         .strip_prefix("\x1b[31m")
-        .and_then(|output| output.strip_suffix("\x1b[0m\n[output truncated]"))
-        .expect("truncated styled output is bounded by complete SGR sequences and marked");
+        .and_then(|output| output.strip_suffix("\x1b[0m"))
+        .expect("truncated styled output is bounded by complete SGR sequences");
     assert_eq!(truncated_text.len(), 65_520);
     assert!(truncated_text.chars().all(|character| character == 'x'));
     let Activity::Command {
@@ -721,11 +726,19 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
     };
     assert_eq!(redrawn_output, "\x1b[32mdone\x1b[0m\n");
     assert_eq!(completed.messages[1].content, "\x1b[1;32mHello    world\n");
+    assert!(
+        !completed.messages[1].truncated,
+        "a Message that ran to its end is stored untruncated"
+    );
+    assert!(
+        completed.messages[2].truncated,
+        "the cap that cut the Message short is stored as a typed signal"
+    );
     let truncated_prose = completed.messages[2]
         .content
         .strip_prefix("\x1b[31m")
-        .and_then(|content| content.strip_suffix("\x1b[0m\n[Message truncated]"))
-        .expect("a truncated Message is bounded by complete SGR sequences and marked");
+        .and_then(|content| content.strip_suffix("\x1b[0m"))
+        .expect("a truncated Message is bounded by complete SGR sequences");
     assert_eq!(truncated_prose.len(), 524_270);
     assert!(truncated_prose.chars().all(|character| character == 'y'));
 
@@ -3219,6 +3232,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                         role: MessageRole::User,
                         status: MessageStatus::Completed,
                         content: "Long-running work".to_owned(),
+                        truncated: false,
                     },
                 },
             ],
@@ -4696,6 +4710,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
                         role: MessageRole::User,
                         status: MessageStatus::Completed,
                         content: "Continue with an active Agent".to_owned(),
+                        truncated: false,
                     },
                 },
             ],
@@ -5220,6 +5235,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
                         role: MessageRole::User,
                         status: MessageStatus::Completed,
                         content: "Keep working while detached".to_owned(),
+                        truncated: false,
                     },
                 },
                 SessionChange::SessionStatusChanged {
@@ -5400,6 +5416,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
                         role: MessageRole::User,
                         status: MessageStatus::Completed,
                         content: "Observe this change".to_owned(),
+                        truncated: false,
                     },
                 },
                 SessionChange::ActivityAdded {
@@ -5673,6 +5690,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             role: MessageRole::User,
             status: MessageStatus::Completed,
             content: "Explain this workspace".to_owned(),
+            truncated: false,
         }],
         activities: vec![Activity::Error {
             id: activity_id,

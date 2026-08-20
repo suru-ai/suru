@@ -12,6 +12,7 @@ use std::{
 use anyhow::anyhow;
 use tokio::sync::broadcast;
 
+use crate::ansi::NormalizedText;
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
     AgentSelection, AgentSelectionOperationId, CreateSessionRequest, Message, MessageId,
@@ -164,7 +165,7 @@ pub(crate) enum ProviderTurnOutcome {
 /// actor holds those normalizers, while which streams are still in flight is the
 /// store's own knowledge, so a settle path that cannot reach the actor carries
 /// an empty one and still settles every stream the Turn left open.
-pub(crate) type TrailingCommandOutput = HashMap<ActivityId, String>;
+pub(crate) type TrailingCommandOutput = HashMap<ActivityId, NormalizedText>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ListSessionsError {
@@ -1244,6 +1245,17 @@ impl SessionStore {
         session_id: SessionId,
         change: SessionChange,
     ) -> anyhow::Result<SessionUpdate> {
+        self.publish_agent_output_changes(session_id, vec![change])
+    }
+
+    /// Publishes Agent output whose changes describe one step of a Provider
+    /// stream, as a single update so a client never observes content apart
+    /// from the truncation that ended it.
+    pub(crate) fn publish_agent_output_changes(
+        &self,
+        session_id: SessionId,
+        changes: Vec<SessionChange>,
+    ) -> anyhow::Result<SessionUpdate> {
         let mut state = self
             .state
             .lock()
@@ -1253,15 +1265,17 @@ impl SessionStore {
                 .sessions
                 .get(&session_id)
                 .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
-            let turn_id = agent_output_turn_id(&record.snapshot, &change)?;
-            let turn = record
-                .snapshot
-                .turns
-                .iter()
-                .find(|turn| turn.id == turn_id)
-                .ok_or_else(|| anyhow!("Agent output referenced an unknown Turn"))?;
-            if turn.status != TurnStatus::Active {
-                return Err(anyhow!("Agent output referenced a terminal Turn"));
+            for change in &changes {
+                let turn_id = agent_output_turn_id(&record.snapshot, change)?;
+                let turn = record
+                    .snapshot
+                    .turns
+                    .iter()
+                    .find(|turn| turn.id == turn_id)
+                    .ok_or_else(|| anyhow!("Agent output referenced an unknown Turn"))?;
+                if turn.status != TurnStatus::Active {
+                    return Err(anyhow!("Agent output referenced a terminal Turn"));
+                }
             }
         }
         let updated_at = state.next_timestamp();
@@ -1269,7 +1283,7 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        record.commit(&self.storage, session_id, vec![change], updated_at)
+        record.commit(&self.storage, session_id, changes, updated_at)
     }
 
     pub(crate) fn continuation_boundary(
@@ -1325,6 +1339,7 @@ impl SessionStore {
                         role: MessageRole::User,
                         status: MessageStatus::Completed,
                         content: prompt.text.clone(),
+                        truncated: false,
                     },
                 },
             ]);
@@ -1518,6 +1533,51 @@ fn model_option_value_text(value: &ModelOptionValue) -> String {
     }
 }
 
+/// The changes that carry one step of normalized Agent Message content into a
+/// Session: the content the Provider sent, and the truncation if Suru's cap
+/// ended the stream there. Both travel as data, so no client has to read a
+/// marker back out of the content.
+pub(crate) fn message_content_changes(
+    message_id: MessageId,
+    content: NormalizedText,
+) -> Vec<SessionChange> {
+    let NormalizedText { content, truncated } = content;
+    let mut changes = Vec::new();
+    if !content.is_empty() {
+        changes.push(SessionChange::MessageContentAppended {
+            message_id,
+            content,
+        });
+    }
+    if truncated {
+        changes.push(SessionChange::MessageTruncated { message_id });
+    }
+    changes
+}
+
+/// The changes that carry one step of normalized command output into a
+/// Session, on the same terms as [`message_content_changes`].
+pub(crate) fn command_output_changes(
+    activity_id: ActivityId,
+    output: NormalizedText,
+) -> Vec<SessionChange> {
+    let NormalizedText {
+        content,
+        truncated: output_truncated,
+    } = output;
+    let mut changes = Vec::new();
+    if !content.is_empty() {
+        changes.push(SessionChange::CommandOutputAppended {
+            activity_id,
+            content,
+        });
+    }
+    if output_truncated {
+        changes.push(SessionChange::CommandOutputTruncated { activity_id });
+    }
+    changes
+}
+
 /// The changes that settle everything a Turn left in flight: its streaming Agent
 /// Message completes, and each command or file-change Activity still Active
 /// fails, every command first storing the trailing output its normalizer
@@ -1555,13 +1615,8 @@ fn settle_in_flight_changes(
                 status: ActivityStatus::Active,
                 ..
             } => {
-                if let Some(content) = trailing_output.remove(id)
-                    && !content.is_empty()
-                {
-                    changes.push(SessionChange::CommandOutputAppended {
-                        activity_id: *id,
-                        content,
-                    });
+                if let Some(output) = trailing_output.remove(id) {
+                    changes.extend(command_output_changes(*id, output));
                 }
                 changes.push(SessionChange::CommandStatusChanged {
                     activity_id: *id,
@@ -1600,6 +1655,7 @@ fn append_steer_delivery_changes(
                 role: MessageRole::User,
                 status: MessageStatus::Completed,
                 content: prompt.text.clone(),
+                truncated: false,
             },
         },
     ]);
@@ -1629,6 +1685,7 @@ fn prepare_prompt_delivery(
                 role: MessageRole::User,
                 status: MessageStatus::Completed,
                 content: prompt.text.clone(),
+                truncated: false,
             },
         },
     ];
@@ -1817,6 +1874,7 @@ fn agent_output_turn_id(
             Ok(message.turn_id)
         }
         SessionChange::MessageContentAppended { message_id, .. }
+        | SessionChange::MessageTruncated { message_id }
         | SessionChange::MessageCompleted { message_id } => snapshot
             .messages
             .iter()
@@ -1825,6 +1883,7 @@ fn agent_output_turn_id(
             .ok_or_else(|| anyhow!("Agent output referenced an unknown Agent Message")),
         SessionChange::ActivityAdded { activity } => Ok(activity.turn_id()),
         SessionChange::CommandOutputAppended { activity_id, .. }
+        | SessionChange::CommandOutputTruncated { activity_id }
         | SessionChange::CommandStatusChanged { activity_id, .. }
         | SessionChange::FileChangeUpdated { activity_id, .. }
         | SessionChange::FileChangeStatusChanged { activity_id, .. } => snapshot
@@ -1937,6 +1996,7 @@ mod tests {
             command: "report progress".to_owned(),
             cwd: None,
             output: String::new(),
+            output_truncated: false,
             exit_status: None,
         }
     }
@@ -1957,6 +2017,7 @@ mod tests {
             role: MessageRole::Agent,
             status: MessageStatus::Streaming,
             content: String::new(),
+            truncated: false,
         };
         let snapshot = settling_snapshot(
             turn_id,
@@ -1994,7 +2055,13 @@ mod tests {
         let changes = settle_in_flight_changes(
             &snapshot,
             turn_id,
-            TrailingCommandOutput::from([(running.id(), "progress 90%".to_owned())]),
+            TrailingCommandOutput::from([(
+                running.id(),
+                NormalizedText {
+                    content: "progress 90%".to_owned(),
+                    truncated: false,
+                },
+            )]),
         );
 
         assert_eq!(
@@ -2003,6 +2070,43 @@ mod tests {
                 SessionChange::CommandOutputAppended {
                     activity_id: running.id(),
                     content: "progress 90%".to_owned(),
+                },
+                SessionChange::CommandStatusChanged {
+                    activity_id: running.id(),
+                    status: ActivityStatus::Failed,
+                    exit_status: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn settling_a_turn_stores_the_truncation_its_flushed_output_reached() {
+        let turn_id = TurnId::new();
+        let running = command(turn_id, ActivityStatus::Active);
+        let snapshot = settling_snapshot(turn_id, vec![running.clone()], Vec::new());
+
+        let changes = settle_in_flight_changes(
+            &snapshot,
+            turn_id,
+            TrailingCommandOutput::from([(
+                running.id(),
+                NormalizedText {
+                    content: "as much as the cap held".to_owned(),
+                    truncated: true,
+                },
+            )]),
+        );
+
+        assert_eq!(
+            changes,
+            vec![
+                SessionChange::CommandOutputAppended {
+                    activity_id: running.id(),
+                    content: "as much as the cap held".to_owned(),
+                },
+                SessionChange::CommandOutputTruncated {
+                    activity_id: running.id(),
                 },
                 SessionChange::CommandStatusChanged {
                     activity_id: running.id(),
@@ -2025,6 +2129,7 @@ mod tests {
             role: MessageRole::Agent,
             status: MessageStatus::Completed,
             content: "done".to_owned(),
+            truncated: false,
         };
         let user = Message {
             id: MessageId::new(),
@@ -2032,6 +2137,7 @@ mod tests {
             role: MessageRole::User,
             status: MessageStatus::Completed,
             content: "report progress".to_owned(),
+            truncated: false,
         };
         let snapshot = settling_snapshot(
             turn_id,
@@ -2042,7 +2148,13 @@ mod tests {
         let changes = settle_in_flight_changes(
             &snapshot,
             turn_id,
-            TrailingCommandOutput::from([(settled.id(), "lost".to_owned())]),
+            TrailingCommandOutput::from([(
+                settled.id(),
+                NormalizedText {
+                    content: "lost".to_owned(),
+                    truncated: false,
+                },
+            )]),
         );
 
         assert!(

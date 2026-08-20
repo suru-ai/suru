@@ -168,6 +168,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             role: MessageRole::User,
             status: MessageStatus::Completed,
             content: "Explain this workspace".to_owned(),
+            truncated: false,
         }],
         activities: vec![Activity::Error {
             id: ActivityId::from_uuid(fixture_id("0198b27e-345a-700e-ae3b-d971c57fbe87")),
@@ -231,7 +232,8 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
             "role": "user",
             "status": "completed",
-            "content": "Explain this workspace"
+            "content": "Explain this workspace",
+            "truncated": false
         }],
         "activities": [{
             "id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
@@ -277,6 +279,7 @@ fn agent_message_streaming_uses_one_stable_provider_neutral_identity() {
                     role: MessageRole::Agent,
                     status: MessageStatus::Streaming,
                     content: String::new(),
+                    truncated: false,
                 },
             }],
         },
@@ -291,6 +294,11 @@ fn agent_message_streaming_uses_one_stable_provider_neutral_identity() {
         SessionUpdate {
             session_id,
             revision: SessionRevision(10),
+            changes: vec![SessionChange::MessageTruncated { message_id }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(11),
             changes: vec![SessionChange::MessageCompleted { message_id }],
         },
     ];
@@ -305,7 +313,8 @@ fn agent_message_streaming_uses_one_stable_provider_neutral_identity() {
                     "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
                     "role": "agent",
                     "status": "streaming",
-                    "content": ""
+                    "content": "",
+                    "truncated": false
                 }
             }]
         },
@@ -322,6 +331,14 @@ fn agent_message_streaming_uses_one_stable_provider_neutral_identity() {
             "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
             "revision": 10,
             "changes": [{
+                "type": "message_truncated",
+                "message_id": "0198b27e-310d-763a-9825-51cc8b2bef81"
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 11,
+            "changes": [{
                 "type": "message_completed",
                 "message_id": "0198b27e-310d-763a-9825-51cc8b2bef81"
             }]
@@ -333,7 +350,7 @@ fn agent_message_streaming_uses_one_stable_provider_neutral_identity() {
         expected
     );
     assert_eq!(
-        serde_json::from_value::<[SessionUpdate; 3]>(expected)
+        serde_json::from_value::<[SessionUpdate; 4]>(expected)
             .expect("decode Agent Message updates"),
         updates
     );
@@ -356,6 +373,7 @@ fn command_activity_lifecycle_uses_typed_incremental_updates() {
                     command: "cargo test --test session_protocol".to_owned(),
                     cwd: Some(PathBuf::from("/work/suru")),
                     output: String::new(),
+                    output_truncated: false,
                     exit_status: None,
                 },
             }],
@@ -371,6 +389,11 @@ fn command_activity_lifecycle_uses_typed_incremental_updates() {
         SessionUpdate {
             session_id,
             revision: SessionRevision(10),
+            changes: vec![SessionChange::CommandOutputTruncated { activity_id }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(11),
             changes: vec![SessionChange::CommandStatusChanged {
                 activity_id,
                 status: ActivityStatus::Completed,
@@ -392,6 +415,7 @@ fn command_activity_lifecycle_uses_typed_incremental_updates() {
                     "command": "cargo test --test session_protocol",
                     "cwd": "/work/suru",
                     "output": "",
+                    "output_truncated": false,
                     "exit_status": null
                 }
             }]
@@ -409,6 +433,14 @@ fn command_activity_lifecycle_uses_typed_incremental_updates() {
             "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
             "revision": 10,
             "changes": [{
+                "type": "command_output_truncated",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87"
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 11,
+            "changes": [{
                 "type": "command_status_changed",
                 "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
                 "status": "completed",
@@ -422,7 +454,7 @@ fn command_activity_lifecycle_uses_typed_incremental_updates() {
         expected
     );
     assert_eq!(
-        serde_json::from_value::<[SessionUpdate; 3]>(expected)
+        serde_json::from_value::<[SessionUpdate; 4]>(expected)
             .expect("decode command Activity updates"),
         updates
     );

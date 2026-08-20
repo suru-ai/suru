@@ -18,14 +18,14 @@ use super::{
     ProviderRuntime, ProviderSession, ProviderSessionRequest, ProviderSteerInput,
     ProviderTurnInput,
 };
-use crate::ansi::{CappedStream, ProviderTextNormalizer, normalize_provider_text};
+use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AgentIdentity, Message, MessageId, MessageRole,
     MessageStatus, PromptId, SessionChange, SessionId, TurnId, TurnStatus,
 };
 use crate::sessions::{
     DeliveredTurn, DeliveredTurnStatus, InterruptTurnError, ProviderTurnOutcome, SessionStore,
-    TrailingCommandOutput,
+    TrailingCommandOutput, command_output_changes, message_content_changes,
 };
 
 /// The most characters of Provider-sent output Suru stores for one command; the
@@ -856,6 +856,20 @@ fn project_turn_start_failure(
     });
 }
 
+/// Publishes the changes normalization produced, which is nothing at all when
+/// a delta carried no storable content and left the stream short of its cap.
+fn publish_normalized_output(
+    sessions: &SessionStore,
+    session_id: SessionId,
+    changes: Vec<SessionChange>,
+) -> Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    sessions.publish_agent_output_changes(session_id, changes)?;
+    Ok(())
+}
+
 fn project_provider_event(
     sessions: &SessionStore,
     updates: &ProviderUpdateGate,
@@ -883,8 +897,7 @@ fn project_provider_event(
                     let message_id = MessageId::new();
                     active.streaming_message = Some(ActiveProviderMessage {
                         id: message_id,
-                        normalizer: ProviderTextNormalizer::capped(
-                            CappedStream::Message,
+                        normalizer: ProviderTextNormalizer::with_max_chars(
                             MAX_STORED_MESSAGE_CHARS,
                         ),
                     });
@@ -898,6 +911,7 @@ fn project_provider_event(
                                     role: MessageRole::Agent,
                                     status: MessageStatus::Streaming,
                                     content: String::new(),
+                                    truncated: false,
                                 },
                             },
                         )
@@ -915,19 +929,12 @@ fn project_provider_event(
                     );
                 };
                 let content = message.normalizer.push(&content);
-                if content.is_empty() {
-                    Ok(ProviderEventProjection::Continue)
-                } else {
-                    sessions
-                        .publish_agent_output(
-                            session_id,
-                            SessionChange::MessageContentAppended {
-                                message_id: message.id,
-                                content,
-                            },
-                        )
-                        .map(|_| ProviderEventProjection::Continue)
-                }
+                publish_normalized_output(
+                    sessions,
+                    session_id,
+                    message_content_changes(message.id, content),
+                )
+                .map(|()| ProviderEventProjection::Continue)
             }
             ProviderEvent::AgentMessageCompleted => {
                 let Some(message) = active.streaming_message.take() else {
@@ -972,6 +979,7 @@ fn project_provider_event(
                                     command: normalize_provider_text(&command),
                                     cwd,
                                     output: String::new(),
+                                    output_truncated: false,
                                     exit_status: None,
                                 },
                             },
@@ -981,11 +989,9 @@ fn project_provider_event(
                                 activity_id,
                                 ActiveProviderCommand {
                                     id: command_activity_id,
-                                    output_normalizer:
-                                        ProviderTextNormalizer::capped_with_line_overwrite(
-                                            CappedStream::CommandOutput,
-                                            MAX_STORED_COMMAND_OUTPUT_CHARS,
-                                        ),
+                                    output_normalizer: ProviderTextNormalizer::with_line_overwrite(
+                                        MAX_STORED_COMMAND_OUTPUT_CHARS,
+                                    ),
                                 },
                             );
                             ProviderEventProjection::Continue
@@ -1006,19 +1012,12 @@ fn project_provider_event(
                     );
                 };
                 let content = command.output_normalizer.push(&content);
-                if content.is_empty() {
-                    Ok(ProviderEventProjection::Continue)
-                } else {
-                    sessions
-                        .publish_agent_output(
-                            session_id,
-                            SessionChange::CommandOutputAppended {
-                                activity_id: command.id,
-                                content,
-                            },
-                        )
-                        .map(|_| ProviderEventProjection::Continue)
-                }
+                publish_normalized_output(
+                    sessions,
+                    session_id,
+                    command_output_changes(command.id, content),
+                )
+                .map(|()| ProviderEventProjection::Continue)
             }
             ProviderEvent::CommandCompleted {
                 activity_id,
@@ -1036,15 +1035,11 @@ fn project_provider_event(
                 };
                 let command_activity_id = command.id;
                 let trailing_output = command.output_normalizer.finish();
-                if !trailing_output.is_empty()
-                    && let Err(error) = sessions.publish_agent_output(
-                        session_id,
-                        SessionChange::CommandOutputAppended {
-                            activity_id: command_activity_id,
-                            content: trailing_output,
-                        },
-                    )
-                {
+                if let Err(error) = publish_normalized_output(
+                    sessions,
+                    session_id,
+                    command_output_changes(command_activity_id, trailing_output),
+                ) {
                     return finish_invalid_provider_event(
                         sessions,
                         session_id,

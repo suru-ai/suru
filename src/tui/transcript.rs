@@ -22,7 +22,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    ansi::{AnsiScanner, CappedStream, FragmentRole, sgr_parameter_code, sgr_parameters},
+    ansi::{AnsiScanner, FragmentRole, sgr_parameter_code, sgr_parameters},
     protocol::{
         Activity, ActivityId, FileChange, InitialPrompt, Message, MessageId, MessageRole, PromptId,
         SessionId, SessionRevision, SessionSnapshot, TranscriptItem,
@@ -35,6 +35,31 @@ use super::markdown;
 /// Source lines wrapping to more rows than this are split so ratatui's
 /// u16-based scroll arithmetic stays in range.
 const MAX_TRANSCRIPT_SOURCE_LINE_ROWS: usize = 32_000;
+
+/// A kind of Provider stream Suru stores under a cap. The kind decides what a
+/// truncation marker names, so the marker ends the thing the reader was
+/// reading rather than a word that only fits one of the two.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CappedStream {
+    /// Agent prose stored as the content of a Message.
+    Message,
+    /// The output a command wrote, stored on its Activity.
+    CommandOutput,
+}
+
+impl CappedStream {
+    /// What the transcript shows in place of the content a cap cut short. Both
+    /// markers are decided here so the two stream kinds cannot drift apart in
+    /// wording. A marker is drawn from the stored truncation signal rather than
+    /// read out of stored content, so content that ends with these characters
+    /// stays ordinary text.
+    const fn truncation_marker(self) -> &'static str {
+        match self {
+            Self::Message => "[Message truncated]",
+            Self::CommandOutput => "[output truncated]",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MessageStart {
@@ -318,9 +343,14 @@ fn reuse_or_render(
     }
 }
 
-/// Message content is append-only, so length identifies it within a Session.
+/// Message content is append-only, so its length identifies it within a
+/// Session once the truncation signal, which flips without lengthening the
+/// content, is folded in.
 fn message_fingerprint(message: &Message) -> u64 {
-    message.content.len() as u64
+    let mut hasher = std::hash::DefaultHasher::new();
+    message.content.len().hash(&mut hasher);
+    message.truncated.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn activity_fingerprint(activity: &Activity) -> u64 {
@@ -330,11 +360,13 @@ fn activity_fingerprint(activity: &Activity) -> u64 {
         Activity::Command {
             status,
             output,
+            output_truncated,
             exit_status,
             ..
         } => {
             (*status as u8).hash(&mut hasher);
             output.len().hash(&mut hasher);
+            output_truncated.hash(&mut hasher);
             exit_status.hash(&mut hasher);
         }
         Activity::FileChange {
@@ -427,7 +459,7 @@ fn sanitize_content(text: &str) -> std::borrow::Cow<'_, str> {
 fn render_message(lines: &mut Vec<Line<'static>>, message: &Message, theme: &Theme, width: u16) {
     match message.role {
         MessageRole::User => push_user_message(lines, &message.content, theme, width),
-        MessageRole::Agent => push_agent_message(lines, &message.content, theme),
+        MessageRole::Agent => push_agent_message(lines, &message.content, message.truncated, theme),
     }
 }
 
@@ -454,15 +486,19 @@ fn render_activity(
             command,
             cwd,
             output,
+            output_truncated,
             exit_status,
             ..
         } => push_command_activity(
             &mut projection,
-            *status,
-            command,
-            cwd.as_deref(),
-            output,
-            *exit_status,
+            CommandActivity {
+                status: *status,
+                command,
+                cwd: cwd.as_deref(),
+                output,
+                output_truncated: *output_truncated,
+                exit_status: *exit_status,
+            },
             theme,
         ),
         Activity::FileChange {
@@ -476,17 +512,32 @@ struct ActivityProjection<'a> {
     links: &'a mut Vec<TranscriptLink>,
 }
 
+/// What a command Activity contributes to the transcript, gathered so the
+/// renderer reads one subject rather than a row of loose parameters.
+struct CommandActivity<'a> {
+    status: crate::protocol::ActivityStatus,
+    command: &'a str,
+    cwd: Option<&'a std::path::Path>,
+    output: &'a str,
+    output_truncated: bool,
+    exit_status: Option<i32>,
+}
+
 fn push_command_activity(
     projection: &mut ActivityProjection<'_>,
-    status: crate::protocol::ActivityStatus,
-    command: &str,
-    cwd: Option<&std::path::Path>,
-    output: &str,
-    exit_status: Option<i32>,
+    activity: CommandActivity<'_>,
     theme: &Theme,
 ) {
     use crate::protocol::ActivityStatus;
 
+    let CommandActivity {
+        status,
+        command,
+        cwd,
+        output,
+        output_truncated,
+        exit_status,
+    } = activity;
     let (marker, style) = match status {
         ActivityStatus::Active => ("$ ", theme.accent.primary),
         ActivityStatus::Completed => ("✓ ", theme.feedback.success),
@@ -507,18 +558,17 @@ fn push_command_activity(
             theme.text.subdued,
         );
     }
-    let (output, truncated) = CappedStream::CommandOutput.split_truncation_marker(output);
     if !output.is_empty() {
         push_styled_prefixed_lines(projection, "    ", output, theme.text.subdued, theme);
     }
-    if truncated {
+    if output_truncated {
         push_truncation_marker(projection.lines, CappedStream::CommandOutput, "    ", theme);
     }
 }
 
-/// Renders the marker the normalizer left on capped content as its own line, in
-/// a style Suru applies rather than one the stream can set, so a reader can tell
-/// Suru dropped the rest rather than the Provider ending there.
+/// Renders the marker for capped content as its own line, in a style Suru
+/// applies rather than one the stream can set, so a reader can tell Suru
+/// dropped the rest rather than the Provider ending there.
 fn push_truncation_marker(
     lines: &mut Vec<Line<'static>>,
     stream: CappedStream,
@@ -611,8 +661,12 @@ fn wrapped_content_lines(content: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
-fn push_agent_message(lines: &mut Vec<Line<'static>>, content: &str, theme: &Theme) {
-    let (content, truncated) = CappedStream::Message.split_truncation_marker(content);
+fn push_agent_message(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    truncated: bool,
+    theme: &Theme,
+) {
     let content = sanitize_content(content);
     for mut line in markdown::render(&content, theme) {
         if !line.spans.is_empty() {
@@ -986,7 +1040,6 @@ mod tests {
     };
 
     use crate::{
-        ansi::CappedStream,
         protocol::{
             Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus,
             ModelAvailability, Session, SessionRevision, SessionSnapshot, SessionStatus,
@@ -995,7 +1048,11 @@ mod tests {
         theme::Theme,
     };
 
-    use super::{TranscriptCache, render_activity, render_message};
+    use super::{CappedStream, TranscriptCache, render_activity, render_message};
+
+    fn rendered_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|span| &*span.content).collect()
+    }
 
     #[test]
     fn activity_base_ansi_colors_follow_theme_palette() {
@@ -1006,6 +1063,7 @@ mod tests {
             command: "show colors".to_owned(),
             cwd: None,
             output: "\x1b[31;44mnormal\x1b[91;104mbright".to_owned(),
+            output_truncated: false,
             exit_status: Some(0),
         };
         let mut theme = Theme::system();
@@ -1049,6 +1107,7 @@ mod tests {
                 "\x1b[0;1;41mbold background"
             )
             .to_owned(),
+            output_truncated: false,
             exit_status: Some(0),
         };
         let mut theme = Theme::system();
@@ -1084,6 +1143,7 @@ mod tests {
             command: "show theme".to_owned(),
             cwd: None,
             output: "\x1b[31mthemed output".to_owned(),
+            output_truncated: false,
             exit_status: Some(0),
         };
         let snapshot = SessionSnapshot {
@@ -1138,10 +1198,8 @@ mod tests {
             status: ActivityStatus::Completed,
             command: "emit oversized output".to_owned(),
             cwd: None,
-            output: format!(
-                "\x1b[31mkept output\x1b[0m\n{}",
-                CappedStream::CommandOutput.truncation_marker()
-            ),
+            output: "\x1b[31mkept output\x1b[0m".to_owned(),
+            output_truncated: true,
             exit_status: Some(0),
         };
         let theme = Theme::system();
@@ -1151,14 +1209,7 @@ mod tests {
         render_activity(&mut lines, &mut links, &activity, &theme);
 
         let marker = lines.last().expect("render the truncation marker");
-        assert_eq!(
-            marker
-                .spans
-                .iter()
-                .map(|span| &*span.content)
-                .collect::<String>(),
-            format!("    {}", CappedStream::CommandOutput.truncation_marker())
-        );
+        assert_eq!(rendered_text(marker), "    [output truncated]");
         assert!(
             marker.style.add_modifier.contains(Modifier::ITALIC),
             "the marker carries a style command output cannot: {marker:?}"
@@ -1179,10 +1230,8 @@ mod tests {
             turn_id: TurnId::new(),
             role: MessageRole::Agent,
             status: MessageStatus::Completed,
-            content: format!(
-                "```\nfenced code\n{}",
-                CappedStream::Message.truncation_marker()
-            ),
+            content: "```\nfenced code\n".to_owned(),
+            truncated: true,
         };
         let theme = Theme::system();
         let mut lines = Vec::new();
@@ -1191,13 +1240,13 @@ mod tests {
 
         let marker = lines
             .iter()
-            .find(|line| {
-                line.spans.iter().any(|span| {
-                    span.content
-                        .contains(CappedStream::Message.truncation_marker())
-                })
-            })
+            .find(|line| rendered_text(line).contains("truncated]"))
             .expect("render the truncation marker");
+        assert_eq!(
+            rendered_text(marker),
+            "  [Message truncated]",
+            "a capped Message ends with a marker that names a Message"
+        );
         assert!(
             marker.style.add_modifier.contains(Modifier::ITALIC),
             "the marker keeps its own style outside the rendered Markdown: {marker:?}"
@@ -1208,6 +1257,68 @@ mod tests {
                 .flat_map(|line| &line.spans)
                 .any(|span| span.content.contains("fenced code")),
             "Message content before the marker still renders: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn command_output_ending_in_the_marker_text_renders_as_ordinary_output() {
+        let activity = Activity::Command {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Completed,
+            command: "echo the marker".to_owned(),
+            cwd: None,
+            output: format!("{}\n", CappedStream::CommandOutput.truncation_marker()),
+            output_truncated: false,
+            exit_status: Some(0),
+        };
+        let theme = Theme::system();
+        let mut lines = Vec::new();
+        let mut links = Vec::new();
+
+        render_activity(&mut lines, &mut links, &activity, &theme);
+
+        let marker_lines = lines
+            .iter()
+            .filter(|line| {
+                rendered_text(line).contains(CappedStream::CommandOutput.truncation_marker())
+            })
+            .collect::<Vec<_>>();
+        let [marker] = marker_lines.as_slice() else {
+            panic!("output that reads like the marker renders once: {lines:?}");
+        };
+        assert!(
+            !marker.style.add_modifier.contains(Modifier::ITALIC),
+            "output the Provider sent keeps the style of command output: {marker:?}"
+        );
+        assert_eq!(rendered_text(marker), "    [output truncated]");
+    }
+
+    #[test]
+    fn agent_message_ending_in_the_marker_text_renders_as_ordinary_content() {
+        let message = Message {
+            id: MessageId::new(),
+            turn_id: TurnId::new(),
+            role: MessageRole::Agent,
+            status: MessageStatus::Completed,
+            content: format!("prose\n\n{}\n", CappedStream::Message.truncation_marker()),
+            truncated: false,
+        };
+        let theme = Theme::system();
+        let mut lines = Vec::new();
+
+        render_message(&mut lines, &message, &theme, 80);
+
+        let marker_lines = lines
+            .iter()
+            .filter(|line| rendered_text(line).contains(CappedStream::Message.truncation_marker()))
+            .collect::<Vec<_>>();
+        let [marker] = marker_lines.as_slice() else {
+            panic!("content that reads like the marker renders once: {lines:?}");
+        };
+        assert!(
+            !marker.style.add_modifier.contains(Modifier::ITALIC),
+            "content the Provider sent renders as Markdown: {marker:?}"
         );
     }
 
@@ -1224,6 +1335,7 @@ mod tests {
                 "\x1b]8;;file:///tmp/second\x1b\\second\x1b]8;;\x1b\\"
             )
             .to_owned(),
+            output_truncated: false,
             exit_status: Some(0),
         };
         let mut lines = Vec::new();

@@ -85,6 +85,7 @@ impl AgentOutputSink {
                     role: MessageRole::Agent,
                     status: MessageStatus::Streaming,
                     content: String::new(),
+                    truncated: false,
                 },
             },
             AgentOutput::MessageDelta {

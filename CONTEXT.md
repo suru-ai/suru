@@ -60,6 +60,10 @@ _Avoid_: Function, action
 The ordered, user-visible history of a Session: its Messages and Activities in presentation order.
 _Avoid_: History, log, conversation
 
+**Truncation**:
+The condition of a Message or command Activity whose stored content Suru's cap cut short of everything the Provider sent. It is carried as a typed property beside the content rather than as text inside it, so a client reads it as data and renders the notice in its own style.
+_Avoid_: Marker, elision, clipping
+
 **Resume State**:
 Provider-owned data, opaque to Suru, that lets a Session continue with its Provider after a restart. Without it a restored Session is viewable but cannot continue where it left off.
 _Avoid_: Thread mapping, provider cache

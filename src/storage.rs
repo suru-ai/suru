@@ -944,6 +944,7 @@ impl MessageRow {
                     role: message.role,
                     status: message.status,
                     content: message.content,
+                    truncated: message.truncated,
                 },
             )?,
         })
@@ -959,6 +960,7 @@ impl MessageRow {
                 role: payload.role,
                 status: payload.status,
                 content: payload.content,
+                truncated: payload.truncated,
             },
             self.transcript_order,
         ))
@@ -1156,6 +1158,7 @@ struct StoredMessagePayload {
     role: MessageRole,
     status: MessageStatus,
     content: String,
+    truncated: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1172,6 +1175,7 @@ enum StoredActivityPayload {
         command: String,
         cwd: Option<PathBuf>,
         output: String,
+        output_truncated: bool,
         exit_status: Option<i32>,
     },
     FileChange {
@@ -1190,6 +1194,7 @@ impl StoredActivityPayload {
                 command,
                 cwd,
                 output,
+                output_truncated,
                 exit_status,
             } => Activity::Command {
                 id,
@@ -1198,6 +1203,7 @@ impl StoredActivityPayload {
                 command,
                 cwd,
                 output,
+                output_truncated,
                 exit_status,
             },
             Self::FileChange { status, changes } => Activity::FileChange {
@@ -1220,6 +1226,7 @@ impl From<Activity> for StoredActivityPayload {
                 command,
                 cwd,
                 output,
+                output_truncated,
                 exit_status,
                 ..
             } => Self::Command {
@@ -1227,6 +1234,7 @@ impl From<Activity> for StoredActivityPayload {
                 command,
                 cwd,
                 output,
+                output_truncated,
                 exit_status,
             },
             Activity::FileChange {
