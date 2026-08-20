@@ -271,6 +271,45 @@ fn terminal_input_capabilities_map_mouse_wheel_to_transcript_navigation() {
 }
 
 #[test]
+fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
+    let turn_id = snapshot.turns[0].id;
+    snapshot
+        .messages
+        .iter_mut()
+        .find(|message| message.role == MessageRole::Agent)
+        .expect("fixture contains an Agent message")
+        .content = "Build finished: \x1b[32mok\x1b(B\x1b[m today".to_owned();
+    let activity_id = ActivityId::new();
+    snapshot.activities.push(Activity::Command {
+        id: activity_id,
+        turn_id,
+        status: ActivityStatus::Completed,
+        command: "cargo test --all".to_owned(),
+        cwd: None,
+        output: "\x1b[1mtest result\x1b[0m: ok. 78 passed;\r\n\tnext\x07line".to_owned(),
+        exit_status: Some(0),
+    });
+    snapshot
+        .transcript
+        .push(TranscriptItem::Activity { activity_id });
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach Session with escape-laden content");
+
+    let screen = rendered_application_rows_at(&application, 90, 20).join("\n");
+    assert!(screen.contains("Build finished: ok today"));
+    assert!(screen.contains("test result: ok. 78 passed;"));
+    assert!(screen.contains("    nextline"));
+    assert!(
+        !screen.contains('\u{1b}') && !screen.contains('\u{7}'),
+        "terminal control sequences leaked into rendered cells"
+    );
+}
+
+#[test]
 fn connected_application_uses_the_persisted_landing_agent_selection() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let selected = AgentSelection {

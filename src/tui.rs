@@ -6,6 +6,7 @@ mod model_options;
 mod model_picker;
 mod session_picker;
 mod slots;
+mod transcript;
 
 use std::{
     cell::{Cell, RefCell},
@@ -21,10 +22,9 @@ use anyhow::{Result, anyhow};
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event as InputEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-        KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, EnableBracketedPaste, Event as InputEvent, EventStream, KeyCode,
+        KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -46,11 +46,10 @@ use crate::{
         SessionProjection, SessionStreamError, SessionSubscription,
     },
     protocol::{
-        Activity, AdmitPromptRequest, AgentSelection, AgentSelectionOperationId,
-        CreateSessionRequest, FileChange, InitialPrompt, MessageId, MessageRole, ModelAvailability,
-        ModelCatalog, ModelDescriptor, PromptDelivery, PromptId, PromptStatus, ServerIdentity,
-        SessionChange, SessionId, SessionListItem, SessionSnapshot, SessionStatus,
-        SessionTimestamp, ShutdownReason, TranscriptItem, TurnId, TurnStatus,
+        AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
+        InitialPrompt, MessageId, ModelAvailability, ModelCatalog, ModelDescriptor, PromptDelivery,
+        PromptId, PromptStatus, ServerIdentity, SessionChange, SessionId, SessionListItem,
+        SessionSnapshot, SessionStatus, SessionTimestamp, ShutdownReason, TurnId, TurnStatus,
         UpdateAgentSelectionRequest, Workspace,
     },
     theme::Theme,
@@ -71,6 +70,7 @@ use slots::{
     PromptStatusSlotContext, RenderSlots, RenderedSlot, SessionComposerTopSlotContext, SlotText,
     truncate_to_width,
 };
+use transcript::{MessageStart, TranscriptCache};
 
 const NARROW_TERMINAL_WIDTH: u16 = 44;
 const MINIMUM_TERMINAL_WIDTH: u16 = 28;
@@ -78,6 +78,8 @@ const MINIMUM_TERMINAL_HEIGHT: u16 = 5;
 const LANDING_BRAND_MINIMUM_HEIGHT: u16 = 9;
 const SESSION_HEADER_MINIMUM_HEIGHT: u16 = 8;
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
+/// Rows scrolled per mouse wheel tick, matching common terminal conventions.
+const WHEEL_SCROLL_ROWS: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionListScope {
@@ -176,12 +178,6 @@ struct TranscriptAnchor {
     screen_row: isize,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct MessageStart {
-    message_id: MessageId,
-    row: usize,
-}
-
 #[derive(Clone, Debug)]
 struct TranscriptViewport {
     height: usize,
@@ -215,6 +211,10 @@ pub struct TuiState {
     workspace: PathBuf,
     composers: ComposerMemory,
     session_interactions: HashMap<SessionId, SessionInteraction>,
+    transcript_cache: TranscriptCache,
+    /// Bumped whenever the Session projection is replaced wholesale, so the
+    /// transcript cache never trusts a revision across snapshot swaps.
+    transcript_generation: u64,
     composer_focused: bool,
     submission_error: Option<String>,
     session: Option<SessionProjection>,
@@ -303,6 +303,8 @@ impl TuiState {
             workspace: workspace.clone(),
             composers: ComposerMemory::default(),
             session_interactions: HashMap::new(),
+            transcript_cache: TranscriptCache::default(),
+            transcript_generation: 0,
             composer_focused: true,
             submission_error: None,
             session: None,
@@ -541,6 +543,7 @@ impl TuiState {
             .or_default();
         self.submission_error = None;
         self.session = Some(SessionProjection::new(snapshot));
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.sync_command_autocomplete();
     }
 
@@ -638,31 +641,42 @@ impl TuiState {
     }
 
     fn navigate_transcript_page(&mut self, direction: TranscriptDirection) {
+        self.navigate_transcript(direction, None);
+    }
+
+    fn navigate_transcript_lines(&mut self, direction: TranscriptDirection) {
+        self.navigate_transcript(direction, Some(WHEEL_SCROLL_ROWS));
+    }
+
+    fn navigate_transcript(&mut self, direction: TranscriptDirection, rows: Option<usize>) {
         let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id) else {
             return;
         };
         let Some(interaction) = self.session_interactions.get_mut(&session_id) else {
             return;
         };
-        let Some(viewport) = interaction.viewport.get_mut().as_ref() else {
+        let Some(viewport) = interaction.viewport.get_mut().as_mut() else {
             return;
         };
+        let step = rows.unwrap_or(viewport.height).max(1);
         let target = match direction {
-            TranscriptDirection::Up => viewport
-                .scroll_position
-                .saturating_sub(viewport.height.max(1)),
+            TranscriptDirection::Up => viewport.scroll_position.saturating_sub(step),
             TranscriptDirection::Down => viewport
                 .scroll_position
-                .saturating_add(viewport.height.max(1))
+                .saturating_add(step)
                 .min(viewport.maximum_scroll),
         };
+        // Record the target eagerly so a burst of scroll events handled between
+        // two frames compounds instead of re-deriving from a stale viewport.
+        viewport.scroll_position = target;
         if target >= viewport.maximum_scroll {
             interaction.follow_latest.set(true);
             interaction.anchor.set(None);
             return;
         }
+        let anchor = viewport.anchor_at(target);
         interaction.follow_latest.set(false);
-        interaction.anchor.set(viewport.anchor_at(target));
+        interaction.anchor.set(anchor);
     }
 
     fn follow_latest(&mut self) {
@@ -956,6 +970,8 @@ pub enum CommandId {
     HistoryNext,
     ScrollTranscriptPageUp,
     ScrollTranscriptPageDown,
+    ScrollTranscriptLinesUp,
+    ScrollTranscriptLinesDown,
     FollowLatest,
     BeginLeader,
     OpenQueuedPrompts,
@@ -1109,6 +1125,16 @@ impl Application {
             ApplicationEvent::Command(CommandId::ScrollTranscriptPageDown) => {
                 self.state
                     .navigate_transcript_page(TranscriptDirection::Down);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::ScrollTranscriptLinesUp) => {
+                self.state
+                    .navigate_transcript_lines(TranscriptDirection::Up);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::Command(CommandId::ScrollTranscriptLinesDown) => {
+                self.state
+                    .navigate_transcript_lines(TranscriptDirection::Down);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Command(CommandId::FollowLatest) => {
@@ -1777,40 +1803,37 @@ impl Application {
     }
 
     pub fn handle_terminal_event(&mut self, event: InputEvent) -> Result<ApplicationTransition> {
+        self.command_for_terminal_input(event)
+            .map_or(Ok(ApplicationTransition::Continue), |command| {
+                self.handle_event(ApplicationEvent::Command(command))
+            })
+    }
+
+    /// Translates a terminal event through the active input mode. `None` means
+    /// the event changes nothing, so callers can skip redrawing.
+    pub fn command_for_terminal_input(&self, event: InputEvent) -> Option<CommandId> {
         if self.state.model_options.is_open() {
-            return command_for_model_options_event(event)
-                .map_or(Ok(ApplicationTransition::Continue), |command| {
-                    self.handle_event(ApplicationEvent::Command(command))
-                });
+            return command_for_model_options_event(event);
         }
         if self.state.model_picker.is_open() {
-            return command_for_model_picker_event(event)
-                .map_or(Ok(ApplicationTransition::Continue), |command| {
-                    self.handle_event(ApplicationEvent::Command(command))
-                });
+            return command_for_model_picker_event(event);
         }
         if self.state.session_picker.is_open() {
-            return command_for_session_picker_event(event)
-                .map_or(Ok(ApplicationTransition::Continue), |command| {
-                    self.handle_event(ApplicationEvent::Command(command))
-                });
+            return command_for_session_picker_event(event);
         }
         if self.state.command_autocomplete.is_visible()
             && let Some(command) = command_for_autocomplete_event(event.clone())
         {
-            return self.handle_event(ApplicationEvent::Command(command));
+            return Some(command);
         }
-        let command = match self.state.command_mode {
+        match self.state.command_mode {
             CommandMode::Composer => command_for_terminal_event(event),
             CommandMode::Leader => command_for_leader_event(event),
             CommandMode::QueuedPrompts { .. } => command_for_queued_prompt_event(event),
             CommandMode::InterruptConfirmation { .. } => {
                 command_for_interrupt_confirmation_event(event)
             }
-        };
-        command.map_or(Ok(ApplicationTransition::Continue), |command| {
-            self.handle_event(ApplicationEvent::Command(command))
-        })
+        }
     }
 
     fn session_id(&self) -> Option<SessionId> {
@@ -1828,8 +1851,8 @@ impl Application {
 pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
     match event {
         InputEvent::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => Some(CommandId::ScrollTranscriptPageUp),
-            MouseEventKind::ScrollDown => Some(CommandId::ScrollTranscriptPageDown),
+            MouseEventKind::ScrollUp => Some(CommandId::ScrollTranscriptLinesUp),
+            MouseEventKind::ScrollDown => Some(CommandId::ScrollTranscriptLinesDown),
             _ => None,
         },
         InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,
@@ -3052,17 +3075,14 @@ fn render_session(
         .saturating_add(1);
     let composer_height =
         desired_composer_height.min(frame.area().height.saturating_sub(reserved_height).max(1));
-    let mut transcript = transcript_projection(snapshot, theme, content_width);
-    for provisional in state.provisional_prompts(session_id) {
-        push_user_message(
-            &mut transcript.lines,
-            &provisional.text,
-            theme,
-            content_width,
-        );
-    }
-    transcript.split_oversized_lines(content_width);
-    let transcript_layout = transcript.layout(content_width);
+    let provisional_prompts = state.provisional_prompts(session_id);
+    let transcript_view = state.transcript_cache.view(
+        state.transcript_generation,
+        snapshot,
+        &provisional_prompts,
+        theme,
+        content_width,
+    );
     let interaction = state
         .session_interaction(session_id)
         .expect("Session interaction is initialized with its snapshot");
@@ -3088,8 +3108,8 @@ fn render_session(
     let viewport_with_latest = transcript_viewport_height(transcript_with_latest);
     let (away_from_bottom, viewport_height, maximum_scroll, scroll_position) =
         if interaction.follow_latest.get() {
-            let maximum_scroll = transcript_layout
-                .row_count
+            let maximum_scroll = transcript_view
+                .row_count()
                 .saturating_sub(viewport_without_latest);
             (
                 false,
@@ -3099,10 +3119,10 @@ fn render_session(
             )
         } else {
             let viewport_height = viewport_with_latest;
-            let maximum_scroll = transcript_layout.row_count.saturating_sub(viewport_height);
+            let maximum_scroll = transcript_view.row_count().saturating_sub(viewport_height);
             let scroll_position = interaction.anchor.get().map_or(maximum_scroll, |anchor| {
-                transcript_layout
-                    .message_starts
+                transcript_view
+                    .message_starts()
                     .iter()
                     .find(|start| start.message_id == anchor.message_id)
                     .map_or(maximum_scroll, |start| {
@@ -3114,8 +3134,8 @@ fn render_session(
             if scroll_position >= maximum_scroll {
                 interaction.follow_latest.set(true);
                 interaction.anchor.set(None);
-                let maximum_scroll = transcript_layout
-                    .row_count
+                let maximum_scroll = transcript_view
+                    .row_count()
                     .saturating_sub(viewport_without_latest);
                 (
                     false,
@@ -3162,33 +3182,17 @@ fn render_session(
     let composer_top_area = horizontally_inset(composer_top_area, padding);
     let composer_area = horizontally_inset(composer_area, padding);
     let footer_area = horizontally_inset(status_area, padding);
-    let first_visible_line = transcript_layout
-        .line_starts
-        .partition_point(|row| *row <= scroll_position)
-        .saturating_sub(1);
-    let window_start = transcript_layout
-        .line_starts
-        .get(first_visible_line)
-        .copied()
-        .unwrap_or(0);
-    let local_scroll = scroll_position
-        .saturating_sub(window_start)
-        .min(usize::from(u16::MAX.saturating_sub(transcript_area.height)))
-        as u16;
+    let (window_lines, local_scroll) =
+        transcript_view.window(scroll_position, usize::from(transcript_area.height));
+    let local_scroll =
+        local_scroll.min(usize::from(u16::MAX.saturating_sub(transcript_area.height))) as u16;
     interaction.viewport.replace(Some(TranscriptViewport {
         height: viewport_height,
         scroll_position,
         maximum_scroll,
-        message_starts: transcript_layout.message_starts,
+        message_starts: transcript_view.message_starts().to_vec(),
     }));
-    let transcript_widget = Paragraph::new(Text::from(
-        transcript
-            .lines
-            .into_iter()
-            .skip(first_visible_line)
-            .collect::<Vec<_>>(),
-    ))
-    .wrap(Wrap { trim: false });
+    let transcript_widget = Paragraph::new(Text::from(window_lines)).wrap(Wrap { trim: false });
     let transcript_widget = if transcript_area.height > 1 {
         transcript_widget.block(
             Block::default()
@@ -3510,361 +3514,6 @@ fn wrapped_composer_lines(text: &str, width: u16) -> Text<'static> {
     Text::from(lines)
 }
 
-struct TranscriptProjection {
-    lines: Vec<Line<'static>>,
-    message_boundaries: Vec<MessageBoundary>,
-}
-
-const MAX_TRANSCRIPT_SOURCE_LINE_ROWS: usize = 32_000;
-
-#[derive(Clone, Copy)]
-struct MessageBoundary {
-    message_id: MessageId,
-    line_index: usize,
-}
-
-struct TranscriptLayout {
-    row_count: usize,
-    message_starts: Vec<MessageStart>,
-    line_starts: Vec<usize>,
-}
-
-impl TranscriptProjection {
-    fn split_oversized_lines(&mut self, width: u16) {
-        let original_lines = std::mem::take(&mut self.lines);
-        let mut remapped_line_indices = Vec::with_capacity(original_lines.len() + 1);
-        for line in original_lines {
-            remapped_line_indices.push(self.lines.len());
-            split_oversized_line(line, width, &mut self.lines);
-        }
-        remapped_line_indices.push(self.lines.len());
-        for boundary in &mut self.message_boundaries {
-            boundary.line_index = remapped_line_indices
-                .get(boundary.line_index)
-                .copied()
-                .unwrap_or(self.lines.len());
-        }
-    }
-
-    fn layout(&self, width: u16) -> TranscriptLayout {
-        let mut row_count = 0;
-        let mut boundaries = self.message_boundaries.iter().peekable();
-        let mut message_starts = Vec::with_capacity(self.message_boundaries.len());
-        let mut line_starts = Vec::with_capacity(self.lines.len());
-        for (line_index, line) in self.lines.iter().enumerate() {
-            line_starts.push(row_count);
-            while boundaries
-                .peek()
-                .is_some_and(|boundary| boundary.line_index == line_index)
-            {
-                let boundary = boundaries.next().expect("peeked Message boundary exists");
-                message_starts.push(MessageStart {
-                    message_id: boundary.message_id,
-                    row: row_count,
-                });
-            }
-            row_count = row_count.saturating_add(wrapped_line_count(line, width));
-        }
-        for boundary in boundaries {
-            message_starts.push(MessageStart {
-                message_id: boundary.message_id,
-                row: row_count,
-            });
-        }
-        TranscriptLayout {
-            row_count,
-            message_starts,
-            line_starts,
-        }
-    }
-}
-
-fn wrapped_line_count(line: &Line<'static>, width: u16) -> usize {
-    Paragraph::new(line.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(width)
-}
-
-fn split_oversized_line(line: Line<'static>, width: u16, output: &mut Vec<Line<'static>>) {
-    if wrapped_line_count(&line, width) <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
-        output.push(line);
-        return;
-    }
-    let character_count = line
-        .spans
-        .iter()
-        .map(|span| span.content.chars().count())
-        .sum::<usize>();
-    if character_count < 2 {
-        output.push(line);
-        return;
-    }
-    let (left, right) = split_line_at_character_midpoint(line, character_count);
-    split_oversized_line(left, width, output);
-    split_oversized_line(right, width, output);
-}
-
-fn split_line_at_character_midpoint(
-    line: Line<'static>,
-    character_count: usize,
-) -> (Line<'static>, Line<'static>) {
-    let Line {
-        style,
-        alignment,
-        spans,
-    } = line;
-    let mut remaining_left = character_count / 2;
-    let mut left_spans = Vec::new();
-    let mut right_spans = Vec::new();
-    for span in spans {
-        if remaining_left == 0 {
-            right_spans.push(span);
-            continue;
-        }
-        let span_character_count = span.content.chars().count();
-        if span_character_count <= remaining_left {
-            remaining_left -= span_character_count;
-            left_spans.push(span);
-            continue;
-        }
-
-        let content = span.content.into_owned();
-        let split_byte = content
-            .char_indices()
-            .nth(remaining_left)
-            .map_or(content.len(), |(index, _)| index);
-        let (left, right) = content.split_at(split_byte);
-        if !left.is_empty() {
-            left_spans.push(Span::styled(left.to_owned(), span.style));
-        }
-        if !right.is_empty() {
-            right_spans.push(Span::styled(right.to_owned(), span.style));
-        }
-        remaining_left = 0;
-    }
-
-    (
-        Line {
-            style,
-            alignment,
-            spans: left_spans,
-        },
-        Line {
-            style,
-            alignment,
-            spans: right_spans,
-        },
-    )
-}
-
-fn transcript_projection(
-    snapshot: &SessionSnapshot,
-    theme: &Theme,
-    available_width: u16,
-) -> TranscriptProjection {
-    let mut lines = Vec::new();
-    let mut message_boundaries = Vec::new();
-    for item in &snapshot.transcript {
-        match item {
-            TranscriptItem::Message { message_id } => {
-                let Some(message) = snapshot
-                    .messages
-                    .iter()
-                    .find(|message| message.id == *message_id)
-                else {
-                    continue;
-                };
-                message_boundaries.push(MessageBoundary {
-                    message_id: *message_id,
-                    line_index: lines.len(),
-                });
-                match message.role {
-                    MessageRole::User => {
-                        push_user_message(&mut lines, &message.content, theme, available_width)
-                    }
-                    MessageRole::Agent => push_agent_message(&mut lines, &message.content, theme),
-                }
-            }
-            TranscriptItem::Activity { activity_id } => {
-                let Some(activity) = snapshot
-                    .activities
-                    .iter()
-                    .find(|activity| activity.id() == *activity_id)
-                else {
-                    continue;
-                };
-                match activity {
-                    Activity::Status { text, .. } => {
-                        push_prefixed_lines(&mut lines, "  ", text, theme.text.subdued)
-                    }
-                    Activity::Error { text, .. } => {
-                        push_prefixed_lines(&mut lines, "  Error: ", text, theme.feedback.error)
-                    }
-                    Activity::Command {
-                        status,
-                        command,
-                        cwd,
-                        output,
-                        exit_status,
-                        ..
-                    } => push_command_activity(
-                        &mut lines,
-                        *status,
-                        command,
-                        cwd.as_deref(),
-                        output,
-                        *exit_status,
-                        theme,
-                    ),
-                    Activity::FileChange {
-                        status, changes, ..
-                    } => push_file_change_activity(&mut lines, *status, changes, theme),
-                }
-            }
-        }
-    }
-    TranscriptProjection {
-        lines,
-        message_boundaries,
-    }
-}
-
-fn push_command_activity(
-    lines: &mut Vec<Line<'static>>,
-    status: crate::protocol::ActivityStatus,
-    command: &str,
-    cwd: Option<&std::path::Path>,
-    output: &str,
-    exit_status: Option<i32>,
-    theme: &Theme,
-) {
-    use crate::protocol::ActivityStatus;
-
-    let (marker, style) = match status {
-        ActivityStatus::Active => ("$ ", theme.accent.primary),
-        ActivityStatus::Completed => ("✓ ", theme.feedback.success),
-        ActivityStatus::Failed => ("× ", theme.feedback.error),
-    };
-    let command = match (status, exit_status) {
-        (ActivityStatus::Failed, Some(exit_status)) => {
-            format!("{command} (exit {exit_status})")
-        }
-        _ => command.to_owned(),
-    };
-    push_prefixed_lines(lines, &format!("  {marker}"), &command, style);
-    if let Some(cwd) = cwd {
-        push_prefixed_lines(
-            lines,
-            "    in ",
-            cwd.to_string_lossy().as_ref(),
-            theme.text.subdued,
-        );
-    }
-    if !output.is_empty() {
-        push_prefixed_lines(lines, "    ", output, theme.text.subdued);
-    }
-}
-
-fn push_file_change_activity(
-    lines: &mut Vec<Line<'static>>,
-    status: crate::protocol::ActivityStatus,
-    changes: &[FileChange],
-    theme: &Theme,
-) {
-    use crate::protocol::ActivityStatus;
-
-    let (marker, label, style) = match status {
-        ActivityStatus::Active => ("… ", "Applying file changes", theme.accent.primary),
-        ActivityStatus::Completed => ("✓ ", "Applied file changes", theme.feedback.success),
-        ActivityStatus::Failed => ("× ", "Failed to apply file changes", theme.feedback.error),
-    };
-    push_prefixed_lines(lines, &format!("  {marker}"), label, style);
-    for change in changes {
-        let summary = match change {
-            FileChange::Add { path } => format!("A {}", path.to_string_lossy()),
-            FileChange::Delete { path } => format!("D {}", path.to_string_lossy()),
-            FileChange::Update {
-                path,
-                moved_to: Some(moved_to),
-            } => format!(
-                "R {} → {}",
-                path.to_string_lossy(),
-                moved_to.to_string_lossy()
-            ),
-            FileChange::Update {
-                path,
-                moved_to: None,
-            } => format!("M {}", path.to_string_lossy()),
-        };
-        push_prefixed_lines(lines, "    ", &summary, theme.text.subdued);
-    }
-}
-
-fn push_user_message(
-    lines: &mut Vec<Line<'static>>,
-    content: &str,
-    theme: &Theme,
-    available_width: u16,
-) {
-    let surface = theme.surface.elevated.patch(theme.text.primary);
-    let accent = theme.surface.elevated.patch(theme.accent.primary);
-    let available_width = usize::from(available_width);
-    let content_width = available_width.saturating_sub(2).max(1);
-    for content_line in wrapped_content_lines(content, content_width) {
-        let padding = available_width.saturating_sub(2 + content_line.width());
-        lines.push(Line::from(vec![
-            Span::styled("┃ ", accent),
-            Span::styled(content_line, surface),
-            Span::styled(" ".repeat(padding), surface),
-        ]));
-    }
-    lines.push(Line::default());
-}
-
-fn wrapped_content_lines(content: &str, width: usize) -> Vec<String> {
-    let mut wrapped = Vec::new();
-    for source_line in content.split('\n') {
-        if source_line.is_empty() {
-            wrapped.push(String::new());
-            continue;
-        }
-        let mut line = String::new();
-        let mut line_width = 0;
-        for character in source_line.chars() {
-            let character_width = character.width().unwrap_or(1);
-            if line_width > 0 && line_width + character_width > width {
-                wrapped.push(std::mem::take(&mut line));
-                line_width = 0;
-            }
-            line.push(character);
-            line_width += character_width;
-        }
-        wrapped.push(line);
-    }
-    wrapped
-}
-
-fn push_agent_message(lines: &mut Vec<Line<'static>>, content: &str, theme: &Theme) {
-    for mut line in markdown::render(content, theme) {
-        if !line.spans.is_empty() {
-            line.spans.insert(0, Span::styled("  ", theme.text.primary));
-        }
-        lines.push(line);
-    }
-    if !content.is_empty() {
-        lines.push(Line::default());
-    }
-}
-
-fn push_prefixed_lines(lines: &mut Vec<Line<'static>>, prefix: &str, content: &str, style: Style) {
-    for (index, line) in content.lines().enumerate() {
-        lines.push(Line::styled(
-            format!("{}{line}", if index == 0 { prefix } else { "  " }),
-            style,
-        ));
-    }
-}
-
 pub async fn run(client: ManagedClient) -> Result<()> {
     let workspace =
         std::env::current_dir().map_err(|error| anyhow!("read current Workspace: {error}"))?;
@@ -3889,11 +3538,170 @@ async fn run_loop(
     let mut session_list_task: Option<(SessionListRequest, tokio::task::JoinHandle<()>)> = None;
     let mut session_attachment_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut model_list_task: Option<(ModelListRequest, tokio::task::JoinHandle<()>)> = None;
+    let mut needs_redraw = true;
+
+    // Shared between the select arm and the drain loop below; a macro so the
+    // body can borrow the run loop's state and use `?`/`return` directly.
+    macro_rules! process_input_event {
+        ($event:expr) => {{
+            let event = $event;
+            if matches!(event, InputEvent::Resize(..)) {
+                needs_redraw = true;
+            }
+            if let Some(command) = application.command_for_terminal_input(event) {
+                needs_redraw = true;
+                let transition = application.handle_event(ApplicationEvent::Command(command))?;
+                match transition {
+                    ApplicationTransition::Continue => {}
+                    ApplicationTransition::SessionEnded => {
+                        session_subscription = None;
+                    }
+                    ApplicationTransition::DetachSession => {
+                        session_subscription = None;
+                        if let Some((_, task)) = session_subscription_task.take() {
+                            task.abort();
+                        }
+                    }
+                    ApplicationTransition::Exit => return Ok(()),
+                    ApplicationTransition::CreateSession(request) => {
+                        let prompt_id = request.prompt.id;
+                        let commands = client.session_commands();
+                        let results = submission_tx.clone();
+                        tokio::spawn(async move {
+                            let result = match commands.create_session(request).await {
+                                Ok(created) => SubmissionResult::SessionCreated(Box::new(created)),
+                                Err(error) => SubmissionResult::Failed {
+                                    prompt_id,
+                                    error: error.to_string(),
+                                },
+                            };
+                            let _ = results.send(result);
+                        });
+                    }
+                    ApplicationTransition::AdmitPrompt {
+                        session_id,
+                        request,
+                    } => {
+                        let prompt_id = request.prompt.id;
+                        let commands = client.session_commands();
+                        let results = submission_tx.clone();
+                        tokio::spawn(async move {
+                            let result = match commands.admit_prompt(session_id, request).await {
+                                Ok(prompt) => SubmissionResult::PromptAdmitted(prompt.id),
+                                Err(error) => SubmissionResult::Failed {
+                                    prompt_id,
+                                    error: error.to_string(),
+                                },
+                            };
+                            let _ = results.send(result);
+                        });
+                    }
+                    ApplicationTransition::PromotePrompt {
+                        session_id,
+                        prompt_id,
+                    } => {
+                        spawn_session_operation(
+                            client.session_commands(),
+                            SessionOperation::PromotePrompt {
+                                session_id,
+                                prompt_id,
+                            },
+                            submission_tx.clone(),
+                        );
+                    }
+                    ApplicationTransition::CancelPrompt {
+                        session_id,
+                        prompt_id,
+                    } => {
+                        spawn_session_operation(
+                            client.session_commands(),
+                            SessionOperation::CancelPrompt {
+                                session_id,
+                                prompt_id,
+                            },
+                            submission_tx.clone(),
+                        );
+                    }
+                    ApplicationTransition::InterruptTurn {
+                        session_id,
+                        turn_id,
+                    } => {
+                        spawn_session_operation(
+                            client.session_commands(),
+                            SessionOperation::InterruptTurn {
+                                session_id,
+                                turn_id,
+                            },
+                            submission_tx.clone(),
+                        );
+                    }
+                    ApplicationTransition::DeleteSession(session_id) => {
+                        spawn_session_operation(
+                            client.session_commands(),
+                            SessionOperation::DeleteSession { session_id },
+                            submission_tx.clone(),
+                        );
+                    }
+                    ApplicationTransition::SubscribeSession(_) => {
+                        unreachable!("terminal input cannot end a Session subscription")
+                    }
+                    ApplicationTransition::AttachSession(session_id) => {
+                        if session_attachment_task.is_none() {
+                            session_attachment_task = Some(spawn_session_attachment(
+                                client.session_commands(),
+                                session_id,
+                                picker_tx.clone(),
+                            ));
+                        }
+                    }
+                    ApplicationTransition::ListSessions(request) => {
+                        replace_session_listing(
+                            &mut session_list_task,
+                            client.session_commands(),
+                            request,
+                            picker_tx.clone(),
+                        );
+                    }
+                    ApplicationTransition::ListModels(request) => {
+                        replace_listing(&mut model_list_task, request, |request| {
+                            spawn_model_listing(
+                                client.session_commands(),
+                                request,
+                                model_tx.clone(),
+                            )
+                        });
+                    }
+                    ApplicationTransition::ConfirmLandingAgentSelection(selection) => {
+                        spawn_landing_agent_selection_confirmation(
+                            client.session_commands(),
+                            selection,
+                            submission_tx.clone(),
+                        );
+                    }
+                    ApplicationTransition::UpdateAgentSelection {
+                        session_id,
+                        request,
+                    } => {
+                        spawn_agent_selection_update(
+                            client.session_commands(),
+                            session_id,
+                            request,
+                            submission_tx.clone(),
+                        );
+                    }
+                }
+            }
+        }};
+    }
 
     loop {
-        terminal.draw(|frame| application.render(frame))?;
+        if needs_redraw {
+            terminal.draw(|frame| application.render(frame))?;
+            needs_redraw = false;
+        }
         tokio::select! {
             managed_event = client.next() => {
+                needs_redraw = true;
                 match managed_event {
                     Some(event) => {
                         let was_recovering = application.is_recovering();
@@ -3943,10 +3751,12 @@ async fn run_loop(
                 }
             }
             _ = wait_for_reconnect_grace(&mut reconnect_grace) => {
+                needs_redraw = true;
                 application.handle_event(ApplicationEvent::ReconnectGraceElapsed)?;
                 reconnect_grace = None;
             }
             session_event = next_session_event(&mut session_subscription) => {
+                needs_redraw = true;
                 match session_event {
                     Some(Ok(event)) => {
                         application.handle_event(ApplicationEvent::Session(event))?;
@@ -3978,6 +3788,7 @@ async fn run_loop(
                 }
             }
             submission = submission_rx.recv() => {
+                needs_redraw = true;
                 let Some(submission) = submission else {
                     return Err(anyhow!("Prompt admission task channel stopped unexpectedly"));
                 };
@@ -4057,6 +3868,7 @@ async fn run_loop(
                 }
             }
             model = model_rx.recv() => {
+                needs_redraw = true;
                 let Some(model) = model else {
                     return Err(anyhow!("Model picker task channel stopped unexpectedly"));
                 };
@@ -4084,6 +3896,7 @@ async fn run_loop(
                 }
             }
             picker = picker_rx.recv() => {
+                needs_redraw = true;
                 let Some(picker) = picker else {
                     return Err(anyhow!("Session picker task channel stopped unexpectedly"));
                 };
@@ -4131,134 +3944,35 @@ async fn run_loop(
             }
             input_event = input.next() => {
                 match input_event {
-                    Some(Ok(event)) => {
-                            let transition = application.handle_terminal_event(event)?;
-                            match transition {
-                                ApplicationTransition::Continue => {}
-                                ApplicationTransition::SessionEnded => {
-                                    session_subscription = None;
-                                }
-                                ApplicationTransition::DetachSession => {
-                                    session_subscription = None;
-                                    if let Some((_, task)) = session_subscription_task.take() {
-                                        task.abort();
-                                    }
-                                }
-                                ApplicationTransition::Exit => return Ok(()),
-                                ApplicationTransition::CreateSession(request) => {
-                                    let prompt_id = request.prompt.id;
-                                    let commands = client.session_commands();
-                                    let results = submission_tx.clone();
-                                    tokio::spawn(async move {
-                                        let result = match commands.create_session(request).await {
-                                            Ok(created) => {
-                                                SubmissionResult::SessionCreated(Box::new(created))
-                                            }
-                                            Err(error) => SubmissionResult::Failed {
-                                                prompt_id,
-                                                error: error.to_string(),
-                                            },
-                                        };
-                                        let _ = results.send(result);
-                                    });
-                                }
-                                ApplicationTransition::AdmitPrompt { session_id, request } => {
-                                    let prompt_id = request.prompt.id;
-                                    let commands = client.session_commands();
-                                    let results = submission_tx.clone();
-                                    tokio::spawn(async move {
-                                        let result = match commands.admit_prompt(session_id, request).await {
-                                            Ok(prompt) => SubmissionResult::PromptAdmitted(prompt.id),
-                                            Err(error) => SubmissionResult::Failed {
-                                                prompt_id,
-                                                error: error.to_string(),
-                                            },
-                                        };
-                                        let _ = results.send(result);
-                                    });
-                                }
-                                ApplicationTransition::PromotePrompt { session_id, prompt_id } => {
-                                    spawn_session_operation(
-                                        client.session_commands(),
-                                        SessionOperation::PromotePrompt { session_id, prompt_id },
-                                        submission_tx.clone(),
-                                    );
-                                }
-                                ApplicationTransition::CancelPrompt { session_id, prompt_id } => {
-                                    spawn_session_operation(
-                                        client.session_commands(),
-                                        SessionOperation::CancelPrompt { session_id, prompt_id },
-                                        submission_tx.clone(),
-                                    );
-                                }
-                                ApplicationTransition::InterruptTurn { session_id, turn_id } => {
-                                    spawn_session_operation(
-                                        client.session_commands(),
-                                        SessionOperation::InterruptTurn { session_id, turn_id },
-                                        submission_tx.clone(),
-                                    );
-                                }
-                                ApplicationTransition::DeleteSession(session_id) => {
-                                    spawn_session_operation(
-                                        client.session_commands(),
-                                        SessionOperation::DeleteSession { session_id },
-                                        submission_tx.clone(),
-                                    );
-                                }
-                                ApplicationTransition::SubscribeSession(_) => {
-                                    unreachable!("terminal input cannot end a Session subscription")
-                                }
-                                ApplicationTransition::AttachSession(session_id) => {
-                                    if session_attachment_task.is_none() {
-                                        session_attachment_task = Some(spawn_session_attachment(
-                                            client.session_commands(),
-                                            session_id,
-                                            picker_tx.clone(),
-                                        ));
-                                    }
-                                }
-                                ApplicationTransition::ListSessions(request) => {
-                                    replace_session_listing(
-                                        &mut session_list_task,
-                                        client.session_commands(),
-                                        request,
-                                        picker_tx.clone(),
-                                    );
-                                }
-                                ApplicationTransition::ListModels(request) => {
-                                    replace_listing(
-                                        &mut model_list_task,
-                                        request,
-                                        |request| spawn_model_listing(
-                                            client.session_commands(),
-                                            request,
-                                            model_tx.clone(),
-                                        ),
-                                    );
-                                }
-                                ApplicationTransition::ConfirmLandingAgentSelection(selection) => {
-                                    spawn_landing_agent_selection_confirmation(
-                                        client.session_commands(),
-                                        selection,
-                                        submission_tx.clone(),
-                                    );
-                                }
-                                ApplicationTransition::UpdateAgentSelection {
-                                    session_id,
-                                    request,
-                                } => {
-                                    spawn_agent_selection_update(
-                                        client.session_commands(),
-                                        session_id,
-                                        request,
-                                        submission_tx.clone(),
-                                    );
-                                }
-                            }
-                    }
+                    Some(Ok(event)) => process_input_event!(event),
                     Some(Err(error)) => return Err(error.into()),
                     None => return Ok(()),
                 }
+            }
+        }
+        // Coalesce input that is already pending into this frame so a burst of
+        // events (wheel scrolling, key auto-repeat) costs one redraw instead of
+        // one per event. Bounded so a continuous flood cannot starve rendering.
+        //
+        // The stream must be polled with the run loop's own task context: a
+        // detached poll (`now_or_never`) would hand the stream a no-op waker,
+        // and a Pending poll would then leave nothing to wake this task when
+        // the next event arrives, deadlocking all input.
+        for _ in 0..128 {
+            let pending_input = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(match input.poll_next_unpin(context) {
+                    std::task::Poll::Ready(event) => Some(event),
+                    std::task::Poll::Pending => None,
+                })
+            })
+            .await;
+            let Some(pending_input) = pending_input else {
+                break;
+            };
+            match pending_input {
+                Some(Ok(event)) => process_input_event!(event),
+                Some(Err(error)) => return Err(error.into()),
+                None => return Ok(()),
             }
         }
     }
@@ -4817,8 +4531,38 @@ struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
+/// Enables button-press and wheel reporting (1000) with SGR encoding (1006).
+/// Deliberately excludes any-motion tracking (1003), which crossterm's
+/// `EnableMouseCapture` turns on: motion tracking floods the input stream with
+/// pointer-move events nothing in the TUI consumes.
+struct EnableMouseButtonReporting;
+
+impl crossterm::Command for EnableMouseButtonReporting {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str(concat!("\x1b[?1000h", "\x1b[?1006h"))
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        crossterm::event::EnableMouseCapture.execute_winapi()
+    }
+}
+
+struct DisableMouseButtonReporting;
+
+impl crossterm::Command for DisableMouseButtonReporting {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str(concat!("\x1b[?1006l", "\x1b[?1000l"))
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        crossterm::event::DisableMouseCapture.execute_winapi()
+    }
+}
+
 fn enable_terminal_features(output: &mut impl std::io::Write) -> std::io::Result<()> {
-    execute!(output, EnableBracketedPaste, EnableMouseCapture)?;
+    execute!(output, EnableBracketedPaste, EnableMouseButtonReporting)?;
     let _ = execute!(
         output,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -4828,7 +4572,7 @@ fn enable_terminal_features(output: &mut impl std::io::Write) -> std::io::Result
 
 fn disable_terminal_features(output: &mut impl std::io::Write) -> std::io::Result<()> {
     let _ = execute!(output, PopKeyboardEnhancementFlags);
-    execute!(output, DisableMouseCapture, DisableBracketedPaste)
+    execute!(output, DisableMouseButtonReporting, DisableBracketedPaste)
 }
 
 impl TerminalSession {

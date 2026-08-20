@@ -1,0 +1,196 @@
+//! Timing harness for transcript rendering hot paths.
+//!
+//! Run with: cargo test --release --test transcript_perf -- --ignored --nocapture
+
+use std::time::Instant;
+
+use ratatui::{Terminal, backend::TestBackend};
+use suru::{
+    managed_client::SessionEvent,
+    protocol::{
+        Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus,
+        ModelAvailability, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, Session,
+        SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionUpdate,
+        TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+    },
+    tui::{Application, ApplicationEvent},
+};
+
+const SECTIONS: usize = 150;
+
+fn agent_markdown(section: usize) -> String {
+    format!(
+        "## Section {section}\n\nHere is a paragraph with **bold**, _emphasis_, and `inline code` \
+         explaining step {section} of the work in enough prose to wrap across several terminal \
+         rows at typical widths.\n\n- first bullet with detail\n- second bullet with detail\n- \
+         third bullet with detail\n\n```rust\nfn example_{section}() -> usize {{\n    // \
+         representative code block content\n    {section} * 42\n}}\n```\n\nClosing paragraph for \
+         section {section} that also wraps across the viewport width."
+    )
+}
+
+fn command_output() -> String {
+    (0..40)
+        .map(|line| format!("build output line {line}: compiling module and linking artifacts"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
+    let mut snapshot = SessionSnapshot {
+        session: Session {
+            id: SessionId::new(),
+            workspace: Workspace {
+                path: workspace.to_owned(),
+            },
+            agent_selection: None,
+            agent_selection_availability: ModelAvailability::Available,
+            status: SessionStatus::Idle,
+        },
+        revision: SessionRevision::INITIAL,
+        prompts: Vec::new(),
+        turns: Vec::new(),
+        messages: Vec::new(),
+        activities: Vec::new(),
+        transcript: Vec::new(),
+    };
+    for section in 1..=SECTIONS {
+        let prompt_id = PromptId::new();
+        let turn_id = TurnId::new();
+        let user_message_id = MessageId::new();
+        let agent_message_id = MessageId::new();
+        let activity_id = ActivityId::new();
+        snapshot.prompts.push(Prompt {
+            id: prompt_id,
+            text: format!("Prompt section {section}"),
+            delivery: PromptDelivery::Steer,
+            admission_order: PromptOrder(section as u64),
+            status: PromptStatus::Delivered,
+        });
+        snapshot.turns.push(Turn {
+            id: turn_id,
+            prompt_id,
+            agent: None,
+            status: TurnStatus::Completed,
+        });
+        snapshot.messages.extend([
+            Message {
+                id: user_message_id,
+                turn_id,
+                role: MessageRole::User,
+                status: MessageStatus::Completed,
+                content: format!("User question for section {section} with a bit of extra text"),
+            },
+            Message {
+                id: agent_message_id,
+                turn_id,
+                role: MessageRole::Agent,
+                status: MessageStatus::Completed,
+                content: agent_markdown(section),
+            },
+        ]);
+        snapshot.activities.push(Activity::Command {
+            id: activity_id,
+            turn_id,
+            status: ActivityStatus::Completed,
+            command: format!("cargo build --package section-{section}"),
+            cwd: None,
+            output: command_output(),
+            exit_status: Some(0),
+        });
+        snapshot.transcript.extend([
+            TranscriptItem::Message {
+                message_id: user_message_id,
+            },
+            TranscriptItem::Activity { activity_id },
+            TranscriptItem::Message {
+                message_id: agent_message_id,
+            },
+        ]);
+    }
+    snapshot
+}
+
+fn streaming_update(snapshot: &SessionSnapshot, ordinal: u64) -> SessionUpdate {
+    let last_agent_message = snapshot
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Agent)
+        .expect("snapshot contains an Agent message");
+    SessionUpdate {
+        session_id: snapshot.session.id,
+        revision: SessionRevision(snapshot.revision.0 + ordinal),
+        changes: vec![SessionChange::MessageContentAppended {
+            message_id: last_agent_message.id,
+            content: " another streamed token batch".to_owned(),
+        }],
+    }
+}
+
+fn timed(label: &str, iterations: u32, mut body: impl FnMut()) {
+    let start = Instant::now();
+    for _ in 0..iterations {
+        body();
+    }
+    let total = start.elapsed();
+    println!(
+        "{label}: {:.3} ms/iter ({iterations} iters, {:.1} ms total)",
+        total.as_secs_f64() * 1000.0 / f64::from(iterations),
+        total.as_secs_f64() * 1000.0
+    );
+}
+
+#[test]
+#[ignore = "timing harness, run manually with --release"]
+fn transcript_render_timings() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let mut snapshot = large_session_snapshot(workspace.path());
+    // Streaming appends must target a streaming message.
+    snapshot
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == MessageRole::Agent)
+        .map(|message| message.status = MessageStatus::Streaming)
+        .expect("snapshot contains an Agent message");
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .expect("attach large Session");
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("create test terminal");
+
+    timed("cold render (first frame)", 1, || {
+        terminal
+            .draw(|frame| application.render(frame))
+            .expect("render frame");
+    });
+    timed("warm render (unchanged state)", 50, || {
+        terminal
+            .draw(|frame| application.render(frame))
+            .expect("render frame");
+    });
+    timed("scroll event + render", 50, || {
+        application
+            .handle_event(ApplicationEvent::Command(
+                suru::tui::CommandId::ScrollTranscriptPageUp,
+            ))
+            .expect("scroll");
+        terminal
+            .draw(|frame| application.render(frame))
+            .expect("render frame");
+    });
+    let mut ordinal = 1;
+    timed("streaming append + render", 50, || {
+        application
+            .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+                streaming_update(&snapshot, ordinal),
+            )))
+            .expect("apply streamed update");
+        ordinal += 1;
+        terminal
+            .draw(|frame| application.render(frame))
+            .expect("render frame");
+    });
+}

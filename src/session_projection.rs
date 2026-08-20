@@ -7,6 +7,10 @@ use crate::protocol::{
     SessionChange, SessionSnapshot, SessionUpdate, TranscriptItem, TurnStatus,
 };
 
+/// Applies `update` to `snapshot` in place. On error the snapshot may hold a
+/// partially applied update and must be discarded by the caller; every current
+/// caller either replaces the snapshot wholesale or treats the error as fatal.
+/// Callers that need atomicity clone before applying.
 pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdate) -> Result<()> {
     if snapshot.session.id != update.session_id {
         bail!("Session update targeted a different Session");
@@ -15,7 +19,7 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
         bail!("Session update revision is not monotonic");
     }
 
-    let mut next = snapshot.clone();
+    let next = snapshot;
     for change in &update.changes {
         match change {
             SessionChange::AgentSelectionChanged { selection } => {
@@ -304,6 +308,5 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
         }
     }
     next.revision = update.revision;
-    *snapshot = next;
     Ok(())
 }
