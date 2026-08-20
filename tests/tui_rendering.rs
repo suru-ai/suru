@@ -641,6 +641,46 @@ fn slash_autocomplete_invokes_new_session_from_a_description_match() {
 }
 
 #[test]
+fn exit_and_quit_commands_dispatch_one_semantic_exit_action() {
+    let mut canonical = Application::default();
+    type_terminal_text(&mut canonical, "/exit");
+    let autocomplete = rendered_application_rows(&canonical).join("\n");
+    assert!(autocomplete.contains("/exit"));
+    assert!(autocomplete.contains("Exit Suru"));
+    assert_eq!(
+        canonical
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("select /exit"),
+        ApplicationTransition::Exit
+    );
+
+    let mut alias = Application::default();
+    type_terminal_text(&mut alias, "/quit");
+    assert!(
+        rendered_application_rows(&alias)
+            .join("\n")
+            .contains("/exit")
+    );
+    assert_eq!(
+        alias
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("select /quit"),
+        ApplicationTransition::Exit
+    );
+
+    assert_eq!(
+        suru::tui::SemanticCommandId::ApplicationExit.as_str(),
+        "application.exit"
+    );
+}
+
+#[test]
 fn models_commands_dispatch_one_semantic_model_list_action() {
     let mut canonical = Application::default();
     type_terminal_text(&mut canonical, "/models");

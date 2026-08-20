@@ -6,6 +6,7 @@ const AUTOCOMPLETE_LIMIT: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SemanticCommandId {
+    ApplicationExit,
     ModelList,
     ModelOptions,
     ModelOptionsPrevious,
@@ -22,6 +23,7 @@ pub enum SemanticCommandId {
 impl SemanticCommandId {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ApplicationExit => "application.exit",
             Self::ModelList => "model.list",
             Self::ModelOptions => "model.options",
             Self::ModelOptionsPrevious => "model.options.previous",
@@ -65,6 +67,16 @@ pub(super) struct SemanticKeybinding {
 const LEADER_PREFIX: (KeyCode, KeyModifiers) = (KeyCode::Char('x'), KeyModifiers::CONTROL);
 
 const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApplicationExit,
+        title: "Exit Suru",
+        description: "Close this TUI",
+        slash: Some(SlashCommand {
+            name: "exit",
+            aliases: &["quit"],
+        }),
+        keybinding: None,
+    },
     SemanticCommandDescriptor {
         id: SemanticCommandId::ModelList,
         title: "Choose Model",

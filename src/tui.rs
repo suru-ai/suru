@@ -1590,6 +1590,7 @@ impl Application {
             return Ok(ApplicationTransition::Continue);
         }
         match command {
+            SemanticCommandId::ApplicationExit => Ok(ApplicationTransition::Exit),
             SemanticCommandId::ModelList => {
                 let current = self.state.agent_selection().cloned();
                 let provider_scope = self
