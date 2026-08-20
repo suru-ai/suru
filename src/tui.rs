@@ -21,8 +21,10 @@ use anyhow::{Result, anyhow};
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        DisableBracketedPaste, EnableBracketedPaste, Event as InputEvent, EventStream, KeyCode,
-        KeyEvent, KeyEventKind, KeyModifiers,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event as InputEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -1825,6 +1827,11 @@ impl Application {
 
 pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
     match event {
+        InputEvent::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => Some(CommandId::ScrollTranscriptPageUp),
+            MouseEventKind::ScrollDown => Some(CommandId::ScrollTranscriptPageDown),
+            _ => None,
+        },
         InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,
         InputEvent::Key(key) if binding_for(key).is_some() => {
             binding_for(key).map(|binding| binding.command.clone())
@@ -4810,12 +4817,32 @@ struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
+fn enable_terminal_features(output: &mut impl std::io::Write) -> std::io::Result<()> {
+    execute!(output, EnableBracketedPaste, EnableMouseCapture)?;
+    let _ = execute!(
+        output,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+    Ok(())
+}
+
+fn disable_terminal_features(output: &mut impl std::io::Write) -> std::io::Result<()> {
+    let _ = execute!(output, PopKeyboardEnhancementFlags);
+    execute!(output, DisableMouseCapture, DisableBracketedPaste)
+}
+
 impl TerminalSession {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut output = stdout();
-        if let Err(error) = execute!(output, EnterAlternateScreen, Hide, EnableBracketedPaste) {
-            let _ = execute!(output, DisableBracketedPaste, LeaveAlternateScreen, Show);
+        if let Err(error) = execute!(output, EnterAlternateScreen, Hide) {
+            let _ = execute!(output, LeaveAlternateScreen, Show);
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
+        if let Err(error) = enable_terminal_features(&mut output) {
+            let _ = disable_terminal_features(&mut output);
+            let _ = execute!(output, LeaveAlternateScreen, Show);
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -4823,7 +4850,8 @@ impl TerminalSession {
             Ok(terminal) => Ok(Self { terminal }),
             Err(error) => {
                 let mut output = stdout();
-                let _ = execute!(output, DisableBracketedPaste, LeaveAlternateScreen, Show);
+                let _ = disable_terminal_features(&mut output);
+                let _ = execute!(output, LeaveAlternateScreen, Show);
                 let _ = disable_raw_mode();
                 Err(error.into())
             }
@@ -4833,12 +4861,8 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            DisableBracketedPaste,
-            LeaveAlternateScreen,
-            Show
-        );
+        let _ = disable_terminal_features(self.terminal.backend_mut());
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show);
         let _ = disable_raw_mode();
     }
 }
@@ -4855,7 +4879,10 @@ mod tests {
     };
 
     use super::slots::{Placement, RenderSlots, TestContribution};
-    use super::{Application, ApplicationEvent, SessionEvent};
+    use super::{
+        Application, ApplicationEvent, SessionEvent, disable_terminal_features,
+        enable_terminal_features,
+    };
     use crate::protocol::{
         ModelAvailability, Session, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
         Workspace,
@@ -4894,6 +4921,33 @@ mod tests {
             .chunks(buffer.area.width as usize)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect()
+    }
+
+    #[test]
+    fn terminal_input_capabilities_enable_mouse_and_modified_key_reporting() {
+        let mut enabled = Vec::new();
+        enable_terminal_features(&mut enabled).expect("enable terminal features");
+        let enabled = String::from_utf8(enabled).expect("terminal commands are ANSI");
+        assert!(
+            enabled.contains("\x1b[?1000h"),
+            "mouse capture was not enabled"
+        );
+        assert!(
+            enabled.contains("\x1b[>1u"),
+            "modified key reporting was not enabled"
+        );
+
+        let mut disabled = Vec::new();
+        disable_terminal_features(&mut disabled).expect("disable terminal features");
+        let disabled = String::from_utf8(disabled).expect("terminal commands are ANSI");
+        assert!(
+            disabled.contains("\x1b[?1000l"),
+            "mouse capture was not disabled"
+        );
+        assert!(
+            disabled.contains("\x1b[<1u"),
+            "modified key reporting was not restored"
+        );
     }
 
     #[test]

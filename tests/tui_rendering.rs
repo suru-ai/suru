@@ -1,4 +1,6 @@
-use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::{
     Frame, Terminal,
     backend::TestBackend,
@@ -228,6 +230,44 @@ fn headless_application_handles_terminal_and_managed_events_through_the_producti
         .handle_event(ApplicationEvent::Command(CommandId::ClearOrExit))
         .expect("handle terminal command after clearing the composer");
     assert_eq!(terminal_transition, ApplicationTransition::Exit);
+}
+
+#[test]
+fn terminal_input_capabilities_map_mouse_wheel_to_transcript_navigation() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            navigable_session_snapshot(SessionId::new(), workspace.path(), 8),
+        ))
+        .expect("attach a long Session");
+    let latest = rendered_application_rows_at(&application, 72, 18).join("\n");
+    assert!(latest.contains("Agent section 8"));
+
+    let mouse_event = |kind| {
+        InputEvent::Mouse(MouseEvent {
+            kind,
+            column: 12,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    assert_eq!(
+        application
+            .handle_terminal_event(mouse_event(MouseEventKind::ScrollUp))
+            .expect("scroll up through transcript content"),
+        ApplicationTransition::Continue
+    );
+    let reading_history = rendered_application_rows_at(&application, 72, 18).join("\n");
+    assert!(reading_history.contains("Latest"));
+    assert!(!reading_history.contains("Agent section 8"));
+
+    assert_eq!(
+        application
+            .handle_terminal_event(mouse_event(MouseEventKind::ScrollDown))
+            .expect("scroll down through transcript content"),
+        ApplicationTransition::Continue
+    );
 }
 
 #[test]
