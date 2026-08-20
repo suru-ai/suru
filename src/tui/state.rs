@@ -813,12 +813,12 @@ enum QueuedPromptStep {
     Next,
 }
 
-/// Whether the catalog request behind a Model listing result has finished, so
-/// pending Model Options either wait for more or give up with a message.
+/// Whether the Model catalog listing behind a result has finished, so pending
+/// Model Options either wait for more of it or give up with a message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CatalogRequest {
-    Outstanding,
-    Settled,
+enum CatalogListing {
+    InFlight,
+    Complete,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1052,10 +1052,10 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::ModelsListed { request, catalog } => {
-                Ok(self.load_model_catalog(&request, catalog, CatalogRequest::Outstanding))
+                Ok(self.load_model_catalog(&request, catalog, CatalogListing::InFlight))
             }
             ApplicationEvent::ModelsRefreshed { request, catalog } => {
-                Ok(self.load_model_catalog(&request, catalog, CatalogRequest::Settled))
+                Ok(self.load_model_catalog(&request, catalog, CatalogListing::Complete))
             }
             ApplicationEvent::ModelListingFailed { request, error } => {
                 Ok(self.fail_model_catalog(&request, error))
@@ -1069,7 +1069,7 @@ impl Application {
             ApplicationEvent::AgentSelectionUpdated {
                 operation_id,
                 selection,
-            } => self.settle_agent_selection_update(operation_id, selection),
+            } => self.accept_agent_selection_update(operation_id, selection),
             ApplicationEvent::AgentSelectionUpdateFailed {
                 operation_id,
                 error,
@@ -1077,8 +1077,10 @@ impl Application {
         }
     }
 
-    /// Routes a command to the handler for the surface it acts on. The match is
-    /// exhaustive so a newly added [`CommandId`] cannot be silently dropped.
+    /// Routes a command to the handler for the surface it acts on. This match
+    /// is exhaustive, so a newly added [`CommandId`] has to be routed to a
+    /// surface before it compiles; the handler it lands in then ignores
+    /// anything outside its own group.
     fn handle_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
         if self.state.reconnect_overlay_visible || self.defers_for_agent_selection(&command) {
             return Ok(ApplicationTransition::Continue);
@@ -1344,7 +1346,7 @@ impl Application {
                 self.select_queued_prompt(QueuedPromptStep::Next);
             }
             CommandId::PromoteSelectedPrompt => {
-                return self.settle_selected_prompt(|session_id, prompt_id| {
+                return self.apply_to_selected_prompt(|session_id, prompt_id| {
                     ApplicationTransition::PromotePrompt {
                         session_id,
                         prompt_id,
@@ -1352,7 +1354,7 @@ impl Application {
                 });
             }
             CommandId::CancelSelectedPrompt => {
-                return self.settle_selected_prompt(|session_id, prompt_id| {
+                return self.apply_to_selected_prompt(|session_id, prompt_id| {
                     ApplicationTransition::CancelPrompt {
                         session_id,
                         prompt_id,
@@ -1403,9 +1405,10 @@ impl Application {
         };
     }
 
-    fn settle_selected_prompt(
+    /// Leaves the queued Prompt mode, handing the selected Prompt to `act`.
+    fn apply_to_selected_prompt(
         &mut self,
-        settle: impl FnOnce(SessionId, PromptId) -> ApplicationTransition,
+        act: impl FnOnce(SessionId, PromptId) -> ApplicationTransition,
     ) -> ApplicationTransition {
         let (Some(session_id), CommandMode::QueuedPrompts { selected }) =
             (self.session_id(), self.state.command_mode)
@@ -1413,7 +1416,7 @@ impl Application {
             return ApplicationTransition::Continue;
         };
         self.state.command_mode = CommandMode::Composer;
-        settle(session_id, selected)
+        act(session_id, selected)
     }
 
     fn confirm_interrupt(&mut self) -> ApplicationTransition {
@@ -1508,18 +1511,18 @@ impl Application {
         &mut self,
         request: &ModelListRequest,
         catalog: ModelCatalog,
-        state: CatalogRequest,
+        listing: CatalogListing,
     ) -> ApplicationTransition {
         let accepted = self.state.model_picker.is_active_request(request);
         let current = self.state.agent_selection().cloned();
         self.state
             .model_picker
             .load(request, catalog, current.as_ref());
-        if state == CatalogRequest::Settled {
+        if listing == CatalogListing::Complete {
             self.state.model_picker.finish(request);
         }
         if accepted {
-            self.reconcile_model_options(state);
+            self.reconcile_model_options(listing);
         }
         ApplicationTransition::Continue
     }
@@ -1532,7 +1535,7 @@ impl Application {
         let accepted = self.state.model_picker.is_active_request(request);
         self.state.model_picker.fail(request, error);
         if accepted {
-            self.reconcile_model_options(CatalogRequest::Settled);
+            self.reconcile_model_options(CatalogListing::Complete);
         }
         ApplicationTransition::Continue
     }
@@ -1567,7 +1570,7 @@ impl Application {
         ApplicationTransition::Continue
     }
 
-    /// Settles the in-flight Agent Selection update named by `operation_id`,
+    /// Retires the in-flight Agent Selection update named by `operation_id`,
     /// reporting the Session it targeted. `None` means a newer operation has
     /// already replaced it, so the result is stale.
     fn take_pending_agent_selection(
@@ -1588,7 +1591,7 @@ impl Application {
         })
     }
 
-    fn settle_agent_selection_update(
+    fn accept_agent_selection_update(
         &mut self,
         operation_id: AgentSelectionOperationId,
         selection: AgentSelection,
@@ -1653,60 +1656,14 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::ListModels(request))
             }
-            SemanticCommandId::ModelOptions => {
-                self.state.pending_model_options = true;
-                self.state.submission_error = None;
-                let request = self.state.model_picker.begin_refresh();
-                self.reconcile_model_options(CatalogRequest::Outstanding);
-                self.state.command_mode = CommandMode::Composer;
-                Ok(ApplicationTransition::ListModels(request))
-            }
-            SemanticCommandId::ModelOptionsPrevious => {
-                self.state.model_options.select_previous();
-                Ok(ApplicationTransition::Continue)
-            }
-            SemanticCommandId::ModelOptionsNext => {
-                self.state.model_options.select_next();
-                Ok(ApplicationTransition::Continue)
-            }
-            SemanticCommandId::ModelOptionsSelect => {
-                self.state.model_options.choose();
-                Ok(ApplicationTransition::Continue)
-            }
-            SemanticCommandId::ModelOptionsApply => {
-                if self.state.model_options.is_choice_picker_open() {
-                    return Ok(ApplicationTransition::Continue);
-                }
-                let Some(selection) = self.state.model_options.apply() else {
-                    return Ok(ApplicationTransition::Continue);
-                };
-                self.state.model_options.close();
-                self.apply_agent_selection(selection)
-            }
-            SemanticCommandId::ModelOptionsCancel => {
-                self.state.model_options.close();
-                Ok(ApplicationTransition::Continue)
-            }
-            SemanticCommandId::ModelOptionReasoningCycle => {
-                let current = self.state.agent_selection().cloned();
-                let Some(model) = self
-                    .state
-                    .model_picker
-                    .cached_model_for_options(current.as_ref())
-                else {
-                    self.state.submission_error = Some(
-                        "No concrete Model is loaded yet; use /models to choose one".to_owned(),
-                    );
-                    let request = self.state.model_picker.begin_refresh();
-                    return Ok(ApplicationTransition::ListModels(request));
-                };
-                match cycle_reasoning_effort(&model, current.as_ref()) {
-                    ReasoningCycle::Advanced(selection) => self.apply_agent_selection(selection),
-                    ReasoningCycle::Unavailable(message) => {
-                        self.state.submission_error = Some(message);
-                        Ok(ApplicationTransition::Continue)
-                    }
-                }
+            command @ (SemanticCommandId::ModelOptions
+            | SemanticCommandId::ModelOptionsPrevious
+            | SemanticCommandId::ModelOptionsNext
+            | SemanticCommandId::ModelOptionsSelect
+            | SemanticCommandId::ModelOptionsApply
+            | SemanticCommandId::ModelOptionsCancel
+            | SemanticCommandId::ModelOptionReasoningCycle) => {
+                self.handle_model_options_command(command)
             }
             SemanticCommandId::SessionList => {
                 let request = self.state.session_picker.open();
@@ -1741,6 +1698,72 @@ impl Application {
                 } else {
                     ApplicationTransition::Continue
                 })
+            }
+        }
+    }
+
+    /// Handles the Model Options commands routed here; any other semantic
+    /// command leaves the options editor alone.
+    fn handle_model_options_command(
+        &mut self,
+        command: SemanticCommandId,
+    ) -> Result<ApplicationTransition> {
+        match command {
+            SemanticCommandId::ModelOptions => return Ok(self.open_model_options()),
+            SemanticCommandId::ModelOptionsPrevious => self.state.model_options.select_previous(),
+            SemanticCommandId::ModelOptionsNext => self.state.model_options.select_next(),
+            SemanticCommandId::ModelOptionsSelect => self.state.model_options.choose(),
+            SemanticCommandId::ModelOptionsCancel => self.state.model_options.close(),
+            SemanticCommandId::ModelOptionsApply => return self.apply_model_options(),
+            SemanticCommandId::ModelOptionReasoningCycle => {
+                return self.cycle_model_reasoning_effort();
+            }
+            _ => {}
+        }
+        Ok(ApplicationTransition::Continue)
+    }
+
+    /// Opens the options editor for the current Model, refreshing the catalog
+    /// first so the choices on screen are the ones the Provider still offers.
+    fn open_model_options(&mut self) -> ApplicationTransition {
+        self.state.pending_model_options = true;
+        self.state.submission_error = None;
+        let request = self.state.model_picker.begin_refresh();
+        self.reconcile_model_options(CatalogListing::InFlight);
+        self.state.command_mode = CommandMode::Composer;
+        ApplicationTransition::ListModels(request)
+    }
+
+    fn apply_model_options(&mut self) -> Result<ApplicationTransition> {
+        if self.state.model_options.is_choice_picker_open() {
+            return Ok(ApplicationTransition::Continue);
+        }
+        let Some(selection) = self.state.model_options.apply() else {
+            return Ok(ApplicationTransition::Continue);
+        };
+        self.state.model_options.close();
+        self.apply_agent_selection(selection)
+    }
+
+    /// Advances the current Model's reasoning effort one step, refreshing the
+    /// catalog instead when no concrete Model is cached to cycle through.
+    fn cycle_model_reasoning_effort(&mut self) -> Result<ApplicationTransition> {
+        let current = self.state.agent_selection().cloned();
+        let Some(model) = self
+            .state
+            .model_picker
+            .cached_model_for_options(current.as_ref())
+        else {
+            self.state.submission_error =
+                Some("No concrete Model is loaded yet; use /models to choose one".to_owned());
+            let request = self.state.model_picker.begin_refresh();
+            return Ok(ApplicationTransition::ListModels(request));
+        };
+        match cycle_reasoning_effort(&model, current.as_ref()) {
+            ReasoningCycle::Advanced(selection) => self.apply_agent_selection(selection),
+            ReasoningCycle::Unavailable(message) => {
+                self.state.submission_error = Some(message);
+                Ok(ApplicationTransition::Continue)
             }
         }
     }
@@ -1795,7 +1818,7 @@ impl Application {
         })
     }
 
-    fn reconcile_model_options(&mut self, request: CatalogRequest) {
+    fn reconcile_model_options(&mut self, listing: CatalogListing) {
         if self.state.model_options.is_open() {
             let current_model = self
                 .state
@@ -1805,7 +1828,7 @@ impl Application {
             if let Some((provider, model)) = current_model {
                 if let Some(refreshed) = self.state.model_picker.cached_model(&provider, &model) {
                     self.state.model_options.refresh(refreshed);
-                } else if request == CatalogRequest::Settled {
+                } else if listing == CatalogListing::Complete {
                     self.state.model_options.mark_model_unavailable();
                 }
             }
@@ -1819,7 +1842,7 @@ impl Application {
             .model_picker
             .cached_model_for_options(current.as_ref())
         else {
-            if request == CatalogRequest::Settled {
+            if listing == CatalogListing::Complete {
                 self.state.pending_model_options = false;
                 self.state.submission_error =
                     Some("No concrete Model is available; use /models to choose one".to_owned());
@@ -1827,7 +1850,7 @@ impl Application {
             return;
         };
         if model.options.is_empty() {
-            if request == CatalogRequest::Settled {
+            if listing == CatalogListing::Complete {
                 self.state.pending_model_options = false;
             }
             self.state.submission_error = Some(format!(

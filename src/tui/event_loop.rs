@@ -3,7 +3,7 @@
 //! carry out the transitions the Application returns.
 
 use std::{
-    future::pending,
+    future::{Future, pending},
     io::{Stdout, stdout},
     ops::ControlFlow,
     path::PathBuf,
@@ -49,7 +49,7 @@ pub async fn run(client: ManagedClient) -> Result<()> {
     run_loop(&mut session.terminal, client, workspace).await
 }
 
-/// How the run loop leaves the screen when an event ends the Session.
+/// How the run loop leaves the screen when an event ends the run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Exit {
     /// Stop immediately.
@@ -70,10 +70,16 @@ struct SessionTasks {
 }
 
 impl SessionTasks {
-    /// Drops the current Session's subscription along with any attempt to
-    /// re-establish it, so nothing reconnects to a Session left behind.
-    fn detach(&mut self) {
+    /// Drops the live subscription, leaving any attempt to establish a new one
+    /// running: the Session itself is still current.
+    fn end_subscription(&mut self) {
         self.subscription = None;
+    }
+
+    /// Drops the live subscription along with any attempt to re-establish it,
+    /// so nothing reconnects to a Session left behind.
+    fn detach(&mut self) {
+        self.end_subscription();
         self.abort_subscribing();
     }
 
@@ -83,19 +89,57 @@ impl SessionTasks {
         }
     }
 
-    /// Subscribes to `session_id`, replacing any subscription attempt already
+    /// Takes over a subscription a spawned task established.
+    fn adopt(&mut self, subscription: SessionSubscription) {
+        self.subscription = Some(subscription);
+    }
+
+    /// Subscribes to `session_id`, abandoning any subscription attempt already
     /// in flight for an earlier Session.
-    fn subscribe(
+    fn resubscribe(
         &mut self,
         commands: SessionCommandClient,
         session_id: SessionId,
         connected: &UnboundedSender<ConnectedSessionSubscription>,
     ) {
         self.abort_subscribing();
+        self.spawn_subscribe(commands, session_id, connected);
+    }
+
+    /// Subscribes to `session_id` only when no attempt is already in flight, so
+    /// stream recovery never restarts a connection that is still retrying.
+    fn subscribe_if_idle(
+        &mut self,
+        commands: SessionCommandClient,
+        session_id: SessionId,
+        connected: &UnboundedSender<ConnectedSessionSubscription>,
+    ) {
+        if self.subscribing.is_none() {
+            self.spawn_subscribe(commands, session_id, connected);
+        }
+    }
+
+    fn spawn_subscribe(
+        &mut self,
+        commands: SessionCommandClient,
+        session_id: SessionId,
+        connected: &UnboundedSender<ConnectedSessionSubscription>,
+    ) {
         self.subscribing = Some((
             session_id,
             spawn_session_subscription(commands, session_id, connected.clone()),
         ));
+    }
+
+    /// Forgets the subscription attempt for `session_id` now that it connected.
+    fn finish_subscribing(&mut self, session_id: SessionId) {
+        if self
+            .subscribing
+            .as_ref()
+            .is_some_and(|(subscribing, _)| *subscribing == session_id)
+        {
+            self.subscribing = None;
+        }
     }
 
     /// Attaches to `session_id` unless an attachment is already in flight; the
@@ -113,6 +157,18 @@ impl SessionTasks {
                 results.clone(),
             ));
         }
+    }
+
+    fn finish_attaching(&mut self) {
+        self.attaching = None;
+    }
+
+    fn finish_listing_sessions(&mut self, request: &SessionListRequest) {
+        finish_listing(&mut self.listing_sessions, request);
+    }
+
+    fn finish_listing_models(&mut self, request: &ModelListRequest) {
+        finish_listing(&mut self.listing_models, request);
     }
 
     fn list_sessions(
@@ -148,119 +204,72 @@ struct TaskChannels {
     models: UnboundedSender<ModelPickerResult>,
 }
 
+/// The run loop's mutable world: the Application it feeds, the client it sends
+/// Session commands through, the Session work it owns, and the channels its
+/// spawned tasks report back on.
+struct RunLoop {
+    client: ManagedClient,
+    application: Application,
+    tasks: SessionTasks,
+    channels: TaskChannels,
+    reconnect_grace: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// Set by anything that changes what is on screen, so an event the user
+    /// cannot see costs no frame.
+    needs_redraw: bool,
+}
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    mut client: ManagedClient,
+    client: ManagedClient,
     workspace: PathBuf,
 ) -> Result<()> {
-    let mut application = Application::new(workspace);
-    let mut input = EventStream::new();
-    let mut tasks = SessionTasks::default();
-    let mut reconnect_grace: Option<Pin<Box<tokio::time::Sleep>>> = None;
     let (submissions, mut submission_rx) = tokio::sync::mpsc::unbounded_channel();
     let (subscriptions, mut subscription_rx) = tokio::sync::mpsc::unbounded_channel();
     let (pickers, mut picker_rx) = tokio::sync::mpsc::unbounded_channel();
     let (models, mut model_rx) = tokio::sync::mpsc::unbounded_channel();
-    let channels = TaskChannels {
-        submissions,
-        subscriptions,
-        pickers,
-        models,
+    let mut run = RunLoop {
+        client,
+        application: Application::new(workspace),
+        tasks: SessionTasks::default(),
+        channels: TaskChannels {
+            submissions,
+            subscriptions,
+            pickers,
+            models,
+        },
+        reconnect_grace: None,
+        needs_redraw: true,
     };
-    let mut needs_redraw = true;
+    let mut input = EventStream::new();
 
     loop {
-        if needs_redraw {
-            terminal.draw(|frame| application.render(frame))?;
-            needs_redraw = false;
+        if run.needs_redraw {
+            terminal.draw(|frame| run.application.render(frame))?;
+            run.needs_redraw = false;
         }
+        // Every arm reports through ControlFlow so the two events that can end
+        // the run -- a Provider shutdown and the exit command -- leave by the
+        // same path as the input stream closing.
         let step = tokio::select! {
-            managed_event = client.next() => {
-                needs_redraw = true;
-                handle_managed_event(
-                    managed_event,
-                    &mut application,
-                    &mut tasks,
-                    &mut reconnect_grace,
-                )?
+            managed_event = run.client.next() => run.receive_managed_event(managed_event)?,
+            () = wait_for_reconnect_grace(&mut run.reconnect_grace) => {
+                run.expire_reconnect_grace()?
             }
-            () = wait_for_reconnect_grace(&mut reconnect_grace) => {
-                needs_redraw = true;
-                application.handle_event(ApplicationEvent::ReconnectGraceElapsed)?;
-                reconnect_grace = None;
-                ControlFlow::Continue(())
+            session_event = next_session_event(&mut run.tasks.subscription) => {
+                run.receive_session_event(session_event)?
             }
-            session_event = next_session_event(&mut tasks.subscription) => {
-                needs_redraw = true;
-                handle_session_stream_event(
-                    session_event,
-                    &mut application,
-                    &client,
-                    &mut tasks,
-                    &channels,
-                )?;
-                ControlFlow::Continue(())
-            }
-            connected = subscription_rx.recv() => {
-                let connected = connected.ok_or_else(|| {
-                    anyhow!("Session subscription task channel stopped unexpectedly")
-                })?;
-                adopt_session_subscription(connected, &application, &mut tasks);
-                ControlFlow::Continue(())
-            }
-            submission = submission_rx.recv() => {
-                needs_redraw = true;
-                let submission = submission.ok_or_else(|| {
-                    anyhow!("Prompt admission task channel stopped unexpectedly")
-                })?;
-                handle_submission_result(
-                    submission,
-                    &mut application,
-                    &client,
-                    &mut tasks,
-                    &channels,
-                )?;
-                ControlFlow::Continue(())
-            }
-            model = model_rx.recv() => {
-                needs_redraw = true;
-                let model = model.ok_or_else(|| {
-                    anyhow!("Model picker task channel stopped unexpectedly")
-                })?;
-                handle_model_listing_result(model, &mut application, &mut tasks)?;
-                ControlFlow::Continue(())
-            }
-            picker = picker_rx.recv() => {
-                needs_redraw = true;
-                let picker = picker.ok_or_else(|| {
-                    anyhow!("Session picker task channel stopped unexpectedly")
-                })?;
-                handle_session_picker_result(
-                    picker,
-                    &mut application,
-                    &client,
-                    &mut tasks,
-                    &channels,
-                )?;
-                ControlFlow::Continue(())
-            }
-            input_event = input.next() => {
-                match input_event {
-                    Some(Ok(event)) => handle_input_event(
-                        event,
-                        &mut application,
-                        &client,
-                        &mut tasks,
-                        &channels,
-                        &mut needs_redraw,
-                    )?,
-                    Some(Err(error)) => return Err(error.into()),
-                    None => ControlFlow::Break(Exit::Now),
-                }
-            }
+            connected = subscription_rx.recv() => run.receive_subscription(connected)?,
+            submission = submission_rx.recv() => run.receive_submission(submission)?,
+            model = model_rx.recv() => run.receive_model_listing(model)?,
+            picker = picker_rx.recv() => run.receive_session_picker(picker)?,
+            input_event = input.next() => match input_event {
+                Some(Ok(event)) => run.handle_input_event(event)?,
+                Some(Err(error)) => return Err(error.into()),
+                None => ControlFlow::Break(Exit::Now),
+            },
         };
         if let ControlFlow::Break(exit) = step {
-            return leave_run_loop(terminal, &application, exit);
+            return leave_run_loop(terminal, &run.application, exit);
         }
 
         // Coalesce input that is already pending into this frame so a burst of
@@ -283,19 +292,12 @@ async fn run_loop(
                 break;
             };
             let step = match pending_input {
-                Some(Ok(event)) => handle_input_event(
-                    event,
-                    &mut application,
-                    &client,
-                    &mut tasks,
-                    &channels,
-                    &mut needs_redraw,
-                )?,
+                Some(Ok(event)) => run.handle_input_event(event)?,
                 Some(Err(error)) => return Err(error.into()),
                 None => ControlFlow::Break(Exit::Now),
             };
             if let ControlFlow::Break(exit) = step {
-                return leave_run_loop(terminal, &application, exit);
+                return leave_run_loop(terminal, &run.application, exit);
             }
         }
     }
@@ -312,339 +314,392 @@ fn leave_run_loop(
     Ok(())
 }
 
-fn handle_input_event(
-    event: InputEvent,
-    application: &mut Application,
-    client: &ManagedClient,
-    tasks: &mut SessionTasks,
-    channels: &TaskChannels,
-    needs_redraw: &mut bool,
-) -> Result<ControlFlow<Exit>> {
-    if matches!(event, InputEvent::Resize(..)) {
-        *needs_redraw = true;
-    }
-    let Some(command) = application.command_for_terminal_input(event) else {
-        return Ok(ControlFlow::Continue(()));
-    };
-    *needs_redraw = true;
-    let transition = application.handle_event(ApplicationEvent::Command(command))?;
-    Ok(dispatch_transition(transition, client, tasks, channels))
-}
-
-/// Carries out the transition a terminal command produced, spawning whatever
-/// Session command it asked for.
-fn dispatch_transition(
-    transition: ApplicationTransition,
-    client: &ManagedClient,
-    tasks: &mut SessionTasks,
-    channels: &TaskChannels,
-) -> ControlFlow<Exit> {
-    match transition {
-        ApplicationTransition::Continue => {}
-        ApplicationTransition::Exit => return ControlFlow::Break(Exit::Now),
-        ApplicationTransition::SessionEnded => tasks.subscription = None,
-        ApplicationTransition::DetachSession => tasks.detach(),
-        ApplicationTransition::CreateSession(request) => {
-            spawn_session_creation(
-                client.session_commands(),
-                request,
-                channels.submissions.clone(),
-            );
+impl RunLoop {
+    fn handle_input_event(&mut self, event: InputEvent) -> Result<ControlFlow<Exit>> {
+        if matches!(event, InputEvent::Resize(..)) {
+            self.needs_redraw = true;
         }
-        ApplicationTransition::AdmitPrompt {
-            session_id,
-            request,
-        } => {
-            spawn_prompt_admission(
-                client.session_commands(),
+        let Some(command) = self.application.command_for_terminal_input(event) else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        self.needs_redraw = true;
+        let transition = self
+            .application
+            .handle_event(ApplicationEvent::Command(command))?;
+        Ok(self.dispatch_transition(transition))
+    }
+
+    /// Carries out the transition a terminal command produced, spawning
+    /// whatever Session command it asked for.
+    fn dispatch_transition(&mut self, transition: ApplicationTransition) -> ControlFlow<Exit> {
+        match transition {
+            ApplicationTransition::Continue => {}
+            ApplicationTransition::Exit => return ControlFlow::Break(Exit::Now),
+            ApplicationTransition::SessionEnded => self.tasks.end_subscription(),
+            ApplicationTransition::DetachSession => self.tasks.detach(),
+            ApplicationTransition::CreateSession(request) => {
+                spawn_session_creation(
+                    self.client.session_commands(),
+                    request,
+                    self.channels.submissions.clone(),
+                );
+            }
+            ApplicationTransition::AdmitPrompt {
                 session_id,
                 request,
-                channels.submissions.clone(),
-            );
-        }
-        ApplicationTransition::PromotePrompt {
-            session_id,
-            prompt_id,
-        } => {
-            spawn_session_operation(
-                client.session_commands(),
-                SessionOperation::PromotePrompt {
+            } => {
+                spawn_prompt_admission(
+                    self.client.session_commands(),
                     session_id,
-                    prompt_id,
-                },
-                channels.submissions.clone(),
-            );
-        }
-        ApplicationTransition::CancelPrompt {
-            session_id,
-            prompt_id,
-        } => {
-            spawn_session_operation(
-                client.session_commands(),
-                SessionOperation::CancelPrompt {
+                    request,
+                    self.channels.submissions.clone(),
+                );
+            }
+            ApplicationTransition::PromotePrompt {
+                session_id,
+                prompt_id,
+            } => self.spawn_operation(SessionOperation::PromotePrompt {
+                session_id,
+                prompt_id,
+            }),
+            ApplicationTransition::CancelPrompt {
+                session_id,
+                prompt_id,
+            } => self.spawn_operation(SessionOperation::CancelPrompt {
+                session_id,
+                prompt_id,
+            }),
+            ApplicationTransition::InterruptTurn {
+                session_id,
+                turn_id,
+            } => self.spawn_operation(SessionOperation::InterruptTurn {
+                session_id,
+                turn_id,
+            }),
+            ApplicationTransition::DeleteSession(session_id) => {
+                self.spawn_operation(SessionOperation::DeleteSession { session_id });
+            }
+            ApplicationTransition::SubscribeSession(_) => {
+                unreachable!("terminal input cannot end a Session subscription")
+            }
+            ApplicationTransition::AttachSession(session_id) => {
+                self.tasks.attach(
+                    self.client.session_commands(),
                     session_id,
-                    prompt_id,
-                },
-                channels.submissions.clone(),
-            );
-        }
-        ApplicationTransition::InterruptTurn {
-            session_id,
-            turn_id,
-        } => {
-            spawn_session_operation(
-                client.session_commands(),
-                SessionOperation::InterruptTurn {
-                    session_id,
-                    turn_id,
-                },
-                channels.submissions.clone(),
-            );
-        }
-        ApplicationTransition::DeleteSession(session_id) => {
-            spawn_session_operation(
-                client.session_commands(),
-                SessionOperation::DeleteSession { session_id },
-                channels.submissions.clone(),
-            );
-        }
-        ApplicationTransition::SubscribeSession(_) => {
-            unreachable!("terminal input cannot end a Session subscription")
-        }
-        ApplicationTransition::AttachSession(session_id) => {
-            tasks.attach(client.session_commands(), session_id, &channels.pickers);
-        }
-        ApplicationTransition::ListSessions(request) => {
-            tasks.list_sessions(client.session_commands(), request, &channels.pickers);
-        }
-        ApplicationTransition::ListModels(request) => {
-            tasks.list_models(client.session_commands(), request, &channels.models);
-        }
-        ApplicationTransition::ConfirmLandingAgentSelection(selection) => {
-            spawn_landing_agent_selection_confirmation(
-                client.session_commands(),
-                selection,
-                channels.submissions.clone(),
-            );
-        }
-        ApplicationTransition::UpdateAgentSelection {
-            session_id,
-            request,
-        } => {
-            spawn_agent_selection_update(
-                client.session_commands(),
+                    &self.channels.pickers,
+                );
+            }
+            ApplicationTransition::ListSessions(request) => self.list_sessions(request),
+            ApplicationTransition::ListModels(request) => {
+                self.tasks.list_models(
+                    self.client.session_commands(),
+                    request,
+                    &self.channels.models,
+                );
+            }
+            ApplicationTransition::ConfirmLandingAgentSelection(selection) => {
+                spawn_landing_agent_selection_confirmation(
+                    self.client.session_commands(),
+                    selection,
+                    self.channels.submissions.clone(),
+                );
+            }
+            ApplicationTransition::UpdateAgentSelection {
                 session_id,
                 request,
-                channels.submissions.clone(),
-            );
-        }
-    }
-    ControlFlow::Continue(())
-}
-
-fn handle_managed_event(
-    event: Option<ManagedEvent>,
-    application: &mut Application,
-    tasks: &mut SessionTasks,
-    reconnect_grace: &mut Option<Pin<Box<tokio::time::Sleep>>>,
-) -> Result<ControlFlow<Exit>> {
-    let event = event.ok_or_else(|| anyhow!("managed client stopped unexpectedly"))?;
-    let was_recovering = application.is_recovering();
-    let transition = application.handle_event(ApplicationEvent::Managed(event))?;
-    if application.is_recovering() {
-        if !was_recovering {
-            *reconnect_grace = Some(Box::pin(tokio::time::sleep(RECONNECT_GRACE_PERIOD)));
-        }
-    } else {
-        *reconnect_grace = None;
-    }
-    match transition {
-        ApplicationTransition::Continue => {}
-        ApplicationTransition::SessionEnded => tasks.subscription = None,
-        // The shutdown state is worth one last frame before the screen goes.
-        ApplicationTransition::Exit => return Ok(ControlFlow::Break(Exit::AfterFinalFrame)),
-        ApplicationTransition::CreateSession(_)
-        | ApplicationTransition::DetachSession
-        | ApplicationTransition::DeleteSession(_)
-        | ApplicationTransition::AdmitPrompt { .. }
-        | ApplicationTransition::PromotePrompt { .. }
-        | ApplicationTransition::CancelPrompt { .. }
-        | ApplicationTransition::InterruptTurn { .. }
-        | ApplicationTransition::SubscribeSession(_)
-        | ApplicationTransition::AttachSession(_)
-        | ApplicationTransition::ListSessions(_)
-        | ApplicationTransition::ListModels(_)
-        | ApplicationTransition::ConfirmLandingAgentSelection(_)
-        | ApplicationTransition::UpdateAgentSelection { .. } => {
-            unreachable!("managed events do not issue Session commands");
-        }
-    }
-    if application.session_id().is_none() {
-        tasks.detach();
-    }
-    Ok(ControlFlow::Continue(()))
-}
-
-fn handle_session_stream_event(
-    event: Option<std::result::Result<SessionEvent, SessionStreamError>>,
-    application: &mut Application,
-    client: &ManagedClient,
-    tasks: &mut SessionTasks,
-    channels: &TaskChannels,
-) -> Result<()> {
-    match event {
-        Some(Ok(event)) => {
-            application.handle_event(ApplicationEvent::Session(event))?;
-        }
-        Some(Err(error)) if !error.is_recoverable() => return Err(error.into()),
-        Some(Err(_)) | None => recover_session_subscription(application, client, tasks, channels)?,
-    }
-    Ok(())
-}
-
-/// Adopts a subscription a spawned task established, unless the Application
-/// has moved on to another Session while the task was connecting.
-fn adopt_session_subscription(
-    connected: ConnectedSessionSubscription,
-    application: &Application,
-    tasks: &mut SessionTasks,
-) {
-    if tasks
-        .subscribing
-        .as_ref()
-        .is_some_and(|(session_id, _)| *session_id == connected.session_id)
-    {
-        tasks.subscribing = None;
-    }
-    if application.session_id() == Some(connected.session_id) {
-        tasks.subscription = Some(connected.subscription);
-    }
-}
-
-fn handle_submission_result(
-    result: SubmissionResult,
-    application: &mut Application,
-    client: &ManagedClient,
-    tasks: &mut SessionTasks,
-    channels: &TaskChannels,
-) -> Result<()> {
-    match result {
-        SubmissionResult::SessionCreated(created) => {
-            let session_id = created.session.id;
-            application.handle_event(ApplicationEvent::SessionCreated(*created))?;
-            tasks.subscribe(
-                client.session_commands(),
-                session_id,
-                &channels.subscriptions,
-            );
-        }
-        SubmissionResult::PromptAdmitted(prompt_id) => {
-            application.handle_event(ApplicationEvent::PromptAdmissionSucceeded(prompt_id))?;
-        }
-        SubmissionResult::Failed { prompt_id, error } => {
-            application
-                .handle_event(ApplicationEvent::PromptAdmissionFailed { prompt_id, error })?;
-        }
-        SubmissionResult::OperationSucceeded => {}
-        SubmissionResult::OperationFailed(error) => {
-            application.handle_event(ApplicationEvent::SessionOperationFailed(error))?;
-        }
-        SubmissionResult::SessionDeletionFailed { session_id, error } => {
-            application
-                .handle_event(ApplicationEvent::SessionDeletionFailed { session_id, error })?;
-        }
-        SubmissionResult::LandingAgentSelectionConfirmed(selection) => {
-            let transition = application
-                .handle_event(ApplicationEvent::LandingAgentSelectionConfirmed(selection))?;
-            flush_landing_agent_selection(client, transition, &channels.submissions);
-        }
-        SubmissionResult::LandingAgentSelectionConfirmationFailed(error) => {
-            let transition = application.handle_event(
-                ApplicationEvent::LandingAgentSelectionConfirmationFailed(error),
-            )?;
-            flush_landing_agent_selection(client, transition, &channels.submissions);
-        }
-        SubmissionResult::AgentSelectionUpdated {
-            operation_id,
-            selection,
-        } => {
-            let transition = application.handle_event(ApplicationEvent::AgentSelectionUpdated {
-                operation_id,
-                selection,
-            })?;
-            flush_agent_selection(client, transition, &channels.submissions);
-        }
-        SubmissionResult::AgentSelectionUpdateFailed {
-            operation_id,
-            error,
-        } => {
-            let transition =
-                application.handle_event(ApplicationEvent::AgentSelectionUpdateFailed {
-                    operation_id,
-                    error,
-                })?;
-            flush_agent_selection(client, transition, &channels.submissions);
-        }
-    }
-    Ok(())
-}
-
-fn handle_model_listing_result(
-    result: ModelPickerResult,
-    application: &mut Application,
-    tasks: &mut SessionTasks,
-) -> Result<()> {
-    match result {
-        ModelPickerResult::Listed { request, catalog } => {
-            application.handle_event(ApplicationEvent::ModelsListed { request, catalog })?;
-        }
-        ModelPickerResult::Refreshed { request, catalog } => {
-            finish_listing(&mut tasks.listing_models, &request);
-            application.handle_event(ApplicationEvent::ModelsRefreshed { request, catalog })?;
-        }
-        ModelPickerResult::Failed { request, error } => {
-            finish_listing(&mut tasks.listing_models, &request);
-            application.handle_event(ApplicationEvent::ModelListingFailed { request, error })?;
-        }
-    }
-    Ok(())
-}
-
-fn handle_session_picker_result(
-    result: SessionPickerResult,
-    application: &mut Application,
-    client: &ManagedClient,
-    tasks: &mut SessionTasks,
-    channels: &TaskChannels,
-) -> Result<()> {
-    match result {
-        SessionPickerResult::Listed { request, sessions } => {
-            finish_listing(&mut tasks.listing_sessions, &request);
-            application.handle_event(ApplicationEvent::SessionsListed { request, sessions })?;
-        }
-        SessionPickerResult::ListingFailed { request, error } => {
-            finish_listing(&mut tasks.listing_sessions, &request);
-            application.handle_event(ApplicationEvent::SessionListingFailed { request, error })?;
-        }
-        SessionPickerResult::Attached {
-            snapshot,
-            subscription,
-        } => {
-            tasks.attaching = None;
-            application.handle_event(ApplicationEvent::SessionAttached(*snapshot))?;
-            tasks.subscription = Some(subscription);
-            tasks.abort_subscribing();
-        }
-        SessionPickerResult::AttachmentFailed(error) => {
-            tasks.attaching = None;
-            let transition =
-                application.handle_event(ApplicationEvent::SessionAttachmentFailed(error))?;
-            if let ApplicationTransition::ListSessions(request) = transition {
-                tasks.list_sessions(client.session_commands(), request, &channels.pickers);
+            } => {
+                spawn_agent_selection_update(
+                    self.client.session_commands(),
+                    session_id,
+                    request,
+                    self.channels.submissions.clone(),
+                );
             }
         }
+        ControlFlow::Continue(())
     }
-    Ok(())
+
+    fn spawn_operation(&self, operation: SessionOperation) {
+        spawn_session_operation(
+            self.client.session_commands(),
+            operation,
+            self.channels.submissions.clone(),
+        );
+    }
+
+    fn list_sessions(&mut self, request: SessionListRequest) {
+        self.tasks.list_sessions(
+            self.client.session_commands(),
+            request,
+            &self.channels.pickers,
+        );
+    }
+
+    fn receive_managed_event(&mut self, event: Option<ManagedEvent>) -> Result<ControlFlow<Exit>> {
+        self.needs_redraw = true;
+        let event = event.ok_or_else(|| anyhow!("managed client stopped unexpectedly"))?;
+        let was_recovering = self.application.is_recovering();
+        let transition = self
+            .application
+            .handle_event(ApplicationEvent::Managed(event))?;
+        if self.application.is_recovering() {
+            if !was_recovering {
+                self.reconnect_grace = Some(Box::pin(tokio::time::sleep(RECONNECT_GRACE_PERIOD)));
+            }
+        } else {
+            self.reconnect_grace = None;
+        }
+        match transition {
+            ApplicationTransition::Continue => {}
+            ApplicationTransition::SessionEnded => self.tasks.end_subscription(),
+            // The shutdown state is worth one last frame before the screen goes.
+            ApplicationTransition::Exit => return Ok(ControlFlow::Break(Exit::AfterFinalFrame)),
+            ApplicationTransition::CreateSession(_)
+            | ApplicationTransition::DetachSession
+            | ApplicationTransition::DeleteSession(_)
+            | ApplicationTransition::AdmitPrompt { .. }
+            | ApplicationTransition::PromotePrompt { .. }
+            | ApplicationTransition::CancelPrompt { .. }
+            | ApplicationTransition::InterruptTurn { .. }
+            | ApplicationTransition::SubscribeSession(_)
+            | ApplicationTransition::AttachSession(_)
+            | ApplicationTransition::ListSessions(_)
+            | ApplicationTransition::ListModels(_)
+            | ApplicationTransition::ConfirmLandingAgentSelection(_)
+            | ApplicationTransition::UpdateAgentSelection { .. } => {
+                unreachable!("managed events do not issue Session commands");
+            }
+        }
+        if self.application.session_id().is_none() {
+            self.tasks.detach();
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn expire_reconnect_grace(&mut self) -> Result<ControlFlow<Exit>> {
+        self.needs_redraw = true;
+        self.application
+            .handle_event(ApplicationEvent::ReconnectGraceElapsed)?;
+        self.reconnect_grace = None;
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn receive_session_event(
+        &mut self,
+        event: Option<std::result::Result<SessionEvent, SessionStreamError>>,
+    ) -> Result<ControlFlow<Exit>> {
+        self.needs_redraw = true;
+        match event {
+            Some(Ok(event)) => {
+                self.application
+                    .handle_event(ApplicationEvent::Session(event))?;
+            }
+            Some(Err(error)) if !error.is_recoverable() => return Err(error.into()),
+            Some(Err(_)) | None => self.recover_session_subscription()?,
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Re-establishes the Session subscription after the stream dropped,
+    /// leaving any attempt already in flight to finish rather than restarting.
+    fn recover_session_subscription(&mut self) -> Result<()> {
+        self.tasks.end_subscription();
+        let transition = self
+            .application
+            .handle_event(ApplicationEvent::SessionSubscriptionEnded)?;
+        if let ApplicationTransition::SubscribeSession(session_id) = transition {
+            self.tasks.subscribe_if_idle(
+                self.client.session_commands(),
+                session_id,
+                &self.channels.subscriptions,
+            );
+        }
+        Ok(())
+    }
+
+    /// Adopts a subscription a spawned task established. Nothing on screen
+    /// changes, so this is the one event that does not ask for a redraw.
+    fn receive_subscription(
+        &mut self,
+        connected: Option<ConnectedSessionSubscription>,
+    ) -> Result<ControlFlow<Exit>> {
+        let connected = connected
+            .ok_or_else(|| anyhow!("Session subscription task channel stopped unexpectedly"))?;
+        self.tasks.finish_subscribing(connected.session_id);
+        if self.application.session_id() == Some(connected.session_id) {
+            self.tasks.adopt(connected.subscription);
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn receive_submission(
+        &mut self,
+        submission: Option<SubmissionResult>,
+    ) -> Result<ControlFlow<Exit>> {
+        self.needs_redraw = true;
+        let submission = submission
+            .ok_or_else(|| anyhow!("Prompt admission task channel stopped unexpectedly"))?;
+        match submission {
+            SubmissionResult::SessionCreated(created) => {
+                let session_id = created.session.id;
+                self.application
+                    .handle_event(ApplicationEvent::SessionCreated(*created))?;
+                self.tasks.resubscribe(
+                    self.client.session_commands(),
+                    session_id,
+                    &self.channels.subscriptions,
+                );
+            }
+            SubmissionResult::PromptAdmitted(prompt_id) => {
+                self.application
+                    .handle_event(ApplicationEvent::PromptAdmissionSucceeded(prompt_id))?;
+            }
+            SubmissionResult::Failed { prompt_id, error } => {
+                self.application
+                    .handle_event(ApplicationEvent::PromptAdmissionFailed { prompt_id, error })?;
+            }
+            SubmissionResult::OperationSucceeded => {}
+            SubmissionResult::OperationFailed(error) => {
+                self.application
+                    .handle_event(ApplicationEvent::SessionOperationFailed(error))?;
+            }
+            SubmissionResult::SessionDeletionFailed { session_id, error } => {
+                self.application
+                    .handle_event(ApplicationEvent::SessionDeletionFailed { session_id, error })?;
+            }
+            SubmissionResult::LandingAgentSelectionConfirmed(selection) => {
+                let transition = self
+                    .application
+                    .handle_event(ApplicationEvent::LandingAgentSelectionConfirmed(selection))?;
+                self.flush_landing_agent_selection(transition);
+            }
+            SubmissionResult::LandingAgentSelectionConfirmationFailed(error) => {
+                let transition = self.application.handle_event(
+                    ApplicationEvent::LandingAgentSelectionConfirmationFailed(error),
+                )?;
+                self.flush_landing_agent_selection(transition);
+            }
+            SubmissionResult::AgentSelectionUpdated {
+                operation_id,
+                selection,
+            } => {
+                let transition =
+                    self.application
+                        .handle_event(ApplicationEvent::AgentSelectionUpdated {
+                            operation_id,
+                            selection,
+                        })?;
+                self.flush_agent_selection(transition);
+            }
+            SubmissionResult::AgentSelectionUpdateFailed {
+                operation_id,
+                error,
+            } => {
+                let transition = self.application.handle_event(
+                    ApplicationEvent::AgentSelectionUpdateFailed {
+                        operation_id,
+                        error,
+                    },
+                )?;
+                self.flush_agent_selection(transition);
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Dispatches the follow-up request when settling one Agent Selection
+    /// operation released a coalesced newer selection.
+    fn flush_agent_selection(&self, transition: ApplicationTransition) {
+        if let ApplicationTransition::UpdateAgentSelection {
+            session_id,
+            request,
+        } = transition
+        {
+            spawn_agent_selection_update(
+                self.client.session_commands(),
+                session_id,
+                request,
+                self.channels.submissions.clone(),
+            );
+        }
+    }
+
+    fn flush_landing_agent_selection(&self, transition: ApplicationTransition) {
+        if let ApplicationTransition::ConfirmLandingAgentSelection(selection) = transition {
+            spawn_landing_agent_selection_confirmation(
+                self.client.session_commands(),
+                selection,
+                self.channels.submissions.clone(),
+            );
+        }
+    }
+
+    fn receive_model_listing(
+        &mut self,
+        result: Option<ModelPickerResult>,
+    ) -> Result<ControlFlow<Exit>> {
+        self.needs_redraw = true;
+        let result =
+            result.ok_or_else(|| anyhow!("Model picker task channel stopped unexpectedly"))?;
+        match result {
+            ModelPickerResult::Listed { request, catalog } => {
+                self.application
+                    .handle_event(ApplicationEvent::ModelsListed { request, catalog })?;
+            }
+            ModelPickerResult::Refreshed { request, catalog } => {
+                self.tasks.finish_listing_models(&request);
+                self.application
+                    .handle_event(ApplicationEvent::ModelsRefreshed { request, catalog })?;
+            }
+            ModelPickerResult::Failed { request, error } => {
+                self.tasks.finish_listing_models(&request);
+                self.application
+                    .handle_event(ApplicationEvent::ModelListingFailed { request, error })?;
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn receive_session_picker(
+        &mut self,
+        result: Option<SessionPickerResult>,
+    ) -> Result<ControlFlow<Exit>> {
+        self.needs_redraw = true;
+        let result =
+            result.ok_or_else(|| anyhow!("Session picker task channel stopped unexpectedly"))?;
+        match result {
+            SessionPickerResult::Listed { request, sessions } => {
+                self.tasks.finish_listing_sessions(&request);
+                self.application
+                    .handle_event(ApplicationEvent::SessionsListed { request, sessions })?;
+            }
+            SessionPickerResult::ListingFailed { request, error } => {
+                self.tasks.finish_listing_sessions(&request);
+                self.application
+                    .handle_event(ApplicationEvent::SessionListingFailed { request, error })?;
+            }
+            SessionPickerResult::Attached {
+                snapshot,
+                subscription,
+            } => {
+                self.tasks.finish_attaching();
+                self.application
+                    .handle_event(ApplicationEvent::SessionAttached(*snapshot))?;
+                self.tasks.adopt(subscription);
+                self.tasks.abort_subscribing();
+            }
+            SessionPickerResult::AttachmentFailed(error) => {
+                self.tasks.finish_attaching();
+                let transition = self
+                    .application
+                    .handle_event(ApplicationEvent::SessionAttachmentFailed(error))?;
+                if let ApplicationTransition::ListSessions(request) = transition {
+                    self.list_sessions(request);
+                }
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
 }
 
 fn spawn_session_creation(
@@ -653,15 +708,9 @@ fn spawn_session_creation(
     results: UnboundedSender<SubmissionResult>,
 ) {
     let prompt_id = request.prompt.id;
-    tokio::spawn(async move {
-        let result = match commands.create_session(request).await {
-            Ok(created) => SubmissionResult::SessionCreated(Box::new(created)),
-            Err(error) => SubmissionResult::Failed {
-                prompt_id,
-                error: error.to_string(),
-            },
-        };
-        let _ = results.send(result);
+    spawn_prompt_delivery(prompt_id, results, async move {
+        let created = commands.create_session(request).await?;
+        Ok(SubmissionResult::SessionCreated(Box::new(created)))
     });
 }
 
@@ -672,14 +721,26 @@ fn spawn_prompt_admission(
     results: UnboundedSender<SubmissionResult>,
 ) {
     let prompt_id = request.prompt.id;
+    spawn_prompt_delivery(prompt_id, results, async move {
+        let prompt = commands.admit_prompt(session_id, request).await?;
+        Ok(SubmissionResult::PromptAdmitted(prompt.id))
+    });
+}
+
+/// Delivers a Prompt, reporting any transport failure against `prompt_id` so
+/// the composer can restore the text the user submitted.
+fn spawn_prompt_delivery(
+    prompt_id: PromptId,
+    results: UnboundedSender<SubmissionResult>,
+    deliver: impl Future<Output = Result<SubmissionResult>> + Send + 'static,
+) {
     tokio::spawn(async move {
-        let result = match commands.admit_prompt(session_id, request).await {
-            Ok(prompt) => SubmissionResult::PromptAdmitted(prompt.id),
-            Err(error) => SubmissionResult::Failed {
+        let result = deliver
+            .await
+            .unwrap_or_else(|error| SubmissionResult::Failed {
                 prompt_id,
                 error: error.to_string(),
-            },
-        };
+            });
         let _ = results.send(result);
     });
 }
@@ -757,41 +818,6 @@ fn spawn_model_listing(
         };
         let _ = results.send(result);
     })
-}
-
-/// Dispatches the follow-up request when settling one Agent Selection
-/// operation released a coalesced newer selection.
-fn flush_agent_selection(
-    client: &ManagedClient,
-    transition: ApplicationTransition,
-    results: &UnboundedSender<SubmissionResult>,
-) {
-    if let ApplicationTransition::UpdateAgentSelection {
-        session_id,
-        request,
-    } = transition
-    {
-        spawn_agent_selection_update(
-            client.session_commands(),
-            session_id,
-            request,
-            results.clone(),
-        );
-    }
-}
-
-fn flush_landing_agent_selection(
-    client: &ManagedClient,
-    transition: ApplicationTransition,
-    results: &UnboundedSender<SubmissionResult>,
-) {
-    if let ApplicationTransition::ConfirmLandingAgentSelection(selection) = transition {
-        spawn_landing_agent_selection_confirmation(
-            client.session_commands(),
-            selection,
-            results.clone(),
-        );
-    }
 }
 
 fn spawn_landing_agent_selection_confirmation(
@@ -1028,31 +1054,6 @@ fn spawn_session_subscription(
             }
         }
     })
-}
-
-/// Re-establishes the Session subscription after the stream dropped, leaving
-/// any attempt already in flight to finish rather than restarting it.
-fn recover_session_subscription(
-    application: &mut Application,
-    client: &ManagedClient,
-    tasks: &mut SessionTasks,
-    channels: &TaskChannels,
-) -> Result<()> {
-    tasks.subscription = None;
-    let transition = application.handle_event(ApplicationEvent::SessionSubscriptionEnded)?;
-    if let ApplicationTransition::SubscribeSession(session_id) = transition
-        && tasks.subscribing.is_none()
-    {
-        tasks.subscribing = Some((
-            session_id,
-            spawn_session_subscription(
-                client.session_commands(),
-                session_id,
-                channels.subscriptions.clone(),
-            ),
-        ));
-    }
-    Ok(())
 }
 
 async fn next_session_event(
