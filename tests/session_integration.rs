@@ -599,6 +599,28 @@ async fn provider_streams_store_only_printable_text_newlines_and_sgr() {
             status: ProviderCommandStatus::Completed,
             exit_status: Some(0),
         },
+        ProviderEvent::CommandStarted {
+            activity_id: ProviderActivityId::new("progress-command"),
+            command: "show progress".to_owned(),
+            cwd: Some(workspace.path().to_owned()),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("progress-command"),
+            content: "10%".to_owned(),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("progress-command"),
+            content: "\r50%\r\x1b[31mlonger frame".to_owned(),
+        },
+        ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new("progress-command"),
+            content: "\r\x1b[32m100%\x1b[0m\nplain\r\nmulti\nline\r".to_owned(),
+        },
+        ProviderEvent::CommandCompleted {
+            activity_id: ProviderActivityId::new("progress-command"),
+            status: ProviderCommandStatus::Completed,
+            exit_status: Some(0),
+        },
         ProviderEvent::AgentMessageStarted,
         ProviderEvent::AgentMessageDelta {
             content: "\x1b[1;3".to_owned(),
@@ -625,7 +647,7 @@ async fn provider_streams_store_only_printable_text_newlines_and_sgr() {
     let Activity::Command { output, .. } = &completed.activities[0] else {
         panic!("Provider command projects as command Activity");
     };
-    assert_eq!(output, "plain    \x1b[38;5;42mgreendone\n");
+    assert_eq!(output, "\x1b[38;5;42mdone\n");
     let Activity::Command {
         output: truncated_output,
         ..
@@ -639,6 +661,17 @@ async fn provider_streams_store_only_printable_text_newlines_and_sgr() {
         .expect("truncated styled output is bounded by complete SGR sequences");
     assert_eq!(truncated_text.len(), 65_520);
     assert!(truncated_text.chars().all(|character| character == 'x'));
+    let Activity::Command {
+        output: progress_output,
+        ..
+    } = &completed.activities[2]
+    else {
+        panic!("third Provider command projects as command Activity");
+    };
+    assert_eq!(
+        progress_output,
+        "\x1b[31m\x1b[32m100%\x1b[0m\nplain\nmulti\nline"
+    );
     assert_eq!(completed.messages[1].content, "\x1b[1;32mHello    world\n");
 
     server.shutdown().await.expect("shut down server");

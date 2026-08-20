@@ -175,6 +175,14 @@ pub(crate) struct ProviderTextNormalizer {
     remaining_chars: Option<usize>,
     style_may_be_active: bool,
     truncated: bool,
+    overwrite_line: Option<OverwriteLine>,
+}
+
+#[derive(Debug, Default)]
+struct OverwriteLine {
+    content: String,
+    sgr: String,
+    overwrite_pending: bool,
 }
 
 impl ProviderTextNormalizer {
@@ -183,6 +191,12 @@ impl ProviderTextNormalizer {
             remaining_chars: Some(max_chars),
             ..Self::default()
         }
+    }
+
+    pub(crate) fn with_line_overwrite(max_chars: usize) -> Self {
+        let mut normalizer = Self::with_max_chars(max_chars);
+        normalizer.overwrite_line = Some(OverwriteLine::default());
+        normalizer
     }
 
     pub(crate) fn push(&mut self, chunk: &str) -> String {
@@ -195,7 +209,8 @@ impl ProviderTextNormalizer {
                 Fragment::Text(text) => self.push_text(&text, &mut normalized),
                 Fragment::Sgr(sequence) => self.push_sgr(&sequence, &mut normalized),
                 Fragment::Control('\t') => self.push_text("    ", &mut normalized),
-                Fragment::Control('\n') => self.push_text("\n", &mut normalized),
+                Fragment::Control('\n') => self.push_newline(&mut normalized),
+                Fragment::Control('\r') => self.overwrite_line(),
                 Fragment::Csi(_)
                 | Fragment::Osc(_)
                 | Fragment::Dcs(_)
@@ -210,15 +225,23 @@ impl ProviderTextNormalizer {
         normalized
     }
 
+    pub(crate) fn finish(&mut self) -> String {
+        self.overwrite_line
+            .as_mut()
+            .map(|line| std::mem::take(&mut line.content))
+            .unwrap_or_default()
+    }
+
     fn push_text(&mut self, text: &str, normalized: &mut String) {
         let Some(remaining) = self.remaining_chars.as_mut() else {
-            normalized.push_str(text);
+            self.push_visible(text, normalized);
             return;
         };
         let mut characters = text.chars();
-        normalized.extend(characters.by_ref().take(*remaining));
+        let visible = characters.by_ref().take(*remaining).collect::<String>();
         let emitted = text.chars().count().min(*remaining);
         *remaining -= emitted;
+        self.push_visible(&visible, normalized);
         if characters.next().is_some() {
             self.mark_truncated(normalized);
         }
@@ -233,12 +256,55 @@ impl ProviderTextNormalizer {
             }
             *remaining -= sequence_chars;
         }
-        normalized.push_str(sequence);
+        if let Some(line) = self.overwrite_line.as_mut() {
+            line.content.push_str(sequence);
+            line.sgr.push_str(sequence);
+        } else {
+            normalized.push_str(sequence);
+        }
         update_style_state(sequence, &mut self.style_may_be_active);
+    }
+
+    fn push_newline(&mut self, normalized: &mut String) {
+        if let Some(remaining) = self.remaining_chars.as_mut() {
+            if *remaining == 0 {
+                self.mark_truncated(normalized);
+                return;
+            }
+            *remaining -= 1;
+        }
+        if let Some(line) = self.overwrite_line.as_mut() {
+            line.content.push('\n');
+            normalized.push_str(&line.content);
+            line.content.clear();
+            line.sgr.clear();
+            line.overwrite_pending = false;
+        } else {
+            normalized.push('\n');
+        }
+    }
+
+    fn overwrite_line(&mut self) {
+        if let Some(line) = self.overwrite_line.as_mut() {
+            line.overwrite_pending = true;
+        }
+    }
+
+    fn push_visible(&mut self, text: &str, normalized: &mut String) {
+        if let Some(line) = self.overwrite_line.as_mut() {
+            if line.overwrite_pending && !text.is_empty() {
+                line.content.clone_from(&line.sgr);
+                line.overwrite_pending = false;
+            }
+            line.content.push_str(text);
+        } else {
+            normalized.push_str(text);
+        }
     }
 
     fn mark_truncated(&mut self, normalized: &mut String) {
         self.truncated = true;
+        normalized.push_str(&self.finish());
         if self.style_may_be_active {
             normalized.push_str("\x1b[0m");
             self.style_may_be_active = false;

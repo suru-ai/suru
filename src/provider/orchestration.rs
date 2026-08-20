@@ -928,7 +928,7 @@ fn project_provider_event(
                                 activity_id,
                                 ActiveProviderCommand {
                                     id: command_activity_id,
-                                    output_normalizer: ProviderTextNormalizer::with_max_chars(
+                                    output_normalizer: ProviderTextNormalizer::with_line_overwrite(
                                         MAX_STORED_COMMAND_OUTPUT_CHARS,
                                     ),
                                 },
@@ -970,11 +970,7 @@ fn project_provider_event(
                 status,
                 exit_status,
             } => {
-                let Some(command_activity_id) = active
-                    .command_activities
-                    .get(&activity_id)
-                    .map(|command| command.id)
-                else {
+                let Some(command) = active.command_activities.get_mut(&activity_id) else {
                     return fail_invalid_provider_event(
                         sessions,
                         session_id,
@@ -983,6 +979,25 @@ fn project_provider_event(
                         "Provider completed a command before starting the Activity",
                     );
                 };
+                let command_activity_id = command.id;
+                let trailing_output = command.output_normalizer.finish();
+                if !trailing_output.is_empty()
+                    && let Err(error) = sessions.publish_agent_output(
+                        session_id,
+                        SessionChange::CommandOutputAppended {
+                            activity_id: command_activity_id,
+                            content: trailing_output,
+                        },
+                    )
+                {
+                    return finish_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        next_agent,
+                        normalize_provider_text(&format!("Provider execution failed: {error}")),
+                    );
+                }
                 sessions
                     .publish_agent_output(
                         session_id,
