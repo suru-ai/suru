@@ -15,7 +15,7 @@ use std::{
 };
 
 use ratatui::{
-    style::Style,
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
@@ -354,6 +354,34 @@ fn provisional_fingerprint(provisional: &[&InitialPrompt]) -> u64 {
     hasher.finish()
 }
 
+enum ContentToken {
+    Text(String),
+    Sgr(String),
+    Tab,
+    LineBreak,
+}
+
+/// Reduces Session content to printable text, layout controls, and SGR style
+/// transitions. Every escape/control sequence omitted here stays invisible in
+/// both the strip-only and styled rendering paths.
+fn content_tokens(text: &str) -> impl Iterator<Item = ContentToken> {
+    AnsiScanner::default()
+        .feed(text)
+        .into_iter()
+        .filter_map(|fragment| match fragment {
+            Fragment::Text(text) => Some(ContentToken::Text(text)),
+            Fragment::Sgr(sequence) => Some(ContentToken::Sgr(sequence)),
+            Fragment::Control('\t') => Some(ContentToken::Tab),
+            Fragment::Control('\n') => Some(ContentToken::LineBreak),
+            Fragment::Csi(_)
+            | Fragment::Osc(_)
+            | Fragment::Dcs(_)
+            | Fragment::Apc(_)
+            | Fragment::Escape(_)
+            | Fragment::Control(_) => None,
+        })
+}
+
 /// Removes terminal control sequences from Session content before it becomes
 /// cell symbols. Provider output can carry raw ANSI escapes (colored build
 /// logs, cursor movement); written verbatim they desynchronize the terminal
@@ -366,18 +394,12 @@ fn sanitize_content(text: &str) -> std::borrow::Cow<'_, str> {
         return std::borrow::Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len());
-    for fragment in AnsiScanner::default().feed(text) {
-        match fragment {
-            Fragment::Text(text) => out.push_str(&text),
-            Fragment::Control('\t') => out.push_str("    "),
-            Fragment::Control('\n') => out.push('\n'),
-            Fragment::Sgr(_)
-            | Fragment::Csi(_)
-            | Fragment::Osc(_)
-            | Fragment::Dcs(_)
-            | Fragment::Apc(_)
-            | Fragment::Escape(_)
-            | Fragment::Control(_) => {}
+    for token in content_tokens(text) {
+        match token {
+            ContentToken::Text(text) => out.push_str(&text),
+            ContentToken::Tab => out.push_str("    "),
+            ContentToken::LineBreak => out.push('\n'),
+            ContentToken::Sgr(_) => {}
         }
     }
     std::borrow::Cow::Owned(out)
@@ -392,9 +414,11 @@ fn render_message(lines: &mut Vec<Line<'static>>, message: &Message, theme: &The
 
 fn render_activity(lines: &mut Vec<Line<'static>>, activity: &Activity, theme: &Theme) {
     match activity {
-        Activity::Status { text, .. } => push_prefixed_lines(lines, "  ", text, theme.text.subdued),
+        Activity::Status { text, .. } => {
+            push_styled_prefixed_lines(lines, "  ", text, theme.text.subdued)
+        }
         Activity::Error { text, .. } => {
-            push_prefixed_lines(lines, "  Error: ", text, theme.feedback.error)
+            push_styled_prefixed_lines(lines, "  Error: ", text, theme.feedback.error)
         }
         Activity::Command {
             status,
@@ -450,7 +474,7 @@ fn push_command_activity(
         );
     }
     if !output.is_empty() {
-        push_prefixed_lines(lines, "    ", output, theme.text.subdued);
+        push_styled_prefixed_lines(lines, "    ", output, theme.text.subdued);
     }
 }
 
@@ -555,6 +579,214 @@ fn push_prefixed_lines(lines: &mut Vec<Line<'static>>, prefix: &str, content: &s
             style,
         ));
     }
+}
+
+fn push_styled_prefixed_lines(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    content: &str,
+    base_style: Style,
+) {
+    let mut style = base_style;
+    let mut spans = vec![Span::styled(prefix.to_owned(), base_style)];
+    let mut line_has_content = false;
+
+    for token in content_tokens(content) {
+        match token {
+            ContentToken::Text(text) if !text.is_empty() => {
+                spans.push(Span::styled(text, style));
+                line_has_content = true;
+            }
+            ContentToken::Sgr(sequence) => apply_sgr(&sequence, &mut style, base_style),
+            ContentToken::Tab => {
+                spans.push(Span::styled("    ", style));
+                line_has_content = true;
+            }
+            ContentToken::LineBreak => {
+                lines.push(Line::from(std::mem::take(&mut spans)));
+                spans.push(Span::styled("  ", base_style));
+                line_has_content = false;
+            }
+            ContentToken::Text(_) => {}
+        }
+    }
+    if line_has_content {
+        lines.push(Line::from(spans));
+    }
+}
+
+fn apply_sgr(sequence: &str, style: &mut Style, base_style: Style) {
+    let Some(parameters) = sequence
+        .strip_prefix("\x1b[")
+        .and_then(|sequence| sequence.strip_suffix('m'))
+    else {
+        return;
+    };
+    let parameters: Vec<&str> = if parameters.is_empty() {
+        vec!["0"]
+    } else {
+        parameters.split(';').collect()
+    };
+    let mut index = 0;
+    while index < parameters.len() {
+        if parameters[index].contains(':') {
+            apply_colon_color(parameters[index], style);
+            index += 1;
+            continue;
+        }
+        let Some(parameter) = parse_sgr_parameter(parameters[index]) else {
+            index += 1;
+            continue;
+        };
+        match parameter {
+            0 => *style = base_style,
+            1 => *style = style.add_modifier(Modifier::BOLD),
+            2 => *style = style.add_modifier(Modifier::DIM),
+            3 => *style = style.add_modifier(Modifier::ITALIC),
+            4 => *style = style.add_modifier(Modifier::UNDERLINED),
+            7 => *style = style.add_modifier(Modifier::REVERSED),
+            22 => *style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            23 => *style = style.remove_modifier(Modifier::ITALIC),
+            24 => *style = style.remove_modifier(Modifier::UNDERLINED),
+            27 => *style = style.remove_modifier(Modifier::REVERSED),
+            30..=37 => style.fg = ansi_color(parameter - 30, false),
+            38 => {
+                index = apply_extended_color(&parameters, index, &mut style.fg);
+                continue;
+            }
+            39 => style.fg = base_style.fg,
+            40..=47 => style.bg = ansi_color(parameter - 40, false),
+            48 => {
+                index = apply_extended_color(&parameters, index, &mut style.bg);
+                continue;
+            }
+            49 => style.bg = base_style.bg,
+            90..=97 => style.fg = ansi_color(parameter - 90, true),
+            100..=107 => style.bg = ansi_color(parameter - 100, true),
+            _ => {}
+        }
+        index += 1;
+    }
+}
+
+fn parse_sgr_parameter(parameter: &str) -> Option<u16> {
+    if parameter.is_empty() {
+        Some(0)
+    } else {
+        parameter.parse().ok()
+    }
+}
+
+fn apply_extended_color(parameters: &[&str], index: usize, target: &mut Option<Color>) -> usize {
+    match parameters
+        .get(index + 1)
+        .and_then(|parameter| parse_sgr_parameter(parameter))
+    {
+        Some(5) => {
+            if let Some(value) = parameters
+                .get(index + 2)
+                .and_then(|parameter| parse_sgr_parameter(parameter))
+                .and_then(|value| u8::try_from(value).ok())
+            {
+                *target = Some(Color::Indexed(value));
+            }
+            (index + 3).min(parameters.len())
+        }
+        Some(2) => {
+            if let (Some(red), Some(green), Some(blue)) = (
+                parameters.get(index + 2).copied().and_then(sgr_byte),
+                parameters.get(index + 3).copied().and_then(sgr_byte),
+                parameters.get(index + 4).copied().and_then(sgr_byte),
+            ) {
+                *target = Some(Color::Rgb(red, green, blue));
+            }
+            (index + 5).min(parameters.len())
+        }
+        Some(_) => (index + 2).min(parameters.len()),
+        None => index + 1,
+    }
+}
+
+fn apply_colon_color(parameter: &str, style: &mut Style) {
+    let parameters: Vec<Option<u16>> = parameter
+        .split(':')
+        .map(|parameter| {
+            if parameter.is_empty() {
+                None
+            } else {
+                parameter.parse().ok()
+            }
+        })
+        .collect();
+    let [
+        Some(color_target @ (38 | 48)),
+        Some(color_kind),
+        values @ ..,
+    ] = parameters.as_slice()
+    else {
+        return;
+    };
+    let color = match color_kind {
+        5 => values
+            .first()
+            .copied()
+            .flatten()
+            .and_then(|value| u8::try_from(value).ok())
+            .map(Color::Indexed),
+        2 => {
+            let rgb = if values.len() >= 4 {
+                &values[1..]
+            } else {
+                values
+            };
+            let (red, green, blue) = (
+                rgb.first().copied().flatten(),
+                rgb.get(1).copied().flatten(),
+                rgb.get(2).copied().flatten(),
+            );
+            match (red, green, blue) {
+                (Some(red), Some(green), Some(blue)) => {
+                    match (u8::try_from(red), u8::try_from(green), u8::try_from(blue)) {
+                        (Ok(red), Ok(green), Ok(blue)) => Some(Color::Rgb(red, green, blue)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    match (*color_target, color) {
+        (38, Some(color)) => style.fg = Some(color),
+        (48, Some(color)) => style.bg = Some(color),
+        _ => {}
+    }
+}
+
+fn sgr_byte(parameter: &str) -> Option<u8> {
+    parameter.parse().ok()
+}
+
+fn ansi_color(index: u16, bright: bool) -> Option<Color> {
+    Some(match (bright, index) {
+        (false, 0) => Color::Black,
+        (false, 1) => Color::Red,
+        (false, 2) => Color::Green,
+        (false, 3) => Color::Yellow,
+        (false, 4) => Color::Blue,
+        (false, 5) => Color::Magenta,
+        (false, 6) => Color::Cyan,
+        (false, 7) => Color::Gray,
+        (true, 0) => Color::DarkGray,
+        (true, 1) => Color::LightRed,
+        (true, 2) => Color::LightGreen,
+        (true, 3) => Color::LightYellow,
+        (true, 4) => Color::LightBlue,
+        (true, 5) => Color::LightMagenta,
+        (true, 6) => Color::LightCyan,
+        (true, 7) => Color::White,
+        _ => return None,
+    })
 }
 
 fn wrapped_line_count(line: &Line<'static>, width: u16) -> usize {

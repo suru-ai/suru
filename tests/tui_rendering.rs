@@ -98,6 +98,18 @@ fn buffer_rows(buffer: &Buffer) -> Vec<String> {
         .collect()
 }
 
+#[track_caller]
+fn assert_no_control_cells(buffer: &Buffer) {
+    assert!(
+        buffer.content().iter().all(|cell| {
+            cell.symbol()
+                .chars()
+                .all(|character| !character.is_control() && character != '\u{7f}')
+        }),
+        "terminal control sequences leaked into rendered cells"
+    );
+}
+
 fn text_position(buffer: &Buffer, needle: &str) -> (u16, u16) {
     for (y, row) in buffer_rows(buffer).into_iter().enumerate() {
         if let Some(byte_offset) = row.find(needle) {
@@ -282,6 +294,12 @@ fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
         .find(|message| message.role == MessageRole::Agent)
         .expect("fixture contains an Agent message")
         .content = "Build finished: \x1b[32mok\x1b(B\x1b[m today".to_owned();
+    snapshot
+        .messages
+        .iter_mut()
+        .find(|message| message.role == MessageRole::User)
+        .expect("fixture contains a user Message")
+        .content = "\x1b[31mPrompt section 1\x1b[0m".to_owned();
     let activity_id = ActivityId::new();
     snapshot.activities.push(Activity::Command {
         id: activity_id,
@@ -289,7 +307,12 @@ fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
         status: ActivityStatus::Completed,
         command: "cargo test --all".to_owned(),
         cwd: None,
-        output: "\x1b[1mtest result\x1b[0m: ok. 78 passed;\r\n\tnext\x07line".to_owned(),
+        output: concat!(
+            "\x1b[1;31mtest result\x1b[22;32m: green-ok\x1b[0m. 78 passed;\r\n",
+            "\tnext\x07\x1b[2K\x1b]0;hidden title\x07",
+            "\x1bPdevice payload\x1b\\\x1b_hidden app data\x1b\\\0\x7fline"
+        )
+        .to_owned(),
         exit_status: Some(0),
     });
     snapshot
@@ -299,13 +322,165 @@ fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach Session with escape-laden content");
 
-    let screen = rendered_application_rows_at(&application, 90, 20).join("\n");
+    let buffer = rendered_application_buffer(&application, 90, 20);
+    let screen = buffer_rows(&buffer).join("\n");
     assert!(screen.contains("Build finished: ok today"));
-    assert!(screen.contains("test result: ok. 78 passed;"));
+    assert!(screen.contains("Prompt section 1"));
+    assert!(screen.contains("test result: green-ok. 78 passed;"));
     assert!(screen.contains("    nextline"));
+    for hidden in ["hidden title", "device payload", "hidden app data"] {
+        assert!(!screen.contains(hidden));
+    }
+    assert_no_control_cells(&buffer);
+    assert_ne!(text_cell(&buffer, "Build finished").fg, Color::Green);
+    assert_ne!(text_cell(&buffer, "Prompt section 1").fg, Color::Red);
+    assert_eq!(text_cell(&buffer, "test result").fg, Color::Red);
     assert!(
-        !screen.contains('\u{1b}') && !screen.contains('\u{7}'),
-        "terminal control sequences leaked into rendered cells"
+        text_cell(&buffer, "test result")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    assert_eq!(text_cell(&buffer, "green-ok").fg, Color::Green);
+    assert!(
+        !text_cell(&buffer, "green-ok")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    assert_eq!(text_cell(&buffer, ". 78 passed").fg, Color::DarkGray);
+}
+
+#[test]
+fn escape_laden_transcript_stays_clean_after_scroll_and_session_switch() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let mut escaped = navigable_session_snapshot(SessionId::new(), workspace.path(), 8);
+    let turn_id = escaped.turns[7].id;
+    let activity_id = ActivityId::new();
+    escaped.activities.push(Activity::Command {
+        id: activity_id,
+        turn_id,
+        status: ActivityStatus::Completed,
+        command: "artifact-repro".to_owned(),
+        cwd: None,
+        output: "artifact marker \x1b[31mred\x1b[0m\x1b[2K\x1b]0;title\x07".to_owned(),
+        exit_status: Some(0),
+    });
+    escaped
+        .transcript
+        .push(TranscriptItem::Activity { activity_id });
+    application
+        .handle_event(ApplicationEvent::SessionAttached(escaped))
+        .expect("attach escape-laden Session");
+
+    let mut terminal = Terminal::new(TestBackend::new(72, 18)).expect("create test terminal");
+    terminal
+        .draw(|frame| application.render(frame))
+        .expect("render escape-laden Session");
+    let escaped_buffer = terminal.backend().buffer();
+    assert!(
+        buffer_rows(escaped_buffer)
+            .join("\n")
+            .contains("artifact marker")
+    );
+    assert_eq!(text_cell(escaped_buffer, "red").fg, Color::Red);
+    assert_no_control_cells(escaped_buffer);
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::ScrollTranscriptPageUp))
+        .expect("scroll escape-laden Session");
+    terminal
+        .draw(|frame| application.render(frame))
+        .expect("render scrolled Session");
+
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            navigable_session_snapshot(SessionId::new(), workspace.path(), 1),
+        ))
+        .expect("switch to clean Session");
+    terminal
+        .draw(|frame| application.render(frame))
+        .expect("render clean Session after switch");
+    let buffer = terminal.backend().buffer();
+    let screen = buffer_rows(buffer).join("\n");
+    assert!(screen.contains("Agent section 1"));
+    assert!(!screen.contains("artifact marker"));
+    assert_no_control_cells(buffer);
+}
+
+#[test]
+fn activity_sgr_styles_patch_over_each_activity_base_style() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
+    let turn_id = snapshot.turns[0].id;
+    let activities = [
+        Activity::Status {
+            id: ActivityId::new(),
+            turn_id,
+            text: "status \x1b[93;104mbright pair\x1b[0m plain status".to_owned(),
+        },
+        Activity::Error {
+            id: ActivityId::new(),
+            turn_id,
+            text: "failure \x1b[4;7munder reversed\x1b[0m plain error".to_owned(),
+        },
+        Activity::Command {
+            id: ActivityId::new(),
+            turn_id,
+            status: ActivityStatus::Completed,
+            command: "colored-output".to_owned(),
+            cwd: None,
+            output: concat!(
+                "\x1b[38;5;201;48;5;22mindexed pair\x1b[0m ",
+                "\x1b[38;2;1;2;3;48;2;4;5;6mtruecolor pair\x1b[0m ",
+                "\x1b[38:2::7:8:9;48:5:42mcolon pair\x1b[m ",
+                "\x1b[2mdim text\x1b[0m \x1b[3mitalic text\x1b[0m"
+            )
+            .to_owned(),
+            exit_status: Some(0),
+        },
+    ];
+    for activity in activities {
+        snapshot.transcript.push(TranscriptItem::Activity {
+            activity_id: activity.id(),
+        });
+        snapshot.activities.push(activity);
+    }
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach Session with SGR-styled Activities");
+
+    let buffer = rendered_application_buffer(&application, 120, 28);
+    assert_eq!(text_cell(&buffer, "bright pair").fg, Color::LightYellow);
+    assert_eq!(text_cell(&buffer, "bright pair").bg, Color::LightBlue);
+    assert_eq!(text_cell(&buffer, "plain status").fg, Color::DarkGray);
+
+    let decorated_error = text_cell(&buffer, "under reversed");
+    assert_eq!(decorated_error.fg, Color::Red);
+    assert!(decorated_error.modifier.contains(Modifier::UNDERLINED));
+    assert!(decorated_error.modifier.contains(Modifier::REVERSED));
+    let plain_error = text_cell(&buffer, "plain error");
+    assert_eq!(plain_error.fg, Color::Red);
+    assert!(!plain_error.modifier.contains(Modifier::UNDERLINED));
+    assert!(!plain_error.modifier.contains(Modifier::REVERSED));
+
+    let indexed = text_cell(&buffer, "indexed pair");
+    assert_eq!(indexed.fg, Color::Indexed(201));
+    assert_eq!(indexed.bg, Color::Indexed(22));
+    let truecolor = text_cell(&buffer, "truecolor pair");
+    assert_eq!(truecolor.fg, Color::Rgb(1, 2, 3));
+    assert_eq!(truecolor.bg, Color::Rgb(4, 5, 6));
+    let colon = text_cell(&buffer, "colon pair");
+    assert_eq!(colon.fg, Color::Rgb(7, 8, 9));
+    assert_eq!(colon.bg, Color::Indexed(42));
+    assert!(
+        text_cell(&buffer, "dim text")
+            .modifier
+            .contains(Modifier::DIM)
+    );
+    assert!(
+        text_cell(&buffer, "italic text")
+            .modifier
+            .contains(Modifier::ITALIC)
     );
 }
 
