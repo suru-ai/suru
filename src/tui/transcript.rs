@@ -22,6 +22,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
+    ansi::{AnsiScanner, Fragment},
     protocol::{
         Activity, ActivityId, FileChange, InitialPrompt, Message, MessageId, MessageRole, PromptId,
         SessionId, SessionRevision, SessionSnapshot, TranscriptItem,
@@ -365,52 +366,18 @@ fn sanitize_content(text: &str) -> std::borrow::Cow<'_, str> {
         return std::borrow::Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len());
-    let mut characters = text.chars().peekable();
-    while let Some(character) = characters.next() {
-        match character {
-            '\x1b' => match characters.peek() {
-                // CSI: parameters and intermediates are all below 0x40; the
-                // sequence ends at its final byte in 0x40..=0x7e.
-                Some('[') => {
-                    characters.next();
-                    for next in characters.by_ref() {
-                        if ('\u{40}'..='\u{7e}').contains(&next) {
-                            break;
-                        }
-                    }
-                }
-                // OSC: runs to BEL or the ESC-backslash string terminator.
-                Some(']') => {
-                    characters.next();
-                    while let Some(next) = characters.next() {
-                        if next == '\x07' {
-                            break;
-                        }
-                        if next == '\x1b' {
-                            if characters.peek() == Some(&'\\') {
-                                characters.next();
-                            }
-                            break;
-                        }
-                    }
-                }
-                // Other escapes: optional intermediates 0x20..=0x2f, then one
-                // final byte (covers charset designations like ESC ( B).
-                Some(_) => {
-                    while characters
-                        .peek()
-                        .is_some_and(|next| ('\u{20}'..='\u{2f}').contains(next))
-                    {
-                        characters.next();
-                    }
-                    characters.next();
-                }
-                None => {}
-            },
-            '\t' => out.push_str("    "),
-            '\n' => out.push('\n'),
-            character if character.is_control() || character == '\u{7f}' => {}
-            character => out.push(character),
+    for fragment in AnsiScanner::default().feed(text) {
+        match fragment {
+            Fragment::Text(text) => out.push_str(&text),
+            Fragment::Control('\t') => out.push_str("    "),
+            Fragment::Control('\n') => out.push('\n'),
+            Fragment::Sgr(_)
+            | Fragment::Csi(_)
+            | Fragment::Osc(_)
+            | Fragment::Dcs(_)
+            | Fragment::Apc(_)
+            | Fragment::Escape(_)
+            | Fragment::Control(_) => {}
         }
     }
     std::borrow::Cow::Owned(out)

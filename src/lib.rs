@@ -1,3 +1,4 @@
+mod ansi;
 pub mod build_identity;
 pub mod managed_client;
 mod model_catalog;
