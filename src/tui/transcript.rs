@@ -22,7 +22,10 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    ansi::{AnsiScanner, Fragment, TRUNCATION_MARKER, split_truncation_marker},
+    ansi::{
+        AnsiScanner, FragmentRole, TRUNCATION_MARKER, sgr_parameter_code, sgr_parameters,
+        split_truncation_marker,
+    },
     protocol::{
         Activity, ActivityId, FileChange, InitialPrompt, Message, MessageId, MessageRole, PromptId,
         SessionId, SessionRevision, SessionSnapshot, TranscriptItem,
@@ -388,21 +391,16 @@ fn content_tokens(text: &str) -> impl Iterator<Item = ContentToken> {
     AnsiScanner::default()
         .feed(text)
         .into_iter()
-        .filter_map(|fragment| match fragment {
-            Fragment::Text(text) => Some(ContentToken::Text(text)),
-            Fragment::Sgr(sequence) => Some(ContentToken::Sgr(sequence)),
-            Fragment::Osc8(hyperlink) => Some(match hyperlink.target() {
+        .filter_map(|fragment| match fragment.into_role() {
+            FragmentRole::Text(text) => Some(ContentToken::Text(text)),
+            FragmentRole::Sgr(sequence) => Some(ContentToken::Sgr(sequence)),
+            FragmentRole::Hyperlink(hyperlink) => Some(match hyperlink.target() {
                 Some(target) => ContentToken::LinkStart(target.to_owned()),
                 None => ContentToken::LinkEnd,
             }),
-            Fragment::Control('\t') => Some(ContentToken::Tab),
-            Fragment::Control('\n') => Some(ContentToken::LineBreak),
-            Fragment::Csi(_)
-            | Fragment::Osc(_)
-            | Fragment::Dcs(_)
-            | Fragment::Apc(_)
-            | Fragment::Escape(_)
-            | Fragment::Control(_) => None,
+            FragmentRole::Tab => Some(ContentToken::Tab),
+            FragmentRole::LineBreak => Some(ContentToken::LineBreak),
+            FragmentRole::CarriageReturn | FragmentRole::Invisible => None,
         })
 }
 
@@ -755,17 +753,10 @@ fn activity_content_style(style: Style, hyperlink_active: bool, theme: &Theme) -
 }
 
 fn apply_sgr(sequence: &str, style: &mut SgrStyle, base_style: Style, theme: &Theme) {
-    let Some(parameters) = sequence
-        .strip_prefix("\x1b[")
-        .and_then(|sequence| sequence.strip_suffix('m'))
-    else {
+    let Some(parameters) = sgr_parameters(sequence) else {
         return;
     };
-    let parameters: Vec<&str> = if parameters.is_empty() {
-        vec!["0"]
-    } else {
-        parameters.split(';').collect()
-    };
+    let parameters: Vec<&str> = parameters.collect();
     let mut index = 0;
     while index < parameters.len() {
         if parameters[index].contains(':') {
@@ -776,7 +767,7 @@ fn apply_sgr(sequence: &str, style: &mut SgrStyle, base_style: Style, theme: &Th
             index += 1;
             continue;
         }
-        let Some(parameter) = parse_sgr_parameter(parameters[index]) else {
+        let Some(parameter) = sgr_parameter_code(parameters[index]) else {
             index += 1;
             continue;
         };
@@ -815,23 +806,15 @@ fn apply_sgr(sequence: &str, style: &mut SgrStyle, base_style: Style, theme: &Th
     }
 }
 
-fn parse_sgr_parameter(parameter: &str) -> Option<u16> {
-    if parameter.is_empty() {
-        Some(0)
-    } else {
-        parameter.parse().ok()
-    }
-}
-
 fn apply_extended_color(parameters: &[&str], index: usize, target: &mut Option<Color>) -> usize {
     match parameters
         .get(index + 1)
-        .and_then(|parameter| parse_sgr_parameter(parameter))
+        .and_then(|parameter| sgr_parameter_code(parameter))
     {
         Some(5) => {
             if let Some(value) = parameters
                 .get(index + 2)
-                .and_then(|parameter| parse_sgr_parameter(parameter))
+                .and_then(|parameter| sgr_parameter_code(parameter))
                 .and_then(|value| u8::try_from(value).ok())
             {
                 *target = Some(Color::Indexed(value));

@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Display,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
 };
@@ -477,9 +478,7 @@ async fn run_provider_session(
                                 prompt_id,
                                 None,
                                 DeliveredTurnStatus::Failed {
-                                    message: normalize_provider_text(&format!(
-                                        "Provider startup failed: {error}"
-                                    )),
+                                    message: failure_message("Provider startup failed", &error),
                                 },
                             )
                         }) else {
@@ -499,9 +498,10 @@ async fn run_provider_session(
                             prompt_id,
                             None,
                             DeliveredTurnStatus::Failed {
-                                message: normalize_provider_text(&format!(
-                                    "Provider startup failed: save Resume State: {error}"
-                                )),
+                                message: failure_message(
+                                    "Provider startup failed: save Resume State",
+                                    &error,
+                                ),
                             },
                         )
                     });
@@ -522,9 +522,7 @@ async fn run_provider_session(
                             prompt_id,
                             None,
                             DeliveredTurnStatus::Failed {
-                                message: normalize_provider_text(&format!(
-                                    "Provider startup failed: {error}"
-                                )),
+                                message: failure_message("Provider startup failed", &error),
                             },
                         )
                     });
@@ -639,9 +637,7 @@ async fn run_provider_session(
                                 session_id,
                                 current.turn_id,
                                 prompt.id,
-                                normalize_provider_text(&format!(
-                                    "Provider steering failed: {error}"
-                                )),
+                                failure_message("Provider steering failed", &error),
                             )
                         });
                     }
@@ -684,9 +680,7 @@ async fn run_provider_session(
                         let _ = response.send(Ok(target));
                     }
                     Err(error) => {
-                        let message = normalize_provider_text(&format!(
-                            "Provider interruption failed: {error}"
-                        ));
+                        let message = failure_message("Provider interruption failed", &error);
                         let unfinished_output = current.take_unfinished_output();
                         let _ = updates.apply(|| {
                             sessions.fail_turn(
@@ -751,9 +745,7 @@ async fn run_provider_session(
                                 session_id,
                                 current.turn_id,
                                 unfinished_output,
-                                normalize_provider_text(&format!(
-                                    "Provider execution failed: {error}"
-                                )),
+                                failure_message("Provider execution failed", &error),
                             )
                         });
                         active = None;
@@ -808,7 +800,7 @@ fn project_turn_start_failure(
 ) {
     let selection_rejected = error.is_selection_rejected();
     let _ = updates.apply(|| {
-        let message = normalize_provider_text(&format!("Provider execution failed: {error}"));
+        let message = failure_message("Provider execution failed", &error);
         if selection_rejected {
             sessions.reject_agent_selection(
                 session_id,
@@ -1018,7 +1010,7 @@ fn project_provider_event(
                         session_id,
                         active,
                         next_agent,
-                        normalize_provider_text(&format!("Provider execution failed: {error}")),
+                        failure_message("Provider execution failed", &error),
                     );
                 }
                 sessions
@@ -1189,13 +1181,21 @@ fn project_provider_event(
                 session_id,
                 active,
                 next_agent,
-                normalize_provider_text(&format!("Provider execution failed: {error}")),
+                failure_message("Provider execution failed", &error),
             )
         })
     }) else {
         return ProviderEventProjection::Terminal(None);
     };
     projected
+}
+
+/// Renders a Provider failure as the message the Turn or Prompt carries. Every
+/// failure reads the same way — what failed, then what went wrong — and is
+/// normalized, because the cause is usually the Provider's own text and can
+/// carry the escape sequences Provider output carries.
+fn failure_message(failure: &str, cause: &impl Display) -> String {
+    normalize_provider_text(&format!("{failure}: {cause}"))
 }
 
 fn fail_invalid_provider_event(

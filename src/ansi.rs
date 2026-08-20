@@ -11,6 +11,44 @@ pub(crate) enum Fragment {
     Control(char),
 }
 
+impl Fragment {
+    /// Classifies what this fragment contributes to rendered output. Every
+    /// fragment a reader never sees — cursor movement, terminal-private
+    /// strings, controls Suru does not act on — classifies as
+    /// [`FragmentRole::Invisible`], so ingest and rendering cannot drift apart
+    /// over which sequences disappear.
+    pub(crate) fn into_role(self) -> FragmentRole {
+        match self {
+            Self::Text(text) => FragmentRole::Text(text),
+            Self::Sgr(sequence) => FragmentRole::Sgr(sequence),
+            Self::Osc8(hyperlink) => FragmentRole::Hyperlink(hyperlink),
+            Self::Control('\t') => FragmentRole::Tab,
+            Self::Control('\n') => FragmentRole::LineBreak,
+            Self::Control('\r') => FragmentRole::CarriageReturn,
+            Self::Csi(_)
+            | Self::Osc(_)
+            | Self::Dcs(_)
+            | Self::Apc(_)
+            | Self::Escape(_)
+            | Self::Control(_) => FragmentRole::Invisible,
+        }
+    }
+}
+
+/// What a [`Fragment`] contributes to the output a reader sees. Consumers
+/// decide what to do with each role; only [`FragmentRole::Invisible`] has one
+/// answer, which is to drop it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FragmentRole {
+    Text(String),
+    Sgr(String),
+    Hyperlink(Osc8),
+    Tab,
+    LineBreak,
+    CarriageReturn,
+    Invisible,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Osc8 {
     sequence: String,
@@ -354,19 +392,14 @@ impl ProviderTextNormalizer {
         }
         let mut normalized = String::with_capacity(chunk.len());
         for fragment in self.scanner.feed(chunk) {
-            match fragment {
-                Fragment::Text(text) => self.push_text(&text, &mut normalized),
-                Fragment::Sgr(sequence) => self.push_sgr(&sequence, &mut normalized),
-                Fragment::Osc8(hyperlink) => self.push_osc8(&hyperlink, &mut normalized),
-                Fragment::Control('\t') => self.push_text("    ", &mut normalized),
-                Fragment::Control('\n') => self.push_newline(&mut normalized),
-                Fragment::Control('\r') => self.overwrite_line(),
-                Fragment::Csi(_)
-                | Fragment::Osc(_)
-                | Fragment::Dcs(_)
-                | Fragment::Apc(_)
-                | Fragment::Escape(_)
-                | Fragment::Control(_) => {}
+            match fragment.into_role() {
+                FragmentRole::Text(text) => self.push_text(&text, &mut normalized),
+                FragmentRole::Sgr(sequence) => self.push_sgr(&sequence, &mut normalized),
+                FragmentRole::Hyperlink(hyperlink) => self.push_osc8(&hyperlink, &mut normalized),
+                FragmentRole::Tab => self.push_text("    ", &mut normalized),
+                FragmentRole::LineBreak => self.push_newline(&mut normalized),
+                FragmentRole::CarriageReturn => self.mark_overwrite_pending(),
+                FragmentRole::Invisible => {}
             }
             if self.truncated {
                 break;
@@ -502,7 +535,10 @@ impl ProviderTextNormalizer {
         }
     }
 
-    fn overwrite_line(&mut self) {
+    /// Marks that the next text to reach the line replaces the frame it holds.
+    /// The frame is not discarded here: the line keeps it until text arrives,
+    /// so a carriage return that ends the stream still commits what it framed.
+    fn mark_overwrite_pending(&mut self) {
         if let Some(line) = self.overwrite_line.as_mut() {
             line.overwrite_pending = true;
         }
@@ -631,19 +667,37 @@ enum SgrEffect {
     ExtendedColor(SgrAttribute),
 }
 
+/// Splits an SGR sequence into its parameters, reporting `None` for a
+/// sequence that is not SGR. A sequence carrying no parameters splits into one
+/// empty parameter, which [`sgr_parameter_code`] reads as the reset the
+/// standard assigns it.
+pub(crate) fn sgr_parameters(sequence: &str) -> Option<impl Iterator<Item = &str>> {
+    sequence
+        .strip_prefix("\x1b[")
+        .and_then(|sequence| sequence.strip_suffix('m'))
+        .map(|parameters| parameters.split(';'))
+}
+
+/// Reads the numeric code an SGR parameter names, reporting `None` for a
+/// parameter that names none. An omitted parameter names zero.
+pub(crate) fn sgr_parameter_code(parameter: &str) -> Option<u16> {
+    if parameter.is_empty() {
+        Some(0)
+    } else {
+        parameter.parse().ok()
+    }
+}
+
 impl SgrState {
     fn is_empty(&self) -> bool {
         self.attributes.is_empty()
     }
 
     fn apply(&mut self, sequence: &str) {
-        let Some(parameters) = sequence
-            .strip_prefix("\x1b[")
-            .and_then(|sequence| sequence.strip_suffix('m'))
-        else {
+        let Some(parameters) = sgr_parameters(sequence) else {
             return;
         };
-        let parameters = parameters.split(';').collect::<Vec<_>>();
+        let parameters = parameters.collect::<Vec<_>>();
         let mut index = 0;
         while index < parameters.len() {
             index += self.apply_parameter(&parameters, index);
@@ -701,12 +755,7 @@ impl SgrState {
 fn sgr_effect(parameter: &str) -> SgrEffect {
     let colon_form = parameter.contains(':');
     let leading = parameter.split(':').next().unwrap_or_default();
-    let code = if leading.is_empty() {
-        Some(0)
-    } else {
-        leading.parse::<u16>().ok()
-    };
-    let Some(code) = code else {
+    let Some(code) = sgr_parameter_code(leading) else {
         return SgrEffect::Set(SgrAttribute::Unrecognized(parameter.to_owned()));
     };
     match code {
@@ -763,7 +812,76 @@ fn extended_color_length(parameters: &[&str], index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnsiScanner, Fragment, ProviderTextNormalizer, split_truncation_marker};
+    use super::{
+        AnsiScanner, Fragment, FragmentRole, ProviderTextNormalizer, sgr_parameter_code,
+        sgr_parameters, split_truncation_marker,
+    };
+
+    fn roles(text: &str) -> Vec<FragmentRole> {
+        AnsiScanner::default()
+            .feed(text)
+            .into_iter()
+            .map(Fragment::into_role)
+            .collect()
+    }
+
+    #[test]
+    fn sgr_parameters_reject_a_sequence_that_is_not_sgr() {
+        assert!(sgr_parameters("\x1b[2J").is_none());
+        assert!(sgr_parameters("\x1b[1;32").is_none());
+        assert!(sgr_parameters("plain text").is_none());
+    }
+
+    #[test]
+    fn sgr_parameters_split_a_sequence_on_its_separators() {
+        assert_eq!(
+            sgr_parameters("\x1b[38;5;213m")
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec!["38", "5", "213"]
+        );
+    }
+
+    #[test]
+    fn an_sgr_sequence_without_parameters_carries_one_empty_parameter() {
+        assert_eq!(
+            sgr_parameters("\x1b[m").unwrap().collect::<Vec<_>>(),
+            vec![""]
+        );
+    }
+
+    #[test]
+    fn an_omitted_sgr_parameter_reads_as_the_reset_code() {
+        assert_eq!(sgr_parameter_code(""), Some(0));
+        assert_eq!(sgr_parameter_code("38"), Some(38));
+        assert_eq!(sgr_parameter_code("nonsense"), None);
+    }
+
+    #[test]
+    fn fragments_that_reach_the_reader_classify_by_what_they_carry() {
+        assert_eq!(
+            roles("text\x1b[1m\t\n\r"),
+            vec![
+                FragmentRole::Text("text".to_owned()),
+                FragmentRole::Sgr("\x1b[1m".to_owned()),
+                FragmentRole::Tab,
+                FragmentRole::LineBreak,
+                FragmentRole::CarriageReturn,
+            ]
+        );
+        assert!(matches!(
+            roles("\x1b]8;;https://example.com\x07").as_slice(),
+            [FragmentRole::Hyperlink(_)]
+        ));
+    }
+
+    #[test]
+    fn fragments_that_leave_no_mark_classify_as_invisible() {
+        assert_eq!(
+            roles("\x1b[2J\x1b]0;title\x07\x1bP1;2q\x1b\\\x1b_apc\x1b\\\x1b(B\x07"),
+            vec![FragmentRole::Invisible; 6]
+        );
+    }
 
     #[test]
     fn classifies_sgr_separately_from_text() {
