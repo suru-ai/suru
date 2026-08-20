@@ -375,6 +375,10 @@ impl ProviderTextNormalizer {
         normalized
     }
 
+    /// Ends the stream, committing the line withheld from the emitted output.
+    /// Every path that settles a normalizer built with
+    /// [`Self::with_line_overwrite`] must call this, or the unterminated line
+    /// the normalizer is holding back is lost.
     pub(crate) fn finish(&mut self) -> String {
         if self.truncated {
             return String::new();

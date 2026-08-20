@@ -148,6 +148,10 @@ struct ActiveProviderTurn {
     file_change_activities: HashMap<super::ProviderActivityId, ActivityId>,
 }
 
+/// An Agent Message the Provider is still streaming. Its normalizer buffers no
+/// unterminated line, so settling the Turn may drop it; give this one line
+/// overwrite and [`ActiveProviderTurn::take_unfinished_output`] must drain it
+/// the way it drains command output.
 struct ActiveProviderMessage {
     id: MessageId,
     normalizer: ProviderTextNormalizer,

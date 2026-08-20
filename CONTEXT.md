@@ -36,6 +36,10 @@ _Avoid_: Project, working directory, location
 A unit of work that begins when a Prompt is delivered while a Session is idle and includes the resulting Agent activity. A Turn retains its effective Agent identity and may accept delivered steer Prompts without beginning another Turn.
 _Avoid_: Request, exchange
 
+**Settle**:
+The transition of a Turn or Activity into a terminal state — completed, failed, or interrupted — after which it accepts no further Provider output.
+_Avoid_: Finish, close, resolve
+
 **Prompt**:
 User input submitted for delivery to an agent. A delivered Prompt becomes either the user Message that begins a Turn or a later user Message that steers its active Turn.
 _Avoid_: Request, draft, message
