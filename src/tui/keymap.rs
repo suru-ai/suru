@@ -1,0 +1,390 @@
+//! Terminal input mapping: the keybinding tables and the per-mode functions
+//! that translate a terminal event into a [`CommandId`].
+
+use crossterm::event::{
+    Event as InputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+};
+
+use super::{
+    commands::{
+        SemanticCommandId, command_for_direct_semantic_key, command_for_leader_key, descriptor,
+    },
+    state::CommandId,
+};
+
+
+pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
+    match event {
+        InputEvent::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => Some(CommandId::ScrollTranscriptLinesUp),
+            MouseEventKind::ScrollDown => Some(CommandId::ScrollTranscriptLinesDown),
+            _ => None,
+        },
+        InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,
+        InputEvent::Key(key) if binding_for(key).is_some() => {
+            binding_for(key).map(|binding| binding.command.clone())
+        }
+        InputEvent::Key(key) if command_for_direct_semantic_key(key).is_some() => {
+            command_for_direct_semantic_key(key).map(CommandId::InvokeSemantic)
+        }
+        InputEvent::Key(key)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            match key.code {
+                KeyCode::Char(character) => Some(CommandId::InsertText(character.to_string())),
+                _ => None,
+            }
+        }
+        InputEvent::Paste(text) => Some(CommandId::PasteText(text)),
+        _ => None,
+    }
+}
+
+pub(super) fn command_for_autocomplete_event(event: InputEvent) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            Some(CommandId::SelectPreviousAutocomplete)
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            Some(CommandId::SelectNextAutocomplete)
+        }
+        (KeyCode::Enter | KeyCode::Tab, KeyModifiers::NONE) => Some(CommandId::SelectAutocomplete),
+        (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::DismissAutocomplete),
+        _ => None,
+    }
+}
+
+pub(super) fn command_for_session_picker_event(event: InputEvent) -> Option<CommandId> {
+    if let InputEvent::Key(key) = &event
+        && key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('d')
+        && key.modifiers == KeyModifiers::CONTROL
+    {
+        return Some(CommandId::InvokeSemantic(SemanticCommandId::SessionDelete));
+    }
+    command_for_picker_event(event, &SESSION_PICKER_COMMANDS)
+}
+
+pub(super) fn command_for_model_picker_event(event: InputEvent) -> Option<CommandId> {
+    command_for_picker_event(event, &MODEL_PICKER_COMMANDS)
+}
+
+pub(super) fn command_for_model_options_event(event: InputEvent) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(
+            CommandId::InvokeSemantic(SemanticCommandId::ModelOptionsPrevious),
+        ),
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(
+            CommandId::InvokeSemantic(SemanticCommandId::ModelOptionsNext),
+        ),
+        (KeyCode::Enter, KeyModifiers::NONE) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelOptionsSelect,
+        )),
+        (KeyCode::Enter, KeyModifiers::CONTROL) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelOptionsApply,
+        )),
+        (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelOptionsCancel,
+        )),
+        _ => None,
+    }
+}
+
+struct PickerCommandBindings {
+    previous: CommandId,
+    next: CommandId,
+    page_previous: CommandId,
+    page_next: CommandId,
+    select: CommandId,
+    close: CommandId,
+    delete_backward: CommandId,
+    insert: fn(String) -> CommandId,
+    toggle_scope: Option<CommandId>,
+}
+
+const SESSION_PICKER_COMMANDS: PickerCommandBindings = PickerCommandBindings {
+    previous: CommandId::SelectPreviousSession,
+    next: CommandId::SelectNextSession,
+    page_previous: CommandId::PagePreviousSessions,
+    page_next: CommandId::PageNextSessions,
+    select: CommandId::SelectSession,
+    close: CommandId::CloseSessionPicker,
+    delete_backward: CommandId::DeleteSessionSearchBackward,
+    insert: CommandId::InsertSessionSearch,
+    toggle_scope: Some(CommandId::ToggleSessionScope),
+};
+
+const MODEL_PICKER_COMMANDS: PickerCommandBindings = PickerCommandBindings {
+    previous: CommandId::SelectPreviousModel,
+    next: CommandId::SelectNextModel,
+    page_previous: CommandId::PagePreviousModels,
+    page_next: CommandId::PageNextModels,
+    select: CommandId::SelectModel,
+    close: CommandId::CloseModelPicker,
+    delete_backward: CommandId::DeleteModelSearchBackward,
+    insert: CommandId::InsertModelSearch,
+    toggle_scope: None,
+};
+
+fn command_for_picker_event(
+    event: InputEvent,
+    bindings: &PickerCommandBindings,
+) -> Option<CommandId> {
+    match event {
+        InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,
+        InputEvent::Key(key) => match (key.code, key.modifiers) {
+            (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                Some(bindings.previous.clone())
+            }
+            (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                Some(bindings.next.clone())
+            }
+            (KeyCode::PageUp, KeyModifiers::NONE) => Some(bindings.page_previous.clone()),
+            (KeyCode::PageDown, KeyModifiers::NONE) => Some(bindings.page_next.clone()),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => bindings.toggle_scope.clone(),
+            (KeyCode::Enter, KeyModifiers::NONE) => Some(bindings.select.clone()),
+            (KeyCode::Esc, KeyModifiers::NONE) => Some(bindings.close.clone()),
+            (KeyCode::Backspace, KeyModifiers::NONE) => Some(bindings.delete_backward.clone()),
+            (KeyCode::Char(character), modifiers)
+                if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                Some((bindings.insert)(character.to_string()))
+            }
+            _ => None,
+        },
+        InputEvent::Paste(text) => Some((bindings.insert)(text)),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CommandBinding {
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    command: CommandId,
+    label: &'static str,
+}
+
+const COMMAND_BINDINGS: &[CommandBinding] = &[
+    CommandBinding {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::SubmitSteer,
+        label: "Enter",
+    },
+    CommandBinding {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::ALT,
+        command: CommandId::SubmitQueue,
+        label: "Alt+Enter",
+    },
+    CommandBinding {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::SHIFT,
+        command: CommandId::InsertNewline,
+        label: "Shift+Enter",
+    },
+    CommandBinding {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::CONTROL,
+        command: CommandId::InsertNewline,
+        label: "Ctrl+Enter",
+    },
+    CommandBinding {
+        code: KeyCode::Char('j'),
+        modifiers: KeyModifiers::CONTROL,
+        command: CommandId::InsertNewline,
+        label: "Ctrl+J",
+    },
+    CommandBinding {
+        code: KeyCode::Char('c'),
+        modifiers: KeyModifiers::CONTROL,
+        command: CommandId::ClearOrExit,
+        label: "Ctrl+C",
+    },
+    CommandBinding {
+        code: KeyCode::Backspace,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::DeleteBackward,
+        label: "Backspace",
+    },
+    CommandBinding {
+        code: KeyCode::Delete,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::DeleteForward,
+        label: "Delete",
+    },
+    CommandBinding {
+        code: KeyCode::Left,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::MoveCursorLeft,
+        label: "Left",
+    },
+    CommandBinding {
+        code: KeyCode::Right,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::MoveCursorRight,
+        label: "Right",
+    },
+    CommandBinding {
+        code: KeyCode::Up,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::HistoryPrevious,
+        label: "Up",
+    },
+    CommandBinding {
+        code: KeyCode::Down,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::HistoryNext,
+        label: "Down",
+    },
+    CommandBinding {
+        code: KeyCode::PageUp,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::ScrollTranscriptPageUp,
+        label: "PageUp",
+    },
+    CommandBinding {
+        code: KeyCode::PageDown,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::ScrollTranscriptPageDown,
+        label: "PageDown",
+    },
+    CommandBinding {
+        code: KeyCode::End,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::FollowLatest,
+        label: "End",
+    },
+    CommandBinding {
+        code: KeyCode::Char('x'),
+        modifiers: KeyModifiers::CONTROL,
+        command: CommandId::BeginLeader,
+        label: "Ctrl+X",
+    },
+    CommandBinding {
+        code: KeyCode::Esc,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::RequestInterrupt,
+        label: "Esc",
+    },
+];
+
+const LEADER_BINDINGS: &[CommandBinding] = &[CommandBinding {
+    code: KeyCode::Char('q'),
+    modifiers: KeyModifiers::NONE,
+    command: CommandId::OpenQueuedPrompts,
+    label: "q",
+}];
+
+const QUEUED_PROMPT_BINDINGS: &[CommandBinding] = &[
+    CommandBinding {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::PromoteSelectedPrompt,
+        label: "Enter",
+    },
+    CommandBinding {
+        code: KeyCode::Char('d'),
+        modifiers: KeyModifiers::CONTROL,
+        command: CommandId::CancelSelectedPrompt,
+        label: "Ctrl+D",
+    },
+    CommandBinding {
+        code: KeyCode::Up,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::SelectPreviousQueuedPrompt,
+        label: "Up",
+    },
+    CommandBinding {
+        code: KeyCode::Down,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::SelectNextQueuedPrompt,
+        label: "Down",
+    },
+    CommandBinding {
+        code: KeyCode::Esc,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::CloseCommandMode,
+        label: "Esc",
+    },
+];
+
+const INTERRUPT_CONFIRMATION_BINDINGS: &[CommandBinding] = &[CommandBinding {
+    code: KeyCode::Esc,
+    modifiers: KeyModifiers::NONE,
+    command: CommandId::ConfirmInterrupt,
+    label: "Esc",
+}];
+
+fn binding_for(key: KeyEvent) -> Option<&'static CommandBinding> {
+    COMMAND_BINDINGS
+        .iter()
+        .find(|binding| binding.code == key.code && binding.modifiers == key.modifiers)
+}
+
+pub(super) fn binding_label(command: &CommandId) -> &'static str {
+    if let CommandId::InvokeSemantic(command) = command {
+        return descriptor(*command)
+            .keybinding
+            .map_or("", |binding| binding.label);
+    }
+    COMMAND_BINDINGS
+        .iter()
+        .chain(LEADER_BINDINGS)
+        .chain(QUEUED_PROMPT_BINDINGS)
+        .chain(INTERRUPT_CONFIRMATION_BINDINGS)
+        .find(|binding| &binding.command == command)
+        .map_or("", |binding| binding.label)
+}
+
+pub(super) fn command_for_leader_event(event: InputEvent) -> Option<CommandId> {
+    let semantic = match &event {
+        InputEvent::Key(key) if key.kind == KeyEventKind::Press => {
+            command_for_leader_key(*key).map(CommandId::InvokeSemantic)
+        }
+        _ => None,
+    };
+    semantic
+        .or_else(|| command_from_scoped_bindings(event, LEADER_BINDINGS))
+        .or(Some(CommandId::CloseCommandMode))
+}
+
+pub(super) fn command_for_queued_prompt_event(event: InputEvent) -> Option<CommandId> {
+    command_from_scoped_bindings(event, QUEUED_PROMPT_BINDINGS)
+}
+
+pub(super) fn command_for_interrupt_confirmation_event(event: InputEvent) -> Option<CommandId> {
+    command_from_scoped_bindings(event, INTERRUPT_CONFIRMATION_BINDINGS)
+        .or(Some(CommandId::CloseCommandMode))
+}
+
+fn command_from_scoped_bindings(
+    event: InputEvent,
+    bindings: &'static [CommandBinding],
+) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    bindings
+        .iter()
+        .find(|binding| binding.code == key.code && binding.modifiers == key.modifiers)
+        .map(|binding| binding.command.clone())
+}
