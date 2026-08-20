@@ -18,7 +18,10 @@ enum State {
         sequence: String,
         has_intermediate: bool,
     },
-    Csi(String),
+    Csi {
+        sequence: String,
+        sgr_candidate: bool,
+    },
     String {
         kind: StringKind,
         sequence: String,
@@ -80,7 +83,12 @@ impl AnsiScanner {
                 } => {
                     sequence.push(character);
                     match (has_intermediate, character) {
-                        (false, '[') => self.state = State::Csi(sequence),
+                        (false, '[') => {
+                            self.state = State::Csi {
+                                sequence,
+                                sgr_candidate: true,
+                            };
+                        }
                         (false, ']') => {
                             self.state = State::String {
                                 kind: StringKind::Osc,
@@ -114,16 +122,23 @@ impl AnsiScanner {
                         _ => {}
                     }
                 }
-                State::Csi(mut sequence) => {
+                State::Csi {
+                    mut sequence,
+                    sgr_candidate,
+                } => {
                     sequence.push(character);
                     if ('\u{40}'..='\u{7e}').contains(&character) {
-                        if character == 'm' {
+                        if character == 'm' && sgr_candidate {
                             fragments.push(Fragment::Sgr(sequence));
                         } else {
                             fragments.push(Fragment::Csi(sequence));
                         }
                     } else {
-                        self.state = State::Csi(sequence);
+                        self.state = State::Csi {
+                            sequence,
+                            sgr_candidate: sgr_candidate
+                                && matches!(character, '0'..='9' | ';' | ':'),
+                        };
                     }
                 }
                 State::String {
@@ -179,6 +194,20 @@ mod tests {
                 Fragment::Csi("\x1b[2K".to_owned()),
                 Fragment::Csi("\x1b[?25h".to_owned()),
                 Fragment::Sgr("\x1b[0m".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn classifies_only_csi_m_with_sgr_parameters_as_sgr() {
+        let mut scanner = AnsiScanner::default();
+
+        assert_eq!(
+            scanner.feed("\x1b[1$m\x1b[>4;2m\x1b[38:2::1:2:3m"),
+            vec![
+                Fragment::Csi("\x1b[1$m".to_owned()),
+                Fragment::Csi("\x1b[>4;2m".to_owned()),
+                Fragment::Sgr("\x1b[38:2::1:2:3m".to_owned()),
             ]
         );
     }
