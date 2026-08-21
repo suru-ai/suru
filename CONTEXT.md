@@ -69,7 +69,7 @@ The condition of a Message, command Activity, or Reasoning Activity whose stored
 _Avoid_: Elision, clipping
 
 **Fold**:
-The compact presentation a client's Transcript gives an entry whose full stored content remains available. A Fold is reversible, client-local view state: expanding it reveals everything stored, and folding never alters stored content. A folded entry shows a **fold marker**: the line indicating how much the Fold hides, or, where a Fold hides an entry's whole body rather than part of it, the entry's own header naming what is behind it. Distinct from Truncation, which is a condition of the stored content itself; a single entry can carry both.
+The compact presentation a client's Transcript gives an entry whose full stored content remains available. A Fold is reversible, client-local view state: expanding it reveals everything stored, and folding never alters stored content. A folded entry shows a **fold marker**: the line indicating how much the Fold hides. Distinct from Truncation, which is a condition of the stored content itself; a single entry can carry both.
 _Avoid_: Collapse, elision, hide
 
 **Resume State**:

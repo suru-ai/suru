@@ -937,11 +937,21 @@ fn fold_command_output(
     lines
 }
 
+/// What a fold marker counts: how much this entry's Fold is holding back. Kept
+/// apart from [`fold_marker_line`] so an entry whose Fold hides its whole body,
+/// and so reports the count on its own header, still says it the one way.
+fn fold_marker_text(hidden: usize, unit: &str) -> String {
+    format!("+{hidden} {unit}")
+}
+
 /// Renders the fold marker: how much this entry's Fold hides, styled as the
 /// affordance it is so a reader never reads it as the truncation marker, which
 /// reports content Suru's storage cap dropped for good.
 fn fold_marker_line(hidden: usize, unit: &str, indent: &str, theme: &Theme) -> Line<'static> {
-    Line::styled(format!("{indent}… +{hidden} {unit}"), theme.action.primary)
+    Line::styled(
+        format!("{indent}… {}", fold_marker_text(hidden, unit)),
+        theme.action.primary,
+    )
 }
 
 /// Renders the truncation marker as its own line, styled from Suru's typed
@@ -1057,26 +1067,40 @@ fn push_reasoning_activity(
         header.push_str(" · ");
         header.push_str(&humanized_duration(duration_ms));
     }
+    // The body is projected whether or not it will be shown, because a Fold
+    // that hides all of it still has to say how many lines that is.
+    let content = sanitize_content(content);
+    let mut body = markdown::render(&content, theme)
+        .into_iter()
+        .map(|line| subdued_line(line, OUTPUT_INDENT, theme))
+        .collect::<Vec<_>>();
+    if content_truncated {
+        push_truncation_marker(&mut body, CappedStream::Reasoning, OUTPUT_INDENT, theme);
+    }
     let header_start = lines.len();
     push_prefixed_lines(lines, &format!("  {marker}"), &header, style);
+    // A Reasoning Fold hides the entry's whole body rather than the middle of
+    // it, so its fold marker rides the header instead of standing on a line of
+    // its own: the reader still learns how much is behind it, and the folded
+    // form stays the single line it is meant to be.
+    if folded && !body.is_empty() {
+        let header_line = lines
+            .last_mut()
+            .expect("a Reasoning Activity always projects a header line");
+        header_line.spans.push(Span::styled(" · ", style));
+        header_line.spans.push(Span::styled(
+            fold_marker_text(body.len(), "lines"),
+            theme.action.primary,
+        ));
+    }
     let header_source_lines = lines.len() - header_start;
     if folded {
-        // A Reasoning Fold hides the whole summary rather than the middle of
-        // it, so the header above is the fold marker: naming the block and how
-        // long it took says more about what is behind it than a line count
-        // would, and keeps the folded form to the single line it is meant to be.
         return FoldedEntry {
             header_source_lines,
-            hides_content: !content.is_empty() || content_truncated,
+            hides_content: !body.is_empty(),
         };
     }
-    let content = sanitize_content(content);
-    for line in markdown::render(&content, theme) {
-        lines.push(subdued_line(line, OUTPUT_INDENT, theme));
-    }
-    if content_truncated {
-        push_truncation_marker(lines, CappedStream::Reasoning, OUTPUT_INDENT, theme);
-    }
+    lines.append(&mut body);
     FoldedEntry {
         header_source_lines,
         hides_content: false,

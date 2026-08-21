@@ -1764,7 +1764,7 @@ fn folded_reasoning_is_one_line_naming_its_title_and_how_long_it_took() {
         workspace.path(),
         ActivityStatus::Completed,
         Some("Inspecting the seam"),
-        "Reading the projection before the store.",
+        "Reading the projection.\n\nThen the store.",
         Some(72_000),
     );
     let mut application = connected_application(workspace.path());
@@ -1774,9 +1774,11 @@ fn folded_reasoning_is_one_line_naming_its_title_and_how_long_it_took() {
 
     let folded_rows = rendered_application_rows_at(&application, 72, 24);
     let folded = folded_rows.join("\n");
-    assert!(
-        folded.contains("Thought: Inspecting the seam · 1m 12s"),
-        "a folded Reasoning block heads with its title and duration: {folded}"
+    assert_eq!(
+        folded_rows[rendered_row(&folded_rows, "Thought: Inspecting the seam")].trim_end(),
+        "    ✓ Thought: Inspecting the seam · 1m 12s · +3 lines",
+        "a folded Reasoning block is one line naming its title, its duration, \
+         and how much its Fold hides"
     );
     assert!(
         !folded.contains("Reading the projection"),
@@ -1789,14 +1791,19 @@ fn folded_reasoning_is_one_line_naming_its_title_and_how_long_it_took() {
             "Thought: Inspecting the seam",
         ) as u16))
         .expect("expand the Reasoning entry");
-    let expanded = rendered_application_rows_at(&application, 72, 24).join("\n");
-    assert!(
-        expanded.contains("Reading the projection before the store."),
-        "expanding a Reasoning block reveals everything stored: {expanded}"
-    );
-    assert!(
-        expanded.contains("Thought: Inspecting the seam · 1m 12s"),
-        "an expanded Reasoning block keeps the header that re-folds it: {expanded}"
+    let expanded_rows = rendered_application_rows_at(&application, 72, 24);
+    let expanded = expanded_rows.join("\n");
+    for revealed in ["Reading the projection.", "Then the store."] {
+        assert!(
+            expanded.contains(revealed),
+            "expanding a Reasoning block reveals everything stored: {expanded}"
+        );
+    }
+    assert_eq!(
+        expanded_rows[rendered_row(&expanded_rows, "Thought: Inspecting the seam")].trim_end(),
+        "    ✓ Thought: Inspecting the seam · 1m 12s",
+        "an expanded Reasoning block keeps the header that re-folds it, and drops \
+         the count of what it is no longer hiding"
     );
 }
 
@@ -1821,7 +1828,7 @@ fn reasoning_still_running_heads_with_its_running_label_and_no_duration() {
     let header = &streaming_rows[rendered_row(&streaming_rows, "Thinking: Inspecting the seam")];
     assert_eq!(
         header.trim_end(),
-        "    … Thinking: Inspecting the seam",
+        "    … Thinking: Inspecting the seam · +1 lines",
         "a Reasoning block still running heads with its running label and no duration"
     );
     assert!(
@@ -1848,7 +1855,7 @@ fn untitled_reasoning_heads_with_the_label_alone() {
     let folded = rendered_application_rows_at(&application, 72, 24).join("\n");
 
     assert!(
-        folded.contains("Thought · 4s"),
+        folded.contains("Thought · 4s · +1 lines"),
         "a Reasoning block the Provider never titled still heads its Fold: {folded}"
     );
 }
