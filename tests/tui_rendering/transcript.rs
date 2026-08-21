@@ -2230,6 +2230,45 @@ fn command_run_snapshot(
 
 const SUCCESSFUL_COMMAND: RunEntry = RunEntry::Command(ActivityStatus::Completed, Some(0));
 
+/// The shape a live run has mid-Turn: two settled successful commands then one
+/// Active command, inside a Session and Turn still marked Active.
+fn live_command_run_snapshot(
+    session_id: SessionId,
+    workspace: &std::path::Path,
+) -> suru::protocol::SessionSnapshot {
+    let mut snapshot = command_run_snapshot(
+        session_id,
+        workspace,
+        &[
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            RunEntry::Command(ActivityStatus::Active, None),
+        ],
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    snapshot
+}
+
+/// The Session update that settles a running command into `status`.
+fn command_settles(
+    session_id: SessionId,
+    revision: SessionRevision,
+    activity_id: ActivityId,
+    status: ActivityStatus,
+    exit_status: Option<i32>,
+) -> ApplicationEvent {
+    ApplicationEvent::Session(SessionEvent::Updated(SessionUpdate {
+        session_id,
+        revision,
+        changes: vec![SessionChange::CommandStatusChanged {
+            activity_id,
+            status,
+            exit_status,
+        }],
+    }))
+}
+
 #[test]
 fn a_run_of_successful_commands_collapses_to_one_group_row() {
     let workspace = tempfile::tempdir().expect("create Workspace");
@@ -2372,17 +2411,12 @@ fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
 }
 
 #[test]
-fn an_active_command_stays_outside_the_group() {
+fn an_active_command_renders_live_outside_the_group_while_the_turn_runs() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let snapshot = command_run_snapshot(
-        SessionId::new(),
-        workspace.path(),
-        &[
-            SUCCESSFUL_COMMAND,
-            SUCCESSFUL_COMMAND,
-            RunEntry::Command(ActivityStatus::Active, None),
-        ],
-    );
+    let mut snapshot = live_command_run_snapshot(SessionId::new(), workspace.path());
+    if let Activity::Command { output, .. } = &mut snapshot.activities[2] {
+        *output = numbered_output(12);
+    }
     let mut application = connected_application(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
@@ -2392,11 +2426,23 @@ fn an_active_command_stays_outside_the_group() {
 
     assert!(
         rendered.contains("✓ Ran 2 commands"),
-        "the settled run still groups: {rendered}"
+        "the settled run groups while the Turn is still active: {rendered}"
+    );
+    assert!(
+        !rendered.contains("command 1") && !rendered.contains("command 2"),
+        "no member row escapes the Group: {rendered}"
     );
     assert!(
         rendered.contains("$ command 3"),
         "the running command stays visible outside the Group: {rendered}"
+    );
+    assert!(
+        rendered.contains("output line 12") && rendered.contains("… +9 lines"),
+        "the running command keeps its live-tail presentation: {rendered}"
+    );
+    assert!(
+        !rendered.contains("output line 3"),
+        "a live tail keeps no head: {rendered}"
     );
 }
 
@@ -2428,19 +2474,9 @@ fn groups_have_no_size_cap() {
 fn a_command_settling_successfully_is_absorbed_into_the_group_row() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let session_id = SessionId::new();
-    let mut snapshot = command_run_snapshot(
-        session_id,
-        workspace.path(),
-        &[
-            SUCCESSFUL_COMMAND,
-            SUCCESSFUL_COMMAND,
-            RunEntry::Command(ActivityStatus::Active, None),
-        ],
-    );
-    snapshot.session.status = SessionStatus::Active;
-    snapshot.turns[0].status = TurnStatus::Active;
+    let snapshot = live_command_run_snapshot(session_id, workspace.path());
     let running_id = snapshot.activities[2].id();
-    let initial_revision = snapshot.revision;
+    let next_revision = SessionRevision(snapshot.revision.0 + 1);
     let mut application = connected_application(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
@@ -2450,17 +2486,13 @@ fn a_command_settling_successfully_is_absorbed_into_the_group_row() {
     assert!(before.contains("✓ Ran 2 commands"), "{before}");
 
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
-            SessionUpdate {
-                session_id,
-                revision: SessionRevision(initial_revision.0 + 1),
-                changes: vec![SessionChange::CommandStatusChanged {
-                    activity_id: running_id,
-                    status: ActivityStatus::Completed,
-                    exit_status: Some(0),
-                }],
-            },
-        )))
+        .handle_event(command_settles(
+            session_id,
+            next_revision,
+            running_id,
+            ActivityStatus::Completed,
+            Some(0),
+        ))
         .expect("project the command settling successfully");
 
     let after = rendered_application_rows_at(&application, 80, 18).join("\n");
@@ -2472,4 +2504,87 @@ fn a_command_settling_successfully_is_absorbed_into_the_group_row() {
         !after.contains("Ran 2 commands") && !after.contains("command 3"),
         "the settled command left no standalone row behind: {after}"
     );
+}
+
+#[test]
+fn a_command_settling_failed_stays_a_standalone_row_and_leaves_the_group_unchanged() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let snapshot = live_command_run_snapshot(session_id, workspace.path());
+    let running_id = snapshot.activities[2].id();
+    let next_revision = SessionRevision(snapshot.revision.0 + 1);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a running command after a run");
+
+    application
+        .handle_event(command_settles(
+            session_id,
+            next_revision,
+            running_id,
+            ActivityStatus::Failed,
+            Some(1),
+        ))
+        .expect("project the command settling failed");
+
+    let rendered = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert!(
+        rendered.contains("✓ Ran 2 commands") && !rendered.contains("Ran 3 commands"),
+        "a failed settle never joins the Group: {rendered}"
+    );
+    assert!(
+        rendered.contains("× command 3 (exit 1)"),
+        "the failed command stands alone as its own row: {rendered}"
+    );
+}
+
+#[test]
+fn an_interrupted_command_settles_as_a_standalone_failed_row_and_stays_expanded() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let mut snapshot = live_command_run_snapshot(session_id, workspace.path());
+    if let Activity::Command { output, .. } = &mut snapshot.activities[2] {
+        *output = numbered_output(12);
+    }
+    let running_id = snapshot.activities[2].id();
+    let next_revision = SessionRevision(snapshot.revision.0 + 1);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a running command after a run");
+
+    for _ in 0..2 {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .expect("request and confirm the interrupt");
+    }
+    application
+        .handle_event(command_settles(
+            session_id,
+            next_revision,
+            running_id,
+            ActivityStatus::Failed,
+            None,
+        ))
+        .expect("project the interrupted command settling failed");
+
+    let rendered = rendered_application_rows_at(&application, 80, 40).join("\n");
+    assert!(
+        rendered.contains("✓ Ran 2 commands") && !rendered.contains("Ran 3 commands"),
+        "the Group is unchanged by the interrupt: {rendered}"
+    );
+    assert!(
+        rendered.contains("× command 3") && !rendered.contains("(exit"),
+        "an interrupt settles the row failed with no exit status to report: {rendered}"
+    );
+    for line in 1..=12 {
+        assert!(
+            rendered.contains(&format!("output line {line}")),
+            "interrupt auto-expand keeps the watched output visible after the settle: {rendered}"
+        );
+    }
 }
