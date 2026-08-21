@@ -33,6 +33,7 @@ use super::{
         SlotText, truncate_to_width,
     },
     state::{CommandId, CommandMode, QueuedPrompt, TranscriptViewport, TuiState},
+    transcript::TranscriptDisclosure,
 };
 
 const NARROW_TERMINAL_WIDTH: u16 = 44;
@@ -920,11 +921,16 @@ fn render_session(
     let interaction = state
         .session_interaction(session_id)
         .expect("Session interaction is initialized with its snapshot");
+    let folds = interaction.folds.borrow();
+    let groups = interaction.groups.borrow();
     let transcript_view = state.transcript_cache.view(
         state.transcript_generation,
         snapshot,
         &provisional_prompts,
-        &interaction.folds.borrow(),
+        TranscriptDisclosure {
+            folds: &folds,
+            groups: &groups,
+        },
         theme,
         content_width,
     );

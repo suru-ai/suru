@@ -19,9 +19,11 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
             MouseEventKind::ScrollDown => Some(CommandId::ScrollTranscriptLinesDown),
             // A press, not a release, so a Fold answers the click the reader
             // just made rather than trailing a drag that ends elsewhere.
-            MouseEventKind::Down(MouseButton::Left) => Some(CommandId::ToggleTranscriptFoldAt {
-                screen_row: mouse.row,
-            }),
+            MouseEventKind::Down(MouseButton::Left) => {
+                Some(CommandId::ToggleTranscriptDisclosureAt {
+                    screen_row: mouse.row,
+                })
+            }
             _ => None,
         },
         InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,

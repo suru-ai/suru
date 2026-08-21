@@ -36,7 +36,9 @@ use super::{
     render::render_with_slots,
     session_picker::SessionPicker,
     slots::RenderSlots,
-    transcript::{MessageStart, TranscriptCache, TranscriptFolds, UnitKey, UnitStart},
+    transcript::{
+        MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups, UnitKey, UnitStart,
+    },
 };
 
 /// Rows scrolled per mouse wheel tick, matching common terminal conventions.
@@ -101,6 +103,9 @@ pub(super) struct SessionInteraction {
     /// so they live here rather than in the Session and are dropped whenever
     /// the Session's interaction is.
     pub(super) folds: RefCell<TranscriptFolds>,
+    /// Which Groups this client has expanded, held beside the Folds because
+    /// the two disclosure axes are view state of the same locality.
+    pub(super) groups: RefCell<TranscriptGroups>,
 }
 
 impl Default for SessionInteraction {
@@ -110,6 +115,7 @@ impl Default for SessionInteraction {
             anchor: Cell::new(None),
             viewport: RefCell::new(None),
             folds: RefCell::new(TranscriptFolds::default()),
+            groups: RefCell::new(TranscriptGroups::default()),
         }
     }
 }
@@ -655,15 +661,16 @@ impl TuiState {
         Some(self.session_interactions.entry(session_id).or_default())
     }
 
-    /// Toggles the Fold of the unit drawn at `screen_row` when it projects a
-    /// single Activity; a Group answers to its own toggle, not a Fold, so a
-    /// click on one does nothing until Group expansion lands (#81). A unit
-    /// holding content back expands wherever it is clicked; one already
-    /// showing everything folds again only from its header line, so pointing
-    /// at output never hides what is under the pointer. A unit with nothing to
-    /// hide answers neither, so an idle click never records a Fold that does
-    /// not exist.
-    fn toggle_fold_at(&mut self, screen_row: u16) {
+    /// Toggles the disclosure of the unit drawn at `screen_row`: the Fold of
+    /// a unit projecting a single Activity, or the expansion of a Group. Both
+    /// axes speak one grammar: a unit holding content back expands wherever it
+    /// is clicked; one already showing everything closes again only from its
+    /// header line, so pointing at content never hides what is under the
+    /// pointer. A unit with nothing to hide answers neither, so an idle click
+    /// never records state that changes nothing. An expanded Group's members
+    /// are their own units, which is why a member click toggles that member's
+    /// Fold and never the Group.
+    fn toggle_disclosure_at(&mut self, screen_row: u16) {
         let Some(interaction) = self.current_interaction() else {
             return;
         };
@@ -675,14 +682,24 @@ impl TuiState {
         else {
             return;
         };
-        let UnitKey::Activity(activity_id) = start.key else {
-            return;
-        };
-        let mut folds = interaction.folds.borrow_mut();
-        if start.hides_content {
-            folds.expand(activity_id);
-        } else if start.is_header(row) && !folds.is_folded(activity_id) {
-            folds.fold(activity_id);
+        match start.key {
+            UnitKey::Activity(activity_id) => {
+                let mut folds = interaction.folds.borrow_mut();
+                if start.hides_content {
+                    folds.expand(activity_id);
+                } else if start.is_header(row) && !folds.is_folded(activity_id) {
+                    folds.fold(activity_id);
+                }
+            }
+            UnitKey::Group(group_id) => {
+                let mut groups = interaction.groups.borrow_mut();
+                if start.hides_content {
+                    groups.expand(group_id);
+                } else if start.is_header(row) && !groups.is_collapsed(group_id) {
+                    groups.collapse(group_id);
+                }
+            }
+            UnitKey::Message(_) | UnitKey::Provisional(_) => {}
         }
     }
 
@@ -1027,7 +1044,7 @@ pub enum CommandId {
     ScrollTranscriptLinesUp,
     ScrollTranscriptLinesDown,
     FollowLatest,
-    ToggleTranscriptFoldAt { screen_row: u16 },
+    ToggleTranscriptDisclosureAt { screen_row: u16 },
     BeginLeader,
     OpenQueuedPrompts,
     SelectPreviousQueuedPrompt,
@@ -1207,7 +1224,7 @@ impl Application {
             | CommandId::ScrollTranscriptLinesUp
             | CommandId::ScrollTranscriptLinesDown
             | CommandId::FollowLatest
-            | CommandId::ToggleTranscriptFoldAt { .. }) => {
+            | CommandId::ToggleTranscriptDisclosureAt { .. }) => {
                 Ok(self.handle_transcript_command(command))
             }
             command @ (CommandId::SelectPreviousAutocomplete
@@ -1323,8 +1340,8 @@ impl Application {
                     .navigate_transcript_lines(TranscriptDirection::Down);
             }
             CommandId::FollowLatest => self.state.follow_latest(),
-            CommandId::ToggleTranscriptFoldAt { screen_row } => {
-                self.state.toggle_fold_at(screen_row);
+            CommandId::ToggleTranscriptDisclosureAt { screen_row } => {
+                self.state.toggle_disclosure_at(screen_row);
             }
             _ => {}
         }

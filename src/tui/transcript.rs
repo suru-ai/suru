@@ -58,6 +58,10 @@ const LIVE_COMMAND_TAIL_ROWS: usize = 3;
 /// truncation marker lines up with the lines it stands in for.
 const OUTPUT_INDENT: &str = "    ";
 
+/// The extra gutter an expanded Group's members sit in, so a member reads as
+/// subordinate to the Group header above it.
+const GROUP_MEMBER_INDENT: &str = "  ";
+
 /// Paths a folded FileChange Activity lists before its fold marker.
 /// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
 const FOLDED_FILE_CHANGE_PATHS: usize = 4;
@@ -122,21 +126,70 @@ impl TranscriptFolds {
         }
     }
 
-    /// Order-independent digest of the Fold state, so the view cache rebuilds
-    /// when a Fold changes without depending on hash iteration order.
+    /// Digest of the Fold state, so the view cache rebuilds when a Fold
+    /// changes.
     fn fingerprint(&self) -> u64 {
-        let mut overrides = 0u64;
-        for activity_id in &self.overrides {
-            let mut hasher = std::hash::DefaultHasher::new();
-            activity_id.hash(&mut hasher);
-            overrides ^= hasher.finish();
-        }
         let mut hasher = std::hash::DefaultHasher::new();
         (self.posture as u8).hash(&mut hasher);
         self.overrides.len().hash(&mut hasher);
-        overrides.hash(&mut hasher);
+        activity_id_set_digest(&self.overrides).hash(&mut hasher);
         hasher.finish()
     }
+}
+
+/// Order-independent digest of a set of Activity ids, so a view-state
+/// fingerprint over one never depends on hash iteration order.
+fn activity_id_set_digest(ids: &HashSet<ActivityId>) -> u64 {
+    let mut digest = 0u64;
+    for id in ids {
+        let mut hasher = std::hash::DefaultHasher::new();
+        id.hash(&mut hasher);
+        digest ^= hasher.finish();
+    }
+    digest
+}
+
+/// One client's Group state for one Session's Transcript: the Groups the
+/// reader expanded away from the collapsed default, each named by its first
+/// member. Like a Fold, Group state is presentation only, so it never reaches
+/// the Session, never syncs between clients, and dies with the process. The
+/// global Group posture and its toggle arrive with `transcript.groups.toggle`
+/// (#82).
+#[derive(Clone, Debug, Default)]
+pub(super) struct TranscriptGroups {
+    expanded: HashSet<ActivityId>,
+}
+
+impl TranscriptGroups {
+    pub(super) fn is_collapsed(&self, group_id: ActivityId) -> bool {
+        !self.expanded.contains(&group_id)
+    }
+
+    pub(super) fn expand(&mut self, group_id: ActivityId) {
+        self.expanded.insert(group_id);
+    }
+
+    pub(super) fn collapse(&mut self, group_id: ActivityId) {
+        self.expanded.remove(&group_id);
+    }
+
+    /// Digest of the Group state, so the view cache rebuilds when a Group
+    /// flips.
+    fn fingerprint(&self) -> u64 {
+        let mut hasher = std::hash::DefaultHasher::new();
+        self.expanded.len().hash(&mut hasher);
+        activity_id_set_digest(&self.expanded).hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+/// The two disclosure axes a client renders a Transcript through: Groups
+/// decide which rows exist, Folds how much of a row shows. Rendering reads
+/// both, so they travel as one input.
+#[derive(Clone, Copy)]
+pub(super) struct TranscriptDisclosure<'a> {
+    pub(super) folds: &'a TranscriptFolds,
+    pub(super) groups: &'a TranscriptGroups,
 }
 
 /// A kind of Provider stream Suru stores under a cap. The kind decides what a
@@ -212,7 +265,7 @@ impl TranscriptCache {
         generation: u64,
         snapshot: &SessionSnapshot,
         provisional: &[&InitialPrompt],
-        folds: &TranscriptFolds,
+        disclosure: TranscriptDisclosure<'_>,
         theme: &Theme,
         width: u16,
     ) -> Ref<'_, TranscriptView> {
@@ -223,7 +276,8 @@ impl TranscriptCache {
             theme: *theme,
             width,
             provisional_fingerprint: provisional_fingerprint(provisional),
-            folds_fingerprint: folds.fingerprint(),
+            folds_fingerprint: disclosure.folds.fingerprint(),
+            groups_fingerprint: disclosure.groups.fingerprint(),
         };
         let needs_rebuild = self
             .view
@@ -238,7 +292,7 @@ impl TranscriptCache {
                 key,
                 snapshot,
                 provisional,
-                folds,
+                disclosure,
                 theme,
                 width,
             ));
@@ -260,6 +314,8 @@ struct ViewKey {
     /// Folds are a rendering input outside the Session snapshot, so ADR 0007
     /// requires them in the key or a flipped Fold would render a stale frame.
     folds_fingerprint: u64,
+    /// Group state is the same kind of input, so a flipped Group rebuilds too.
+    groups_fingerprint: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -342,9 +398,18 @@ enum RenderUnit<'a> {
     Message(&'a Message),
     Activity(&'a Activity),
     /// A Group: a run of two or more adjacent command Activities, each settled
-    /// Completed with exit status 0, shown as one collapsed row. Never empty
-    /// and never a run of one; [`close_command_run`] holds that invariant.
-    Group(Vec<&'a Activity>),
+    /// Completed with exit status 0. Collapsed it is the run's single row;
+    /// expanded it is the header the run re-collapses from, with its members
+    /// following as their own units. Never empty and never a run of one;
+    /// [`close_command_run`] holds that invariant.
+    Group {
+        members: Vec<&'a Activity>,
+        expanded: bool,
+    },
+    /// One member of an expanded Group: an ordinary Activity drawn in the
+    /// member gutter. A member is its own unit so its Fold, its cached lines,
+    /// and its click target all work exactly as they do standalone.
+    GroupMember(&'a Activity),
     /// A prompt this client sent that the Session has not echoed back yet.
     Provisional(&'a InitialPrompt),
 }
@@ -354,7 +419,8 @@ impl RenderUnit<'_> {
         match self {
             Self::Message(message) => UnitKey::Message(message.id),
             Self::Activity(activity) => UnitKey::Activity(activity.id()),
-            Self::Group(members) => UnitKey::Group(members[0].id()),
+            Self::Group { members, .. } => UnitKey::Group(members[0].id()),
+            Self::GroupMember(activity) => UnitKey::Activity(activity.id()),
             Self::Provisional(prompt) => UnitKey::Provisional(prompt.id),
         }
     }
@@ -367,7 +433,17 @@ impl RenderUnit<'_> {
             Self::Activity(activity) => {
                 activity_fingerprint(activity, folds.is_folded(activity.id()))
             }
-            Self::Group(members) => group_fingerprint(members),
+            Self::Group { members, expanded } => group_fingerprint(members, *expanded),
+            // Member-ness joins the content signals: the same Activity keeps
+            // its key when it moves between standalone and member rendering,
+            // and only the fingerprint stops a cached standalone render from
+            // surviving the move.
+            Self::GroupMember(activity) => {
+                let mut hasher = std::hash::DefaultHasher::new();
+                activity_fingerprint(activity, folds.is_folded(activity.id())).hash(&mut hasher);
+                true.hash(&mut hasher);
+                hasher.finish()
+            }
             // A provisional prompt's text only grows and carries no Fold, so
             // its length is the whole of its rendering input.
             Self::Provisional(prompt) => prompt.text.len() as u64,
@@ -379,7 +455,10 @@ impl RenderUnit<'_> {
     fn message_id(&self) -> Option<MessageId> {
         match self {
             Self::Message(message) => Some(message.id),
-            Self::Activity(_) | Self::Group(_) | Self::Provisional(_) => None,
+            Self::Activity(_)
+            | Self::Group { .. }
+            | Self::GroupMember(_)
+            | Self::Provisional(_) => None,
         }
     }
 
@@ -406,7 +485,24 @@ impl RenderUnit<'_> {
                 theme,
                 width,
             ),
-            Self::Group(members) => Some(render_group(lines, members.len(), theme)),
+            Self::Group { members, expanded } => {
+                Some(render_group(lines, members.len(), *expanded, theme))
+            }
+            Self::GroupMember(activity) => {
+                let start = lines.len();
+                let anchor = render_activity(
+                    lines,
+                    links,
+                    activity,
+                    folds.is_folded(activity.id()),
+                    theme,
+                    width.saturating_sub(GROUP_MEMBER_INDENT.len() as u16),
+                );
+                for line in &mut lines[start..] {
+                    line.spans.insert(0, Span::raw(GROUP_MEMBER_INDENT));
+                }
+                anchor
+            }
             Self::Provisional(prompt) => {
                 push_user_message(lines, &prompt.text, theme, width);
                 None
@@ -421,6 +517,7 @@ impl RenderUnit<'_> {
 fn plan_units<'a>(
     snapshot: &'a SessionSnapshot,
     provisional: &[&'a InitialPrompt],
+    groups: &TranscriptGroups,
 ) -> Vec<RenderUnit<'a>> {
     let messages: HashMap<MessageId, &Message> = snapshot
         .messages
@@ -441,7 +538,7 @@ fn plan_units<'a>(
         match item {
             TranscriptItem::Message { message_id } => {
                 if let Some(message) = messages.get(message_id).copied() {
-                    close_command_run(&mut units, &mut run);
+                    close_command_run(&mut units, &mut run, groups);
                     units.push(RenderUnit::Message(message));
                 }
             }
@@ -450,14 +547,14 @@ fn plan_units<'a>(
                     if joins_command_run(activity) {
                         run.push(activity);
                     } else {
-                        close_command_run(&mut units, &mut run);
+                        close_command_run(&mut units, &mut run, groups);
                         units.push(RenderUnit::Activity(activity));
                     }
                 }
             }
         }
     }
-    close_command_run(&mut units, &mut run);
+    close_command_run(&mut units, &mut run, groups);
     units.extend(provisional.iter().copied().map(RenderUnit::Provisional));
     units
 }
@@ -477,12 +574,30 @@ fn joins_command_run(activity: &Activity) -> bool {
     )
 }
 
-/// Ends the current run of groupable commands: two or more become one Group
-/// unit, while a run of one stays the ordinary command row it is, so grouping
-/// never adds a layer where it saves nothing.
-fn close_command_run<'a>(units: &mut Vec<RenderUnit<'a>>, run: &mut Vec<&'a Activity>) {
+/// Ends the current run of groupable commands: two or more become one Group,
+/// while a run of one stays the ordinary command row it is, so grouping never
+/// adds a layer where it saves nothing. A Group the reader expanded plans as
+/// its header followed by each member as its own unit, so member Folds,
+/// caching, and clicks need no Group-specific machinery.
+fn close_command_run<'a>(
+    units: &mut Vec<RenderUnit<'a>>,
+    run: &mut Vec<&'a Activity>,
+    groups: &TranscriptGroups,
+) {
     if run.len() >= 2 {
-        units.push(RenderUnit::Group(std::mem::take(run)));
+        let members = std::mem::take(run);
+        if groups.is_collapsed(members[0].id()) {
+            units.push(RenderUnit::Group {
+                members,
+                expanded: false,
+            });
+        } else {
+            units.push(RenderUnit::Group {
+                members: members.clone(),
+                expanded: true,
+            });
+            units.extend(members.into_iter().map(RenderUnit::GroupMember));
+        }
     } else {
         units.extend(run.drain(..).map(RenderUnit::Activity));
     }
@@ -531,7 +646,7 @@ fn rebuild(
     key: ViewKey,
     snapshot: &SessionSnapshot,
     provisional: &[&InitialPrompt],
-    folds: &TranscriptFolds,
+    disclosure: TranscriptDisclosure<'_>,
     theme: &Theme,
     width: u16,
 ) -> TranscriptView {
@@ -549,9 +664,9 @@ fn rebuild(
                 .collect()
         })
         .unwrap_or_default();
-    let mut units = plan_units(snapshot, provisional)
+    let mut units = plan_units(snapshot, provisional, disclosure.groups)
         .into_iter()
-        .map(|unit| reuse_or_render(&mut reusable, &unit, folds, theme, width))
+        .map(|unit| reuse_or_render(&mut reusable, &unit, disclosure.folds, theme, width))
         .collect::<Vec<_>>();
 
     let mut row_count = 0;
@@ -717,11 +832,13 @@ fn activity_fingerprint(activity: &Activity, folded: bool) -> u64 {
     hasher.finish()
 }
 
-/// A collapsed Group renders only its membership, so its identity is who it
-/// holds. Folds are deliberately absent: they act on the members, which a
-/// collapsed Group does not draw.
-fn group_fingerprint(members: &[&Activity]) -> u64 {
+/// A Group unit renders from its membership and which way it is flipped, the
+/// collapsed row and the expanded header being two drawings of the same unit.
+/// Folds are deliberately absent: they act on the members, which render as
+/// their own units when they render at all.
+fn group_fingerprint(members: &[&Activity], expanded: bool) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
+    expanded.hash(&mut hasher);
     members.len().hash(&mut hasher);
     for member in members {
         member.id().hash(&mut hasher);
@@ -891,18 +1008,25 @@ fn render_activity(
     }
 }
 
-/// Projects a collapsed Group: one header row in the settled Activity-header
-/// idiom, with the `Ran N commands` count styled as the expand affordance it
-/// is — the count doubles as the hidden-ness indicator, so no fold-marker line
-/// follows. `member_count` is always at least two.
-fn render_group(lines: &mut Vec<Line<'static>>, member_count: usize, theme: &Theme) -> UnitAnchor {
+/// Projects a Group's header: one row in the settled Activity-header idiom,
+/// with the `Ran N commands` count styled as the toggle affordance it is.
+/// Collapsed, the row stands in for its members and the count doubles as the
+/// hidden-ness indicator, so no fold-marker line follows; expanded, the same
+/// header leads the member units and is the one place the Group re-collapses
+/// from. `member_count` is always at least two.
+fn render_group(
+    lines: &mut Vec<Line<'static>>,
+    member_count: usize,
+    expanded: bool,
+    theme: &Theme,
+) -> UnitAnchor {
     lines.push(Line::from(vec![
         Span::styled("  ✓ ", theme.feedback.success),
         Span::styled(format!("Ran {member_count} commands"), theme.action.primary),
     ]));
     UnitAnchor {
         header_source_lines: 1,
-        hides_content: true,
+        hides_content: !expanded,
     }
 }
 
@@ -1795,8 +1919,9 @@ mod tests {
     };
 
     use super::{
-        CappedStream, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, TranscriptCache, TranscriptFolds,
-        render_activity, render_message, split_oversized_line, wrapped_line_count,
+        CappedStream, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, TranscriptCache, TranscriptDisclosure,
+        TranscriptFolds, TranscriptGroups, render_activity, render_message, split_oversized_line,
+        wrapped_line_count,
     };
 
     fn rendered_text(line: &Line<'static>) -> String {
@@ -2030,7 +2155,10 @@ mod tests {
             0,
             &snapshot,
             &[],
-            &TranscriptFolds::default(),
+            TranscriptDisclosure {
+                folds: &TranscriptFolds::default(),
+                groups: &TranscriptGroups::default(),
+            },
             &first_theme,
             80,
         );
@@ -2043,7 +2171,10 @@ mod tests {
             0,
             &snapshot,
             &[],
-            &TranscriptFolds::default(),
+            TranscriptDisclosure {
+                folds: &TranscriptFolds::default(),
+                groups: &TranscriptGroups::default(),
+            },
             &second_theme,
             80,
         );
@@ -2099,13 +2230,34 @@ mod tests {
         let theme = Theme::system();
         let cache = TranscriptCache::default();
         let mut folds = TranscriptFolds::default();
+        let groups = TranscriptGroups::default();
 
         let folded_rows = cache
-            .view(0, &snapshot, &[], &folds, &theme, 80)
+            .view(
+                0,
+                &snapshot,
+                &[],
+                TranscriptDisclosure {
+                    folds: &folds,
+                    groups: &groups,
+                },
+                &theme,
+                80,
+            )
             .row_count();
         folds.expand(activity.id());
         let expanded_rows = cache
-            .view(0, &snapshot, &[], &folds, &theme, 80)
+            .view(
+                0,
+                &snapshot,
+                &[],
+                TranscriptDisclosure {
+                    folds: &folds,
+                    groups: &groups,
+                },
+                &theme,
+                80,
+            )
             .row_count();
 
         assert!(

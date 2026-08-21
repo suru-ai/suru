@@ -1392,10 +1392,7 @@ fn command_activity_session(
 }
 
 fn numbered_output(lines: usize) -> String {
-    (1..=lines)
-        .map(|line| format!("output line {line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    prefixed_output("output", lines)
 }
 
 fn left_click_at(row: u16) -> InputEvent {
@@ -2289,12 +2286,7 @@ fn a_run_of_successful_commands_collapses_to_one_group_row() {
         rendered.contains("✓ Ran 3 commands"),
         "a run of three successful commands is one Group row: {rendered}"
     );
-    for member in [
-        "command 1",
-        "command 2",
-        "command 3",
-        "output of command 1",
-    ] {
+    for member in ["command 1", "command 2", "command 3", "output of command 1"] {
         assert!(
             !rendered.contains(member),
             "a collapsed Group hides its member rows, but {member:?} rendered: {rendered}"
@@ -2326,8 +2318,7 @@ fn a_run_of_successful_commands_collapses_to_one_group_row() {
 #[test]
 fn a_run_of_one_successful_command_renders_as_a_normal_command_row() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let snapshot =
-        command_run_snapshot(SessionId::new(), workspace.path(), &[SUCCESSFUL_COMMAND]);
+    let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &[SUCCESSFUL_COMMAND]);
     let mut application = connected_application(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
@@ -2353,14 +2344,23 @@ fn a_run_of_one_successful_command_renders_as_a_normal_command_row() {
 fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let breakers: [(RunEntry, &str); 7] = [
-        (RunEntry::AgentMessage("A breaking message"), "A breaking message"),
+        (
+            RunEntry::AgentMessage("A breaking message"),
+            "A breaking message",
+        ),
         (
             RunEntry::UserMessage("A breaking user message"),
             "A breaking user message",
         ),
-        (RunEntry::Reasoning("Weighing options"), "Thought: Weighing options"),
+        (
+            RunEntry::Reasoning("Weighing options"),
+            "Thought: Weighing options",
+        ),
         (RunEntry::FileChange, "✓ Applied file changes"),
-        (RunEntry::Status("Agent Selection changed"), "Agent Selection changed"),
+        (
+            RunEntry::Status("Agent Selection changed"),
+            "Agent Selection changed",
+        ),
         (RunEntry::Error("Provider failed"), "Error: Provider failed"),
         (
             RunEntry::Command(ActivityStatus::Failed, Some(2)),
@@ -2587,4 +2587,332 @@ fn an_interrupted_command_settles_as_a_standalone_failed_row_and_stays_expanded(
             "interrupt auto-expand keeps the watched output visible after the settle: {rendered}"
         );
     }
+}
+
+/// Rewrites the output of the run member holding `command`, so a test can give
+/// one member more output than its Fold budget without touching the others.
+fn set_member_output(
+    snapshot: &mut suru::protocol::SessionSnapshot,
+    command: &str,
+    output: String,
+) {
+    let member = snapshot
+        .activities
+        .iter_mut()
+        .find_map(|activity| match activity {
+            Activity::Command {
+                command: name,
+                output: slot,
+                ..
+            } if name == command => Some(slot),
+            _ => None,
+        })
+        .expect("the run holds the named command");
+    *member = output;
+}
+
+fn prefixed_output(prefix: &str, lines: usize) -> String {
+    (1..=lines)
+        .map(|line| format!("{prefix} line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn clicking_a_collapsed_group_expands_it_into_indented_folded_members() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[SUCCESSFUL_COMMAND, SUCCESSFUL_COMMAND, SUCCESSFUL_COMMAND],
+    );
+    set_member_output(&mut snapshot, "command 2", numbered_output(12));
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a run of successful commands");
+    let collapsed_rows = rendered_application_rows_at(&application, 80, 30);
+
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&collapsed_rows, "Ran 3 commands") as u16,
+        ))
+        .expect("click the collapsed Group row");
+
+    let rows = rendered_application_rows_at(&application, 80, 30);
+    let rendered = rows.join("\n");
+    assert!(
+        rendered.contains("✓ Ran 3 commands"),
+        "the header stays when the Group expands: {rendered}"
+    );
+    for member in ["✓ command 1", "✓ command 2", "✓ command 3"] {
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with(&format!("      {member}"))),
+            "members render indented one gutter past a standalone row, missing {member:?}: {rendered}"
+        );
+    }
+    let header = rendered_row(&rows, "Ran 3 commands");
+    assert!(
+        rendered_row(&rows, "✓ command 1") > header,
+        "members render beneath the header: {rendered}"
+    );
+    for kept in [
+        "output line 1",
+        "output line 3",
+        "output line 10",
+        "output line 12",
+    ] {
+        assert!(
+            rendered.contains(kept),
+            "a member keeps its default Fold's head and tail: {rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("… +6 lines") && !rendered.contains("output line 6"),
+        "a member renders in its default Fold presentation, not in full: {rendered}"
+    );
+}
+
+#[test]
+fn a_members_fold_toggles_independently_within_an_expanded_group() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[SUCCESSFUL_COMMAND, SUCCESSFUL_COMMAND],
+    );
+    set_member_output(&mut snapshot, "command 1", prefixed_output("first", 12));
+    set_member_output(&mut snapshot, "command 2", prefixed_output("second", 12));
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a run of successful commands");
+    let collapsed_rows = rendered_application_rows_at(&application, 80, 36);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
+        ))
+        .expect("expand the Group");
+    let expanded_rows = rendered_application_rows_at(&application, 80, 36);
+    assert_eq!(
+        expanded_rows.join("\n").matches("… +6 lines").count(),
+        2,
+        "both members start out folded"
+    );
+
+    let first_marker = expanded_rows
+        .iter()
+        .position(|row| row.contains("… +6 lines"))
+        .expect("the first member shows a fold marker");
+    application
+        .handle_terminal_event(left_click_at(first_marker as u16))
+        .expect("expand one member's Fold");
+
+    let rows = rendered_application_rows_at(&application, 80, 36);
+    let rendered = rows.join("\n");
+    for line in 1..=12 {
+        assert!(
+            rendered.contains(&format!("first line {line}")),
+            "the clicked member expands in full: {rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("… +6 lines") && !rendered.contains("second line 6"),
+        "the sibling member's Fold is untouched: {rendered}"
+    );
+    assert!(
+        rendered.contains("✓ Ran 2 commands"),
+        "a member's Fold never collapses the Group: {rendered}"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&rows, "✓ command 1") as u16))
+        .expect("fold the member back from its header");
+    let refolded = rendered_application_rows_at(&application, 80, 36).join("\n");
+    assert_eq!(
+        refolded.matches("… +6 lines").count(),
+        2,
+        "the member folds back while the Group stays expanded: {refolded}"
+    );
+}
+
+#[test]
+fn a_members_fold_override_survives_collapse_and_re_expansion() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[SUCCESSFUL_COMMAND, SUCCESSFUL_COMMAND],
+    );
+    set_member_output(&mut snapshot, "command 1", numbered_output(12));
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a run of successful commands");
+    let collapsed_rows = rendered_application_rows_at(&application, 80, 36);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
+        ))
+        .expect("expand the Group");
+    let expanded_rows = rendered_application_rows_at(&application, 80, 36);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&expanded_rows, "… +6 lines") as u16
+        ))
+        .expect("expand the member's Fold");
+    let unfolded_rows = rendered_application_rows_at(&application, 80, 36);
+
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&unfolded_rows, "Ran 2 commands") as u16,
+        ))
+        .expect("collapse the Group over the unfolded member");
+    let recollapsed_rows = rendered_application_rows_at(&application, 80, 36);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&recollapsed_rows, "Ran 2 commands") as u16,
+        ))
+        .expect("expand the Group again");
+
+    let rendered = rendered_application_rows_at(&application, 80, 36).join("\n");
+    assert!(
+        rendered.contains("output line 6") && !rendered.contains("… +"),
+        "collapsing a Group never touches Fold state, so the member comes back \
+         as the reader left it: {rendered}"
+    );
+}
+
+#[test]
+fn an_expanded_group_recollapses_only_from_its_header_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[SUCCESSFUL_COMMAND, SUCCESSFUL_COMMAND, SUCCESSFUL_COMMAND],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a run of successful commands");
+    let collapsed_rows = rendered_application_rows_at(&application, 80, 30);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&collapsed_rows, "Ran 3 commands") as u16,
+        ))
+        .expect("expand the Group");
+    let expanded_rows = rendered_application_rows_at(&application, 80, 30);
+
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&expanded_rows, "output of command 2") as u16,
+        ))
+        .expect("click inside a member's output");
+    let still_expanded = rendered_application_rows_at(&application, 80, 30).join("\n");
+    assert!(
+        still_expanded.contains("✓ command 2"),
+        "a click below the header leaves the Group expanded: {still_expanded}"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&expanded_rows, "Ran 3 commands") as u16,
+        ))
+        .expect("click the Group header");
+    let collapsed = rendered_application_rows_at(&application, 80, 30).join("\n");
+    assert!(
+        collapsed.contains("✓ Ran 3 commands"),
+        "the header remains after re-collapse: {collapsed}"
+    );
+    assert!(
+        !collapsed.contains("command 1") && !collapsed.contains("output of command"),
+        "re-collapsing hides the member rows again: {collapsed}"
+    );
+}
+
+#[test]
+fn group_state_stays_local_to_the_client_that_flipped_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[SUCCESSFUL_COMMAND, SUCCESSFUL_COMMAND, SUCCESSFUL_COMMAND],
+    );
+    let mut reader = connected_application(workspace.path());
+    let mut observer = connected_application(workspace.path());
+    for application in [&mut reader, &mut observer] {
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+            .expect("attach both clients to the same Session");
+    }
+    let collapsed_rows = rendered_application_rows_at(&reader, 80, 30);
+
+    reader
+        .handle_terminal_event(left_click_at(
+            rendered_row(&collapsed_rows, "Ran 3 commands") as u16,
+        ))
+        .expect("one client expands the Group");
+
+    assert!(
+        rendered_application_rows_at(&reader, 80, 30)
+            .join("\n")
+            .contains("✓ command 1"),
+        "the client that expanded sees the members"
+    );
+    let observed = rendered_application_rows_at(&observer, 80, 30).join("\n");
+    assert!(
+        observed.contains("✓ Ran 3 commands") && !observed.contains("command 1"),
+        "Group state is client-local view state and never reaches another client: {observed}"
+    );
+}
+
+#[test]
+fn a_command_settling_successfully_is_absorbed_into_an_expanded_group() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let snapshot = live_command_run_snapshot(session_id, workspace.path());
+    let running_id = snapshot.activities[2].id();
+    let next_revision = SessionRevision(snapshot.revision.0 + 1);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a running command after a run");
+    let collapsed_rows = rendered_application_rows_at(&application, 80, 30);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
+        ))
+        .expect("expand the Group while the Turn runs");
+    let expanded_rows = rendered_application_rows_at(&application, 80, 30);
+    let running = &expanded_rows[rendered_row(&expanded_rows, "$ command 3")];
+    assert!(
+        running.starts_with("    $ command 3"),
+        "the running command stays outside the Group, in the standalone column: {running:?}"
+    );
+
+    application
+        .handle_event(command_settles(
+            session_id,
+            next_revision,
+            running_id,
+            ActivityStatus::Completed,
+            Some(0),
+        ))
+        .expect("project the command settling successfully");
+
+    let rows = rendered_application_rows_at(&application, 80, 30);
+    let rendered = rows.join("\n");
+    assert!(
+        rendered.contains("✓ Ran 3 commands"),
+        "the expanded Group's header counts the absorbed member: {rendered}"
+    );
+    assert!(
+        rows.iter().any(|row| row.starts_with("      ✓ command 3")),
+        "the absorbed command renders as an indented member: {rendered}"
+    );
+    assert!(
+        !rendered.contains("$ command 3"),
+        "the standalone running row is gone: {rendered}"
+    );
 }
