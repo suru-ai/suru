@@ -1,12 +1,18 @@
 //! Cached projection of Session transcript content into renderable rows.
 //!
+//! The projection walks render units. A unit owns the transcript entries that
+//! render as one block, and is what keying, memoization, and click hit-testing
+//! address, so which entries share a unit is answered in one walk rather than
+//! in each of those four places. Every unit holds exactly one entry today; a
+//! Group will hold a run of adjacent command Activities.
+//!
 //! Rendering happens on every input event, so this module memoizes the
 //! expensive work at two levels. The whole view is keyed on the Session
 //! revision and content width: unchanged frames reuse it outright. When the
-//! Session does change, each transcript item keeps its rendered lines and
-//! wrapped-row counts, so a streaming append only re-renders the item it
-//! touched. Frames then extract just the viewport-sized window of lines
-//! instead of handing the whole transcript to the terminal.
+//! Session does change, each unit keeps its rendered lines and wrapped-row
+//! counts, so a streaming append only re-renders the unit it touched. Frames
+//! then extract just the viewport-sized window of lines instead of handing the
+//! whole transcript to the terminal.
 
 use std::{
     cell::{Ref, RefCell},
@@ -165,21 +171,21 @@ pub(super) struct MessageStart {
     pub(super) row: usize,
 }
 
-/// Where a foldable Activity sits in the projected rows, so a pointer lands on
-/// an entry in one lookup instead of a re-render. `header_rows` covers the
-/// entry's header line, the only part of an expanded entry that re-folds it.
+/// Where a projected unit sits in the rendered rows, so a pointer lands on a
+/// unit in one lookup instead of a re-render. `header_rows` covers the unit's
+/// header line, the only part of an expanded unit that closes it again.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct ActivityStart {
-    pub(super) activity_id: ActivityId,
+pub(super) struct UnitStart {
+    pub(super) key: UnitKey,
     pub(super) row: usize,
     pub(super) header_rows: usize,
     pub(super) row_count: usize,
-    /// Whether the entry as drawn is holding content back, so a click only
+    /// Whether the unit as drawn is holding content back, so a click only
     /// toggles a Fold that is really there.
     pub(super) hides_content: bool,
 }
 
-impl ActivityStart {
+impl UnitStart {
     pub(super) const fn contains(&self, row: usize) -> bool {
         row >= self.row && row < self.row + self.row_count
     }
@@ -257,11 +263,11 @@ struct ViewKey {
 #[derive(Clone, Debug)]
 pub(super) struct TranscriptView {
     key: ViewKey,
-    items: Vec<ItemView>,
+    units: Vec<UnitView>,
     row_count: usize,
     message_starts: Vec<MessageStart>,
-    activity_starts: Vec<ActivityStart>,
-    /// Row offset of every source line across all items, for scroll math.
+    unit_starts: Vec<UnitStart>,
+    /// Row offset of every source line across all units, for scroll math.
     line_starts: Vec<usize>,
 }
 
@@ -279,15 +285,15 @@ impl TranscriptView {
         &self.message_starts
     }
 
-    pub(super) fn activity_starts(&self) -> &[ActivityStart] {
-        &self.activity_starts
+    pub(super) fn unit_starts(&self) -> &[UnitStart] {
+        &self.unit_starts
     }
 
     /// Parsed hyperlink targets retained for future semantic commands and
     /// pointer hit-testing.
     #[allow(dead_code)]
     pub(super) fn links(&self) -> impl Iterator<Item = &TranscriptLink> {
-        self.items.iter().flat_map(|item| item.links.iter())
+        self.units.iter().flat_map(|unit| unit.links.iter())
     }
 
     /// Extracts the lines needed to render `viewport_rows` rows starting at
@@ -308,17 +314,17 @@ impl TranscriptView {
         let rows_needed = local_scroll.saturating_add(viewport_rows);
         let mut lines = Vec::new();
         let mut rows = 0;
-        let first_item = self
-            .items
-            .partition_point(|item| item.start_line <= first_line)
+        let first_unit = self
+            .units
+            .partition_point(|unit| unit.start_line <= first_line)
             .saturating_sub(1);
-        'items: for item in &self.items[first_item.min(self.items.len())..] {
-            let skip = first_line.saturating_sub(item.start_line);
-            for (line, rows_of_line) in item.lines.iter().zip(&item.rows_per_line).skip(skip) {
+        'units: for unit in &self.units[first_unit.min(self.units.len())..] {
+            let skip = first_line.saturating_sub(unit.start_line);
+            for (line, rows_of_line) in unit.lines.iter().zip(&unit.rows_per_line).skip(skip) {
                 lines.push(line.clone());
                 rows += rows_of_line;
                 if rows >= rows_needed {
-                    break 'items;
+                    break 'units;
                 }
             }
         }
@@ -326,16 +332,133 @@ impl TranscriptView {
     }
 }
 
+/// One block of the Transcript the projection renders as a whole: the entries
+/// that share a cache key, a fingerprint, and a click target. A unit answers
+/// for all three itself, so rendering, memoization, and hit-testing address
+/// the unit rather than what it holds.
+enum RenderUnit<'a> {
+    Message(&'a Message),
+    Activity(&'a Activity),
+    /// A prompt this client sent that the Session has not echoed back yet.
+    Provisional(&'a InitialPrompt),
+}
+
+impl RenderUnit<'_> {
+    fn key(&self) -> UnitKey {
+        match self {
+            Self::Message(message) => UnitKey::Message(message.id),
+            Self::Activity(activity) => UnitKey::Activity(activity.id()),
+            Self::Provisional(prompt) => UnitKey::Provisional(prompt.id),
+        }
+    }
+
+    /// Identifies everything the unit's rendering reads, so it re-renders when
+    /// any entry it holds changes and reuses its lines when none did.
+    fn fingerprint(&self, folds: &TranscriptFolds) -> u64 {
+        match self {
+            Self::Message(message) => message_fingerprint(message),
+            Self::Activity(activity) => {
+                activity_fingerprint(activity, folds.is_folded(activity.id()))
+            }
+            // A provisional prompt's text only grows and carries no Fold, so
+            // its length is the whole of its rendering input.
+            Self::Provisional(prompt) => prompt.text.len() as u64,
+        }
+    }
+
+    /// The Message a scroll anchor holds onto when it lands on this unit.
+    /// Anchoring tracks conversation, so only a unit holding one answers.
+    fn message_id(&self) -> Option<MessageId> {
+        match self {
+            Self::Message(message) => Some(message.id),
+            Self::Activity(_) | Self::Provisional(_) => None,
+        }
+    }
+
+    /// Projects the unit's lines, reporting the anchor a click acts on when
+    /// the unit has one.
+    fn render(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        links: &mut Vec<TranscriptLink>,
+        folds: &TranscriptFolds,
+        theme: &Theme,
+        width: u16,
+    ) -> Option<UnitAnchor> {
+        match self {
+            Self::Message(message) => {
+                render_message(lines, message, theme, width);
+                None
+            }
+            Self::Activity(activity) => render_activity(
+                lines,
+                links,
+                activity,
+                folds.is_folded(activity.id()),
+                theme,
+                width,
+            ),
+            Self::Provisional(prompt) => {
+                push_user_message(lines, &prompt.text, theme, width);
+                None
+            }
+        }
+    }
+}
+
+/// Walks a Session's transcript into the units a view renders. Which entries
+/// share a unit is decided here and nowhere else, so gathering a run of them
+/// into one stays a change to this walk rather than to rendering or layout.
+fn plan_units<'a>(
+    snapshot: &'a SessionSnapshot,
+    provisional: &[&'a InitialPrompt],
+) -> Vec<RenderUnit<'a>> {
+    let messages: HashMap<MessageId, &Message> = snapshot
+        .messages
+        .iter()
+        .map(|message| (message.id, message))
+        .collect();
+    let activities: HashMap<ActivityId, &Activity> = snapshot
+        .activities
+        .iter()
+        .map(|activity| (activity.id(), activity))
+        .collect();
+    let mut units = Vec::with_capacity(snapshot.transcript.len() + provisional.len());
+    // A transcript entry naming content the snapshot does not carry projects
+    // nothing rather than a gap.
+    for item in &snapshot.transcript {
+        match item {
+            TranscriptItem::Message { message_id } => {
+                if let Some(message) = messages.get(message_id).copied() {
+                    units.push(RenderUnit::Message(message));
+                }
+            }
+            TranscriptItem::Activity { activity_id } => {
+                if let Some(activity) = activities.get(activity_id).copied() {
+                    units.push(RenderUnit::Activity(activity));
+                }
+            }
+        }
+    }
+    units.extend(provisional.iter().copied().map(RenderUnit::Provisional));
+    units
+}
+
+/// A unit's identity across rebuilds, taken from the entries it holds so the
+/// cache recognizes the same unit in the next frame, and what a click resolves
+/// to, so the interaction layer learns what it landed on without re-deriving
+/// the projection. A unit that grows must keep the key it had, or the cache
+/// reads it as a new unit and re-renders what only gained a line.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum ItemKey {
+pub(super) enum UnitKey {
     Message(MessageId),
     Activity(ActivityId),
     Provisional(PromptId),
 }
 
 #[derive(Clone, Debug)]
-struct ItemView {
-    key: ItemKey,
+struct UnitView {
+    key: UnitKey,
     fingerprint: u64,
     lines: Vec<Line<'static>>,
     links: Vec<TranscriptLink>,
@@ -344,14 +467,13 @@ struct ItemView {
     rows_per_line: Vec<usize>,
     start_line: usize,
     message_id: Option<MessageId>,
-    anchor: Option<ActivityAnchor>,
+    anchor: Option<LaidOutAnchor>,
 }
 
-/// A foldable Activity's identity, the count of laid-out lines that form its
-/// header, and whether its Fold held content back.
+/// A unit's anchor once layout resolved it: how many of the unit's laid-out
+/// lines form its header, and whether it held content back.
 #[derive(Clone, Copy, Debug)]
-struct ActivityAnchor {
-    activity_id: ActivityId,
+struct LaidOutAnchor {
     header_lines: usize,
     hides_content: bool,
 }
@@ -365,7 +487,7 @@ fn rebuild(
     theme: &Theme,
     width: u16,
 ) -> TranscriptView {
-    let mut reusable: HashMap<ItemKey, ItemView> = previous
+    let mut reusable: HashMap<UnitKey, UnitView> = previous
         .filter(|view| {
             view.key.generation == key.generation
                 && view.key.session_id == key.session_id
@@ -373,135 +495,81 @@ fn rebuild(
                 && view.key.width == key.width
         })
         .map(|view| {
-            view.items
+            view.units
                 .into_iter()
-                .map(|item| (item.key, item))
+                .map(|unit| (unit.key, unit))
                 .collect()
         })
         .unwrap_or_default();
-    let messages: HashMap<MessageId, &Message> = snapshot
-        .messages
-        .iter()
-        .map(|message| (message.id, message))
-        .collect();
-    let activities: HashMap<ActivityId, &Activity> = snapshot
-        .activities
-        .iter()
-        .map(|activity| (activity.id(), activity))
-        .collect();
-
-    let mut items = Vec::with_capacity(snapshot.transcript.len() + provisional.len());
-    for item in &snapshot.transcript {
-        match item {
-            TranscriptItem::Message { message_id } => {
-                let Some(message) = messages.get(message_id) else {
-                    continue;
-                };
-                items.push(reuse_or_render(
-                    &mut reusable,
-                    ItemKey::Message(message.id),
-                    message_fingerprint(message),
-                    Some(message.id),
-                    width,
-                    |lines, _links| {
-                        render_message(lines, message, theme, width);
-                        None
-                    },
-                ));
-            }
-            TranscriptItem::Activity { activity_id } => {
-                let Some(activity) = activities.get(activity_id) else {
-                    continue;
-                };
-                let folded = folds.is_folded(activity.id());
-                items.push(reuse_or_render(
-                    &mut reusable,
-                    ItemKey::Activity(activity.id()),
-                    activity_fingerprint(activity, folded),
-                    None,
-                    width,
-                    |lines, links| render_activity(lines, links, activity, folded, theme, width),
-                ));
-            }
-        }
-    }
-    for prompt in provisional {
-        items.push(reuse_or_render(
-            &mut reusable,
-            ItemKey::Provisional(prompt.id),
-            prompt.text.len() as u64,
-            None,
-            width,
-            |lines, _links| {
-                push_user_message(lines, &prompt.text, theme, width);
-                None
-            },
-        ));
-    }
+    let mut units = plan_units(snapshot, provisional)
+        .into_iter()
+        .map(|unit| reuse_or_render(&mut reusable, &unit, folds, theme, width))
+        .collect::<Vec<_>>();
 
     let mut row_count = 0;
     let mut line_count = 0;
     let mut message_starts = Vec::new();
-    let mut activity_starts = Vec::new();
+    let mut unit_starts = Vec::new();
     let mut line_starts = Vec::new();
-    for item in &mut items {
-        item.start_line = line_count;
-        let item_start_row = row_count;
-        if let Some(message_id) = item.message_id {
+    for unit in &mut units {
+        unit.start_line = line_count;
+        let unit_start_row = row_count;
+        if let Some(message_id) = unit.message_id {
             message_starts.push(MessageStart {
                 message_id,
                 row: row_count,
             });
         }
-        for rows_of_line in &item.rows_per_line {
+        for rows_of_line in &unit.rows_per_line {
             line_starts.push(row_count);
             row_count += rows_of_line;
         }
-        line_count += item.lines.len();
-        if let Some(anchor) = item.anchor {
-            activity_starts.push(ActivityStart {
-                activity_id: anchor.activity_id,
-                row: item_start_row,
-                header_rows: item.rows_per_line[..anchor.header_lines].iter().sum(),
-                row_count: row_count - item_start_row,
+        line_count += unit.lines.len();
+        if let Some(anchor) = unit.anchor {
+            unit_starts.push(UnitStart {
+                key: unit.key,
+                row: unit_start_row,
+                header_rows: unit.rows_per_line[..anchor.header_lines].iter().sum(),
+                row_count: row_count - unit_start_row,
                 hides_content: anchor.hides_content,
             });
         }
     }
     TranscriptView {
         key,
-        items,
+        units,
         row_count,
         message_starts,
-        activity_starts,
+        unit_starts,
         line_starts,
     }
 }
 
-/// Renders one transcript item, or returns the cached render when nothing it
-/// depends on changed. `render` reports the item's fold anchor, whose header
-/// line count is re-derived here because oversized lines split during layout.
+/// Renders one unit, or returns the cached render when nothing it depends on
+/// changed. The unit reports its own anchor, whose header line count is
+/// re-derived here because oversized lines split during layout.
 fn reuse_or_render(
-    reusable: &mut HashMap<ItemKey, ItemView>,
-    key: ItemKey,
-    fingerprint: u64,
-    message_id: Option<MessageId>,
+    reusable: &mut HashMap<UnitKey, UnitView>,
+    unit: &RenderUnit<'_>,
+    folds: &TranscriptFolds,
+    theme: &Theme,
     width: u16,
-    render: impl FnOnce(&mut Vec<Line<'static>>, &mut Vec<TranscriptLink>) -> Option<FoldAnchor>,
-) -> ItemView {
-    if let Some(item) = reusable.remove(&key)
-        && item.fingerprint == fingerprint
+) -> UnitView {
+    let key = unit.key();
+    let fingerprint = unit.fingerprint(folds);
+    if let Some(cached) = reusable.remove(&key)
+        && cached.fingerprint == fingerprint
     {
-        return item;
+        return cached;
     }
     let mut rendered = Vec::new();
     let mut links = Vec::new();
-    let rendered_anchor = render(&mut rendered, &mut links);
+    let rendered_anchor = unit.render(&mut rendered, &mut links, folds, theme, width);
     let mut lines = Vec::with_capacity(rendered.len());
     let mut header_lines = 0;
     for (index, line) in rendered.into_iter().enumerate() {
         split_oversized_line(line, width, &mut lines);
-        if rendered_anchor.is_some_and(|anchor| index + 1 == anchor.entry.header_source_lines) {
+        if rendered_anchor.is_some_and(|anchor| index + 1 == anchor.header_source_lines) {
             header_lines = lines.len();
         }
     }
@@ -509,37 +577,29 @@ fn reuse_or_render(
         .iter()
         .map(|line| wrapped_line_count(line, width))
         .collect::<Vec<_>>();
-    ItemView {
+    UnitView {
         key,
         fingerprint,
         lines,
         links,
         rows_per_line,
         start_line: 0,
-        message_id,
-        anchor: rendered_anchor.map(|anchor| ActivityAnchor {
-            activity_id: anchor.activity_id,
+        message_id: unit.message_id(),
+        anchor: rendered_anchor.map(|anchor| LaidOutAnchor {
             header_lines,
-            hides_content: anchor.entry.hides_content,
+            hides_content: anchor.hides_content,
         }),
     }
 }
 
-/// What a foldable entry's renderer reports: how many of the lines it just
-/// pushed form the header a reader clicks to fold it again, and whether its
-/// Fold held any content back. The count is in pre-split source lines, which
-/// layout resolves to rows.
+/// What a projected unit reports about the block it pushed: how many of those
+/// lines form the header a reader clicks to close it again, and whether it
+/// held any content back. The count is in pre-split source lines, which layout
+/// resolves to rows.
 #[derive(Clone, Copy, Debug)]
-struct FoldedEntry {
+struct UnitAnchor {
     header_source_lines: usize,
     hides_content: bool,
-}
-
-/// A [`FoldedEntry`] joined to the Activity it projected.
-#[derive(Clone, Copy, Debug)]
-struct FoldAnchor {
-    activity_id: ActivityId,
-    entry: FoldedEntry,
 }
 
 /// Message content is append-only, so its length identifies it within a
@@ -680,9 +740,11 @@ fn render_message(lines: &mut Vec<Line<'static>>, message: &Message, theme: &The
     }
 }
 
-/// Projects one Activity, reporting a fold anchor for the kinds a reader can
-/// fold. `Status` is already one line and `Error` is a failure the reader must
-/// not have to hunt for, so neither is ever folded and neither anchors a click.
+/// Projects one Activity, reporting an anchor for the kinds a reader can fold.
+/// `Status` is already one line and `Error` is a failure the reader must not
+/// have to hunt for, so neither is ever folded and neither anchors a click.
+/// Each kind projects through its own renderer, so what one kind shows never
+/// depends on how another renders.
 fn render_activity(
     lines: &mut Vec<Line<'static>>,
     links: &mut Vec<TranscriptLink>,
@@ -690,7 +752,7 @@ fn render_activity(
     folded: bool,
     theme: &Theme,
     width: u16,
-) -> Option<FoldAnchor> {
+) -> Option<UnitAnchor> {
     let mut projection = ActivityProjection { lines, links };
     match activity {
         Activity::Status { text, .. } => {
@@ -720,7 +782,6 @@ fn render_activity(
             None
         }
         Activity::Command {
-            id,
             status,
             command,
             cwd,
@@ -728,65 +789,48 @@ fn render_activity(
             output_truncated,
             exit_status,
             ..
-        } => {
-            let entry = push_command_activity(
-                &mut projection,
-                CommandActivity {
-                    status: *status,
-                    command,
-                    cwd: cwd.as_deref(),
-                    output,
-                    output_truncated: *output_truncated,
-                    exit_status: *exit_status,
-                },
-                folded,
-                theme,
-                width,
-            );
-            Some(FoldAnchor {
-                activity_id: *id,
-                entry,
-            })
-        }
+        } => Some(push_command_activity(
+            &mut projection,
+            CommandActivity {
+                status: *status,
+                command,
+                cwd: cwd.as_deref(),
+                output,
+                output_truncated: *output_truncated,
+                exit_status: *exit_status,
+            },
+            folded,
+            theme,
+            width,
+        )),
         Activity::FileChange {
-            id,
-            status,
+            status, changes, ..
+        } => Some(push_file_change_activity(
+            projection.lines,
+            *status,
             changes,
-            ..
-        } => {
-            let entry =
-                push_file_change_activity(projection.lines, *status, changes, folded, theme);
-            Some(FoldAnchor {
-                activity_id: *id,
-                entry,
-            })
-        }
+            folded,
+            theme,
+        )),
         Activity::Reasoning {
-            id,
             status,
             title,
             content,
             content_truncated,
             duration_ms,
             ..
-        } => {
-            let entry = push_reasoning_activity(
-                projection.lines,
-                ReasoningActivity {
-                    status: *status,
-                    title: title.as_deref(),
-                    content,
-                    content_truncated: *content_truncated,
-                    duration_ms: *duration_ms,
-                },
-                folded,
-                theme,
-            );
-            Some(FoldAnchor {
-                activity_id: *id,
-                entry,
-            })
-        }
+        } => Some(push_reasoning_activity(
+            projection.lines,
+            ReasoningActivity {
+                status: *status,
+                title: title.as_deref(),
+                content,
+                content_truncated: *content_truncated,
+                duration_ms: *duration_ms,
+            },
+            folded,
+            theme,
+        )),
     }
 }
 
@@ -815,7 +859,7 @@ fn push_command_activity(
     folded: bool,
     theme: &Theme,
     width: u16,
-) -> FoldedEntry {
+) -> UnitAnchor {
     use crate::protocol::ActivityStatus;
 
     let CommandActivity {
@@ -879,7 +923,7 @@ fn push_command_activity(
             theme,
         );
     }
-    FoldedEntry {
+    UnitAnchor {
         header_source_lines,
         hides_content,
     }
@@ -979,7 +1023,7 @@ fn push_file_change_activity(
     changes: &[FileChange],
     folded: bool,
     theme: &Theme,
-) -> FoldedEntry {
+) -> UnitAnchor {
     use crate::protocol::ActivityStatus;
 
     let (marker, label, style) = match status {
@@ -1018,7 +1062,7 @@ fn push_file_change_activity(
     if hidden > 0 {
         lines.push(fold_marker_line(hidden, "more", OUTPUT_INDENT, theme));
     }
-    FoldedEntry {
+    UnitAnchor {
         header_source_lines,
         hides_content: hidden > 0,
     }
@@ -1043,7 +1087,7 @@ fn push_reasoning_activity(
     activity: ReasoningActivity<'_>,
     folded: bool,
     theme: &Theme,
-) -> FoldedEntry {
+) -> UnitAnchor {
     use crate::protocol::ActivityStatus;
 
     let ReasoningActivity {
@@ -1095,13 +1139,13 @@ fn push_reasoning_activity(
     }
     let header_source_lines = lines.len() - header_start;
     if folded {
-        return FoldedEntry {
+        return UnitAnchor {
             header_source_lines,
             hides_content: !body.is_empty(),
         };
     }
     lines.append(&mut body);
-    FoldedEntry {
+    UnitAnchor {
         header_source_lines,
         hides_content: false,
     }

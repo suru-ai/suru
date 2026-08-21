@@ -36,7 +36,7 @@ use super::{
     render::render_with_slots,
     session_picker::SessionPicker,
     slots::RenderSlots,
-    transcript::{ActivityStart, MessageStart, TranscriptCache, TranscriptFolds},
+    transcript::{MessageStart, TranscriptCache, TranscriptFolds, UnitKey, UnitStart},
 };
 
 /// Rows scrolled per mouse wheel tick, matching common terminal conventions.
@@ -126,7 +126,7 @@ pub(super) struct TranscriptViewport {
     pub(super) scroll_position: usize,
     pub(super) maximum_scroll: usize,
     pub(super) message_starts: Vec<MessageStart>,
-    pub(super) activity_starts: Vec<ActivityStart>,
+    pub(super) unit_starts: Vec<UnitStart>,
     /// Terminal row the first projected transcript row was drawn on, with the
     /// count of rows below it, so a pointer position maps back to a transcript
     /// row without re-deriving the frame's layout.
@@ -143,16 +143,16 @@ impl TranscriptViewport {
             .then(|| self.scroll_position.saturating_add(usize::from(offset)))
     }
 
-    /// The foldable Activity drawn at `screen_row`, with the transcript row the
-    /// pointer landed on. Activities are recorded in row order, so this is a
-    /// binary search rather than a scan of the transcript.
-    fn activity_at(&self, screen_row: u16) -> Option<(ActivityStart, usize)> {
+    /// The projected unit drawn at `screen_row`, with the transcript row the
+    /// pointer landed on. Units are recorded in row order, so this is a binary
+    /// search rather than a scan of the transcript.
+    fn unit_at(&self, screen_row: u16) -> Option<(UnitStart, usize)> {
         let row = self.transcript_row(screen_row)?;
         let index = self
-            .activity_starts
+            .unit_starts
             .partition_point(|start| start.row <= row)
             .checked_sub(1)?;
-        let start = self.activity_starts[index];
+        let start = self.unit_starts[index];
         start.contains(row).then_some((start, row))
     }
 
@@ -655,12 +655,12 @@ impl TuiState {
         Some(self.session_interactions.entry(session_id).or_default())
     }
 
-    /// Toggles the Fold of the entry drawn at `screen_row`. An entry holding
-    /// content back expands wherever it is clicked; one already showing
-    /// everything folds again only from its header line, so pointing at output
-    /// never hides what is under the pointer. An entry with nothing to hide
-    /// answers neither, so an idle click never records a Fold that does not
-    /// exist.
+    /// Toggles the Fold of the unit drawn at `screen_row`, which today is
+    /// always the one Activity that unit projects. A unit holding content back
+    /// expands wherever it is clicked; one already showing everything folds
+    /// again only from its header line, so pointing at output never hides what
+    /// is under the pointer. A unit with nothing to hide answers neither, so an
+    /// idle click never records a Fold that does not exist.
     fn toggle_fold_at(&mut self, screen_row: u16) {
         let Some(interaction) = self.current_interaction() else {
             return;
@@ -669,15 +669,18 @@ impl TuiState {
             .viewport
             .borrow()
             .as_ref()
-            .and_then(|viewport| viewport.activity_at(screen_row))
+            .and_then(|viewport| viewport.unit_at(screen_row))
         else {
+            return;
+        };
+        let UnitKey::Activity(activity_id) = start.key else {
             return;
         };
         let mut folds = interaction.folds.borrow_mut();
         if start.hides_content {
-            folds.expand(start.activity_id);
-        } else if start.is_header(row) && !folds.is_folded(start.activity_id) {
-            folds.fold(start.activity_id);
+            folds.expand(activity_id);
+        } else if start.is_header(row) && !folds.is_folded(activity_id) {
+            folds.fold(activity_id);
         }
     }
 

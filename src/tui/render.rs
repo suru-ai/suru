@@ -1037,7 +1037,7 @@ fn render_session(
         scroll_position,
         maximum_scroll,
         message_starts: transcript_view.message_starts().to_vec(),
-        activity_starts: transcript_view.activity_starts().to_vec(),
+        unit_starts: transcript_view.unit_starts().to_vec(),
         content_top: transcript_area.y.saturating_add(border_rows),
         content_rows: transcript_area.height.saturating_sub(border_rows),
     }));
