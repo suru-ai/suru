@@ -54,6 +54,14 @@ const OUTPUT_INDENT: &str = "    ";
 /// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
 const FOLDED_FILE_CHANGE_PATHS: usize = 4;
 
+/// What a Reasoning Activity's header calls the block in each of its states.
+/// Suru's own word for the concept is Reasoning, but the Transcript speaks the
+/// reader's: an agent is thinking, and what it leaves behind is a thought.
+/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
+const REASONING_ACTIVE_LABEL: &str = "Thinking";
+const REASONING_COMPLETED_LABEL: &str = "Thought";
+const REASONING_FAILED_LABEL: &str = "Thinking interrupted";
+
 /// Which way a Session's Transcript leans before any per-entry override.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum FoldPosture {
@@ -132,6 +140,8 @@ enum CappedStream {
     Message,
     /// The output a command wrote, stored on its Activity.
     CommandOutput,
+    /// The summary of a Reasoning block, stored on its Activity.
+    Reasoning,
 }
 
 impl CappedStream {
@@ -144,6 +154,7 @@ impl CappedStream {
         match self {
             Self::Message => "[Message truncated]",
             Self::CommandOutput => "[output truncated]",
+            Self::Reasoning => "[Reasoning truncated]",
         }
     }
 }
@@ -561,6 +572,20 @@ fn activity_fingerprint(activity: &Activity, folded: bool) -> u64 {
             output_truncated.hash(&mut hasher);
             exit_status.hash(&mut hasher);
         }
+        Activity::Reasoning {
+            status,
+            title,
+            content,
+            content_truncated,
+            duration_ms,
+            ..
+        } => {
+            (*status as u8).hash(&mut hasher);
+            title.hash(&mut hasher);
+            content.len().hash(&mut hasher);
+            content_truncated.hash(&mut hasher);
+            duration_ms.hash(&mut hasher);
+        }
         Activity::FileChange {
             status, changes, ..
         } => {
@@ -731,6 +756,32 @@ fn render_activity(
         } => {
             let entry =
                 push_file_change_activity(projection.lines, *status, changes, folded, theme);
+            Some(FoldAnchor {
+                activity_id: *id,
+                entry,
+            })
+        }
+        Activity::Reasoning {
+            id,
+            status,
+            title,
+            content,
+            content_truncated,
+            duration_ms,
+            ..
+        } => {
+            let entry = push_reasoning_activity(
+                projection.lines,
+                ReasoningActivity {
+                    status: *status,
+                    title: title.as_deref(),
+                    content,
+                    content_truncated: *content_truncated,
+                    duration_ms: *duration_ms,
+                },
+                folded,
+                theme,
+            );
             Some(FoldAnchor {
                 activity_id: *id,
                 entry,
@@ -960,6 +1011,110 @@ fn push_file_change_activity(
     FoldedEntry {
         header_source_lines,
         hides_content: hidden > 0,
+    }
+}
+
+/// What a Reasoning Activity contributes to the transcript, gathered so the
+/// renderer reads one subject rather than a row of loose parameters.
+struct ReasoningActivity<'a> {
+    status: crate::protocol::ActivityStatus,
+    title: Option<&'a str>,
+    content: &'a str,
+    content_truncated: bool,
+    duration_ms: Option<u64>,
+}
+
+/// Projects a Reasoning Activity. Folded — the posture a Transcript leans to —
+/// it is the single header line the reader skims past; expanded it opens into
+/// the summary the Provider wrote, rendered as the Markdown it is but drained of
+/// colour so Reasoning never competes with the answer it led to.
+fn push_reasoning_activity(
+    lines: &mut Vec<Line<'static>>,
+    activity: ReasoningActivity<'_>,
+    folded: bool,
+    theme: &Theme,
+) -> FoldedEntry {
+    use crate::protocol::ActivityStatus;
+
+    let ReasoningActivity {
+        status,
+        title,
+        content,
+        content_truncated,
+        duration_ms,
+    } = activity;
+    let (marker, label, style) = match status {
+        ActivityStatus::Active => ("… ", REASONING_ACTIVE_LABEL, theme.accent.primary),
+        ActivityStatus::Completed => ("✓ ", REASONING_COMPLETED_LABEL, theme.text.subdued),
+        ActivityStatus::Failed => ("× ", REASONING_FAILED_LABEL, theme.feedback.error),
+    };
+    let mut header = label.to_owned();
+    if let Some(title) = title {
+        header.push_str(": ");
+        header.push_str(title);
+    }
+    if let Some(duration_ms) = duration_ms {
+        header.push_str(" · ");
+        header.push_str(&humanized_duration(duration_ms));
+    }
+    let header_start = lines.len();
+    push_prefixed_lines(lines, &format!("  {marker}"), &header, style);
+    let header_source_lines = lines.len() - header_start;
+    if folded {
+        // A Reasoning Fold hides the whole summary rather than the middle of
+        // it, so the header above is the fold marker: naming the block and how
+        // long it took says more about what is behind it than a line count
+        // would, and keeps the folded form to the single line it is meant to be.
+        return FoldedEntry {
+            header_source_lines,
+            hides_content: !content.is_empty() || content_truncated,
+        };
+    }
+    let content = sanitize_content(content);
+    for line in markdown::render(&content, theme) {
+        lines.push(subdued_line(line, OUTPUT_INDENT, theme));
+    }
+    if content_truncated {
+        push_truncation_marker(lines, CappedStream::Reasoning, OUTPUT_INDENT, theme);
+    }
+    FoldedEntry {
+        header_source_lines,
+        hides_content: false,
+    }
+}
+
+/// Re-styles a rendered Markdown line as subdued prose in the Activity gutter.
+/// The Markdown renderer's own emphasis survives as modifiers; only its colours
+/// are dropped, which is what makes the body read as an aside rather than as a
+/// second Message.
+fn subdued_line(line: Line<'static>, indent: &str, theme: &Theme) -> Line<'static> {
+    if line.spans.is_empty() {
+        return line;
+    }
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::styled(indent.to_owned(), theme.text.subdued));
+    spans.extend(line.spans.into_iter().map(|span| {
+        let modifiers = span.style.add_modifier;
+        Span::styled(span.content, theme.text.subdued.add_modifier(modifiers))
+    }));
+    Line::from(spans)
+}
+
+/// Renders a duration at the coarsest precision that still says something: a
+/// block that took seconds is not reported to the millisecond, and one that took
+/// minutes is not reported as hundreds of seconds.
+fn humanized_duration(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        return format!("{duration_ms}ms");
+    }
+    let seconds = duration_ms / 1_000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    match seconds % 60 {
+        0 => format!("{minutes}m"),
+        remainder => format!("{minutes}m {remainder}s"),
     }
 }
 
@@ -1669,6 +1824,45 @@ mod tests {
                 .flat_map(|line| &line.spans)
                 .any(|span| span.content == "kept output"),
             "output before the marker still renders: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_expanded_reasoning_block_ends_in_its_own_truncation_marker() {
+        let activity = Activity::Reasoning {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Completed,
+            title: Some("Inspecting the seam".to_owned()),
+            content: "Reading **the** projection.".to_owned(),
+            content_truncated: true,
+            duration_ms: Some(4_200),
+        };
+        let theme = Theme::system();
+        let mut lines = Vec::new();
+        let mut links = Vec::new();
+
+        render_activity(&mut lines, &mut links, &activity, false, &theme, 80);
+
+        assert_eq!(
+            rendered_text(&lines[0]),
+            "  ✓ Thought: Inspecting the seam · 4s"
+        );
+        let marker = lines.last().expect("render the truncation marker");
+        assert_eq!(rendered_text(marker), "    [Reasoning truncated]");
+        let body = lines[1..lines.len() - 1]
+            .iter()
+            .map(rendered_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(body, "    Reading the projection.");
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .all(|span| span.style.fg == theme.text.subdued.fg),
+            "an expanded Reasoning body reads as subdued prose: {:?}",
+            lines[1]
         );
     }
 

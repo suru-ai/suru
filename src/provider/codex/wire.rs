@@ -438,13 +438,24 @@ pub(super) enum NativeItem {
         changes: Vec<NativeFileChange>,
         status: NativeFileChangeStatus,
     },
+    /// A block of Reasoning. `summary` holds the readable sections Codex
+    /// streams; the raw `content` beside it is the unsummarized form, which
+    /// Suru neither asks for nor stores.
+    Reasoning {
+        id: String,
+        #[serde(default)]
+        summary: Vec<String>,
+    },
     #[serde(other)]
     Unknown,
 }
 
+/// One step of an item Codex is streaming: which item, and the text it added.
+/// Every streamed item kind shares this shape, so it is named for the shape
+/// rather than for whichever kind was decoded through it first.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct AgentMessageDeltaParams {
+pub(super) struct ItemDeltaParams {
     pub(super) thread_id: String,
     pub(super) turn_id: String,
     pub(super) item_id: String,
@@ -497,6 +508,16 @@ pub(super) enum NativeFileChangeStatus {
     Completed,
     Failed,
     Declined,
+}
+
+/// Progress Codex reports about an item without adding any text to it, such as
+/// the break between one Reasoning summary section and the next.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ItemProgressParams {
+    pub(super) thread_id: String,
+    pub(super) turn_id: String,
+    pub(super) item_id: String,
 }
 
 #[derive(Deserialize)]
@@ -650,12 +671,40 @@ pub(super) enum NativeNotification {
         changes: Vec<NativeFileChange>,
         status: NativeFileChangeStatus,
     },
+    ReasoningStarted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+    },
+    ReasoningDelta {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        delta: String,
+    },
+    ReasoningSectionBreak {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+    },
+    ReasoningCompleted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        summary: Vec<String>,
+    },
     TurnCompleted {
         thread_id: String,
         turn_id: String,
         outcome: NativeTurnOutcome,
     },
 }
+
+/// What separates one Reasoning summary section from the next once Suru has
+/// joined them into the single body a Reasoning Activity stores. Codex reports
+/// the break on its own, and the same separator joins the sections it sends
+/// back with the completed item, so the two forms stay comparable.
+pub(super) const NATIVE_REASONING_SECTION_SEPARATOR: &str = "\n\n";
 
 pub(super) enum NativeTurnOutcome {
     Completed,

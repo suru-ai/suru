@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 
 use crate::protocol::{
-    Activity, ActivityStatus, MessageRole, MessageStatus, PromptDelivery, PromptStatus,
+    Activity, ActivityId, ActivityStatus, MessageRole, MessageStatus, PromptDelivery, PromptStatus,
     SessionChange, SessionSnapshot, SessionUpdate, TranscriptItem, TurnStatus,
 };
 
@@ -209,6 +209,23 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 ) {
                     bail!("Session update added a file-change Activity outside its initial state");
                 }
+                if matches!(
+                    activity,
+                    Activity::Reasoning {
+                        status,
+                        title,
+                        content,
+                        content_truncated,
+                        duration_ms,
+                        ..
+                    } if *status != ActivityStatus::Active
+                        || title.is_some()
+                        || !content.is_empty()
+                        || *content_truncated
+                        || duration_ms.is_some()
+                ) {
+                    bail!("Session update added a Reasoning Activity outside its initial state");
+                }
                 next.activities.push(activity.clone());
                 next.transcript.push(TranscriptItem::Activity {
                     activity_id: activity.id(),
@@ -342,6 +359,78 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 }
                 *current_status = *status;
             }
+            SessionChange::ReasoningTitleChanged { activity_id, title } => {
+                let Some(Activity::Reasoning {
+                    status,
+                    title: current_title,
+                    ..
+                }) = reasoning_activity(next, activity_id)?
+                else {
+                    bail!("Session update titled a different Activity kind");
+                };
+                if *status != ActivityStatus::Active {
+                    bail!("Session update titled a terminal Reasoning Activity");
+                }
+                *current_title = Some(title.clone());
+            }
+            SessionChange::ReasoningContentAppended {
+                activity_id,
+                content,
+            } => {
+                let Some(Activity::Reasoning {
+                    status,
+                    content: current_content,
+                    content_truncated,
+                    ..
+                }) = reasoning_activity(next, activity_id)?
+                else {
+                    bail!("Session update appended Reasoning to a different Activity kind");
+                };
+                if *status != ActivityStatus::Active {
+                    bail!("Session update appended content to a terminal Reasoning Activity");
+                }
+                if *content_truncated {
+                    bail!("Session update appended content past the cap that truncated Reasoning");
+                }
+                current_content.push_str(content);
+            }
+            SessionChange::ReasoningContentTruncated { activity_id } => {
+                let Some(Activity::Reasoning {
+                    status,
+                    content_truncated,
+                    ..
+                }) = reasoning_activity(next, activity_id)?
+                else {
+                    bail!("Session update truncated the content of a different Activity kind");
+                };
+                if *status != ActivityStatus::Active {
+                    bail!("Session update truncated the content of a terminal Reasoning Activity");
+                }
+                *content_truncated = true;
+            }
+            SessionChange::ReasoningStatusChanged {
+                activity_id,
+                status,
+                duration_ms,
+            } => {
+                let Some(Activity::Reasoning {
+                    status: current_status,
+                    duration_ms: current_duration_ms,
+                    ..
+                }) = reasoning_activity(next, activity_id)?
+                else {
+                    bail!("Session update completed a different Activity kind");
+                };
+                if *current_status != ActivityStatus::Active
+                    || !matches!(status, ActivityStatus::Completed | ActivityStatus::Failed)
+                {
+                    bail!(
+                        "Session update contained an invalid Reasoning Activity status transition"
+                    );
+                }
+                *current_status = *status;
+                *current_duration_ms = *duration_ms;
+            }
             SessionChange::TurnStatusChanged { turn_id, status } => {
                 let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {
                     bail!("Session update referenced an unknown Turn");
@@ -361,4 +450,21 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
     }
     next.revision = update.revision;
     Ok(())
+}
+
+/// Resolves the Activity a Reasoning change names, failing when the Session
+/// has no such Activity so every Reasoning arm reports the same miss the same
+/// way and is left to check only that the Activity is the kind it can act on.
+fn reasoning_activity<'a>(
+    snapshot: &'a mut SessionSnapshot,
+    activity_id: &ActivityId,
+) -> Result<Option<&'a mut Activity>> {
+    let Some(activity) = snapshot
+        .activities
+        .iter_mut()
+        .find(|activity| activity.id() == *activity_id)
+    else {
+        bail!("Session update referenced an unknown Activity");
+    };
+    Ok(matches!(activity, Activity::Reasoning { .. }).then_some(activity))
 }

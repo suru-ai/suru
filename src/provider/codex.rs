@@ -2,11 +2,13 @@
 //!
 //! The integration is layered: [`wire`] holds every serde type Codex speaks and its conversions to
 //! Suru's protocol, [`process`] owns the app-server child processes, [`transport`] carries JSON-RPC
-//! over one of those processes, [`projection`] turns native notifications into Provider events, and
-//! [`session`] composes them into the Provider runtime and Session the rest of Suru uses.
+//! over one of those processes, [`projection`] turns native notifications into Provider events with
+//! [`reasoning`] splitting the title off a streamed Reasoning summary, and [`session`] composes them
+//! into the Provider runtime and Session the rest of Suru uses.
 
 mod process;
 mod projection;
+mod reasoning;
 mod session;
 mod transport;
 mod wire;

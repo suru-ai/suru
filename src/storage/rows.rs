@@ -659,6 +659,13 @@ enum StoredActivityPayload {
         status: ActivityStatus,
         changes: Vec<StoredFileChange>,
     },
+    Reasoning {
+        status: ActivityStatus,
+        title: Option<String>,
+        content: String,
+        content_truncated: bool,
+        duration_ms: Option<u64>,
+    },
 }
 
 impl StoredActivityPayload {
@@ -688,6 +695,21 @@ impl StoredActivityPayload {
                 turn_id,
                 status,
                 changes: changes.into_iter().map(Into::into).collect(),
+            },
+            Self::Reasoning {
+                status,
+                title,
+                content,
+                content_truncated,
+                duration_ms,
+            } => Activity::Reasoning {
+                id,
+                turn_id,
+                status,
+                title,
+                content,
+                content_truncated,
+                duration_ms,
             },
         }
     }
@@ -719,6 +741,20 @@ impl From<Activity> for StoredActivityPayload {
             } => Self::FileChange {
                 status,
                 changes: changes.into_iter().map(Into::into).collect(),
+            },
+            Activity::Reasoning {
+                status,
+                title,
+                content,
+                content_truncated,
+                duration_ms,
+                ..
+            } => Self::Reasoning {
+                status,
+                title,
+                content,
+                content_truncated,
+                duration_ms,
             },
         }
     }

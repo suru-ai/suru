@@ -29,11 +29,11 @@ use super::{
         ProcessGuard, ProcessRegistry, ProcessStdio, spawn_codex_process, supervise_codex_process,
     },
     wire::{
-        AgentMessageDeltaParams, ClientError, ClientErrorResponse, ClientInfo, ClientNotification,
-        ClientRequest, FileChangeUpdatedParams, IncomingMessage, InitializeCapabilities,
-        InitializeParams, ItemNotificationParams, NativeCodexErrorInfo, NativeItem,
-        NativeNotification, NativeTurnFailureKind, NativeTurnOutcome, NativeTurnStatus, RequestId,
-        ThreadSettingsUpdatedParams, TurnCompletedParams,
+        ClientError, ClientErrorResponse, ClientInfo, ClientNotification, ClientRequest,
+        FileChangeUpdatedParams, IncomingMessage, InitializeCapabilities, InitializeParams,
+        ItemDeltaParams, ItemNotificationParams, ItemProgressParams, NativeCodexErrorInfo,
+        NativeItem, NativeNotification, NativeTurnFailureKind, NativeTurnOutcome, NativeTurnStatus,
+        RequestId, ThreadSettingsUpdatedParams, TurnCompletedParams,
     },
 };
 use crate::provider::ProviderError;
@@ -456,11 +456,18 @@ fn decode_notification(
                     changes,
                     status,
                 })),
+                NativeItem::Reasoning { id, .. } => {
+                    Ok(Some(NativeNotification::ReasoningStarted {
+                        thread_id: params.thread_id,
+                        turn_id: params.turn_id,
+                        item_id: id,
+                    }))
+                }
                 NativeItem::Unknown => Ok(None),
             }
         }
         "item/agentMessage/delta" => {
-            let params: AgentMessageDeltaParams = decode_notification_params(method, params)?;
+            let params: ItemDeltaParams = decode_notification_params(method, params)?;
             Ok(Some(NativeNotification::AgentMessageDelta {
                 thread_id: params.thread_id,
                 turn_id: params.turn_id,
@@ -469,12 +476,29 @@ fn decode_notification(
             }))
         }
         "item/commandExecution/outputDelta" => {
-            let params: AgentMessageDeltaParams = decode_notification_params(method, params)?;
+            let params: ItemDeltaParams = decode_notification_params(method, params)?;
             Ok(Some(NativeNotification::CommandOutputDelta {
                 thread_id: params.thread_id,
                 turn_id: params.turn_id,
                 item_id: params.item_id,
                 delta: params.delta,
+            }))
+        }
+        "item/reasoning/summaryTextDelta" => {
+            let params: ItemDeltaParams = decode_notification_params(method, params)?;
+            Ok(Some(NativeNotification::ReasoningDelta {
+                thread_id: params.thread_id,
+                turn_id: params.turn_id,
+                item_id: params.item_id,
+                delta: params.delta,
+            }))
+        }
+        "item/reasoning/summaryPartAdded" => {
+            let params: ItemProgressParams = decode_notification_params(method, params)?;
+            Ok(Some(NativeNotification::ReasoningSectionBreak {
+                thread_id: params.thread_id,
+                turn_id: params.turn_id,
+                item_id: params.item_id,
             }))
         }
         "item/fileChange/patchUpdated" => {
@@ -522,6 +546,14 @@ fn decode_notification(
                     changes,
                     status,
                 })),
+                NativeItem::Reasoning { id, summary } => {
+                    Ok(Some(NativeNotification::ReasoningCompleted {
+                        thread_id: params.thread_id,
+                        turn_id: params.turn_id,
+                        item_id: id,
+                        summary,
+                    }))
+                }
                 NativeItem::Unknown => Ok(None),
             }
         }

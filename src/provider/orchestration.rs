@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
-    time::{Duration, timeout},
+    time::{Duration, Instant, timeout},
 };
 
 use super::{
@@ -26,6 +26,7 @@ use crate::protocol::{
 use crate::sessions::{
     DeliveredTurn, DeliveredTurnStatus, InterruptTurnError, ProviderTurnOutcome, SessionStore,
     TrailingCommandOutput, command_output_changes, message_content_changes,
+    reasoning_content_changes,
 };
 
 /// The most characters of Provider-sent output Suru stores for one command; the
@@ -43,6 +44,14 @@ const MAX_STORED_COMMAND_OUTPUT_CHARS: usize = 64 * 1024;
 /// without bound. It is far more generous than the command-output cap because
 /// cutting an explanation short costs a reader more than cutting a log short.
 const MAX_STORED_MESSAGE_CHARS: usize = 512 * 1024;
+
+/// The most characters of Provider-sent content Suru stores for one Reasoning
+/// Activity. Reasoning is prose, so it is capped like an agent Message rather
+/// than like a log, but it is a summary of work rather than the answer the
+/// reader came for, so the cap sits at the command-output figure: generous next
+/// to any real block of Reasoning, and low enough that a Provider reasoning
+/// without end cannot grow one Activity without bound.
+const MAX_STORED_REASONING_CHARS: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct ProviderOrchestrator {
@@ -150,6 +159,7 @@ struct ActiveProviderTurn {
     interruption_acknowledged: bool,
     command_activities: HashMap<super::ProviderActivityId, ActiveProviderCommand>,
     file_change_activities: HashMap<super::ProviderActivityId, ActivityId>,
+    reasoning_activities: HashMap<super::ProviderActivityId, ActiveProviderReasoning>,
 }
 
 /// An Agent Message the Provider is still streaming. Its normalizer buffers no
@@ -168,7 +178,28 @@ struct ActiveProviderCommand {
     output_normalizer: ProviderTextNormalizer,
 }
 
+/// A Reasoning block the Provider is still streaming. Suru times the block
+/// itself rather than asking every Provider to report a duration, so `started`
+/// is the moment this actor admitted the block and the elapsed time it yields
+/// is what the Transcript reports. Like an Agent Message, its normalizer holds
+/// back no unterminated line, so settling the Turn drops nothing.
+struct ActiveProviderReasoning {
+    id: ActivityId,
+    started: Instant,
+    normalizer: ProviderTextNormalizer,
+}
+
 impl ActiveProviderTurn {
+    /// Whether the Turn already has a stream open under this Provider Activity
+    /// identity, whatever kind of stream it is. Identities are the Provider's
+    /// to choose and are unique across kinds, so every stream that opens one
+    /// asks here rather than each restating the list of kinds.
+    fn claims_activity(&self, activity_id: &super::ProviderActivityId) -> bool {
+        self.command_activities.contains_key(activity_id)
+            || self.file_change_activities.contains_key(activity_id)
+            || self.reasoning_activities.contains_key(activity_id)
+    }
+
     /// Drains what the Turn's streams hold that only this actor knows: the
     /// unterminated line each command normalizer buffered. The Session store
     /// settles the streams themselves from its own snapshot, so forgetting a
@@ -593,6 +624,7 @@ async fn run_provider_session(
                 interruption_acknowledged: false,
                 command_activities: HashMap::new(),
                 file_change_activities: HashMap::new(),
+                reasoning_activities: HashMap::new(),
             });
             continue;
         }
@@ -746,6 +778,7 @@ async fn run_provider_session(
                                         interruption_acknowledged: false,
                                         command_activities: HashMap::new(),
                                         file_change_activities: HashMap::new(),
+                                        reasoning_activities: HashMap::new(),
                                     });
                                 }
                             }
@@ -946,9 +979,7 @@ fn project_provider_event(
                 command,
                 cwd,
             } => {
-                if active.command_activities.contains_key(&activity_id)
-                    || active.file_change_activities.contains_key(&activity_id)
-                {
+                if active.claims_activity(&activity_id) {
                     Err(anyhow::anyhow!(
                         "Provider reused an active command Activity identity"
                     ))
@@ -1054,9 +1085,7 @@ fn project_provider_event(
                 activity_id,
                 changes,
             } => {
-                if active.command_activities.contains_key(&activity_id)
-                    || active.file_change_activities.contains_key(&activity_id)
-                {
+                if active.claims_activity(&activity_id) {
                     Err(anyhow::anyhow!(
                         "Provider reused an active file-change Activity identity"
                     ))
@@ -1138,10 +1167,115 @@ fn project_provider_event(
                         ProviderEventProjection::Continue
                     })
             }
+            ProviderEvent::ReasoningStarted { activity_id } => {
+                if active.claims_activity(&activity_id) {
+                    Err(anyhow::anyhow!(
+                        "Provider reused an active Reasoning Activity identity"
+                    ))
+                } else {
+                    let reasoning_activity_id = ActivityId::new();
+                    sessions
+                        .publish_agent_output(
+                            session_id,
+                            SessionChange::ActivityAdded {
+                                activity: Activity::Reasoning {
+                                    id: reasoning_activity_id,
+                                    turn_id: active.turn_id,
+                                    status: ActivityStatus::Active,
+                                    title: None,
+                                    content: String::new(),
+                                    content_truncated: false,
+                                    duration_ms: None,
+                                },
+                            },
+                        )
+                        .map(|_| {
+                            active.reasoning_activities.insert(
+                                activity_id,
+                                ActiveProviderReasoning {
+                                    id: reasoning_activity_id,
+                                    started: Instant::now(),
+                                    normalizer: ProviderTextNormalizer::with_max_chars(
+                                        MAX_STORED_REASONING_CHARS,
+                                    ),
+                                },
+                            );
+                            ProviderEventProjection::Continue
+                        })
+                }
+            }
+            ProviderEvent::ReasoningTitleChanged { activity_id, title } => {
+                let Some(reasoning) = active.reasoning_activities.get(&activity_id) else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        next_agent,
+                        "Provider titled Reasoning before starting the Activity",
+                    );
+                };
+                sessions
+                    .publish_agent_output(
+                        session_id,
+                        SessionChange::ReasoningTitleChanged {
+                            activity_id: reasoning.id,
+                            title: normalize_provider_text(&title),
+                        },
+                    )
+                    .map(|_| ProviderEventProjection::Continue)
+            }
+            ProviderEvent::ReasoningDelta {
+                activity_id,
+                content,
+            } => {
+                let Some(reasoning) = active.reasoning_activities.get_mut(&activity_id) else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        next_agent,
+                        "Provider sent Reasoning content before starting the Activity",
+                    );
+                };
+                let content = reasoning.normalizer.push(&content);
+                sessions
+                    .publish_agent_output_changes(
+                        session_id,
+                        reasoning_content_changes(reasoning.id, content),
+                    )
+                    .map(|_| ProviderEventProjection::Continue)
+            }
+            ProviderEvent::ReasoningCompleted { activity_id } => {
+                let Some(reasoning) = active.reasoning_activities.get(&activity_id) else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        next_agent,
+                        "Provider completed Reasoning before starting the Activity",
+                    );
+                };
+                let reasoning_activity_id = reasoning.id;
+                let duration_ms = u64::try_from(reasoning.started.elapsed().as_millis()).ok();
+                sessions
+                    .publish_agent_output(
+                        session_id,
+                        SessionChange::ReasoningStatusChanged {
+                            activity_id: reasoning_activity_id,
+                            status: ActivityStatus::Completed,
+                            duration_ms,
+                        },
+                    )
+                    .map(|_| {
+                        active.reasoning_activities.remove(&activity_id);
+                        ProviderEventProjection::Continue
+                    })
+            }
             ProviderEvent::TurnCompleted => {
                 if active.streaming_message.is_some()
                     || !active.command_activities.is_empty()
                     || !active.file_change_activities.is_empty()
+                    || !active.reasoning_activities.is_empty()
                 {
                     Err(anyhow::anyhow!(
                         "Provider completed the Turn before completing its streamed output"

@@ -56,16 +56,20 @@ _Avoid_: Message, notification
 A provider-operated capability that performs work for an agent. User-visible Tool execution is represented as Activity.
 _Avoid_: Function, action
 
+**Reasoning**:
+The account a Provider gives of an agent's thinking during a Turn, carried as Activity because it reports progress rather than the prose the agent authored for the user. A Reasoning block may carry a **title** — a short heading the Provider leads it with, kept beside the content as a typed property so a client can head a Fold with it instead of reading it out of the prose. Distinct from the Reasoning Effort Model Option, which tunes how much of it a Model does. Suru's own name for the concept is Reasoning everywhere except the words a Transcript shows a reader, which deliberately say _Thinking_ while a block runs and _Thought_ once it settles.
+_Avoid_: Chain of thought, and — outside a Transcript's own wording — thinking, thought
+
 **Transcript**:
 The ordered, user-visible history of a Session: its Messages and Activities in presentation order.
 _Avoid_: History, log, conversation
 
 **Truncation**:
-The condition of a Message or command Activity whose stored content Suru's cap cut short of everything the Provider sent. Truncation is carried as a typed property beside the content rather than as text within it, so a client reads it as data and draws its own **truncation marker**: the line a Transcript shows in place of what the cap dropped.
+The condition of a Message, command Activity, or Reasoning Activity whose stored content Suru's cap cut short of everything the Provider sent. Truncation is carried as a typed property beside the content rather than as text within it, so a client reads it as data and draws its own **truncation marker**: the line a Transcript shows in place of what the cap dropped.
 _Avoid_: Elision, clipping
 
 **Fold**:
-The compact presentation a client's Transcript gives an entry whose full stored content remains available. A Fold is reversible, client-local view state: expanding it reveals everything stored, and folding never alters stored content. A folded entry shows a **fold marker**: the line indicating how much the Fold hides. Distinct from Truncation, which is a condition of the stored content itself; a single entry can carry both.
+The compact presentation a client's Transcript gives an entry whose full stored content remains available. A Fold is reversible, client-local view state: expanding it reveals everything stored, and folding never alters stored content. A folded entry shows a **fold marker**: the line indicating how much the Fold hides, or, where a Fold hides an entry's whole body rather than part of it, the entry's own header naming what is behind it. Distinct from Truncation, which is a condition of the stored content itself; a single entry can carry both.
 _Avoid_: Collapse, elision, hide
 
 **Resume State**:

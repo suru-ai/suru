@@ -1729,6 +1729,130 @@ fn file_change_activities_fold_past_the_path_budget_and_expand_on_click() {
     }
 }
 
+/// A Session whose single Activity is a Reasoning block, so a test can drive
+/// one entry's Fold without competing transcript content.
+fn reasoning_activity_session(
+    workspace: &std::path::Path,
+    status: ActivityStatus,
+    title: Option<&str>,
+    content: &str,
+    duration_ms: Option<u64>,
+) -> (suru::protocol::SessionSnapshot, ActivityId) {
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Explain the Transcript",
+        workspace,
+    );
+    let activity_id = snapshot.activities[0].id();
+    snapshot.activities[0] = Activity::Reasoning {
+        id: activity_id,
+        turn_id: snapshot.turns[0].id,
+        status,
+        title: title.map(ToOwned::to_owned),
+        content: content.to_owned(),
+        content_truncated: false,
+        duration_ms,
+    };
+    (snapshot, activity_id)
+}
+
+#[test]
+fn folded_reasoning_is_one_line_naming_its_title_and_how_long_it_took() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = reasoning_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        Some("Inspecting the seam"),
+        "Reading the projection before the store.",
+        Some(72_000),
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a settled Reasoning Activity");
+
+    let folded_rows = rendered_application_rows_at(&application, 72, 24);
+    let folded = folded_rows.join("\n");
+    assert!(
+        folded.contains("Thought: Inspecting the seam · 1m 12s"),
+        "a folded Reasoning block heads with its title and duration: {folded}"
+    );
+    assert!(
+        !folded.contains("Reading the projection"),
+        "a folded Reasoning block hides the summary itself: {folded}"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(rendered_row(
+            &folded_rows,
+            "Thought: Inspecting the seam",
+        ) as u16))
+        .expect("expand the Reasoning entry");
+    let expanded = rendered_application_rows_at(&application, 72, 24).join("\n");
+    assert!(
+        expanded.contains("Reading the projection before the store."),
+        "expanding a Reasoning block reveals everything stored: {expanded}"
+    );
+    assert!(
+        expanded.contains("Thought: Inspecting the seam · 1m 12s"),
+        "an expanded Reasoning block keeps the header that re-folds it: {expanded}"
+    );
+}
+
+#[test]
+fn reasoning_still_running_heads_with_its_running_label_and_no_duration() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = reasoning_activity_session(
+        workspace.path(),
+        ActivityStatus::Active,
+        Some("Inspecting the seam"),
+        "Reading the projection.",
+        None,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a streaming Reasoning Activity");
+
+    let streaming_rows = rendered_application_rows_at(&application, 72, 24);
+    let streaming = streaming_rows.join("\n");
+
+    let header = &streaming_rows[rendered_row(&streaming_rows, "Thinking: Inspecting the seam")];
+    assert_eq!(
+        header.trim_end(),
+        "    … Thinking: Inspecting the seam",
+        "a Reasoning block still running heads with its running label and no duration"
+    );
+    assert!(
+        !streaming.contains("Reading the projection."),
+        "a Reasoning block still running is folded like any other: {streaming}"
+    );
+}
+
+#[test]
+fn untitled_reasoning_heads_with_the_label_alone() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = reasoning_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        None,
+        "Reading the projection.",
+        Some(4_200),
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with an untitled Reasoning Activity");
+
+    let folded = rendered_application_rows_at(&application, 72, 24).join("\n");
+
+    assert!(
+        folded.contains("Thought · 4s"),
+        "a Reasoning block the Provider never titled still heads its Fold: {folded}"
+    );
+}
+
 #[test]
 fn an_active_command_shows_a_live_tail_and_settles_into_a_head_and_tail_fold() {
     let workspace = tempfile::tempdir().expect("create Workspace");

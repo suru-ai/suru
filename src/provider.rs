@@ -171,6 +171,23 @@ pub enum ProviderEvent {
         activity_id: ProviderActivityId,
         status: ProviderFileChangeStatus,
     },
+    /// The Provider began a block of Reasoning. Its content follows as deltas,
+    /// and its title arrives separately because a Provider that leads with one
+    /// only reveals it once enough of the block has streamed.
+    ReasoningStarted {
+        activity_id: ProviderActivityId,
+    },
+    ReasoningTitleChanged {
+        activity_id: ProviderActivityId,
+        title: String,
+    },
+    ReasoningDelta {
+        activity_id: ProviderActivityId,
+        content: String,
+    },
+    ReasoningCompleted {
+        activity_id: ProviderActivityId,
+    },
     TurnCompleted,
     TurnInterrupted,
     AgentSelectionRejected {

@@ -27,7 +27,9 @@ mod prompts;
 mod selection;
 mod settlement;
 
-pub(crate) use output::{command_output_changes, message_content_changes};
+pub(crate) use output::{
+    command_output_changes, message_content_changes, reasoning_content_changes,
+};
 pub(crate) use prompts::{
     AdmitPromptError, CreateSessionError, DeliveredTurn, DeliveredTurnStatus,
     PromptAdmissionDisposition, PromptMutationError,

@@ -461,6 +461,125 @@ fn command_activity_lifecycle_uses_typed_incremental_updates() {
 }
 
 #[test]
+fn reasoning_activity_lifecycle_uses_typed_incremental_updates() {
+    let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));
+    let activity_id = ActivityId::from_uuid(fixture_id("0198b27e-345a-700e-ae3b-d971c57fbe87"));
+    let updates = [
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(8),
+            changes: vec![SessionChange::ActivityAdded {
+                activity: Activity::Reasoning {
+                    id: activity_id,
+                    turn_id,
+                    status: ActivityStatus::Active,
+                    title: None,
+                    content: String::new(),
+                    content_truncated: false,
+                    duration_ms: None,
+                },
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(9),
+            changes: vec![SessionChange::ReasoningTitleChanged {
+                activity_id,
+                title: "Inspecting the seam".to_owned(),
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(10),
+            changes: vec![SessionChange::ReasoningContentAppended {
+                activity_id,
+                content: "Reading the projection.".to_owned(),
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(11),
+            changes: vec![SessionChange::ReasoningContentTruncated { activity_id }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(12),
+            changes: vec![SessionChange::ReasoningStatusChanged {
+                activity_id,
+                status: ActivityStatus::Completed,
+                duration_ms: Some(72_000),
+            }],
+        },
+    ];
+    let expected = json!([
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 8,
+            "changes": [{
+                "type": "activity_added",
+                "activity": {
+                    "id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                    "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+                    "kind": "reasoning",
+                    "status": "active",
+                    "title": null,
+                    "content": "",
+                    "content_truncated": false,
+                    "duration_ms": null
+                }
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 9,
+            "changes": [{
+                "type": "reasoning_title_changed",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "title": "Inspecting the seam"
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 10,
+            "changes": [{
+                "type": "reasoning_content_appended",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "content": "Reading the projection."
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 11,
+            "changes": [{
+                "type": "reasoning_content_truncated",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87"
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 12,
+            "changes": [{
+                "type": "reasoning_status_changed",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "status": "completed",
+                "duration_ms": 72000
+            }]
+        }
+    ]);
+
+    assert_eq!(
+        serde_json::to_value(&updates).expect("encode Reasoning Activity updates"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<[SessionUpdate; 5]>(expected)
+            .expect("decode Reasoning Activity updates"),
+        updates
+    );
+}
+
+#[test]
 fn file_change_activity_lifecycle_uses_typed_incremental_updates() {
     let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
     let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));

@@ -638,6 +638,135 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
 }
 
 #[tokio::test]
+async fn reasoning_streams_into_a_titled_transcript_activity_that_settles_with_a_duration() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "reasoning-transcript-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "reasoning-transcript-test")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Explain the Transcript".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let session_id = created.session.id;
+    let start = provider.next_start().await;
+    let mut provider_session = start.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-reasoning", "high", "fast"),
+    });
+    provider_session.next_turn().await.succeed();
+
+    let reasoning = ProviderActivityId::new("streamed-reasoning");
+    for event in [
+        ProviderEvent::ReasoningStarted {
+            activity_id: reasoning.clone(),
+        },
+        ProviderEvent::ReasoningTitleChanged {
+            activity_id: reasoning.clone(),
+            title: "Inspecting the seam".to_owned(),
+        },
+        ProviderEvent::ReasoningDelta {
+            activity_id: reasoning.clone(),
+            content: "Reading the projection ".to_owned(),
+        },
+        ProviderEvent::ReasoningDelta {
+            activity_id: reasoning.clone(),
+            content: "before the store.\n".to_owned(),
+        },
+        ProviderEvent::ReasoningCompleted {
+            activity_id: reasoning,
+        },
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: "The Transcript is ordered.".to_owned(),
+        },
+        ProviderEvent::AgentMessageCompleted,
+        ProviderEvent::TurnCompleted,
+    ] {
+        provider_session.emit(event);
+    }
+
+    let completed = timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = client
+                .read_session(session_id)
+                .await
+                .expect("read the reasoning Session");
+            if snapshot.turns[0].status == TurnStatus::Completed {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the Turn completes");
+
+    assert_eq!(completed.activities.len(), 1);
+    let Activity::Reasoning {
+        id: reasoning_activity_id,
+        status,
+        title,
+        content,
+        content_truncated,
+        duration_ms,
+        ..
+    } = &completed.activities[0]
+    else {
+        panic!("Provider Reasoning must project as a Reasoning Activity");
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(title.as_deref(), Some("Inspecting the seam"));
+    assert_eq!(content, "Reading the projection before the store.\n");
+    assert!(!content_truncated);
+    assert!(
+        duration_ms.is_some(),
+        "a Reasoning block that completed reports how long it took"
+    );
+    assert_eq!(
+        completed
+            .transcript
+            .iter()
+            .filter(|item| matches!(item,
+                TranscriptItem::Activity { activity_id } if activity_id == reasoning_activity_id))
+            .count(),
+        1,
+        "streaming Reasoning content must not duplicate transcript rows"
+    );
+    assert!(
+        completed.transcript.iter().position(|item| matches!(item,
+            TranscriptItem::Activity { activity_id } if activity_id == reasoning_activity_id))
+            < completed
+                .transcript
+                .iter()
+                .position(|item| matches!(item, TranscriptItem::Message { message_id }
+                    if *message_id == completed.messages[1].id)),
+        "Reasoning takes its place in the Transcript before the Message it led to"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");

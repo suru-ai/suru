@@ -232,8 +232,8 @@ impl SessionStore {
 }
 
 /// The changes that settle everything a Turn left in flight: its streaming Agent
-/// Message completes, and each command or file-change Activity still Active
-/// fails, every command first storing the trailing output its normalizer
+/// Message completes, and each command, file-change, or Reasoning Activity still
+/// Active fails, every command first storing the trailing output its normalizer
 /// flushed. Reading the in-flight set from the Session's own snapshot rather
 /// than from the caller keeps every settle path equivalent, including the ones
 /// that never reach the Provider actor holding that Turn. A Turn that completes
@@ -284,6 +284,18 @@ pub(super) fn settle_in_flight_changes(
             } => changes.push(SessionChange::FileChangeStatusChanged {
                 activity_id: *id,
                 status: ActivityStatus::Failed,
+            }),
+            Activity::Reasoning {
+                id,
+                status: ActivityStatus::Active,
+                ..
+            } => changes.push(SessionChange::ReasoningStatusChanged {
+                activity_id: *id,
+                status: ActivityStatus::Failed,
+                // Only the Provider actor timed the block, and a Turn that
+                // settles this way never reported the block finishing, so
+                // there is no duration to record.
+                duration_ms: None,
             }),
             _ => {}
         }
@@ -465,6 +477,32 @@ mod tests {
                     exit_status: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn settling_a_turn_fails_the_reasoning_it_left_unfinished_without_a_duration() {
+        let turn_id = TurnId::new();
+        let reasoning = Activity::Reasoning {
+            id: ActivityId::new(),
+            turn_id,
+            status: ActivityStatus::Active,
+            title: Some("Inspecting the seam".to_owned()),
+            content: "Reading it.".to_owned(),
+            content_truncated: false,
+            duration_ms: None,
+        };
+        let snapshot = settling_snapshot(turn_id, vec![reasoning.clone()], Vec::new());
+
+        let changes = settle_in_flight_changes(&snapshot, turn_id, TrailingCommandOutput::new());
+
+        assert_eq!(
+            changes,
+            vec![SessionChange::ReasoningStatusChanged {
+                activity_id: reasoning.id(),
+                status: ActivityStatus::Failed,
+                duration_ms: None,
+            }]
         );
     }
 

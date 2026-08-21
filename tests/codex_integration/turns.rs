@@ -68,6 +68,15 @@ while IFS= read -r line; do
       printf '%s\n' '{"method":"item/fileChange/patchUpdated","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"other-file-change","changes":[{"path":"wrong-session.txt","kind":{"type":"add"},"diff":"wrong item patch"}]}}'
       printf '%s\n' '{"method":"item/fileChange/patchUpdated","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-file-change","changes":[{"path":"src/protocol.rs","kind":{"type":"update","movePath":"src/protocol_v2.rs"},"diff":"private updated patch"},{"path":"tests/session_protocol.rs","kind":{"type":"add"},"diff":"private added patch"}],"futureField":true}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"fileChange","id":"native-file-change","changes":[{"path":"src/protocol.rs","kind":{"type":"update","movePath":"src/protocol_v2.rs"},"diff":"private final patch"},{"path":"tests/session_protocol.rs","kind":{"type":"add"},"diff":"private final test patch"},{"path":"obsolete.txt","kind":{"type":"delete"},"diff":"private deleted patch"}],"status":"completed","futureField":{"native":true}},"futureField":true}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"reasoning","id":"native-reasoning","summary":[],"content":[],"futureField":true},"futureField":true}}'
+      printf '%s\n' '{"method":"item/reasoning/summaryPartAdded","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-reasoning","summaryIndex":0}}'
+      printf '%s\n' '{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"other-reasoning","delta":"wrong reasoning content","summaryIndex":0}}'
+      printf '%s\n' '{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-reasoning","delta":"**Inspecting the","summaryIndex":0,"futureField":true}}'
+      printf '%s\n' '{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-reasoning","delta":" harness**\n\nReading the fixture.","summaryIndex":0}}'
+      printf '%s\n' '{"method":"item/reasoning/textDelta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-reasoning","delta":"private raw chain of thought","contentIndex":0}}'
+      printf '%s\n' '{"method":"item/reasoning/summaryPartAdded","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-reasoning","summaryIndex":1}}'
+      printf '%s\n' '{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"native-reasoning","delta":"Then the store.","summaryIndex":1}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"reasoning","id":"native-reasoning","summary":["**Inspecting the harness**\n\nReading the fixture.","Then the store."],"content":["private raw chain of thought"]},"futureField":true}}'
       printf '%s' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"native-message","text":"","futureField":true},"futureField":true'
       printf '%s\n' '}}'
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"other-message","delta":"wrong item content"}}'
@@ -336,7 +345,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     assert_eq!(agent_message.status, MessageStatus::Completed);
     assert_eq!(agent_message.content, "Hello from Codex");
     assert!(!agent_message.content.contains("fixture diagnostic"));
-    assert_eq!(completed.activities.len(), 2);
+    assert_eq!(completed.activities.len(), 3);
     let Activity::Command {
         id: command_activity_id,
         status,
@@ -386,12 +395,43 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         1,
         "Codex file-change updates must update one transcript row"
     );
+    let Activity::Reasoning {
+        id: reasoning_activity_id,
+        status: reasoning_status,
+        title,
+        content,
+        content_truncated,
+        duration_ms,
+        ..
+    } = &completed.activities[2]
+    else {
+        panic!("Codex Reasoning must project as a Reasoning Activity");
+    };
+    assert_eq!(*reasoning_status, ActivityStatus::Completed);
+    assert_eq!(title.as_deref(), Some("Inspecting the harness"));
+    assert_eq!(content, "Reading the fixture.\n\nThen the store.");
+    assert!(!content_truncated);
+    assert!(duration_ms.is_some());
+    assert_eq!(
+        completed
+            .transcript
+            .iter()
+            .filter(|item| matches!(item,
+                TranscriptItem::Activity { activity_id }
+                    if activity_id == reasoning_activity_id))
+            .count(),
+        1,
+        "Codex Reasoning deltas must update one transcript row"
+    );
+
     let persisted = serde_json::to_string(&completed).expect("encode completed Session");
     for excluded in [
         "private start patch",
         "private updated patch",
         "private final patch",
+        "private raw chain of thought",
         "wrong item patch",
+        "wrong reasoning content",
         "futureField",
         "opaque",
     ] {

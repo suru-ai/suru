@@ -113,6 +113,29 @@ pub(crate) fn command_output_changes(
     changes
 }
 
+/// The changes that carry one step of normalized Reasoning content into a
+/// Session, on the same terms as [`message_content_changes`].
+pub(crate) fn reasoning_content_changes(
+    activity_id: ActivityId,
+    content: NormalizedText,
+) -> Vec<SessionChange> {
+    let NormalizedText {
+        content,
+        truncated: content_truncated,
+    } = content;
+    let mut changes = Vec::new();
+    if !content.is_empty() {
+        changes.push(SessionChange::ReasoningContentAppended {
+            activity_id,
+            content,
+        });
+    }
+    if content_truncated {
+        changes.push(SessionChange::ReasoningContentTruncated { activity_id });
+    }
+    changes
+}
+
 fn agent_output_turn_id(
     snapshot: &SessionSnapshot,
     change: &SessionChange,
@@ -134,7 +157,11 @@ fn agent_output_turn_id(
         | SessionChange::CommandOutputTruncated { activity_id }
         | SessionChange::CommandStatusChanged { activity_id, .. }
         | SessionChange::FileChangeUpdated { activity_id, .. }
-        | SessionChange::FileChangeStatusChanged { activity_id, .. } => snapshot
+        | SessionChange::FileChangeStatusChanged { activity_id, .. }
+        | SessionChange::ReasoningTitleChanged { activity_id, .. }
+        | SessionChange::ReasoningContentAppended { activity_id, .. }
+        | SessionChange::ReasoningContentTruncated { activity_id }
+        | SessionChange::ReasoningStatusChanged { activity_id, .. } => snapshot
             .activities
             .iter()
             .find(|activity| activity.id() == *activity_id)

@@ -407,6 +407,20 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
             status: ProviderCommandStatus::Completed,
             exit_status: Some(0),
         },
+        ProviderEvent::ReasoningStarted {
+            activity_id: ProviderActivityId::new("capped-reasoning"),
+        },
+        ProviderEvent::ReasoningTitleChanged {
+            activity_id: ProviderActivityId::new("capped-reasoning"),
+            title: "Inspecting the seam".to_owned(),
+        },
+        ProviderEvent::ReasoningDelta {
+            activity_id: ProviderActivityId::new("capped-reasoning"),
+            content: "y".repeat(70 * 1024),
+        },
+        ProviderEvent::ReasoningCompleted {
+            activity_id: ProviderActivityId::new("capped-reasoning"),
+        },
         ProviderEvent::AgentMessageStarted,
         ProviderEvent::AgentMessageDelta {
             content: "streamed ".to_owned(),
@@ -428,7 +442,7 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
         &client,
         &descriptor,
         created.session.id,
-        SessionRevision(18),
+        SessionRevision(22),
     )
     .await;
     assert_eq!(completed.turns[0].status, TurnStatus::Completed);
@@ -489,6 +503,28 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
     assert!(
         output_truncated,
         "a command whose output was capped stays truncated across a restart"
+    );
+    let Activity::Reasoning {
+        title,
+        content_truncated,
+        duration_ms,
+        ..
+    } = &reopened.activities[2]
+    else {
+        panic!("the capped Provider Reasoning projects as a Reasoning Activity");
+    };
+    assert_eq!(
+        title.as_deref(),
+        Some("Inspecting the seam"),
+        "a Reasoning title stays a typed property across a restart"
+    );
+    assert!(
+        content_truncated,
+        "Reasoning whose content was capped stays truncated across a restart"
+    );
+    assert!(
+        duration_ms.is_some(),
+        "the time a Reasoning block took survives a restart"
     );
     assert!(
         !reopened.messages[1].truncated,

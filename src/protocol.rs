@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SESSION_CATALOG_SNAPSHOT_EVENT: &str = "session_catalog_snapshot";
 pub const SESSION_CATALOG_UPDATED_EVENT: &str = "session_catalog_updated";
@@ -465,6 +465,23 @@ pub enum Activity {
         status: ActivityStatus,
         changes: Vec<FileChange>,
     },
+    /// One block of Reasoning the Provider reported while working the Turn.
+    Reasoning {
+        id: ActivityId,
+        turn_id: TurnId,
+        status: ActivityStatus,
+        /// The heading the Provider led the block with, once it has sent one.
+        /// Carried apart from `content` so a client can head a folded block
+        /// with it rather than parsing it back out of the prose.
+        title: Option<String>,
+        content: String,
+        /// Whether Suru's cap cut the stored content short of what the Provider
+        /// sent, so a client can say so without reading it out of `content`.
+        content_truncated: bool,
+        /// How long the Provider spent on the block, known only once it
+        /// settles and only when it settled by completing.
+        duration_ms: Option<u64>,
+    },
 }
 
 impl Activity {
@@ -473,7 +490,8 @@ impl Activity {
             Self::Status { id, .. }
             | Self::Error { id, .. }
             | Self::Command { id, .. }
-            | Self::FileChange { id, .. } => *id,
+            | Self::FileChange { id, .. }
+            | Self::Reasoning { id, .. } => *id,
         }
     }
 
@@ -482,7 +500,8 @@ impl Activity {
             Self::Status { turn_id, .. }
             | Self::Error { turn_id, .. }
             | Self::Command { turn_id, .. }
-            | Self::FileChange { turn_id, .. } => *turn_id,
+            | Self::FileChange { turn_id, .. }
+            | Self::Reasoning { turn_id, .. } => *turn_id,
         }
     }
 
@@ -491,7 +510,9 @@ impl Activity {
     pub const fn status(&self) -> Option<ActivityStatus> {
         match self {
             Self::Status { .. } | Self::Error { .. } => None,
-            Self::Command { status, .. } | Self::FileChange { status, .. } => Some(*status),
+            Self::Command { status, .. }
+            | Self::FileChange { status, .. }
+            | Self::Reasoning { status, .. } => Some(*status),
         }
     }
 }
@@ -717,6 +738,22 @@ pub enum SessionChange {
     FileChangeStatusChanged {
         activity_id: ActivityId,
         status: ActivityStatus,
+    },
+    ReasoningTitleChanged {
+        activity_id: ActivityId,
+        title: String,
+    },
+    ReasoningContentAppended {
+        activity_id: ActivityId,
+        content: String,
+    },
+    ReasoningContentTruncated {
+        activity_id: ActivityId,
+    },
+    ReasoningStatusChanged {
+        activity_id: ActivityId,
+        status: ActivityStatus,
+        duration_ms: Option<u64>,
     },
     TurnStatusChanged {
         turn_id: TurnId,
