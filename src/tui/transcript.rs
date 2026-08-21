@@ -3,8 +3,8 @@
 //! The projection walks render units. A unit owns the transcript entries that
 //! render as one block, and is what keying, memoization, and click hit-testing
 //! address, so which entries share a unit is answered in one walk rather than
-//! in each of those four places. Every unit holds exactly one entry today; a
-//! Group will hold a run of adjacent command Activities.
+//! in each of those four places. Most units hold exactly one entry; a Group
+//! holds a run of adjacent, successfully settled command Activities.
 //!
 //! Rendering happens on every input event, so this module memoizes the
 //! expensive work at two levels. The whole view is keyed on the Session
@@ -341,6 +341,10 @@ impl TranscriptView {
 enum RenderUnit<'a> {
     Message(&'a Message),
     Activity(&'a Activity),
+    /// A Group: a run of two or more adjacent command Activities, each settled
+    /// Completed with exit status 0, shown as one collapsed row. Never empty
+    /// and never a run of one; [`close_command_run`] holds that invariant.
+    Group(Vec<&'a Activity>),
     /// A prompt this client sent that the Session has not echoed back yet.
     Provisional(&'a InitialPrompt),
 }
@@ -350,6 +354,7 @@ impl RenderUnit<'_> {
         match self {
             Self::Message(message) => UnitKey::Message(message.id),
             Self::Activity(activity) => UnitKey::Activity(activity.id()),
+            Self::Group(members) => UnitKey::Group(members[0].id()),
             Self::Provisional(prompt) => UnitKey::Provisional(prompt.id),
         }
     }
@@ -362,6 +367,7 @@ impl RenderUnit<'_> {
             Self::Activity(activity) => {
                 activity_fingerprint(activity, folds.is_folded(activity.id()))
             }
+            Self::Group(members) => group_fingerprint(members),
             // A provisional prompt's text only grows and carries no Fold, so
             // its length is the whole of its rendering input.
             Self::Provisional(prompt) => prompt.text.len() as u64,
@@ -373,7 +379,7 @@ impl RenderUnit<'_> {
     fn message_id(&self) -> Option<MessageId> {
         match self {
             Self::Message(message) => Some(message.id),
-            Self::Activity(_) | Self::Provisional(_) => None,
+            Self::Activity(_) | Self::Group(_) | Self::Provisional(_) => None,
         }
     }
 
@@ -400,6 +406,7 @@ impl RenderUnit<'_> {
                 theme,
                 width,
             ),
+            Self::Group(members) => Some(render_group(lines, members.len(), theme)),
             Self::Provisional(prompt) => {
                 push_user_message(lines, &prompt.text, theme, width);
                 None
@@ -426,24 +433,59 @@ fn plan_units<'a>(
         .map(|activity| (activity.id(), activity))
         .collect();
     let mut units = Vec::with_capacity(snapshot.transcript.len() + provisional.len());
+    let mut run: Vec<&Activity> = Vec::new();
     // A transcript entry naming content the snapshot does not carry projects
-    // nothing rather than a gap.
+    // nothing rather than a gap, so it does not end a run either: the commands
+    // around it are still adjacent as presented.
     for item in &snapshot.transcript {
         match item {
             TranscriptItem::Message { message_id } => {
                 if let Some(message) = messages.get(message_id).copied() {
+                    close_command_run(&mut units, &mut run);
                     units.push(RenderUnit::Message(message));
                 }
             }
             TranscriptItem::Activity { activity_id } => {
                 if let Some(activity) = activities.get(activity_id).copied() {
-                    units.push(RenderUnit::Activity(activity));
+                    if joins_command_run(activity) {
+                        run.push(activity);
+                    } else {
+                        close_command_run(&mut units, &mut run);
+                        units.push(RenderUnit::Activity(activity));
+                    }
                 }
             }
         }
     }
+    close_command_run(&mut units, &mut run);
     units.extend(provisional.iter().copied().map(RenderUnit::Provisional));
     units
+}
+
+/// Whether an Activity extends a run of groupable commands: a command settled
+/// Completed with exit status 0. Every other entry kind breaks the run, as
+/// does a failed, interrupted, or still-running command, so anything worth
+/// scanning for never hides behind a Group row.
+fn joins_command_run(activity: &Activity) -> bool {
+    matches!(
+        activity,
+        Activity::Command {
+            status: crate::protocol::ActivityStatus::Completed,
+            exit_status: Some(0),
+            ..
+        }
+    )
+}
+
+/// Ends the current run of groupable commands: two or more become one Group
+/// unit, while a run of one stays the ordinary command row it is, so grouping
+/// never adds a layer where it saves nothing.
+fn close_command_run<'a>(units: &mut Vec<RenderUnit<'a>>, run: &mut Vec<&'a Activity>) {
+    if run.len() >= 2 {
+        units.push(RenderUnit::Group(std::mem::take(run)));
+    } else {
+        units.extend(run.drain(..).map(RenderUnit::Activity));
+    }
 }
 
 /// A unit's identity across rebuilds, taken from the entries it holds so the
@@ -455,6 +497,10 @@ fn plan_units<'a>(
 pub(super) enum UnitKey {
     Message(MessageId),
     Activity(ActivityId),
+    /// A Group, identified by its first member: the anchor a run keeps as it
+    /// absorbs a command settling behind it, where a key over the member set
+    /// would read the grown Group as a new unit and re-render it every settle.
+    Group(ActivityId),
     Provisional(PromptId),
 }
 
@@ -671,6 +717,18 @@ fn activity_fingerprint(activity: &Activity, folded: bool) -> u64 {
     hasher.finish()
 }
 
+/// A collapsed Group renders only its membership, so its identity is who it
+/// holds. Folds are deliberately absent: they act on the members, which a
+/// collapsed Group does not draw.
+fn group_fingerprint(members: &[&Activity]) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    members.len().hash(&mut hasher);
+    for member in members {
+        member.id().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn provisional_fingerprint(provisional: &[&InitialPrompt]) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     for prompt in provisional {
@@ -830,6 +888,21 @@ fn render_activity(
             folded,
             theme,
         )),
+    }
+}
+
+/// Projects a collapsed Group: one header row in the settled Activity-header
+/// idiom, with the `Ran N commands` count styled as the expand affordance it
+/// is — the count doubles as the hidden-ness indicator, so no fold-marker line
+/// follows. `member_count` is always at least two.
+fn render_group(lines: &mut Vec<Line<'static>>, member_count: usize, theme: &Theme) -> UnitAnchor {
+    lines.push(Line::from(vec![
+        Span::styled("  ✓ ", theme.feedback.success),
+        Span::styled(format!("Ran {member_count} commands"), theme.action.primary),
+    ]));
+    UnitAnchor {
+        header_source_lines: 1,
+        hides_content: true,
     }
 }
 

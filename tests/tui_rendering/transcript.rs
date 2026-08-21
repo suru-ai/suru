@@ -2131,3 +2131,345 @@ fn clicks_do_not_reach_the_transcript_while_a_picker_covers_it() {
         "the entry beneath the picker keeps its Fold: {after}"
     );
 }
+
+/// One transcript entry in a Group scenario, so a test states the shape of the
+/// run it drives instead of assembling Activities by hand. Commands are
+/// numbered `command 1`, `command 2`, … in transcript order so member rows are
+/// assertable by name.
+enum RunEntry {
+    Command(ActivityStatus, Option<i32>),
+    AgentMessage(&'static str),
+    UserMessage(&'static str),
+    Reasoning(&'static str),
+    FileChange,
+    Status(&'static str),
+    Error(&'static str),
+}
+
+/// A Session whose transcript is exactly `entries` under one Turn.
+fn command_run_snapshot(
+    session_id: SessionId,
+    workspace: &std::path::Path,
+    entries: &[RunEntry],
+) -> suru::protocol::SessionSnapshot {
+    let mut snapshot =
+        failed_session_snapshot(session_id, PromptId::new(), "Run the workflow", workspace);
+    let turn_id = snapshot.turns[0].id;
+    snapshot.messages.clear();
+    snapshot.activities.clear();
+    snapshot.transcript.clear();
+    let mut command_number = 0;
+    for entry in entries {
+        let activity = match entry {
+            RunEntry::AgentMessage(content) | RunEntry::UserMessage(content) => {
+                let message = Message {
+                    id: MessageId::new(),
+                    turn_id,
+                    role: match entry {
+                        RunEntry::UserMessage(_) => MessageRole::User,
+                        _ => MessageRole::Agent,
+                    },
+                    status: MessageStatus::Completed,
+                    content: (*content).to_owned(),
+                    truncated: false,
+                };
+                snapshot.transcript.push(TranscriptItem::Message {
+                    message_id: message.id,
+                });
+                snapshot.messages.push(message);
+                continue;
+            }
+            RunEntry::Command(status, exit_status) => {
+                command_number += 1;
+                Activity::Command {
+                    id: ActivityId::new(),
+                    turn_id,
+                    status: *status,
+                    command: format!("command {command_number}"),
+                    cwd: None,
+                    output: format!("output of command {command_number}"),
+                    output_truncated: false,
+                    exit_status: *exit_status,
+                }
+            }
+            RunEntry::Reasoning(title) => Activity::Reasoning {
+                id: ActivityId::new(),
+                turn_id,
+                status: ActivityStatus::Completed,
+                title: Some((*title).to_owned()),
+                content: "Weighed the options.".to_owned(),
+                content_truncated: false,
+                duration_ms: None,
+            },
+            RunEntry::FileChange => Activity::FileChange {
+                id: ActivityId::new(),
+                turn_id,
+                status: ActivityStatus::Completed,
+                changes: vec![FileChange::Add {
+                    path: "src/new.rs".into(),
+                }],
+            },
+            RunEntry::Status(text) => Activity::Status {
+                id: ActivityId::new(),
+                turn_id,
+                text: (*text).to_owned(),
+            },
+            RunEntry::Error(text) => Activity::Error {
+                id: ActivityId::new(),
+                turn_id,
+                text: (*text).to_owned(),
+            },
+        };
+        snapshot.transcript.push(TranscriptItem::Activity {
+            activity_id: activity.id(),
+        });
+        snapshot.activities.push(activity);
+    }
+    snapshot
+}
+
+const SUCCESSFUL_COMMAND: RunEntry = RunEntry::Command(ActivityStatus::Completed, Some(0));
+
+#[test]
+fn a_run_of_successful_commands_collapses_to_one_group_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[SUCCESSFUL_COMMAND, SUCCESSFUL_COMMAND, SUCCESSFUL_COMMAND],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a run of successful commands");
+
+    let buffer = rendered_application_buffer(&application, 80, 18);
+    let rendered = buffer_rows(&buffer).join("\n");
+
+    assert!(
+        rendered.contains("✓ Ran 3 commands"),
+        "a run of three successful commands is one Group row: {rendered}"
+    );
+    for member in [
+        "command 1",
+        "command 2",
+        "command 3",
+        "output of command 1",
+    ] {
+        assert!(
+            !rendered.contains(member),
+            "a collapsed Group hides its member rows, but {member:?} rendered: {rendered}"
+        );
+    }
+    let affordance = text_cell(&buffer, "Ran 3 commands");
+    assert_eq!(
+        affordance.fg,
+        Color::Blue,
+        "the count is the expand affordance, styled action-primary"
+    );
+    assert!(
+        affordance.modifier.contains(Modifier::BOLD),
+        "action-primary carries its bold weight"
+    );
+    assert_eq!(
+        text_cell(&buffer, "✓").fg,
+        Color::Green,
+        "the header keeps the settled Activity-header marker"
+    );
+    let rows = buffer_rows(&buffer);
+    let header = &rows[rendered_row(&rows, "Ran 3 commands")];
+    assert!(
+        header.contains("  ✓ Ran 3 commands"),
+        "the Group header sits in the Activity-header gutter: {header:?}"
+    );
+}
+
+#[test]
+fn a_run_of_one_successful_command_renders_as_a_normal_command_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot =
+        command_run_snapshot(SessionId::new(), workspace.path(), &[SUCCESSFUL_COMMAND]);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with one successful command");
+
+    let rendered = rendered_application_rows_at(&application, 80, 18).join("\n");
+
+    assert!(
+        rendered.contains("✓ command 1"),
+        "a run of one renders the ordinary command row: {rendered}"
+    );
+    assert!(
+        rendered.contains("output of command 1"),
+        "the ordinary row keeps its output: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Ran 1 command"),
+        "grouping never adds a layer where it saves nothing: {rendered}"
+    );
+}
+
+#[test]
+fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let breakers: [(RunEntry, &str); 7] = [
+        (RunEntry::AgentMessage("A breaking message"), "A breaking message"),
+        (
+            RunEntry::UserMessage("A breaking user message"),
+            "A breaking user message",
+        ),
+        (RunEntry::Reasoning("Weighing options"), "Thought: Weighing options"),
+        (RunEntry::FileChange, "✓ Applied file changes"),
+        (RunEntry::Status("Agent Selection changed"), "Agent Selection changed"),
+        (RunEntry::Error("Provider failed"), "Error: Provider failed"),
+        (
+            RunEntry::Command(ActivityStatus::Failed, Some(2)),
+            "× command 3 (exit 2)",
+        ),
+    ];
+    for (breaker, visible) in breakers {
+        let snapshot = command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[
+                SUCCESSFUL_COMMAND,
+                SUCCESSFUL_COMMAND,
+                breaker,
+                SUCCESSFUL_COMMAND,
+                SUCCESSFUL_COMMAND,
+            ],
+        );
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach a Session with a broken command run");
+
+        let rows = rendered_application_rows_at(&application, 80, 24);
+        let rendered = rows.join("\n");
+        assert_eq!(
+            rendered.matches("Ran 2 commands").count(),
+            2,
+            "{visible:?} splits the run into two Groups: {rendered}"
+        );
+        assert!(
+            rendered.contains(visible),
+            "the breaking entry renders as its own row: {rendered}"
+        );
+        let first_group = rendered_row(&rows, "Ran 2 commands");
+        let breaker_row = rendered_row(&rows, visible);
+        assert!(
+            first_group < breaker_row,
+            "presentation order is preserved: {rendered}"
+        );
+        assert!(
+            rows[breaker_row + 1..]
+                .iter()
+                .any(|row| row.contains("Ran 2 commands")),
+            "the second Group renders after the breaking entry: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn an_active_command_stays_outside_the_group() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            RunEntry::Command(ActivityStatus::Active, None),
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a running command after a run");
+
+    let rendered = rendered_application_rows_at(&application, 80, 18).join("\n");
+
+    assert!(
+        rendered.contains("✓ Ran 2 commands"),
+        "the settled run still groups: {rendered}"
+    );
+    assert!(
+        rendered.contains("$ command 3"),
+        "the running command stays visible outside the Group: {rendered}"
+    );
+}
+
+#[test]
+fn groups_have_no_size_cap() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let entries = std::iter::repeat_with(|| SUCCESSFUL_COMMAND)
+        .take(40)
+        .collect::<Vec<_>>();
+    let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &entries);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a long run of successful commands");
+
+    let rendered = rendered_application_rows_at(&application, 80, 18).join("\n");
+
+    assert!(
+        rendered.contains("✓ Ran 40 commands"),
+        "a forty-command run is one row, not several Groups: {rendered}"
+    );
+    assert!(
+        !rendered.contains("command 1") && !rendered.contains("command 40"),
+        "no member row escapes the Group: {rendered}"
+    );
+}
+
+#[test]
+fn a_command_settling_successfully_is_absorbed_into_the_group_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let mut snapshot = command_run_snapshot(
+        session_id,
+        workspace.path(),
+        &[
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            RunEntry::Command(ActivityStatus::Active, None),
+        ],
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    let running_id = snapshot.activities[2].id();
+    let initial_revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a running command after a run");
+
+    let before = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert!(before.contains("✓ Ran 2 commands"), "{before}");
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(initial_revision.0 + 1),
+                changes: vec![SessionChange::CommandStatusChanged {
+                    activity_id: running_id,
+                    status: ActivityStatus::Completed,
+                    exit_status: Some(0),
+                }],
+            },
+        )))
+        .expect("project the command settling successfully");
+
+    let after = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert!(
+        after.contains("✓ Ran 3 commands"),
+        "the Group row updates when a member settles into it: {after}"
+    );
+    assert!(
+        !after.contains("Ran 2 commands") && !after.contains("command 3"),
+        "the settled command left no standalone row behind: {after}"
+    );
+}

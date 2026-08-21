@@ -655,12 +655,14 @@ impl TuiState {
         Some(self.session_interactions.entry(session_id).or_default())
     }
 
-    /// Toggles the Fold of the unit drawn at `screen_row`, which today is
-    /// always the one Activity that unit projects. A unit holding content back
-    /// expands wherever it is clicked; one already showing everything folds
-    /// again only from its header line, so pointing at output never hides what
-    /// is under the pointer. A unit with nothing to hide answers neither, so an
-    /// idle click never records a Fold that does not exist.
+    /// Toggles the Fold of the unit drawn at `screen_row` when it projects a
+    /// single Activity; a Group answers to its own toggle, not a Fold, so a
+    /// click on one does nothing until Group expansion lands (#81). A unit
+    /// holding content back expands wherever it is clicked; one already
+    /// showing everything folds again only from its header line, so pointing
+    /// at output never hides what is under the pointer. A unit with nothing to
+    /// hide answers neither, so an idle click never records a Fold that does
+    /// not exist.
     fn toggle_fold_at(&mut self, screen_row: u16) {
         let Some(interaction) = self.current_interaction() else {
             return;
