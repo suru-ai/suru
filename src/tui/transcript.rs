@@ -38,9 +38,13 @@ use crate::{
 
 use super::markdown;
 
-/// Source lines wrapping to more rows than this are split so ratatui's
-/// u16-based scroll arithmetic stays in range.
-const MAX_TRANSCRIPT_SOURCE_LINE_ROWS: usize = 32_000;
+/// Source lines wrapping to more rows than this are split. The cap serves two
+/// bounds: ratatui's u16-based scroll arithmetic stays in range, and the draw
+/// re-wraps the first visible source line every frame, so the cap also limits
+/// how much text that per-frame wrap can touch. Splitting is recursive
+/// bisection that re-measures each half, so a lower cap trades one-time
+/// projection cost on pathological lines for a lower per-frame ceiling.
+const MAX_TRANSCRIPT_SOURCE_LINE_ROWS: usize = 1_000;
 
 /// Wrapped rows a settled command Activity's output occupies while folded,
 /// split into a head and a tail around the fold marker.
