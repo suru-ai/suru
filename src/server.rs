@@ -54,12 +54,17 @@ pub type ServerConfig = RuntimeConfig;
 #[derive(Clone, Copy, Debug)]
 pub struct ServerTimings {
     pub sse_keepalive_interval: Duration,
+    /// How long an accepted shutdown keeps health and existing streams
+    /// available so the final authenticated intent can reach clients before
+    /// graceful transport closure.
+    pub shutdown_grace: Duration,
 }
 
 impl Default for ServerTimings {
     fn default() -> Self {
         Self {
             sse_keepalive_interval: Duration::from_secs(10),
+            shutdown_grace: Duration::from_millis(100),
         }
     }
 }
@@ -209,6 +214,7 @@ struct ShutdownController {
     shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     provider_shutdown: watch::Sender<bool>,
     provider_updates: ProviderUpdateGate,
+    shutdown_grace: Duration,
 }
 
 impl ShutdownController {
@@ -233,10 +239,11 @@ impl ShutdownController {
         self.lifecycle.send_replace(LifecycleState::Stopping);
         self.shutdown_intent.send_replace(Some(request));
         self.provider_shutdown.send_replace(true);
+        let grace = self.shutdown_grace;
         tokio::spawn(async move {
             // Keep health and existing streams available briefly so the accepted response and
             // final authenticated intent can reach clients before graceful transport closure.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(grace).await;
             let _ = shutdown.send(());
         });
     }
@@ -366,6 +373,7 @@ pub async fn spawn_with_provider_and_timings(
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
         provider_shutdown,
         provider_updates: provider_updates.clone(),
+        shutdown_grace: timings.shutdown_grace,
     };
     let provider_id = runtime.provider_id();
     let (storage_writer, storage) = StorageWriter::spawn(repository, &persisted_sessions.readable);

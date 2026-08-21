@@ -29,6 +29,7 @@ const PROCESS_KILL_TIMEOUT: Duration = Duration::from_millis(500);
 #[derive(Clone, Debug)]
 pub(super) struct ProcessRegistry {
     next_id: Arc<AtomicU64>,
+    exit_grace: Duration,
     state: Arc<StdMutex<ProcessRegistryState>>,
 }
 
@@ -42,11 +43,18 @@ impl ProcessRegistry {
     pub(super) fn new() -> Self {
         Self {
             next_id: Arc::new(AtomicU64::new(1)),
+            exit_grace: PROCESS_EXIT_GRACE_PERIOD,
             state: Arc::new(StdMutex::new(ProcessRegistryState {
                 shutting_down: false,
                 processes: HashMap::new(),
             })),
         }
+    }
+
+    /// Overrides how long a stopping process may exit gracefully before it is
+    /// forced down. Takes effect for processes launched after the call.
+    pub(super) fn set_exit_grace(&mut self, exit_grace: Duration) {
+        self.exit_grace = exit_grace;
     }
 
     fn register(&self, process: ProcessControl) -> Result<u64, ProviderError> {
@@ -101,6 +109,8 @@ impl ProcessRegistry {
 struct ProcessControl {
     shutdown: watch::Sender<bool>,
     stopped: watch::Receiver<bool>,
+    /// The exit grace, forced-kill wait, and margin a stop may take in total.
+    wait_budget: Duration,
 }
 
 impl ProcessControl {
@@ -122,12 +132,9 @@ impl ProcessControl {
                     codex_error("Codex app-server process supervisor stopped unexpectedly")
                 })
         };
-        timeout(
-            PROCESS_EXIT_GRACE_PERIOD + PROCESS_KILL_TIMEOUT + Duration::from_millis(250),
-            wait,
-        )
-        .await
-        .map_err(|_| codex_error("Codex app-server did not stop within the shutdown deadline"))?
+        timeout(self.wait_budget, wait).await.map_err(|_| {
+            codex_error("Codex app-server did not stop within the shutdown deadline")
+        })?
     }
 }
 
@@ -228,6 +235,7 @@ pub(super) async fn supervise_codex_process(
     let control = ProcessControl {
         shutdown: shutdown_tx,
         stopped: stopped_rx,
+        wait_budget: processes.exit_grace + PROCESS_KILL_TIMEOUT + Duration::from_millis(250),
     };
     let registration_id = match processes.register(control.clone()) {
         Ok(registration_id) => registration_id,
@@ -276,7 +284,7 @@ async fn supervise_child(supervisor: ChildSupervisor) {
         biased;
         _ = wait_for_shutdown(&mut shutdown) => {
             transport.close();
-            match timeout(PROCESS_EXIT_GRACE_PERIOD, async {
+            match timeout(processes.exit_grace, async {
                 transport.close_stdin().await;
                 child.wait().await
             }).await {

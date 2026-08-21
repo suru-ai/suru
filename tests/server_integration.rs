@@ -893,6 +893,7 @@ async fn sse_keepalive_comments_are_periodic_and_event_neutral() {
         ServerConfig::new(state_dir.path(), "keepalive-test").expect("configure server"),
         ServerTimings {
             sse_keepalive_interval: Duration::from_millis(100),
+            ..ServerTimings::default()
         },
     )
     .await

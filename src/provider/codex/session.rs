@@ -53,6 +53,7 @@ pub struct CodexRuntime {
     executable: OsString,
     processes: ProcessRegistry,
     interrupt_request_timeout: Duration,
+    shutdown_interrupt_timeout: Duration,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -76,7 +77,24 @@ impl CodexRuntime {
             executable: executable.as_ref().to_owned(),
             processes: ProcessRegistry::new(),
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
+            shutdown_interrupt_timeout: SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Bounds how long a Session shutdown waits for Codex to acknowledge the
+    /// courtesy interrupt before forcing the process down; injectable so tests
+    /// with unresponsive fixtures do not wait out the default.
+    pub fn with_shutdown_interrupt_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_interrupt_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long a stopping Codex process may exit gracefully before it
+    /// is forced down; injectable so tests with fixtures that ignore stdin
+    /// closure do not wait out the default.
+    pub fn with_process_exit_grace(mut self, exit_grace: Duration) -> Self {
+        self.processes.set_exit_grace(exit_grace);
+        self
     }
 
     /// Bounds how long an interrupt RPC waits for Codex to acknowledge; injectable
@@ -117,10 +135,11 @@ impl ProviderRuntime for CodexRuntime {
     ) -> ProviderFuture<'_, ProviderSessionConnection> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
-        let interrupt_request_timeout = self.interrupt_request_timeout;
-        Box::pin(async move {
-            start_codex_session(executable, request, processes, interrupt_request_timeout).await
-        })
+        let timeouts = SessionTimeouts {
+            interrupt_request: self.interrupt_request_timeout,
+            shutdown_interrupt: self.shutdown_interrupt_timeout,
+        };
+        Box::pin(async move { start_codex_session(executable, request, processes, timeouts).await })
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
@@ -179,20 +198,27 @@ async fn discover_codex_models(
     Ok(models)
 }
 
+/// The interruption-related timeouts a [`CodexRuntime`] hands each Session.
+#[derive(Clone, Copy, Debug)]
+struct SessionTimeouts {
+    interrupt_request: Duration,
+    shutdown_interrupt: Duration,
+}
+
 async fn start_codex_session(
     executable: OsString,
     request: ProviderSessionRequest,
     processes: ProcessRegistry,
-    interrupt_request_timeout: Duration,
+    timeouts: SessionTimeouts,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let connection = JsonRpcTransport::launch(&executable, processes).await?;
-    start_codex_thread(connection, request, interrupt_request_timeout).await
+    start_codex_thread(connection, request, timeouts).await
 }
 
 async fn start_codex_thread(
     connection: CodexConnection,
     request: ProviderSessionRequest,
-    interrupt_request_timeout: Duration,
+    timeouts: SessionTimeouts,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let CodexConnection {
         transport,
@@ -294,7 +320,7 @@ async fn start_codex_thread(
     let turn_start_changed = Arc::new(Notify::new());
     let session = Arc::new(CodexSession {
         thread_id: started.thread.id,
-        interrupt_request_timeout,
+        timeouts,
         transport,
         correlation: correlation.clone(),
         turn_start_changed,
@@ -319,7 +345,7 @@ async fn start_codex_thread(
 
 struct CodexSession {
     thread_id: String,
-    interrupt_request_timeout: Duration,
+    timeouts: SessionTimeouts,
     transport: JsonRpcTransport,
     correlation: Arc<StdMutex<NativeCorrelation>>,
     turn_start_changed: Arc<Notify>,
@@ -405,7 +431,7 @@ impl ProviderSession for CodexSession {
                         thread_id: &self.thread_id,
                         turn_id: &turn_id,
                     },
-                    self.interrupt_request_timeout,
+                    self.timeouts.interrupt_request,
                 )
                 .await
                 .map_err(|error| codex_error_context("Codex Turn interruption failed", error))?;
@@ -437,7 +463,7 @@ impl ProviderSession for CodexSession {
             }
             if let Some(turn_id) = active_turn_id {
                 let _ = timeout(
-                    SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT,
+                    self.timeouts.shutdown_interrupt,
                     self.transport.request(
                         "turn/interrupt",
                         &TurnInterruptParams {

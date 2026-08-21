@@ -9,7 +9,7 @@ use suru::{
         SessionStatus, TurnStatus, Workspace,
     },
     provider::CodexRuntime,
-    server::{self, ServerConfig},
+    server::{self, ServerConfig, ServerTimings},
 };
 use tokio::time::{Duration, timeout};
 
@@ -212,12 +212,18 @@ async fn assert_interruption_failure(script: &str, channel: &str, expected_error
     let fixture = ScriptedCodex::new(&interruption_script(script));
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn_with_provider(
+    let server = server::spawn_with_provider_and_timings(
         ServerConfig::new(state_dir.path(), channel).expect("configure server"),
         Arc::new(
             CodexRuntime::new(fixture.executable())
-                .with_interrupt_request_timeout(Duration::from_millis(300)),
+                .with_interrupt_request_timeout(Duration::from_millis(300))
+                .with_shutdown_interrupt_timeout(Duration::from_millis(25))
+                .with_process_exit_grace(Duration::from_millis(50)),
         ),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(10),
+            ..ServerTimings::default()
+        },
     )
     .await
     .expect("spawn server");
