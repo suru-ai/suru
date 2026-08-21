@@ -214,7 +214,10 @@ async fn assert_interruption_failure(script: &str, channel: &str, expected_error
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let server = server::spawn_with_provider(
         ServerConfig::new(state_dir.path(), channel).expect("configure server"),
-        Arc::new(CodexRuntime::new(fixture.executable())),
+        Arc::new(
+            CodexRuntime::new(fixture.executable())
+                .with_interrupt_request_timeout(Duration::from_millis(300)),
+        ),
     )
     .await
     .expect("spawn server");
@@ -252,7 +255,7 @@ async fn assert_interruption_failure(script: &str, channel: &str, expected_error
         .expect("read active Session");
 
     let error = timeout(
-        Duration::from_secs(7),
+        Duration::from_secs(2),
         client.interrupt_turn(created.session.id, active.turns[0].id),
     )
     .await

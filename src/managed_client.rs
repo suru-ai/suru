@@ -35,11 +35,16 @@ pub use session_stream::{SessionEvent, SessionStreamError, SessionSubscription};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const INITIAL_RECOVERY_BACKOFF: Duration = Duration::from_millis(50);
+const MAX_RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct ManagedClientConfig {
     runtime: RuntimeConfig,
     server_executable: PathBuf,
+    startup_timeout: Duration,
+    initial_recovery_backoff: Duration,
+    max_recovery_backoff: Duration,
 }
 
 impl ManagedClientConfig {
@@ -47,11 +52,29 @@ impl ManagedClientConfig {
         Ok(Self {
             runtime: RuntimeConfig::new(state_base_dir, channel)?,
             server_executable: std::env::current_exe().context("find current Suru executable")?,
+            startup_timeout: STARTUP_TIMEOUT,
+            initial_recovery_backoff: INITIAL_RECOVERY_BACKOFF,
+            max_recovery_backoff: MAX_RECOVERY_BACKOFF,
         })
     }
 
     pub fn with_server_executable(mut self, executable: impl Into<PathBuf>) -> Self {
         self.server_executable = executable.into();
+        self
+    }
+
+    /// Bounds how long connecting waits for a server to become ready; injectable
+    /// so tests can exercise the deadline without waiting out the default.
+    pub fn with_startup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_timeout = timeout;
+        self
+    }
+
+    /// Overrides the crash-recovery retry schedule (initial wait, doubling up to
+    /// the cap); injectable so tests can observe the schedule at millisecond scale.
+    pub fn with_recovery_backoff(mut self, initial: Duration, max: Duration) -> Self {
+        self.initial_recovery_backoff = initial;
+        self.max_recovery_backoff = max;
         self
     }
 
@@ -502,7 +525,7 @@ async fn decode_api_error(response: reqwest::Response, operation: &str) -> anyho
 }
 
 pub async fn start_server(config: &ManagedClientConfig) -> Result<Health> {
-    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + config.startup_timeout;
     launcher::ensure_server(config, deadline)
         .await
         .map(|registration| registration.health)

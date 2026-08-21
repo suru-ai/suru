@@ -52,6 +52,7 @@ const PENDING_TURN_START_GRACE_PERIOD: Duration = Duration::from_millis(250);
 pub struct CodexRuntime {
     executable: OsString,
     processes: ProcessRegistry,
+    interrupt_request_timeout: Duration,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -74,7 +75,15 @@ impl CodexRuntime {
         Self {
             executable: executable.as_ref().to_owned(),
             processes: ProcessRegistry::new(),
+            interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Bounds how long an interrupt RPC waits for Codex to acknowledge; injectable
+    /// so tests can exercise the timeout without waiting out the default.
+    pub fn with_interrupt_request_timeout(mut self, timeout: Duration) -> Self {
+        self.interrupt_request_timeout = timeout;
+        self
     }
 
     pub fn from_environment() -> Self {
@@ -108,7 +117,10 @@ impl ProviderRuntime for CodexRuntime {
     ) -> ProviderFuture<'_, ProviderSessionConnection> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
-        Box::pin(async move { start_codex_session(executable, request, processes).await })
+        let interrupt_request_timeout = self.interrupt_request_timeout;
+        Box::pin(async move {
+            start_codex_session(executable, request, processes, interrupt_request_timeout).await
+        })
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
@@ -171,14 +183,16 @@ async fn start_codex_session(
     executable: OsString,
     request: ProviderSessionRequest,
     processes: ProcessRegistry,
+    interrupt_request_timeout: Duration,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let connection = JsonRpcTransport::launch(&executable, processes).await?;
-    start_codex_thread(connection, request).await
+    start_codex_thread(connection, request, interrupt_request_timeout).await
 }
 
 async fn start_codex_thread(
     connection: CodexConnection,
     request: ProviderSessionRequest,
+    interrupt_request_timeout: Duration,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let CodexConnection {
         transport,
@@ -280,6 +294,7 @@ async fn start_codex_thread(
     let turn_start_changed = Arc::new(Notify::new());
     let session = Arc::new(CodexSession {
         thread_id: started.thread.id,
+        interrupt_request_timeout,
         transport,
         correlation: correlation.clone(),
         turn_start_changed,
@@ -304,6 +319,7 @@ async fn start_codex_thread(
 
 struct CodexSession {
     thread_id: String,
+    interrupt_request_timeout: Duration,
     transport: JsonRpcTransport,
     correlation: Arc<StdMutex<NativeCorrelation>>,
     turn_start_changed: Arc<Notify>,
@@ -389,7 +405,7 @@ impl ProviderSession for CodexSession {
                         thread_id: &self.thread_id,
                         turn_id: &turn_id,
                     },
-                    INTERRUPT_REQUEST_TIMEOUT,
+                    self.interrupt_request_timeout,
                 )
                 .await
                 .map_err(|error| codex_error_context("Codex Turn interruption failed", error))?;

@@ -11,7 +11,7 @@ use suru::{
         Health, LifecycleState, SERVER_SHUTDOWN_EVENT, ServerIdentity, ServerShutdown,
         ShutdownReason,
     },
-    server::{self, ServerConfig},
+    server::{self, ServerConfig, ServerTimings},
 };
 use tokio::time::{Duration, timeout};
 
@@ -889,8 +889,11 @@ async fn managed_client_connects_without_periodic_domain_events() {
 #[tokio::test]
 async fn sse_keepalive_comments_are_periodic_and_event_neutral() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let server = server::spawn(
+    let server = server::spawn_with_timings(
         ServerConfig::new(state_dir.path(), "keepalive-test").expect("configure server"),
+        ServerTimings {
+            sse_keepalive_interval: Duration::from_millis(100),
+        },
     )
     .await
     .expect("spawn server");
@@ -906,7 +909,7 @@ async fn sse_keepalive_comments_are_periodic_and_event_neutral() {
     let mut chunks = response.bytes_stream();
     let mut raw = Vec::new();
 
-    timeout(Duration::from_secs(12), async {
+    timeout(Duration::from_secs(5), async {
         loop {
             let chunk = chunks
                 .next()
@@ -915,13 +918,13 @@ async fn sse_keepalive_comments_are_periodic_and_event_neutral() {
                 .expect("read event stream bytes");
             raw.extend_from_slice(&chunk);
             let text = String::from_utf8_lossy(&raw);
-            if text.contains(": keep-alive\n\n") {
+            if text.matches(": keep-alive\n\n").count() >= 2 {
                 break;
             }
         }
     })
     .await
-    .expect("periodic keepalive comment arrives");
+    .expect("periodic keepalive comments arrive");
 
     let text = String::from_utf8(raw).expect("SSE response is UTF-8");
     assert!(text.contains(": connected\n\n"));

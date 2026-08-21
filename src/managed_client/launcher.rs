@@ -42,7 +42,10 @@ pub(super) async fn ensure_server(
             Err(_) => {
                 return Err(startup_error(
                     config,
-                    "detached Suru server did not become ready within 15s",
+                    &format!(
+                        "detached Suru server did not become ready within {:?}",
+                        config.startup_timeout
+                    ),
                 ));
             }
         };
@@ -118,7 +121,10 @@ pub(super) async fn ensure_server(
         if tokio::time::Instant::now() >= deadline {
             return Err(startup_error(
                 config,
-                &format!("detached Suru server did not become ready within 15s: {error:#}"),
+                &format!(
+                    "detached Suru server did not become ready within {:?}: {error:#}",
+                    config.startup_timeout
+                ),
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

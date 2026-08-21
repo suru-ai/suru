@@ -12,6 +12,7 @@ support others down the line.
 - Do not account for backwards compatibility with previous versions.
 - Build using interfaces designed for an eventual plugin architecture based on that of OpenCode.
 - User-facing configuration is deferred. When hardcoding a value a user would plausibly tune, add it to the candidate-settings inventory in issue #71 rather than building config machinery.
+- Run tests with `cargo nextest run` (parallelizes across test binaries and reports per-test timings); `cargo test` also works. Tests must not wait out production-scale delays: timing constants (timeouts, backoff, keepalive) are injectable via builders such as `ManagedClientConfig::with_startup_timeout`, `ServerTimings`, and `CodexRuntime::with_interrupt_request_timeout`, so inject millisecond-scale values instead of sleeping.
 
 ## Plugins
 

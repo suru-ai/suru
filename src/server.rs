@@ -49,6 +49,21 @@ use crate::storage::{StorageRepository, StorageSink, StorageWriter};
 
 pub type ServerConfig = RuntimeConfig;
 
+/// Wall-clock intervals the server schedules against; injectable so tests can
+/// observe periodic behavior without waiting out production-scale delays.
+#[derive(Clone, Copy, Debug)]
+pub struct ServerTimings {
+    pub sse_keepalive_interval: Duration,
+}
+
+impl Default for ServerTimings {
+    fn default() -> Self {
+        Self {
+            sse_keepalive_interval: Duration::from_secs(10),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentOutput {
     MessageStarted {
@@ -272,6 +287,7 @@ struct AppState {
     landing_agent_selection: LandingAgentSelectionStore,
     shutdown: ShutdownController,
     provider_id: ProviderId,
+    timings: ServerTimings,
 }
 
 pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
@@ -281,6 +297,22 @@ pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
 pub async fn spawn_with_provider(
     config: ServerConfig,
     runtime: Arc<dyn ProviderRuntime>,
+) -> Result<RunningServer> {
+    spawn_with_provider_and_timings(config, runtime, ServerTimings::default()).await
+}
+
+pub async fn spawn_with_timings(
+    config: ServerConfig,
+    timings: ServerTimings,
+) -> Result<RunningServer> {
+    spawn_with_provider_and_timings(config, Arc::new(CodexRuntime::from_environment()), timings)
+        .await
+}
+
+pub async fn spawn_with_provider_and_timings(
+    config: ServerConfig,
+    runtime: Arc<dyn ProviderRuntime>,
+    timings: ServerTimings,
 ) -> Result<RunningServer> {
     config.create_private_runtime_dir()?;
 
@@ -355,6 +387,7 @@ pub async fn spawn_with_provider(
         landing_agent_selection,
         shutdown: shutdown.clone(),
         provider_id,
+        timings,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -469,7 +502,7 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
 
     Sse::new(event_stream(
         state.shutdown.subscribe_to_intent(),
-        Duration::from_secs(10),
+        state.timings.sse_keepalive_interval,
     ))
     .into_response()
 }
@@ -536,7 +569,7 @@ async fn session_catalog_events(State(state): State<AppState>, headers: HeaderMa
     Sse::new(session_catalog_event_stream(
         state.sessions.subscribe_catalog(),
         shutdown,
-        Duration::from_secs(10),
+        state.timings.sse_keepalive_interval,
     ))
     .into_response()
 }
@@ -983,7 +1016,7 @@ async fn session_events(
     Sse::new(session_event_stream(
         feed,
         shutdown,
-        Duration::from_secs(10),
+        state.timings.sse_keepalive_interval,
     ))
     .into_response()
 }

@@ -523,14 +523,17 @@ async fn receive_recovered_state(client: &mut ManagedClient, previous_instance_i
 }
 
 #[tokio::test]
-async fn recovery_backoff_is_exponential_and_capped_at_five_seconds() {
+async fn recovery_backoff_is_exponential_and_capped() {
+    const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
+    const MAX_BACKOFF: Duration = Duration::from_millis(80);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "recovery-backoff-test";
     let _fixture = ReadinessFixture::spawn_recovery_backoff(state_dir.path(), channel).await;
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
             .expect("configure managed client")
-            .with_server_executable(inert_server_executable(state_dir.path())),
+            .with_server_executable(inert_server_executable(state_dir.path()))
+            .with_recovery_backoff(INITIAL_BACKOFF, MAX_BACKOFF),
     )
     .await
     .expect("connect managed client");
@@ -550,18 +553,15 @@ async fn recovery_backoff_is_exponential_and_capped_at_five_seconds() {
             panic!("expected recovering event, got {event:?}");
         };
         assert_eq!(status.attempt, expected_attempt);
-        assert!(status.retry_in <= Duration::from_secs(5));
+        assert!(status.retry_in <= MAX_BACKOFF);
         if expected_attempt == 1 {
             assert!(status.retry_in.is_zero());
         } else if let Some(previous) = previous_nonzero_wait {
-            assert_eq!(
-                status.retry_in,
-                previous.saturating_mul(2).min(Duration::from_secs(5))
-            );
+            assert_eq!(status.retry_in, previous.saturating_mul(2).min(MAX_BACKOFF));
         } else {
-            assert!(!status.retry_in.is_zero());
+            assert_eq!(status.retry_in, INITIAL_BACKOFF);
         }
-        if status.retry_in == Duration::from_secs(5) {
+        if status.retry_in == MAX_BACKOFF {
             observed_cap = true;
             break;
         }
@@ -570,10 +570,7 @@ async fn recovery_backoff_is_exponential_and_capped_at_five_seconds() {
         }
     }
 
-    assert!(
-        observed_cap,
-        "recovery backoff never reached its five-second cap"
-    );
+    assert!(observed_cap, "recovery backoff never reached its cap");
 }
 
 #[tokio::test]
@@ -1548,9 +1545,10 @@ async fn managed_client_bounds_the_initial_event_stream_handshake() {
     .expect("write fixture server log");
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure managed client")
-        .with_server_executable(inert_server_executable(state_dir.path()));
+        .with_server_executable(inert_server_executable(state_dir.path()))
+        .with_startup_timeout(Duration::from_millis(500));
 
-    let result = timeout(Duration::from_secs(17), ManagedClient::connect(config))
+    let result = timeout(Duration::from_secs(2), ManagedClient::connect(config))
         .await
         .expect("initial event stream uses the startup deadline");
     let error = match result {
@@ -1559,7 +1557,7 @@ async fn managed_client_bounds_the_initial_event_stream_handshake() {
     };
 
     assert!(fixture.events_opened.load(Ordering::SeqCst));
-    assert!(error.contains("initial event stream did not open within 15s"));
+    assert!(error.contains("initial event stream did not open within 500ms"));
     assert!(error.contains("event stream fixture stalled"));
 }
 

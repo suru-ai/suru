@@ -8,15 +8,12 @@ use tokio::sync::{mpsc, watch};
 use crate::protocol::{Health, LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor};
 
 use super::{
-    ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus, STARTUP_TIMEOUT,
+    ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus,
     event_stream::{self, StreamOutcome},
     launcher,
     lifecycle::{self, Registration},
     session_catalog_stream,
 };
-
-const INITIAL_RECOVERY_BACKOFF: Duration = Duration::from_millis(50);
-const MAX_RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
 
 struct ActiveConnection {
     descriptor: RuntimeDescriptor,
@@ -31,7 +28,7 @@ struct ManagedStreamResponses {
 }
 
 pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient> {
-    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + config.startup_timeout;
     let http = reqwest::Client::new();
     let connection = establish_connection(&config, &http, deadline).await?;
     let (events_tx, events_rx) = mpsc::channel(32);
@@ -58,7 +55,7 @@ async fn establish_connection(
     deadline: tokio::time::Instant,
 ) -> Result<ActiveConnection> {
     let Registration { descriptor, health } = launcher::ensure_server(config, deadline).await?;
-    let streams = open_managed_streams(http, &descriptor, deadline)
+    let streams = open_managed_streams(http, &descriptor, deadline, config.startup_timeout)
         .await
         .map_err(|error| launcher::startup_error(config, &error.to_string()))?;
     Ok(ActiveConnection {
@@ -73,15 +70,18 @@ async fn open_managed_streams(
     http: &reqwest::Client,
     descriptor: &RuntimeDescriptor,
     deadline: tokio::time::Instant,
+    startup_timeout: Duration,
 ) -> Result<ManagedStreamResponses> {
     let lifecycle = open_required_stream(
         deadline,
+        startup_timeout,
         "event stream",
         event_stream::open(http, descriptor),
     )
     .await?;
     let catalog = open_required_stream(
         deadline,
+        startup_timeout,
         "Session catalog stream",
         session_catalog_stream::open(http, descriptor),
     )
@@ -91,6 +91,7 @@ async fn open_managed_streams(
 
 async fn open_required_stream(
     deadline: tokio::time::Instant,
+    startup_timeout: Duration,
     name: &str,
     opening: impl std::future::Future<Output = reqwest::Result<reqwest::Response>>,
 ) -> Result<reqwest::Response> {
@@ -100,7 +101,9 @@ async fn open_required_stream(
             Err(anyhow!("server rejected the initial {name}: {error}"))
         }
         Ok(Err(error)) => Err(anyhow!("could not open the initial {name}: {error}")),
-        Err(_) => Err(anyhow!("initial {name} did not open within 15s")),
+        Err(_) => Err(anyhow!(
+            "initial {name} did not open within {startup_timeout:?}"
+        )),
     }
 }
 
@@ -215,7 +218,7 @@ async fn run_managed_client(
             {
                 return;
             }
-            let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+            let deadline = tokio::time::Instant::now() + config.startup_timeout;
             match wait_for_protocol_compatible_connection(
                 &config,
                 &http,
@@ -238,9 +241,10 @@ async fn run_managed_client(
                 }
                 ConnectionWait::TimedOut => {
                     let _ = events
-                        .send(ManagedEvent::Fatal(
-                            "replacement Suru server did not become ready within 15s".to_owned(),
-                        ))
+                        .send(ManagedEvent::Fatal(format!(
+                            "replacement Suru server did not become ready within {:?}",
+                            config.startup_timeout
+                        )))
                         .await;
                     return;
                 }
@@ -265,7 +269,7 @@ async fn run_managed_client(
             }
             tokio::time::sleep(retry_in).await;
 
-            let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+            let deadline = tokio::time::Instant::now() + config.startup_timeout;
             let recovery = if configured_build_can_restore {
                 establish_connection(&config, &http, deadline).await
             } else {
@@ -290,7 +294,11 @@ async fn run_managed_client(
                 }
                 Err(_) => {
                     attempt = attempt.saturating_add(1);
-                    retry_in = next_recovery_backoff(retry_in);
+                    retry_in = next_recovery_backoff(
+                        retry_in,
+                        config.initial_recovery_backoff,
+                        config.max_recovery_backoff,
+                    );
                 }
             }
         }
@@ -359,7 +367,9 @@ async fn probe_protocol_compatible_connection(
     if health.protocol_version != PROTOCOL_VERSION {
         return ConnectionProbe::Incompatible(health.protocol_version);
     }
-    let Ok(streams) = open_managed_streams(http, &descriptor, deadline).await else {
+    let Ok(streams) =
+        open_managed_streams(http, &descriptor, deadline, config.startup_timeout).await
+    else {
         return ConnectionProbe::Pending;
     };
     ConnectionProbe::Ready(Box::new(ActiveConnection {
@@ -370,10 +380,35 @@ async fn probe_protocol_compatible_connection(
     }))
 }
 
-fn next_recovery_backoff(previous: Duration) -> Duration {
+fn next_recovery_backoff(previous: Duration, initial: Duration, max: Duration) -> Duration {
     if previous.is_zero() {
-        INITIAL_RECOVERY_BACKOFF
+        initial
     } else {
-        previous.saturating_mul(2).min(MAX_RECOVERY_BACKOFF)
+        previous.saturating_mul(2).min(max)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::managed_client::{INITIAL_RECOVERY_BACKOFF, MAX_RECOVERY_BACKOFF};
+
+    #[test]
+    fn default_recovery_backoff_doubles_from_fifty_millis_and_caps_at_five_seconds() {
+        let mut waits = Vec::new();
+        let mut retry_in = Duration::ZERO;
+        for _ in 0..10 {
+            retry_in =
+                next_recovery_backoff(retry_in, INITIAL_RECOVERY_BACKOFF, MAX_RECOVERY_BACKOFF);
+            waits.push(retry_in);
+        }
+        assert_eq!(
+            waits,
+            [50, 100, 200, 400, 800, 1600, 3200, 5000, 5000, 5000]
+                .map(Duration::from_millis)
+                .to_vec()
+        );
+        assert_eq!(INITIAL_RECOVERY_BACKOFF, Duration::from_millis(50));
+        assert_eq!(MAX_RECOVERY_BACKOFF, Duration::from_secs(5));
     }
 }
