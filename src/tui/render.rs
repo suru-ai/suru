@@ -917,16 +917,17 @@ fn render_session(
     let composer_height =
         desired_composer_height.min(frame.area().height.saturating_sub(reserved_height).max(1));
     let provisional_prompts = state.provisional_prompts(session_id);
+    let interaction = state
+        .session_interaction(session_id)
+        .expect("Session interaction is initialized with its snapshot");
     let transcript_view = state.transcript_cache.view(
         state.transcript_generation,
         snapshot,
         &provisional_prompts,
+        &interaction.folds.borrow(),
         theme,
         content_width,
     );
-    let interaction = state
-        .session_interaction(session_id)
-        .expect("Session interaction is initialized with its snapshot");
     let [_, transcript_without_latest, _, _, _, _, _] = session_areas(
         frame.area(),
         u16::from(show_header),
@@ -1027,14 +1028,21 @@ fn render_session(
         transcript_view.window(scroll_position, usize::from(transcript_area.height));
     let local_scroll =
         local_scroll.min(usize::from(u16::MAX.saturating_sub(transcript_area.height))) as u16;
+    let has_top_border = transcript_area.height > 1;
+    // The top border pushes projected rows down one, so a pointer maps back to
+    // a transcript row through the same offset the widget draws with.
+    let border_rows = u16::from(has_top_border);
     interaction.viewport.replace(Some(TranscriptViewport {
         height: viewport_height,
         scroll_position,
         maximum_scroll,
         message_starts: transcript_view.message_starts().to_vec(),
+        activity_starts: transcript_view.activity_starts().to_vec(),
+        content_top: transcript_area.y.saturating_add(border_rows),
+        content_rows: transcript_area.height.saturating_sub(border_rows),
     }));
     let transcript_widget = Paragraph::new(Text::from(window_lines)).wrap(Wrap { trim: false });
-    let transcript_widget = if transcript_area.height > 1 {
+    let transcript_widget = if has_top_border {
         transcript_widget.block(
             Block::default()
                 .borders(Borders::TOP)

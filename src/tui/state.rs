@@ -14,10 +14,10 @@ use ratatui::{Frame, style::Style};
 use crate::{
     managed_client::{ManagedEvent, RecoveryStatus, SessionEvent, SessionProjection},
     protocol::{
-        AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
-        InitialPrompt, MessageId, ModelCatalog, PromptDelivery, PromptId, PromptStatus,
-        ServerIdentity, SessionChange, SessionId, SessionListItem, SessionSnapshot, ShutdownReason,
-        TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        Activity, ActivityStatus, AdmitPromptRequest, AgentSelection, AgentSelectionOperationId,
+        CreateSessionRequest, InitialPrompt, MessageId, ModelCatalog, PromptDelivery, PromptId,
+        PromptStatus, ServerIdentity, SessionChange, SessionId, SessionListItem, SessionSnapshot,
+        ShutdownReason, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
     },
     theme::Theme,
 };
@@ -36,7 +36,7 @@ use super::{
     render::render_with_slots,
     session_picker::SessionPicker,
     slots::RenderSlots,
-    transcript::{MessageStart, TranscriptCache},
+    transcript::{ActivityStart, MessageStart, TranscriptCache, TranscriptFolds},
 };
 
 /// Rows scrolled per mouse wheel tick, matching common terminal conventions.
@@ -97,6 +97,10 @@ pub(super) struct SessionInteraction {
     pub(super) anchor: Cell<Option<TranscriptAnchor>>,
     /// Rendering records the latest terminal geometry so semantic page commands can use it.
     pub(super) viewport: RefCell<Option<TranscriptViewport>>,
+    /// How this client presents each foldable Activity. Folds are view state,
+    /// so they live here rather than in the Session and are dropped whenever
+    /// the Session's interaction is.
+    pub(super) folds: RefCell<TranscriptFolds>,
 }
 
 impl Default for SessionInteraction {
@@ -105,6 +109,7 @@ impl Default for SessionInteraction {
             follow_latest: Cell::new(true),
             anchor: Cell::new(None),
             viewport: RefCell::new(None),
+            folds: RefCell::new(TranscriptFolds::default()),
         }
     }
 }
@@ -121,9 +126,36 @@ pub(super) struct TranscriptViewport {
     pub(super) scroll_position: usize,
     pub(super) maximum_scroll: usize,
     pub(super) message_starts: Vec<MessageStart>,
+    pub(super) activity_starts: Vec<ActivityStart>,
+    /// Terminal row the first projected transcript row was drawn on, with the
+    /// count of rows below it, so a pointer position maps back to a transcript
+    /// row without re-deriving the frame's layout.
+    pub(super) content_top: u16,
+    pub(super) content_rows: u16,
 }
 
 impl TranscriptViewport {
+    /// The transcript row drawn at `screen_row`, or `None` when that terminal
+    /// row belongs to another part of the frame.
+    fn transcript_row(&self, screen_row: u16) -> Option<usize> {
+        let offset = screen_row.checked_sub(self.content_top)?;
+        (offset < self.content_rows)
+            .then(|| self.scroll_position.saturating_add(usize::from(offset)))
+    }
+
+    /// The foldable Activity drawn at `screen_row`, with the transcript row the
+    /// pointer landed on. Activities are recorded in row order, so this is a
+    /// binary search rather than a scan of the transcript.
+    fn activity_at(&self, screen_row: u16) -> Option<(ActivityStart, usize)> {
+        let row = self.transcript_row(screen_row)?;
+        let index = self
+            .activity_starts
+            .partition_point(|start| start.row <= row)
+            .checked_sub(1)?;
+        let start = self.activity_starts[index];
+        start.contains(row).then_some((start, row))
+    }
+
     fn anchor_at(&self, scroll_position: usize) -> Option<TranscriptAnchor> {
         let message_start = self
             .message_starts
@@ -616,6 +648,71 @@ impl TuiState {
         interaction.anchor.set(anchor);
     }
 
+    /// The attached Session's interaction state, created if this is the first
+    /// thing to reach for it.
+    fn current_interaction(&mut self) -> Option<&SessionInteraction> {
+        let session_id = self.session.as_ref().map(SessionProjection::session_id)?;
+        Some(self.session_interactions.entry(session_id).or_default())
+    }
+
+    /// Toggles the Fold of the entry drawn at `screen_row`. An entry holding
+    /// content back expands wherever it is clicked; one already showing
+    /// everything folds again only from its header line, so pointing at output
+    /// never hides what is under the pointer. An entry with nothing to hide
+    /// answers neither, so an idle click never records a Fold that does not
+    /// exist.
+    fn toggle_fold_at(&mut self, screen_row: u16) {
+        let Some(interaction) = self.current_interaction() else {
+            return;
+        };
+        let Some((start, row)) = interaction
+            .viewport
+            .borrow()
+            .as_ref()
+            .and_then(|viewport| viewport.activity_at(screen_row))
+        else {
+            return;
+        };
+        let mut folds = interaction.folds.borrow_mut();
+        if start.hides_content {
+            folds.expand(start.activity_id);
+        } else if start.is_header(row) && !folds.is_folded(start.activity_id) {
+            folds.fold(start.activity_id);
+        }
+    }
+
+    /// Flips the Session view between folded-by-default and expanded-by-default.
+    fn toggle_fold_posture(&mut self) {
+        if let Some(interaction) = self.current_interaction() {
+            interaction.folds.borrow_mut().toggle_posture();
+        }
+    }
+
+    /// Expands every Activity still Active in `turn_id`. An interrupted Turn
+    /// leaves its work half-done, and the reader was already watching it, so
+    /// the Fold must not hide what they were reading.
+    fn expand_active_activities(&mut self, turn_id: TurnId) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let active = session
+            .snapshot()
+            .activities
+            .iter()
+            .filter(|activity| {
+                activity.turn_id() == turn_id && activity.status() == Some(ActivityStatus::Active)
+            })
+            .map(Activity::id)
+            .collect::<Vec<_>>();
+        let Some(interaction) = self.current_interaction() else {
+            return;
+        };
+        let mut folds = interaction.folds.borrow_mut();
+        for activity_id in active {
+            folds.expand(activity_id);
+        }
+    }
+
     fn follow_latest(&mut self) {
         let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id) else {
             return;
@@ -925,6 +1022,7 @@ pub enum CommandId {
     ScrollTranscriptLinesUp,
     ScrollTranscriptLinesDown,
     FollowLatest,
+    ToggleTranscriptFoldAt { screen_row: u16 },
     BeginLeader,
     OpenQueuedPrompts,
     SelectPreviousQueuedPrompt,
@@ -1103,7 +1201,10 @@ impl Application {
             | CommandId::ScrollTranscriptPageDown
             | CommandId::ScrollTranscriptLinesUp
             | CommandId::ScrollTranscriptLinesDown
-            | CommandId::FollowLatest) => Ok(self.handle_transcript_command(command)),
+            | CommandId::FollowLatest
+            | CommandId::ToggleTranscriptFoldAt { .. }) => {
+                Ok(self.handle_transcript_command(command))
+            }
             command @ (CommandId::SelectPreviousAutocomplete
             | CommandId::SelectNextAutocomplete
             | CommandId::DismissAutocomplete
@@ -1217,6 +1318,9 @@ impl Application {
                     .navigate_transcript_lines(TranscriptDirection::Down);
             }
             CommandId::FollowLatest => self.state.follow_latest(),
+            CommandId::ToggleTranscriptFoldAt { screen_row } => {
+                self.state.toggle_fold_at(screen_row);
+            }
             _ => {}
         }
         ApplicationTransition::Continue
@@ -1426,6 +1530,7 @@ impl Application {
             return ApplicationTransition::Continue;
         };
         self.state.command_mode = CommandMode::Composer;
+        self.state.expand_active_activities(turn_id);
         ApplicationTransition::InterruptTurn {
             session_id,
             turn_id,
@@ -1669,6 +1774,11 @@ impl Application {
                 let request = self.state.session_picker.open();
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::ListSessions(request))
+            }
+            SemanticCommandId::TranscriptFoldsToggle => {
+                self.state.toggle_fold_posture();
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::SessionDelete => {
                 Ok(self.state.session_picker.begin_deletion().map_or(

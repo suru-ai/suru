@@ -10,7 +10,7 @@
 
 use std::{
     cell::{Ref, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
 };
 
@@ -35,6 +35,93 @@ use super::markdown;
 /// Source lines wrapping to more rows than this are split so ratatui's
 /// u16-based scroll arithmetic stays in range.
 const MAX_TRANSCRIPT_SOURCE_LINE_ROWS: usize = 32_000;
+
+/// Wrapped rows a settled command Activity's output occupies while folded,
+/// split into a head and a tail around the fold marker.
+/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
+const FOLDED_COMMAND_OUTPUT_ROWS: usize = 6;
+
+/// Wrapped rows of live tail an Active command Activity shows while it streams,
+/// before it settles into the head-and-tail form.
+/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
+const LIVE_COMMAND_TAIL_ROWS: usize = 3;
+
+/// The gutter an Activity's subordinate content sits in, so a fold or
+/// truncation marker lines up with the lines it stands in for.
+const OUTPUT_INDENT: &str = "    ";
+
+/// Paths a folded FileChange Activity lists before its fold marker.
+/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
+const FOLDED_FILE_CHANGE_PATHS: usize = 4;
+
+/// Which way a Session's Transcript leans before any per-entry override.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum FoldPosture {
+    /// Entries are folded unless the reader expanded that one.
+    #[default]
+    Folded,
+    /// Entries are expanded unless the reader folded that one.
+    Expanded,
+}
+
+/// One client's Fold state for one Session's Transcript: the posture the view
+/// leans to, plus the entries the reader flipped away from it. Folds are
+/// presentation only, so this never reaches the Session, never syncs between
+/// clients, and dies with the process.
+#[derive(Clone, Debug, Default)]
+pub(super) struct TranscriptFolds {
+    posture: FoldPosture,
+    overrides: HashSet<ActivityId>,
+}
+
+impl TranscriptFolds {
+    pub(super) fn is_folded(&self, activity_id: ActivityId) -> bool {
+        (self.posture == FoldPosture::Folded) != self.overrides.contains(&activity_id)
+    }
+
+    /// Flips the whole view between folded-by-default and expanded-by-default.
+    /// Per-entry overrides are dropped so one invocation always reaches a
+    /// posture the reader can predict.
+    pub(super) fn toggle_posture(&mut self) {
+        self.posture = match self.posture {
+            FoldPosture::Folded => FoldPosture::Expanded,
+            FoldPosture::Expanded => FoldPosture::Folded,
+        };
+        self.overrides.clear();
+    }
+
+    pub(super) fn expand(&mut self, activity_id: ActivityId) {
+        self.set_folded(activity_id, false);
+    }
+
+    pub(super) fn fold(&mut self, activity_id: ActivityId) {
+        self.set_folded(activity_id, true);
+    }
+
+    fn set_folded(&mut self, activity_id: ActivityId, folded: bool) {
+        if (self.posture == FoldPosture::Folded) == folded {
+            self.overrides.remove(&activity_id);
+        } else {
+            self.overrides.insert(activity_id);
+        }
+    }
+
+    /// Order-independent digest of the Fold state, so the view cache rebuilds
+    /// when a Fold changes without depending on hash iteration order.
+    fn fingerprint(&self) -> u64 {
+        let mut overrides = 0u64;
+        for activity_id in &self.overrides {
+            let mut hasher = std::hash::DefaultHasher::new();
+            activity_id.hash(&mut hasher);
+            overrides ^= hasher.finish();
+        }
+        let mut hasher = std::hash::DefaultHasher::new();
+        (self.posture as u8).hash(&mut hasher);
+        self.overrides.len().hash(&mut hasher);
+        overrides.hash(&mut hasher);
+        hasher.finish()
+    }
+}
 
 /// A kind of Provider stream Suru stores under a cap. The kind decides what a
 /// truncation marker names, so the marker ends the thing the reader was
@@ -67,6 +154,30 @@ pub(super) struct MessageStart {
     pub(super) row: usize,
 }
 
+/// Where a foldable Activity sits in the projected rows, so a pointer lands on
+/// an entry in one lookup instead of a re-render. `header_rows` covers the
+/// entry's header line, the only part of an expanded entry that re-folds it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ActivityStart {
+    pub(super) activity_id: ActivityId,
+    pub(super) row: usize,
+    pub(super) header_rows: usize,
+    pub(super) row_count: usize,
+    /// Whether the entry as drawn is holding content back, so a click only
+    /// toggles a Fold that is really there.
+    pub(super) hides_content: bool,
+}
+
+impl ActivityStart {
+    pub(super) const fn contains(&self, row: usize) -> bool {
+        row >= self.row && row < self.row + self.row_count
+    }
+
+    pub(super) const fn is_header(&self, row: usize) -> bool {
+        row >= self.row && row < self.row + self.header_rows
+    }
+}
+
 /// Memoized transcript view owned by the render state. Interior mutability
 /// keeps the cache transparent to callers that render from `&TuiState`.
 #[derive(Clone, Debug, Default)]
@@ -82,6 +193,7 @@ impl TranscriptCache {
         generation: u64,
         snapshot: &SessionSnapshot,
         provisional: &[&InitialPrompt],
+        folds: &TranscriptFolds,
         theme: &Theme,
         width: u16,
     ) -> Ref<'_, TranscriptView> {
@@ -92,6 +204,7 @@ impl TranscriptCache {
             theme: *theme,
             width,
             provisional_fingerprint: provisional_fingerprint(provisional),
+            folds_fingerprint: folds.fingerprint(),
         };
         let needs_rebuild = self
             .view
@@ -101,7 +214,15 @@ impl TranscriptCache {
         if needs_rebuild {
             let mut slot = self.view.borrow_mut();
             let previous = slot.take();
-            *slot = Some(rebuild(previous, key, snapshot, provisional, theme, width));
+            *slot = Some(rebuild(
+                previous,
+                key,
+                snapshot,
+                provisional,
+                folds,
+                theme,
+                width,
+            ));
         }
         Ref::map(self.view.borrow(), |view| {
             view.as_ref().expect("transcript view was just rebuilt")
@@ -117,6 +238,9 @@ struct ViewKey {
     theme: Theme,
     width: u16,
     provisional_fingerprint: u64,
+    /// Folds are a rendering input outside the Session snapshot, so ADR 0007
+    /// requires them in the key or a flipped Fold would render a stale frame.
+    folds_fingerprint: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +249,7 @@ pub(super) struct TranscriptView {
     items: Vec<ItemView>,
     row_count: usize,
     message_starts: Vec<MessageStart>,
+    activity_starts: Vec<ActivityStart>,
     /// Row offset of every source line across all items, for scroll math.
     line_starts: Vec<usize>,
 }
@@ -141,6 +266,10 @@ impl TranscriptView {
 
     pub(super) fn message_starts(&self) -> &[MessageStart] {
         &self.message_starts
+    }
+
+    pub(super) fn activity_starts(&self) -> &[ActivityStart] {
+        &self.activity_starts
     }
 
     /// Parsed hyperlink targets retained for future semantic commands and
@@ -204,6 +333,16 @@ struct ItemView {
     rows_per_line: Vec<usize>,
     start_line: usize,
     message_id: Option<MessageId>,
+    anchor: Option<ActivityAnchor>,
+}
+
+/// A foldable Activity's identity, the count of laid-out lines that form its
+/// header, and whether its Fold held content back.
+#[derive(Clone, Copy, Debug)]
+struct ActivityAnchor {
+    activity_id: ActivityId,
+    header_lines: usize,
+    hides_content: bool,
 }
 
 fn rebuild(
@@ -211,6 +350,7 @@ fn rebuild(
     key: ViewKey,
     snapshot: &SessionSnapshot,
     provisional: &[&InitialPrompt],
+    folds: &TranscriptFolds,
     theme: &Theme,
     width: u16,
 ) -> TranscriptView {
@@ -252,20 +392,24 @@ fn rebuild(
                     message_fingerprint(message),
                     Some(message.id),
                     width,
-                    |lines, _links| render_message(lines, message, theme, width),
+                    |lines, _links| {
+                        render_message(lines, message, theme, width);
+                        None
+                    },
                 ));
             }
             TranscriptItem::Activity { activity_id } => {
                 let Some(activity) = activities.get(activity_id) else {
                     continue;
                 };
+                let folded = folds.is_folded(activity.id());
                 items.push(reuse_or_render(
                     &mut reusable,
                     ItemKey::Activity(activity.id()),
-                    activity_fingerprint(activity),
+                    activity_fingerprint(activity, folded),
                     None,
                     width,
-                    |lines, links| render_activity(lines, links, activity, theme),
+                    |lines, links| render_activity(lines, links, activity, folded, theme, width),
                 ));
             }
         }
@@ -277,16 +421,21 @@ fn rebuild(
             prompt.text.len() as u64,
             None,
             width,
-            |lines, _links| push_user_message(lines, &prompt.text, theme, width),
+            |lines, _links| {
+                push_user_message(lines, &prompt.text, theme, width);
+                None
+            },
         ));
     }
 
     let mut row_count = 0;
     let mut line_count = 0;
     let mut message_starts = Vec::new();
+    let mut activity_starts = Vec::new();
     let mut line_starts = Vec::new();
     for item in &mut items {
         item.start_line = line_count;
+        let item_start_row = row_count;
         if let Some(message_id) = item.message_id {
             message_starts.push(MessageStart {
                 message_id,
@@ -298,23 +447,36 @@ fn rebuild(
             row_count += rows_of_line;
         }
         line_count += item.lines.len();
+        if let Some(anchor) = item.anchor {
+            activity_starts.push(ActivityStart {
+                activity_id: anchor.activity_id,
+                row: item_start_row,
+                header_rows: item.rows_per_line[..anchor.header_lines].iter().sum(),
+                row_count: row_count - item_start_row,
+                hides_content: anchor.hides_content,
+            });
+        }
     }
     TranscriptView {
         key,
         items,
         row_count,
         message_starts,
+        activity_starts,
         line_starts,
     }
 }
 
+/// Renders one transcript item, or returns the cached render when nothing it
+/// depends on changed. `render` reports the item's fold anchor, whose header
+/// line count is re-derived here because oversized lines split during layout.
 fn reuse_or_render(
     reusable: &mut HashMap<ItemKey, ItemView>,
     key: ItemKey,
     fingerprint: u64,
     message_id: Option<MessageId>,
     width: u16,
-    render: impl FnOnce(&mut Vec<Line<'static>>, &mut Vec<TranscriptLink>),
+    render: impl FnOnce(&mut Vec<Line<'static>>, &mut Vec<TranscriptLink>) -> Option<FoldAnchor>,
 ) -> ItemView {
     if let Some(item) = reusable.remove(&key)
         && item.fingerprint == fingerprint
@@ -323,10 +485,14 @@ fn reuse_or_render(
     }
     let mut rendered = Vec::new();
     let mut links = Vec::new();
-    render(&mut rendered, &mut links);
+    let rendered_anchor = render(&mut rendered, &mut links);
     let mut lines = Vec::with_capacity(rendered.len());
-    for line in rendered {
+    let mut header_lines = 0;
+    for (index, line) in rendered.into_iter().enumerate() {
         split_oversized_line(line, width, &mut lines);
+        if rendered_anchor.is_some_and(|anchor| index + 1 == anchor.entry.header_source_lines) {
+            header_lines = lines.len();
+        }
     }
     let rows_per_line = lines
         .iter()
@@ -340,7 +506,29 @@ fn reuse_or_render(
         rows_per_line,
         start_line: 0,
         message_id,
+        anchor: rendered_anchor.map(|anchor| ActivityAnchor {
+            activity_id: anchor.activity_id,
+            header_lines,
+            hides_content: anchor.entry.hides_content,
+        }),
     }
+}
+
+/// What a foldable entry's renderer reports: how many of the lines it just
+/// pushed form the header a reader clicks to fold it again, and whether its
+/// Fold held any content back. The count is in pre-split source lines, which
+/// layout resolves to rows.
+#[derive(Clone, Copy, Debug)]
+struct FoldedEntry {
+    header_source_lines: usize,
+    hides_content: bool,
+}
+
+/// A [`FoldedEntry`] joined to the Activity it projected.
+#[derive(Clone, Copy, Debug)]
+struct FoldAnchor {
+    activity_id: ActivityId,
+    entry: FoldedEntry,
 }
 
 /// Message content is append-only, so its length identifies it within a
@@ -353,8 +541,12 @@ fn message_fingerprint(message: &Message) -> u64 {
     hasher.finish()
 }
 
-fn activity_fingerprint(activity: &Activity) -> u64 {
+/// Identifies an Activity's rendered form. The Fold state joins the content
+/// signals because a folded entry renders different lines from the same
+/// Activity.
+fn activity_fingerprint(activity: &Activity, folded: bool) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
+    folded.hash(&mut hasher);
     match activity {
         Activity::Status { .. } | Activity::Error { .. } => {}
         Activity::Command {
@@ -463,25 +655,47 @@ fn render_message(lines: &mut Vec<Line<'static>>, message: &Message, theme: &The
     }
 }
 
+/// Projects one Activity, reporting a fold anchor for the kinds a reader can
+/// fold. `Status` is already one line and `Error` is a failure the reader must
+/// not have to hunt for, so neither is ever folded and neither anchors a click.
 fn render_activity(
     lines: &mut Vec<Line<'static>>,
     links: &mut Vec<TranscriptLink>,
     activity: &Activity,
+    folded: bool,
     theme: &Theme,
-) {
+    width: u16,
+) -> Option<FoldAnchor> {
     let mut projection = ActivityProjection { lines, links };
     match activity {
         Activity::Status { text, .. } => {
-            push_styled_prefixed_lines(&mut projection, "  ", text, theme.text.subdued, theme)
+            push_styled_prefixed_lines(
+                &mut projection,
+                ContentGutter {
+                    lead: "  ",
+                    indent: "  ",
+                },
+                text,
+                theme.text.subdued,
+                theme,
+            );
+            None
         }
-        Activity::Error { text, .. } => push_styled_prefixed_lines(
-            &mut projection,
-            "  Error: ",
-            text,
-            theme.feedback.error,
-            theme,
-        ),
+        Activity::Error { text, .. } => {
+            push_styled_prefixed_lines(
+                &mut projection,
+                ContentGutter {
+                    lead: "  Error: ",
+                    indent: "  ",
+                },
+                text,
+                theme.feedback.error,
+                theme,
+            );
+            None
+        }
         Activity::Command {
+            id,
             status,
             command,
             cwd,
@@ -489,21 +703,39 @@ fn render_activity(
             output_truncated,
             exit_status,
             ..
-        } => push_command_activity(
-            &mut projection,
-            CommandActivity {
-                status: *status,
-                command,
-                cwd: cwd.as_deref(),
-                output,
-                output_truncated: *output_truncated,
-                exit_status: *exit_status,
-            },
-            theme,
-        ),
+        } => {
+            let entry = push_command_activity(
+                &mut projection,
+                CommandActivity {
+                    status: *status,
+                    command,
+                    cwd: cwd.as_deref(),
+                    output,
+                    output_truncated: *output_truncated,
+                    exit_status: *exit_status,
+                },
+                folded,
+                theme,
+                width,
+            );
+            Some(FoldAnchor {
+                activity_id: *id,
+                entry,
+            })
+        }
         Activity::FileChange {
-            status, changes, ..
-        } => push_file_change_activity(projection.lines, *status, changes, theme),
+            id,
+            status,
+            changes,
+            ..
+        } => {
+            let entry =
+                push_file_change_activity(projection.lines, *status, changes, folded, theme);
+            Some(FoldAnchor {
+                activity_id: *id,
+                entry,
+            })
+        }
     }
 }
 
@@ -523,11 +755,16 @@ struct CommandActivity<'a> {
     exit_status: Option<i32>,
 }
 
+/// Projects a command Activity. Output is projected in full first so hyperlink
+/// targets survive, and only then clamped, so a Fold changes presentation and
+/// nothing else.
 fn push_command_activity(
     projection: &mut ActivityProjection<'_>,
     activity: CommandActivity<'_>,
+    folded: bool,
     theme: &Theme,
-) {
+    width: u16,
+) -> FoldedEntry {
     use crate::protocol::ActivityStatus;
 
     let CommandActivity {
@@ -549,7 +786,9 @@ fn push_command_activity(
         }
         _ => command.to_owned(),
     };
+    let header_start = projection.lines.len();
     push_prefixed_lines(projection.lines, &format!("  {marker}"), &command, style);
+    let header_source_lines = projection.lines.len() - header_start;
     if let Some(cwd) = cwd {
         push_prefixed_lines(
             projection.lines,
@@ -558,12 +797,100 @@ fn push_command_activity(
             theme.text.subdued,
         );
     }
+    let mut hides_content = false;
     if !output.is_empty() {
-        push_styled_prefixed_lines(projection, "    ", output, theme.text.subdued, theme);
+        let mut output_lines = Vec::new();
+        push_styled_prefixed_lines(
+            &mut ActivityProjection {
+                lines: &mut output_lines,
+                links: projection.links,
+            },
+            ContentGutter {
+                lead: OUTPUT_INDENT,
+                indent: OUTPUT_INDENT,
+            },
+            output,
+            theme.text.subdued,
+            theme,
+        );
+        if folded {
+            let projected = output_lines.len();
+            output_lines = fold_command_output(output_lines, status, theme, width);
+            hides_content = output_lines.len() != projected;
+        }
+        projection.lines.append(&mut output_lines);
     }
     if output_truncated {
-        push_truncation_marker(projection.lines, CappedStream::CommandOutput, "    ", theme);
+        push_truncation_marker(
+            projection.lines,
+            CappedStream::CommandOutput,
+            OUTPUT_INDENT,
+            theme,
+        );
     }
+    FoldedEntry {
+        header_source_lines,
+        hides_content,
+    }
+}
+
+/// Clamps a command's projected output to its Fold budget, splitting it into a
+/// head and a tail joined by the fold marker. An Active command keeps only a
+/// live tail of what it is writing now; a settled one keeps both ends.
+///
+/// Rows are counted after wrapping so a handful of very long lines cannot
+/// flood the budget, while the marker counts the source lines it replaced, so
+/// the number a reader sees does not shift when the terminal is resized.
+fn fold_command_output(
+    mut lines: Vec<Line<'static>>,
+    status: crate::protocol::ActivityStatus,
+    theme: &Theme,
+    width: u16,
+) -> Vec<Line<'static>> {
+    use crate::protocol::ActivityStatus;
+
+    let (head_rows, tail_rows) = match status {
+        ActivityStatus::Active => (0, LIVE_COMMAND_TAIL_ROWS),
+        ActivityStatus::Completed | ActivityStatus::Failed => (
+            FOLDED_COMMAND_OUTPUT_ROWS / 2,
+            FOLDED_COMMAND_OUTPUT_ROWS - FOLDED_COMMAND_OUTPUT_ROWS / 2,
+        ),
+    };
+    let rows_per_line = lines
+        .iter()
+        .map(|line| wrapped_line_count(line, width).max(1))
+        .collect::<Vec<_>>();
+    if rows_per_line.iter().sum::<usize>() <= head_rows + tail_rows {
+        return lines;
+    }
+    let mut head_end = 0;
+    let mut head_used = 0;
+    while head_end < lines.len() && head_used + rows_per_line[head_end] <= head_rows {
+        head_used += rows_per_line[head_end];
+        head_end += 1;
+    }
+    let mut tail_start = lines.len();
+    let mut tail_used = 0;
+    while tail_start > head_end && tail_used + rows_per_line[tail_start - 1] <= tail_rows {
+        tail_used += rows_per_line[tail_start - 1];
+        tail_start -= 1;
+    }
+    let hidden = tail_start - head_end;
+    if hidden == 0 {
+        return lines;
+    }
+    let tail = lines.split_off(tail_start);
+    lines.truncate(head_end);
+    lines.push(fold_marker_line(hidden, "lines", OUTPUT_INDENT, theme));
+    lines.extend(tail);
+    lines
+}
+
+/// Renders the fold marker: how much this entry's Fold hides, styled as the
+/// affordance it is so a reader never reads it as the truncation marker, which
+/// reports content Suru's storage cap dropped for good.
+fn fold_marker_line(hidden: usize, unit: &str, indent: &str, theme: &Theme) -> Line<'static> {
+    Line::styled(format!("{indent}… +{hidden} {unit}"), theme.action.primary)
 }
 
 /// Renders the truncation marker as its own line, styled from Suru's typed
@@ -581,12 +908,17 @@ fn push_truncation_marker(
     ));
 }
 
+/// Projects a FileChange Activity. A folded entry lists the first few paths
+/// and reports the rest through the same fold marker and the same per-entry
+/// Fold state a command Activity uses, which is what makes those generic
+/// rather than specific to command output.
 fn push_file_change_activity(
     lines: &mut Vec<Line<'static>>,
     status: crate::protocol::ActivityStatus,
     changes: &[FileChange],
+    folded: bool,
     theme: &Theme,
-) {
+) -> FoldedEntry {
     use crate::protocol::ActivityStatus;
 
     let (marker, label, style) = match status {
@@ -594,8 +926,15 @@ fn push_file_change_activity(
         ActivityStatus::Completed => ("✓ ", "Applied file changes", theme.feedback.success),
         ActivityStatus::Failed => ("× ", "Failed to apply file changes", theme.feedback.error),
     };
+    let header_start = lines.len();
     push_prefixed_lines(lines, &format!("  {marker}"), label, style);
-    for change in changes {
+    let header_source_lines = lines.len() - header_start;
+    let listed = if folded {
+        changes.len().min(FOLDED_FILE_CHANGE_PATHS)
+    } else {
+        changes.len()
+    };
+    for change in &changes[..listed] {
         let summary = match change {
             FileChange::Add { path } => format!("A {}", path.to_string_lossy()),
             FileChange::Delete { path } => format!("D {}", path.to_string_lossy()),
@@ -612,7 +951,15 @@ fn push_file_change_activity(
                 moved_to: None,
             } => format!("M {}", path.to_string_lossy()),
         };
-        push_prefixed_lines(lines, "    ", &summary, theme.text.subdued);
+        push_prefixed_lines(lines, OUTPUT_INDENT, &summary, theme.text.subdued);
+    }
+    let hidden = changes.len() - listed;
+    if hidden > 0 {
+        lines.push(fold_marker_line(hidden, "more", OUTPUT_INDENT, theme));
+    }
+    FoldedEntry {
+        header_source_lines,
+        hides_content: hidden > 0,
     }
 }
 
@@ -692,16 +1039,26 @@ fn push_prefixed_lines(lines: &mut Vec<Line<'static>>, prefix: &str, content: &s
     }
 }
 
+/// What precedes an Activity's projected content: the label or gutter its
+/// first line opens with, and the indent every line after it sits in.
+#[derive(Clone, Copy, Debug)]
+struct ContentGutter<'a> {
+    lead: &'a str,
+    indent: &'a str,
+}
+
+/// Projects Activity content one source line per rendered line, keeping the
+/// style and link transitions the stream carried.
 fn push_styled_prefixed_lines(
     projection: &mut ActivityProjection<'_>,
-    prefix: &str,
+    gutter: ContentGutter<'_>,
     content: &str,
     base_style: Style,
     theme: &Theme,
 ) {
     let mut style = SgrStyle::new(base_style);
     let mut hyperlink_active = false;
-    let mut spans = vec![Span::styled(prefix.to_owned(), base_style)];
+    let mut spans = vec![Span::styled(gutter.lead.to_owned(), base_style)];
     let mut line_has_content = false;
 
     for token in content_tokens(content) {
@@ -730,7 +1087,7 @@ fn push_styled_prefixed_lines(
                 projection
                     .lines
                     .push(Line::from(std::mem::take(&mut spans)));
-                spans.push(Span::styled("  ", base_style));
+                spans.push(Span::styled(gutter.indent.to_owned(), base_style));
                 line_has_content = false;
             }
             ContentToken::Text(_) => {}
@@ -1048,7 +1405,7 @@ mod tests {
         theme::Theme,
     };
 
-    use super::{CappedStream, TranscriptCache, render_activity, render_message};
+    use super::{CappedStream, TranscriptCache, TranscriptFolds, render_activity, render_message};
 
     fn rendered_text(line: &Line<'static>) -> String {
         line.spans.iter().map(|span| &*span.content).collect()
@@ -1074,7 +1431,7 @@ mod tests {
         let mut lines = Vec::new();
         let mut links = Vec::new();
 
-        render_activity(&mut lines, &mut links, &activity, &theme);
+        render_activity(&mut lines, &mut links, &activity, true, &theme, 80);
 
         let spans = &lines.last().expect("render command output").spans;
         let normal = spans
@@ -1116,7 +1473,7 @@ mod tests {
         let mut lines = Vec::new();
         let mut links = Vec::new();
 
-        render_activity(&mut lines, &mut links, &activity, &theme);
+        render_activity(&mut lines, &mut links, &activity, true, &theme, 80);
 
         let spans = &lines.last().expect("render command output").spans;
         let style_for = |content| {
@@ -1168,13 +1525,27 @@ mod tests {
         let cache = TranscriptCache::default();
         let mut first_theme = Theme::system();
         first_theme.ansi.normal.red = Color::Rgb(1, 2, 3);
-        let first = cache.view(0, &snapshot, &[], &first_theme, 80);
+        let first = cache.view(
+            0,
+            &snapshot,
+            &[],
+            &TranscriptFolds::default(),
+            &first_theme,
+            80,
+        );
         let first_lines = first.window(0, 10).0;
         drop(first);
         let mut second_theme = first_theme;
         second_theme.ansi.normal.red = Color::Rgb(4, 5, 6);
 
-        let second = cache.view(0, &snapshot, &[], &second_theme, 80);
+        let second = cache.view(
+            0,
+            &snapshot,
+            &[],
+            &TranscriptFolds::default(),
+            &second_theme,
+            80,
+        );
         let second_lines = second.window(0, 10).0;
 
         let themed_color = |lines: &[Line<'static>]| {
@@ -1188,6 +1559,84 @@ mod tests {
         };
         assert_eq!(themed_color(&first_lines), Some(Color::Rgb(1, 2, 3)));
         assert_eq!(themed_color(&second_lines), Some(Color::Rgb(4, 5, 6)));
+    }
+
+    #[test]
+    fn transcript_cache_rebuilds_when_only_the_fold_state_changes() {
+        let activity = Activity::Command {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Completed,
+            command: "emit many lines".to_owned(),
+            cwd: None,
+            output: (1..=20)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            output_truncated: false,
+            exit_status: Some(0),
+        };
+        let snapshot = SessionSnapshot {
+            session: Session {
+                id: crate::protocol::SessionId::new(),
+                workspace: Workspace {
+                    path: PathBuf::from("/workspace"),
+                },
+                agent_selection: None,
+                agent_selection_availability: ModelAvailability::Available,
+                status: SessionStatus::Idle,
+            },
+            revision: SessionRevision::INITIAL,
+            prompts: Vec::new(),
+            turns: Vec::new(),
+            messages: Vec::new(),
+            activities: vec![activity.clone()],
+            transcript: vec![TranscriptItem::Activity {
+                activity_id: activity.id(),
+            }],
+        };
+        let theme = Theme::system();
+        let cache = TranscriptCache::default();
+        let mut folds = TranscriptFolds::default();
+
+        let folded_rows = cache
+            .view(0, &snapshot, &[], &folds, &theme, 80)
+            .row_count();
+        folds.expand(activity.id());
+        let expanded_rows = cache
+            .view(0, &snapshot, &[], &folds, &theme, 80)
+            .row_count();
+
+        assert!(
+            expanded_rows > folded_rows,
+            "the Fold state is a rendering input, so flipping it alone must rebuild the view: \
+             {folded_rows} rows folded, {expanded_rows} rows expanded"
+        );
+    }
+
+    #[test]
+    fn flipping_the_fold_posture_drops_the_overrides_taken_against_the_previous_one() {
+        let expanded_by_hand = ActivityId::new();
+        let untouched = ActivityId::new();
+        let mut folds = TranscriptFolds::default();
+        folds.expand(expanded_by_hand);
+        assert!(!folds.is_folded(expanded_by_hand));
+        assert!(folds.is_folded(untouched));
+
+        folds.toggle_posture();
+
+        assert!(
+            !folds.is_folded(expanded_by_hand) && !folds.is_folded(untouched),
+            "the expanded posture shows every entry, whatever the reader flipped before"
+        );
+
+        folds.fold(untouched);
+        assert!(folds.is_folded(untouched));
+        folds.toggle_posture();
+        assert!(
+            folds.is_folded(expanded_by_hand) && folds.is_folded(untouched),
+            "flipping back folds everything again"
+        );
     }
 
     #[test]
@@ -1206,7 +1655,7 @@ mod tests {
         let mut lines = Vec::new();
         let mut links = Vec::new();
 
-        render_activity(&mut lines, &mut links, &activity, &theme);
+        render_activity(&mut lines, &mut links, &activity, true, &theme, 80);
 
         let marker = lines.last().expect("render the truncation marker");
         assert_eq!(rendered_text(marker), "    [output truncated]");
@@ -1276,7 +1725,7 @@ mod tests {
         let mut lines = Vec::new();
         let mut links = Vec::new();
 
-        render_activity(&mut lines, &mut links, &activity, &theme);
+        render_activity(&mut lines, &mut links, &activity, true, &theme, 80);
 
         let marker_lines = lines
             .iter()
@@ -1341,7 +1790,14 @@ mod tests {
         let mut lines = Vec::new();
         let mut links = Vec::new();
 
-        render_activity(&mut lines, &mut links, &activity, &Theme::system());
+        render_activity(
+            &mut lines,
+            &mut links,
+            &activity,
+            true,
+            &Theme::system(),
+            80,
+        );
 
         assert_eq!(
             links

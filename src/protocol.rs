@@ -485,6 +485,15 @@ impl Activity {
             | Self::FileChange { turn_id, .. } => *turn_id,
         }
     }
+
+    /// The lifecycle this Activity settles through, or `None` for the kinds
+    /// that report a moment rather than work in progress.
+    pub const fn status(&self) -> Option<ActivityStatus> {
+        match self {
+            Self::Status { .. } | Self::Error { .. } => None,
+            Self::Command { status, .. } | Self::FileChange { status, .. } => Some(*status),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

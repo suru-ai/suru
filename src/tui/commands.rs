@@ -18,6 +18,7 @@ pub enum SemanticCommandId {
     SessionList,
     SessionDelete,
     SessionNew,
+    TranscriptFoldsToggle,
 }
 
 impl SemanticCommandId {
@@ -35,6 +36,7 @@ impl SemanticCommandId {
             Self::SessionList => "session.list",
             Self::SessionDelete => "session.delete",
             Self::SessionNew => "session.new",
+            Self::TranscriptFoldsToggle => "transcript.folds.toggle",
         }
     }
 }
@@ -175,6 +177,18 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         description: "Delete the selected Session and everything it owns",
         slash: None,
         keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::TranscriptFoldsToggle,
+        title: "Toggle Transcript Folds",
+        description: "Show every Transcript entry in full, or fold them back down",
+        slash: None,
+        keybinding: Some(SemanticKeybinding {
+            prefix: Some(LEADER_PREFIX),
+            code: KeyCode::Char('f'),
+            modifiers: KeyModifiers::NONE,
+            label: "Ctrl+X F",
+        }),
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::SessionNew,

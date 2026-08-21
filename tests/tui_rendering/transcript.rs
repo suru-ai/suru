@@ -1359,3 +1359,644 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
     assert_eq!(latest.matches("Reconciled line one").count(), 1);
     assert!(!latest.contains("Latest"));
 }
+
+/// A Session whose single Activity is a command carrying `output`, so a test
+/// can drive one entry's Fold without competing transcript content.
+fn command_activity_session(
+    workspace: &std::path::Path,
+    status: ActivityStatus,
+    output: &str,
+    output_truncated: bool,
+) -> (suru::protocol::SessionSnapshot, ActivityId) {
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Run the test suite",
+        workspace,
+    );
+    let activity_id = snapshot.activities[0].id();
+    snapshot.activities[0] = Activity::Command {
+        id: activity_id,
+        turn_id: snapshot.turns[0].id,
+        status,
+        command: "cargo test".to_owned(),
+        cwd: None,
+        output: output.to_owned(),
+        output_truncated,
+        exit_status: match status {
+            ActivityStatus::Active => None,
+            ActivityStatus::Completed | ActivityStatus::Failed => Some(0),
+        },
+    };
+    (snapshot, activity_id)
+}
+
+fn numbered_output(lines: usize) -> String {
+    (1..=lines)
+        .map(|line| format!("output line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn left_click_at(row: u16) -> InputEvent {
+    InputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 6,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+#[test]
+fn settled_command_output_folds_to_a_head_and_tail_around_a_fold_marker() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a long command Activity");
+
+    let folded = rendered_application_rows_at(&application, 60, 24).join("\n");
+
+    for head in ["output line 1", "output line 2", "output line 3"] {
+        assert!(
+            folded.contains(head),
+            "a Fold keeps the head of the output: {folded}"
+        );
+    }
+    for tail in ["output line 10", "output line 11", "output line 12"] {
+        assert!(
+            folded.contains(tail),
+            "a Fold keeps the tail of the output: {folded}"
+        );
+    }
+    for hidden in ["output line 5", "output line 6", "output line 7"] {
+        assert!(
+            !folded.contains(hidden),
+            "a Fold hides the middle of the output: {folded}"
+        );
+    }
+    assert!(
+        folded.contains("… +6 lines"),
+        "a folded entry says how much it hides: {folded}"
+    );
+}
+
+#[test]
+fn the_fold_marker_counts_logical_lines_so_it_reads_the_same_at_every_width() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a long command Activity");
+
+    let narrow = rendered_application_rows_at(&application, 44, 24).join("\n");
+    let wide = rendered_application_rows_at(&application, 110, 24).join("\n");
+
+    assert!(narrow.contains("… +6 lines"), "narrow frame: {narrow}");
+    assert!(wide.contains("… +6 lines"), "wide frame: {wide}");
+}
+
+#[test]
+fn long_output_lines_wrap_before_the_clamp_so_a_few_cannot_flood_the_fold() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let output = (1..=4)
+        .map(|line| format!("line {line} {}", "x".repeat(200)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (snapshot, _) =
+        command_activity_session(workspace.path(), ActivityStatus::Completed, &output, false);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with very long output lines");
+
+    let rows = rendered_application_rows_at(&application, 60, 24);
+    let folded = rows.join("\n");
+
+    assert!(
+        folded.contains("… +4 lines"),
+        "the marker counts the four source lines it replaced, not their wrapped rows: {folded}"
+    );
+    assert!(
+        !folded.contains("xxxx"),
+        "no wrapped row of a clamped line survives the Fold: {folded}"
+    );
+}
+
+#[test]
+fn clicking_a_folded_command_expands_it_and_clicking_its_header_folds_it_back() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a long command Activity");
+    let folded_rows = rendered_application_rows_at(&application, 60, 24);
+    let marker_row = rendered_row(&folded_rows, "… +6 lines") as u16;
+
+    assert_eq!(
+        application
+            .handle_terminal_event(left_click_at(marker_row))
+            .expect("click the fold marker"),
+        ApplicationTransition::Continue
+    );
+    let expanded_rows = rendered_application_rows_at(&application, 60, 24);
+    let expanded = expanded_rows.join("\n");
+    for line in 1..=12 {
+        assert!(
+            expanded.contains(&format!("output line {line}")),
+            "expanding reveals everything stored: {expanded}"
+        );
+    }
+    assert!(
+        !expanded.contains("… +"),
+        "no fold marker remains: {expanded}"
+    );
+
+    let header_row = rendered_row(&expanded_rows, "✓ cargo test") as u16;
+    application
+        .handle_terminal_event(left_click_at(header_row))
+        .expect("click the entry header");
+    let refolded = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        refolded.contains("… +6 lines"),
+        "clicking the header folds the entry again: {refolded}"
+    );
+}
+
+#[test]
+fn clicking_inside_expanded_output_leaves_the_entry_expanded() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a long command Activity");
+    let folded_rows = rendered_application_rows_at(&application, 60, 24);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&folded_rows, "… +6 lines") as u16
+        ))
+        .expect("expand the entry");
+    let expanded_rows = rendered_application_rows_at(&application, 60, 24);
+
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&expanded_rows, "output line 6") as u16
+        ))
+        .expect("click inside the revealed output");
+
+    let after = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        after.contains("output line 6"),
+        "a click on output never folds away the content under the pointer: {after}"
+    );
+    assert!(!after.contains("… +"), "the entry stays expanded: {after}");
+}
+
+#[test]
+fn toggling_the_fold_posture_expands_every_entry_and_clears_per_entry_overrides() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a long command Activity");
+    let folded_rows = rendered_application_rows_at(&application, 60, 24);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&folded_rows, "… +6 lines") as u16
+        ))
+        .expect("expand one entry by hand");
+
+    for key in [
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+    ] {
+        application
+            .handle_terminal_event(InputEvent::Key(key))
+            .expect("invoke transcript.folds.toggle");
+    }
+    let expanded = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        expanded.contains("output line 6") && !expanded.contains("… +"),
+        "the expanded posture shows every entry in full: {expanded}"
+    );
+
+    for key in [
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+    ] {
+        application
+            .handle_terminal_event(InputEvent::Key(key))
+            .expect("invoke transcript.folds.toggle again");
+    }
+    let refolded = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        refolded.contains("… +6 lines"),
+        "flipping back folds the entry the reader had expanded by hand: {refolded}"
+    );
+}
+
+#[test]
+fn error_and_status_activities_are_never_folded() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Run the test suite",
+        workspace.path(),
+    );
+    let turn_id = snapshot.turns[0].id;
+    let status_id = ActivityId::new();
+    snapshot.activities[0] = Activity::Error {
+        id: snapshot.activities[0].id(),
+        turn_id,
+        text: (1..=10)
+            .map(|line| format!("failure detail {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    snapshot.activities.push(Activity::Status {
+        id: status_id,
+        turn_id,
+        text: (1..=10)
+            .map(|line| format!("status detail {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    });
+    snapshot.transcript.push(TranscriptItem::Activity {
+        activity_id: status_id,
+    });
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a long Error and Status");
+
+    let rendered = rendered_application_rows_at(&application, 60, 40).join("\n");
+
+    for line in 1..=10 {
+        assert!(
+            rendered.contains(&format!("failure detail {line}")),
+            "a failure the reader cannot see is the one thing a Fold must never hide: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("status detail {line}")),
+            "Status Activities are not folded: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("… +"),
+        "no fold marker appears: {rendered}"
+    );
+}
+
+#[test]
+fn file_change_activities_fold_past_the_path_budget_and_expand_on_click() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Change these files",
+        workspace.path(),
+    );
+    snapshot.activities[0] = Activity::FileChange {
+        id: snapshot.activities[0].id(),
+        turn_id: snapshot.turns[0].id,
+        status: ActivityStatus::Completed,
+        changes: (1..=7)
+            .map(|change| FileChange::Add {
+                path: format!("src/file{change}.rs").into(),
+            })
+            .collect(),
+    };
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with many file changes");
+
+    let folded_rows = rendered_application_rows_at(&application, 60, 24);
+    let folded = folded_rows.join("\n");
+    assert!(
+        folded.contains("A src/file4.rs"),
+        "the budget lists four paths: {folded}"
+    );
+    assert!(
+        !folded.contains("A src/file5.rs"),
+        "paths past the budget are folded away: {folded}"
+    );
+    assert!(
+        folded.contains("… +3 more"),
+        "the fold marker counts the paths it hides: {folded}"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&folded_rows, "… +3 more") as u16))
+        .expect("expand the file-change entry");
+    let expanded = rendered_application_rows_at(&application, 60, 24).join("\n");
+    for change in 1..=7 {
+        assert!(
+            expanded.contains(&format!("A src/file{change}.rs")),
+            "expanding lists every stored path: {expanded}"
+        );
+    }
+}
+
+#[test]
+fn an_active_command_shows_a_live_tail_and_settles_into_a_head_and_tail_fold() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (mut snapshot, activity_id) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Active,
+        &numbered_output(12),
+        false,
+    );
+    let session_id = snapshot.session.id;
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    let revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a streaming command");
+
+    let streaming = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        streaming.contains("output line 12") && streaming.contains("output line 10"),
+        "a streaming command shows the tail it is writing now: {streaming}"
+    );
+    assert!(
+        !streaming.contains("output line 3") && !streaming.contains("output line 9"),
+        "a live tail keeps no head: {streaming}"
+    );
+    assert!(
+        streaming.contains("… +9 lines"),
+        "the live tail says how much it hides: {streaming}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![SessionChange::CommandStatusChanged {
+                    activity_id,
+                    status: ActivityStatus::Completed,
+                    exit_status: Some(0),
+                }],
+            },
+        )))
+        .expect("settle the command");
+
+    let settled = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        settled.contains("output line 1") && settled.contains("output line 12"),
+        "a settled command takes the head-and-tail form: {settled}"
+    );
+    assert!(
+        settled.contains("… +6 lines"),
+        "settled fold marker: {settled}"
+    );
+}
+
+#[test]
+fn interrupting_a_turn_expands_the_activity_the_reader_was_watching() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (mut snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Active,
+        &numbered_output(12),
+        false,
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a streaming command");
+    assert!(
+        rendered_application_rows_at(&application, 60, 24)
+            .join("\n")
+            .contains("… +9 lines")
+    );
+
+    for _ in 0..2 {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .expect("request and confirm the interrupt");
+    }
+
+    let interrupted = rendered_application_rows_at(&application, 60, 40).join("\n");
+    for line in 1..=12 {
+        assert!(
+            interrupted.contains(&format!("output line {line}")),
+            "the Activity the reader was watching stays visible after an interrupt: {interrupted}"
+        );
+    }
+}
+
+#[test]
+fn expanding_a_capped_command_reveals_everything_stored_before_the_truncation_marker() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        true,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with capped command output");
+
+    let folded_rows = rendered_application_rows_at(&application, 60, 30);
+    let folded = folded_rows.join("\n");
+    assert!(
+        folded.contains("… +6 lines") && folded.contains("[output truncated]"),
+        "one entry carries both a Fold and a Truncation: {folded}"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&folded_rows, "… +6 lines") as u16
+        ))
+        .expect("expand the capped entry");
+
+    let expanded_rows = rendered_application_rows_at(&application, 60, 30);
+    let expanded = expanded_rows.join("\n");
+    for line in 1..=12 {
+        assert!(
+            expanded.contains(&format!("output line {line}")),
+            "expanding a Fold reveals everything stored: {expanded}"
+        );
+    }
+    assert!(
+        !expanded.contains("… +"),
+        "the fold marker is gone: {expanded}"
+    );
+    assert!(
+        rendered_row(&expanded_rows, "[output truncated]")
+            > rendered_row(&expanded_rows, "output line 12"),
+        "the expanded entry still ends at the truncation marker: {expanded}"
+    );
+}
+
+#[test]
+fn fold_state_stays_local_to_the_client_that_flipped_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    let mut reader = connected_application(workspace.path());
+    let mut observer = connected_application(workspace.path());
+    for application in [&mut reader, &mut observer] {
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+            .expect("attach both clients to the same Session");
+    }
+    let folded_rows = rendered_application_rows_at(&reader, 60, 24);
+
+    reader
+        .handle_terminal_event(left_click_at(
+            rendered_row(&folded_rows, "… +6 lines") as u16
+        ))
+        .expect("one client expands the entry");
+
+    assert!(
+        !rendered_application_rows_at(&reader, 60, 24)
+            .join("\n")
+            .contains("… +"),
+        "the client that expanded sees the whole entry"
+    );
+    let observed = rendered_application_rows_at(&observer, 60, 24).join("\n");
+    assert!(
+        observed.contains("… +6 lines"),
+        "a Fold is client-local view state and never reaches another client: {observed}"
+    );
+}
+
+#[test]
+fn clicking_an_entry_that_hides_nothing_records_no_fold_for_its_later_output() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (mut snapshot, activity_id) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Active,
+        &numbered_output(2),
+        false,
+    );
+    let session_id = snapshot.session.id;
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    let revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose command has hidden nothing yet");
+    let rows = rendered_application_rows_at(&application, 60, 24);
+    assert!(
+        !rows.join("\n").contains("… +"),
+        "the fixture starts with nothing folded"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&rows, "$ cargo test") as u16))
+        .expect("click an entry that hides nothing");
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![SessionChange::CommandOutputAppended {
+                    activity_id,
+                    content: format!("\n{}", numbered_output(12)),
+                }],
+            },
+        )))
+        .expect("stream more output than the Fold budget");
+
+    let grown = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        grown.contains("… +"),
+        "a click on an entry with nothing to hide leaves the posture in charge: {grown}"
+    );
+}
+
+#[test]
+fn clicks_do_not_reach_the_transcript_while_a_picker_covers_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a folded command Activity");
+    let folded_rows = rendered_application_rows_at(&application, 60, 24);
+    let marker_row = rendered_row(&folded_rows, "… +6 lines") as u16;
+
+    for key in [
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    ] {
+        application
+            .handle_terminal_event(InputEvent::Key(key))
+            .expect("open the Session picker over the transcript");
+    }
+    assert_eq!(
+        application.command_for_terminal_input(left_click_at(marker_row)),
+        None,
+        "a picker owns the surface, so a click never reaches the transcript beneath it"
+    );
+    application
+        .handle_terminal_event(left_click_at(marker_row))
+        .expect("click while the picker covers the transcript");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("close the Session picker");
+
+    let after = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        after.contains("… +6 lines"),
+        "the entry beneath the picker keeps its Fold: {after}"
+    );
+}

@@ -2,7 +2,7 @@
 //! that translate a terminal event into a [`CommandId`].
 
 use crossterm::event::{
-    Event as InputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event as InputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 
 use super::{
@@ -17,6 +17,11 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
         InputEvent::Mouse(mouse) => match mouse.kind {
             MouseEventKind::ScrollUp => Some(CommandId::ScrollTranscriptLinesUp),
             MouseEventKind::ScrollDown => Some(CommandId::ScrollTranscriptLinesDown),
+            // A press, not a release, so a Fold answers the click the reader
+            // just made rather than trailing a drag that ends elsewhere.
+            MouseEventKind::Down(MouseButton::Left) => Some(CommandId::ToggleTranscriptFoldAt {
+                screen_row: mouse.row,
+            }),
             _ => None,
         },
         InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,
