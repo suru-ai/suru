@@ -567,18 +567,15 @@ fn reuse_or_render(
     let mut rendered = Vec::new();
     let mut links = Vec::new();
     let rendered_anchor = unit.render(&mut rendered, &mut links, folds, theme, width);
-    let mut lines = Vec::with_capacity(rendered.len());
+    let mut measured = Vec::with_capacity(rendered.len());
     let mut header_lines = 0;
     for (index, line) in rendered.into_iter().enumerate() {
-        split_oversized_line(line, width, &mut lines);
+        split_oversized_line(line, width, &mut measured);
         if rendered_anchor.is_some_and(|anchor| index + 1 == anchor.header_source_lines) {
-            header_lines = lines.len();
+            header_lines = measured.len();
         }
     }
-    let rows_per_line = lines
-        .iter()
-        .map(|line| wrapped_line_count(line, width))
-        .collect::<Vec<_>>();
+    let (lines, rows_per_line): (Vec<_>, Vec<_>) = measured.into_iter().unzip();
     UnitView {
         key,
         fingerprint,
@@ -1535,14 +1532,29 @@ fn sgr_byte(parameter: &str) -> Option<u8> {
 }
 
 fn wrapped_line_count(line: &Line<'static>, width: u16) -> usize {
+    // A line whose display width fits the wrap width renders as exactly one
+    // row, so the Paragraph wrap machinery only runs for lines that actually
+    // wrap. The width sum uses the same unicode-width tables ratatui's reflow
+    // does; a span-embedded newline would break a line the sum cannot see, so
+    // it falls back to the measured count.
+    if width > 0
+        && line.width() <= usize::from(width)
+        && line.spans.iter().all(|span| !span.content.contains('\n'))
+    {
+        return 1;
+    }
     Paragraph::new(line.clone())
         .wrap(Wrap { trim: false })
         .line_count(width)
 }
 
-fn split_oversized_line(line: Line<'static>, width: u16, output: &mut Vec<Line<'static>>) {
-    if wrapped_line_count(&line, width) <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
-        output.push(line);
+/// Splits `line` into pieces each wrapping to at most
+/// [`MAX_TRANSCRIPT_SOURCE_LINE_ROWS`] rows, pushing every piece with its
+/// measured row count so layout does not have to measure again.
+fn split_oversized_line(line: Line<'static>, width: u16, output: &mut Vec<(Line<'static>, usize)>) {
+    let rows = wrapped_line_count(&line, width);
+    if rows <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
+        output.push((line, rows));
         return;
     }
     // Cut by column arithmetic in one pass, targeting half the row cap so
@@ -1550,8 +1562,9 @@ fn split_oversized_line(line: Line<'static>, width: u16, output: &mut Vec<Line<'
     // arithmetic is an estimate, so each chunk is verified once; a chunk a
     // pathological wrap pattern pushes past the cap falls back to bisection.
     for chunk in split_line_at_column_budget(line, width) {
-        if wrapped_line_count(&chunk, width) <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
-            output.push(chunk);
+        let rows = wrapped_line_count(&chunk, width);
+        if rows <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
+            output.push((chunk, rows));
         } else {
             bisect_oversized_line(chunk, width, output);
         }
@@ -1613,9 +1626,14 @@ fn split_line_at_column_budget(line: Line<'static>, width: u16) -> Vec<Line<'sta
     chunks
 }
 
-fn bisect_oversized_line(line: Line<'static>, width: u16, output: &mut Vec<Line<'static>>) {
-    if wrapped_line_count(&line, width) <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
-        output.push(line);
+fn bisect_oversized_line(
+    line: Line<'static>,
+    width: u16,
+    output: &mut Vec<(Line<'static>, usize)>,
+) {
+    let rows = wrapped_line_count(&line, width);
+    if rows <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
+        output.push((line, rows));
         return;
     }
     let character_count = line
@@ -1624,7 +1642,7 @@ fn bisect_oversized_line(line: Line<'static>, width: u16, output: &mut Vec<Line<
         .map(|span| span.content.chars().count())
         .sum::<usize>();
     if character_count < 2 {
-        output.push(line);
+        output.push((line, rows));
         return;
     }
     let (left, right) = split_line_at_character_midpoint(line, character_count);
@@ -1712,19 +1730,61 @@ mod tests {
         line.spans.iter().map(|span| &*span.content).collect()
     }
 
+    fn paragraph_line_count(line: &Line<'static>, width: u16) -> usize {
+        use ratatui::widgets::{Paragraph, Wrap};
+        Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+    }
+
     fn split_and_check(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
         let original = rendered_text(&line);
-        let mut chunks = Vec::new();
-        split_oversized_line(line, width, &mut chunks);
-        for chunk in &chunks {
+        let mut measured = Vec::new();
+        split_oversized_line(line, width, &mut measured);
+        for (chunk, rows) in &measured {
             assert!(
-                wrapped_line_count(chunk, width) <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS,
+                *rows <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS,
                 "a split chunk exceeds the row cap"
             );
+            assert_eq!(
+                *rows,
+                paragraph_line_count(chunk, width),
+                "a chunk's reported row count must match ratatui's wrapping"
+            );
         }
+        let chunks: Vec<_> = measured.into_iter().map(|(chunk, _)| chunk).collect();
         let reassembled = chunks.iter().map(rendered_text).collect::<String>();
         assert_eq!(reassembled, original, "splitting must not lose content");
         chunks
+    }
+
+    #[test]
+    fn wrapped_line_count_fast_path_matches_paragraph_wrapping() {
+        let corpus = vec![
+            Line::from(""),
+            Line::from("x"),
+            Line::from("word"),
+            Line::from("exactly-tw"),
+            Line::from("just-over-w"),
+            Line::from("\u{5b57}".repeat(6)),
+            Line::from("\t\tindented content"),
+            Line::from("word ".repeat(40)),
+            Line::from(vec![
+                Span::raw("styled "),
+                Span::styled("span pieces", Style::default().fg(Color::Rgb(9, 8, 7))),
+            ]),
+            Line::from("a \u{5b57}\u{5b57} mixed width content line"),
+        ];
+        for width in [1u16, 2, 5, 10, 11, 26, 80] {
+            for line in &corpus {
+                assert_eq!(
+                    wrapped_line_count(line, width),
+                    paragraph_line_count(line, width),
+                    "fast path diverged for {:?} at width {width}",
+                    rendered_text(line)
+                );
+            }
+        }
     }
 
     #[test]
