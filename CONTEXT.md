@@ -72,6 +72,10 @@ _Avoid_: Elision, clipping
 The compact presentation a client's Transcript gives an entry whose full stored content remains available. A Fold is reversible, client-local view state: expanding it reveals everything stored, and folding never alters stored content. A folded entry shows a **fold marker**: the line indicating how much the Fold hides. Distinct from Truncation, which is a condition of the stored content itself; a single entry can carry both.
 _Avoid_: Collapse, elision, hide
 
+**Group**:
+The single-row presentation a client's Transcript gives a run of two or more adjacent, successfully settled command Activities. Like a Fold, a Group is reversible, client-local view state: expanding it reveals its member Activities, each keeping its own Fold state, and grouping never alters stored content or presentation order. Any other Transcript entry, or a command that failed or was interrupted, ends the run; a still-running command stays outside a Group until it settles successfully.
+_Avoid_: Batch, merge, cell
+
 **Resume State**:
 Provider-owned data, opaque to Suru, that lets a Session continue with its Provider after a restart. Without it a restored Session is viewable but cannot continue where it left off.
 _Avoid_: Thread mapping, provider cache
