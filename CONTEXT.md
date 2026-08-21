@@ -64,6 +64,10 @@ _Avoid_: History, log, conversation
 The condition of a Message or command Activity whose stored content Suru's cap cut short of everything the Provider sent. Truncation is carried as a typed property beside the content rather than as text within it, so a client reads it as data and draws its own **truncation marker**: the line a Transcript shows in place of what the cap dropped.
 _Avoid_: Elision, clipping
 
+**Fold**:
+The compact presentation a client's Transcript gives an entry whose full stored content remains available. A Fold is reversible, client-local view state: expanding it reveals everything stored, and folding never alters stored content. A folded entry shows a **fold marker**: the line indicating how much the Fold hides. Distinct from Truncation, which is a condition of the stored content itself; a single entry can carry both.
+_Avoid_: Collapse, elision, hide
+
 **Resume State**:
 Provider-owned data, opaque to Suru, that lets a Session continue with its Provider after a restart. Without it a restored Session is viewable but cannot continue where it left off.
 _Avoid_: Thread mapping, provider cache

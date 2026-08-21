@@ -11,6 +11,7 @@ support others down the line.
 - This application is very early in development. Freely make breaking changes if they result in better code.
 - Do not account for backwards compatibility with previous versions.
 - Build using interfaces designed for an eventual plugin architecture based on that of OpenCode.
+- User-facing configuration is deferred. When hardcoding a value a user would plausibly tune, add it to the candidate-settings inventory in issue #71 rather than building config machinery.
 
 ## Plugins
 
