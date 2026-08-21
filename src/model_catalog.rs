@@ -98,24 +98,16 @@ impl ModelCatalogService {
 
 impl ProviderCatalog {
     async fn list(&self) -> ProviderModelCatalog {
-        let cached = self
-            .state
-            .lock()
-            .expect("Model catalog lock is not poisoned")
-            .models
-            .is_some();
-        if cached {
-            self.begin_refresh();
-            let state = self
+        {
+            let mut state = self
                 .state
                 .lock()
                 .expect("Model catalog lock is not poisoned");
-            let status = if state.refreshing {
-                ProviderCatalogStatus::Refreshing
-            } else {
-                catalog_status(&state)
-            };
-            return self.snapshot(&state, status);
+            if state.models.is_some() {
+                self.begin_refresh_locked(&mut state);
+                let status = catalog_status(&state);
+                return self.snapshot(&state, status);
+            }
         }
         self.refresh().await
     }
@@ -124,13 +116,18 @@ impl ProviderCatalog {
         let mut generation = self.generation.subscribe();
         self.begin_refresh();
         loop {
-            if !self
-                .state
-                .lock()
-                .expect("Model catalog lock is not poisoned")
-                .refreshing
             {
-                return self.current();
+                let state = self
+                    .state
+                    .lock()
+                    .expect("Model catalog lock is not poisoned");
+                if !state.refreshing {
+                    // Snapshot under the same lock acquisition that observed the
+                    // settled refresh, so a concurrent `begin_refresh` cannot turn
+                    // the status we waited for back into `Refreshing`.
+                    let status = catalog_status(&state);
+                    return self.snapshot(&state, status);
+                }
             }
             if generation.changed().await.is_err() {
                 return self.current();
@@ -143,6 +140,10 @@ impl ProviderCatalog {
             .state
             .lock()
             .expect("Model catalog lock is not poisoned");
+        self.begin_refresh_locked(&mut state);
+    }
+
+    fn begin_refresh_locked(&self, state: &mut CatalogState) {
         if state.refreshing {
             return;
         }
@@ -213,5 +214,109 @@ fn catalog_status(state: &CatalogState) -> ProviderCatalogStatus {
         (None, None, false) => ProviderCatalogStatus::Failed {
             message: "Model catalog has not been loaded".to_owned(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::{
+        protocol::{ModelAvailability, ModelId},
+        provider::{ProviderFuture, ProviderSessionConnection, ProviderSessionRequest},
+    };
+
+    /// Serves one good catalog, then fails every later refresh.
+    struct FailingAfterFirstRuntime {
+        calls: AtomicUsize,
+    }
+
+    impl FailingAfterFirstRuntime {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ProviderRuntime for FailingAfterFirstRuntime {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::new("stub")
+        }
+
+        fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if call == 0 {
+                    return Ok(vec![ModelDescriptor {
+                        provider: ProviderId::new("stub"),
+                        id: ModelId::new("stub-model"),
+                        display_name: "Stub".to_owned(),
+                        description: String::new(),
+                        is_default: true,
+                        availability: ModelAvailability::Available,
+                        options: Vec::new(),
+                    }]);
+                }
+                Err(ProviderError::new("temporary catalog outage"))
+            })
+        }
+
+        fn start_session(
+            &self,
+            _request: ProviderSessionRequest,
+        ) -> ProviderFuture<'_, ProviderSessionConnection> {
+            unimplemented!("catalog tests never start Sessions")
+        }
+
+        fn shutdown(&self) -> ProviderFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Issue #83: `refresh` must report the settled status of the refresh it waited
+    /// for, even when concurrent `list` calls immediately re-arm a new background
+    /// refresh between the moment the awaited refresh settles and the moment the
+    /// caller reads the status.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_reports_the_settled_status_despite_concurrent_list_rearming() {
+        let service = ModelCatalogService::new([
+            Arc::new(FailingAfterFirstRuntime::new()) as Arc<dyn ProviderRuntime>
+        ]);
+        assert_eq!(
+            service.refresh().await.providers[0].status,
+            ProviderCatalogStatus::Fresh
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let hammers: Vec<_> = (0..4)
+            .map(|_| {
+                let service = service.clone();
+                let stop = Arc::clone(&stop);
+                tokio::spawn(async move {
+                    while !stop.load(Ordering::SeqCst) {
+                        service.list().await;
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect();
+
+        for _ in 0..500 {
+            let status = &service.refresh().await.providers[0].status;
+            assert!(
+                matches!(
+                    status,
+                    ProviderCatalogStatus::Stale { message } if message.contains("temporary catalog outage")
+                ),
+                "refresh must return the settled status it waited for, got {status:?}"
+            );
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        for hammer in hammers {
+            hammer.await.expect("hammer task completes");
+        }
     }
 }
