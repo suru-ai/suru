@@ -41,9 +41,7 @@ use super::markdown;
 /// Source lines wrapping to more rows than this are split. The cap serves two
 /// bounds: ratatui's u16-based scroll arithmetic stays in range, and the draw
 /// re-wraps the first visible source line every frame, so the cap also limits
-/// how much text that per-frame wrap can touch. Splitting is recursive
-/// bisection that re-measures each half, so a lower cap trades one-time
-/// projection cost on pathological lines for a lower per-frame ceiling.
+/// how much text that per-frame wrap can touch.
 const MAX_TRANSCRIPT_SOURCE_LINE_ROWS: usize = 1_000;
 
 /// Wrapped rows a settled command Activity's output occupies while folded,
@@ -1547,6 +1545,79 @@ fn split_oversized_line(line: Line<'static>, width: u16, output: &mut Vec<Line<'
         output.push(line);
         return;
     }
+    // Cut by column arithmetic in one pass, targeting half the row cap so
+    // ordinary word-wrap waste still leaves each chunk under the cap. The
+    // arithmetic is an estimate, so each chunk is verified once; a chunk a
+    // pathological wrap pattern pushes past the cap falls back to bisection.
+    for chunk in split_line_at_column_budget(line, width) {
+        if wrapped_line_count(&chunk, width) <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
+            output.push(chunk);
+        } else {
+            bisect_oversized_line(chunk, width, output);
+        }
+    }
+}
+
+/// Splits a line at character boundaries whenever the running display width
+/// reaches half the row cap's worth of columns. One pass over the content, so
+/// the split stays linear in the line's length.
+fn split_line_at_column_budget(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let column_budget = (MAX_TRANSCRIPT_SOURCE_LINE_ROWS / 2)
+        .saturating_mul(usize::from(width.max(1)))
+        .max(1);
+    let Line {
+        style,
+        alignment,
+        spans,
+    } = line;
+    let mut chunks = Vec::new();
+    let mut chunk_spans: Vec<Span<'static>> = Vec::new();
+    let mut chunk_columns = 0usize;
+    for span in spans {
+        let span_columns = span.content.width();
+        if chunk_columns + span_columns <= column_budget {
+            chunk_columns += span_columns;
+            chunk_spans.push(span);
+            continue;
+        }
+        let span_style = span.style;
+        let content = span.content.into_owned();
+        let mut piece = String::new();
+        for character in content.chars() {
+            let character_columns = character.width().unwrap_or(0);
+            if chunk_columns + character_columns > column_budget && chunk_columns > 0 {
+                if !piece.is_empty() {
+                    chunk_spans.push(Span::styled(std::mem::take(&mut piece), span_style));
+                }
+                chunks.push(Line {
+                    style,
+                    alignment,
+                    spans: std::mem::take(&mut chunk_spans),
+                });
+                chunk_columns = 0;
+            }
+            piece.push(character);
+            chunk_columns += character_columns;
+        }
+        if !piece.is_empty() {
+            chunk_spans.push(Span::styled(piece, span_style));
+        }
+    }
+    if !chunk_spans.is_empty() || chunks.is_empty() {
+        chunks.push(Line {
+            style,
+            alignment,
+            spans: chunk_spans,
+        });
+    }
+    chunks
+}
+
+fn bisect_oversized_line(line: Line<'static>, width: u16, output: &mut Vec<Line<'static>>) {
+    if wrapped_line_count(&line, width) <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
+        output.push(line);
+        return;
+    }
     let character_count = line
         .spans
         .iter()
@@ -1557,8 +1628,8 @@ fn split_oversized_line(line: Line<'static>, width: u16, output: &mut Vec<Line<'
         return;
     }
     let (left, right) = split_line_at_character_midpoint(line, character_count);
-    split_oversized_line(left, width, output);
-    split_oversized_line(right, width, output);
+    bisect_oversized_line(left, width, output);
+    bisect_oversized_line(right, width, output);
 }
 
 fn split_line_at_character_midpoint(
@@ -1619,8 +1690,8 @@ mod tests {
     use std::path::PathBuf;
 
     use ratatui::{
-        style::{Color, Modifier},
-        text::Line,
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
     };
 
     use crate::{
@@ -1632,10 +1703,80 @@ mod tests {
         theme::Theme,
     };
 
-    use super::{CappedStream, TranscriptCache, TranscriptFolds, render_activity, render_message};
+    use super::{
+        CappedStream, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, TranscriptCache, TranscriptFolds,
+        render_activity, render_message, split_oversized_line, wrapped_line_count,
+    };
 
     fn rendered_text(line: &Line<'static>) -> String {
         line.spans.iter().map(|span| &*span.content).collect()
+    }
+
+    fn split_and_check(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+        let original = rendered_text(&line);
+        let mut chunks = Vec::new();
+        split_oversized_line(line, width, &mut chunks);
+        for chunk in &chunks {
+            assert!(
+                wrapped_line_count(chunk, width) <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS,
+                "a split chunk exceeds the row cap"
+            );
+        }
+        let reassembled = chunks.iter().map(rendered_text).collect::<String>();
+        assert_eq!(reassembled, original, "splitting must not lose content");
+        chunks
+    }
+
+    #[test]
+    fn oversized_unbroken_line_splits_into_chunks_under_the_row_cap() {
+        let width = 26u16;
+        let content = "x".repeat(usize::from(width) * (MAX_TRANSCRIPT_SOURCE_LINE_ROWS * 4));
+        let chunks = split_and_check(Line::from(content), width);
+        assert!(chunks.len() > 1, "an oversized line must split");
+    }
+
+    #[test]
+    fn oversized_line_with_pathological_word_wrap_stays_under_the_row_cap() {
+        // Alternating one-character and width-filling words maximize the rows
+        // ratatui produces per column of content, stressing the arithmetic
+        // estimate's margin.
+        let width = 12u16;
+        let word = "b".repeat(usize::from(width) - 1);
+        let content = format!("a {word} ").repeat(MAX_TRANSCRIPT_SOURCE_LINE_ROWS * 4);
+        split_and_check(Line::from(content), width);
+    }
+
+    #[test]
+    fn oversized_wide_character_line_splits_at_character_boundaries() {
+        let width = 13u16;
+        let content = "\u{5b57}".repeat(usize::from(width) * MAX_TRANSCRIPT_SOURCE_LINE_ROWS * 2);
+        split_and_check(Line::from(content), width);
+    }
+
+    #[test]
+    fn splitting_a_styled_oversized_line_preserves_span_styles() {
+        let width = 20u16;
+        let styled = Style::default().fg(Color::Rgb(1, 2, 3));
+        let plain = "p".repeat(usize::from(width) * MAX_TRANSCRIPT_SOURCE_LINE_ROWS);
+        let emphasized = "e".repeat(usize::from(width) * MAX_TRANSCRIPT_SOURCE_LINE_ROWS);
+        let line = Line::from(vec![Span::raw(plain), Span::styled(emphasized, styled)]);
+        let chunks = split_and_check(line, width);
+        for chunk in &chunks {
+            for span in &chunk.spans {
+                if span.content.contains('p') {
+                    assert_eq!(span.style, Style::default());
+                }
+                if span.content.contains('e') {
+                    assert_eq!(span.style, styled);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_within_the_row_cap_is_not_split() {
+        let chunks = split_and_check(Line::from("short line"), 80);
+        assert_eq!(chunks.len(), 1);
     }
 
     #[test]
