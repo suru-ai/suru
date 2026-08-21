@@ -1,0 +1,616 @@
+//! The JSON-RPC transport Suru speaks over a Codex app-server's stdio.
+//!
+//! [`JsonRpcTransport::launch`] is the only way to obtain one: it spawns a supervised app-server,
+//! completes the handshake, and returns the request channel alongside the notification stream.
+//! Requests correlate by ID, notifications decode into [`NativeNotification`], and every path that
+//! ends the connection fails the in-flight requests exactly once.
+
+use std::{
+    collections::HashMap,
+    ffi::OsStr,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicI64, Ordering},
+    },
+};
+
+use serde::Serialize;
+use serde_json::Value;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{ChildStdin, ChildStdout},
+    sync::{Mutex, mpsc, oneshot, watch},
+    time::{Duration, timeout},
+};
+
+use super::{
+    codex_error, codex_error_context, concise_remote_message,
+    process::{
+        ProcessGuard, ProcessRegistry, ProcessStdio, spawn_codex_process, supervise_codex_process,
+    },
+    wire::{
+        AgentMessageDeltaParams, ClientError, ClientErrorResponse, ClientInfo, ClientNotification,
+        ClientRequest, FileChangeUpdatedParams, IncomingMessage, InitializeCapabilities,
+        InitializeParams, ItemNotificationParams, NativeCodexErrorInfo, NativeItem,
+        NativeNotification, NativeTurnFailureKind, NativeTurnOutcome, NativeTurnStatus, RequestId,
+        ThreadSettingsUpdatedParams, TurnCompletedParams,
+    },
+};
+use crate::provider::ProviderError;
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const UNSUPPORTED_INTERACTION_ERROR_CODE: i64 = -32000;
+const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
+
+type PendingResponse = oneshot::Sender<Result<Value, ProviderError>>;
+
+struct TransportState {
+    pending: StdMutex<HashMap<String, PendingResponse>>,
+    events: mpsc::UnboundedSender<Result<NativeNotification, ProviderError>>,
+    terminated: AtomicBool,
+}
+
+/// An initialized connection to one supervised Codex app-server.
+pub(super) struct CodexConnection {
+    pub(super) transport: JsonRpcTransport,
+    pub(super) notifications: mpsc::UnboundedReceiver<Result<NativeNotification, ProviderError>>,
+    pub(super) process: Arc<ProcessGuard>,
+}
+
+#[derive(Clone)]
+pub(super) struct JsonRpcTransport {
+    writer: Arc<Mutex<Option<ChildStdin>>>,
+    state: Arc<TransportState>,
+    next_id: Arc<AtomicI64>,
+    _process: Arc<ProcessGuard>,
+}
+
+impl JsonRpcTransport {
+    /// Launches a supervised app-server and completes the protocol handshake with it.
+    pub(super) async fn launch(
+        executable: &OsStr,
+        processes: ProcessRegistry,
+    ) -> Result<CodexConnection, ProviderError> {
+        let (process, ProcessStdio { stdin, stdout }) = spawn_codex_process(executable)?;
+        let (events, notifications) = mpsc::unbounded_channel();
+        let state = Arc::new(TransportState {
+            pending: StdMutex::new(HashMap::new()),
+            events,
+            terminated: AtomicBool::new(false),
+        });
+        let writer = Arc::new(Mutex::new(Some(stdin)));
+        let link = TransportLink {
+            writer: writer.clone(),
+            state: state.clone(),
+        };
+        let (process, exit) = supervise_codex_process(process, processes, link).await?;
+        tokio::spawn(read_stdout(stdout, writer.clone(), state.clone(), exit));
+
+        let transport = Self {
+            writer,
+            state,
+            next_id: Arc::new(AtomicI64::new(1)),
+            _process: process.clone(),
+        };
+        transport
+            .request(
+                "initialize",
+                &InitializeParams {
+                    client_info: ClientInfo {
+                        name: "suru",
+                        title: "Suru",
+                        version: env!("CARGO_PKG_VERSION"),
+                    },
+                    capabilities: InitializeCapabilities {
+                        experimental_api: false,
+                    },
+                },
+            )
+            .await
+            .map_err(|error| codex_error_context("Codex initialization failed", error))?;
+        transport
+            .notify("initialized")
+            .await
+            .map_err(|error| codex_error_context("Codex initialization failed", error))?;
+
+        Ok(CodexConnection {
+            transport,
+            notifications,
+            process,
+        })
+    }
+
+    pub(super) async fn request<T: Serialize + ?Sized>(
+        &self,
+        method: &str,
+        params: &T,
+    ) -> Result<Value, ProviderError> {
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT)
+            .await
+    }
+
+    pub(super) async fn request_with_timeout<T: Serialize + ?Sized>(
+        &self,
+        method: &str,
+        params: &T,
+        request_timeout: Duration,
+    ) -> Result<Value, ProviderError> {
+        if self.state.terminated.load(Ordering::Acquire) {
+            return Err(codex_error("Codex app-server transport has ended").mark_session_lost());
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let key = id.to_string();
+        let (response_tx, response_rx) = oneshot::channel();
+        self.state
+            .pending
+            .lock()
+            .expect("Codex pending request lock is not poisoned")
+            .insert(key.clone(), response_tx);
+        if let Err(error) = write_json_line(
+            &self.writer,
+            &ClientRequest { id, method, params },
+            "write to Codex app-server",
+        )
+        .await
+        {
+            self.state
+                .pending
+                .lock()
+                .expect("Codex pending request lock is not poisoned")
+                .remove(&key);
+            return Err(error);
+        }
+
+        match timeout(request_timeout, response_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(codex_error(format!(
+                "Codex app-server ended before `{method}` completed"
+            ))
+            .mark_session_lost()),
+            Err(_) => {
+                self.state
+                    .pending
+                    .lock()
+                    .expect("Codex pending request lock is not poisoned")
+                    .remove(&key);
+                Err(codex_error(format!(
+                    "Codex app-server timed out handling `{method}`"
+                )))
+            }
+        }
+    }
+
+    async fn notify(&self, method: &str) -> Result<(), ProviderError> {
+        write_json_line(
+            &self.writer,
+            &ClientNotification { method },
+            "write to Codex app-server",
+        )
+        .await
+    }
+
+    pub(super) async fn close(&self) {
+        close_transport(
+            &self.state,
+            codex_error("Codex app-server transport closed during shutdown"),
+        );
+        close_stdin(&self.writer).await;
+    }
+}
+
+/// The process supervisor's handle to the transport running over the process it owns.
+///
+/// The supervisor decides when the connection ends; this is everything it needs to say so.
+pub(super) struct TransportLink {
+    writer: Arc<Mutex<Option<ChildStdin>>>,
+    state: Arc<TransportState>,
+}
+
+impl TransportLink {
+    /// Fails the in-flight requests without publishing a Provider failure, for an intended stop.
+    pub(super) fn close(&self) {
+        close_transport(
+            &self.state,
+            codex_error("Codex app-server transport closed during shutdown"),
+        );
+    }
+
+    /// Closes the app-server's stdin so it can exit on its own.
+    pub(super) async fn close_stdin(&self) {
+        close_stdin(&self.writer).await;
+    }
+
+    /// Fails the in-flight requests and publishes `error` as a lost Provider Session.
+    pub(super) fn terminate(&self, error: ProviderError) {
+        terminate_transport(&self.state, error);
+    }
+}
+
+async fn close_stdin(writer: &Arc<Mutex<Option<ChildStdin>>>) {
+    let stdin = writer.lock().await.take();
+    if let Some(mut stdin) = stdin {
+        let _ = stdin.shutdown().await;
+    }
+}
+
+async fn write_json_line<T: Serialize + ?Sized>(
+    writer: &Arc<Mutex<Option<ChildStdin>>>,
+    value: &T,
+    operation: &str,
+) -> Result<(), ProviderError> {
+    let mut bytes = serde_json::to_vec(value)
+        .map_err(|error| codex_error(format!("could not encode Codex message: {error}")))?;
+    bytes.push(b'\n');
+    let mut writer = writer.lock().await;
+    let writer = writer
+        .as_mut()
+        .ok_or_else(|| codex_error("Codex app-server transport has ended").mark_session_lost())?;
+    writer.write_all(&bytes).await.map_err(|error| {
+        codex_error(format!("could not {operation}: {error}")).mark_session_lost()
+    })?;
+    writer.flush().await.map_err(|error| {
+        codex_error(format!("could not flush after {operation}: {error}")).mark_session_lost()
+    })
+}
+
+async fn read_stdout(
+    stdout: ChildStdout,
+    writer: Arc<Mutex<Option<ChildStdin>>>,
+    state: Arc<TransportState>,
+    mut exit: watch::Receiver<Option<ProviderError>>,
+) {
+    let mut lines = BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match lines.read_line(&mut line).await {
+            Ok(0) => {
+                let error = await_exit_error(&mut exit).await.unwrap_or_else(|| {
+                    codex_error("Codex app-server closed its output unexpectedly")
+                });
+                terminate_transport(&state, error);
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                terminate_transport(
+                    &state,
+                    codex_error(format!("could not read Codex app-server output: {error}")),
+                );
+                return;
+            }
+        }
+        let message: IncomingMessage = match serde_json::from_str(&line) {
+            Ok(message) => message,
+            Err(error) => {
+                terminate_transport(
+                    &state,
+                    codex_error(format!("Codex app-server sent malformed JSON: {error}")),
+                );
+                return;
+            }
+        };
+        if let Err(error) = route_message(message, &writer, &state).await {
+            terminate_transport(&state, error);
+            return;
+        }
+    }
+}
+
+async fn await_exit_error(
+    exit: &mut watch::Receiver<Option<ProviderError>>,
+) -> Option<ProviderError> {
+    if let Some(error) = exit.borrow().clone() {
+        return Some(error);
+    }
+    timeout(Duration::from_millis(100), async {
+        loop {
+            exit.changed().await.ok()?;
+            if let Some(error) = exit.borrow_and_update().clone() {
+                return Some(error);
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn route_message(
+    message: IncomingMessage,
+    writer: &Arc<Mutex<Option<ChildStdin>>>,
+    state: &Arc<TransportState>,
+) -> Result<(), ProviderError> {
+    if let Some(method) = message.method.as_deref() {
+        if let Some(id) = message.id {
+            if is_unsupported_interaction(method) {
+                reject_server_request(
+                    writer,
+                    id,
+                    UNSUPPORTED_INTERACTION_ERROR_CODE,
+                    format!("Suru does not support interactive request `{method}`"),
+                )
+                .await?;
+                return Err(codex_error(format!(
+                    "Codex app-server requested unsupported interaction `{method}`"
+                )));
+            }
+            reject_server_request(
+                writer,
+                id,
+                METHOD_NOT_FOUND_ERROR_CODE,
+                format!("Suru does not recognize server request `{method}`"),
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(event) = decode_notification(method, message.params.as_ref())? {
+            let _ = state.events.send(Ok(event));
+        }
+        return Ok(());
+    }
+
+    let id = message
+        .id
+        .ok_or_else(|| codex_error("Codex app-server sent a message without a method or ID"))?
+        .correlation_key();
+    let pending = state
+        .pending
+        .lock()
+        .expect("Codex pending request lock is not poisoned")
+        .remove(&id);
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+    let response = if let Some(error) = message.error {
+        Err(codex_error(format!(
+            "Codex app-server rejected the request: {}",
+            concise_remote_message(&error.message, "unknown protocol error")
+        )))
+    } else if let Some(result) = message.result {
+        Ok(result)
+    } else {
+        Err(codex_error(
+            "Codex app-server response contained neither a result nor an error",
+        ))
+    };
+    let _ = pending.send(response);
+    Ok(())
+}
+
+async fn reject_server_request(
+    writer: &Arc<Mutex<Option<ChildStdin>>>,
+    id: RequestId,
+    code: i64,
+    message: String,
+) -> Result<(), ProviderError> {
+    write_json_line(
+        writer,
+        &ClientErrorResponse {
+            id,
+            error: ClientError { code, message },
+        },
+        "reject Codex app-server request",
+    )
+    .await
+}
+
+fn is_unsupported_interaction(method: &str) -> bool {
+    matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput"
+            | "mcpServer/elicitation/request"
+            | "item/tool/call"
+    )
+}
+
+fn decode_notification(
+    method: &str,
+    params: Option<&Value>,
+) -> Result<Option<NativeNotification>, ProviderError> {
+    match method {
+        "thread/settings/updated" => {
+            let params: ThreadSettingsUpdatedParams = decode_notification_params(method, params)?;
+            Ok(Some(NativeNotification::AgentSelectionChanged {
+                thread_id: params.thread_id,
+                model: params.thread_settings.model,
+                effort: params.thread_settings.effort,
+                service_tier: params.thread_settings.service_tier,
+            }))
+        }
+        "item/started" => {
+            let params: ItemNotificationParams = decode_notification_params(method, params)?;
+            match params.item {
+                NativeItem::AgentMessage { id, .. } => {
+                    Ok(Some(NativeNotification::AgentMessageStarted {
+                        thread_id: params.thread_id,
+                        turn_id: params.turn_id,
+                        item_id: id,
+                    }))
+                }
+                NativeItem::CommandExecution {
+                    id,
+                    command,
+                    cwd,
+                    status,
+                    ..
+                } => Ok(Some(NativeNotification::CommandStarted {
+                    thread_id: params.thread_id,
+                    turn_id: params.turn_id,
+                    item_id: id,
+                    command,
+                    cwd,
+                    status,
+                })),
+                NativeItem::FileChange {
+                    id,
+                    changes,
+                    status,
+                } => Ok(Some(NativeNotification::FileChangeStarted {
+                    thread_id: params.thread_id,
+                    turn_id: params.turn_id,
+                    item_id: id,
+                    changes,
+                    status,
+                })),
+                NativeItem::Unknown => Ok(None),
+            }
+        }
+        "item/agentMessage/delta" => {
+            let params: AgentMessageDeltaParams = decode_notification_params(method, params)?;
+            Ok(Some(NativeNotification::AgentMessageDelta {
+                thread_id: params.thread_id,
+                turn_id: params.turn_id,
+                item_id: params.item_id,
+                delta: params.delta,
+            }))
+        }
+        "item/commandExecution/outputDelta" => {
+            let params: AgentMessageDeltaParams = decode_notification_params(method, params)?;
+            Ok(Some(NativeNotification::CommandOutputDelta {
+                thread_id: params.thread_id,
+                turn_id: params.turn_id,
+                item_id: params.item_id,
+                delta: params.delta,
+            }))
+        }
+        "item/fileChange/patchUpdated" => {
+            let params: FileChangeUpdatedParams = decode_notification_params(method, params)?;
+            Ok(Some(NativeNotification::FileChangeUpdated {
+                thread_id: params.thread_id,
+                turn_id: params.turn_id,
+                item_id: params.item_id,
+                changes: params.changes,
+            }))
+        }
+        "item/completed" => {
+            let params: ItemNotificationParams = decode_notification_params(method, params)?;
+            match params.item {
+                NativeItem::AgentMessage { id, text } => {
+                    Ok(Some(NativeNotification::AgentMessageCompleted {
+                        thread_id: params.thread_id,
+                        turn_id: params.turn_id,
+                        item_id: id,
+                        text,
+                    }))
+                }
+                NativeItem::CommandExecution {
+                    id,
+                    aggregated_output,
+                    exit_code,
+                    status,
+                    ..
+                } => Ok(Some(NativeNotification::CommandCompleted {
+                    thread_id: params.thread_id,
+                    turn_id: params.turn_id,
+                    item_id: id,
+                    aggregated_output,
+                    exit_status: exit_code,
+                    status,
+                })),
+                NativeItem::FileChange {
+                    id,
+                    changes,
+                    status,
+                } => Ok(Some(NativeNotification::FileChangeCompleted {
+                    thread_id: params.thread_id,
+                    turn_id: params.turn_id,
+                    item_id: id,
+                    changes,
+                    status,
+                })),
+                NativeItem::Unknown => Ok(None),
+            }
+        }
+        "turn/completed" => {
+            let params: TurnCompletedParams = decode_notification_params(method, params)?;
+            let outcome = match params.turn.status {
+                NativeTurnStatus::Completed => NativeTurnOutcome::Completed,
+                NativeTurnStatus::Interrupted => NativeTurnOutcome::Interrupted,
+                NativeTurnStatus::Failed => NativeTurnOutcome::Failed {
+                    message: concise_remote_message(
+                        params
+                            .turn
+                            .error
+                            .as_ref()
+                            .map(|error| error.message.as_str())
+                            .unwrap_or("Codex Turn failed"),
+                        "Codex Turn failed",
+                    ),
+                    kind: match params
+                        .turn
+                        .error
+                        .as_ref()
+                        .and_then(|error| error.codex_error_info.as_ref())
+                    {
+                        Some(NativeCodexErrorInfo::BadRequest) => {
+                            NativeTurnFailureKind::BadRequest {
+                                additional_details: params
+                                    .turn
+                                    .error
+                                    .as_ref()
+                                    .and_then(|error| error.additional_details.clone()),
+                            }
+                        }
+                        Some(NativeCodexErrorInfo::Other) | None => NativeTurnFailureKind::Other,
+                    },
+                },
+            };
+            Ok(Some(NativeNotification::TurnCompleted {
+                thread_id: params.thread_id,
+                turn_id: params.turn.id,
+                outcome,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn decode_notification_params<T: for<'de> serde::Deserialize<'de>>(
+    method: &str,
+    params: Option<&Value>,
+) -> Result<T, ProviderError> {
+    let params = params.ok_or_else(|| {
+        codex_error(format!(
+            "Codex app-server notification `{method}` omitted params"
+        ))
+    })?;
+    serde_json::from_value(params.clone()).map_err(|error| {
+        codex_error(format!(
+            "Codex app-server notification `{method}` had invalid params: {error}"
+        ))
+    })
+}
+
+fn terminate_transport(state: &TransportState, error: ProviderError) {
+    finish_transport(state, error.mark_session_lost(), true);
+}
+
+fn close_transport(state: &TransportState, error: ProviderError) {
+    finish_transport(state, error, false);
+}
+
+fn finish_transport(state: &TransportState, error: ProviderError, publish_error: bool) {
+    if state.terminated.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let pending = {
+        let mut pending = state
+            .pending
+            .lock()
+            .expect("Codex pending request lock is not poisoned");
+        pending
+            .drain()
+            .map(|(_, response)| response)
+            .collect::<Vec<_>>()
+    };
+    for response in pending {
+        let _ = response.send(Err(error.clone()));
+    }
+    if publish_error {
+        let _ = state.events.send(Err(error));
+    }
+}
