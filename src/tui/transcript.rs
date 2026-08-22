@@ -43,7 +43,7 @@ use crate::{
     ansi::{AnsiScanner, FragmentRole, sgr_parameter_code, sgr_parameters},
     protocol::{
         Activity, ActivityId, FileChange, InitialPrompt, Message, MessageId, MessageRole, PromptId,
-        SessionId, SessionRevision, SessionSnapshot, TranscriptItem, TurnId, TurnStatus,
+        SessionId, SessionRevision, SessionSnapshot, TranscriptItem, Turn, TurnId, TurnStatus,
     },
     theme::Theme,
 };
@@ -613,10 +613,15 @@ impl RenderUnit<'_> {
                 true.hash(&mut hasher);
                 hasher.finish()
             }
-            // A Turn Fold's marker says how the Turn settled and nothing
-            // else, so the outcome is the whole of its rendering input; which
+            // A Turn Fold's marker says how the Turn settled and how long it
+            // took, so those two are the whole of its rendering input; which
             // Turn it stands for is already its key.
-            Self::TurnFold(marker) => marker.outcome as u64,
+            Self::TurnFold(marker) => {
+                let mut hasher = std::hash::DefaultHasher::new();
+                (marker.outcome as u64).hash(&mut hasher);
+                marker.duration_ms.hash(&mut hasher);
+                hasher.finish()
+            }
             // A provisional prompt's text only grows and carries no Fold, so
             // its length is the whole of its rendering input.
             Self::Provisional(prompt) => prompt.text.len() as u64,
@@ -695,7 +700,7 @@ impl RenderUnit<'_> {
                 }
                 anchor
             }
-            Self::TurnFold(marker) => Some(render_turn_fold(lines, marker.outcome, theme)),
+            Self::TurnFold(marker) => Some(render_turn_fold(lines, *marker, theme)),
             Self::Provisional(prompt) => {
                 push_user_message(lines, &prompt.text, theme, width);
                 None
@@ -776,26 +781,69 @@ impl SettledTurn {
         }
     }
 
-    /// The word the marker states the outcome in — the reader's word for it,
-    /// the way a Transcript says Thought for settled Reasoning. The wording is
-    /// status-true and permanent rather than recency-scoped, so a reader
+    /// How the marker words this outcome: the word it states the outcome in,
+    /// and the preposition that word takes when a duration follows it. The
+    /// two live in one table because they are one phrase — a Turn that ran to
+    /// completion worked *for* the span it took, while one that was cut short
+    /// stopped or failed *after* it, the span being the run-up to an ending
+    /// rather than the shape of the work.
+    ///
+    /// The wording is status-true and permanent rather than recency-scoped,
+    /// the way a Transcript says Thought for settled Reasoning, so a reader
     /// scrolling back through a session reads how each Turn ended however long
     /// ago it did.
-    const fn label(self) -> &'static str {
+    const fn phrasing(self) -> (&'static str, &'static str) {
         match self {
-            Self::Completed => "Worked",
-            Self::Interrupted => "Stopped",
-            Self::Failed => "Failed",
+            Self::Completed => ("Worked", "for"),
+            Self::Interrupted => ("Stopped", "after"),
+            Self::Failed => ("Failed", "after"),
         }
     }
 }
 
-/// The marker one folded Turn stands as: which Turn it speaks for, and how
-/// that Turn settled.
+/// The marker one folded Turn stands as: which Turn it speaks for, how that
+/// Turn settled, and how long it took to get there.
 #[derive(Clone, Copy, Debug)]
 struct TurnMarker {
     turn_id: TurnId,
     outcome: SettledTurn,
+    /// How long the Turn ran, or `None` when it is missing either of its
+    /// timestamps — which is every Turn stored before Suru recorded them.
+    duration_ms: Option<u64>,
+}
+
+impl TurnMarker {
+    /// The marker a Turn would stand as, or `None` while it is still Active:
+    /// a marker only ever speaks for a Turn that has settled.
+    fn of(turn: &Turn) -> Option<Self> {
+        SettledTurn::of(turn.status).map(|outcome| Self {
+            turn_id: turn.id,
+            outcome,
+            duration_ms: turn_duration_ms(turn),
+        })
+    }
+
+    /// What the marker reads, which is the outcome word alone when the Turn
+    /// carries no duration: a Turn stored before Suru recorded Turn timing
+    /// still says how it ended, just not how long it took.
+    fn label(self) -> String {
+        let (word, preposition) = self.outcome.phrasing();
+        self.duration_ms.map_or_else(
+            || word.to_owned(),
+            |duration_ms| format!("{word} {preposition} {}", humanized_duration(duration_ms)),
+        )
+    }
+}
+
+/// How long a Turn ran: the span between the commit that delivered its opening
+/// Prompt and the commit that settled it. A Turn missing either timestamp has
+/// no span to report rather than a zero-length one, and neither does one whose
+/// settle somehow stamped before its start — a marker saying nothing about how
+/// long a Turn took is honest, where one saying `0ms` is not.
+fn turn_duration_ms(turn: &Turn) -> Option<u64> {
+    let started_at = turn.started_at?;
+    let settled_at = turn.settled_at?;
+    settled_at.0.checked_sub(started_at.0)
 }
 
 /// Which of the roles a Turn Fold keeps outside it a Transcript entry plays.
@@ -923,11 +971,11 @@ impl TurnFolding {
         content: &TranscriptContent<'_>,
         axis: &TranscriptTurnFolds,
     ) -> Self {
-        let folded: HashMap<TurnId, SettledTurn> = snapshot
+        let folded: HashMap<TurnId, TurnMarker> = snapshot
             .turns
             .iter()
             .filter(|turn| axis.is_folded(turn.id))
-            .filter_map(|turn| SettledTurn::of(turn.status).map(|outcome| (turn.id, outcome)))
+            .filter_map(|turn| TurnMarker::of(turn).map(|marker| (turn.id, marker)))
             .collect();
         if folded.is_empty() {
             return Self::default();
@@ -948,7 +996,7 @@ impl TurnFolding {
         let mut hidden = vec![false; snapshot.transcript.len()];
         let mut markers = HashMap::new();
         for (turn_id, positions) in positions {
-            let outcome = folded[&turn_id];
+            let turn_marker = folded[&turn_id];
             let role_at = |position: usize| entries[position].map(|entry| entry.role);
             let final_agent_message = positions
                 .iter()
@@ -959,7 +1007,7 @@ impl TurnFolding {
             // it worked past are work, but the one it ended on stays outside
             // the fold even when a closing Message trails it, because a
             // failure is the one thing a reader must never have to hunt for.
-            let terminal_error = (outcome == SettledTurn::Failed)
+            let terminal_error = (turn_marker.outcome == SettledTurn::Failed)
                 .then(|| {
                     positions
                         .iter()
@@ -986,7 +1034,7 @@ impl TurnFolding {
                 // above it, so the Transcript always reads question, marker,
                 // answer.
                 let position = final_agent_message.map_or(position, |answer| position.min(answer));
-                markers.insert(position, TurnMarker { turn_id, outcome });
+                markers.insert(position, turn_marker);
             }
         }
         Self { hidden, markers }
@@ -1635,17 +1683,17 @@ fn render_group(
 /// something, so it always reports as holding content back.
 fn render_turn_fold(
     lines: &mut Vec<Line<'static>>,
-    outcome: SettledTurn,
+    marker: TurnMarker,
     theme: &Theme,
 ) -> UnitAnchor {
-    let (glyph, style) = match outcome {
+    let (glyph, style) = match marker.outcome {
         SettledTurn::Completed => ("✓ ", theme.feedback.success),
         SettledTurn::Interrupted => ("× ", theme.feedback.warning),
         SettledTurn::Failed => ("× ", theme.feedback.error),
     };
     lines.push(Line::from(vec![
         Span::styled(format!("  {glyph}"), style),
-        Span::styled(outcome.label(), theme.action.primary),
+        Span::styled(marker.label(), theme.action.primary),
     ]));
     UnitAnchor::binary(1, true)
 }
@@ -2031,8 +2079,10 @@ fn subdued_line(line: Line<'static>, indent: &str, theme: &Theme) -> Line<'stati
 }
 
 /// Renders a duration at the coarsest precision that still says something: a
-/// block that took seconds is not reported to the millisecond, and one that took
-/// minutes is not reported as hundreds of seconds.
+/// span of seconds is not reported to the millisecond, and one of minutes is not
+/// reported as hundreds of seconds. Every duration the Transcript states passes
+/// through here — a Reasoning header and a Turn Fold marker alike — so the same
+/// span never reads two ways.
 fn humanized_duration(duration_ms: u64) -> String {
     if duration_ms < 1_000 {
         return format!("{duration_ms}ms");
@@ -2575,7 +2625,7 @@ mod tests {
         protocol::{
             Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus,
             ModelAvailability, PromptId, Session, SessionRevision, SessionSnapshot, SessionStatus,
-            TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+            SessionTimestamp, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
         },
         theme::Theme,
     };
@@ -3562,8 +3612,131 @@ mod tests {
         );
     }
 
+    /// Stamps every Turn in a snapshot as having begun and settled a span
+    /// apart, so a Turn Fold test states the duration it is about rather than
+    /// two wall-clock timestamps.
+    fn stamp_turn_durations(snapshot: &mut SessionSnapshot, duration_ms: u64) {
+        const STARTED_AT: u64 = 1_755_000_000_000;
+        for turn in &mut snapshot.turns {
+            turn.started_at = Some(SessionTimestamp(STARTED_AT));
+            turn.settled_at = Some(SessionTimestamp(STARTED_AT + duration_ms));
+        }
+    }
+
     #[test]
-    fn a_turn_fold_marker_says_how_its_turn_settled() {
+    fn a_turn_fold_marker_says_how_long_its_turn_worked() {
+        for (status, duration_ms, marker) in [
+            (TurnStatus::Completed, 83_000, "  ✓ Worked for 1m 23s"),
+            (TurnStatus::Interrupted, 47_000, "  × Stopped after 47s"),
+            (TurnStatus::Failed, 12_000, "  × Failed after 12s"),
+        ] {
+            let mut entries = vec![Entry::Message(user_message("run the tests"))];
+            entries.extend(hidden_work());
+            let (mut snapshot, _) = turn_snapshot(vec![(status, entries)]);
+            stamp_turn_durations(&mut snapshot, duration_ms);
+
+            let rows = projected_rows(
+                &snapshot,
+                &TranscriptFolds::default(),
+                &TranscriptGroups::default(),
+            );
+
+            assert_eq!(
+                rows,
+                ["┃ run the tests", "", marker],
+                "the marker states how long a {status:?} Turn worked"
+            );
+        }
+    }
+
+    #[test]
+    fn a_turn_fold_markers_duration_reads_as_the_transcript_formats_every_other_one() {
+        // The spans are the ones humanized_duration changes precision at, so a
+        // marker that stopped sharing that formatter would fail here rather
+        // than only where the two happen to agree.
+        for (duration_ms, humanized) in [
+            (900, "900ms"),
+            (4_000, "4s"),
+            (60_000, "1m"),
+            (83_000, "1m 23s"),
+        ] {
+            let mut entries = vec![Entry::Message(user_message("run the tests"))];
+            entries.extend(hidden_work());
+            let (mut snapshot, _) = turn_snapshot(vec![(TurnStatus::Completed, entries)]);
+            stamp_turn_durations(&mut snapshot, duration_ms);
+
+            let rows = projected_rows(
+                &snapshot,
+                &TranscriptFolds::default(),
+                &TranscriptGroups::default(),
+            );
+
+            assert_eq!(
+                rows[2],
+                format!("  ✓ Worked for {humanized}"),
+                "a marker humanizes its duration the way every other duration in the \
+                 Transcript is humanized"
+            );
+            assert_eq!(
+                humanized,
+                super::humanized_duration(duration_ms),
+                "and it is the Transcript's own formatter that says so"
+            );
+        }
+    }
+
+    #[test]
+    fn a_turn_fold_marker_falls_back_to_the_bare_word_when_only_one_timestamp_is_known() {
+        for missing in ["started_at", "settled_at"] {
+            let mut entries = vec![Entry::Message(user_message("run the tests"))];
+            entries.extend(hidden_work());
+            let (mut snapshot, _) = turn_snapshot(vec![(TurnStatus::Completed, entries)]);
+            stamp_turn_durations(&mut snapshot, 83_000);
+            match missing {
+                "started_at" => snapshot.turns[0].started_at = None,
+                _ => snapshot.turns[0].settled_at = None,
+            }
+
+            let rows = projected_rows(
+                &snapshot,
+                &TranscriptFolds::default(),
+                &TranscriptGroups::default(),
+            );
+
+            assert_eq!(
+                rows,
+                ["┃ run the tests", "", "  ✓ Worked"],
+                "a Turn missing its {missing} has no duration to state"
+            );
+        }
+    }
+
+    #[test]
+    fn a_turn_fold_marker_states_no_duration_for_a_turn_that_settled_before_it_began() {
+        let mut entries = vec![Entry::Message(user_message("run the tests"))];
+        entries.extend(hidden_work());
+        let (mut snapshot, _) = turn_snapshot(vec![(TurnStatus::Completed, entries)]);
+        stamp_turn_durations(&mut snapshot, 83_000);
+        let started_at = snapshot.turns[0]
+            .started_at
+            .expect("a timed Turn carries a start");
+        snapshot.turns[0].settled_at = Some(SessionTimestamp(started_at.0 - 1));
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(
+            rows,
+            ["┃ run the tests", "", "  ✓ Worked"],
+            "a span that runs backwards is not a duration the marker can state"
+        );
+    }
+
+    #[test]
+    fn a_turn_fold_marker_without_timing_says_only_how_its_turn_settled() {
         for (status, marker) in [
             (TurnStatus::Completed, "  ✓ Worked"),
             (TurnStatus::Interrupted, "  × Stopped"),
