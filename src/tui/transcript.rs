@@ -44,13 +44,13 @@ use super::markdown;
 /// how much text that per-frame wrap can touch.
 const MAX_TRANSCRIPT_SOURCE_LINE_ROWS: usize = 1_000;
 
-/// Wrapped rows a settled command Activity's output occupies while folded,
-/// split into a head and a tail around the fold marker.
+/// Wrapped rows of output tail a settled command Activity's Peek shows below
+/// its fold marker.
 /// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
 const FOLDED_COMMAND_OUTPUT_ROWS: usize = 6;
 
 /// Wrapped rows of live tail an Active command Activity shows while it streams,
-/// before it settles into the head-and-tail form.
+/// before it settles into its folded single row.
 /// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
 const LIVE_COMMAND_TAIL_ROWS: usize = 3;
 
@@ -129,31 +129,89 @@ impl DisclosureAxis {
     }
 }
 
-/// One client's Fold state for one Session's Transcript: an entry whose axis
-/// is closed folds down to its marker. See `DisclosureAxis` for the posture
-/// and locality semantics.
+/// How far one entry's Fold is open. A Fold may open in stages: every
+/// foldable entry has `Folded` and `Expanded`, and a settled command Activity
+/// adds `Peek` between them — the tail of its output behind a fold marker.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum FoldStep {
+    /// The entry's most compact presentation.
+    Folded,
+    /// The intermediate step of a staged Fold: part of what the Fold hides,
+    /// behind a marker counting the rest.
+    Peek,
+    /// Everything stored.
+    Expanded,
+}
+
+/// One client's Fold state for one Session's Transcript: the posture the view
+/// leans to, plus the step the reader put each entry at. Like every disclosure
+/// axis this is presentation only, so it never reaches the Session, never
+/// syncs between clients, and dies with the process.
 #[derive(Clone, Debug, Default)]
-pub(super) struct TranscriptFolds(DisclosureAxis);
+pub(super) struct TranscriptFolds {
+    posture: DisclosurePosture,
+    overrides: HashMap<ActivityId, FoldStep>,
+}
 
 impl TranscriptFolds {
-    pub(super) fn is_folded(&self, activity_id: ActivityId) -> bool {
-        self.0.is_closed(activity_id)
+    /// The step an entry presents at: the reader's override if they set one,
+    /// otherwise `default` under the closed posture and everything under the
+    /// open one. The default is the entry's own because it depends on what the
+    /// entry is — a failed command opens to its Peek where a successful one
+    /// folds away.
+    pub(super) fn resolve(&self, activity_id: ActivityId, default: FoldStep) -> FoldStep {
+        if let Some(step) = self.overrides.get(&activity_id) {
+            return *step;
+        }
+        match self.posture {
+            DisclosurePosture::Closed => default,
+            DisclosurePosture::Open => FoldStep::Expanded,
+        }
     }
 
+    /// The binary reading entries without a Peek use: anything short of
+    /// `Expanded` is folded.
+    pub(super) fn is_folded(&self, activity_id: ActivityId) -> bool {
+        self.resolve(activity_id, FoldStep::Folded) != FoldStep::Expanded
+    }
+
+    /// Flips the whole axis between closed-by-default and open-by-default.
+    /// Per-entry steps are dropped so one invocation always reaches a posture
+    /// the reader can predict.
     pub(super) fn toggle_posture(&mut self) {
-        self.0.toggle_posture();
+        self.posture = match self.posture {
+            DisclosurePosture::Closed => DisclosurePosture::Open,
+            DisclosurePosture::Open => DisclosurePosture::Closed,
+        };
+        self.overrides.clear();
+    }
+
+    pub(super) fn set_step(&mut self, activity_id: ActivityId, step: FoldStep) {
+        self.overrides.insert(activity_id, step);
     }
 
     pub(super) fn expand(&mut self, activity_id: ActivityId) {
-        self.0.set_closed(activity_id, false);
+        self.set_step(activity_id, FoldStep::Expanded);
     }
 
     pub(super) fn fold(&mut self, activity_id: ActivityId) {
-        self.0.set_closed(activity_id, true);
+        self.set_step(activity_id, FoldStep::Folded);
     }
 
+    /// Digest of the axis state, so the view cache rebuilds when it changes.
     fn fingerprint(&self) -> u64 {
-        self.0.fingerprint()
+        let mut hasher = std::hash::DefaultHasher::new();
+        (self.posture as u8).hash(&mut hasher);
+        self.overrides.len().hash(&mut hasher);
+        let mut digest = 0u64;
+        for (id, step) in &self.overrides {
+            let mut entry = std::hash::DefaultHasher::new();
+            id.hash(&mut entry);
+            (*step as u8).hash(&mut entry);
+            digest ^= entry.finish();
+        }
+        digest.hash(&mut hasher);
+        hasher.finish()
     }
 }
 
@@ -252,6 +310,13 @@ pub(super) struct UnitStart {
     /// Whether the unit as drawn is holding content back, so a click only
     /// toggles a Fold that is really there.
     pub(super) hides_content: bool,
+    /// The step a staged Fold was drawn at, present only for units speaking
+    /// the staged grammar (settled commands), so a click knows which step
+    /// comes next without re-deriving the projection.
+    pub(super) step: Option<FoldStep>,
+    /// The row the unit's fold marker was drawn on, the click target that
+    /// opens a Peek the rest of the way.
+    pub(super) marker_row: Option<usize>,
 }
 
 impl UnitStart {
@@ -445,7 +510,7 @@ impl RenderUnit<'_> {
         match self {
             Self::Message(message) => message_fingerprint(message),
             Self::Activity(activity) => {
-                activity_fingerprint(activity, folds.is_folded(activity.id()))
+                activity_fingerprint(activity, resolved_fold_step(folds, activity))
             }
             Self::Group { members, expanded } => group_fingerprint(members, *expanded),
             // Member-ness joins the content signals: the same Activity keeps
@@ -454,7 +519,8 @@ impl RenderUnit<'_> {
             // surviving the move.
             Self::GroupMember(activity) => {
                 let mut hasher = std::hash::DefaultHasher::new();
-                activity_fingerprint(activity, folds.is_folded(activity.id())).hash(&mut hasher);
+                activity_fingerprint(activity, resolved_fold_step(folds, activity))
+                    .hash(&mut hasher);
                 true.hash(&mut hasher);
                 hasher.finish()
             }
@@ -495,7 +561,7 @@ impl RenderUnit<'_> {
                 lines,
                 links,
                 activity,
-                folds.is_folded(activity.id()),
+                resolved_fold_step(folds, activity),
                 theme,
                 width,
             ),
@@ -508,7 +574,7 @@ impl RenderUnit<'_> {
                     lines,
                     links,
                     activity,
-                    folds.is_folded(activity.id()),
+                    resolved_fold_step(folds, activity),
                     theme,
                     width.saturating_sub(GROUP_MEMBER_INDENT.len() as u16),
                 );
@@ -648,11 +714,15 @@ struct UnitView {
 }
 
 /// A unit's anchor once layout resolved it: how many of the unit's laid-out
-/// lines form its header, and whether it held content back.
+/// lines form its header, whether it held content back, and where its staged
+/// Fold stands.
 #[derive(Clone, Copy, Debug)]
 struct LaidOutAnchor {
     header_lines: usize,
     hides_content: bool,
+    step: Option<FoldStep>,
+    /// Index of the fold-marker line among the unit's laid-out lines.
+    marker_line: Option<usize>,
 }
 
 fn rebuild(
@@ -709,6 +779,10 @@ fn rebuild(
                 header_rows: unit.rows_per_line[..anchor.header_lines].iter().sum(),
                 row_count: row_count - unit_start_row,
                 hides_content: anchor.hides_content,
+                step: anchor.step,
+                marker_row: anchor
+                    .marker_line
+                    .map(|line| unit_start_row + unit.rows_per_line[..line].iter().sum::<usize>()),
             });
         }
     }
@@ -744,7 +818,11 @@ fn reuse_or_render(
     let rendered_anchor = unit.render(&mut rendered, &mut links, folds, theme, width);
     let mut measured = Vec::with_capacity(rendered.len());
     let mut header_lines = 0;
+    let mut marker_line = None;
     for (index, line) in rendered.into_iter().enumerate() {
+        if rendered_anchor.is_some_and(|anchor| anchor.marker_source_line == Some(index)) {
+            marker_line = Some(measured.len());
+        }
         split_oversized_line(line, width, &mut measured);
         if rendered_anchor.is_some_and(|anchor| index + 1 == anchor.header_source_lines) {
             header_lines = measured.len();
@@ -762,18 +840,37 @@ fn reuse_or_render(
         anchor: rendered_anchor.map(|anchor| LaidOutAnchor {
             header_lines,
             hides_content: anchor.hides_content,
+            step: anchor.step,
+            marker_line,
         }),
     }
 }
 
 /// What a projected unit reports about the block it pushed: how many of those
-/// lines form the header a reader clicks to close it again, and whether it
-/// held any content back. The count is in pre-split source lines, which layout
-/// resolves to rows.
+/// lines form the header a reader clicks to close it again, whether it held
+/// any content back, and where its staged Fold stands. The counts are in
+/// pre-split source lines, which layout resolves to rows.
 #[derive(Clone, Copy, Debug)]
 struct UnitAnchor {
     header_source_lines: usize,
     hides_content: bool,
+    /// The step a staged Fold was drawn at; `None` for units whose Fold is
+    /// binary, which includes a still-streaming command.
+    step: Option<FoldStep>,
+    /// Index of the fold-marker source line within the unit's lines.
+    marker_source_line: Option<usize>,
+}
+
+impl UnitAnchor {
+    /// The anchor a binary Fold reports: no staged step and no marker target.
+    const fn binary(header_source_lines: usize, hides_content: bool) -> Self {
+        Self {
+            header_source_lines,
+            hides_content,
+            step: None,
+            marker_source_line: None,
+        }
+    }
 }
 
 /// Message content is append-only, so its length identifies it within a
@@ -786,12 +883,35 @@ fn message_fingerprint(message: &Message) -> u64 {
     hasher.finish()
 }
 
-/// Identifies an Activity's rendered form. The Fold state joins the content
+/// The step an Activity's Fold rests at before the reader touches it. A
+/// failed command opens to its Peek — the tail is where the error lives — so
+/// the one output worth reading is on screen, while everything else folds
+/// away. A command that settled Failed without an exit status was interrupted
+/// rather than refused, so it folds like a success; the reader who was
+/// watching it still gets a Peek, but through the interrupt-time override
+/// rather than this default.
+fn default_fold_step(activity: &Activity) -> FoldStep {
+    match activity {
+        Activity::Command {
+            status: crate::protocol::ActivityStatus::Failed,
+            exit_status: Some(_),
+            ..
+        } => FoldStep::Peek,
+        _ => FoldStep::Folded,
+    }
+}
+
+/// The step an Activity presents at under the client's Fold state.
+fn resolved_fold_step(folds: &TranscriptFolds, activity: &Activity) -> FoldStep {
+    folds.resolve(activity.id(), default_fold_step(activity))
+}
+
+/// Identifies an Activity's rendered form. The Fold step joins the content
 /// signals because a folded entry renders different lines from the same
 /// Activity.
-fn activity_fingerprint(activity: &Activity, folded: bool) -> u64 {
+fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
-    folded.hash(&mut hasher);
+    (step as u8).hash(&mut hasher);
     match activity {
         Activity::Status { .. } | Activity::Error { .. } => {}
         Activity::Command {
@@ -937,7 +1057,7 @@ fn render_activity(
     lines: &mut Vec<Line<'static>>,
     links: &mut Vec<TranscriptLink>,
     activity: &Activity,
-    folded: bool,
+    step: FoldStep,
     theme: &Theme,
     width: u16,
 ) -> Option<UnitAnchor> {
@@ -987,7 +1107,7 @@ fn render_activity(
                 output_truncated: *output_truncated,
                 exit_status: *exit_status,
             },
-            folded,
+            step,
             theme,
             width,
         )),
@@ -997,7 +1117,7 @@ fn render_activity(
             projection.lines,
             *status,
             changes,
-            folded,
+            step != FoldStep::Expanded,
             theme,
         )),
         Activity::Reasoning {
@@ -1016,7 +1136,7 @@ fn render_activity(
                 content_truncated: *content_truncated,
                 duration_ms: *duration_ms,
             },
-            folded,
+            step != FoldStep::Expanded,
             theme,
         )),
     }
@@ -1038,10 +1158,7 @@ fn render_group(
         Span::styled("  ✓ ", theme.feedback.success),
         Span::styled(format!("Ran {member_count} commands"), theme.action.primary),
     ]));
-    UnitAnchor {
-        header_source_lines: 1,
-        hides_content: !expanded,
-    }
+    UnitAnchor::binary(1, !expanded)
 }
 
 struct ActivityProjection<'a> {
@@ -1060,13 +1177,17 @@ struct CommandActivity<'a> {
     exit_status: Option<i32>,
 }
 
-/// Projects a command Activity. Output is projected in full first so hyperlink
-/// targets survive, and only then clamped, so a Fold changes presentation and
-/// nothing else.
+/// Projects a command Activity through its staged Fold. Folded, a settled
+/// command keeps a single end-clamped row; its Peek brings the full header
+/// back over a tail of output behind the fold marker; Expanded shows
+/// everything stored. A still-streaming command shows a live tail instead and
+/// speaks the binary grammar, so a click opens the whole stream. Output is
+/// projected in full first so hyperlink targets survive, and only then
+/// clamped, so a Fold changes presentation and nothing else.
 fn push_command_activity(
     projection: &mut ActivityProjection<'_>,
     activity: CommandActivity<'_>,
-    folded: bool,
+    step: FoldStep,
     theme: &Theme,
     width: u16,
 ) -> UnitAnchor {
@@ -1085,26 +1206,12 @@ fn push_command_activity(
         ActivityStatus::Completed => ("✓ ", theme.feedback.success),
         ActivityStatus::Failed => ("× ", theme.feedback.error),
     };
-    let command = match (status, exit_status) {
-        (ActivityStatus::Failed, Some(exit_status)) => {
-            format!("{command} (exit {exit_status})")
-        }
-        _ => command.to_owned(),
+    let exit_suffix = match (status, exit_status) {
+        (ActivityStatus::Failed, Some(exit_status)) => format!(" (exit {exit_status})"),
+        _ => String::new(),
     };
-    let header_start = projection.lines.len();
-    push_prefixed_lines(projection.lines, &format!("  {marker}"), &command, style);
-    let header_source_lines = projection.lines.len() - header_start;
-    if let Some(cwd) = cwd {
-        push_prefixed_lines(
-            projection.lines,
-            "    in ",
-            cwd.to_string_lossy().as_ref(),
-            theme.text.subdued,
-        );
-    }
-    let mut hides_content = false;
+    let mut output_lines = Vec::new();
     if !output.is_empty() {
-        let mut output_lines = Vec::new();
         push_styled_prefixed_lines(
             &mut ActivityProjection {
                 lines: &mut output_lines,
@@ -1118,10 +1225,46 @@ fn push_command_activity(
             theme.text.subdued,
             theme,
         );
-        if folded {
-            let projected = output_lines.len();
-            output_lines = fold_command_output(output_lines, status, theme, width);
-            hides_content = output_lines.len() != projected;
+    }
+    if status != ActivityStatus::Active && step == FoldStep::Folded {
+        return push_folded_command_row(
+            projection.lines,
+            &format!("  {marker}"),
+            command,
+            &exit_suffix,
+            style,
+            width,
+            cwd.is_some() || !output.is_empty() || output_truncated,
+        );
+    }
+    let tail_rows = match (status, step) {
+        (_, FoldStep::Expanded) => None,
+        (ActivityStatus::Active, _) => Some(LIVE_COMMAND_TAIL_ROWS),
+        (_, FoldStep::Peek) => Some(FOLDED_COMMAND_OUTPUT_ROWS),
+        (_, FoldStep::Folded) => unreachable!("a settled folded command returned above"),
+    };
+    let command = format!("{command}{exit_suffix}");
+    let header_start = projection.lines.len();
+    push_prefixed_lines(projection.lines, &format!("  {marker}"), &command, style);
+    let header_source_lines = projection.lines.len() - header_start;
+    if let Some(cwd) = cwd {
+        push_prefixed_lines(
+            projection.lines,
+            "    in ",
+            cwd.to_string_lossy().as_ref(),
+            theme.text.subdued,
+        );
+    }
+    let mut hides_content = false;
+    let mut marker_source_line = None;
+    if !output_lines.is_empty() {
+        if let Some(tail_rows) = tail_rows {
+            let (folded_lines, marked) = fold_output_to_tail(output_lines, tail_rows, theme, width);
+            output_lines = folded_lines;
+            if marked {
+                hides_content = true;
+                marker_source_line = Some(projection.lines.len());
+            }
         }
         projection.lines.append(&mut output_lines);
     }
@@ -1136,59 +1279,88 @@ fn push_command_activity(
     UnitAnchor {
         header_source_lines,
         hides_content,
+        // A still-streaming command's tail is not a step the reader chose, so
+        // it keeps the binary grammar: one click opens the whole stream.
+        step: (status != ActivityStatus::Active).then_some(step),
+        marker_source_line,
     }
 }
 
-/// Clamps a command's projected output to its Fold budget, splitting it into a
-/// head and a tail joined by the fold marker. An Active command keeps only a
-/// live tail of what it is writing now; a settled one keeps both ends.
-///
-/// Rows are counted after wrapping so a handful of very long lines cannot
-/// flood the budget, while the marker counts the source lines it replaced, so
-/// the number a reader sees does not shift when the terminal is resized.
-fn fold_command_output(
+/// Projects the single row a folded settled command keeps: its status marker
+/// and command, end-clamped to the width with an ellipsis instead of
+/// wrapping. `suffix` — the exit status of a failed command — keeps its place
+/// past the clamp, so failure stays legible however long the command was. The
+/// clamp is presentation only — the Peek brings the full header back — so it
+/// reports as hidden content like everything else the Fold holds.
+fn push_folded_command_row(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    command: &str,
+    suffix: &str,
+    style: Style,
+    width: u16,
+    hides_more: bool,
+) -> UnitAnchor {
+    let command = sanitize_content(command);
+    let first_line = command.lines().next().unwrap_or_default();
+    let has_more_lines = command.lines().nth(1).is_some();
+    let budget = usize::from(width).saturating_sub(prefix.width() + suffix.width());
+    let clamped = has_more_lines || first_line.width() > budget;
+    let text = if clamped {
+        let mut clipped = String::new();
+        let mut used = 0;
+        let target = budget.saturating_sub(1);
+        for character in first_line.chars() {
+            let columns = character.width().unwrap_or(0);
+            if used + columns > target {
+                break;
+            }
+            clipped.push(character);
+            used += columns;
+        }
+        format!("{}…", clipped.trim_end())
+    } else {
+        first_line.to_owned()
+    };
+    lines.push(Line::styled(format!("{prefix}{text}{suffix}"), style));
+    UnitAnchor {
+        header_source_lines: 1,
+        hides_content: hides_more || clamped,
+        step: Some(FoldStep::Folded),
+        marker_source_line: None,
+    }
+}
+
+/// Clamps a command's projected output to the tail its Fold shows, behind the
+/// fold marker counting the source lines above it. Rows are counted after
+/// wrapping so a handful of very long lines cannot flood the budget, while
+/// the marker counts source lines, so the number a reader sees does not shift
+/// when the terminal is resized. Reports whether a marker was drawn.
+fn fold_output_to_tail(
     mut lines: Vec<Line<'static>>,
-    status: crate::protocol::ActivityStatus,
+    tail_rows: usize,
     theme: &Theme,
     width: u16,
-) -> Vec<Line<'static>> {
-    use crate::protocol::ActivityStatus;
-
-    let (head_rows, tail_rows) = match status {
-        ActivityStatus::Active => (0, LIVE_COMMAND_TAIL_ROWS),
-        ActivityStatus::Completed | ActivityStatus::Failed => (
-            FOLDED_COMMAND_OUTPUT_ROWS / 2,
-            FOLDED_COMMAND_OUTPUT_ROWS - FOLDED_COMMAND_OUTPUT_ROWS / 2,
-        ),
-    };
+) -> (Vec<Line<'static>>, bool) {
     let rows_per_line = lines
         .iter()
         .map(|line| wrapped_line_count(line, width).max(1))
         .collect::<Vec<_>>();
-    if rows_per_line.iter().sum::<usize>() <= head_rows + tail_rows {
-        return lines;
-    }
-    let mut head_end = 0;
-    let mut head_used = 0;
-    while head_end < lines.len() && head_used + rows_per_line[head_end] <= head_rows {
-        head_used += rows_per_line[head_end];
-        head_end += 1;
+    if rows_per_line.iter().sum::<usize>() <= tail_rows {
+        return (lines, false);
     }
     let mut tail_start = lines.len();
     let mut tail_used = 0;
-    while tail_start > head_end && tail_used + rows_per_line[tail_start - 1] <= tail_rows {
+    while tail_start > 0 && tail_used + rows_per_line[tail_start - 1] <= tail_rows {
         tail_used += rows_per_line[tail_start - 1];
         tail_start -= 1;
     }
-    let hidden = tail_start - head_end;
-    if hidden == 0 {
-        return lines;
-    }
+    let hidden = tail_start;
     let tail = lines.split_off(tail_start);
-    lines.truncate(head_end);
+    lines.clear();
     lines.push(fold_marker_line(hidden, "lines", OUTPUT_INDENT, theme));
     lines.extend(tail);
-    lines
+    (lines, true)
 }
 
 /// What a fold marker counts: how much this entry's Fold is holding back. Kept
@@ -1272,10 +1444,7 @@ fn push_file_change_activity(
     if hidden > 0 {
         lines.push(fold_marker_line(hidden, "more", OUTPUT_INDENT, theme));
     }
-    UnitAnchor {
-        header_source_lines,
-        hides_content: hidden > 0,
-    }
+    UnitAnchor::binary(header_source_lines, hidden > 0)
 }
 
 /// What a Reasoning Activity contributes to the transcript, gathered so the
@@ -1349,16 +1518,10 @@ fn push_reasoning_activity(
     }
     let header_source_lines = lines.len() - header_start;
     if folded {
-        return UnitAnchor {
-            header_source_lines,
-            hides_content: !body.is_empty(),
-        };
+        return UnitAnchor::binary(header_source_lines, !body.is_empty());
     }
     lines.append(&mut body);
-    UnitAnchor {
-        header_source_lines,
-        hides_content: false,
-    }
+    UnitAnchor::binary(header_source_lines, false)
 }
 
 /// Re-styles a rendered Markdown line as subdued prose in the Activity gutter.
@@ -1933,9 +2096,9 @@ mod tests {
     };
 
     use super::{
-        CappedStream, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, TranscriptCache, TranscriptDisclosure,
-        TranscriptFolds, TranscriptGroups, render_activity, render_message, split_oversized_line,
-        wrapped_line_count,
+        CappedStream, FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, TranscriptCache,
+        TranscriptDisclosure, TranscriptFolds, TranscriptGroups, render_activity, render_message,
+        split_oversized_line, wrapped_line_count,
     };
 
     fn rendered_text(line: &Line<'static>) -> String {
@@ -2071,7 +2234,14 @@ mod tests {
         let mut lines = Vec::new();
         let mut links = Vec::new();
 
-        render_activity(&mut lines, &mut links, &activity, true, &theme, 80);
+        render_activity(
+            &mut lines,
+            &mut links,
+            &activity,
+            FoldStep::Expanded,
+            &theme,
+            80,
+        );
 
         let spans = &lines.last().expect("render command output").spans;
         let normal = spans
@@ -2113,7 +2283,14 @@ mod tests {
         let mut lines = Vec::new();
         let mut links = Vec::new();
 
-        render_activity(&mut lines, &mut links, &activity, true, &theme, 80);
+        render_activity(
+            &mut lines,
+            &mut links,
+            &activity,
+            FoldStep::Expanded,
+            &theme,
+            80,
+        );
 
         let spans = &lines.last().expect("render command output").spans;
         let style_for = |content| {
@@ -2163,6 +2340,8 @@ mod tests {
             }],
         };
         let cache = TranscriptCache::default();
+        let mut folds = TranscriptFolds::default();
+        folds.expand(activity.id());
         let mut first_theme = Theme::system();
         first_theme.ansi.normal.red = Color::Rgb(1, 2, 3);
         let first = cache.view(
@@ -2170,7 +2349,7 @@ mod tests {
             &snapshot,
             &[],
             TranscriptDisclosure {
-                folds: &TranscriptFolds::default(),
+                folds: &folds,
                 groups: &TranscriptGroups::default(),
             },
             &first_theme,
@@ -2186,7 +2365,7 @@ mod tests {
             &snapshot,
             &[],
             TranscriptDisclosure {
-                folds: &TranscriptFolds::default(),
+                folds: &folds,
                 groups: &TranscriptGroups::default(),
             },
             &second_theme,
@@ -2347,7 +2526,14 @@ mod tests {
         let mut lines = Vec::new();
         let mut links = Vec::new();
 
-        render_activity(&mut lines, &mut links, &activity, true, &theme, 80);
+        render_activity(
+            &mut lines,
+            &mut links,
+            &activity,
+            FoldStep::Peek,
+            &theme,
+            80,
+        );
 
         let marker = lines.last().expect("render the truncation marker");
         assert_eq!(rendered_text(marker), "    [output truncated]");
@@ -2379,7 +2565,14 @@ mod tests {
         let mut lines = Vec::new();
         let mut links = Vec::new();
 
-        render_activity(&mut lines, &mut links, &activity, false, &theme, 80);
+        render_activity(
+            &mut lines,
+            &mut links,
+            &activity,
+            FoldStep::Expanded,
+            &theme,
+            80,
+        );
 
         assert_eq!(
             rendered_text(&lines[0]),
@@ -2456,7 +2649,14 @@ mod tests {
         let mut lines = Vec::new();
         let mut links = Vec::new();
 
-        render_activity(&mut lines, &mut links, &activity, true, &theme, 80);
+        render_activity(
+            &mut lines,
+            &mut links,
+            &activity,
+            FoldStep::Peek,
+            &theme,
+            80,
+        );
 
         let marker_lines = lines
             .iter()
@@ -2525,7 +2725,7 @@ mod tests {
             &mut lines,
             &mut links,
             &activity,
-            true,
+            FoldStep::Folded,
             &Theme::system(),
             80,
         );

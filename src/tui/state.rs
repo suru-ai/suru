@@ -37,7 +37,8 @@ use super::{
     session_picker::SessionPicker,
     slots::RenderSlots,
     transcript::{
-        MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups, UnitKey, UnitStart,
+        FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups, UnitKey,
+        UnitStart,
     },
 };
 
@@ -662,14 +663,18 @@ impl TuiState {
     }
 
     /// Toggles the disclosure of the unit drawn at `screen_row`: the Fold of
-    /// a unit projecting a single Activity, or the expansion of a Group. Both
-    /// axes speak one grammar: a unit holding content back expands wherever it
-    /// is clicked; one already showing everything closes again only from its
-    /// header line, so pointing at content never hides what is under the
-    /// pointer. A unit with nothing to hide answers neither, so an idle click
-    /// never records state that changes nothing. An expanded Group's members
-    /// are their own units, which is why a member click toggles that member's
-    /// Fold and never the Group.
+    /// a unit projecting a single Activity, or the expansion of a Group. A
+    /// binary Fold and a Group speak one grammar: a unit holding content back
+    /// expands wherever it is clicked; one already showing everything closes
+    /// again only from its header line, so pointing at content never hides
+    /// what is under the pointer. A settled command's staged Fold opens one
+    /// step at a time instead: its folded row opens to the Peek, the Peek's
+    /// fold marker opens the rest, and the header folds it back from either
+    /// step. Clicks on revealed output do nothing, keeping that surface free
+    /// for text selection. A unit with nothing to hide answers no click, so an
+    /// idle click never records state that changes nothing. An expanded
+    /// Group's members are their own units, which is why a member click
+    /// toggles that member's Fold and never the Group.
     fn toggle_disclosure_at(&mut self, screen_row: u16) {
         let Some(interaction) = self.current_interaction() else {
             return;
@@ -685,10 +690,31 @@ impl TuiState {
         match start.key {
             UnitKey::Activity(activity_id) => {
                 let mut folds = interaction.folds.borrow_mut();
-                if start.hides_content {
-                    folds.expand(activity_id);
-                } else if start.is_header(row) && !folds.is_folded(activity_id) {
-                    folds.fold(activity_id);
+                match start.step {
+                    Some(FoldStep::Folded) => {
+                        if start.hides_content {
+                            folds.set_step(activity_id, FoldStep::Peek);
+                        }
+                    }
+                    Some(FoldStep::Peek) => {
+                        if start.marker_row == Some(row) {
+                            folds.set_step(activity_id, FoldStep::Expanded);
+                        } else if start.is_header(row) {
+                            folds.set_step(activity_id, FoldStep::Folded);
+                        }
+                    }
+                    Some(FoldStep::Expanded) => {
+                        if start.is_header(row) {
+                            folds.set_step(activity_id, FoldStep::Folded);
+                        }
+                    }
+                    None => {
+                        if start.hides_content {
+                            folds.expand(activity_id);
+                        } else if start.is_header(row) && !folds.is_folded(activity_id) {
+                            folds.fold(activity_id);
+                        }
+                    }
                 }
             }
             UnitKey::Group(group_id) => {
@@ -718,9 +744,11 @@ impl TuiState {
         }
     }
 
-    /// Expands every Activity still Active in `turn_id`. An interrupted Turn
+    /// Opens every Activity still Active in `turn_id`. An interrupted Turn
     /// leaves its work half-done, and the reader was already watching it, so
-    /// the Fold must not hide what they were reading.
+    /// the Fold must not hide what they were reading. A command opens to its
+    /// Peek — the tail the reader was watching stream — while everything else
+    /// expands in full.
     fn expand_active_activities(&mut self, turn_id: TurnId) {
         let Some(session) = self.session.as_ref() else {
             return;
@@ -732,14 +760,18 @@ impl TuiState {
             .filter(|activity| {
                 activity.turn_id() == turn_id && activity.status() == Some(ActivityStatus::Active)
             })
-            .map(Activity::id)
+            .map(|activity| (activity.id(), matches!(activity, Activity::Command { .. })))
             .collect::<Vec<_>>();
         let Some(interaction) = self.current_interaction() else {
             return;
         };
         let mut folds = interaction.folds.borrow_mut();
-        for activity_id in active {
-            folds.expand(activity_id);
+        for (activity_id, is_command) in active {
+            if is_command {
+                folds.set_step(activity_id, FoldStep::Peek);
+            } else {
+                folds.expand(activity_id);
+            }
         }
     }
 

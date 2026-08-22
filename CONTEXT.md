@@ -69,8 +69,8 @@ The condition of a Message, command Activity, or Reasoning Activity whose stored
 _Avoid_: Elision, clipping
 
 **Fold**:
-The compact presentation a client's Transcript gives an entry whose full stored content remains available. A Fold is reversible, client-local view state: expanding it reveals everything stored, and folding never alters stored content. A folded entry shows a **fold marker**: the line indicating how much the Fold hides. Distinct from Truncation, which is a condition of the stored content itself; a single entry can carry both.
-_Avoid_: Collapse, elision, hide
+The compact presentation a client's Transcript gives an entry whose full stored content remains available. A Fold is reversible, client-local view state: expanding it fully reveals everything stored, and folding never alters stored content. A folded entry shows a **fold marker**: the line indicating how much the Fold hides. A Fold may open in stages: a **Peek** is an intermediate step that reveals part of what the Fold hides — such as the tail of a command Activity's output — while the fold marker counts what remains hidden. Distinct from Truncation, which is a condition of the stored content itself; a single entry can carry both.
+_Avoid_: Collapse, elision, hide; preview (for Peek)
 
 **Group**:
 The single-row presentation a client's Transcript gives a run of two or more adjacent, successfully settled command Activities. Like a Fold, a Group is reversible, client-local view state: expanding it reveals its member Activities, each keeping its own Fold state, and grouping never alters stored content or presentation order. Any other Transcript entry, or a command that failed or was interrupted, ends the run; a still-running command stays outside a Group until it settles successfully.

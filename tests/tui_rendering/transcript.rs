@@ -140,6 +140,7 @@ fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach Session with escape-laden content");
+    press_leader_chord(&mut application, 'f');
 
     let buffer = rendered_application_buffer(&application, 90, 20);
     let screen = buffer_rows(&buffer).join("\n");
@@ -204,6 +205,7 @@ fn all_base_ansi_foregrounds_and_backgrounds_render_through_the_theme_palette() 
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach Session with every base ANSI color");
+    press_leader_chord(&mut application, 'f');
 
     let buffer = rendered_application_buffer(&application, 160, 30);
     let normal = [
@@ -259,6 +261,7 @@ fn escape_laden_transcript_stays_clean_after_scroll_and_session_switch() {
     application
         .handle_event(ApplicationEvent::SessionAttached(escaped))
         .expect("attach escape-laden Session");
+    press_leader_chord(&mut application, 'f');
 
     let mut terminal = Terminal::new(TestBackend::new(72, 18)).expect("create test terminal");
     terminal
@@ -337,6 +340,7 @@ fn activity_sgr_styles_patch_over_each_activity_base_style() {
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach Session with SGR-styled Activities");
+    press_leader_chord(&mut application, 'f');
 
     let buffer = rendered_application_buffer(&application, 120, 28);
     assert_eq!(text_cell(&buffer, "bright pair").fg, Color::LightYellow);
@@ -399,6 +403,7 @@ fn command_output_osc_8_hyperlinks_render_with_link_style() {
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach Session with OSC 8-linked command output");
+    press_leader_chord(&mut application, 'f');
 
     let buffer = rendered_application_buffer(&application, 100, 24);
     for link_text in ["bel link", "st link"] {
@@ -701,6 +706,7 @@ fn command_activities_render_active_successful_and_failed_states_at_responsive_w
         application
             .handle_event(ApplicationEvent::SessionAttached(snapshot))
             .expect("attach Session with command Activity");
+        press_leader_chord(&mut application, 'f');
 
         let desktop = rendered_application_buffer(&application, 100, 22);
         let desktop_text = buffer_rows(&desktop).join("\n");
@@ -880,7 +886,10 @@ fn streaming_command_updates_reuse_one_projected_transcript_row() {
     let completed = rendered_application_rows_at(&application, 80, 18).join("\n");
     assert_eq!(completed.matches("✓ cargo test").count(), 1);
     assert!(!completed.contains("$ cargo test"));
-    assert_eq!(completed.matches("running tests").count(), 1);
+    assert!(
+        !completed.contains("running tests"),
+        "the settled command folds its output away: {completed}"
+    );
 }
 
 #[test]
@@ -1418,7 +1427,7 @@ fn press_leader_chord(application: &mut Application, key: char) {
 }
 
 #[test]
-fn settled_command_output_folds_to_a_head_and_tail_around_a_fold_marker() {
+fn a_settled_command_folds_to_a_single_row() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let (snapshot, _) = command_activity_session(
         workspace.path(),
@@ -1433,27 +1442,53 @@ fn settled_command_output_folds_to_a_head_and_tail_around_a_fold_marker() {
 
     let folded = rendered_application_rows_at(&application, 60, 24).join("\n");
 
-    for head in ["output line 1", "output line 2", "output line 3"] {
-        assert!(
-            folded.contains(head),
-            "a Fold keeps the head of the output: {folded}"
-        );
-    }
-    for tail in ["output line 10", "output line 11", "output line 12"] {
-        assert!(
-            folded.contains(tail),
-            "a Fold keeps the tail of the output: {folded}"
-        );
-    }
-    for hidden in ["output line 5", "output line 6", "output line 7"] {
-        assert!(
-            !folded.contains(hidden),
-            "a Fold hides the middle of the output: {folded}"
-        );
-    }
     assert!(
-        folded.contains("… +6 lines"),
-        "a folded entry says how much it hides: {folded}"
+        folded.contains("✓ cargo test"),
+        "the folded row keeps the status marker and command: {folded}"
+    );
+    assert!(
+        !folded.contains("output line"),
+        "a folded command shows none of its output: {folded}"
+    );
+    assert!(
+        !folded.contains("… +"),
+        "the single folded row carries no fold marker: {folded}"
+    );
+}
+
+#[test]
+fn a_folded_command_row_end_truncates_instead_of_wrapping() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (mut snapshot, activity_id) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(3),
+        false,
+    );
+    assert_eq!(snapshot.activities[0].id(), activity_id);
+    let Activity::Command { command, .. } = &mut snapshot.activities[0] else {
+        panic!("the session's Activity is a command");
+    };
+    *command =
+        "cargo run --release --bin very-long-binary-name --features one,two,three".to_owned();
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with an overlong command");
+
+    let rows = rendered_application_rows_at(&application, 40, 24);
+    let header = rows
+        .iter()
+        .find(|row| row.contains("✓ cargo run"))
+        .expect("the folded command row renders");
+
+    assert!(
+        header.trim_end().ends_with('…'),
+        "the folded row ends in an ellipsis instead of wrapping: {header}"
+    );
+    assert!(
+        !rows.join("\n").contains("--features"),
+        "the clipped end of the command never renders: {rows:?}"
     );
 }
 
@@ -1470,6 +1505,12 @@ fn the_fold_marker_counts_logical_lines_so_it_reads_the_same_at_every_width() {
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a long command Activity");
+    let folded_rows = rendered_application_rows_at(&application, 60, 24);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&folded_rows, "✓ cargo test") as u16
+        ))
+        .expect("open the command's Peek");
 
     let narrow = rendered_application_rows_at(&application, 44, 24).join("\n");
     let wide = rendered_application_rows_at(&application, 110, 24).join("\n");
@@ -1491,22 +1532,27 @@ fn long_output_lines_wrap_before_the_clamp_so_a_few_cannot_flood_the_fold() {
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with very long output lines");
+    let folded_rows = rendered_application_rows_at(&application, 60, 24);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&folded_rows, "✓ cargo test") as u16
+        ))
+        .expect("open the command's Peek");
 
-    let rows = rendered_application_rows_at(&application, 60, 24);
-    let folded = rows.join("\n");
+    let peek = rendered_application_rows_at(&application, 60, 24).join("\n");
 
     assert!(
-        folded.contains("… +4 lines"),
-        "the marker counts the four source lines it replaced, not their wrapped rows: {folded}"
+        peek.contains("… +3 lines"),
+        "the marker counts the three source lines the wrapped-row budget hides: {peek}"
     );
     assert!(
-        !folded.contains("xxxx"),
-        "no wrapped row of a clamped line survives the Fold: {folded}"
+        peek.contains("line 4") && !peek.contains("line 3 "),
+        "the Peek keeps only the tail the row budget allows: {peek}"
     );
 }
 
 #[test]
-fn clicking_a_folded_command_expands_it_and_clicking_its_header_folds_it_back() {
+fn a_command_fold_opens_in_stages_and_folds_back_from_the_header() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let (snapshot, _) = command_activity_session(
         workspace.path(),
@@ -1519,20 +1565,41 @@ fn clicking_a_folded_command_expands_it_and_clicking_its_header_folds_it_back() 
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a long command Activity");
     let folded_rows = rendered_application_rows_at(&application, 60, 24);
-    let marker_row = rendered_row(&folded_rows, "… +6 lines") as u16;
 
     assert_eq!(
         application
-            .handle_terminal_event(left_click_at(marker_row))
-            .expect("click the fold marker"),
+            .handle_terminal_event(left_click_at(
+                rendered_row(&folded_rows, "✓ cargo test") as u16
+            ))
+            .expect("click the folded row"),
         ApplicationTransition::Continue
     );
+    let peek_rows = rendered_application_rows_at(&application, 60, 24);
+    let peek = peek_rows.join("\n");
+    for tail in ["output line 7", "output line 12"] {
+        assert!(peek.contains(tail), "the Peek shows the tail: {peek}");
+    }
+    for hidden in ["output line 1 ", "output line 6"] {
+        assert!(!peek.contains(hidden), "the Peek hides the head: {peek}");
+    }
+    assert!(
+        peek.contains("… +6 lines"),
+        "the Peek counts what it still hides: {peek}"
+    );
+    assert!(
+        rendered_row(&peek_rows, "… +6 lines") < rendered_row(&peek_rows, "output line 7"),
+        "the fold marker sits above the tail it stands in for: {peek}"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "… +6 lines") as u16))
+        .expect("click the fold marker");
     let expanded_rows = rendered_application_rows_at(&application, 60, 24);
     let expanded = expanded_rows.join("\n");
     for line in 1..=12 {
         assert!(
             expanded.contains(&format!("output line {line}")),
-            "expanding reveals everything stored: {expanded}"
+            "the marker opens the Fold the rest of the way: {expanded}"
         );
     }
     assert!(
@@ -1540,19 +1607,223 @@ fn clicking_a_folded_command_expands_it_and_clicking_its_header_folds_it_back() 
         "no fold marker remains: {expanded}"
     );
 
-    let header_row = rendered_row(&expanded_rows, "✓ cargo test") as u16;
     application
-        .handle_terminal_event(left_click_at(header_row))
+        .handle_terminal_event(left_click_at(
+            rendered_row(&expanded_rows, "✓ cargo test") as u16
+        ))
         .expect("click the entry header");
     let refolded = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
-        refolded.contains("… +6 lines"),
-        "clicking the header folds the entry again: {refolded}"
+        refolded.contains("✓ cargo test") && !refolded.contains("output line"),
+        "clicking the header folds the entry back to its single row: {refolded}"
     );
 }
 
 #[test]
-fn clicking_inside_expanded_output_leaves_the_entry_expanded() {
+fn a_failed_command_opens_to_its_peek_by_default() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (mut snapshot, activity_id) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Failed,
+        &numbered_output(12),
+        false,
+    );
+    assert_eq!(snapshot.activities[0].id(), activity_id);
+    let Activity::Command { exit_status, .. } = &mut snapshot.activities[0] else {
+        panic!("the session's Activity is a command");
+    };
+    *exit_status = Some(3);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a failed command");
+
+    let rendered = rendered_application_rows_at(&application, 60, 24).join("\n");
+
+    assert!(
+        rendered.contains("× cargo test (exit 3)"),
+        "the failed header names its exit status: {rendered}"
+    );
+    assert!(
+        rendered.contains("… +6 lines") && rendered.contains("output line 12"),
+        "a failed command opens to its Peek, where the error lives: {rendered}"
+    );
+    assert!(
+        !rendered.contains("output line 6"),
+        "the Peek still keeps the head behind its marker: {rendered}"
+    );
+}
+
+#[test]
+fn a_command_interrupted_without_being_watched_folds_to_its_single_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (mut snapshot, activity_id) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Failed,
+        &numbered_output(12),
+        false,
+    );
+    assert_eq!(snapshot.activities[0].id(), activity_id);
+    let Activity::Command { exit_status, .. } = &mut snapshot.activities[0] else {
+        panic!("the session's Activity is a command");
+    };
+    *exit_status = None;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with an interrupted command");
+
+    let rendered = rendered_application_rows_at(&application, 60, 24).join("\n");
+
+    assert!(
+        rendered.contains("× cargo test") && !rendered.contains("(exit"),
+        "the interrupted row reports no exit status: {rendered}"
+    );
+    assert!(
+        !rendered.contains("output line") && !rendered.contains("… +"),
+        "without the watcher's interrupt override, an interrupted command folds \
+         like a success — its Peek is the override's doing, not a default: {rendered}"
+    );
+}
+
+#[test]
+fn a_folded_failed_row_keeps_its_exit_suffix_past_the_clamp() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (mut snapshot, activity_id) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Failed,
+        &numbered_output(12),
+        false,
+    );
+    assert_eq!(snapshot.activities[0].id(), activity_id);
+    let Activity::Command {
+        command,
+        exit_status,
+        ..
+    } = &mut snapshot.activities[0]
+    else {
+        panic!("the session's Activity is a command");
+    };
+    *command =
+        "cargo run --release --bin very-long-binary-name --features one,two,three".to_owned();
+    *exit_status = Some(17);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a long failed command");
+    let peek_rows = rendered_application_rows_at(&application, 40, 24);
+
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "× cargo run") as u16))
+        .expect("fold the failed command to its single row");
+
+    let rows = rendered_application_rows_at(&application, 40, 24);
+    let header = rows
+        .iter()
+        .find(|row| row.contains("× cargo run"))
+        .expect("the folded failed row renders");
+    assert!(
+        header.trim_end().ends_with("… (exit 17)"),
+        "the clamp eats the command's tail, never the exit suffix: {header}"
+    );
+}
+
+#[test]
+fn the_folded_row_hides_the_cwd_line_until_the_peek() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (mut snapshot, activity_id) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    assert_eq!(snapshot.activities[0].id(), activity_id);
+    let Activity::Command { cwd, .. } = &mut snapshot.activities[0] else {
+        panic!("the session's Activity is a command");
+    };
+    *cwd = Some("/fixture/work".into());
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a command that has a cwd");
+
+    let folded_rows = rendered_application_rows_at(&application, 60, 24);
+    assert!(
+        !folded_rows.join("\n").contains("in /fixture/work"),
+        "the single folded row keeps the cwd line back: {folded_rows:?}"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&folded_rows, "✓ cargo test") as u16
+        ))
+        .expect("open the command's Peek");
+    let peek = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        peek.contains("in /fixture/work"),
+        "the Peek brings the full header back, cwd included: {peek}"
+    );
+}
+
+#[test]
+fn a_peek_that_fits_everything_shows_no_marker_and_folds_back_from_its_header() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(4),
+        false,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a short-output command");
+    let folded_rows = rendered_application_rows_at(&application, 60, 24);
+
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&folded_rows, "✓ cargo test") as u16
+        ))
+        .expect("open the command's Peek");
+    let peek_rows = rendered_application_rows_at(&application, 60, 24);
+    let peek = peek_rows.join("\n");
+    for line in 1..=4 {
+        assert!(
+            peek.contains(&format!("output line {line}")),
+            "a Peek whose budget fits everything shows it all: {peek}"
+        );
+    }
+    assert!(
+        !peek.contains("… +"),
+        "a fold marker never says +0 lines: {peek}"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&peek_rows, "output line 2") as u16
+        ))
+        .expect("click the revealed output");
+    assert!(
+        rendered_application_rows_at(&application, 60, 24)
+            .join("\n")
+            .contains("output line 2"),
+        "with nothing left to reveal, an output click changes nothing"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&peek_rows, "✓ cargo test") as u16
+        ))
+        .expect("click the entry header");
+    let refolded = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        !refolded.contains("output line"),
+        "the header folds the merged Peek straight back to its single row: {refolded}"
+    );
+}
+
+#[test]
+fn clicks_on_revealed_output_change_nothing() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let (snapshot, _) = command_activity_session(
         workspace.path(),
@@ -1567,23 +1838,37 @@ fn clicking_inside_expanded_output_leaves_the_entry_expanded() {
     let folded_rows = rendered_application_rows_at(&application, 60, 24);
     application
         .handle_terminal_event(left_click_at(
-            rendered_row(&folded_rows, "… +6 lines") as u16
+            rendered_row(&folded_rows, "✓ cargo test") as u16
         ))
-        .expect("expand the entry");
-    let expanded_rows = rendered_application_rows_at(&application, 60, 24);
+        .expect("open the command's Peek");
+    let peek_rows = rendered_application_rows_at(&application, 60, 24);
 
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&peek_rows, "output line 9") as u16
+        ))
+        .expect("click a revealed tail line");
+    let after_peek_click = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        after_peek_click.contains("… +6 lines") && !after_peek_click.contains("output line 6"),
+        "a click on the Peek's output moves nothing, keeping the surface free for selection: {after_peek_click}"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "… +6 lines") as u16))
+        .expect("open the Fold the rest of the way");
+    let expanded_rows = rendered_application_rows_at(&application, 60, 24);
     application
         .handle_terminal_event(left_click_at(
             rendered_row(&expanded_rows, "output line 6") as u16
         ))
-        .expect("click inside the revealed output");
+        .expect("click inside the fully revealed output");
 
     let after = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
-        after.contains("output line 6"),
+        after.contains("output line 6") && !after.contains("… +"),
         "a click on output never folds away the content under the pointer: {after}"
     );
-    assert!(!after.contains("… +"), "the entry stays expanded: {after}");
 }
 
 #[test]
@@ -1602,9 +1887,9 @@ fn toggling_the_fold_posture_expands_every_entry_and_clears_per_entry_overrides(
     let folded_rows = rendered_application_rows_at(&application, 60, 24);
     application
         .handle_terminal_event(left_click_at(
-            rendered_row(&folded_rows, "… +6 lines") as u16
+            rendered_row(&folded_rows, "✓ cargo test") as u16
         ))
-        .expect("expand one entry by hand");
+        .expect("open one entry's Peek by hand");
 
     press_leader_chord(&mut application, 'f');
     let expanded = rendered_application_rows_at(&application, 60, 24).join("\n");
@@ -1616,8 +1901,8 @@ fn toggling_the_fold_posture_expands_every_entry_and_clears_per_entry_overrides(
     press_leader_chord(&mut application, 'f');
     let refolded = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
-        refolded.contains("… +6 lines"),
-        "flipping back folds the entry the reader had expanded by hand: {refolded}"
+        refolded.contains("✓ cargo test") && !refolded.contains("output line"),
+        "flipping back folds the entry the reader had opened by hand: {refolded}"
     );
 }
 
@@ -1857,7 +2142,7 @@ fn untitled_reasoning_heads_with_the_label_alone() {
 }
 
 #[test]
-fn an_active_command_shows_a_live_tail_and_settles_into_a_head_and_tail_fold() {
+fn an_active_command_shows_a_live_tail_and_settles_into_its_folded_row() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let (mut snapshot, activity_id) = command_activity_session(
         workspace.path(),
@@ -1904,26 +2189,28 @@ fn an_active_command_shows_a_live_tail_and_settles_into_a_head_and_tail_fold() {
 
     let settled = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
-        settled.contains("output line 1") && settled.contains("output line 12"),
-        "a settled command takes the head-and-tail form: {settled}"
+        settled.contains("✓ cargo test"),
+        "the settled command keeps its row: {settled}"
     );
     assert!(
-        settled.contains("… +6 lines"),
-        "settled fold marker: {settled}"
+        !settled.contains("output line") && !settled.contains("… +"),
+        "a successful command settles into its single folded row: {settled}"
     );
 }
 
 #[test]
-fn interrupting_a_turn_expands_the_activity_the_reader_was_watching() {
+fn interrupting_a_turn_lands_the_watched_command_in_its_peek() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let (mut snapshot, _) = command_activity_session(
+    let (mut snapshot, activity_id) = command_activity_session(
         workspace.path(),
         ActivityStatus::Active,
         &numbered_output(12),
         false,
     );
+    let session_id = snapshot.session.id;
     snapshot.session.status = SessionStatus::Active;
     snapshot.turns[0].status = TurnStatus::Active;
+    let revision = snapshot.revision;
     let mut application = connected_application(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
@@ -1942,14 +2229,29 @@ fn interrupting_a_turn_expands_the_activity_the_reader_was_watching() {
             )))
             .expect("request and confirm the interrupt");
     }
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![SessionChange::CommandStatusChanged {
+                    activity_id,
+                    status: ActivityStatus::Completed,
+                    exit_status: Some(0),
+                }],
+            },
+        )))
+        .expect("settle the interrupted command");
 
     let interrupted = rendered_application_rows_at(&application, 60, 40).join("\n");
-    for line in 1..=12 {
-        assert!(
-            interrupted.contains(&format!("output line {line}")),
-            "the Activity the reader was watching stays visible after an interrupt: {interrupted}"
-        );
-    }
+    assert!(
+        interrupted.contains("… +6 lines") && interrupted.contains("output line 12"),
+        "the tail the reader was watching stays visible as a Peek instead of folding away: {interrupted}"
+    );
+    assert!(
+        !interrupted.contains("output line 6"),
+        "the interrupt opens the Peek, not the whole stream: {interrupted}"
+    );
 }
 
 #[test]
@@ -1969,15 +2271,25 @@ fn expanding_a_capped_command_reveals_everything_stored_before_the_truncation_ma
     let folded_rows = rendered_application_rows_at(&application, 60, 30);
     let folded = folded_rows.join("\n");
     assert!(
-        folded.contains("… +6 lines") && folded.contains("[output truncated]"),
-        "one entry carries both a Fold and a Truncation: {folded}"
+        !folded.contains("[output truncated]"),
+        "the single folded row keeps even the truncation marker back: {folded}"
     );
 
     application
         .handle_terminal_event(left_click_at(
-            rendered_row(&folded_rows, "… +6 lines") as u16
+            rendered_row(&folded_rows, "✓ cargo test") as u16
         ))
-        .expect("expand the capped entry");
+        .expect("open the capped entry's Peek");
+    let peek_rows = rendered_application_rows_at(&application, 60, 30);
+    let peek = peek_rows.join("\n");
+    assert!(
+        peek.contains("… +6 lines") && peek.contains("[output truncated]"),
+        "one entry carries both a Fold and a Truncation: {peek}"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "… +6 lines") as u16))
+        .expect("open the capped entry the rest of the way");
 
     let expanded_rows = rendered_application_rows_at(&application, 60, 30);
     let expanded = expanded_rows.join("\n");
@@ -2018,19 +2330,19 @@ fn fold_state_stays_local_to_the_client_that_flipped_it() {
 
     reader
         .handle_terminal_event(left_click_at(
-            rendered_row(&folded_rows, "… +6 lines") as u16
+            rendered_row(&folded_rows, "✓ cargo test") as u16
         ))
-        .expect("one client expands the entry");
+        .expect("one client opens the entry's Peek");
 
     assert!(
-        !rendered_application_rows_at(&reader, 60, 24)
+        rendered_application_rows_at(&reader, 60, 24)
             .join("\n")
-            .contains("… +"),
-        "the client that expanded sees the whole entry"
+            .contains("… +6 lines"),
+        "the client that clicked sees the Peek"
     );
     let observed = rendered_application_rows_at(&observer, 60, 24).join("\n");
     assert!(
-        observed.contains("… +6 lines"),
+        !observed.contains("output line") && !observed.contains("… +"),
         "a Fold is client-local view state and never reaches another client: {observed}"
     );
 }
@@ -2096,7 +2408,7 @@ fn clicks_do_not_reach_the_transcript_while_a_picker_covers_it() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a folded command Activity");
     let folded_rows = rendered_application_rows_at(&application, 60, 24);
-    let marker_row = rendered_row(&folded_rows, "… +6 lines") as u16;
+    let command_row = rendered_row(&folded_rows, "✓ cargo test") as u16;
 
     for key in [
         KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
@@ -2107,12 +2419,12 @@ fn clicks_do_not_reach_the_transcript_while_a_picker_covers_it() {
             .expect("open the Session picker over the transcript");
     }
     assert_eq!(
-        application.command_for_terminal_input(left_click_at(marker_row)),
+        application.command_for_terminal_input(left_click_at(command_row)),
         None,
         "a picker owns the surface, so a click never reaches the transcript beneath it"
     );
     application
-        .handle_terminal_event(left_click_at(marker_row))
+        .handle_terminal_event(left_click_at(command_row))
         .expect("click while the picker covers the transcript");
     application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -2123,7 +2435,7 @@ fn clicks_do_not_reach_the_transcript_while_a_picker_covers_it() {
 
     let after = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
-        after.contains("… +6 lines"),
+        !after.contains("output line"),
         "the entry beneath the picker keeps its Fold: {after}"
     );
 }
@@ -2330,8 +2642,8 @@ fn a_run_of_one_successful_command_renders_as_a_normal_command_row() {
         "a run of one renders the ordinary command row: {rendered}"
     );
     assert!(
-        rendered.contains("output of command 1"),
-        "the ordinary row keeps its output: {rendered}"
+        !rendered.contains("output of command 1"),
+        "the ordinary row folds to its single row like any settled command: {rendered}"
     );
     assert!(
         !rendered.contains("Ran 1 command"),
@@ -2539,7 +2851,7 @@ fn a_command_settling_failed_stays_a_standalone_row_and_leaves_the_group_unchang
 }
 
 #[test]
-fn an_interrupted_command_settles_as_a_standalone_failed_row_and_stays_expanded() {
+fn an_interrupted_command_settles_as_a_standalone_failed_row_in_its_peek() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let session_id = SessionId::new();
     let mut snapshot = live_command_run_snapshot(session_id, workspace.path());
@@ -2580,12 +2892,14 @@ fn an_interrupted_command_settles_as_a_standalone_failed_row_and_stays_expanded(
         rendered.contains("× command 3") && !rendered.contains("(exit"),
         "an interrupt settles the row failed with no exit status to report: {rendered}"
     );
-    for line in 1..=12 {
-        assert!(
-            rendered.contains(&format!("output line {line}")),
-            "interrupt auto-expand keeps the watched output visible after the settle: {rendered}"
-        );
-    }
+    assert!(
+        rendered.contains("… +6 lines") && rendered.contains("output line 12"),
+        "the tail the reader was watching stays visible as a Peek: {rendered}"
+    );
+    assert!(
+        !rendered.contains("output line 6"),
+        "the Peek keeps the head behind its marker: {rendered}"
+    );
 }
 
 /// Rewrites the output of the run member holding `command`, so a test can give
@@ -2656,20 +2970,9 @@ fn clicking_a_collapsed_group_expands_it_into_indented_folded_members() {
         rendered_row(&rows, "✓ command 1") > header,
         "members render beneath the header: {rendered}"
     );
-    for kept in [
-        "output line 1",
-        "output line 3",
-        "output line 10",
-        "output line 12",
-    ] {
-        assert!(
-            rendered.contains(kept),
-            "a member keeps its default Fold's head and tail: {rendered}"
-        );
-    }
     assert!(
-        rendered.contains("… +6 lines") && !rendered.contains("output line 6"),
-        "a member renders in its default Fold presentation, not in full: {rendered}"
+        !rendered.contains("output line") && !rendered.contains("… +"),
+        "a member renders in its default Fold presentation — a single row: {rendered}"
     );
 }
 
@@ -2694,30 +2997,28 @@ fn a_members_fold_toggles_independently_within_an_expanded_group() {
         ))
         .expect("expand the Group");
     let expanded_rows = rendered_application_rows_at(&application, 80, 36);
-    assert_eq!(
-        expanded_rows.join("\n").matches("… +6 lines").count(),
-        2,
-        "both members start out folded"
+    let expanded = expanded_rows.join("\n");
+    assert!(
+        !expanded.contains("first line") && !expanded.contains("second line"),
+        "both members start out as single folded rows: {expanded}"
     );
 
-    let first_marker = expanded_rows
-        .iter()
-        .position(|row| row.contains("… +6 lines"))
-        .expect("the first member shows a fold marker");
     application
-        .handle_terminal_event(left_click_at(first_marker as u16))
-        .expect("expand one member's Fold");
+        .handle_terminal_event(left_click_at(
+            rendered_row(&expanded_rows, "✓ command 1") as u16
+        ))
+        .expect("open one member's Peek");
 
     let rows = rendered_application_rows_at(&application, 80, 36);
     let rendered = rows.join("\n");
-    for line in 1..=12 {
+    for line in 7..=12 {
         assert!(
             rendered.contains(&format!("first line {line}")),
-            "the clicked member expands in full: {rendered}"
+            "the clicked member opens to its Peek: {rendered}"
         );
     }
     assert!(
-        rendered.contains("… +6 lines") && !rendered.contains("second line 6"),
+        rendered.contains("… +6 lines") && !rendered.contains("second line"),
         "the sibling member's Fold is untouched: {rendered}"
     );
     assert!(
@@ -2729,9 +3030,8 @@ fn a_members_fold_toggles_independently_within_an_expanded_group() {
         .handle_terminal_event(left_click_at(rendered_row(&rows, "✓ command 1") as u16))
         .expect("fold the member back from its header");
     let refolded = rendered_application_rows_at(&application, 80, 36).join("\n");
-    assert_eq!(
-        refolded.matches("… +6 lines").count(),
-        2,
+    assert!(
+        !refolded.contains("first line") && refolded.contains("✓ Ran 2 commands"),
         "the member folds back while the Group stays expanded: {refolded}"
     );
 }
@@ -2758,9 +3058,13 @@ fn a_members_fold_override_survives_collapse_and_re_expansion() {
     let expanded_rows = rendered_application_rows_at(&application, 80, 36);
     application
         .handle_terminal_event(left_click_at(
-            rendered_row(&expanded_rows, "… +6 lines") as u16
+            rendered_row(&expanded_rows, "✓ command 1") as u16
         ))
-        .expect("expand the member's Fold");
+        .expect("open the member's Peek");
+    let peek_rows = rendered_application_rows_at(&application, 80, 36);
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "… +6 lines") as u16))
+        .expect("open the member's Fold the rest of the way");
     let unfolded_rows = rendered_application_rows_at(&application, 80, 36);
 
     application
@@ -2805,9 +3109,9 @@ fn an_expanded_group_recollapses_only_from_its_header_row() {
 
     application
         .handle_terminal_event(left_click_at(
-            rendered_row(&expanded_rows, "output of command 2") as u16,
+            rendered_row(&expanded_rows, "✓ command 2") as u16
         ))
-        .expect("click inside a member's output");
+        .expect("click a member row below the header");
     let still_expanded = rendered_application_rows_at(&application, 80, 30).join("\n");
     assert!(
         still_expanded.contains("✓ command 2"),
@@ -3000,9 +3304,13 @@ fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
     let member_rows = rendered_application_rows_at(&application, 80, 50);
     application
         .handle_terminal_event(left_click_at(
-            rendered_row(&member_rows, "… +6 lines") as u16
+            rendered_row(&member_rows, "✓ command 1") as u16
         ))
-        .expect("expand the first member's Fold by hand");
+        .expect("open the first member's Peek by hand");
+    let peek_rows = rendered_application_rows_at(&application, 80, 50);
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "… +6 lines") as u16))
+        .expect("open the first member's Fold the rest of the way");
 
     press_leader_chord(&mut application, 'g');
     let groups_expanded = rendered_application_rows_at(&application, 80, 50).join("\n");
