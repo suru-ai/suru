@@ -11,7 +11,8 @@
 //! of the pair of entries it falls between and no renderer can see what
 //! follows it; the walk that lays units out inserts a blank row instead. See
 //! [`Spacing::separates`] for the rule and [`assign_separators`] for the two
-//! boundaries exempt from it.
+//! boundaries exempt from it. One consequence the rule is written to keep: no
+//! step of a Fold moves the header row the reader clicked to open it.
 //!
 //! Rendering happens on every input event, so this module memoizes the
 //! expensive work at two levels. The whole view is keyed on the Session
@@ -638,7 +639,8 @@ enum SpacingKind {
     /// of the conversation, which always takes air around it.
     Message,
     /// An Activity, a Group, or a Group member: progress and operational
-    /// detail, which packs into a tight list while each entry stays one line.
+    /// detail, which packs into a tight list until one runs past a single
+    /// line, which takes air after it rather than around it.
     Activity,
     /// An Error Activity, which takes air whatever its size, because a failure
     /// is the one thing a reader must never have to hunt for.
@@ -660,11 +662,20 @@ impl Spacing {
     /// Whether a blank row separates this unit from the one after it. The
     /// answer comes from the pair alone: whitespace at a boundary is a
     /// property of the boundary, not of either entry, which is why no renderer
-    /// decides it. A run of compact Activities stays a tight list; every other
-    /// boundary takes one blank row.
-    const fn separates(self, next: Self) -> bool {
-        match (self.kind, next.kind) {
-            (SpacingKind::Activity, SpacingKind::Activity) => self.lines > 1 || next.lines > 1,
+    /// decides it. A run of Activities stays a tight list until one of them
+    /// runs past a single line; every other boundary takes one blank row.
+    ///
+    /// Between two Activities, only the earlier one's size opens the boundary,
+    /// which is why the later one is read for its register alone. Air below an
+    /// entry marks where its revealed content stopped, which is what a reader
+    /// needs; air above it would only announce content they are already
+    /// looking at — and it would announce it by pushing the row down at the
+    /// moment they opened that entry's Fold, moving the very row they clicked.
+    /// So an entry that runs past a single line takes air after it and stays
+    /// tight to whatever compact entry it follows.
+    const fn separates(self, next: SpacingKind) -> bool {
+        match (self.kind, next) {
+            (SpacingKind::Activity, SpacingKind::Activity) => self.lines > 1,
             _ => true,
         }
     }
@@ -921,7 +932,7 @@ fn assign_separators<'a>(planned: &'a [RenderUnit<'_>], rendered: &mut [UnitView
         };
         unit.leading_separator = match previous {
             Some((previous_plan, previous_spacing)) => {
-                !plan.heads_the_group(previous_plan) && previous_spacing.separates(spacing)
+                !plan.heads_the_group(previous_plan) && previous_spacing.separates(spacing.kind)
             }
             None => false,
         };
@@ -2989,7 +3000,7 @@ mod tests {
     }
 
     #[test]
-    fn an_activity_with_a_body_takes_air_on_both_sides() {
+    fn an_activity_with_a_body_takes_air_below_it_and_none_above() {
         let noisy = command("cargo test", "running 2 tests\nall green");
         let mut folds = TranscriptFolds::default();
         folds.expand(noisy.id());
@@ -3005,13 +3016,47 @@ mod tests {
             rows,
             [
                 "  Preparing the workspace",
-                "",
                 "  ✓ cargo test",
                 "    running 2 tests",
                 "    all green",
                 "",
                 "  Done",
             ]
+        );
+    }
+
+    #[test]
+    fn no_step_of_a_fold_moves_the_row_the_reader_clicked() {
+        let output = (1..=12)
+            .map(|line| format!("output line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let noisy = command("cargo test", &output);
+        let noisy_id = noisy.id();
+        let snapshot = transcript_snapshot(vec![
+            Entry::Activity(status("Preparing the workspace")),
+            Entry::Activity(noisy),
+            Entry::Activity(status("Done")),
+        ]);
+        let mut folds = TranscriptFolds::default();
+        let header_row = |folds: &TranscriptFolds| {
+            projected_rows(&snapshot, folds, &TranscriptGroups::default())
+                .iter()
+                .position(|row| row.contains("cargo test"))
+                .expect("the command heads its unit at every step")
+        };
+
+        let folded = header_row(&folds);
+        folds.set_step(noisy_id, FoldStep::Peek);
+        let peeking = header_row(&folds);
+        folds.set_step(noisy_id, FoldStep::Expanded);
+        let expanded = header_row(&folds);
+
+        assert_eq!(
+            (folded, peeking, expanded),
+            (1, 1, 1),
+            "each step a reader clicks through must leave the header on the row they clicked, \
+             directly under the compact Activity above it"
         );
     }
 
@@ -3111,7 +3156,7 @@ mod tests {
         let mut folds = TranscriptFolds::default();
         folds.expand(noisy_id);
         let snapshot = transcript_snapshot(vec![
-            Entry::Activity(status("Preparing the workspace")),
+            Entry::Message(user_message("run the tests")),
             Entry::Activity(noisy),
         ]);
         let cache = TranscriptCache::default();
@@ -3130,7 +3175,7 @@ mod tests {
                 .map(rendered_text)
                 .as_deref(),
             Some(""),
-            "row 1 is the separator the expanded command took"
+            "row 1 is the separator the boundary above the command took"
         );
         assert_eq!(start.row, 2, "the unit starts past its own separator");
         assert!(
@@ -3173,7 +3218,7 @@ mod tests {
         let mut folds = TranscriptFolds::default();
         folds.expand(noisy.id());
         let snapshot = transcript_snapshot(vec![
-            Entry::Activity(status("Preparing the workspace")),
+            Entry::Message(user_message("run the tests")),
             Entry::Activity(noisy),
         ]);
         let cache = TranscriptCache::default();
