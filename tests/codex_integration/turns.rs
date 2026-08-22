@@ -469,6 +469,10 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         serde_json::json!([{ "type": "text", "text": "Explain the native harness" }])
     );
     assert_eq!(requests[3]["params"]["model"], "gpt-fixture");
+    assert_eq!(
+        requests[3]["params"]["summary"], "auto",
+        "Codex only summarizes its Reasoning when a Turn asks it to"
+    );
 
     drop(feed);
     drop(client);

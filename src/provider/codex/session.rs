@@ -20,8 +20,8 @@ use tokio::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
-    codex_error, codex_error_context,
+    DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, REASONING_SUMMARY_DETAIL,
+    SERVICE_TIER_OPTION_ID, codex_error, codex_error_context,
     process::{ProcessGuard, ProcessRegistry},
     projection::{NativeCorrelation, provider_events},
     transport::{CodexConnection, JsonRpcTransport},
@@ -502,6 +502,7 @@ async fn start_native_turn(
                         text: &prompt,
                     }],
                     model: selection.model.as_str(),
+                    summary: REASONING_SUMMARY_DETAIL,
                     effort: options.effort,
                     service_tier: options.service_tier,
                 },

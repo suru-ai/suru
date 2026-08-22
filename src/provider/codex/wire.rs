@@ -281,6 +281,10 @@ pub(super) struct TurnStartParams<'a> {
     pub(super) thread_id: &'a str,
     pub(super) input: [TextInput<'a>; 1],
     pub(super) model: &'a str,
+    /// How much detail Codex should summarize its Reasoning in. A Turn that
+    /// omits it inherits the Model's own default, which is why Suru always
+    /// states one.
+    pub(super) summary: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) effort: Option<&'a str>,
     #[serde(
