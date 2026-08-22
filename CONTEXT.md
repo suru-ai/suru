@@ -57,7 +57,7 @@ A provider-operated capability that performs work for an agent. User-visible Too
 _Avoid_: Function, action
 
 **Reasoning**:
-The account a Provider gives of an agent's thinking during a Turn, carried as Activity because it reports progress rather than the prose the agent authored for the user. A Reasoning block may carry a **title** — a short heading the Provider leads it with, kept beside the content as a typed property so a client can head a Fold with it instead of reading it out of the prose. Distinct from the Reasoning Effort Model Option, which tunes how much of it a Model does. Suru's own name for the concept is Reasoning everywhere except the words a Transcript shows a reader, which deliberately say _Thinking_ while a block runs and _Thought_ once it settles.
+The account a Provider gives of an agent's thinking during a Turn, carried as Activity because it reports progress rather than the prose the agent authored for the user. A Reasoning block may carry a **title** — a short heading the Provider leads it with, kept beside the content as a typed property so a client can head a Fold with it instead of reading it out of the prose. Each heading the Provider leads a section with begins a new Reasoning block, so a block never carries more than one title. A block that settles with no title and no content stays stored, but a Transcript shows nothing for it. Distinct from the Reasoning Effort Model Option, which tunes how much of it a Model does. Suru's own name for the concept is Reasoning everywhere except the words a Transcript shows a reader, which deliberately say _Thinking_ while a block runs and _Thought_ once it settles.
 _Avoid_: Chain of thought, and — outside a Transcript's own wording — thinking, thought
 
 **Command**:
@@ -77,7 +77,7 @@ The compact presentation a client's Transcript gives an entry whose full stored 
 _Avoid_: Collapse, elision, hide; preview (for Peek)
 
 **Group**:
-The single-row presentation a client's Transcript gives a run of two or more adjacent, successfully settled command Activities. Like a Fold, a Group is reversible, client-local view state: expanding it reveals its member Activities, each keeping its own Fold state, and grouping never alters stored content or presentation order. Any other Transcript entry, or a command that failed or was interrupted, ends the run; a still-running command stays outside a Group until it settles successfully.
+The single-row presentation a client's Transcript gives a run of two or more adjacent Activities of the same groupable kind — commands or Reasoning. Like a Fold, a Group is reversible, client-local view state: grouping never alters stored content or presentation order, and any entry of another kind ends the run, though an entry the Transcript shows nothing for neither joins nor ends one. Membership follows the kind: a command joins only once it settles successfully — a failed or interrupted command ends the run, and a still-running command stays outside until it settles — while a Reasoning block belongs to its Group from the moment it starts, so a Reasoning Group forms live as thinking streams and its marker leads with the latest member's title. Expansion follows the kind too: a command Group's members each keep their own Fold state, while a Reasoning Group opens straight onto every member's full content.
 _Avoid_: Batch, merge, cell
 
 **Turn Fold**:
