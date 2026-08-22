@@ -28,7 +28,7 @@ use super::{
     model_picker::ModelPickerRow,
     session_picker::SessionPickerRow,
     slots::{
-        HomeBannerSlotContext, HomeFooterSlotContext, PromptContextSlotContext,
+        LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
         PromptFooterSlotContext, PromptStatusSlotContext, RenderSlots, RenderedSlot,
         SessionComposerTopSlotContext, SlotText, truncate_to_width,
     },
@@ -741,13 +741,13 @@ fn render_landing(
     } else {
         agent
     };
-    let banner = slots.home_banner(&HomeBannerSlotContext {
+    let notice = slots.landing_notice(&LandingNoticeSlotContext {
         width: footer_width,
         notice: state
-            .launch_banner()
-            .map(|banner| SlotText::new(banner.text(footer_width), banner.style(theme))),
+            .landing_notice()
+            .map(|notice| SlotText::new(notice.text(footer_width), notice.style(theme))),
     });
-    let footer = slots.home_footer(&HomeFooterSlotContext {
+    let footer = slots.landing_footer(&LandingFooterSlotContext {
         width: footer_width,
         context: SlotText::new(context, theme.text.subdued),
         connection: SlotText::new(
@@ -755,8 +755,8 @@ fn render_landing(
             status_style(state, theme),
         ),
     });
-    let [banner_area, main, footer_area] = Layout::vertical([
-        Constraint::Length(banner.height()),
+    let [notice_area, main, footer_area] = Layout::vertical([
+        Constraint::Length(notice.height()),
         Constraint::Min(1),
         Constraint::Length(footer.height()),
     ])
@@ -821,8 +821,8 @@ fn render_landing(
 
     render_slot(
         frame,
-        horizontally_inset(banner_area, horizontal_padding(frame.area().width)),
-        banner,
+        horizontally_inset(notice_area, horizontal_padding(frame.area().width)),
+        notice,
         theme,
     );
     render_slot(
@@ -1618,10 +1618,10 @@ mod tests {
     #[test]
     fn named_slots_compose_in_order_and_isolate_failed_contributions() {
         let slots = RenderSlots::testing([
-            TestContribution::home_footer(Placement::Prepend, Ok("prepend")),
-            TestContribution::home_footer(Placement::Replace, Err("replacement failed")),
-            TestContribution::home_footer(Placement::Append, Ok("append one")),
-            TestContribution::home_footer(Placement::Append, Ok("append two")),
+            TestContribution::landing_footer(Placement::Prepend, Ok("prepend")),
+            TestContribution::landing_footer(Placement::Replace, Err("replacement failed")),
+            TestContribution::landing_footer(Placement::Append, Ok("append one")),
+            TestContribution::landing_footer(Placement::Append, Ok("append two")),
         ]);
         let application = Application {
             slots,
@@ -1644,7 +1644,7 @@ mod tests {
             .unwrap();
         let failure = rows
             .iter()
-            .position(|row| row.contains("Extension error · home.footer"))
+            .position(|row| row.contains("Extension error · landing.footer"))
             .unwrap();
 
         assert!(prepend < default);
@@ -1653,10 +1653,10 @@ mod tests {
         assert!(failure < prepend);
 
         let slots = RenderSlots::testing([
-            TestContribution::home_footer(Placement::Prepend, Ok("prepend")),
-            TestContribution::home_footer(Placement::Replace, Ok("replacement one")),
-            TestContribution::home_footer(Placement::Replace, Ok("replacement two")),
-            TestContribution::home_footer(Placement::Append, Ok("append")),
+            TestContribution::landing_footer(Placement::Prepend, Ok("prepend")),
+            TestContribution::landing_footer(Placement::Replace, Ok("replacement one")),
+            TestContribution::landing_footer(Placement::Replace, Ok("replacement two")),
+            TestContribution::landing_footer(Placement::Append, Ok("append")),
         ]);
         let application = Application {
             slots,
@@ -1671,10 +1671,10 @@ mod tests {
     }
 
     #[test]
-    fn the_launch_banner_slot_takes_contributions_even_when_startup_was_clean() {
+    fn the_landing_notice_slot_takes_contributions_even_when_startup_was_clean() {
         let slots = RenderSlots::testing([
-            TestContribution::home_banner(Placement::Prepend, Ok("notice from an extension")),
-            TestContribution::home_banner(Placement::Append, Err("banner failed")),
+            TestContribution::landing_notice(Placement::Prepend, Ok("notice from an extension")),
+            TestContribution::landing_notice(Placement::Append, Err("notice failed")),
         ]);
         let application = Application {
             slots,
@@ -1684,7 +1684,7 @@ mod tests {
         let rows = rendered_rows(&application);
         let failure = rows
             .iter()
-            .position(|row| row.contains("Extension error · home.banner"))
+            .position(|row| row.contains("Extension error · landing.notice"))
             .unwrap();
         let notice = rows
             .iter()
@@ -1701,7 +1701,7 @@ mod tests {
         );
         assert!(
             notice < question,
-            "the banner sits above the launch view rather than over it"
+            "the Notice sits above the Landing rather than over it"
         );
     }
 

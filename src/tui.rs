@@ -1,6 +1,5 @@
 //! Ratatui view state and terminal lifecycle.
 
-mod banner;
 mod commands;
 mod composer;
 mod event_loop;
@@ -8,6 +7,7 @@ mod keymap;
 mod markdown;
 mod model_options;
 mod model_picker;
+mod notice;
 mod render;
 mod session_picker;
 mod slots;

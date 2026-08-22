@@ -28,6 +28,10 @@ _Avoid_: Variant, trait, model setting
 A workspace for conversation between a user and an agent. A Session is independently addressable, may be viewed from multiple clients, and may exist before an agent is selected.
 _Avoid_: Chat, thread, conversation
 
+**Landing**:
+The view a client shows when no Session is open, carrying the Agent Selection a new Session will begin from and the composer its first Prompt is written in.
+_Avoid_: Home, launch view, start screen, welcome screen
+
 **Workspace**:
 The working context in which an agent operates, initially rooted at a local directory.
 _Avoid_: Project, working directory, location
@@ -103,6 +107,10 @@ _Avoid_: Environment, profile
 **Log**:
 The operator-facing diagnostic record a Suru process writes about its own run. A Log is about Suru's behavior, never about conversation content — the user-visible history of a Session is its Transcript.
 _Avoid_: Diagnostics, telemetry, trace
+
+**Notice**:
+A transient, one-line message a client shows about Suru's own behavior rather than about a Session. A Notice is dismissed by the reader's next interaction and never returns for the rest of the run, and it points at the Log rather than carrying the detail itself.
+_Avoid_: Banner, toast, alert, diagnostic
 
 **Setting**:
 One user-tunable value governing Suru's behavior, carrying a built-in default that applies whenever no Config Document pins it. Every Setting declares a scope: a **Client Setting** governs a client's presentation, and a machine-local Config Document may one day overlay it, while a **Server Setting** governs server or Provider behavior and follows only the server's own Config Documents. Distinct from a Model Option, which is Provider-advertised rather than user-authored.

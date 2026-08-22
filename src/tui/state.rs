@@ -24,7 +24,6 @@ use crate::{
 };
 
 use super::{
-    banner::{LaunchBanner, LaunchNotice},
     commands::{CommandAutocomplete, SemanticCommandId, SemanticInvocation, SemanticSubject},
     composer::{ComposerKey, ComposerMemory},
     keymap::{
@@ -35,6 +34,7 @@ use super::{
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction},
+    notice::{LandingNotice, Notice},
     render::render_with_slots,
     session_picker::SessionPicker,
     slots::RenderSlots,
@@ -201,10 +201,10 @@ pub struct TuiState {
     /// Client Settings govern presentation from here. The snapshot leads the
     /// lifecycle stream, so it is in hand before any Session view opens.
     settings: EffectiveSettings,
-    /// What the launch view has to say about the configuration problems
-    /// startup found. It is a notice, not state the run depends on: the
-    /// reader's next interaction takes it away for good.
-    launch_notice: LaunchNotice,
+    /// What the Landing has to say about the configuration problems startup
+    /// found. It is a Notice, not state the run depends on: the reader's next
+    /// interaction takes it away for good.
+    landing_notice: LandingNotice,
     pub(super) transcript_cache: TranscriptCache,
     /// Bumped whenever the Session projection is replaced wholesale, so the
     /// transcript cache never trusts a revision across snapshot swaps.
@@ -301,7 +301,7 @@ impl TuiState {
             composers: ComposerMemory::default(),
             session_interactions: HashMap::new(),
             settings: EffectiveSettings::default(),
-            launch_notice: LaunchNotice::default(),
+            landing_notice: LandingNotice::default(),
             transcript_cache: TranscriptCache::default(),
             transcript_generation: 0,
             spinner_frame: 0,
@@ -407,7 +407,7 @@ impl TuiState {
                 // a default is what a view starts from, not something that
                 // reaches back and moves what the reader is looking at.
                 self.settings = snapshot.settings;
-                self.launch_notice.receive(&snapshot.diagnostics);
+                self.landing_notice.receive(&snapshot.diagnostics);
             }
             ManagedEvent::Recovering(status) => {
                 if self.recovery.is_none() {
@@ -444,8 +444,8 @@ impl TuiState {
         }
     }
 
-    pub(super) fn launch_banner(&self) -> Option<&LaunchBanner> {
-        self.launch_notice.showing()
+    pub(super) fn landing_notice(&self) -> Option<&Notice> {
+        self.landing_notice.showing()
     }
 
     fn remove_deleted_session(&mut self, deleted_session_id: SessionId) {
@@ -1343,8 +1343,8 @@ impl Application {
     fn handle_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
         // Every command is an interaction, whatever surface raised it and even
         // where an overlay is about to swallow it: the reader looked away from
-        // the banner either way.
-        self.state.launch_notice.dismiss();
+        // the Notice either way.
+        self.state.landing_notice.dismiss();
         if self.state.reconnect_overlay_visible || self.defers_for_agent_selection(&command) {
             return Ok(ApplicationTransition::Continue);
         }
@@ -2188,13 +2188,13 @@ impl Application {
 
     /// Records that the reader touched the terminal, whether or not the active
     /// input mode makes a command of it: an unbound key and a click on nothing
-    /// are still interactions, and the launch banner is dismissed by any of
+    /// are still interactions, and the Landing's Notice is dismissed by any of
     /// them. A resize, a focus change, and the mouse merely passing over the
     /// window are the terminal's doing rather than the reader's, so they leave
-    /// the banner standing. Reports whether anything on screen changed, so a
+    /// the Notice standing. Reports whether anything on screen changed, so a
     /// caller that draws on demand knows to redraw.
     pub fn note_interaction(&mut self, event: &InputEvent) -> bool {
-        is_reader_interaction(event) && self.state.launch_notice.dismiss()
+        is_reader_interaction(event) && self.state.landing_notice.dismiss()
     }
 
     /// Translates a terminal event through the active input mode. `None` means

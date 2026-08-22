@@ -32,15 +32,15 @@ impl SlotText {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct HomeBannerSlotContext {
+pub(super) struct LandingNoticeSlotContext {
     pub(super) width: u16,
-    /// The notice the launch view has to carry, or `None` when startup found
-    /// nothing to report and the built-in banner contributes no row at all.
+    /// The Notice the Landing has to carry, or `None` when startup found
+    /// nothing to report and the built-in content is no row at all.
     pub(super) notice: Option<SlotText>,
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct HomeFooterSlotContext {
+pub(super) struct LandingFooterSlotContext {
     pub(super) width: u16,
     pub(super) context: SlotText,
     pub(super) connection: SlotText,
@@ -167,8 +167,8 @@ struct FooterItem {
 }
 
 pub(super) struct RenderSlots {
-    home_banner: Slot<HomeBannerSlotContext, Line<'static>>,
-    home_footer: Slot<HomeFooterSlotContext, Line<'static>>,
+    landing_notice: Slot<LandingNoticeSlotContext, Line<'static>>,
+    landing_footer: Slot<LandingFooterSlotContext, Line<'static>>,
     session_composer_top: Slot<SessionComposerTopSlotContext, Line<'static>>,
     prompt_footer: Slot<PromptFooterSlotContext, Line<'static>>,
     prompt_footer_status: Slot<PromptStatusSlotContext, FooterItem>,
@@ -178,8 +178,8 @@ pub(super) struct RenderSlots {
 impl Default for RenderSlots {
     fn default() -> Self {
         Self {
-            home_banner: Slot::new("home.banner"),
-            home_footer: Slot::new("home.footer"),
+            landing_notice: Slot::new("landing.notice"),
+            landing_footer: Slot::new("landing.footer"),
             session_composer_top: Slot::new("session.composer.top"),
             prompt_footer: Slot::new("prompt.footer"),
             prompt_footer_status: Slot::new("prompt.footer.status"),
@@ -193,23 +193,23 @@ impl RenderSlots {
         Self::default()
     }
 
-    pub(super) fn home_banner(
+    pub(super) fn landing_notice(
         &self,
-        context: &HomeBannerSlotContext,
+        context: &LandingNoticeSlotContext,
     ) -> RenderedSlot<Line<'static>> {
         let default = context
             .notice
             .iter()
             .map(|notice| one_line(context.width, notice))
             .collect();
-        self.home_banner.compose(context, default)
+        self.landing_notice.compose(context, default)
     }
 
-    pub(super) fn home_footer(
+    pub(super) fn landing_footer(
         &self,
-        context: &HomeFooterSlotContext,
+        context: &LandingFooterSlotContext,
     ) -> RenderedSlot<Line<'static>> {
-        self.home_footer.compose(
+        self.landing_footer.compose(
             context,
             vec![spread_line(
                 context.width,
@@ -269,7 +269,7 @@ impl RenderSlots {
 }
 
 /// One row of slot text, cut to the width it has rather than wrapping: a
-/// banner that grew a second row would push the launch view around.
+/// Notice that grew a second row would push the Landing around.
 fn one_line(width: u16, text: &SlotText) -> Line<'static> {
     Line::from(
         truncate_slot_text(vec![text.clone()], usize::from(width))
@@ -401,8 +401,8 @@ pub(super) struct TestContribution {
 
 #[cfg(test)]
 enum TestSlot {
-    HomeBanner,
-    HomeFooter,
+    LandingNotice,
+    LandingFooter,
     SessionComposerTop,
     PromptFooter,
     PromptFooterStatus,
@@ -411,24 +411,24 @@ enum TestSlot {
 
 #[cfg(test)]
 impl TestContribution {
-    pub(super) fn home_banner(
+    pub(super) fn landing_notice(
         placement: Placement,
         result: Result<&'static str, &'static str>,
     ) -> Self {
         Self {
-            slot: TestSlot::HomeBanner,
+            slot: TestSlot::LandingNotice,
             placement,
             result,
             style: Style::default(),
         }
     }
 
-    pub(super) fn home_footer(
+    pub(super) fn landing_footer(
         placement: Placement,
         result: Result<&'static str, &'static str>,
     ) -> Self {
         Self {
-            slot: TestSlot::HomeFooter,
+            slot: TestSlot::LandingFooter,
             placement,
             result,
             style: Style::default(),
@@ -497,17 +497,17 @@ impl RenderSlots {
             let result = contribution.result;
             let style = contribution.style;
             match contribution.slot {
-                TestSlot::HomeBanner => {
+                TestSlot::LandingNotice => {
                     slots
-                        .home_banner
+                        .landing_notice
                         .contribute(contribution.placement, move |_| match result {
                             Ok(text) => Ok(vec![Line::styled(text, style)]),
                             Err(message) => Err(message.to_owned()),
                         })
                 }
-                TestSlot::HomeFooter => {
+                TestSlot::LandingFooter => {
                     slots
-                        .home_footer
+                        .landing_footer
                         .contribute(contribution.placement, move |_| match result {
                             Ok(text) => Ok(vec![Line::styled(text, style)]),
                             Err(message) => Err(message.to_owned()),

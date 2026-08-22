@@ -8,7 +8,7 @@ mod failing_provider_support;
 
 mod commands;
 mod composer;
-mod launch_banner;
+mod landing_notice;
 mod model_options;
 mod model_picker;
 mod prompts;

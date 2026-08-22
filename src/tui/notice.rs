@@ -1,8 +1,8 @@
-//! The one-line notice the launch view carries when startup found problems.
+//! The Notice the Landing carries when startup found configuration problems.
 //!
 //! The server hands every client the startup diagnostics on the
 //! effective-settings snapshot, each one already naming its file, its key path,
-//! and why the value was ignored. The Log keeps all of that; the banner keeps
+//! and why the value was ignored. The Log keeps all of that; a Notice keeps
 //! only what a reader needs to know something went wrong and where to look —
 //! so it collapses the whole set into one line: the loudest failures first,
 //! whole files ahead of single keys, the keys merely counted, and a pointer to
@@ -18,32 +18,32 @@ use crate::{
 
 use super::slots::truncate_to_width;
 
-/// Leads the banner so severity reads before the words do.
+/// Leads the Notice so severity reads before the words do.
 const ERROR_GLYPH: &str = "×";
 const WARNING_GLYPH: &str = "!";
 
-/// Where the diagnostics the banner had no room for live.
+/// Where the diagnostics the Notice had no room for live.
 const LOG_POINTER: &str = "see the Log";
 
-/// What the launch view has to say about startup, and whether it has already
-/// said it. Modelled as one value because the two facts constrain each other:
-/// a banner the reader dismissed is gone for the run, so a snapshot arriving
+/// What the Landing has to say about startup, and whether it has already said
+/// it. Modelled as one value because the two facts constrain each other: a
+/// Notice the reader dismissed is gone for the run, so a snapshot arriving
 /// later — after a reconnect, or after an edit of a Setting — cannot put the
 /// same startup problems back in front of them.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) enum LaunchNotice {
+pub(super) enum LandingNotice {
     /// Startup found nothing to report, or the snapshot has not landed yet.
     #[default]
     Quiet,
-    Showing(LaunchBanner),
-    /// The reader saw a banner and moved on.
+    Showing(Notice),
+    /// The reader saw a Notice and moved on.
     Dismissed,
 }
 
-impl LaunchNotice {
-    pub(super) fn showing(&self) -> Option<&LaunchBanner> {
+impl LandingNotice {
+    pub(super) fn showing(&self) -> Option<&Notice> {
         match self {
-            Self::Showing(banner) => Some(banner),
+            Self::Showing(notice) => Some(notice),
             Self::Quiet | Self::Dismissed => None,
         }
     }
@@ -54,13 +54,13 @@ impl LaunchNotice {
         if matches!(self, Self::Dismissed) {
             return;
         }
-        *self = LaunchBanner::for_diagnostics(diagnostics).map_or(Self::Quiet, Self::Showing);
+        *self = Notice::for_diagnostics(diagnostics).map_or(Self::Quiet, Self::Showing);
     }
 
-    /// Takes the banner away on the reader's first interaction with it, and
+    /// Takes the Notice away on the reader's first interaction with it, and
     /// reports whether there was one to take. Dismissal is recorded only once
-    /// a banner was actually showing, so interacting before the snapshot lands
-    /// cannot suppress a notice the reader never got.
+    /// a Notice was actually showing, so interacting before the snapshot lands
+    /// cannot suppress one the reader never got.
     pub(super) fn dismiss(&mut self) -> bool {
         if !matches!(self, Self::Showing(_)) {
             return false;
@@ -71,14 +71,14 @@ impl LaunchNotice {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct LaunchBanner {
+pub(super) struct Notice {
     severity: SettingsDiagnosticSeverity,
     summary: String,
 }
 
-impl LaunchBanner {
-    /// The banner a startup's diagnostics earn, or `None` when it found
-    /// nothing to report and the launch view stays as it was.
+impl Notice {
+    /// The Notice a startup's diagnostics earn, or `None` when it found
+    /// nothing to report and the Landing stays as it was.
     fn for_diagnostics(diagnostics: &[SettingsDiagnostic]) -> Option<Self> {
         // A whole Config Document being ignored is worded first and in full,
         // loudest severity leading; the keys ignored one at a time are worded
@@ -105,7 +105,7 @@ impl LaunchBanner {
             return None;
         }
         // The loudest problem the startup found is the one the reader has to
-        // act on, so it sets the severity the whole banner reads at.
+        // act on, so it sets the severity the whole Notice reads at.
         let any_error = diagnostics
             .iter()
             .any(|diagnostic| diagnostic.severity == SettingsDiagnosticSeverity::Error);
@@ -119,7 +119,7 @@ impl LaunchBanner {
         })
     }
 
-    /// The banner's one line at the width it has. The glyph and the pointer at
+    /// The Notice's one line at the width it has. The glyph and the pointer at
     /// the Log are what the reader acts on, so a summary too long for the
     /// terminal is what gives way — never the pointer telling them where the
     /// rest of it is.
@@ -166,7 +166,7 @@ fn ignored_keys_clause(diagnostics: &[SettingsDiagnostic]) -> Option<String> {
 
 /// A diagnostic's message up to the detail it trails: the loader words every
 /// one as "ignored because …", with whatever the parser or the filesystem said
-/// after a colon. The clause before that colon is the banner's sentence; the
+/// after a colon. The clause before that colon is the Notice's sentence; the
 /// detail is the Log's.
 fn headline(message: &str) -> &str {
     message
@@ -176,7 +176,7 @@ fn headline(message: &str) -> &str {
 }
 
 /// Config Documents are named by their file alone. The Log carries the path
-/// the banner has no room for.
+/// the Notice has no room for.
 fn file_name(diagnostic: &SettingsDiagnostic) -> String {
     diagnostic
         .file

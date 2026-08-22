@@ -1,4 +1,4 @@
-//! The launch view's banner for configuration problems found at startup.
+//! The Landing's Notice for configuration problems found at startup.
 
 use std::path::{Path, PathBuf};
 
@@ -20,9 +20,9 @@ use suru::{
 
 /// A client that connected and then received the effective-settings snapshot,
 /// which is the order the protocol guarantees: the snapshot leads the
-/// lifecycle stream, so the launch view has the startup diagnostics in hand
-/// before the user can touch anything.
-fn launched_with(workspace: &Path, diagnostics: Vec<SettingsDiagnostic>) -> Application {
+/// lifecycle stream, so the Landing has the startup diagnostics in hand before
+/// the user can touch anything.
+fn landing_showing(workspace: &Path, diagnostics: Vec<SettingsDiagnostic>) -> Application {
     let mut application = connected_application(workspace);
     deliver_snapshot(&mut application, diagnostics);
     application
@@ -40,9 +40,9 @@ fn deliver_snapshot(application: &mut Application, diagnostics: Vec<SettingsDiag
         .expect("receive the effective-settings snapshot");
 }
 
-/// The launch view's top row, as the reader sees it: the banner is inset from
-/// the terminal edge exactly as the launch view's other rows are.
-fn banner_row(rows: &[String]) -> String {
+/// The Landing's top row, as the reader sees it: the Notice is inset from the
+/// terminal edge exactly as the Landing's other rows are.
+fn notice_row(rows: &[String]) -> String {
     rows[0].trim().to_owned()
 }
 
@@ -80,36 +80,36 @@ fn mistyped_key() -> SettingsDiagnostic {
 }
 
 #[test]
-fn a_syntax_broken_config_document_banners_the_failure_and_points_at_the_log() {
+fn a_syntax_broken_config_document_notices_the_failure_and_points_at_the_log() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let application = launched_with(workspace.path(), vec![unreadable_document()]);
+    let application = landing_showing(workspace.path(), vec![unreadable_document()]);
 
-    let launch = rendered_application_rows(&application);
-    let banner = banner_row(&launch);
+    let landing = rendered_application_rows(&application);
+    let notice = notice_row(&landing);
     assert!(
-        banner.starts_with("× "),
-        "a whole Config Document being ignored banners at error severity: {banner:?}"
+        notice.starts_with("× "),
+        "a whole Config Document being ignored notices at error severity: {notice:?}"
     );
     assert!(
-        banner.contains("suru.jsonc") && banner.contains("not valid JSONC"),
-        "the banner names the file and why it was ignored: {banner:?}"
+        notice.contains("suru.jsonc") && notice.contains("not valid JSONC"),
+        "the Notice names the file and why it was ignored: {notice:?}"
     );
     assert!(
-        banner.contains("see the Log"),
-        "the banner points at the Log, where the whole diagnostic is: {banner:?}"
+        notice.contains("see the Log"),
+        "the Notice points at the Log, where the whole diagnostic is: {notice:?}"
     );
     assert!(
-        launch
+        landing
             .join("\n")
             .contains("What would you like to work on?"),
-        "the banner sits above the launch view rather than replacing it: {launch:?}"
+        "the Notice sits above the Landing rather than replacing it: {landing:?}"
     );
 }
 
 #[test]
-fn an_ignored_duplicate_config_document_banners_the_file_it_dropped() {
+fn an_ignored_duplicate_config_document_notices_the_file_it_dropped() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let application = launched_with(
+    let application = landing_showing(
         workspace.path(),
         vec![SettingsDiagnostic {
             severity: SettingsDiagnosticSeverity::Warning,
@@ -119,66 +119,66 @@ fn an_ignored_duplicate_config_document_banners_the_file_it_dropped() {
         }],
     );
 
-    let banner = banner_row(&rendered_application_rows(&application));
+    let notice = notice_row(&rendered_application_rows(&application));
     assert!(
-        banner.starts_with("! "),
-        "an ignored duplicate is a warning, not a failure: {banner:?}"
+        notice.starts_with("! "),
+        "an ignored duplicate is a warning, not a failure: {notice:?}"
     );
     assert!(
-        banner.contains("suru.json ignored because suru.jsonc exists and wins"),
-        "the banner names the dropped file and what beat it: {banner:?}"
-    );
-}
-
-#[test]
-fn per_key_ignores_are_counted_in_the_banner_summary() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
-    let application = launched_with(workspace.path(), vec![unknown_key(), mistyped_key()]);
-
-    let banner = banner_row(&rendered_application_rows(&application));
-    assert!(
-        banner.starts_with("! "),
-        "keys ignored one at a time are a warning: {banner:?}"
-    );
-    assert!(
-        banner.contains("2 keys ignored in suru.jsonc"),
-        "the banner counts the ignored keys and names their file: {banner:?}"
-    );
-    assert!(
-        banner.contains("see the Log"),
-        "the Log is where the key paths and reasons are: {banner:?}"
+        notice.contains("suru.json ignored because suru.jsonc exists and wins"),
+        "the Notice names the dropped file and what beat it: {notice:?}"
     );
 }
 
 #[test]
-fn a_file_level_failure_is_worded_ahead_of_the_keys_it_shares_the_banner_with() {
+fn per_key_ignores_are_counted_in_the_notice_summary() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let application = launched_with(
+    let application = landing_showing(workspace.path(), vec![unknown_key(), mistyped_key()]);
+
+    let notice = notice_row(&rendered_application_rows(&application));
+    assert!(
+        notice.starts_with("! "),
+        "keys ignored one at a time are a warning: {notice:?}"
+    );
+    assert!(
+        notice.contains("2 keys ignored in suru.jsonc"),
+        "the Notice counts the ignored keys and names their file: {notice:?}"
+    );
+    assert!(
+        notice.contains("see the Log"),
+        "the Log is where the key paths and reasons are: {notice:?}"
+    );
+}
+
+#[test]
+fn a_file_level_failure_is_worded_ahead_of_the_keys_it_shares_the_notice_with() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = landing_showing(
         workspace.path(),
         vec![unknown_key(), unreadable_document(), mistyped_key()],
     );
 
-    let banner = banner_row(&rendered_application_rows_at(&application, 160, 15));
-    let failure = banner
+    let notice = notice_row(&rendered_application_rows_at(&application, 160, 15));
+    let failure = notice
         .find("not valid JSONC")
-        .unwrap_or_else(|| panic!("banner omitted the file-level failure: {banner:?}"));
-    let keys = banner
+        .unwrap_or_else(|| panic!("Notice omitted the file-level failure: {notice:?}"));
+    let keys = notice
         .find("2 keys ignored")
-        .unwrap_or_else(|| panic!("banner omitted the per-key count: {banner:?}"));
+        .unwrap_or_else(|| panic!("Notice omitted the per-key count: {notice:?}"));
     assert!(
         failure < keys,
-        "the file-level failure is worded loudest, ahead of the key count: {banner:?}"
+        "the file-level failure is worded loudest, ahead of the key count: {notice:?}"
     );
     assert!(
-        banner.starts_with("× "),
-        "one error among warnings banners at error severity: {banner:?}"
+        notice.starts_with("× "),
+        "one error among warnings notices at error severity: {notice:?}"
     );
 }
 
 #[test]
 fn an_ignored_document_is_worded_ahead_of_a_document_merely_dropped() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let application = launched_with(
+    let application = landing_showing(
         workspace.path(),
         vec![
             SettingsDiagnostic {
@@ -191,38 +191,38 @@ fn an_ignored_document_is_worded_ahead_of_a_document_merely_dropped() {
         ],
     );
 
-    let banner = banner_row(&rendered_application_rows_at(&application, 160, 15));
-    let failure = banner
+    let notice = notice_row(&rendered_application_rows_at(&application, 160, 15));
+    let failure = notice
         .find("not valid JSONC")
-        .unwrap_or_else(|| panic!("banner omitted the failure: {banner:?}"));
-    let dropped = banner
+        .unwrap_or_else(|| panic!("Notice omitted the failure: {notice:?}"));
+    let dropped = notice
         .find("exists and wins")
-        .unwrap_or_else(|| panic!("banner omitted the dropped duplicate: {banner:?}"));
+        .unwrap_or_else(|| panic!("Notice omitted the dropped duplicate: {notice:?}"));
     assert!(
         failure < dropped,
-        "the loudest failure leads, whatever order the loader found them in: {banner:?}"
+        "the loudest failure leads, whatever order the loader found them in: {notice:?}"
     );
 }
 
 #[test]
 fn a_summary_too_long_for_the_terminal_gives_way_before_the_pointer_at_the_log_does() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let application = launched_with(
+    let application = landing_showing(
         workspace.path(),
         vec![unreadable_document(), unknown_key(), mistyped_key()],
     );
 
     for width in [40, 60, 80] {
-        let banner = banner_row(&rendered_application_rows_at(&application, width, 15));
+        let notice = notice_row(&rendered_application_rows_at(&application, width, 15));
         assert!(
-            banner.starts_with("× ") && banner.ends_with("see the Log"),
-            "at width {width} the banner still tells the reader where to look: {banner:?}"
+            notice.starts_with("× ") && notice.ends_with("see the Log"),
+            "at width {width} the Notice still tells the reader where to look: {notice:?}"
         );
     }
 }
 
 #[test]
-fn an_interaction_the_launch_view_makes_nothing_of_still_dismisses_the_banner() {
+fn an_interaction_the_landing_makes_nothing_of_still_dismisses_the_notice() {
     let unbound_key = InputEvent::Key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE));
     let click = InputEvent::Mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
@@ -232,11 +232,11 @@ fn an_interaction_the_launch_view_makes_nothing_of_still_dismisses_the_banner() 
     });
     for interaction in [unbound_key, click] {
         let workspace = tempfile::tempdir().expect("create Workspace");
-        let mut application = launched_with(workspace.path(), vec![unreadable_document()]);
+        let mut application = landing_showing(workspace.path(), vec![unreadable_document()]);
 
         application
             .handle_terminal_event(interaction.clone())
-            .expect("deliver an interaction the launch view maps to no command");
+            .expect("deliver an interaction the Landing maps to no command");
 
         let dismissed = rendered_application_rows(&application).join("\n");
         assert!(
@@ -247,45 +247,45 @@ fn an_interaction_the_launch_view_makes_nothing_of_still_dismisses_the_banner() 
 }
 
 #[test]
-fn the_terminal_resizing_around_the_reader_leaves_the_banner_standing() {
+fn the_terminal_resizing_around_the_reader_leaves_the_notice_standing() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let mut application = launched_with(workspace.path(), vec![unreadable_document()]);
+    let mut application = landing_showing(workspace.path(), vec![unreadable_document()]);
 
     application
         .handle_terminal_event(InputEvent::Resize(100, 30))
         .expect("deliver a resize");
 
-    let launch = rendered_application_rows_at(&application, 100, 30).join("\n");
+    let landing = rendered_application_rows_at(&application, 100, 30).join("\n");
     assert!(
-        launch.contains("see the Log"),
-        "a resize is the terminal's doing, not the reader's: {launch}"
+        landing.contains("see the Log"),
+        "a resize is the terminal's doing, not the reader's: {landing}"
     );
 }
 
 #[test]
-fn a_clean_configuration_renders_no_banner() {
+fn a_clean_configuration_renders_no_notice() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let application = launched_with(workspace.path(), Vec::new());
+    let application = landing_showing(workspace.path(), Vec::new());
 
-    let launch = rendered_application_rows(&application);
+    let landing = rendered_application_rows(&application);
     assert!(
-        !launch.join("\n").contains("see the Log"),
-        "a startup with nothing to report says nothing: {launch:?}"
+        !landing.join("\n").contains("see the Log"),
+        "a startup with nothing to report says nothing: {landing:?}"
     );
     assert_eq!(
-        launch,
+        landing,
         rendered_application_rows(&connected_application(workspace.path())),
-        "a clean snapshot leaves the launch view exactly as it was"
+        "a clean snapshot leaves the Landing exactly as it was"
     );
 }
 
 #[test]
-fn the_next_interaction_dismisses_the_banner_for_the_rest_of_the_run() {
+fn the_next_interaction_dismisses_the_notice_for_the_rest_of_the_run() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let mut application = launched_with(workspace.path(), vec![unreadable_document()]);
+    let mut application = landing_showing(workspace.path(), vec![unreadable_document()]);
     assert!(
-        banner_row(&rendered_application_rows(&application)).contains("see the Log"),
-        "the banner shows before the user has touched anything"
+        notice_row(&rendered_application_rows(&application)).contains("see the Log"),
+        "the Notice shows before the user has touched anything"
     );
 
     type_terminal_text(&mut application, "hello");
@@ -293,17 +293,17 @@ fn the_next_interaction_dismisses_the_banner_for_the_rest_of_the_run() {
     let dismissed = rendered_application_rows(&application).join("\n");
     assert!(
         !dismissed.contains("see the Log"),
-        "the reader's next interaction dismisses the banner: {dismissed}"
+        "the reader's next interaction dismisses the Notice: {dismissed}"
     );
     assert!(
         dismissed.contains("hello"),
-        "the banner never blocks input — the keystroke that dismissed it still typed: {dismissed}"
+        "the Notice never blocks input — the keystroke that dismissed it still typed: {dismissed}"
     );
 
     deliver_snapshot(&mut application, vec![unreadable_document()]);
     let reconnected = rendered_application_rows(&application).join("\n");
     assert!(
         !reconnected.contains("see the Log"),
-        "a banner the reader dismissed does not come back during the run: {reconnected}"
+        "a Notice the reader dismissed does not come back during the run: {reconnected}"
     );
 }
