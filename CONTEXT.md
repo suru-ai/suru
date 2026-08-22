@@ -103,3 +103,11 @@ _Avoid_: Environment, profile
 **Log**:
 The operator-facing diagnostic record a Suru process writes about its own run. A Log is about Suru's behavior, never about conversation content — the user-visible history of a Session is its Transcript.
 _Avoid_: Diagnostics, telemetry, trace
+
+**Setting**:
+One user-tunable value governing Suru's behavior, carrying a built-in default that applies whenever no Config Document pins it. Every Setting declares a scope: a **Client Setting** governs a client's presentation, and a machine-local Config Document may one day overlay it, while a **Server Setting** governs server or Provider behavior and follows only the server's own Config Documents. Distinct from a Model Option, which is Provider-advertised rather than user-authored.
+_Avoid_: Option, preference, config value
+
+**Config Document**:
+A file in which a user pins Settings. Config Documents stack in a fixed precedence order, and an edit Suru makes to one changes only the value it targets, leaving the rest of the document — its ordering, spacing, and comments — untouched.
+_Avoid_: Settings file, preferences file, config
