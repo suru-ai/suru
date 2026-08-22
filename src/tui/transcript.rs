@@ -137,6 +137,16 @@ impl<Id: Copy + Eq + Hash> DisclosureAxis<Id> {
         self.overrides.clear();
     }
 
+    /// Drops the overrides holding entries open, leaving the ones holding
+    /// entries closed. Under the closed posture every override is an opening,
+    /// so all of them go; under the open posture none is, so none does — which
+    /// is what makes this a one-way close rather than a reset to the posture.
+    fn close_opened_entries(&mut self) {
+        if self.posture == DisclosurePosture::Closed {
+            self.overrides.clear();
+        }
+    }
+
     /// Flips one entry between the axis's two steps, whichever way the reader
     /// left it.
     fn toggle(&mut self, id: Id) {
@@ -313,17 +323,22 @@ impl TranscriptTurnFolds {
         self.0.toggle(turn_id);
     }
 
-    // The one-way flips below reach the Transcript with the Turn Fold's
-    // lifecycle — an interrupt opens a Turn, a newer Turn folds the older ones
-    // back: <https://github.com/jake-tucker/suru/issues/89>.
-    #[allow(dead_code)]
+    /// Opens one Turn against the axis, which is what interrupting a Turn
+    /// asks for: the reader was watching that work, so the fold it settles
+    /// into must not close over the place they had reached.
     pub(super) fn expand(&mut self, turn_id: TurnId) {
         self.0.set_closed(turn_id, false);
     }
 
-    #[allow(dead_code)]
-    pub(super) fn fold(&mut self, turn_id: TurnId) {
-        self.0.set_closed(turn_id, true);
+    /// Folds back every Turn the reader had opened, which is what a newer Turn
+    /// beginning does to the ones before it. This is deliberately unlike a
+    /// per-entry Fold, whose override is sticky: a Turn Fold exists to compress
+    /// past work, so an expansion taken against a Turn lasts only until the
+    /// reader moves on to the next one. It only ever closes: a Turn the reader
+    /// folded by hand under the expanded posture stays folded, because
+    /// compressing past work is no reason to open anything.
+    pub(super) fn refold_expanded_turns(&mut self) {
+        self.0.close_opened_entries();
     }
 
     fn fingerprint(&self) -> u64 {
@@ -4072,6 +4087,33 @@ mod tests {
     }
 
     #[test]
+    fn refolding_the_turns_the_reader_opened_never_opens_one_they_closed() {
+        let opened_by_hand = TurnId::new();
+        let mut turns = TranscriptTurnFolds::default();
+        turns.expand(opened_by_hand);
+
+        turns.refold_expanded_turns();
+
+        assert!(
+            turns.is_folded(opened_by_hand),
+            "under the folded posture, moving on folds the Turn the reader opened"
+        );
+
+        let folded_by_hand = TurnId::new();
+        turns.toggle_posture();
+        turns.toggle(folded_by_hand);
+        assert!(turns.is_folded(folded_by_hand));
+
+        turns.refold_expanded_turns();
+
+        assert!(
+            turns.is_folded(folded_by_hand),
+            "compressing past work never opens a Turn: under the expanded posture the only \
+             flips the reader can have taken are foldings, and those stand"
+        );
+    }
+
+    #[test]
     fn flipping_the_turn_fold_posture_drops_the_overrides_taken_against_the_previous_one() {
         let expanded_by_hand = TurnId::new();
         let untouched = TurnId::new();
@@ -4087,7 +4129,7 @@ mod tests {
             "the expanded posture opens every Turn, whatever the reader flipped before"
         );
 
-        turns.fold(untouched);
+        turns.toggle(untouched);
         assert!(turns.is_folded(untouched));
         turns.toggle_posture();
         assert!(

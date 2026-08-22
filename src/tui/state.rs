@@ -480,12 +480,22 @@ impl TuiState {
         if self.session_events_blocked {
             return Ok(());
         }
-        let selection_changed = match &event {
-            SessionEvent::Snapshot(_) => true,
-            SessionEvent::Updated(update) => update
-                .changes
-                .iter()
-                .any(|change| matches!(change, SessionChange::AgentSelectionChanged { .. })),
+        // What the event means for the view, read before the event is consumed.
+        // A Snapshot replaces the Session wholesale, so it always resettles the
+        // agent selection; it reports no Turn beginning, because it carries a
+        // Session's Turns rather than the news of one starting.
+        let (selection_changed, turn_began) = match &event {
+            SessionEvent::Snapshot(_) => (true, false),
+            SessionEvent::Updated(update) => (
+                update
+                    .changes
+                    .iter()
+                    .any(|change| matches!(change, SessionChange::AgentSelectionChanged { .. })),
+                update
+                    .changes
+                    .iter()
+                    .any(|change| matches!(change, SessionChange::TurnAdded { .. })),
+            ),
         };
         match event {
             SessionEvent::Snapshot(snapshot) => self.hydrate_session(snapshot),
@@ -500,6 +510,9 @@ impl TuiState {
             self.confirmed_agent_selection = None;
             let current = self.agent_selection().cloned();
             self.model_picker.refocus(current.as_ref());
+        }
+        if turn_began {
+            self.refold_expanded_turns();
         }
         self.reconcile_pending_submission();
         self.reconcile_failed_submissions();
@@ -765,6 +778,29 @@ impl TuiState {
     fn toggle_turn_fold(&mut self, turn_id: TurnId) {
         if let Some(interaction) = self.current_interaction() {
             interaction.turns.borrow_mut().toggle(turn_id);
+        }
+    }
+
+    /// Keeps the reader's place in the Turn they just interrupted. They were
+    /// watching that work, so neither disclosure axis may close over it: the
+    /// Turn Fold the Turn is about to settle into opens ahead of the Settle,
+    /// and every Activity still Active opens behind it.
+    fn keep_interrupted_turn_open(&mut self, turn_id: TurnId) {
+        if let Some(interaction) = self.current_interaction() {
+            interaction.turns.borrow_mut().expand(turn_id);
+        }
+        self.expand_active_activities(turn_id);
+    }
+
+    /// Folds back the Turns the reader had opened, which is what a newer Turn
+    /// beginning means for the ones before it. A Turn Fold's expansion is
+    /// deliberately not sticky the way a per-entry Fold's override is: the fold
+    /// exists to compress past work, so moving on tidies the old expansions
+    /// away — including the one an interrupt opened, which lasts only until the
+    /// reader's next Turn starts.
+    fn refold_expanded_turns(&mut self) {
+        if let Some(interaction) = self.current_interaction() {
+            interaction.turns.borrow_mut().refold_expanded_turns();
         }
     }
 
@@ -1618,7 +1654,7 @@ impl Application {
             return ApplicationTransition::Continue;
         };
         self.state.command_mode = CommandMode::Composer;
-        self.state.expand_active_activities(turn_id);
+        self.state.keep_interrupted_turn_open(turn_id);
         ApplicationTransition::InterruptTurn {
             session_id,
             turn_id,

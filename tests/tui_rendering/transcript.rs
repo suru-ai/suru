@@ -3624,6 +3624,263 @@ fn toggling_the_turn_posture_flips_every_turn_fold_and_clears_per_turn_overrides
     );
 }
 
+/// The Session update a newer Turn beginning delivers: the Prompt that opened
+/// it, the Turn it opened, and the user Message that Turn starts from — the
+/// run a client actually reads a Turn starting from.
+fn newer_turn_begins(
+    session_id: SessionId,
+    revision: SessionRevision,
+    prompt: &str,
+) -> ApplicationEvent {
+    let prompt_id = PromptId::new();
+    let turn_id = TurnId::new();
+    ApplicationEvent::Session(SessionEvent::Updated(SessionUpdate {
+        session_id,
+        revision,
+        changes: vec![
+            SessionChange::PromptAdded {
+                prompt: Prompt {
+                    id: prompt_id,
+                    text: prompt.to_owned(),
+                    delivery: PromptDelivery::Queue,
+                    admission_order: PromptOrder(2),
+                    status: PromptStatus::Delivered,
+                },
+            },
+            SessionChange::TurnAdded {
+                turn: Turn {
+                    id: turn_id,
+                    prompt_id,
+                    agent: None,
+                    status: TurnStatus::Active,
+                    started_at: None,
+                    settled_at: None,
+                },
+            },
+            SessionChange::MessageAdded {
+                message: Message {
+                    id: MessageId::new(),
+                    turn_id,
+                    role: MessageRole::User,
+                    status: MessageStatus::Completed,
+                    content: prompt.to_owned(),
+                    truncated: false,
+                },
+            },
+        ],
+    }))
+}
+
+#[test]
+fn interrupting_a_turn_holds_its_fold_open_until_a_newer_turn_begins() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Run the workflow"),
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            RunEntry::Reasoning("Reading the workflow"),
+            RunEntry::AgentMessage("Two suites in, still going."),
+        ],
+    );
+    let session_id = snapshot.session.id;
+    let interrupted_turn = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, interrupted_turn);
+    let revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    // A second client watching the same Session, so the test reads what the
+    // interrupt does to the reader who asked for it and what it does to a view
+    // that did not.
+    let mut observer = connected_application(workspace.path());
+    for client in [&mut application, &mut observer] {
+        client
+            .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+            .expect("attach a Session whose Turn the reader is watching");
+    }
+
+    for _ in 0..2 {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .expect("request and confirm the interrupt");
+    }
+    let settle = || {
+        ApplicationEvent::Session(SessionEvent::Updated(SessionUpdate {
+            session_id,
+            revision: SessionRevision(revision.0 + 1),
+            changes: vec![SessionChange::TurnStatusChanged {
+                turn_id: interrupted_turn,
+                status: TurnStatus::Interrupted,
+                settled_at: None,
+            }],
+        }))
+    };
+    for client in [&mut application, &mut observer] {
+        client
+            .handle_event(settle())
+            .expect("settle the interrupted Turn for both clients");
+    }
+
+    let observed = rendered_application_rows_at(&observer, 80, 40).join("\n");
+    assert!(
+        observed.contains("× Stopped") && !observed.contains("Reading the workflow"),
+        "the auto-expand is view state of the client that interrupted, so a fresh view of the \
+         Session reads the Turn as its marker: {observed}"
+    );
+    let interrupted = rendered_application_rows_at(&application, 80, 40).join("\n");
+    assert!(
+        interrupted.contains("× Stopped"),
+        "the interrupted Turn marks how it settled: {interrupted}"
+    );
+    for kept in ["Ran 2 commands", "Reading the workflow"] {
+        assert!(
+            interrupted.contains(kept),
+            "interrupting the Turn holds its fold open so the reader keeps their place, but \
+             {kept:?} is missing: {interrupted}"
+        );
+    }
+
+    application
+        .handle_event(newer_turn_begins(
+            session_id,
+            SessionRevision(revision.0 + 2),
+            "Now ship it",
+        ))
+        .expect("begin a newer Turn");
+
+    let moved_on = rendered_application_rows_at(&application, 80, 40).join("\n");
+    for hidden in ["Ran 2 commands", "Reading the workflow"] {
+        assert!(
+            !moved_on.contains(hidden),
+            "a newer Turn re-folds the Turn the interrupt opened, but {hidden:?} rendered: \
+             {moved_on}"
+        );
+    }
+    assert!(
+        moved_on.contains("× Stopped") && moved_on.contains("Run the workflow"),
+        "the re-folded Turn is its marker and its Prompt again: {moved_on}"
+    );
+}
+
+#[test]
+fn a_queued_prompt_starting_in_the_settle_commit_refolds_the_interrupted_turn_at_once() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Run the workflow"),
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            RunEntry::Reasoning("Reading the workflow"),
+            RunEntry::AgentMessage("Two suites in, still going."),
+        ],
+    );
+    let session_id = snapshot.session.id;
+    let interrupted_turn = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, interrupted_turn);
+    let revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Turn the reader is watching");
+
+    for _ in 0..2 {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .expect("request and confirm the interrupt");
+    }
+    // The server settles an interrupted Turn and starts the queued Prompt's
+    // Turn in one commit, so the reader's next Turn begins in the very update
+    // that settles the one they stopped.
+    let ApplicationEvent::Session(SessionEvent::Updated(next_turn)) = newer_turn_begins(
+        session_id,
+        SessionRevision(revision.0 + 1),
+        "Ship it anyway",
+    ) else {
+        unreachable!("a newer Turn arrives as a Session update");
+    };
+    let mut changes = vec![SessionChange::TurnStatusChanged {
+        turn_id: interrupted_turn,
+        status: TurnStatus::Interrupted,
+        settled_at: None,
+    }];
+    changes.extend(next_turn.changes);
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                changes,
+                ..next_turn
+            },
+        )))
+        .expect("settle the interrupted Turn and start the queued Prompt's Turn together");
+
+    let rendered = rendered_application_rows_at(&application, 80, 40).join("\n");
+    assert!(
+        rendered.contains("× Stopped") && rendered.contains("Ship it anyway"),
+        "the stopped Turn stands as its marker above the Turn that displaced it: {rendered}"
+    );
+    for hidden in ["Ran 2 commands", "Reading the workflow"] {
+        assert!(
+            !rendered.contains(hidden),
+            "the reader's own queued Prompt is the newer Turn that re-folds the one they \
+             stopped, so the interrupt's expansion never outlives the Settle, but {hidden:?} \
+             rendered: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn a_newer_turn_refolds_the_turn_the_reader_expanded_by_hand() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = settled_turn_session(
+        workspace.path(),
+        "Run the workflow",
+        "The workflow is green.",
+    );
+    let session_id = snapshot.session.id;
+    let revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Turn has settled");
+    let folded_rows = rendered_application_rows_at(&application, 80, 36);
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&folded_rows, "✓ Worked") as u16))
+        .expect("expand the settled Turn by hand");
+    assert!(
+        rendered_application_rows_at(&application, 80, 36)
+            .join("\n")
+            .contains("Reading the workflow")
+    );
+
+    application
+        .handle_event(newer_turn_begins(
+            session_id,
+            SessionRevision(revision.0 + 1),
+            "Now ship it",
+        ))
+        .expect("begin a newer Turn");
+
+    let moved_on = rendered_application_rows_at(&application, 80, 36).join("\n");
+    assert!(
+        !moved_on.contains("Reading the workflow"),
+        "a Turn Fold's expansion lasts only until the reader moves on, unlike a per-entry \
+         Fold's sticky override: {moved_on}"
+    );
+    assert!(
+        moved_on.contains("✓ Worked"),
+        "the re-folded Turn stands as its marker again: {moved_on}"
+    );
+}
+
 #[test]
 fn the_transcript_keeps_a_row_of_air_above_the_composer() {
     let workspace = tempfile::tempdir().expect("create Workspace");
