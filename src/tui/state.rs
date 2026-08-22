@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use crossterm::event::Event as InputEvent;
+use crossterm::event::{Event as InputEvent, KeyEventKind, MouseEventKind};
 use ratatui::{Frame, style::Style};
 
 use crate::{
@@ -24,6 +24,7 @@ use crate::{
 };
 
 use super::{
+    banner::{LaunchBanner, LaunchNotice},
     commands::{CommandAutocomplete, SemanticCommandId, SemanticInvocation, SemanticSubject},
     composer::{ComposerKey, ComposerMemory},
     keymap::{
@@ -200,6 +201,10 @@ pub struct TuiState {
     /// Client Settings govern presentation from here. The snapshot leads the
     /// lifecycle stream, so it is in hand before any Session view opens.
     settings: EffectiveSettings,
+    /// What the launch view has to say about the configuration problems
+    /// startup found. It is a notice, not state the run depends on: the
+    /// reader's next interaction takes it away for good.
+    launch_notice: LaunchNotice,
     pub(super) transcript_cache: TranscriptCache,
     /// Bumped whenever the Session projection is replaced wholesale, so the
     /// transcript cache never trusts a revision across snapshot swaps.
@@ -296,6 +301,7 @@ impl TuiState {
             composers: ComposerMemory::default(),
             session_interactions: HashMap::new(),
             settings: EffectiveSettings::default(),
+            launch_notice: LaunchNotice::default(),
             transcript_cache: TranscriptCache::default(),
             transcript_generation: 0,
             spinner_frame: 0,
@@ -401,6 +407,7 @@ impl TuiState {
                 // a default is what a view starts from, not something that
                 // reaches back and moves what the reader is looking at.
                 self.settings = snapshot.settings;
+                self.launch_notice.receive(&snapshot.diagnostics);
             }
             ManagedEvent::Recovering(status) => {
                 if self.recovery.is_none() {
@@ -435,6 +442,10 @@ impl TuiState {
                 self.fatal_error = Some(error);
             }
         }
+    }
+
+    pub(super) fn launch_banner(&self) -> Option<&LaunchBanner> {
+        self.launch_notice.showing()
     }
 
     fn remove_deleted_session(&mut self, deleted_session_id: SessionId) {
@@ -1330,6 +1341,10 @@ impl Application {
     /// surface before it compiles; the handler it lands in then ignores
     /// anything outside its own group.
     fn handle_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
+        // Every command is an interaction, whatever surface raised it and even
+        // where an overlay is about to swallow it: the reader looked away from
+        // the banner either way.
+        self.state.launch_notice.dismiss();
         if self.state.reconnect_overlay_visible || self.defers_for_agent_selection(&command) {
             return Ok(ApplicationTransition::Continue);
         }
@@ -2164,10 +2179,22 @@ impl Application {
     }
 
     pub fn handle_terminal_event(&mut self, event: InputEvent) -> Result<ApplicationTransition> {
+        self.note_interaction(&event);
         self.command_for_terminal_input(event)
             .map_or(Ok(ApplicationTransition::Continue), |command| {
                 self.handle_event(ApplicationEvent::Command(command))
             })
+    }
+
+    /// Records that the reader touched the terminal, whether or not the active
+    /// input mode makes a command of it: an unbound key and a click on nothing
+    /// are still interactions, and the launch banner is dismissed by any of
+    /// them. A resize, a focus change, and the mouse merely passing over the
+    /// window are the terminal's doing rather than the reader's, so they leave
+    /// the banner standing. Reports whether anything on screen changed, so a
+    /// caller that draws on demand knows to redraw.
+    pub fn note_interaction(&mut self, event: &InputEvent) -> bool {
+        is_reader_interaction(event) && self.state.launch_notice.dismiss()
     }
 
     /// Translates a terminal event through the active input mode. `None` means
@@ -2225,5 +2252,17 @@ impl Application {
     /// only exists while [`Self::wants_spinner`] holds.
     pub(super) fn advance_spinner(&mut self) {
         self.state.spinner_frame = self.state.spinner_frame.wrapping_add(1);
+    }
+}
+
+/// Whether a terminal event is the reader acting rather than the terminal
+/// reporting: a key press, a click, or a paste is theirs; a resize, a focus
+/// change, and the mouse merely passing over the window are not.
+fn is_reader_interaction(event: &InputEvent) -> bool {
+    match event {
+        InputEvent::Key(key) => key.kind == KeyEventKind::Press,
+        InputEvent::Mouse(mouse) => !matches!(mouse.kind, MouseEventKind::Moved),
+        InputEvent::Paste(_) => true,
+        InputEvent::Resize(..) | InputEvent::FocusGained | InputEvent::FocusLost => false,
     }
 }

@@ -1,5 +1,6 @@
 //! Ratatui view state and terminal lifecycle.
 
+mod banner;
 mod commands;
 mod composer;
 mod event_loop;

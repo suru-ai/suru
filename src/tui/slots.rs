@@ -32,6 +32,14 @@ impl SlotText {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct HomeBannerSlotContext {
+    pub(super) width: u16,
+    /// The notice the launch view has to carry, or `None` when startup found
+    /// nothing to report and the built-in banner contributes no row at all.
+    pub(super) notice: Option<SlotText>,
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct HomeFooterSlotContext {
     pub(super) width: u16,
     pub(super) context: SlotText,
@@ -159,6 +167,7 @@ struct FooterItem {
 }
 
 pub(super) struct RenderSlots {
+    home_banner: Slot<HomeBannerSlotContext, Line<'static>>,
     home_footer: Slot<HomeFooterSlotContext, Line<'static>>,
     session_composer_top: Slot<SessionComposerTopSlotContext, Line<'static>>,
     prompt_footer: Slot<PromptFooterSlotContext, Line<'static>>,
@@ -169,6 +178,7 @@ pub(super) struct RenderSlots {
 impl Default for RenderSlots {
     fn default() -> Self {
         Self {
+            home_banner: Slot::new("home.banner"),
             home_footer: Slot::new("home.footer"),
             session_composer_top: Slot::new("session.composer.top"),
             prompt_footer: Slot::new("prompt.footer"),
@@ -181,6 +191,18 @@ impl Default for RenderSlots {
 impl RenderSlots {
     pub(super) fn builtins() -> Self {
         Self::default()
+    }
+
+    pub(super) fn home_banner(
+        &self,
+        context: &HomeBannerSlotContext,
+    ) -> RenderedSlot<Line<'static>> {
+        let default = context
+            .notice
+            .iter()
+            .map(|notice| one_line(context.width, notice))
+            .collect();
+        self.home_banner.compose(context, default)
     }
 
     pub(super) fn home_footer(
@@ -244,6 +266,17 @@ impl RenderSlots {
         rendered.failures = failures;
         rendered
     }
+}
+
+/// One row of slot text, cut to the width it has rather than wrapping: a
+/// banner that grew a second row would push the launch view around.
+fn one_line(width: u16, text: &SlotText) -> Line<'static> {
+    Line::from(
+        truncate_slot_text(vec![text.clone()], usize::from(width))
+            .into_iter()
+            .map(|item| Span::styled(item.text, item.style))
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn spread_footer_items(width: u16, items: impl IntoIterator<Item = FooterItem>) -> Line<'static> {
@@ -368,6 +401,7 @@ pub(super) struct TestContribution {
 
 #[cfg(test)]
 enum TestSlot {
+    HomeBanner,
     HomeFooter,
     SessionComposerTop,
     PromptFooter,
@@ -377,6 +411,18 @@ enum TestSlot {
 
 #[cfg(test)]
 impl TestContribution {
+    pub(super) fn home_banner(
+        placement: Placement,
+        result: Result<&'static str, &'static str>,
+    ) -> Self {
+        Self {
+            slot: TestSlot::HomeBanner,
+            placement,
+            result,
+            style: Style::default(),
+        }
+    }
+
     pub(super) fn home_footer(
         placement: Placement,
         result: Result<&'static str, &'static str>,
@@ -451,6 +497,14 @@ impl RenderSlots {
             let result = contribution.result;
             let style = contribution.style;
             match contribution.slot {
+                TestSlot::HomeBanner => {
+                    slots
+                        .home_banner
+                        .contribute(contribution.placement, move |_| match result {
+                            Ok(text) => Ok(vec![Line::styled(text, style)]),
+                            Err(message) => Err(message.to_owned()),
+                        })
+                }
                 TestSlot::HomeFooter => {
                     slots
                         .home_footer

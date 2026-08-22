@@ -28,9 +28,9 @@ use super::{
     model_picker::ModelPickerRow,
     session_picker::SessionPickerRow,
     slots::{
-        HomeFooterSlotContext, PromptContextSlotContext, PromptFooterSlotContext,
-        PromptStatusSlotContext, RenderSlots, RenderedSlot, SessionComposerTopSlotContext,
-        SlotText, truncate_to_width,
+        HomeBannerSlotContext, HomeFooterSlotContext, PromptContextSlotContext,
+        PromptFooterSlotContext, PromptStatusSlotContext, RenderSlots, RenderedSlot,
+        SessionComposerTopSlotContext, SlotText, truncate_to_width,
     },
     spinner,
     state::{CommandId, CommandMode, QueuedPrompt, TranscriptViewport, TuiState},
@@ -741,6 +741,12 @@ fn render_landing(
     } else {
         agent
     };
+    let banner = slots.home_banner(&HomeBannerSlotContext {
+        width: footer_width,
+        notice: state
+            .launch_banner()
+            .map(|banner| SlotText::new(banner.text(footer_width), banner.style(theme))),
+    });
     let footer = slots.home_footer(&HomeFooterSlotContext {
         width: footer_width,
         context: SlotText::new(context, theme.text.subdued),
@@ -749,9 +755,12 @@ fn render_landing(
             status_style(state, theme),
         ),
     });
-    let [main, footer_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(footer.height())])
-            .areas(frame.area());
+    let [banner_area, main, footer_area] = Layout::vertical([
+        Constraint::Length(banner.height()),
+        Constraint::Min(1),
+        Constraint::Length(footer.height()),
+    ])
+    .areas(frame.area());
     let content = horizontally_inset(main, horizontal_padding(frame.area().width));
     let key = ComposerKey::Landing;
     let composer_text = state.composers.text(key);
@@ -810,6 +819,12 @@ fn render_landing(
         theme,
     );
 
+    render_slot(
+        frame,
+        horizontally_inset(banner_area, horizontal_padding(frame.area().width)),
+        banner,
+        theme,
+    );
     render_slot(
         frame,
         horizontally_inset(footer_area, horizontal_padding(frame.area().width)),
@@ -1653,6 +1668,41 @@ mod tests {
         assert!(screen.contains("append"));
         assert!(!screen.contains("replacement one"));
         assert!(!screen.contains("Agent unavailable"));
+    }
+
+    #[test]
+    fn the_launch_banner_slot_takes_contributions_even_when_startup_was_clean() {
+        let slots = RenderSlots::testing([
+            TestContribution::home_banner(Placement::Prepend, Ok("notice from an extension")),
+            TestContribution::home_banner(Placement::Append, Err("banner failed")),
+        ]);
+        let application = Application {
+            slots,
+            ..Application::default()
+        };
+
+        let rows = rendered_rows(&application);
+        let failure = rows
+            .iter()
+            .position(|row| row.contains("Extension error · home.banner"))
+            .unwrap();
+        let notice = rows
+            .iter()
+            .position(|row| row.contains("notice from an extension"))
+            .unwrap();
+        let question = rows
+            .iter()
+            .position(|row| row.contains("What would you like to work on?"))
+            .unwrap();
+
+        assert!(
+            failure < notice,
+            "a failed contribution reports above the slot"
+        );
+        assert!(
+            notice < question,
+            "the banner sits above the launch view rather than over it"
+        );
     }
 
     #[test]

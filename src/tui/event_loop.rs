@@ -326,6 +326,9 @@ impl RunLoop {
         if matches!(event, InputEvent::Resize(..)) {
             self.needs_redraw = true;
         }
+        if self.application.note_interaction(&event) {
+            self.needs_redraw = true;
+        }
         let Some(command) = self.application.command_for_terminal_input(event) else {
             return Ok(ControlFlow::Continue(()));
         };
