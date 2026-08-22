@@ -17,8 +17,9 @@ use crate::{
         Activity, ActivityStatus, AdmitPromptRequest, AgentSelection, AgentSelectionOperationId,
         CreateSessionRequest, EffectiveSettings, FoldPosture, InitialPrompt, MessageId,
         ModelCatalog, PromptDelivery, PromptId, PromptStatus, ServerIdentity, SessionChange,
-        SessionId, SessionListItem, SessionSnapshot, SessionStatus, ShutdownReason, TurnId,
-        TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        SessionId, SessionListItem, SessionSnapshot, SessionStatus, SettingMutation,
+        SettingsSnapshot, ShutdownReason, TurnId, TurnStatus, UpdateAgentSelectionRequest,
+        Workspace,
     },
     theme::Theme,
 };
@@ -30,13 +31,14 @@ use super::{
         command_for_autocomplete_event, command_for_interrupt_confirmation_event,
         command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
         command_for_queued_prompt_event, command_for_session_picker_event,
-        command_for_terminal_event,
+        command_for_settings_panel_event, command_for_terminal_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction},
     notice::{LandingNotice, Notice},
     render::render_with_slots,
     session_picker::SessionPicker,
+    settings_panel::SettingsPanel,
     slots::RenderSlots,
     transcript::{
         FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups,
@@ -201,6 +203,9 @@ pub struct TuiState {
     /// Client Settings govern presentation from here. The snapshot leads the
     /// lifecycle stream, so it is in hand before any Session view opens.
     settings: EffectiveSettings,
+    /// The dotted keys a Config Document pins, from the same snapshot, so the
+    /// settings panel can tell the reader's own choice from a built-in default.
+    pinned_settings: Vec<String>,
     /// What the Landing has to say about the configuration problems startup
     /// found. It is a Notice, not state the run depends on: the reader's next
     /// interaction takes it away for good.
@@ -235,6 +240,7 @@ pub struct TuiState {
     pub(super) model_options: ModelOptions,
     pub(super) model_picker: ModelPicker,
     pub(super) session_picker: SessionPicker,
+    pub(super) settings_panel: SettingsPanel,
 }
 
 #[derive(Clone, Debug)]
@@ -301,6 +307,7 @@ impl TuiState {
             composers: ComposerMemory::default(),
             session_interactions: HashMap::new(),
             settings: EffectiveSettings::default(),
+            pinned_settings: Vec::new(),
             landing_notice: LandingNotice::default(),
             transcript_cache: TranscriptCache::default(),
             transcript_generation: 0,
@@ -326,6 +333,7 @@ impl TuiState {
             model_options: ModelOptions::default(),
             model_picker: ModelPicker::default(),
             session_picker: SessionPicker::new(workspace),
+            settings_panel: SettingsPanel::default(),
         }
     }
 
@@ -402,13 +410,7 @@ impl TuiState {
                 self.manually_stopped = false;
                 self.fatal_error = None;
             }
-            ManagedEvent::SettingsSnapshot(snapshot) => {
-                // Session views already open keep the posture they opened at:
-                // a default is what a view starts from, not something that
-                // reaches back and moves what the reader is looking at.
-                self.settings = snapshot.settings;
-                self.landing_notice.receive(&snapshot.diagnostics);
-            }
+            ManagedEvent::SettingsSnapshot(snapshot) => self.adopt_settings(snapshot),
             ManagedEvent::Recovering(status) => {
                 if self.recovery.is_none() {
                     self.reconnect_overlay_visible = false;
@@ -442,6 +444,26 @@ impl TuiState {
                 self.fatal_error = Some(error);
             }
         }
+    }
+
+    /// Takes a freshly pushed effective-settings snapshot as the whole truth
+    /// about what every Setting is worth, which is what makes an edit's round
+    /// trip — and not the keystroke that started it — move a settings row.
+    fn adopt_settings(&mut self, snapshot: SettingsSnapshot) {
+        // Session views already open keep the posture they opened at: a
+        // default is what a view starts from, not something that reaches back
+        // and moves what the reader is looking at.
+        self.settings = snapshot.settings;
+        self.pinned_settings = snapshot.pinned;
+        self.landing_notice.receive(&snapshot.diagnostics);
+    }
+
+    pub(super) fn settings(&self) -> &EffectiveSettings {
+        &self.settings
+    }
+
+    pub(super) fn pinned_settings(&self) -> &[String] {
+        &self.pinned_settings
     }
 
     pub(super) fn landing_notice(&self) -> Option<&Notice> {
@@ -1164,6 +1186,9 @@ pub enum ApplicationEvent {
     },
     SessionCreated(SessionSnapshot),
     SessionOperationFailed(String),
+    /// The effective settings an accepted edit left in force.
+    SettingMutated(SettingsSnapshot),
+    SettingMutationFailed(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1252,6 +1277,8 @@ pub enum ApplicationTransition {
         session_id: SessionId,
         request: UpdateAgentSelectionRequest,
     },
+    /// One Setting's typed edit, on its way to the server that owns the file.
+    MutateSetting(SettingMutation),
 }
 
 impl Application {
@@ -1291,6 +1318,14 @@ impl Application {
             }
             ApplicationEvent::SessionOperationFailed(error) => {
                 self.state.submission_error = Some(error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SettingMutated(snapshot) => {
+                self.state.adopt_settings(snapshot);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SettingMutationFailed(error) => {
+                self.state.settings_panel.report_failure(error);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::PromptAdmissionSucceeded(prompt_id) => {
@@ -1946,6 +1981,13 @@ impl Application {
             | SemanticCommandId::ModelOptionReasoningCycle) => {
                 self.handle_model_options_command(command)
             }
+            command @ (SemanticCommandId::SettingsOpen
+            | SemanticCommandId::SettingsPrevious
+            | SemanticCommandId::SettingsNext
+            | SemanticCommandId::SettingsValuePrevious
+            | SemanticCommandId::SettingsValueNext
+            | SemanticCommandId::SettingsReset
+            | SemanticCommandId::SettingsClose) => Ok(self.handle_settings_panel_command(command)),
             SemanticCommandId::SessionList => {
                 let request = self.state.session_picker.open();
                 self.state.command_mode = CommandMode::Composer;
@@ -2004,6 +2046,49 @@ impl Application {
                 })
             }
         }
+    }
+
+    /// Handles the settings panel commands routed here; any other semantic
+    /// command leaves the panel alone.
+    ///
+    /// An edit is write-through: the mutation goes out the moment the reader
+    /// chooses, because a Setting is one value rather than a transaction, and
+    /// the row moves when the refreshed snapshot comes back.
+    fn handle_settings_panel_command(
+        &mut self,
+        command: SemanticCommandId,
+    ) -> ApplicationTransition {
+        let mutation = match command {
+            SemanticCommandId::SettingsOpen => {
+                self.state.settings_panel.open();
+                self.state.command_mode = CommandMode::Composer;
+                None
+            }
+            SemanticCommandId::SettingsPrevious => {
+                self.state.settings_panel.select_previous();
+                None
+            }
+            SemanticCommandId::SettingsNext => {
+                self.state.settings_panel.select_next();
+                None
+            }
+            SemanticCommandId::SettingsValuePrevious => {
+                self.state.settings_panel.cycle(&self.state.settings, -1)
+            }
+            SemanticCommandId::SettingsValueNext => {
+                self.state.settings_panel.cycle(&self.state.settings, 1)
+            }
+            SemanticCommandId::SettingsReset => self.state.settings_panel.reset(),
+            SemanticCommandId::SettingsClose => {
+                self.state.settings_panel.close();
+                None
+            }
+            _ => None,
+        };
+        mutation.map_or(
+            ApplicationTransition::Continue,
+            ApplicationTransition::MutateSetting,
+        )
     }
 
     /// Handles the Model Options commands routed here; any other semantic
@@ -2200,6 +2285,9 @@ impl Application {
     /// Translates a terminal event through the active input mode. `None` means
     /// the event changes nothing, so callers can skip redrawing.
     pub fn command_for_terminal_input(&self, event: InputEvent) -> Option<CommandId> {
+        if self.state.settings_panel.is_open() {
+            return command_for_settings_panel_event(event);
+        }
         if self.state.model_options.is_open() {
             return command_for_model_options_event(event);
         }

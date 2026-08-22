@@ -98,11 +98,15 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     if state.model_options.is_open() && !state.reconnect_overlay_visible {
         render_model_options(frame, state, &theme);
     }
+    if state.settings_panel.is_open() && !state.reconnect_overlay_visible {
+        render_settings_panel(frame, state, &theme);
+    }
     if state.reconnect_overlay_visible {
         render_reconnect_overlay(frame, &theme);
     } else if !state.session_picker.is_open()
         && !state.model_picker.is_open()
         && !state.model_options.is_open()
+        && !state.settings_panel.is_open()
         && state.composer_focused
         && matches!(state.command_mode, CommandMode::Composer)
     {
@@ -324,6 +328,73 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     );
 }
 
+/// The settings panel: every defined Setting, what it is worth right now, and
+/// whether that value is the reader's own pin or the built-in default. Rows
+/// come straight from the latest effective-settings snapshot, so an edit moves
+/// a row only once the server has answered for it.
+fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+    let rows = state
+        .settings_panel
+        .rows(state.settings(), state.pinned_settings());
+    // The schema is a flat list of known length, so the panel is exactly as
+    // tall as it needs to be: two borders around the headline, one row per
+    // Setting, and the controls.
+    let wanted = u16::try_from(rows.len().saturating_add(4)).unwrap_or(u16::MAX);
+    let area = centered_rect(
+        frame.area(),
+        frame.area().width.saturating_sub(4).min(76),
+        frame.area().height.saturating_sub(2).min(wanted),
+    );
+    let content_width = usize::from(area.width.saturating_sub(2));
+    let content_height = usize::from(area.height.saturating_sub(2));
+    let mut lines = Vec::with_capacity(content_height);
+    if content_height >= 2 {
+        // What the focused Setting does, or why the last edit of it never
+        // reached the Config Document — a failed edit is the more urgent of
+        // the two, so it takes the line.
+        let (headline, style) = match (
+            state.settings_panel.error(),
+            state.settings_panel.selected_descriptor(),
+        ) {
+            (Some(error), _) => (error.to_owned(), theme.feedback.error),
+            (None, Some(descriptor)) => (
+                format!("{} · {}", descriptor.key, descriptor.description),
+                theme.text.subdued,
+            ),
+            (None, None) => (String::new(), theme.text.subdued),
+        };
+        lines.push(Line::styled(
+            truncate_to_width(&headline, content_width),
+            style,
+        ));
+    }
+    let footer_rows = usize::from(content_height >= 3);
+    let capacity = content_height.saturating_sub(lines.len() + footer_rows);
+    let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
+    for row in visible_window(rows, selected, capacity) {
+        let marker = if row.selected { "› " } else { "  " };
+        let origin = if row.pinned { "pinned" } else { "default" };
+        lines.push(Line::styled(
+            truncate_to_width(
+                &format!("{marker}{} · {} [{origin}]", row.label, row.value),
+                content_width,
+            ),
+            if row.selected {
+                theme.selection.focused
+            } else {
+                theme.text.primary
+            },
+        ));
+    }
+    if footer_rows > 0 && lines.len() < content_height {
+        lines.push(Line::styled(
+            truncate_to_width("Enter cycle · Ctrl+D reset · Esc close", content_width),
+            theme.text.subdued,
+        ));
+    }
+    render_overlay_box(frame, area, lines, " Settings ", theme);
+}
+
 fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     let area = centered_rect(
         frame.area(),
@@ -376,11 +447,8 @@ fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) 
         let capacity = content_height.saturating_sub(lines.len() + footer_rows);
         let rows = state.model_options.choice_rows();
         let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
-        let start = selected.saturating_add(1).saturating_sub(capacity);
         lines.extend(
-            rows.into_iter()
-                .skip(start)
-                .take(capacity)
+            visible_window(rows, selected, capacity)
                 .map(|row| model_option_choice_line(row, content_width, theme)),
         );
         if footer_rows > 0 && lines.len() < content_height {
@@ -389,7 +457,7 @@ fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) 
                 theme.text.subdued,
             ));
         }
-        render_model_options_box(
+        render_overlay_box(
             frame,
             area,
             lines,
@@ -403,8 +471,7 @@ fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) 
     let capacity = content_height.saturating_sub(lines.len() + footer_rows);
     let rows = state.model_options.rows();
     let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
-    let start = selected.saturating_add(1).saturating_sub(capacity);
-    for row in rows.into_iter().skip(start).take(capacity) {
+    for row in visible_window(rows, selected, capacity) {
         let marker = if row.selected { "› " } else { "  " };
         let unavailable = if row.available { "" } else { " [unavailable]" };
         let description = row
@@ -438,7 +505,7 @@ fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) 
             theme.text.subdued,
         ));
     }
-    render_model_options_box(frame, area, lines, " Model Options ", theme);
+    render_overlay_box(frame, area, lines, " Model Options ", theme);
 }
 
 fn model_option_choice_line(
@@ -467,7 +534,15 @@ fn model_option_choice_line(
     )
 }
 
-fn render_model_options_box(
+/// The slice of a list to draw when the box is shorter than the list: enough
+/// rows to fill it, ending on the focused one, so a selection moving past the
+/// bottom scrolls the list rather than leaving the frame.
+fn visible_window<T>(rows: Vec<T>, selected: usize, capacity: usize) -> impl Iterator<Item = T> {
+    let start = selected.saturating_add(1).saturating_sub(capacity);
+    rows.into_iter().skip(start).take(capacity)
+}
+
+fn render_overlay_box(
     frame: &mut Frame<'_>,
     area: Rect,
     lines: Vec<Line<'static>>,

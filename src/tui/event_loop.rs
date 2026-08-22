@@ -18,8 +18,8 @@ use crate::{
     },
     protocol::{
         AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
-        ModelCatalog, PromptId, SessionId, SessionListItem, SessionSnapshot, TurnId,
-        UpdateAgentSelectionRequest,
+        ModelCatalog, PromptId, SessionId, SessionListItem, SessionSnapshot, SettingMutation,
+        SettingsSnapshot, TurnId, UpdateAgentSelectionRequest,
     },
 };
 use anyhow::{Result, anyhow};
@@ -425,6 +425,13 @@ impl RunLoop {
                     self.channels.submissions.clone(),
                 );
             }
+            ApplicationTransition::MutateSetting(mutation) => {
+                spawn_setting_mutation(
+                    self.client.session_commands(),
+                    mutation,
+                    self.channels.submissions.clone(),
+                );
+            }
         }
         ControlFlow::Continue(())
     }
@@ -476,7 +483,8 @@ impl RunLoop {
             | ApplicationTransition::ListSessions(_)
             | ApplicationTransition::ListModels(_)
             | ApplicationTransition::ConfirmLandingAgentSelection(_)
-            | ApplicationTransition::UpdateAgentSelection { .. } => {
+            | ApplicationTransition::UpdateAgentSelection { .. }
+            | ApplicationTransition::MutateSetting(_) => {
                 unreachable!("managed events do not issue Session commands");
             }
         }
@@ -633,6 +641,14 @@ impl RunLoop {
                     },
                 )?;
                 self.flush_agent_selection(transition);
+            }
+            SubmissionResult::SettingMutated(snapshot) => {
+                self.application
+                    .handle_event(ApplicationEvent::SettingMutated(*snapshot))?;
+            }
+            SubmissionResult::SettingMutationFailed(error) => {
+                self.application
+                    .handle_event(ApplicationEvent::SettingMutationFailed(error))?;
             }
         }
         Ok(ControlFlow::Continue(()))
@@ -799,6 +815,8 @@ enum SubmissionResult {
         operation_id: AgentSelectionOperationId,
         error: String,
     },
+    SettingMutated(Box<SettingsSnapshot>),
+    SettingMutationFailed(String),
 }
 
 enum ModelPickerResult {
@@ -1039,6 +1057,22 @@ fn operation_result(result: anyhow::Result<()>) -> SubmissionResult {
         Ok(()) => SubmissionResult::OperationSucceeded,
         Err(error) => SubmissionResult::OperationFailed(error.to_string()),
     }
+}
+
+/// Sends one Setting's typed edit to the server, which owns the Config
+/// Document, and brings back the effective settings the edit left in force.
+fn spawn_setting_mutation(
+    commands: SessionCommandClient,
+    mutation: SettingMutation,
+    results: UnboundedSender<SubmissionResult>,
+) {
+    tokio::spawn(async move {
+        let result = match commands.mutate_setting(mutation).await {
+            Ok(snapshot) => SubmissionResult::SettingMutated(Box::new(snapshot)),
+            Err(error) => SubmissionResult::SettingMutationFailed(error.to_string()),
+        };
+        let _ = results.send(result);
+    });
 }
 
 fn spawn_session_operation(

@@ -14,6 +14,7 @@ mod model_picker;
 mod prompts;
 mod reasoning_cycle;
 mod session_picker;
+mod settings_panel;
 mod shell;
 mod support;
 mod transcript;

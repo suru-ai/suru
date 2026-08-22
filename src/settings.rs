@@ -29,8 +29,8 @@ use jsonc_parser::{
 use serde_json::Value;
 
 use crate::protocol::{
-    EffectiveSettings, SettingMutation, SettingScope, SettingsDiagnostic,
-    SettingsDiagnosticSeverity, SettingsSnapshot,
+    EffectiveSettings, FoldPosture, ReasoningSummaryDetail, SettingMutation, SettingScope,
+    SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -46,16 +46,99 @@ const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary"
 /// What a Config Document that does not exist yet is edited as.
 const EMPTY_DOCUMENT: &str = "{}\n";
 
-/// One Setting's compile-time definition.
+/// One Setting's compile-time definition: what a Config Document calls it,
+/// what it may hold, and how each of those values is read and written.
 pub struct SettingDescriptor {
     /// Dotted camelCase path of the Setting in a Config Document.
     pub key: &'static str,
+    /// What the Setting is called where a person reads it rather than writes it.
+    pub label: &'static str,
+    /// What choosing between its values means, in one line.
+    pub description: &'static str,
     pub scope: SettingScope,
-    /// The accepted values, phrased for a diagnostic's "why" clause.
-    expected: &'static str,
+    /// Every value the Setting can hold, in the order a reader cycles them.
+    pub choices: &'static [SettingChoice],
+    /// The mutation that takes this Setting's pin out of the Config Document,
+    /// so the built-in default resumes.
+    pub reset: SettingMutation,
     /// Writes a pinned JSON value into the typed field it governs, or reports
     /// that the value is not one of the accepted ones.
     apply: fn(&mut EffectiveSettings, &Value) -> bool,
+}
+
+/// One value a Setting can hold, and the pin that puts it in force.
+pub struct SettingChoice {
+    /// The value as a Config Document spells it, which is also what a client
+    /// shows: what the reader sees and what they would type are the same word.
+    pub value: &'static str,
+    /// The mutation that pins this value, even when it is the built-in default.
+    pub pin: SettingMutation,
+}
+
+impl SettingDescriptor {
+    /// The choice the effective settings hold for this Setting, or `None` when
+    /// they hold a value the schema does not name — which is what a Setting
+    /// that grew a value without growing a choice for it would read as. A
+    /// client shows that honestly rather than dying on the draw.
+    pub fn effective(&self, settings: &EffectiveSettings) -> Option<&'static SettingChoice> {
+        self.effective_index(settings)
+            .map(|index| &self.choices[index])
+    }
+
+    /// The choice `distance` steps along from the one in force, wrapping past
+    /// either end, which is how a reader cycles a Setting through its values.
+    /// A value the schema does not name has no neighbours, so the first choice
+    /// is where the step lands instead.
+    pub fn choice_after(
+        &self,
+        settings: &EffectiveSettings,
+        distance: isize,
+    ) -> Option<&'static SettingChoice> {
+        let count = isize::try_from(self.choices.len())
+            .ok()
+            .filter(|c| *c > 0)?;
+        let index = match self.effective_index(settings) {
+            Some(current) => (current as isize + distance).rem_euclid(count) as usize,
+            None => 0,
+        };
+        self.choices.get(index)
+    }
+
+    fn effective_index(&self, settings: &EffectiveSettings) -> Option<usize> {
+        self.choices
+            .iter()
+            .position(|choice| pins_effective_value(&choice.pin, settings))
+    }
+
+    /// The accepted values, phrased for a diagnostic's "why" clause. Read off
+    /// the choices themselves, so a Setting that grows a value cannot leave a
+    /// diagnostic still naming the old set.
+    fn expected(&self) -> String {
+        let values = self
+            .choices
+            .iter()
+            .map(|choice| format!("{:?}", choice.value))
+            .collect::<Vec<_>>();
+        match values.split_last() {
+            None => "a value this Setting accepts".to_owned(),
+            Some((last, [])) => last.clone(),
+            Some((last, [first])) => format!("one of {first} or {last}"),
+            Some((last, rest)) => format!("one of {}, or {last}", rest.join(", ")),
+        }
+    }
+}
+
+/// Whether a pin would leave the Setting exactly where the effective settings
+/// already have it.
+fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings) -> bool {
+    match *mutation {
+        SettingMutation::TranscriptDefaultFoldPosture { value } => {
+            value == Some(settings.transcript.default_fold_posture)
+        }
+        SettingMutation::ProviderCodexReasoningSummary { value } => {
+            value == Some(settings.provider.codex.reasoning_summary)
+        }
+    }
 }
 
 /// Every defined Setting. The panel, the loader, and future overlays all read
@@ -66,8 +149,24 @@ pub struct SettingDescriptor {
 pub const SCHEMA: &[SettingDescriptor] = &[
     SettingDescriptor {
         key: TRANSCRIPT_DEFAULT_FOLD_POSTURE,
+        label: "Default Fold posture",
+        description: "How a Session view opens: folded to its markers, or expanded in full",
         scope: SettingScope::Client,
-        expected: "one of \"folded\" or \"expanded\"",
+        choices: &[
+            SettingChoice {
+                value: "folded",
+                pin: SettingMutation::TranscriptDefaultFoldPosture {
+                    value: Some(FoldPosture::Folded),
+                },
+            },
+            SettingChoice {
+                value: "expanded",
+                pin: SettingMutation::TranscriptDefaultFoldPosture {
+                    value: Some(FoldPosture::Expanded),
+                },
+            },
+        ],
+        reset: SettingMutation::TranscriptDefaultFoldPosture { value: None },
         apply: |settings, value| {
             apply_value(value, |posture| {
                 settings.transcript.default_fold_posture = posture;
@@ -76,8 +175,36 @@ pub const SCHEMA: &[SettingDescriptor] = &[
     },
     SettingDescriptor {
         key: PROVIDER_CODEX_REASONING_SUMMARY,
+        label: "Codex Reasoning summary",
+        description: "How much Reasoning summary detail each Turn asks Codex for",
         scope: SettingScope::Server,
-        expected: "one of \"auto\", \"concise\", \"detailed\", or \"none\"",
+        choices: &[
+            SettingChoice {
+                value: "auto",
+                pin: SettingMutation::ProviderCodexReasoningSummary {
+                    value: Some(ReasoningSummaryDetail::Auto),
+                },
+            },
+            SettingChoice {
+                value: "concise",
+                pin: SettingMutation::ProviderCodexReasoningSummary {
+                    value: Some(ReasoningSummaryDetail::Concise),
+                },
+            },
+            SettingChoice {
+                value: "detailed",
+                pin: SettingMutation::ProviderCodexReasoningSummary {
+                    value: Some(ReasoningSummaryDetail::Detailed),
+                },
+            },
+            SettingChoice {
+                value: "none",
+                pin: SettingMutation::ProviderCodexReasoningSummary {
+                    value: Some(ReasoningSummaryDetail::None),
+                },
+            },
+        ],
+        reset: SettingMutation::ProviderCodexReasoningSummary { value: None },
         apply: |settings, value| {
             apply_value(value, |detail| {
                 settings.provider.codex.reasoning_summary = detail;
@@ -502,7 +629,7 @@ fn apply_key(
                 severity: SettingsDiagnosticSeverity::Warning,
                 file: path.to_path_buf(),
                 key: Some(key),
-                message: format!("ignored because its value is not {}", descriptor.expected),
+                message: format!("ignored because its value is not {}", descriptor.expected()),
             });
         }
         return;
@@ -537,6 +664,121 @@ fn apply_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The JSON a pin writes into the Config Document, which is what the
+    /// loader will read back and what a client shows.
+    fn pinned_value(mutation: &SettingMutation) -> Value {
+        serde_json::to_value(mutation).expect("Setting mutations always serialize")["value"].clone()
+    }
+
+    #[test]
+    fn every_choice_is_spelled_the_way_the_config_document_spells_it() {
+        for descriptor in SCHEMA {
+            for choice in descriptor.choices {
+                assert_eq!(
+                    pinned_value(&choice.pin),
+                    Value::String(choice.value.to_owned()),
+                    "{} offers {:?} but pins something else",
+                    descriptor.key,
+                    choice.value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_choice_a_setting_offers_becomes_the_effective_value_it_names() {
+        for descriptor in SCHEMA {
+            for choice in descriptor.choices {
+                let mut settings = EffectiveSettings::default();
+                assert!(
+                    (descriptor.apply)(&mut settings, &pinned_value(&choice.pin)),
+                    "{} rejects its own choice {:?}",
+                    descriptor.key,
+                    choice.value
+                );
+                assert_eq!(
+                    descriptor.effective(&settings).map(|choice| choice.value),
+                    Some(choice.value),
+                    "{} does not read back the choice it just took",
+                    descriptor.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_setting_reads_a_choice_for_its_built_in_default() {
+        let defaults = EffectiveSettings::default();
+        for descriptor in SCHEMA {
+            assert!(
+                descriptor.effective(&defaults).is_some(),
+                "{} defaults to a value it does not offer",
+                descriptor.key
+            );
+        }
+    }
+
+    #[test]
+    fn cycling_a_setting_walks_its_choices_in_order_and_wraps_at_both_ends() {
+        for descriptor in SCHEMA {
+            let mut settings = EffectiveSettings::default();
+            let mut walked = Vec::new();
+            for _ in 0..descriptor.choices.len() {
+                let next = descriptor
+                    .choice_after(&settings, 1)
+                    .expect("a Setting always offers somewhere to step");
+                assert!(
+                    (descriptor.apply)(&mut settings, &pinned_value(&next.pin)),
+                    "{} rejects the choice it stepped to",
+                    descriptor.key
+                );
+                walked.push(next.value);
+            }
+            let offered = descriptor
+                .choices
+                .iter()
+                .map(|choice| choice.value)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                walked.len(),
+                offered.len(),
+                "{} does not return to where it started",
+                descriptor.key
+            );
+            for value in &offered {
+                assert!(
+                    walked.contains(value),
+                    "{} never steps onto {value:?}",
+                    descriptor.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_rejected_value_is_diagnosed_with_the_choices_the_setting_offers() {
+        let expected = SCHEMA
+            .iter()
+            .map(SettingDescriptor::expected)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected,
+            vec![
+                "one of \"folded\" or \"expanded\"".to_owned(),
+                "one of \"auto\", \"concise\", \"detailed\", or \"none\"".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resetting_a_setting_unpins_the_key_that_setting_owns() {
+        for descriptor in SCHEMA {
+            let (key, value) = pin_for(&descriptor.reset);
+            assert_eq!(key, descriptor.key);
+            assert_eq!(value, None, "a reset never writes a value");
+        }
+    }
 
     #[test]
     fn suru_config_dir_overrides_every_other_config_root() {

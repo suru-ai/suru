@@ -110,6 +110,35 @@ pub(super) fn command_for_model_options_event(event: InputEvent) -> Option<Comma
     }
 }
 
+/// The settings panel edits one Setting at a time and has no search line, so
+/// its keys are the arrows that move between Settings and between values, plus
+/// the reset that takes a pin out. Nothing else reaches the composer while it
+/// is open.
+pub(super) fn command_for_settings_panel_event(event: InputEvent) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let semantic = match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::SettingsPrevious
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::SettingsNext
+        }
+        (KeyCode::Left, KeyModifiers::NONE) => SemanticCommandId::SettingsValuePrevious,
+        (KeyCode::Enter | KeyCode::Right, KeyModifiers::NONE) => {
+            SemanticCommandId::SettingsValueNext
+        }
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) => SemanticCommandId::SettingsReset,
+        (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::SettingsClose,
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(semantic))
+}
+
 struct PickerCommandBindings {
     previous: CommandId,
     next: CommandId,
