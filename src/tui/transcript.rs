@@ -694,7 +694,7 @@ impl RenderUnit<'_> {
             Self::Activity(activity) | Self::GroupMember(activity) => {
                 (activity.status() == Some(crate::protocol::ActivityStatus::Active)).then_some(0)
             }
-            Self::Group { kind, .. } => kind.header_spinner_line(),
+            Self::Group { kind, members, .. } => kind.header_spinner_line(members),
             Self::Message(_) | Self::TurnFold(_) | Self::Provisional(_) => None,
         }
     }
@@ -1193,8 +1193,7 @@ impl TurnFolding {
 enum GroupableKind {
     /// Commands, which join a run only once they settle successfully.
     Command,
-    /// Reasoning blocks, which join a run once they settle having said
-    /// something.
+    /// Reasoning blocks, which join a run from the moment they start.
     Reasoning,
 }
 
@@ -1203,20 +1202,23 @@ impl GroupableKind {
     /// nothing and so ends whatever run it follows. A command joins only once
     /// it settles Completed with exit status 0, so a failed, interrupted, or
     /// still-running one — anything worth scanning for — never hides behind a
-    /// Group row. A Reasoning block joins once it settles Completed, so a
-    /// block a Turn interrupted ends the run and stands outside it: a Group
-    /// row only ever summarizes thinking that finished. A block the reader
-    /// sees nothing for never reaches here at all, because the walk resolves
-    /// it to no entry.
+    /// Group row. A Reasoning block joins from the moment it starts, so the
+    /// Group forms live and the run a reader is watching is the same row it
+    /// reads afterwards; only a block a Turn interrupted stands outside,
+    /// ending the run, because a Group row only ever summarizes thinking that
+    /// finished or is still going. A block the reader sees nothing for never
+    /// reaches here at all, because the walk resolves it to no entry.
     const fn joined_by(activity: &Activity) -> Option<Self> {
+        use crate::protocol::ActivityStatus;
+
         match activity {
             Activity::Command {
-                status: crate::protocol::ActivityStatus::Completed,
+                status: ActivityStatus::Completed,
                 exit_status: Some(0),
                 ..
             } => Some(Self::Command),
             Activity::Reasoning {
-                status: crate::protocol::ActivityStatus::Completed,
+                status: ActivityStatus::Completed | ActivityStatus::Active,
                 ..
             } => Some(Self::Reasoning),
             _ => None,
@@ -1224,12 +1226,14 @@ impl GroupableKind {
     }
 
     /// The line of a Group's header carrying a Spinner in its Marker cell, or
-    /// `None` for a kind whose header never stands for work in progress.
-    /// Neither kind joins a run before it has settled, so neither Group ever
-    /// speaks for work still going on.
-    const fn header_spinner_line(self) -> Option<usize> {
+    /// `None` when the Group stands for no work in progress. A command joins
+    /// only once it has settled, so a command Group never speaks for live
+    /// work; a Reasoning Group does whenever its latest member is still
+    /// thinking, and its Marker leads the first line of its header.
+    fn header_spinner_line(self, members: &[&Activity]) -> Option<usize> {
         match self {
-            Self::Command | Self::Reasoning => None,
+            Self::Command => None,
+            Self::Reasoning => reasoning_group_is_live(members).then_some(0),
         }
     }
 
@@ -1243,11 +1247,13 @@ impl GroupableKind {
         match self {
             Self::Command => member.id().hash(&mut hasher),
             // A Reasoning Group's header leads with the latest member's title
-            // and sums every member's duration, and its expansion draws each
+            // and sums every member's duration, its wording turns on whether
+            // that member is still thinking, and its expansion draws each
             // member's whole prose, so all of what a member shows is header
             // input.
             Self::Reasoning => {
                 if let Some(reasoning) = ReasoningActivity::of(member) {
+                    (reasoning.status as u8).hash(&mut hasher);
                     reasoning.title.hash(&mut hasher);
                     reasoning.content.len().hash(&mut hasher);
                     reasoning.content_truncated.hash(&mut hasher);
@@ -1926,55 +1932,105 @@ fn render_command_group(
 }
 
 /// Projects a Reasoning Group: the run's single row, and — when the reader
-/// opened it — every member's prose beneath it. The row leads with the latest
-/// member's title, because what a reader wants from a settled run of thinking
-/// is where it arrived rather than where it set out; a latest member the
-/// Provider never headed leaves the row with no description to give, and it
-/// gives none rather than reaching back for an earlier heading. The step count
-/// stands as the toggle affordance, the way a command Group's count does, and
-/// always speaks for more than one member: a run of one is never a Group, so a
-/// lone block keeps the header-and-fold row it has alone instead of gaining a
-/// count of one. Expanded, the same row heads the sections it opened onto.
+/// opened it — every member's prose beneath it. The row exists in the same
+/// place through the whole run, reading as live thinking while its latest
+/// member streams and flipping to the settled account of it once that member
+/// lands, so a reader watching a Turn work never sees the line move.
+///
+/// Settled, the row leads with the latest member's title, because what a
+/// reader wants from a run of thinking is where it arrived rather than where it
+/// set out; a latest member the Provider never headed leaves the row with no
+/// description to give, and it gives none rather than reaching back for an
+/// earlier heading. It then counts its steps — the toggle affordance, the way a
+/// command Group's count is — and sums what its members spent. The count always
+/// speaks for more than one member: a run of one is never a Group, so a lone
+/// block keeps the header-and-fold row it has alone instead of gaining a count
+/// of one.
+///
+/// Live, the row is the running Marker and the topic alone: steps still being
+/// taken are not a total to report, and thinking still going on has no duration
+/// to state. Its description does reach back, because a section the Provider
+/// has not headed yet is thinking that has not said where it is going — so the
+/// row holds the last topic it knew rather than falling silent mid-run.
+///
+/// Expanded, the same row heads the sections it opened onto, live or settled.
 fn render_reasoning_group(
     lines: &mut Vec<Line<'static>>,
     members: &[&Activity],
     expanded: bool,
     theme: &Theme,
 ) -> UnitAnchor {
-    let style = theme.text.subdued;
-    let header =
-        reasoning_header_text(REASONING_COMPLETED_LABEL, latest_reasoning_heading(members));
-    push_prefixed_lines(lines, "  ✓ ", &header, style);
-    let header_line = lines
-        .last_mut()
-        .expect("a Reasoning Group always projects a header line");
-    header_line.spans.push(Span::styled(" · ", style));
-    header_line.spans.push(Span::styled(
-        format!("{} steps", members.len()),
-        theme.action.primary,
-    ));
-    if let Some(duration_ms) = summed_reasoning_duration(members) {
+    use crate::protocol::ActivityStatus;
+
+    // The state the row speaks for is the run's, not any one member's: still
+    // thinking while its latest member is, and thought once that member lands.
+    // A Group never stands for thinking that was interrupted, because a block
+    // a Turn cut short leaves the run rather than ending it inside one.
+    let live = reasoning_group_is_live(members);
+    let status = if live {
+        ActivityStatus::Active
+    } else {
+        ActivityStatus::Completed
+    };
+    let (marker, label, style) = reasoning_marker(status, theme);
+    let heading = if live {
+        held_reasoning_heading(members)
+    } else {
+        latest_reasoning_heading(members)
+    };
+    let header = reasoning_header_text(label, heading);
+    push_prefixed_lines(lines, &format!("  {marker}"), &header, style);
+    if !live {
+        let header_line = lines
+            .last_mut()
+            .expect("a Reasoning Group always projects a header line");
+        header_line.spans.push(Span::styled(" · ", style));
         header_line.spans.push(Span::styled(
-            format!(" · {}", humanized_duration(duration_ms)),
-            style,
+            format!("{} steps", members.len()),
+            theme.action.primary,
         ));
+        if let Some(duration_ms) = summed_reasoning_duration(members) {
+            header_line.spans.push(Span::styled(
+                format!(" · {}", humanized_duration(duration_ms)),
+                style,
+            ));
+        }
     }
     let header_source_lines = lines.len();
     if !expanded {
         return UnitAnchor::binary(header_source_lines, true);
     }
-    for (index, member) in members
-        .iter()
-        .copied()
-        .filter_map(ReasoningActivity::of)
-        .enumerate()
-    {
-        if index > 0 {
+    let mut opened_a_section = false;
+    for member in members.iter().copied().filter_map(ReasoningActivity::of) {
+        let mut section = Vec::new();
+        push_reasoning_section(&mut section, member, theme);
+        // A member that has started without saying anything or being headed
+        // projects nothing, and a section that is not there takes no blank row
+        // to stand apart from the one before it.
+        if section.is_empty() {
+            continue;
+        }
+        if opened_a_section {
             lines.push(Line::default());
         }
-        push_reasoning_section(lines, member, theme);
+        lines.append(&mut section);
+        opened_a_section = true;
     }
     UnitAnchor::binary(header_source_lines, false)
+}
+
+/// The member a Reasoning Group's row speaks for: the latest one, which is
+/// where the run arrived and the only one it can still be in, since every
+/// earlier member had to settle for the next to follow it.
+fn latest_reasoning<'a>(members: &[&'a Activity]) -> Option<ReasoningActivity<'a>> {
+    members.last().copied().and_then(ReasoningActivity::of)
+}
+
+/// Whether a Reasoning Group stands for thinking going on right now, which is
+/// the one thing its row's whole wording turns on.
+fn reasoning_group_is_live(members: &[&Activity]) -> bool {
+    latest_reasoning(members)
+        .is_some_and(|reasoning| reasoning.status == crate::protocol::ActivityStatus::Active)
 }
 
 /// Projects one section of an expanded Reasoning Group: the heading the
@@ -2000,19 +2056,28 @@ fn push_reasoning_section(
     lines.append(&mut reasoning_body_lines(&reasoning, theme));
 }
 
-/// The description a Reasoning Group's row leads with, or `None` when its
-/// latest member carries no heading. Read off the last member rather than the
-/// last member that has one, because the row states where the thinking ended
-/// up: a run whose final section the Provider left unheaded ended up somewhere
-/// it did not name.
+/// The description a settled Reasoning Group's row leads with, or `None` when
+/// its latest member carries no heading. Read off the last member rather than
+/// the last member that has one, because the row states where the thinking
+/// ended up: a run whose final section the Provider left unheaded ended up
+/// somewhere it did not name. A live row reaches back instead — see
+/// [`held_reasoning_heading`].
 fn latest_reasoning_heading<'a>(members: &[&'a Activity]) -> Option<&'a str> {
-    reasoning_heading(
-        members
-            .last()
-            .copied()
-            .and_then(ReasoningActivity::of)?
-            .title,
-    )
+    reasoning_heading(latest_reasoning(members)?.title)
+}
+
+/// The description a live Reasoning Group's row leads with: the heading of the
+/// latest member that has one. A settled row reads the last member alone
+/// because the run ended there and has nothing further to say, but a live row
+/// is naming a topic the reader is watching, and the section streaming under
+/// an unwritten heading is still the same thinking the last heading announced.
+fn held_reasoning_heading<'a>(members: &[&'a Activity]) -> Option<&'a str> {
+    members
+        .iter()
+        .rev()
+        .copied()
+        .filter_map(ReasoningActivity::of)
+        .find_map(|reasoning| reasoning_heading(reasoning.title))
 }
 
 /// The duration a Reasoning Group's row reports: the sum of what its members
@@ -2378,6 +2443,27 @@ impl<'a> ReasoningActivity<'a> {
     }
 }
 
+/// The Marker cell a Reasoning row leads with, the word for the state it
+/// stands in, and the style both are drawn in. A lone block's header reads its
+/// own status here and a Group's row the state of the run it speaks for, so
+/// the Marker keeps the one contract it is meant to have across both.
+fn reasoning_marker(
+    status: crate::protocol::ActivityStatus,
+    theme: &Theme,
+) -> (&'static str, &'static str, Style) {
+    use crate::protocol::ActivityStatus;
+
+    match status {
+        ActivityStatus::Active => (
+            spinner::MARKER,
+            REASONING_ACTIVE_LABEL,
+            theme.accent.primary,
+        ),
+        ActivityStatus::Completed => ("✓ ", REASONING_COMPLETED_LABEL, theme.text.subdued),
+        ActivityStatus::Failed => ("× ", REASONING_FAILED_LABEL, theme.feedback.error),
+    }
+}
+
 /// What a Reasoning header states before any count or duration: the word for
 /// the state the block is in, and the heading the Provider led it with when
 /// there is one. A lone block's header and a Group's row both open with this,
@@ -2418,17 +2504,7 @@ fn push_reasoning_activity(
     folded: bool,
     theme: &Theme,
 ) -> UnitAnchor {
-    use crate::protocol::ActivityStatus;
-
-    let (marker, label, style) = match activity.status {
-        ActivityStatus::Active => (
-            spinner::MARKER,
-            REASONING_ACTIVE_LABEL,
-            theme.accent.primary,
-        ),
-        ActivityStatus::Completed => ("✓ ", REASONING_COMPLETED_LABEL, theme.text.subdued),
-        ActivityStatus::Failed => ("× ", REASONING_FAILED_LABEL, theme.feedback.error),
-    };
+    let (marker, label, style) = reasoning_marker(activity.status, theme);
     let mut header = reasoning_header_text(label, activity.title);
     if let Some(duration_ms) = activity.duration_ms {
         header.push_str(" · ");
@@ -3681,6 +3757,18 @@ mod tests {
         }
     }
 
+    fn reasoning(status: ActivityStatus, title: Option<&str>, content: &str) -> Activity {
+        Activity::Reasoning {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status,
+            title: title.map(ToOwned::to_owned),
+            content: content.to_owned(),
+            content_truncated: false,
+            duration_ms: None,
+        }
+    }
+
     fn error(text: &str) -> Activity {
         Activity::Error {
             id: ActivityId::new(),
@@ -4756,6 +4844,81 @@ mod tests {
         assert!(
             past_it.spinner_lines.is_empty(),
             "a window opening past the Marker records nothing to patch"
+        );
+    }
+
+    #[test]
+    fn an_opened_live_reasoning_group_holds_no_air_for_a_section_that_has_not_spoken() {
+        let settled = reasoning(ActivityStatus::Completed, Some("Reading"), "Read the plan.");
+        let mut groups = TranscriptGroups::default();
+        groups.expand(settled.id());
+        let snapshot = transcript_snapshot(vec![
+            Entry::Activity(settled),
+            Entry::Activity(reasoning(ActivityStatus::Active, None, "")),
+        ]);
+        let cache = TranscriptCache::default();
+        let view = projected_view(&cache, &snapshot, &TranscriptFolds::default(), &groups);
+
+        let whole = view.window(0, view.row_count());
+        let rows = whole
+            .lines
+            .iter()
+            .map(|line| rendered_text(line).trim_end().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                format!("  {}Thinking: Reading", super::spinner::MARKER),
+                "    Reading".to_owned(),
+                "    Read the plan.".to_owned(),
+            ],
+            "a section that has neither said anything nor been headed is nothing to \
+             read, so the expansion ends on the last one that spoke rather than on a \
+             blank row held for it"
+        );
+    }
+
+    #[test]
+    fn a_live_reasoning_groups_header_is_the_line_recorded_to_animate() {
+        let snapshot = transcript_snapshot(vec![
+            Entry::Activity(reasoning(
+                ActivityStatus::Completed,
+                Some("Reading"),
+                "Read the plan.",
+            )),
+            Entry::Activity(reasoning(ActivityStatus::Active, Some("Settling"), "")),
+        ]);
+        let cache = TranscriptCache::default();
+        let view = projected_view(
+            &cache,
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        let whole = view.window(0, view.row_count());
+        assert_eq!(
+            whole.spinner_lines.len(),
+            1,
+            "the Group speaks for the member still thinking, so its header is the one \
+             Marker on screen"
+        );
+        let spinner_row = rendered_text(&whole.lines[whole.spinner_lines[0]]);
+        assert_eq!(
+            spinner_row.trim_end(),
+            format!("  {}Thinking: Settling", super::spinner::MARKER),
+            "the recorded line is the Group's live header"
+        );
+        let rendered = whole
+            .lines
+            .iter()
+            .map(rendered_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !rendered.contains("Thought"),
+            "the settled member is inside the live Group rather than beside it, so the \
+             animated header is the run's only row: {rendered}"
         );
     }
 }

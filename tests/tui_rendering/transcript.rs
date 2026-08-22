@@ -2751,12 +2751,24 @@ impl ReasoningBlock {
         }
     }
 
-    /// A block still streaming its prose, which has not settled into anything
-    /// a Group could gather yet.
+    /// A block still streaming its prose under a heading the Provider led the
+    /// section with.
     const fn streaming(title: &'static str, content: &'static str) -> Self {
         Self {
             status: ActivityStatus::Active,
             title: Some(title),
+            content,
+            content_truncated: false,
+            duration_ms: None,
+        }
+    }
+
+    /// A block still streaming a section the Provider has not headed, which is
+    /// what a live row has to hold a title across.
+    const fn streaming_untitled(content: &'static str) -> Self {
+        Self {
+            status: ActivityStatus::Active,
+            title: None,
             content,
             content_truncated: false,
             duration_ms: None,
@@ -3767,6 +3779,29 @@ const REASONING_RUN: [RunEntry; 3] = [
 /// test asserting it is hidden cannot drift from what they carry.
 const REASONING_RUN_PROSE: [&str; 3] = [INSPECTING.content, WEIGHING.content, SETTLING.content];
 
+/// The shape a Reasoning run has mid-Turn: two settled sections and a third
+/// still streaming, inside a Session and Turn still marked Active. The settled
+/// members are short-titled so a live row's held title is assertable against
+/// the section it was held from.
+fn live_reasoning_run_snapshot(
+    session_id: SessionId,
+    workspace: &std::path::Path,
+    streaming: ReasoningBlock,
+) -> suru::protocol::SessionSnapshot {
+    let mut snapshot = command_run_snapshot(
+        session_id,
+        workspace,
+        &[
+            RunEntry::Reasoning(ReasoningBlock::thought("Reading", "Read the plan.", 300)),
+            RunEntry::Reasoning(ReasoningBlock::thought("Weighing", "Weighed it.", 400)),
+            RunEntry::Reasoning(streaming),
+        ],
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    snapshot
+}
+
 #[test]
 fn a_run_of_settled_reasoning_blocks_collapses_to_one_thought_row() {
     let workspace = tempfile::tempdir().expect("create Workspace");
@@ -4151,20 +4186,128 @@ fn an_expanded_reasoning_group_marks_the_member_whose_prose_the_cap_cut_short() 
 }
 
 #[test]
-fn a_reasoning_block_settling_is_absorbed_into_the_group_row() {
+fn a_streaming_reasoning_block_joins_the_group_as_its_live_thinking_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = live_reasoning_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        ReasoningBlock::streaming("Settling", "Settling on it."),
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session still thinking after a settled run");
+
+    let rows = rendered_application_rows_at(&application, 80, 18);
+    let rendered = rows.join("\n");
+
+    assert_eq!(
+        rows[rendered_row(&rows, "Thinking")].trim_end(),
+        "    ⠋ Thinking: Settling",
+        "a block belongs to its Group from the moment it starts, so the run stands \
+         as one live row naming what it is thinking about: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Thought"),
+        "the run has not settled, so no row in it speaks of thinking that finished: \
+         {rendered}"
+    );
+    for hidden in ["Read the plan.", "Weighed it.", "Settling on it."] {
+        assert!(
+            !rendered.contains(hidden),
+            "streaming Reasoning prose is hidden until the reader asks for it, but \
+             {hidden:?} rendered: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn a_live_reasoning_row_holds_its_last_title_while_an_untitled_section_streams() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = live_reasoning_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        ReasoningBlock::streaming_untitled("Still going."),
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose streaming section the Provider has not headed");
+
+    let rows = rendered_application_rows_at(&application, 80, 18);
+
+    assert_eq!(
+        rows[rendered_row(&rows, "Thinking")].trim_end(),
+        "    ⠋ Thinking: Weighing",
+        "a live row names the most recent topic it knows, so an unheaded section \
+         streams under the title before it rather than under none: {}",
+        rows.join("\n")
+    );
+}
+
+#[test]
+fn clicking_the_live_reasoning_row_reveals_the_streaming_prose_and_hides_it_again() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = live_reasoning_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        ReasoningBlock::streaming("Settling", "Settling on it."),
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session still thinking after a settled run");
+
+    let collapsed = rendered_application_rows_at(&application, 80, 24);
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&collapsed, "Thinking") as u16))
+        .expect("open the live Reasoning row");
+
+    let expanded_rows = rendered_application_rows_at(&application, 80, 24);
+    let header = rendered_row(&expanded_rows, "Thinking");
+    assert_eq!(
+        expanded_rows[header..header + 9]
+            .iter()
+            .map(|row| row.trim_end())
+            .collect::<Vec<_>>(),
+        [
+            "    ⠋ Thinking: Settling",
+            "      Reading",
+            "      Read the plan.",
+            "",
+            "      Weighing",
+            "      Weighed it.",
+            "",
+            "      Settling",
+            "      Settling on it.",
+        ],
+        "a reader who asks watches the prose stream under the live row, sections and \
+         all: {}",
+        expanded_rows.join("\n")
+    );
+
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&expanded_rows, "Thinking") as u16
+        ))
+        .expect("hide the streaming prose again");
+
+    assert_eq!(
+        rendered_application_rows_at(&application, 80, 24),
+        collapsed,
+        "clicking the live row again returns it to the single line it opened from"
+    );
+}
+
+#[test]
+fn a_live_reasoning_group_settles_into_its_thought_row_without_moving() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let session_id = SessionId::new();
-    let mut snapshot = command_run_snapshot(
+    let snapshot = live_reasoning_run_snapshot(
         session_id,
         workspace.path(),
-        &[
-            RunEntry::Reasoning(ReasoningBlock::thought("Reading", "Read the plan.", 300)),
-            RunEntry::Reasoning(ReasoningBlock::thought("Weighing", "Weighed it.", 400)),
-            RunEntry::Reasoning(ReasoningBlock::streaming("Settling", "Settling on it.")),
-        ],
+        ReasoningBlock::streaming("Settling", "Settling on it."),
     );
-    snapshot.session.status = SessionStatus::Active;
-    snapshot.turns[0].status = TurnStatus::Active;
     let streaming_id = snapshot.activities[2].id();
     let next_revision = SessionRevision(snapshot.revision.0 + 1);
     let mut application = connected_application(workspace.path());
@@ -4173,15 +4316,11 @@ fn a_reasoning_block_settling_is_absorbed_into_the_group_row() {
         .expect("attach a Session still thinking after a settled run");
 
     let before = rendered_application_rows_at(&application, 80, 18);
+    let row = rendered_row(&before, "Thinking");
     assert_eq!(
-        before[rendered_row(&before, "Thought")].trim_end(),
-        "    ✓ Thought: Weighing · 2 steps · 700ms",
-        "the settled run groups while the block after it is still streaming: {}",
-        before.join("\n")
-    );
-    assert!(
-        before.join("\n").contains("⠋ Thinking: Settling"),
-        "the streaming block stays outside the Group: {}",
+        before[row].trim_end(),
+        "    ⠋ Thinking: Settling",
+        "the run is live in place while its latest member streams: {}",
         before.join("\n")
     );
 
@@ -4201,16 +4340,132 @@ fn a_reasoning_block_settling_is_absorbed_into_the_group_row() {
 
     let after = rendered_application_rows_at(&application, 80, 18);
     assert_eq!(
-        after[rendered_row(&after, "Thought")].trim_end(),
+        after[row].trim_end(),
         "    ✓ Thought: Settling · 3 steps · 1s",
-        "the memoized projection re-reads the Group when a member settles into it, \
-         so the row absorbs the block, leads with its title, and re-sums: {}",
+        "the same row flips to its settled form where it stood, counting every member \
+         and summing what they each spent: {}",
         after.join("\n")
     );
     assert!(
         !after.join("\n").contains("Thinking"),
-        "the settled block left no standalone row behind: {}",
+        "the settled run left no live row behind: {}",
         after.join("\n")
+    );
+}
+
+#[test]
+fn an_interrupted_streaming_block_leaves_the_group_it_was_living_in() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let snapshot = live_reasoning_run_snapshot(
+        session_id,
+        workspace.path(),
+        ReasoningBlock::streaming("Settling", "Settling on it."),
+    );
+    let streaming_id = snapshot.activities[2].id();
+    let next_revision = SessionRevision(snapshot.revision.0 + 1);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session still thinking after a settled run");
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: next_revision,
+                changes: vec![SessionChange::ReasoningStatusChanged {
+                    activity_id: streaming_id,
+                    status: ActivityStatus::Failed,
+                    duration_ms: None,
+                }],
+            },
+        )))
+        .expect("project the Reasoning block being cut off");
+
+    let rows = rendered_application_rows_at(&application, 80, 18);
+    let rendered = rows.join("\n");
+
+    assert_eq!(
+        rows[rendered_row(&rows, "Thought")].trim_end(),
+        "    ✓ Thought: Weighing · 2 steps · 700ms",
+        "a Group row only ever summarizes thinking that completed, so the run closes \
+         over the members that did: {rendered}"
+    );
+    assert_eq!(
+        rows[rendered_row(&rows, "Thinking interrupted")].trim_end(),
+        "    × Thinking interrupted: Settling · +1 lines",
+        "and the block that was cut off stands outside it as its own row: {rendered}"
+    );
+    assert!(
+        rendered_row(&rows, "Thought") < rendered_row(&rows, "Thinking interrupted"),
+        "presentation order is preserved: {rendered}"
+    );
+}
+
+#[test]
+fn interrupting_a_turn_keeps_the_live_reasoning_row_the_reader_had_opened() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let snapshot = live_reasoning_run_snapshot(
+        session_id,
+        workspace.path(),
+        ReasoningBlock::streaming("Settling", "Settling on it."),
+    );
+    let streaming_id = snapshot.activities[2].id();
+    let interrupted_turn = snapshot.turns[0].id;
+    let revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session still thinking after a settled run");
+
+    let collapsed = rendered_application_rows_at(&application, 80, 40);
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&collapsed, "Thinking") as u16))
+        .expect("open the live Reasoning row to watch the prose stream");
+    for _ in 0..2 {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .expect("request and confirm the interrupt");
+    }
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![
+                    SessionChange::ReasoningStatusChanged {
+                        activity_id: streaming_id,
+                        status: ActivityStatus::Failed,
+                        duration_ms: None,
+                    },
+                    SessionChange::TurnStatusChanged {
+                        turn_id: interrupted_turn,
+                        status: TurnStatus::Interrupted,
+                        settled_at: None,
+                    },
+                ],
+            },
+        )))
+        .expect("settle the cut-off block and the Turn it belonged to");
+
+    let rendered = rendered_application_rows_at(&application, 80, 40).join("\n");
+
+    for kept in ["Read the plan.", "Weighed it."] {
+        assert!(
+            rendered.contains(kept),
+            "the reader opened the live row and the interrupt must not close over what \
+             they were reading, but {kept:?} went with it: {rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("× Thinking interrupted: Settling")
+            && rendered.contains("Settling on it."),
+        "and the block the interrupt cut short stands outside the Group with the prose \
+         it got as far as: {rendered}"
     );
 }
 
