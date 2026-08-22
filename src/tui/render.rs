@@ -929,6 +929,7 @@ fn render_session(
         .expect("Session interaction is initialized with its snapshot");
     let folds = interaction.folds.borrow();
     let groups = interaction.groups.borrow();
+    let turns = interaction.turns.borrow();
     let transcript_view = state.transcript_cache.view(
         state.transcript_generation,
         snapshot,
@@ -936,6 +937,7 @@ fn render_session(
         TranscriptDisclosure {
             folds: &folds,
             groups: &groups,
+            turns: &turns,
         },
         theme,
         content_width,

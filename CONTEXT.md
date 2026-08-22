@@ -80,6 +80,10 @@ _Avoid_: Collapse, elision, hide; preview (for Peek)
 The single-row presentation a client's Transcript gives a run of two or more adjacent, successfully settled command Activities. Like a Fold, a Group is reversible, client-local view state: expanding it reveals its member Activities, each keeping its own Fold state, and grouping never alters stored content or presentation order. Any other Transcript entry, or a command that failed or was interrupted, ends the run; a still-running command stays outside a Group until it settles successfully.
 _Avoid_: Batch, merge, cell
 
+**Turn Fold**:
+The single-marker presentation a client's Transcript gives a settled Turn, hiding the work between the Turn's opening user Message and its outcome. Like a Fold, a Turn Fold is reversible, client-local view state, but it keys on the Turn's Settle rather than on entry adjacency, and it opens in one step rather than in stages. Its marker names how the Turn settled — worked, stopped, or failed — with the Turn's duration when known. A Turn's user Messages, its final agent Message, and a failed Turn's terminal Error Activity stay visible outside it; entries revealed by expanding keep their own Fold and Group state.
+_Avoid_: Turn collapse, worked row
+
 **Resume State**:
 Provider-owned data, opaque to Suru, that lets a Session continue with its Provider after a restart. Without it a restored Session is viewable but cannot continue where it left off.
 _Avoid_: Thread mapping, provider cache

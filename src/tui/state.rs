@@ -37,8 +37,8 @@ use super::{
     session_picker::SessionPicker,
     slots::RenderSlots,
     transcript::{
-        FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups, UnitKey,
-        UnitStart,
+        FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups,
+        TranscriptTurnFolds, UnitKey, UnitStart,
     },
 };
 
@@ -105,8 +105,12 @@ pub(super) struct SessionInteraction {
     /// the Session's interaction is.
     pub(super) folds: RefCell<TranscriptFolds>,
     /// Which Groups this client has expanded, held beside the Folds because
-    /// the two disclosure axes are view state of the same locality.
+    /// the disclosure axes are view state of the same locality.
     pub(super) groups: RefCell<TranscriptGroups>,
+    /// Which settled Turns this client has expanded out of their Turn Fold,
+    /// the third axis of that same locality: per-Session, in memory, and gone
+    /// with the Session's interaction.
+    pub(super) turns: RefCell<TranscriptTurnFolds>,
 }
 
 impl Default for SessionInteraction {
@@ -117,6 +121,7 @@ impl Default for SessionInteraction {
             viewport: RefCell::new(None),
             folds: RefCell::new(TranscriptFolds::default()),
             groups: RefCell::new(TranscriptGroups::default()),
+            turns: RefCell::new(TranscriptTurnFolds::default()),
         }
     }
 }
@@ -725,7 +730,9 @@ impl TuiState {
                     groups.collapse(group_id);
                 }
             }
-            UnitKey::Message(_) | UnitKey::Provisional(_) => {}
+            // A Turn Fold's marker takes its own semantic command rather than
+            // this one: <https://github.com/jake-tucker/suru/issues/88>.
+            UnitKey::Message(_) | UnitKey::TurnFold(_) | UnitKey::Provisional(_) => {}
         }
     }
 

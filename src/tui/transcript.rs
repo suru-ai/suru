@@ -4,7 +4,11 @@
 //! render as one block, and is what keying, memoization, and click hit-testing
 //! address, so which entries share a unit is answered in one walk rather than
 //! in each of those four places. Most units hold exactly one entry; a Group
-//! holds a run of adjacent, successfully settled command Activities.
+//! holds a run of adjacent, successfully settled command Activities; a Turn
+//! Fold's marker holds none, standing instead where the entries its Turn hides
+//! would have been. Which entries a folded Turn hides is decided before the
+//! walk, in [`TurnFolding`], because a Turn Fold keys on the Turn's Settle
+//! rather than on the entry adjacency the walk reads.
 //!
 //! Vertical rhythm is decided between units rather than inside them. A
 //! renderer never pads itself, because whitespace at a boundary is a property
@@ -39,7 +43,7 @@ use crate::{
     ansi::{AnsiScanner, FragmentRole, sgr_parameter_code, sgr_parameters},
     protocol::{
         Activity, ActivityId, FileChange, InitialPrompt, Message, MessageId, MessageRole, PromptId,
-        SessionId, SessionRevision, SessionSnapshot, TranscriptItem,
+        SessionId, SessionRevision, SessionSnapshot, TranscriptItem, TurnId, TurnStatus,
     },
     theme::Theme,
 };
@@ -96,16 +100,30 @@ enum DisclosurePosture {
 /// One client's state for one disclosure axis of one Session's Transcript:
 /// the posture the view leans to, plus the entries the reader flipped away
 /// from it. Disclosure is presentation only, so this never reaches the
-/// Session, never syncs between clients, and dies with the process.
-#[derive(Clone, Debug, Default)]
-struct DisclosureAxis {
+/// Session, never syncs between clients, and dies with the process. The axis
+/// is generic over what it keys on because the Transcript's axes disclose
+/// different things: Groups and Folds key on an Activity, a Turn Fold on the
+/// Turn it stands for.
+#[derive(Clone, Debug)]
+struct DisclosureAxis<Id> {
     posture: DisclosurePosture,
-    overrides: HashSet<ActivityId>,
+    overrides: HashSet<Id>,
 }
 
-impl DisclosureAxis {
-    fn is_closed(&self, activity_id: ActivityId) -> bool {
-        (self.posture == DisclosurePosture::Closed) != self.overrides.contains(&activity_id)
+/// Written out rather than derived because a derived `Default` would demand
+/// one of the key type, which an empty axis has no use for.
+impl<Id> Default for DisclosureAxis<Id> {
+    fn default() -> Self {
+        Self {
+            posture: DisclosurePosture::default(),
+            overrides: HashSet::new(),
+        }
+    }
+}
+
+impl<Id: Copy + Eq + Hash> DisclosureAxis<Id> {
+    fn is_closed(&self, id: Id) -> bool {
+        (self.posture == DisclosurePosture::Closed) != self.overrides.contains(&id)
     }
 
     /// Flips the whole axis between closed-by-default and open-by-default.
@@ -119,11 +137,11 @@ impl DisclosureAxis {
         self.overrides.clear();
     }
 
-    fn set_closed(&mut self, activity_id: ActivityId, closed: bool) {
+    fn set_closed(&mut self, id: Id, closed: bool) {
         if (self.posture == DisclosurePosture::Closed) == closed {
-            self.overrides.remove(&activity_id);
+            self.overrides.remove(&id);
         } else {
-            self.overrides.insert(activity_id);
+            self.overrides.insert(id);
         }
     }
 
@@ -132,7 +150,7 @@ impl DisclosureAxis {
         let mut hasher = std::hash::DefaultHasher::new();
         (self.posture as u8).hash(&mut hasher);
         self.overrides.len().hash(&mut hasher);
-        activity_id_set_digest(&self.overrides).hash(&mut hasher);
+        id_set_digest(&self.overrides).hash(&mut hasher);
         hasher.finish()
     }
 }
@@ -223,9 +241,9 @@ impl TranscriptFolds {
     }
 }
 
-/// Order-independent digest of a set of Activity ids, so a view-state
-/// fingerprint over one never depends on hash iteration order.
-fn activity_id_set_digest(ids: &HashSet<ActivityId>) -> u64 {
+/// Order-independent digest of a set of ids, so a view-state fingerprint over
+/// one never depends on hash iteration order.
+fn id_set_digest<Id: Hash>(ids: &HashSet<Id>) -> u64 {
     let mut digest = 0u64;
     for id in ids {
         let mut hasher = std::hash::DefaultHasher::new();
@@ -239,7 +257,7 @@ fn activity_id_set_digest(ids: &HashSet<ActivityId>) -> u64 {
 /// its first member, collapses to its single header row while its axis is
 /// closed. See `DisclosureAxis` for the posture and locality semantics.
 #[derive(Clone, Debug, Default)]
-pub(super) struct TranscriptGroups(DisclosureAxis);
+pub(super) struct TranscriptGroups(DisclosureAxis<ActivityId>);
 
 impl TranscriptGroups {
     pub(super) fn is_collapsed(&self, group_id: ActivityId) -> bool {
@@ -263,13 +281,51 @@ impl TranscriptGroups {
     }
 }
 
-/// The two disclosure axes a client renders a Transcript through: Groups
-/// decide which rows exist, Folds how much of a row shows. Rendering reads
-/// both, so they travel as one input.
+/// One client's Turn Fold state for one Session's Transcript: a settled Turn
+/// stands as its single marker row while its axis is closed. The axis is
+/// binary — a Turn Fold has no Peek — and, like the other two, it is view
+/// state of the client that holds it. See `DisclosureAxis` for the posture and
+/// locality semantics.
+#[derive(Clone, Debug, Default)]
+pub(super) struct TranscriptTurnFolds(DisclosureAxis<TurnId>);
+
+impl TranscriptTurnFolds {
+    pub(super) fn is_folded(&self, turn_id: TurnId) -> bool {
+        self.0.is_closed(turn_id)
+    }
+
+    // The posture toggle and the per-Turn flips below reach the Transcript
+    // with the Turn Fold's interaction and lifecycle:
+    // <https://github.com/jake-tucker/suru/issues/88>.
+    #[allow(dead_code)]
+    pub(super) fn toggle_posture(&mut self) {
+        self.0.toggle_posture();
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn expand(&mut self, turn_id: TurnId) {
+        self.0.set_closed(turn_id, false);
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn fold(&mut self, turn_id: TurnId) {
+        self.0.set_closed(turn_id, true);
+    }
+
+    fn fingerprint(&self) -> u64 {
+        self.0.fingerprint()
+    }
+}
+
+/// The three disclosure axes a client renders a Transcript through: Turn Folds
+/// decide which entries reach the projection at all, Groups which of the
+/// survivors share a row, and Folds how much of a row shows. Rendering reads
+/// all three, so they travel as one input.
 #[derive(Clone, Copy)]
 pub(super) struct TranscriptDisclosure<'a> {
     pub(super) folds: &'a TranscriptFolds,
     pub(super) groups: &'a TranscriptGroups,
+    pub(super) turns: &'a TranscriptTurnFolds,
 }
 
 /// A kind of Provider stream Suru stores under a cap. The kind decides what a
@@ -365,6 +421,7 @@ impl TranscriptCache {
             provisional_fingerprint: provisional_fingerprint(provisional),
             folds_fingerprint: disclosure.folds.fingerprint(),
             groups_fingerprint: disclosure.groups.fingerprint(),
+            turns_fingerprint: disclosure.turns.fingerprint(),
         };
         let needs_rebuild = self
             .view
@@ -403,6 +460,9 @@ struct ViewKey {
     folds_fingerprint: u64,
     /// Group state is the same kind of input, so a flipped Group rebuilds too.
     groups_fingerprint: u64,
+    /// Turn Fold state is the same kind of input again, and the one that
+    /// decides which entries are projected at all.
+    turns_fingerprint: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -511,6 +571,12 @@ enum RenderUnit<'a> {
     /// member gutter. A member is its own unit so its Fold, its cached lines,
     /// and its click target all work exactly as they do standalone.
     GroupMember(&'a Activity),
+    /// A settled Turn's fold: the single marker row standing where the work
+    /// the fold hides happened. The entries behind it are absent from the
+    /// plan rather than held by this unit, because a Turn Fold hides entries
+    /// that are not adjacent — a steer Message and the final agent Message
+    /// stay outside a fold whose hidden work surrounds them.
+    TurnFold(TurnMarker),
     /// A prompt this client sent that the Session has not echoed back yet.
     Provisional(&'a InitialPrompt),
 }
@@ -522,6 +588,7 @@ impl RenderUnit<'_> {
             Self::Activity(activity) => UnitKey::Activity(activity.id()),
             Self::Group { members, .. } => UnitKey::Group(members[0].id()),
             Self::GroupMember(activity) => UnitKey::Activity(activity.id()),
+            Self::TurnFold(marker) => UnitKey::TurnFold(marker.turn_id),
             Self::Provisional(prompt) => UnitKey::Provisional(prompt.id),
         }
     }
@@ -546,6 +613,10 @@ impl RenderUnit<'_> {
                 true.hash(&mut hasher);
                 hasher.finish()
             }
+            // A Turn Fold's marker says how the Turn settled and nothing
+            // else, so the outcome is the whole of its rendering input; which
+            // Turn it stands for is already its key.
+            Self::TurnFold(marker) => marker.outcome as u64,
             // A provisional prompt's text only grows and carries no Fold, so
             // its length is the whole of its rendering input.
             Self::Provisional(prompt) => prompt.text.len() as u64,
@@ -560,6 +631,7 @@ impl RenderUnit<'_> {
             Self::Activity(_)
             | Self::Group { .. }
             | Self::GroupMember(_)
+            | Self::TurnFold(_)
             | Self::Provisional(_) => None,
         }
     }
@@ -571,7 +643,7 @@ impl RenderUnit<'_> {
                 Activity::Error { .. } => SpacingKind::Error,
                 _ => SpacingKind::Activity,
             },
-            Self::Group { .. } => SpacingKind::Activity,
+            Self::Group { .. } | Self::TurnFold(_) => SpacingKind::Activity,
         }
     }
 
@@ -623,6 +695,7 @@ impl RenderUnit<'_> {
                 }
                 anchor
             }
+            Self::TurnFold(marker) => Some(render_turn_fold(lines, marker.outcome, theme)),
             Self::Provisional(prompt) => {
                 push_user_message(lines, &prompt.text, theme, width);
                 None
@@ -681,6 +754,253 @@ impl Spacing {
     }
 }
 
+/// How a Turn settled, which is all a Turn Fold's marker says about it. Turn
+/// Folds only ever stand for settled Turns, so the Active status has no
+/// spelling here: an Active Turn cannot reach a marker because it cannot
+/// become one of these.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettledTurn {
+    Completed,
+    Interrupted,
+    Failed,
+}
+
+impl SettledTurn {
+    /// How a Turn settled, or `None` while it is still Active.
+    const fn of(status: TurnStatus) -> Option<Self> {
+        match status {
+            TurnStatus::Active => None,
+            TurnStatus::Completed => Some(Self::Completed),
+            TurnStatus::Interrupted => Some(Self::Interrupted),
+            TurnStatus::Failed => Some(Self::Failed),
+        }
+    }
+
+    /// The word the marker states the outcome in — the reader's word for it,
+    /// the way a Transcript says Thought for settled Reasoning. The wording is
+    /// status-true and permanent rather than recency-scoped, so a reader
+    /// scrolling back through a session reads how each Turn ended however long
+    /// ago it did.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Completed => "Worked",
+            Self::Interrupted => "Stopped",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+/// The marker one folded Turn stands as: which Turn it speaks for, and how
+/// that Turn settled.
+#[derive(Clone, Copy, Debug)]
+struct TurnMarker {
+    turn_id: TurnId,
+    outcome: SettledTurn,
+}
+
+/// Which of the roles a Turn Fold keeps outside it a Transcript entry plays.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TurnEntryRole {
+    /// A Message the user authored: the Turn's opening Prompt or a steer.
+    /// Every one of them stays outside the fold, because a fold that hid what
+    /// the reader asked for would hide the question its marker answers.
+    UserMessage,
+    /// A Message the agent authored. Only the Turn's last one survives its
+    /// fold: that is the answer the Turn arrived at, and the ones before it
+    /// are work.
+    AgentMessage,
+    /// An Error Activity. The last one a failed Turn recorded is its
+    /// outcome and stays outside the fold; the ones it worked past are work.
+    Error,
+    /// Everything else, which is the work a Turn Fold hides.
+    Work,
+}
+
+/// What a Turn Fold needs to know about one Transcript entry.
+#[derive(Clone, Copy, Debug)]
+struct TurnEntry {
+    turn_id: TurnId,
+    role: TurnEntryRole,
+}
+
+/// A Session's Messages and Activities by id, so the walks over its Transcript
+/// resolve what each entry names in one lookup. Gathered once and shared,
+/// because the projection walks the Transcript twice: once to decide the Turn
+/// Folds, once to plan the units.
+struct TranscriptContent<'a> {
+    messages: HashMap<MessageId, &'a Message>,
+    activities: HashMap<ActivityId, &'a Activity>,
+}
+
+impl<'a> TranscriptContent<'a> {
+    fn of(snapshot: &'a SessionSnapshot) -> Self {
+        Self {
+            messages: snapshot
+                .messages
+                .iter()
+                .map(|message| (message.id, message))
+                .collect(),
+            activities: snapshot
+                .activities
+                .iter()
+                .map(|activity| (activity.id(), activity))
+                .collect(),
+        }
+    }
+
+    /// What a Transcript entry names, or `None` when the snapshot does not
+    /// carry it.
+    fn entry(&self, item: &TranscriptItem) -> Option<TranscriptEntry<'a>> {
+        match item {
+            TranscriptItem::Message { message_id } => self
+                .messages
+                .get(message_id)
+                .copied()
+                .map(TranscriptEntry::Message),
+            TranscriptItem::Activity { activity_id } => self
+                .activities
+                .get(activity_id)
+                .copied()
+                .map(TranscriptEntry::Activity),
+        }
+    }
+}
+
+/// One Transcript entry resolved to the content it names.
+#[derive(Clone, Copy, Debug)]
+enum TranscriptEntry<'a> {
+    Message(&'a Message),
+    Activity(&'a Activity),
+}
+
+impl TranscriptEntry<'_> {
+    /// What a Turn Fold reads off the entry: whose Turn it belongs to, and
+    /// which of the roles a fold keeps outside it the entry plays.
+    fn in_turn(self) -> TurnEntry {
+        match self {
+            Self::Message(message) => TurnEntry {
+                turn_id: message.turn_id,
+                role: match message.role {
+                    MessageRole::User => TurnEntryRole::UserMessage,
+                    MessageRole::Agent => TurnEntryRole::AgentMessage,
+                },
+            },
+            Self::Activity(activity) => TurnEntry {
+                turn_id: activity.turn_id(),
+                role: match activity {
+                    Activity::Error { .. } => TurnEntryRole::Error,
+                    _ => TurnEntryRole::Work,
+                },
+            },
+        }
+    }
+}
+
+/// What each folded Turn hides, decided in one pass over the Transcript so the
+/// unit walk only has to ask by position. A Turn Fold keys on the Turn's
+/// Settle rather than on entry adjacency, so it is answered here rather than
+/// inside the walk that gathers adjacent entries into Groups.
+#[derive(Debug, Default)]
+struct TurnFolding {
+    /// Whether the entry at each Transcript position is hidden by its Turn's
+    /// fold.
+    hidden: Vec<bool>,
+    /// The Turn whose marker stands at a Transcript position, which is the
+    /// position of the first entry that Turn hides, or of its final agent
+    /// Message when every hidden entry trails that — so the marker stands
+    /// where the hidden work happened without ever falling past the answer.
+    /// A Turn that hides nothing has no entry here, which is how a marker
+    /// that would disclose nothing is suppressed.
+    markers: HashMap<usize, TurnMarker>,
+}
+
+impl TurnFolding {
+    /// Decides every folded Turn's fold from the Transcript and the client's
+    /// axis. Only settled Turns the reader has left folded take part; an
+    /// Active Turn and an expanded one alike project every entry they own.
+    fn plan(
+        snapshot: &SessionSnapshot,
+        content: &TranscriptContent<'_>,
+        axis: &TranscriptTurnFolds,
+    ) -> Self {
+        let folded: HashMap<TurnId, SettledTurn> = snapshot
+            .turns
+            .iter()
+            .filter(|turn| axis.is_folded(turn.id))
+            .filter_map(|turn| SettledTurn::of(turn.status).map(|outcome| (turn.id, outcome)))
+            .collect();
+        if folded.is_empty() {
+            return Self::default();
+        }
+        let mut entries: Vec<Option<TurnEntry>> = Vec::with_capacity(snapshot.transcript.len());
+        let mut positions: HashMap<TurnId, Vec<usize>> = HashMap::new();
+        for (position, item) in snapshot.transcript.iter().enumerate() {
+            // An entry naming content the snapshot does not carry projects
+            // nothing, so it is not one of the entries a fold decides about.
+            let entry = content.entry(item).map(TranscriptEntry::in_turn);
+            if let Some(entry) = entry
+                && folded.contains_key(&entry.turn_id)
+            {
+                positions.entry(entry.turn_id).or_default().push(position);
+            }
+            entries.push(entry);
+        }
+        let mut hidden = vec![false; snapshot.transcript.len()];
+        let mut markers = HashMap::new();
+        for (turn_id, positions) in positions {
+            let outcome = folded[&turn_id];
+            let role_at = |position: usize| entries[position].map(|entry| entry.role);
+            let final_agent_message = positions
+                .iter()
+                .copied()
+                .rev()
+                .find(|position| role_at(*position) == Some(TurnEntryRole::AgentMessage));
+            // A failed Turn's outcome is the last Error it recorded: the ones
+            // it worked past are work, but the one it ended on stays outside
+            // the fold even when a closing Message trails it, because a
+            // failure is the one thing a reader must never have to hunt for.
+            let terminal_error = (outcome == SettledTurn::Failed)
+                .then(|| {
+                    positions
+                        .iter()
+                        .copied()
+                        .rev()
+                        .find(|position| role_at(*position) == Some(TurnEntryRole::Error))
+                })
+                .flatten();
+            let mut marker = None;
+            for position in positions {
+                if role_at(position) == Some(TurnEntryRole::UserMessage)
+                    || Some(position) == final_agent_message
+                    || Some(position) == terminal_error
+                {
+                    continue;
+                }
+                hidden[position] = true;
+                marker.get_or_insert(position);
+            }
+            if let Some(position) = marker {
+                // The marker stands where the hidden work happened, but never
+                // past the answer that work led to: a Turn whose only hidden
+                // entries trailed its final agent Message still marks them
+                // above it, so the Transcript always reads question, marker,
+                // answer.
+                let position = final_agent_message.map_or(position, |answer| position.min(answer));
+                markers.insert(position, TurnMarker { turn_id, outcome });
+            }
+        }
+        Self { hidden, markers }
+    }
+
+    fn hides(&self, position: usize) -> bool {
+        self.hidden.get(position).copied().unwrap_or(false)
+    }
+
+    fn marker_at(&self, position: usize) -> Option<TurnMarker> {
+        self.markers.get(&position).copied()
+    }
+}
+
 /// Walks a Session's transcript into the units a view renders. Which entries
 /// share a unit is decided here and nowhere else, so gathering a run of them
 /// into one stays a change to this walk rather than to rendering or layout.
@@ -688,40 +1008,38 @@ fn plan_units<'a>(
     snapshot: &'a SessionSnapshot,
     provisional: &[&'a InitialPrompt],
     groups: &TranscriptGroups,
+    turns: &TranscriptTurnFolds,
 ) -> Vec<RenderUnit<'a>> {
-    let messages: HashMap<MessageId, &Message> = snapshot
-        .messages
-        .iter()
-        .map(|message| (message.id, message))
-        .collect();
-    let activities: HashMap<ActivityId, &Activity> = snapshot
-        .activities
-        .iter()
-        .map(|activity| (activity.id(), activity))
-        .collect();
+    let content = TranscriptContent::of(snapshot);
+    let folding = TurnFolding::plan(snapshot, &content, turns);
     let mut units = Vec::with_capacity(snapshot.transcript.len() + provisional.len());
     let mut run: Vec<&Activity> = Vec::new();
     // A transcript entry naming content the snapshot does not carry projects
     // nothing rather than a gap, so it does not end a run either: the commands
-    // around it are still adjacent as presented.
-    for item in &snapshot.transcript {
-        match item {
-            TranscriptItem::Message { message_id } => {
-                if let Some(message) = messages.get(message_id).copied() {
+    // around it are still adjacent as presented. An entry a Turn Fold hides
+    // projects nothing for the same reason and is read the same way.
+    for (position, item) in snapshot.transcript.iter().enumerate() {
+        if let Some(marker) = folding.marker_at(position) {
+            close_command_run(&mut units, &mut run, groups);
+            units.push(RenderUnit::TurnFold(marker));
+        }
+        if folding.hides(position) {
+            continue;
+        }
+        match content.entry(item) {
+            Some(TranscriptEntry::Message(message)) => {
+                close_command_run(&mut units, &mut run, groups);
+                units.push(RenderUnit::Message(message));
+            }
+            Some(TranscriptEntry::Activity(activity)) => {
+                if joins_command_run(activity) {
+                    run.push(activity);
+                } else {
                     close_command_run(&mut units, &mut run, groups);
-                    units.push(RenderUnit::Message(message));
+                    units.push(RenderUnit::Activity(activity));
                 }
             }
-            TranscriptItem::Activity { activity_id } => {
-                if let Some(activity) = activities.get(activity_id).copied() {
-                    if joins_command_run(activity) {
-                        run.push(activity);
-                    } else {
-                        close_command_run(&mut units, &mut run, groups);
-                        units.push(RenderUnit::Activity(activity));
-                    }
-                }
-            }
+            None => {}
         }
     }
     close_command_run(&mut units, &mut run, groups);
@@ -786,6 +1104,9 @@ pub(super) enum UnitKey {
     /// absorbs a command settling behind it, where a key over the member set
     /// would read the grown Group as a new unit and re-render it every settle.
     Group(ActivityId),
+    /// A Turn Fold, identified by the Turn it stands for: the marker keeps its
+    /// key as the Turn's hidden work grows behind it.
+    TurnFold(TurnId),
     Provisional(PromptId),
 }
 
@@ -849,7 +1170,7 @@ fn rebuild(
                 .collect()
         })
         .unwrap_or_default();
-    let planned = plan_units(snapshot, provisional, disclosure.groups);
+    let planned = plan_units(snapshot, provisional, disclosure.groups, disclosure.turns);
     let mut units = planned
         .iter()
         .map(|unit| reuse_or_render(&mut reusable, unit, disclosure.folds, theme, width))
@@ -1306,6 +1627,27 @@ fn render_group(
         Span::styled(format!("Ran {member_count} commands"), theme.action.primary),
     ]));
     UnitAnchor::binary(1, !expanded)
+}
+
+/// Projects a Turn Fold's marker: the single row a settled Turn stands as,
+/// drawn in the settled Activity-header idiom with the outcome word styled as
+/// the toggle affordance it is. The marker only exists when the fold hides
+/// something, so it always reports as holding content back.
+fn render_turn_fold(
+    lines: &mut Vec<Line<'static>>,
+    outcome: SettledTurn,
+    theme: &Theme,
+) -> UnitAnchor {
+    let (glyph, style) = match outcome {
+        SettledTurn::Completed => ("✓ ", theme.feedback.success),
+        SettledTurn::Interrupted => ("× ", theme.feedback.warning),
+        SettledTurn::Failed => ("× ", theme.feedback.error),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {glyph}"), style),
+        Span::styled(outcome.label(), theme.action.primary),
+    ]));
+    UnitAnchor::binary(1, true)
 }
 
 struct ActivityProjection<'a> {
@@ -2232,16 +2574,17 @@ mod tests {
     use crate::{
         protocol::{
             Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus,
-            ModelAvailability, Session, SessionRevision, SessionSnapshot, SessionStatus,
-            TranscriptItem, TurnId, Workspace,
+            ModelAvailability, PromptId, Session, SessionRevision, SessionSnapshot, SessionStatus,
+            TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
         },
         theme::Theme,
     };
 
     use super::{
         CappedStream, FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, TranscriptCache,
-        TranscriptDisclosure, TranscriptFolds, TranscriptGroups, TranscriptView, UnitKey,
-        render_activity, render_message, split_oversized_line, wrapped_line_count,
+        TranscriptDisclosure, TranscriptFolds, TranscriptGroups, TranscriptTurnFolds,
+        TranscriptView, UnitKey, render_activity, render_message, split_oversized_line,
+        wrapped_line_count,
     };
 
     fn rendered_text(line: &Line<'static>) -> String {
@@ -2476,6 +2819,7 @@ mod tests {
             TranscriptDisclosure {
                 folds: &folds,
                 groups: &TranscriptGroups::default(),
+                turns: &TranscriptTurnFolds::default(),
             },
             &first_theme,
             80,
@@ -2492,6 +2836,7 @@ mod tests {
             TranscriptDisclosure {
                 folds: &folds,
                 groups: &TranscriptGroups::default(),
+                turns: &TranscriptTurnFolds::default(),
             },
             &second_theme,
             80,
@@ -2540,6 +2885,7 @@ mod tests {
                 TranscriptDisclosure {
                     folds: &folds,
                     groups: &groups,
+                    turns: &TranscriptTurnFolds::default(),
                 },
                 &theme,
                 80,
@@ -2554,6 +2900,7 @@ mod tests {
                 TranscriptDisclosure {
                     folds: &folds,
                     groups: &groups,
+                    turns: &TranscriptTurnFolds::default(),
                 },
                 &theme,
                 80,
@@ -2951,14 +3298,26 @@ mod tests {
             .collect()
     }
 
-    /// Projects the whole Transcript as the text of each row.
+    /// Projects the whole Transcript as the text of each row, with every Turn
+    /// at the posture a fresh view leans to.
     fn projected_rows(
         snapshot: &SessionSnapshot,
         folds: &TranscriptFolds,
         groups: &TranscriptGroups,
     ) -> Vec<String> {
+        projected_rows_through(snapshot, folds, groups, &TranscriptTurnFolds::default())
+    }
+
+    /// Projects the whole Transcript as the text of each row, through the Turn
+    /// Fold state a test drove.
+    fn projected_rows_through(
+        snapshot: &SessionSnapshot,
+        folds: &TranscriptFolds,
+        groups: &TranscriptGroups,
+        turns: &TranscriptTurnFolds,
+    ) -> Vec<String> {
         let cache = TranscriptCache::default();
-        let view = projected_view(&cache, snapshot, folds, groups);
+        let view = projected_view_through(&cache, snapshot, folds, groups, turns);
         let row_count = view.row_count();
         row_text(&view.window(0, row_count).0)
     }
@@ -3131,6 +3490,392 @@ mod tests {
         );
     }
 
+    /// Reassigns an Activity to a Turn, so a fixture can state which Turn its
+    /// entries belong to without spelling out every Activity kind.
+    fn set_turn(activity: &mut Activity, turn_id: TurnId) {
+        match activity {
+            Activity::Status { turn_id: id, .. }
+            | Activity::Error { turn_id: id, .. }
+            | Activity::Command { turn_id: id, .. }
+            | Activity::FileChange { turn_id: id, .. }
+            | Activity::Reasoning { turn_id: id, .. } => *id = turn_id,
+        }
+    }
+
+    /// Builds a Session snapshot whose Transcript holds each Turn's entries in
+    /// order, reporting the Turns in the same order, so a Turn Fold test reads
+    /// as the conversation it is describing.
+    fn turn_snapshot(turns: Vec<(TurnStatus, Vec<Entry>)>) -> (SessionSnapshot, Vec<TurnId>) {
+        let mut snapshot = transcript_snapshot(Vec::new());
+        let mut turn_ids = Vec::new();
+        for (status, entries) in turns {
+            let turn_id = TurnId::new();
+            turn_ids.push(turn_id);
+            let mut turn = transcript_snapshot(entries);
+            for message in &mut turn.messages {
+                message.turn_id = turn_id;
+            }
+            for activity in &mut turn.activities {
+                set_turn(activity, turn_id);
+            }
+            snapshot.turns.push(Turn {
+                id: turn_id,
+                prompt_id: PromptId::new(),
+                agent: None,
+                status,
+            });
+            snapshot.messages.append(&mut turn.messages);
+            snapshot.activities.append(&mut turn.activities);
+            snapshot.transcript.append(&mut turn.transcript);
+        }
+        (snapshot, turn_ids)
+    }
+
+    /// The entries a Turn Fold test hides: enough work to be worth folding
+    /// away, and nothing that stays outside a fold.
+    fn hidden_work() -> Vec<Entry> {
+        vec![
+            Entry::Activity(status("Preparing the workspace")),
+            Entry::Activity(command("cargo test", "running 2 tests\nall green")),
+        ]
+    }
+
+    #[test]
+    fn a_settled_turn_folds_to_one_marker_between_its_prompt_and_its_answer() {
+        let mut entries = vec![Entry::Message(user_message("run the tests"))];
+        entries.extend(hidden_work());
+        entries.push(Entry::Message(agent_message("All green.")));
+        let (snapshot, _) = turn_snapshot(vec![(TurnStatus::Completed, entries)]);
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(
+            rows,
+            ["┃ run the tests", "", "  ✓ Worked", "", "  All green.",],
+            "a settled Turn reads as question, marker, answer"
+        );
+    }
+
+    #[test]
+    fn a_turn_fold_marker_says_how_its_turn_settled() {
+        for (status, marker) in [
+            (TurnStatus::Completed, "  ✓ Worked"),
+            (TurnStatus::Interrupted, "  × Stopped"),
+            (TurnStatus::Failed, "  × Failed"),
+        ] {
+            let mut entries = vec![Entry::Message(user_message("run the tests"))];
+            entries.extend(hidden_work());
+            let (snapshot, _) = turn_snapshot(vec![(status, entries)]);
+
+            let rows = projected_rows(
+                &snapshot,
+                &TranscriptFolds::default(),
+                &TranscriptGroups::default(),
+            );
+
+            assert_eq!(
+                rows,
+                ["┃ run the tests", "", marker],
+                "the marker states the outcome of a {status:?} Turn"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_turns_terminal_error_stays_outside_its_fold() {
+        let mut entries = vec![Entry::Message(user_message("run the tests"))];
+        entries.extend(hidden_work());
+        entries.push(Entry::Activity(error("the Provider disconnected")));
+        let (snapshot, _) = turn_snapshot(vec![(TurnStatus::Failed, entries)]);
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(
+            rows,
+            [
+                "┃ run the tests",
+                "",
+                "  × Failed",
+                "",
+                "  Error: the Provider disconnected",
+            ],
+            "the Error a Turn ended on is its outcome, so a fold never hides it"
+        );
+    }
+
+    #[test]
+    fn a_turn_whose_hidden_work_trailed_its_answer_still_marks_it_above_the_answer() {
+        let mut entries = vec![
+            Entry::Message(user_message("run the tests")),
+            Entry::Message(agent_message("All green.")),
+        ];
+        entries.extend(hidden_work());
+        let (snapshot, _) = turn_snapshot(vec![(TurnStatus::Completed, entries)]);
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(
+            rows,
+            ["┃ run the tests", "", "  ✓ Worked", "", "  All green."],
+            "the marker never falls past the answer the hidden work led to"
+        );
+    }
+
+    #[test]
+    fn a_failed_turns_error_stays_outside_its_fold_even_when_a_message_trails_it() {
+        let mut entries = vec![Entry::Message(user_message("run the tests"))];
+        entries.extend(hidden_work());
+        entries.extend([
+            Entry::Activity(error("the Provider disconnected")),
+            Entry::Message(agent_message("I lost the connection.")),
+        ]);
+        let (snapshot, _) = turn_snapshot(vec![(TurnStatus::Failed, entries)]);
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(
+            rows,
+            [
+                "┃ run the tests",
+                "",
+                "  × Failed",
+                "",
+                "  Error: the Provider disconnected",
+                "",
+                "  I lost the connection.",
+            ],
+            "the Error a Turn failed on is its outcome whatever the Provider said afterwards"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_hides_nothing_shows_no_marker() {
+        let (snapshot, _) = turn_snapshot(vec![(
+            TurnStatus::Completed,
+            vec![
+                Entry::Message(user_message("say hello")),
+                Entry::Message(agent_message("Hello.")),
+            ],
+        )]);
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(
+            rows,
+            ["┃ say hello", "", "  Hello."],
+            "a marker that discloses nothing is noise"
+        );
+    }
+
+    #[test]
+    fn an_active_turn_never_folds() {
+        let mut entries = vec![Entry::Message(user_message("run the tests"))];
+        entries.extend(hidden_work());
+        let (snapshot, _) = turn_snapshot(vec![(TurnStatus::Active, entries)]);
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(
+            rows,
+            [
+                "┃ run the tests",
+                "",
+                "  Preparing the workspace",
+                "  ✓ cargo test",
+            ],
+            "the Turn a reader is watching keeps every entry it has produced"
+        );
+    }
+
+    #[test]
+    fn a_turn_fold_keeps_every_user_message_and_only_the_final_agent_message() {
+        let (snapshot, _) = turn_snapshot(vec![(
+            TurnStatus::Completed,
+            vec![
+                Entry::Message(user_message("start the migration")),
+                Entry::Activity(command("cargo test", "")),
+                Entry::Message(user_message("skip the slow suite")),
+                Entry::Activity(status("Skipping the slow suite")),
+                Entry::Message(agent_message("Working on it.")),
+                Entry::Message(agent_message("Migration done.")),
+            ],
+        )]);
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(
+            rows,
+            [
+                "┃ start the migration",
+                "",
+                "  ✓ Worked",
+                "",
+                "┃ skip the slow suite",
+                "",
+                "  Migration done.",
+            ],
+            "steers stay outside the fold and one marker stands for all the work"
+        );
+    }
+
+    #[test]
+    fn expanding_a_turn_leaves_its_entries_at_their_own_fold_and_group_state() {
+        let first = command("cargo fmt", "reformatted 1 file");
+        let second = command("cargo clippy", "");
+        let mut groups = TranscriptGroups::default();
+        groups.expand(first.id());
+        let mut folds = TranscriptFolds::default();
+        folds.expand(first.id());
+        let (snapshot, turn_ids) = turn_snapshot(vec![(
+            TurnStatus::Completed,
+            vec![
+                Entry::Message(user_message("tidy the tree")),
+                Entry::Activity(first),
+                Entry::Activity(second),
+                Entry::Message(agent_message("Tidied.")),
+            ],
+        )]);
+        let mut turns = TranscriptTurnFolds::default();
+        turns.expand(turn_ids[0]);
+
+        let rows = projected_rows_through(&snapshot, &folds, &groups, &turns);
+
+        assert_eq!(
+            rows,
+            [
+                "┃ tidy the tree",
+                "",
+                "  ✓ Ran 2 commands",
+                "    ✓ cargo fmt",
+                "      reformatted 1 file",
+                "",
+                "    ✓ cargo clippy",
+                "",
+                "  Tidied.",
+            ],
+            "a Turn Fold opens onto the Groups and Folds the reader left behind it"
+        );
+    }
+
+    #[test]
+    fn one_turns_fold_leaves_the_turns_around_it_alone() {
+        let mut first = vec![Entry::Message(user_message("run the tests"))];
+        first.extend(hidden_work());
+        first.push(Entry::Message(agent_message("All green.")));
+        let mut second = vec![Entry::Message(user_message("now ship it"))];
+        second.extend(hidden_work());
+        second.push(Entry::Message(agent_message("Shipped.")));
+        let (snapshot, turn_ids) = turn_snapshot(vec![
+            (TurnStatus::Completed, first),
+            (TurnStatus::Completed, second),
+        ]);
+        let mut turns = TranscriptTurnFolds::default();
+        turns.expand(turn_ids[1]);
+
+        let rows = projected_rows_through(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+            &turns,
+        );
+
+        assert_eq!(
+            rows,
+            [
+                "┃ run the tests",
+                "",
+                "  ✓ Worked",
+                "",
+                "  All green.",
+                "",
+                "┃ now ship it",
+                "",
+                "  Preparing the workspace",
+                "  ✓ cargo test",
+                "",
+                "  Shipped.",
+            ],
+            "Turn Folds are per-Turn state, so opening one leaves its neighbours folded"
+        );
+    }
+
+    #[test]
+    fn the_transcript_cache_rebuilds_when_only_the_turn_fold_state_changes() {
+        let mut entries = vec![Entry::Message(user_message("run the tests"))];
+        entries.extend(hidden_work());
+        entries.push(Entry::Message(agent_message("All green.")));
+        let (snapshot, turn_ids) = turn_snapshot(vec![(TurnStatus::Completed, entries)]);
+        let cache = TranscriptCache::default();
+        let folds = TranscriptFolds::default();
+        let groups = TranscriptGroups::default();
+        let mut turns = TranscriptTurnFolds::default();
+
+        let folded_rows =
+            projected_view_through(&cache, &snapshot, &folds, &groups, &turns).row_count();
+        turns.expand(turn_ids[0]);
+        let expanded_rows =
+            projected_view_through(&cache, &snapshot, &folds, &groups, &turns).row_count();
+
+        assert!(
+            expanded_rows > folded_rows,
+            "the Turn Fold state is a rendering input, so flipping it alone must rebuild the \
+             view: {folded_rows} rows folded, {expanded_rows} rows expanded"
+        );
+    }
+
+    #[test]
+    fn flipping_the_turn_fold_posture_drops_the_overrides_taken_against_the_previous_one() {
+        let expanded_by_hand = TurnId::new();
+        let untouched = TurnId::new();
+        let mut turns = TranscriptTurnFolds::default();
+        turns.expand(expanded_by_hand);
+        assert!(!turns.is_folded(expanded_by_hand));
+        assert!(turns.is_folded(untouched));
+
+        turns.toggle_posture();
+
+        assert!(
+            !turns.is_folded(expanded_by_hand) && !turns.is_folded(untouched),
+            "the expanded posture opens every Turn, whatever the reader flipped before"
+        );
+
+        turns.fold(untouched);
+        assert!(turns.is_folded(untouched));
+        turns.toggle_posture();
+        assert!(
+            turns.is_folded(expanded_by_hand) && turns.is_folded(untouched),
+            "flipping back folds every Turn again"
+        );
+    }
+
     /// Projects a Transcript and hands back the view, for the tests that read
     /// its row accounting rather than its text.
     fn projected_view<'a>(
@@ -3139,11 +3884,32 @@ mod tests {
         folds: &TranscriptFolds,
         groups: &TranscriptGroups,
     ) -> std::cell::Ref<'a, TranscriptView> {
+        projected_view_through(
+            cache,
+            snapshot,
+            folds,
+            groups,
+            &TranscriptTurnFolds::default(),
+        )
+    }
+
+    /// Projects a Transcript through every disclosure axis a test drove.
+    fn projected_view_through<'a>(
+        cache: &'a TranscriptCache,
+        snapshot: &SessionSnapshot,
+        folds: &TranscriptFolds,
+        groups: &TranscriptGroups,
+        turns: &TranscriptTurnFolds,
+    ) -> std::cell::Ref<'a, TranscriptView> {
         cache.view(
             0,
             snapshot,
             &[],
-            TranscriptDisclosure { folds, groups },
+            TranscriptDisclosure {
+                folds,
+                groups,
+                turns,
+            },
             &Theme::system(),
             80,
         )

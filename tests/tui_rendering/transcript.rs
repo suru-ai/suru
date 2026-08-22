@@ -29,6 +29,21 @@ use suru::{
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId},
 };
 
+/// Puts a fixture's Turn — and the Session running it — in flight, which is
+/// what a reader watching that work is looking at. A settled Turn folds to its
+/// marker, the subject of the Turn Fold tests, while these tests are about how
+/// the entries inside a Turn disclose.
+#[track_caller]
+fn set_turn_in_flight(snapshot: &mut suru::protocol::SessionSnapshot, turn_id: TurnId) {
+    snapshot.session.status = SessionStatus::Active;
+    snapshot
+        .turns
+        .iter_mut()
+        .find(|turn| turn.id == turn_id)
+        .expect("fixture carries the Turn its Activities belong to")
+        .status = TurnStatus::Active;
+}
+
 #[track_caller]
 fn assert_no_control_cells(buffer: &Buffer) {
     assert!(
@@ -106,6 +121,7 @@ fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
     let mut application = Application::new(workspace.path());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
     snapshot
         .messages
         .iter_mut()
@@ -174,6 +190,8 @@ fn all_base_ansi_foregrounds_and_backgrounds_render_through_the_theme_palette() 
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = Application::new(workspace.path());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
+    let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
     let activity_id = ActivityId::new();
     let mut output = String::new();
     for (prefix, first_code) in [("nfg", 30), ("bfg", 90)] {
@@ -244,6 +262,7 @@ fn escape_laden_transcript_stays_clean_after_scroll_and_session_switch() {
     let mut application = Application::new(workspace.path());
     let mut escaped = navigable_session_snapshot(SessionId::new(), workspace.path(), 8);
     let turn_id = escaped.turns[7].id;
+    set_turn_in_flight(&mut escaped, turn_id);
     let activity_id = ActivityId::new();
     escaped.activities.push(Activity::Command {
         id: activity_id,
@@ -303,6 +322,7 @@ fn activity_sgr_styles_patch_over_each_activity_base_style() {
     let mut application = Application::new(workspace.path());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
     let activities = [
         Activity::Status {
             id: ActivityId::new(),
@@ -382,9 +402,11 @@ fn command_output_osc_8_hyperlinks_render_with_link_style() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = Application::new(workspace.path());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
+    let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
     let activity = Activity::Command {
         id: ActivityId::new(),
-        turn_id: snapshot.turns[0].id,
+        turn_id,
         status: ActivityStatus::Completed,
         command: "show links".to_owned(),
         cwd: None,
@@ -691,10 +713,12 @@ fn command_activities_render_active_successful_and_failed_states_at_responsive_w
             "Run the test suite",
             workspace.path(),
         );
+        let turn_id = snapshot.turns[0].id;
+        set_turn_in_flight(&mut snapshot, turn_id);
         let activity_id = snapshot.activities[0].id();
         snapshot.activities[0] = Activity::Command {
             id: activity_id,
-            turn_id: snapshot.turns[0].id,
+            turn_id,
             status,
             command: "cargo test".to_owned(),
             cwd: Some("/fixture/work".into()),
@@ -766,10 +790,12 @@ fn file_change_activities_render_active_successful_and_failed_states_at_responsi
             "Change these files",
             workspace.path(),
         );
+        let turn_id = snapshot.turns[0].id;
+        set_turn_in_flight(&mut snapshot, turn_id);
         let activity_id = snapshot.activities[0].id();
         snapshot.activities[0] = Activity::FileChange {
             id: activity_id,
-            turn_id: snapshot.turns[0].id,
+            turn_id,
             status,
             changes: vec![
                 FileChange::Update {
@@ -1383,10 +1409,12 @@ fn command_activity_session(
         "Run the test suite",
         workspace,
     );
+    let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
     let activity_id = snapshot.activities[0].id();
     snapshot.activities[0] = Activity::Command {
         id: activity_id,
-        turn_id: snapshot.turns[0].id,
+        turn_id,
         status,
         command: "cargo test".to_owned(),
         cwd: None,
@@ -1916,6 +1944,7 @@ fn error_and_status_activities_are_never_folded() {
         workspace.path(),
     );
     let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
     let status_id = ActivityId::new();
     snapshot.activities[0] = Activity::Error {
         id: snapshot.activities[0].id(),
@@ -1968,9 +1997,11 @@ fn file_change_activities_fold_past_the_path_budget_and_expand_on_click() {
         "Change these files",
         workspace.path(),
     );
+    let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
     snapshot.activities[0] = Activity::FileChange {
         id: snapshot.activities[0].id(),
-        turn_id: snapshot.turns[0].id,
+        turn_id,
         status: ActivityStatus::Completed,
         changes: (1..=7)
             .map(|change| FileChange::Add {
@@ -2025,10 +2056,12 @@ fn reasoning_activity_session(
         "Explain the Transcript",
         workspace,
     );
+    let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
     let activity_id = snapshot.activities[0].id();
     snapshot.activities[0] = Activity::Reasoning {
         id: activity_id,
-        turn_id: snapshot.turns[0].id,
+        turn_id,
         status,
         title: title.map(ToOwned::to_owned),
         content: content.to_owned(),
@@ -2463,6 +2496,7 @@ fn command_run_snapshot(
     let mut snapshot =
         failed_session_snapshot(session_id, PromptId::new(), "Run the workflow", workspace);
     let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
     snapshot.messages.clear();
     snapshot.activities.clear();
     snapshot.transcript.clear();
@@ -3350,6 +3384,50 @@ fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
         2,
         "both Group headers survive the Folds toggle: {folds_expanded}"
     );
+}
+
+#[test]
+fn a_settled_turn_renders_as_one_marker_between_its_prompt_and_its_answer() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Run the workflow"),
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            RunEntry::Reasoning("Reading the workflow"),
+            RunEntry::AgentMessage("The workflow is green."),
+        ],
+    );
+    // The reader has stopped watching: the Turn settled and the Session went
+    // back to idle.
+    snapshot.session.status = SessionStatus::Idle;
+    snapshot.turns[0].status = TurnStatus::Completed;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Turn has settled");
+
+    let rows = rendered_application_rows_at(&application, 80, 24).join("\n");
+
+    assert!(
+        rows.contains("✓ Worked"),
+        "a settled Turn stands as its marker: {rows}"
+    );
+    for hidden in ["Ran 2 commands", "command 1", "Thought"] {
+        assert!(
+            !rows.contains(hidden),
+            "the Turn Fold hides the work it stands for, but {hidden:?} rendered: {rows}"
+        );
+    }
+    for kept in ["Run the workflow", "The workflow is green."] {
+        assert!(
+            rows.contains(kept),
+            "the Turn's Prompt and its answer stay outside the fold, but {kept:?} is missing: \
+             {rows}"
+        );
+    }
 }
 
 #[test]
