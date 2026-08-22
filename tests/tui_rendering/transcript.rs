@@ -2180,6 +2180,215 @@ fn untitled_reasoning_heads_with_the_label_alone() {
 }
 
 #[test]
+fn a_reasoning_block_that_settled_empty_renders_no_row_in_either_posture() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = reasoning_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        None,
+        "",
+        Some(276),
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a Reasoning block the Provider never described");
+
+    let folded = rendered_application_rows_at(&application, 72, 24).join("\n");
+    assert!(
+        folded.contains("Explain the Transcript"),
+        "the rest of the Transcript still renders: {folded}"
+    );
+    assert_reasoning_shows_nothing(
+        &folded,
+        "a Reasoning block that settled with no title and no content shows nothing",
+    );
+
+    press_leader_chord(&mut application, 'f');
+    let expanded = rendered_application_rows_at(&application, 72, 24).join("\n");
+    assert_reasoning_shows_nothing(
+        &expanded,
+        "the expanded posture has nothing to open for an empty block",
+    );
+}
+
+/// Asserts a rendered Transcript carries no trace of a Reasoning block: no
+/// header in either of its wordings, and none of the fixture duration that
+/// would ride one.
+#[track_caller]
+fn assert_reasoning_shows_nothing(rendered: &str, why: &str) {
+    for absent in ["Thought", "Thinking", "276ms"] {
+        assert!(
+            !rendered.contains(absent),
+            "{why}, but {absent:?} rendered: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn a_reasoning_block_interrupted_before_it_said_anything_renders_no_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) =
+        reasoning_activity_session(workspace.path(), ActivityStatus::Failed, None, "", None);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Reasoning block was cut off before it said anything");
+
+    let rendered = rendered_application_rows_at(&application, 72, 24).join("\n");
+    assert_reasoning_shows_nothing(
+        &rendered,
+        "a block cut off before the Provider described it settled with nothing to show",
+    );
+    assert!(
+        !rendered.contains("interrupted"),
+        "how the thinking ended is the Turn's story, not an empty block's: {rendered}"
+    );
+}
+
+#[test]
+fn an_interrupted_reasoning_block_that_said_something_keeps_its_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = reasoning_activity_session(
+        workspace.path(),
+        ActivityStatus::Failed,
+        None,
+        "Reading the projection.",
+        None,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Reasoning block was cut off mid-summary");
+
+    let rows = rendered_application_rows_at(&application, 72, 24);
+    assert_eq!(
+        rows[rendered_row(&rows, "Thinking interrupted")].trim_end(),
+        "    × Thinking interrupted · +1 lines",
+        "a block that said something before it was cut off still stands for what it said"
+    );
+}
+
+#[test]
+fn a_reasoning_block_whose_content_the_cap_dropped_keeps_its_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (mut snapshot, activity_id) = reasoning_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        None,
+        "",
+        Some(276),
+    );
+    let Some(Activity::Reasoning {
+        content_truncated, ..
+    }) = snapshot
+        .activities
+        .iter_mut()
+        .find(|activity| activity.id() == activity_id)
+    else {
+        panic!("the fixture's Activity is the Reasoning block");
+    };
+    *content_truncated = true;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Reasoning block lost its content to the cap");
+
+    let rendered = rendered_application_rows_at(&application, 72, 24).join("\n");
+    assert!(
+        rendered.contains("Thought · 276ms"),
+        "content the cap cut away still happened, so the block keeps its row: {rendered}"
+    );
+
+    press_leader_chord(&mut application, 'f');
+    let expanded = rendered_application_rows_at(&application, 72, 24).join("\n");
+    assert!(
+        expanded.contains("[Reasoning truncated]"),
+        "and the row opens onto the marker saying what was dropped: {expanded}"
+    );
+}
+
+#[test]
+fn a_live_reasoning_block_that_settles_empty_loses_the_row_it_was_streaming_in() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let (mut snapshot, activity_id) =
+        reasoning_activity_session(workspace.path(), ActivityStatus::Active, None, "", None);
+    snapshot.session.id = session_id;
+    let next_revision = SessionRevision(snapshot.revision.0 + 1);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Reasoning block has only just started");
+    assert!(
+        rendered_application_rows_at(&application, 72, 24)
+            .join("\n")
+            .contains("Thinking"),
+        "the reader watching the Turn sees that it is thinking"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: next_revision,
+                changes: vec![SessionChange::ReasoningStatusChanged {
+                    activity_id,
+                    status: ActivityStatus::Completed,
+                    duration_ms: Some(276),
+                }],
+            },
+        )))
+        .expect("project the Reasoning block settling with nothing to show");
+
+    assert_reasoning_shows_nothing(
+        &rendered_application_rows_at(&application, 72, 24).join("\n"),
+        "the block settled empty, so the row it was streaming in goes with it",
+    );
+}
+
+#[test]
+fn a_reasoning_block_the_provider_only_titled_still_renders_its_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = reasoning_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        Some("Inspecting the seam"),
+        "",
+        Some(4_200),
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a titled but wordless Reasoning block");
+
+    let rows = rendered_application_rows_at(&application, 72, 24);
+    assert_eq!(
+        rows[rendered_row(&rows, "Thought: Inspecting the seam")].trim_end(),
+        "    ✓ Thought: Inspecting the seam · 4s",
+        "a title is something to say, so the block keeps its row"
+    );
+}
+
+#[test]
+fn a_reasoning_block_still_running_renders_before_the_provider_describes_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) =
+        reasoning_activity_session(workspace.path(), ActivityStatus::Active, None, "", None);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Reasoning block has only just started");
+
+    let rows = rendered_application_rows_at(&application, 72, 24);
+    assert_eq!(
+        rows[rendered_row(&rows, "Thinking")].trim_end(),
+        "    … Thinking",
+        "a block that has not settled is live progress, so it keeps its row"
+    );
+}
+
+#[test]
 fn an_active_command_shows_a_live_tail_and_settles_into_its_folded_row() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let (mut snapshot, activity_id) = command_activity_session(
@@ -2487,6 +2696,10 @@ enum RunEntry {
     AgentMessage(&'static str),
     UserMessage(&'static str),
     Reasoning(&'static str),
+    /// A Reasoning block the Provider settled without ever describing: no
+    /// title, no content, and only the duration it spent arriving at nothing
+    /// a reader could see.
+    EmptyReasoning,
     FileChange,
     Status(&'static str),
     Error(&'static str),
@@ -2547,6 +2760,15 @@ fn command_run_snapshot(
                 content: "Weighed the options.".to_owned(),
                 content_truncated: false,
                 duration_ms: None,
+            },
+            RunEntry::EmptyReasoning => Activity::Reasoning {
+                id: ActivityId::new(),
+                turn_id,
+                status: ActivityStatus::Completed,
+                title: None,
+                content: String::new(),
+                content_truncated: false,
+                duration_ms: Some(276),
             },
             RunEntry::FileChange => Activity::FileChange {
                 id: ActivityId::new(),
@@ -2758,6 +2980,56 @@ fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
             "the second Group renders after the breaking entry: {rendered}"
         );
     }
+}
+
+#[test]
+fn an_empty_reasoning_block_neither_breaks_a_command_run_nor_leaves_a_gap() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let with_empty_blocks = command_run_snapshot(
+        session_id,
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Run the workflow"),
+            SUCCESSFUL_COMMAND,
+            RunEntry::EmptyReasoning,
+            SUCCESSFUL_COMMAND,
+            RunEntry::EmptyReasoning,
+            RunEntry::AgentMessage("The workflow is green."),
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(with_empty_blocks))
+        .expect("attach a Session whose command run is interleaved with empty Reasoning");
+    let rows = rendered_application_rows_at(&application, 80, 24);
+    assert!(
+        rows.join("\n").contains("✓ Ran 2 commands"),
+        "an invisible block neither joins nor ends the run around it: {}",
+        rows.join("\n")
+    );
+
+    let without_empty_blocks = command_run_snapshot(
+        session_id,
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Run the workflow"),
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            RunEntry::AgentMessage("The workflow is green."),
+        ],
+    );
+    let mut without = connected_application(workspace.path());
+    without
+        .handle_event(ApplicationEvent::SessionAttached(without_empty_blocks))
+        .expect("attach the same Session without the empty Reasoning blocks");
+
+    assert_eq!(
+        rows,
+        rendered_application_rows_at(&without, 80, 24),
+        "a Transcript reads exactly as it would had the empty blocks never happened, \
+         down to the rows of air between its entries"
+    );
 }
 
 #[test]
@@ -3495,6 +3767,40 @@ fn append_settled_turn(
             message_id: message.id,
         });
         snapshot.messages.push(message);
+    }
+}
+
+#[test]
+fn a_settled_turn_whose_only_work_was_empty_reasoning_shows_no_marker() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Explain the Transcript"),
+            RunEntry::EmptyReasoning,
+            RunEntry::AgentMessage("It is the history of a Session."),
+        ],
+    );
+    snapshot.session.status = SessionStatus::Idle;
+    snapshot.turns[0].status = TurnStatus::Completed;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose settled Turn only ever thought emptily");
+
+    let rows = rendered_application_rows_at(&application, 80, 24).join("\n");
+
+    assert!(
+        !rows.contains("Worked"),
+        "a Turn Fold covering only invisible work has nothing to disclose, so no marker \
+         stands for it: {rows}"
+    );
+    for kept in ["Explain the Transcript", "It is the history of a Session."] {
+        assert!(
+            rows.contains(kept),
+            "the Turn's Prompt and its answer still render, but {kept:?} is missing: {rows}"
+        );
     }
 }
 

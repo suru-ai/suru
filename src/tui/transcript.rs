@@ -908,9 +908,11 @@ struct TurnEntry {
 }
 
 /// A Session's Messages and Activities by id, so the walks over its Transcript
-/// resolve what each entry names in one lookup. Gathered once and shared,
-/// because the projection walks the Transcript twice: once to decide the Turn
-/// Folds, once to plan the units.
+/// resolve what each entry names in one lookup — and, in the same lookup,
+/// whether the Transcript shows anything for it at all. Gathered once and
+/// shared, because the projection walks the Transcript twice: once to decide
+/// the Turn Folds, once to plan the units, and the two must agree on which
+/// entries are there to be read.
 struct TranscriptContent<'a> {
     messages: HashMap<MessageId, &'a Message>,
     activities: HashMap<ActivityId, &'a Activity>,
@@ -932,8 +934,11 @@ impl<'a> TranscriptContent<'a> {
         }
     }
 
-    /// What a Transcript entry names, or `None` when the snapshot does not
-    /// carry it.
+    /// What a Transcript entry names, or `None` when the Transcript shows
+    /// nothing for it — because the snapshot does not carry what it names, or
+    /// because what it names projects no rows at all. Both walks over the
+    /// Transcript ask the same question of an entry, which is whether it is
+    /// one of the entries a reader sees, so both are answered here.
     fn entry(&self, item: &TranscriptItem) -> Option<TranscriptEntry<'a>> {
         match item {
             TranscriptItem::Message { message_id } => self
@@ -945,9 +950,54 @@ impl<'a> TranscriptContent<'a> {
                 .activities
                 .get(activity_id)
                 .copied()
+                .filter(|activity| !transcript_shows_nothing(activity))
                 .map(TranscriptEntry::Activity),
         }
     }
+}
+
+/// Whether the Transcript shows nothing at all for an Activity. A Reasoning
+/// block that settles without the Provider ever describing it — no heading and
+/// no content — has nothing a row could carry, so the Transcript draws none:
+/// not a folded row, not an expanded one, and not the duration it spent
+/// arriving at nothing. The Activity stays stored exactly as it arrived; it is
+/// simply absent from the projection rather than empty within it, which is
+/// what makes it neither join nor end the run of commands around it and leave
+/// no gap in the Transcript's spacing.
+///
+/// The rule reads Settle rather than success, so a block the Provider failed
+/// or a Turn interrupted before either arrived is as invisible as one that
+/// completed empty: how the thinking ended is the Turn's story to tell, and
+/// its marker tells it. A block still running is never this, even before its
+/// first delta — that an agent is thinking is itself progress worth a row —
+/// and neither is one whose content the cap cut away, because content the
+/// reader cannot see still happened and its truncation marker says so.
+fn transcript_shows_nothing(activity: &Activity) -> bool {
+    match activity {
+        Activity::Reasoning {
+            status,
+            title,
+            content,
+            content_truncated,
+            ..
+        } => {
+            *status != crate::protocol::ActivityStatus::Active
+                && reasoning_heading(title.as_deref()).is_none()
+                && content.trim().is_empty()
+                && !content_truncated
+        }
+        _ => false,
+    }
+}
+
+/// The heading a Reasoning block leads with, which is a title that says
+/// something: a Provider that sent only blank space named the block no better
+/// than one that sent no title at all. Both readings of a title pass through
+/// here — the header that would otherwise print an empty heading, and the rule
+/// deciding whether the block is shown at all — so the two cannot disagree
+/// about which blocks the Provider described.
+fn reasoning_heading(title: Option<&str>) -> Option<&str> {
+    title.filter(|title| !title.trim().is_empty())
 }
 
 /// One Transcript entry resolved to the content it names.
@@ -1023,8 +1073,9 @@ impl TurnFolding {
         let mut entries: Vec<Option<TurnEntry>> = Vec::with_capacity(snapshot.transcript.len());
         let mut positions: HashMap<TurnId, Vec<usize>> = HashMap::new();
         for (position, item) in snapshot.transcript.iter().enumerate() {
-            // An entry naming content the snapshot does not carry projects
-            // nothing, so it is not one of the entries a fold decides about.
+            // An entry the Transcript shows nothing for is not one of the
+            // entries a fold decides about: a fold covering only those would
+            // disclose nothing, so no marker stands for it.
             let entry = content.entry(item).map(TranscriptEntry::in_turn);
             if let Some(entry) = entry
                 && settled.contains_key(&entry.turn_id)
@@ -1104,10 +1155,10 @@ fn plan_units<'a>(
     let folding = TurnFolding::plan(snapshot, &content, turns);
     let mut units = Vec::with_capacity(snapshot.transcript.len() + provisional.len());
     let mut run: Vec<&Activity> = Vec::new();
-    // A transcript entry naming content the snapshot does not carry projects
-    // nothing rather than a gap, so it does not end a run either: the commands
-    // around it are still adjacent as presented. An entry a Turn Fold hides
-    // projects nothing for the same reason and is read the same way.
+    // A transcript entry the Transcript shows nothing for projects nothing
+    // rather than a gap, so it does not end a run either: the commands around
+    // it are still adjacent as presented. An entry a Turn Fold hides projects
+    // nothing for the same reason and is read the same way.
     for (position, item) in snapshot.transcript.iter().enumerate() {
         if let Some(marker) = folding.marker_at(position) {
             close_command_run(&mut units, &mut run, groups);
@@ -2062,7 +2113,7 @@ fn push_reasoning_activity(
         ActivityStatus::Failed => ("× ", REASONING_FAILED_LABEL, theme.feedback.error),
     };
     let mut header = label.to_owned();
-    if let Some(title) = title {
+    if let Some(title) = reasoning_heading(title) {
         header.push_str(": ");
         header.push_str(title);
     }
