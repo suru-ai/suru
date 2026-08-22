@@ -693,7 +693,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
 fn command_activities_render_active_successful_and_failed_states_at_responsive_widths() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let cases = [
-        (ActivityStatus::Active, None, "$ cargo test", Color::Cyan),
+        (ActivityStatus::Active, None, "⠋ cargo test", Color::Cyan),
         (
             ActivityStatus::Completed,
             Some(0),
@@ -770,7 +770,7 @@ fn file_change_activities_render_active_successful_and_failed_states_at_responsi
     let cases = [
         (
             ActivityStatus::Active,
-            "… Applying file changes",
+            "⠋ Applying file changes",
             Color::Cyan,
         ),
         (
@@ -895,7 +895,7 @@ fn streaming_command_updates_reuse_one_projected_transcript_row() {
             .expect("project streamed command output");
     }
     let streamed = rendered_application_rows_at(&application, 80, 18).join("\n");
-    assert_eq!(streamed.matches("$ cargo test").count(), 1);
+    assert_eq!(streamed.matches("⠋ cargo test").count(), 1);
     assert_eq!(streamed.matches("running tests").count(), 1);
 
     application
@@ -913,7 +913,7 @@ fn streaming_command_updates_reuse_one_projected_transcript_row() {
         .expect("project command completion");
     let completed = rendered_application_rows_at(&application, 80, 18).join("\n");
     assert_eq!(completed.matches("✓ cargo test").count(), 1);
-    assert!(!completed.contains("$ cargo test"));
+    assert!(!completed.contains("⠋ cargo test"));
     assert!(
         !completed.contains("running tests"),
         "the settled command folds its output away: {completed}"
@@ -2147,7 +2147,7 @@ fn reasoning_still_running_heads_with_its_running_label_and_no_duration() {
     let header = &streaming_rows[rendered_row(&streaming_rows, "Thinking: Inspecting the seam")];
     assert_eq!(
         header.trim_end(),
-        "    … Thinking: Inspecting the seam · +1 lines",
+        "    ⠋ Thinking: Inspecting the seam · +1 lines",
         "a Reasoning block still running heads with its running label and no duration"
     );
     assert!(
@@ -2383,7 +2383,7 @@ fn a_reasoning_block_still_running_renders_before_the_provider_describes_it() {
     let rows = rendered_application_rows_at(&application, 72, 24);
     assert_eq!(
         rows[rendered_row(&rows, "Thinking")].trim_end(),
-        "    … Thinking",
+        "    ⠋ Thinking",
         "a block that has not settled is live progress, so it keeps its row"
     );
 }
@@ -2618,7 +2618,7 @@ fn clicking_an_entry_that_hides_nothing_records_no_fold_for_its_later_output() {
     );
 
     application
-        .handle_terminal_event(left_click_at(rendered_row(&rows, "$ cargo test") as u16))
+        .handle_terminal_event(left_click_at(rendered_row(&rows, "⠋ cargo test") as u16))
         .expect("click an entry that hides nothing");
 
     application
@@ -3055,7 +3055,7 @@ fn an_active_command_renders_live_outside_the_group_while_the_turn_runs() {
         "no member row escapes the Group: {rendered}"
     );
     assert!(
-        rendered.contains("$ command 3"),
+        rendered.contains("⠋ command 3"),
         "the running command stays visible outside the Group: {rendered}"
     );
     assert!(
@@ -3499,9 +3499,9 @@ fn a_command_settling_successfully_is_absorbed_into_an_expanded_group() {
         ))
         .expect("expand the Group while the Turn runs");
     let expanded_rows = rendered_application_rows_at(&application, 80, 30);
-    let running = &expanded_rows[rendered_row(&expanded_rows, "$ command 3")];
+    let running = &expanded_rows[rendered_row(&expanded_rows, "⠋ command 3")];
     assert!(
-        running.starts_with("    $ command 3"),
+        running.starts_with("    ⠋ command 3"),
         "the running command stays outside the Group, in the standalone column: {running:?}"
     );
 
@@ -3526,7 +3526,7 @@ fn a_command_settling_successfully_is_absorbed_into_an_expanded_group() {
         "the absorbed command renders as an indented member: {rendered}"
     );
     assert!(
-        !rendered.contains("$ command 3"),
+        !rendered.contains("⠋ command 3"),
         "the standalone running row is gone: {rendered}"
     );
 }

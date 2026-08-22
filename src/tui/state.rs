@@ -17,7 +17,7 @@ use crate::{
         Activity, ActivityStatus, AdmitPromptRequest, AgentSelection, AgentSelectionOperationId,
         CreateSessionRequest, InitialPrompt, MessageId, ModelCatalog, PromptDelivery, PromptId,
         PromptStatus, ServerIdentity, SessionChange, SessionId, SessionListItem, SessionSnapshot,
-        ShutdownReason, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        SessionStatus, ShutdownReason, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
     },
     theme::Theme,
 };
@@ -196,6 +196,9 @@ pub struct TuiState {
     /// Bumped whenever the Session projection is replaced wholesale, so the
     /// transcript cache never trusts a revision across snapshot swaps.
     pub(super) transcript_generation: u64,
+    /// Which Spinner frame is showing, advanced by the run loop's tick and
+    /// read only at draw time — never by the transcript projection (ADR 0009).
+    pub(super) spinner_frame: usize,
     pub(super) composer_focused: bool,
     pub(super) submission_error: Option<String>,
     pub(super) session: Option<SessionProjection>,
@@ -286,6 +289,7 @@ impl TuiState {
             session_interactions: HashMap::new(),
             transcript_cache: TranscriptCache::default(),
             transcript_generation: 0,
+            spinner_frame: 0,
             composer_focused: true,
             submission_error: None,
             session: None,
@@ -2178,5 +2182,24 @@ impl Application {
 
     pub(super) fn is_recovering(&self) -> bool {
         self.state.recovery.is_some()
+    }
+
+    /// Whether anything on screen is animating a Spinner, so the run loop
+    /// ticks only while one shows and an idle TUI schedules zero wakeups.
+    pub(super) fn wants_spinner(&self) -> bool {
+        self.state.session.as_ref().is_some_and(|session| {
+            let snapshot = session.snapshot();
+            snapshot.session.status == SessionStatus::Active
+                || snapshot
+                    .activities
+                    .iter()
+                    .any(|activity| activity.status() == Some(ActivityStatus::Active))
+        })
+    }
+
+    /// Advances the Spinner one frame. Called from the run loop's tick, which
+    /// only exists while [`Self::wants_spinner`] holds.
+    pub(super) fn advance_spinner(&mut self) {
+        self.state.spinner_frame = self.state.spinner_frame.wrapping_add(1);
     }
 }

@@ -10,6 +10,7 @@ mod model_picker;
 mod render;
 mod session_picker;
 mod slots;
+mod spinner;
 mod state;
 mod transcript;
 

@@ -84,6 +84,14 @@ _Avoid_: Batch, merge, cell
 The single-marker presentation a client's Transcript gives a settled Turn, hiding the work between the Turn's opening user Message and its outcome. Like a Fold, a Turn Fold is reversible, client-local view state, but it keys on the Turn's Settle rather than on entry adjacency, and it opens in one step rather than in stages. Its marker names how the Turn settled — worked, stopped, or failed — with the Turn's duration when known. A Turn's user Messages, its final agent Message, and a failed Turn's terminal Error Activity stay visible outside it; entries revealed by expanding keep their own Fold and Group state. The marker stands in the same place folded or expanded, because it is the row a reader clicks to move between the two: folded it stands for the work, and expanded it heads the work it opened onto. A Turn Fold also manages itself around the reader's attention, which a Fold does not: interrupting a Turn opens the fold it is about to settle into so the reader keeps their place, and a newer Turn beginning folds back the Turns before it that the reader had opened — the interrupted one included — because compressing past work is what the fold is for.
 _Avoid_: Turn collapse, worked row
 
+**Marker**:
+The leading cell of an Activity's header row in a Transcript: a Spinner while the Activity is Active, the Activity's outcome glyph once it Settles. One cell with one contract, shared by every Activity kind that shows liveness. Distinct from a fold marker or truncation marker, which are whole rows.
+_Avoid_: Status icon, prefix glyph
+
+**Spinner**:
+The animated glyph a client shows where work is live right now — in the Marker of an Active Activity, and beside any other live-work state a client surfaces. A Spinner only ever animates presentation: it carries no state of its own beyond which frame is showing.
+_Avoid_: Throbber, loading indicator
+
 **Resume State**:
 Provider-owned data, opaque to Suru, that lets a Session continue with its Provider after a restart. Without it a restored Session is viewable but cannot continue where it left off.
 _Avoid_: Thread mapping, provider cache

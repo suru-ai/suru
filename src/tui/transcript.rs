@@ -49,6 +49,7 @@ use crate::{
 };
 
 use super::markdown;
+use super::spinner;
 
 /// Source lines wrapping to more rows than this are split. The cap serves two
 /// bounds: ratatui's u16-based scroll arithmetic stays in range, and the draw
@@ -534,11 +535,7 @@ impl TranscriptView {
     /// `scroll_position`, along with the residual scroll offset into the first
     /// returned line. The result is bounded by the viewport, not the
     /// transcript.
-    pub(super) fn window(
-        &self,
-        scroll_position: usize,
-        viewport_rows: usize,
-    ) -> (Vec<Line<'static>>, usize) {
+    pub(super) fn window(&self, scroll_position: usize, viewport_rows: usize) -> TranscriptWindow {
         let first_line = self
             .line_starts
             .partition_point(|row| *row <= scroll_position)
@@ -547,6 +544,7 @@ impl TranscriptView {
         let local_scroll = scroll_position.saturating_sub(window_start);
         let rows_needed = local_scroll.saturating_add(viewport_rows);
         let mut lines = Vec::new();
+        let mut spinner_lines = Vec::new();
         let mut rows = 0;
         let first_unit = self
             .units
@@ -568,7 +566,16 @@ impl TranscriptView {
                     skip -= 1;
                 }
             }
-            for (line, rows_of_line) in unit.lines.iter().zip(&unit.rows_per_line).skip(skip) {
+            for (index, (line, rows_of_line)) in unit
+                .lines
+                .iter()
+                .zip(&unit.rows_per_line)
+                .enumerate()
+                .skip(skip)
+            {
+                if unit.spinner_line == Some(index) {
+                    spinner_lines.push(lines.len());
+                }
                 lines.push(line.clone());
                 rows += rows_of_line;
                 if rows >= rows_needed {
@@ -576,8 +583,22 @@ impl TranscriptView {
                 }
             }
         }
-        (lines, local_scroll)
+        TranscriptWindow {
+            lines,
+            local_scroll,
+            spinner_lines,
+        }
     }
+}
+
+/// The viewport-sized slice of a [`TranscriptView`] one frame draws: its
+/// lines, the residual scroll into the first one, and which of them carry a
+/// Spinner for the draw-time overlay (ADR 0009) to patch.
+pub(super) struct TranscriptWindow {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) local_scroll: usize,
+    /// Indices into `lines` whose Marker cell holds a Spinner.
+    pub(super) spinner_lines: Vec<usize>,
 }
 
 /// One block of the Transcript the projection renders as a whole: the entries
@@ -656,6 +677,20 @@ impl RenderUnit<'_> {
             // A provisional prompt's text only grows and carries no Fold, so
             // its length is the whole of its rendering input.
             Self::Provisional(prompt) => prompt.text.len() as u64,
+        }
+    }
+
+    /// The unit-local line carrying a Spinner in its Marker cell, so the
+    /// draw-time overlay (ADR 0009) knows where to patch the current frame.
+    /// Only an Active Activity animates, and its Marker leads its first line.
+    fn spinner_line(&self) -> Option<usize> {
+        match self {
+            Self::Activity(activity) | Self::GroupMember(activity) => {
+                (activity.status() == Some(crate::protocol::ActivityStatus::Active)).then_some(0)
+            }
+            Self::Message(_) | Self::Group { .. } | Self::TurnFold(_) | Self::Provisional(_) => {
+                None
+            }
         }
     }
 
@@ -1272,6 +1307,10 @@ struct UnitView {
     /// separator as that first line so a window opening mid-unit lands by
     /// simple subtraction.
     start_line: usize,
+    /// The unit-local line whose Marker cell carries a Spinner, recorded so
+    /// the draw-time overlay (ADR 0009) can patch the current frame in
+    /// without the projection ever depending on it.
+    spinner_line: Option<usize>,
     message_id: Option<MessageId>,
     anchor: Option<LaidOutAnchor>,
 }
@@ -1445,6 +1484,7 @@ fn reuse_or_render(
         source_lines,
         leading_separator: false,
         start_line: 0,
+        spinner_line: unit.spinner_line(),
         message_id: unit.message_id(),
         anchor: rendered_anchor.map(|anchor| LaidOutAnchor {
             header_lines,
@@ -1833,7 +1873,7 @@ fn push_command_activity(
         exit_status,
     } = activity;
     let (marker, style) = match status {
-        ActivityStatus::Active => ("$ ", theme.accent.primary),
+        ActivityStatus::Active => (spinner::MARKER, theme.accent.primary),
         ActivityStatus::Completed => ("✓ ", theme.feedback.success),
         ActivityStatus::Failed => ("× ", theme.feedback.error),
     };
@@ -2040,7 +2080,11 @@ fn push_file_change_activity(
     use crate::protocol::ActivityStatus;
 
     let (marker, label, style) = match status {
-        ActivityStatus::Active => ("… ", "Applying file changes", theme.accent.primary),
+        ActivityStatus::Active => (
+            spinner::MARKER,
+            "Applying file changes",
+            theme.accent.primary,
+        ),
         ActivityStatus::Completed => ("✓ ", "Applied file changes", theme.feedback.success),
         ActivityStatus::Failed => ("× ", "Failed to apply file changes", theme.feedback.error),
     };
@@ -2108,7 +2152,11 @@ fn push_reasoning_activity(
         duration_ms,
     } = activity;
     let (marker, label, style) = match status {
-        ActivityStatus::Active => ("… ", REASONING_ACTIVE_LABEL, theme.accent.primary),
+        ActivityStatus::Active => (
+            spinner::MARKER,
+            REASONING_ACTIVE_LABEL,
+            theme.accent.primary,
+        ),
         ActivityStatus::Completed => ("✓ ", REASONING_COMPLETED_LABEL, theme.text.subdued),
         ActivityStatus::Failed => ("× ", REASONING_FAILED_LABEL, theme.feedback.error),
     };
@@ -2968,7 +3016,7 @@ mod tests {
             &first_theme,
             80,
         );
-        let first_lines = first.window(0, 10).0;
+        let first_lines = first.window(0, 10).lines;
         drop(first);
         let mut second_theme = first_theme;
         second_theme.ansi.normal.red = Color::Rgb(4, 5, 6);
@@ -2985,7 +3033,7 @@ mod tests {
             &second_theme,
             80,
         );
-        let second_lines = second.window(0, 10).0;
+        let second_lines = second.window(0, 10).lines;
 
         let themed_color = |lines: &[Line<'static>]| {
             lines
@@ -3463,7 +3511,7 @@ mod tests {
         let cache = TranscriptCache::default();
         let view = projected_view_through(&cache, snapshot, folds, groups, turns);
         let row_count = view.row_count();
-        row_text(&view.window(0, row_count).0)
+        row_text(&view.window(0, row_count).lines)
     }
 
     #[test]
@@ -4313,7 +4361,7 @@ mod tests {
             .expect("the expanded command anchors a click");
         assert_eq!(
             view.window(0, view.row_count())
-                .0
+                .lines
                 .get(1)
                 .map(rendered_text)
                 .as_deref(),
@@ -4367,8 +4415,8 @@ mod tests {
         let cache = TranscriptCache::default();
         let view = projected_view(&cache, &snapshot, &folds, &TranscriptGroups::default());
 
-        let opening_on_it = view.window(1, 2).0;
-        let opening_past_it = view.window(2, 2).0;
+        let opening_on_it = view.window(1, 2).lines;
+        let opening_past_it = view.window(2, 2).lines;
 
         assert_eq!(row_text(&opening_on_it), ["", "  ✓ cargo test"]);
         assert_eq!(
@@ -4391,7 +4439,7 @@ mod tests {
         let cache = TranscriptCache::default();
         let view = projected_view(&cache, &snapshot, &folds, &TranscriptGroups::default());
 
-        let whole = view.window(0, view.row_count()).0;
+        let whole = view.window(0, view.row_count()).lines;
 
         assert_eq!(
             whole.len(),
@@ -4399,12 +4447,57 @@ mod tests {
             "the reported row count must cover exactly the rows the window draws"
         );
         for (row, drawn) in whole.iter().enumerate() {
-            let (lines, local_scroll) = view.window(row, 1);
+            let window = view.window(row, 1);
             assert_eq!(
-                rendered_text(&lines[local_scroll]),
+                rendered_text(&window.lines[window.local_scroll]),
                 rendered_text(drawn),
                 "scrolling to row {row} must land on the same row the whole window draws"
             );
         }
+    }
+
+    #[test]
+    fn the_window_records_spinner_lines_for_active_markers_only() {
+        let mut running = command("cargo build", "compiling suru");
+        let Activity::Command {
+            status,
+            exit_status,
+            ..
+        } = &mut running
+        else {
+            unreachable!("the command helper builds a Command Activity");
+        };
+        *status = ActivityStatus::Active;
+        *exit_status = None;
+        let snapshot = transcript_snapshot(vec![
+            Entry::Activity(command("cargo check", "")),
+            Entry::Activity(running),
+        ]);
+        let cache = TranscriptCache::default();
+        let view = projected_view_through(
+            &cache,
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+            &TranscriptTurnFolds::default(),
+        );
+
+        let whole = view.window(0, view.row_count());
+        assert_eq!(
+            whole.spinner_lines.len(),
+            1,
+            "only the running command animates; the settled one keeps its outcome glyph"
+        );
+        let spinner_row = rendered_text(&whole.lines[whole.spinner_lines[0]]);
+        assert!(
+            spinner_row.contains(super::spinner::MARKER) && spinner_row.contains("cargo build"),
+            "the recorded line is the running command's header: {spinner_row}"
+        );
+
+        let past_it = view.window(view.row_count().saturating_sub(1), 1);
+        assert!(
+            past_it.spinner_lines.is_empty(),
+            "a window opening past the Marker records nothing to patch"
+        );
     }
 }

@@ -32,6 +32,7 @@ use super::{
         PromptStatusSlotContext, RenderSlots, RenderedSlot, SessionComposerTopSlotContext,
         SlotText, truncate_to_width,
     },
+    spinner,
     state::{CommandId, CommandMode, QueuedPrompt, TranscriptViewport, TuiState},
     transcript::TranscriptDisclosure,
 };
@@ -851,13 +852,14 @@ fn render_session(
         SessionStatus::Idle => "idle".to_owned(),
         SessionStatus::Active => {
             let interrupt = binding_label(&CommandId::RequestInterrupt);
+            let glyph = spinner::frame(state.spinner_frame);
             if matches!(
                 state.command_mode,
                 CommandMode::InterruptConfirmation { .. }
             ) {
-                format!("active · {interrupt} again to interrupt")
+                format!("{glyph} active · {interrupt} again to interrupt")
             } else {
-                format!("active · {interrupt} interrupt")
+                format!("{glyph} active · {interrupt} interrupt")
             }
         }
     };
@@ -1039,10 +1041,16 @@ fn render_session(
     let composer_top_area = horizontally_inset(composer_top_area, padding);
     let composer_area = horizontally_inset(composer_area, padding);
     let footer_area = horizontally_inset(status_area, padding);
-    let (window_lines, local_scroll) =
-        transcript_view.window(scroll_position, usize::from(transcript_area.height));
-    let local_scroll =
-        local_scroll.min(usize::from(u16::MAX.saturating_sub(transcript_area.height))) as u16;
+    let mut window = transcript_view.window(scroll_position, usize::from(transcript_area.height));
+    spinner::overlay_frame(
+        &mut window.lines,
+        &window.spinner_lines,
+        state.spinner_frame,
+    );
+    let local_scroll = window
+        .local_scroll
+        .min(usize::from(u16::MAX.saturating_sub(transcript_area.height)))
+        as u16;
     let has_top_border = transcript_area.height > 1;
     // The top border pushes projected rows down one, so a pointer maps back to
     // a transcript row through the same offset the widget draws with.
@@ -1056,7 +1064,7 @@ fn render_session(
         content_top: transcript_area.y.saturating_add(border_rows),
         content_rows: transcript_area.height.saturating_sub(border_rows),
     }));
-    let transcript_widget = Paragraph::new(Text::from(window_lines)).wrap(Wrap { trim: false });
+    let transcript_widget = Paragraph::new(Text::from(window.lines)).wrap(Wrap { trim: false });
     let transcript_widget = if has_top_border {
         transcript_widget.block(
             Block::default()

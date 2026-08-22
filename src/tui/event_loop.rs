@@ -36,6 +36,7 @@ use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc::UnboundedSender;
 
+use super::spinner;
 use super::state::{
     Application, ApplicationEvent, ApplicationTransition, ModelListRequest, SessionListRequest,
 };
@@ -213,6 +214,9 @@ struct RunLoop {
     tasks: SessionTasks,
     channels: TaskChannels,
     reconnect_grace: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// Armed only while something on screen animates a Spinner, so an idle
+    /// TUI schedules zero wakeups (ADR 0009). Re-armed on every fire.
+    spinner_tick: Option<Pin<Box<tokio::time::Sleep>>>,
     /// Set by anything that changes what is on screen, so an event the user
     /// cannot see costs no frame.
     needs_redraw: bool,
@@ -238,11 +242,13 @@ async fn run_loop(
             models,
         },
         reconnect_grace: None,
+        spinner_tick: None,
         needs_redraw: true,
     };
     let mut input = EventStream::new();
 
     loop {
+        run.sync_spinner_tick();
         if run.needs_redraw {
             terminal.draw(|frame| run.application.render(frame))?;
             run.needs_redraw = false;
@@ -255,6 +261,7 @@ async fn run_loop(
             () = wait_for_reconnect_grace(&mut run.reconnect_grace) => {
                 run.expire_reconnect_grace()?
             }
+            () = wait_for_spinner_tick(&mut run.spinner_tick) => run.advance_spinner(),
             session_event = next_session_event(&mut run.tasks.subscription) => {
                 run.receive_session_event(session_event)?
             }
@@ -474,6 +481,27 @@ impl RunLoop {
             self.tasks.detach();
         }
         Ok(ControlFlow::Continue(()))
+    }
+
+    /// Arms the Spinner tick while anything on screen animates and drops it
+    /// the moment nothing does, keeping the run loop idle-by-default. Called
+    /// once per loop iteration, so every event that starts or settles work
+    /// re-decides the tick before the frame it changed draws.
+    fn sync_spinner_tick(&mut self) {
+        if self.application.wants_spinner() {
+            if self.spinner_tick.is_none() {
+                self.spinner_tick = Some(Box::pin(tokio::time::sleep(spinner::TICK_PERIOD)));
+            }
+        } else {
+            self.spinner_tick = None;
+        }
+    }
+
+    fn advance_spinner(&mut self) -> ControlFlow<Exit> {
+        self.needs_redraw = true;
+        self.application.advance_spinner();
+        self.spinner_tick = Some(Box::pin(tokio::time::sleep(spinner::TICK_PERIOD)));
+        ControlFlow::Continue(())
     }
 
     fn expire_reconnect_grace(&mut self) -> Result<ControlFlow<Exit>> {
@@ -1068,6 +1096,13 @@ async fn next_session_event(
 async fn wait_for_reconnect_grace(grace: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
     match grace {
         Some(grace) => grace.as_mut().await,
+        None => pending().await,
+    }
+}
+
+async fn wait_for_spinner_tick(tick: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
+    match tick {
+        Some(tick) => tick.as_mut().await,
         None => pending().await,
     }
 }
