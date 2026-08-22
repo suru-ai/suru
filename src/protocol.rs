@@ -405,10 +405,26 @@ pub enum ReasoningSummaryDetail {
     None,
 }
 
+/// Whether a Transcript draws the Reasoning a Session stored.
+///
+/// Hiding is presentation and nothing more: the blocks keep arriving, keep
+/// being stored, and keep being what a Provider was asked for — a reader who
+/// does not want thinking in front of them simply is not shown it. Distinct
+/// from the `provider.codex.reasoningSummary` Setting, which decides how much
+/// Reasoning a Turn asks for in the first place.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningVisibility {
+    #[default]
+    Shown,
+    Hidden,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TranscriptSettings {
     pub default_fold_posture: FoldPosture,
+    pub reasoning_visibility: ReasoningVisibility,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -443,6 +459,9 @@ pub struct EffectiveSettings {
 pub enum SettingMutation {
     TranscriptDefaultFoldPosture {
         value: Option<FoldPosture>,
+    },
+    TranscriptReasoningVisibility {
+        value: Option<ReasoningVisibility>,
     },
     ProviderCodexReasoningSummary {
         value: Option<ReasoningSummaryDetail>,

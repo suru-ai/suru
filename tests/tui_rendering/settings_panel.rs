@@ -36,6 +36,7 @@ fn opening_at(posture: FoldPosture) -> EffectiveSettings {
     EffectiveSettings {
         transcript: TranscriptSettings {
             default_fold_posture: posture,
+            ..TranscriptSettings::default()
         },
         ..EffectiveSettings::default()
     }
@@ -119,10 +120,15 @@ fn every_defined_setting_shows_its_effective_value_and_whether_a_config_document
         fold.contains("expanded") && fold.contains("[pinned]"),
         "a Setting a Config Document pins shows its pinned value: {fold:?}"
     );
-    let reasoning = row(&application, "Codex Reasoning summary");
+    let summary = row(&application, "Codex Reasoning summary");
     assert!(
-        reasoning.contains("auto") && reasoning.contains("[default]"),
-        "a Setting nothing pins rides its built-in default: {reasoning:?}"
+        summary.contains("auto") && summary.contains("[default]"),
+        "a Setting nothing pins rides its built-in default: {summary:?}"
+    );
+    let visibility = row(&application, "Reasoning visibility");
+    assert!(
+        visibility.contains("shown") && visibility.contains("[default]"),
+        "a Transcript shows Reasoning until a reader says otherwise: {visibility:?}"
     );
     assert!(
         rendered_application_rows(&application)
@@ -168,7 +174,18 @@ fn a_setting_cycles_through_every_value_it_offers_in_both_directions() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
+    // Down onto the Setting with the most values to walk, which is the one
+    // that shows a cycle wrapping rather than merely flipping. The panel names
+    // the focused Setting's key, so the walk asserts where it landed rather
+    // than trusting a count of rows the schema is free to grow.
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("provider.codex.reasoningSummary"),
+        "the walk focused the Setting this test cycles"
+    );
 
     assert_eq!(
         press(&mut application, KeyCode::Right, KeyModifiers::NONE),

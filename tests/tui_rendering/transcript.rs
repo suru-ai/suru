@@ -24,8 +24,8 @@ use suru::{
     protocol::{
         Activity, ActivityId, ActivityStatus, CreateSessionRequest, EffectiveSettings, FileChange,
         FoldPosture, InitialPrompt, Message, MessageId, MessageRole, MessageStatus, Prompt,
-        PromptDelivery, PromptId, PromptOrder, PromptStatus, SessionChange, SessionId,
-        SessionRevision, SessionStatus, SessionUpdate, SettingsSnapshot, TranscriptItem,
+        PromptDelivery, PromptId, PromptOrder, PromptStatus, ReasoningVisibility, SessionChange,
+        SessionId, SessionRevision, SessionStatus, SessionUpdate, SettingsSnapshot, TranscriptItem,
         TranscriptSettings, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{AgentOutput, ServerConfig},
@@ -1946,30 +1946,65 @@ fn toggling_the_fold_posture_expands_every_entry_and_clears_per_entry_overrides(
 /// opened `snapshot`, which is the order the protocol guarantees: the snapshot
 /// is the first event on the lifecycle stream, and attaching a Session takes a
 /// reader's action after that.
+fn session_opened_under(
+    workspace: &std::path::Path,
+    settings: EffectiveSettings,
+    pinned: &[&str],
+    snapshot: suru::protocol::SessionSnapshot,
+) -> Application {
+    let mut application = connected_application(workspace);
+    deliver_settings(&mut application, settings, pinned);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("open a Session view under the pinned Settings");
+    application
+}
+
+/// Pushes an effective-settings snapshot at a client, the way the server does
+/// on connect and after every accepted edit.
+fn deliver_settings(application: &mut Application, settings: EffectiveSettings, pinned: &[&str]) {
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
+                settings,
+                pinned: pinned.iter().map(|key| (*key).to_owned()).collect(),
+                diagnostics: Vec::new(),
+            },
+        )))
+        .expect("receive the effective-settings snapshot");
+}
+
+/// The same client, opened under one pinned default Fold posture and built-in
+/// defaults everywhere else.
 fn session_opened_at(
     workspace: &std::path::Path,
     posture: FoldPosture,
     snapshot: suru::protocol::SessionSnapshot,
 ) -> Application {
-    let mut application = connected_application(workspace);
-    application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
-            SettingsSnapshot {
-                settings: EffectiveSettings {
-                    transcript: TranscriptSettings {
-                        default_fold_posture: posture,
-                    },
-                    ..EffectiveSettings::default()
-                },
-                pinned: vec!["transcript.defaultFoldPosture".to_owned()],
-                diagnostics: Vec::new(),
+    session_opened_under(
+        workspace,
+        EffectiveSettings {
+            transcript: TranscriptSettings {
+                default_fold_posture: posture,
+                ..TranscriptSettings::default()
             },
-        )))
-        .expect("receive the effective-settings snapshot");
-    application
-        .handle_event(ApplicationEvent::SessionAttached(snapshot))
-        .expect("open a Session view under the pinned posture");
-    application
+            ..EffectiveSettings::default()
+        },
+        &["transcript.defaultFoldPosture"],
+        snapshot,
+    )
+}
+
+/// Effective settings whose only departure from the built-in defaults is
+/// whether a Transcript shows Reasoning at all.
+fn settings_with_reasoning(visibility: ReasoningVisibility) -> EffectiveSettings {
+    EffectiveSettings {
+        transcript: TranscriptSettings {
+            reasoning_visibility: visibility,
+            ..TranscriptSettings::default()
+        },
+        ..EffectiveSettings::default()
+    }
 }
 
 #[test]
@@ -2346,6 +2381,88 @@ fn assert_reasoning_shows_nothing(rendered: &str, why: &str) {
             "{why}, but {absent:?} rendered: {rendered}"
         );
     }
+}
+
+#[test]
+fn hidden_reasoning_shows_no_row_however_fully_the_provider_described_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = reasoning_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        Some("Inspecting the seam"),
+        "Reading the projection.",
+        Some(72_000),
+    );
+    let mut application = session_opened_under(
+        workspace.path(),
+        settings_with_reasoning(ReasoningVisibility::Hidden),
+        &["transcript.reasoningVisibility"],
+        snapshot,
+    );
+
+    let folded = rendered_application_rows_at(&application, 72, 24).join("\n");
+    assert!(
+        folded.contains("Explain the Transcript"),
+        "the rest of the Transcript still renders: {folded}"
+    );
+    for absent in ["Thought", "Thinking", "Inspecting the seam", "1m 12s"] {
+        assert!(
+            !folded.contains(absent),
+            "a hidden Reasoning block draws no row at all, but {absent:?} rendered: {folded}"
+        );
+    }
+
+    press_leader_chord(&mut application, 'f');
+    let expanded = rendered_application_rows_at(&application, 72, 24).join("\n");
+    assert!(
+        !expanded.contains("Reading the projection."),
+        "the expanded posture has nothing to open for a hidden block: {expanded}"
+    );
+}
+
+#[test]
+fn flipping_reasoning_visibility_moves_the_transcript_the_reader_is_looking_at() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = reasoning_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        Some("Inspecting the seam"),
+        "Reading the projection.",
+        Some(72_000),
+    );
+    let mut application = session_opened_under(
+        workspace.path(),
+        EffectiveSettings::default(),
+        &[],
+        snapshot,
+    );
+    assert!(
+        rendered_application_rows_at(&application, 72, 24)
+            .join("\n")
+            .contains("Thought: Inspecting the seam"),
+        "Reasoning shows by default"
+    );
+
+    deliver_settings(
+        &mut application,
+        settings_with_reasoning(ReasoningVisibility::Hidden),
+        &["transcript.reasoningVisibility"],
+    );
+    assert!(
+        !rendered_application_rows_at(&application, 72, 24)
+            .join("\n")
+            .contains("Thought"),
+        "hiding Reasoning reaches the view the reader already has open, \
+         unlike a default Fold posture, which only decides where a view starts"
+    );
+
+    deliver_settings(&mut application, EffectiveSettings::default(), &[]);
+    assert!(
+        rendered_application_rows_at(&application, 72, 24)
+            .join("\n")
+            .contains("Thought: Inspecting the seam"),
+        "showing it again brings back the block, which was stored all along"
+    );
 }
 
 #[test]
@@ -3252,6 +3369,61 @@ fn an_empty_reasoning_block_neither_breaks_a_command_run_nor_leaves_a_gap() {
 }
 
 #[test]
+fn hidden_reasoning_neither_breaks_a_command_run_nor_leaves_a_gap() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let with_reasoning = command_run_snapshot(
+        session_id,
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Run the workflow"),
+            SUCCESSFUL_COMMAND,
+            RunEntry::Reasoning(ReasoningBlock::thought(
+                "Weighing options",
+                "The second command settles it.",
+                4_000,
+            )),
+            SUCCESSFUL_COMMAND,
+            RunEntry::AgentMessage("The workflow is green."),
+        ],
+    );
+    let hiding = session_opened_under(
+        workspace.path(),
+        settings_with_reasoning(ReasoningVisibility::Hidden),
+        &["transcript.reasoningVisibility"],
+        with_reasoning,
+    );
+    let rows = rendered_application_rows_at(&hiding, 80, 24);
+    assert!(
+        rows.join("\n").contains("✓ Ran 2 commands"),
+        "a hidden block neither joins nor ends the run around it: {}",
+        rows.join("\n")
+    );
+
+    let without_reasoning = command_run_snapshot(
+        session_id,
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Run the workflow"),
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            RunEntry::AgentMessage("The workflow is green."),
+        ],
+    );
+    let mut without = connected_application(workspace.path());
+    without
+        .handle_event(ApplicationEvent::SessionAttached(without_reasoning))
+        .expect("attach the same Session without the Reasoning between its commands");
+
+    assert_eq!(
+        rows,
+        rendered_application_rows_at(&without, 80, 24),
+        "a Transcript with Reasoning hidden reads exactly as it would had the \
+         thinking never happened, down to the rows of air between its entries"
+    );
+}
+
+#[test]
 fn an_active_command_renders_live_outside_the_group_while_the_turn_runs() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut snapshot = live_command_run_snapshot(SessionId::new(), workspace.path());
@@ -3923,6 +4095,36 @@ fn live_reasoning_run_snapshot(
     snapshot.session.status = SessionStatus::Active;
     snapshot.turns[0].status = TurnStatus::Active;
     snapshot
+}
+
+#[test]
+fn hidden_reasoning_leaves_a_live_run_nothing_to_stream_into() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = live_reasoning_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        ReasoningBlock::streaming("Settling on the plan", "Still weighing it."),
+    );
+    let application = session_opened_under(
+        workspace.path(),
+        settings_with_reasoning(ReasoningVisibility::Hidden),
+        &["transcript.reasoningVisibility"],
+        snapshot,
+    );
+
+    let rendered = rendered_application_rows_at(&application, 80, 24).join("\n");
+    for absent in [
+        "Thinking",
+        "Thought",
+        "Settling on the plan",
+        "Still weighing it.",
+    ] {
+        assert!(
+            !rendered.contains(absent),
+            "a Group forming live has nothing to form from once Reasoning is hidden, \
+             but {absent:?} rendered: {rendered}"
+        );
+    }
 }
 
 #[test]
@@ -4799,6 +5001,61 @@ fn a_settled_turn_whose_only_work_was_empty_reasoning_shows_no_marker() {
             "the Turn's Prompt and its answer still render, but {kept:?} is missing: {rows}"
         );
     }
+}
+
+#[test]
+fn a_settled_turn_loses_its_marker_only_when_hidden_reasoning_was_all_it_did() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let settled_turn_of = |entries: &[RunEntry]| {
+        let mut snapshot = command_run_snapshot(SessionId::new(), workspace.path(), entries);
+        snapshot.session.status = SessionStatus::Idle;
+        snapshot.turns[0].status = TurnStatus::Completed;
+        session_opened_under(
+            workspace.path(),
+            settings_with_reasoning(ReasoningVisibility::Hidden),
+            &["transcript.reasoningVisibility"],
+            snapshot,
+        )
+    };
+
+    let only_thinking = settled_turn_of(&[
+        RunEntry::UserMessage("Explain the Transcript"),
+        RunEntry::Reasoning(ReasoningBlock::thought(
+            "Reading the projection",
+            "It walks the Transcript twice.",
+            72_000,
+        )),
+        RunEntry::AgentMessage("It is the history of a Session."),
+    ]);
+    let rows = rendered_application_rows_at(&only_thinking, 80, 24).join("\n");
+    assert!(
+        !rows.contains("Worked"),
+        "a Turn Fold covering only work the reader hid has nothing left to disclose, \
+         so no marker stands for it: {rows}"
+    );
+    for kept in ["Explain the Transcript", "It is the history of a Session."] {
+        assert!(
+            rows.contains(kept),
+            "the Turn's Prompt and its answer still render, but {kept:?} is missing: {rows}"
+        );
+    }
+
+    let thinking_and_working = settled_turn_of(&[
+        RunEntry::UserMessage("Run the workflow"),
+        RunEntry::Reasoning(ReasoningBlock::thought(
+            "Reading the projection",
+            "It walks the Transcript twice.",
+            72_000,
+        )),
+        SUCCESSFUL_COMMAND,
+        RunEntry::AgentMessage("The workflow is green."),
+    ]);
+    assert!(
+        rendered_application_rows_at(&thinking_and_working, 80, 24)
+            .join("\n")
+            .contains("Worked"),
+        "a Turn that did anything else still marks how it settled and how long it took"
+    );
 }
 
 #[test]

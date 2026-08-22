@@ -1030,6 +1030,7 @@ fn render_session(
             folds: &folds,
             groups: &groups,
             turns: &turns,
+            reasoning_visibility: state.settings().transcript.reasoning_visibility,
         },
         theme,
         content_width,

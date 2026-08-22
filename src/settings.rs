@@ -29,8 +29,8 @@ use jsonc_parser::{
 use serde_json::Value;
 
 use crate::protocol::{
-    EffectiveSettings, FoldPosture, ReasoningSummaryDetail, SettingMutation, SettingScope,
-    SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot,
+    EffectiveSettings, FoldPosture, ReasoningSummaryDetail, ReasoningVisibility, SettingMutation,
+    SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -41,6 +41,7 @@ pub const FALLBACK_CONFIG_FILE: &str = "suru.json";
 // The dotted key of each Setting, named once so the schema and the typed
 // mutations that edit it can never drift apart.
 const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
+const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
 const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary";
 
 /// What a Config Document that does not exist yet is edited as.
@@ -135,6 +136,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::TranscriptDefaultFoldPosture { value } => {
             value == Some(settings.transcript.default_fold_posture)
         }
+        SettingMutation::TranscriptReasoningVisibility { value } => {
+            value == Some(settings.transcript.reasoning_visibility)
+        }
         SettingMutation::ProviderCodexReasoningSummary { value } => {
             value == Some(settings.provider.codex.reasoning_summary)
         }
@@ -170,6 +174,32 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |posture| {
                 settings.transcript.default_fold_posture = posture;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: TRANSCRIPT_REASONING_VISIBILITY,
+        label: "Reasoning visibility",
+        description: "Whether a Transcript draws Reasoning or hides it",
+        scope: SettingScope::Client,
+        choices: &[
+            SettingChoice {
+                value: "shown",
+                pin: SettingMutation::TranscriptReasoningVisibility {
+                    value: Some(ReasoningVisibility::Shown),
+                },
+            },
+            SettingChoice {
+                value: "hidden",
+                pin: SettingMutation::TranscriptReasoningVisibility {
+                    value: Some(ReasoningVisibility::Hidden),
+                },
+            },
+        ],
+        reset: SettingMutation::TranscriptReasoningVisibility { value: None },
+        apply: |settings, value| {
+            apply_value(value, |visibility| {
+                settings.transcript.reasoning_visibility = visibility;
             })
         },
     },
@@ -334,6 +364,9 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
     match mutation {
         SettingMutation::TranscriptDefaultFoldPosture { value } => {
             (TRANSCRIPT_DEFAULT_FOLD_POSTURE, pinned(value))
+        }
+        SettingMutation::TranscriptReasoningVisibility { value } => {
+            (TRANSCRIPT_REASONING_VISIBILITY, pinned(value))
         }
         SettingMutation::ProviderCodexReasoningSummary { value } => {
             (PROVIDER_CODEX_REASONING_SUMMARY, pinned(value))
@@ -766,6 +799,7 @@ mod tests {
             expected,
             vec![
                 "one of \"folded\" or \"expanded\"".to_owned(),
+                "one of \"shown\" or \"hidden\"".to_owned(),
                 "one of \"auto\", \"concise\", \"detailed\", or \"none\"".to_owned(),
             ]
         );

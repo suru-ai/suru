@@ -8,8 +8,8 @@ use std::path::Path;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        FoldPosture, ReasoningSummaryDetail, SettingMutation, SettingsDiagnosticSeverity,
-        SettingsSnapshot,
+        FoldPosture, ReasoningSummaryDetail, ReasoningVisibility, SettingMutation,
+        SettingsDiagnosticSeverity, SettingsSnapshot,
     },
     server::{self, ServerConfig},
 };
@@ -81,6 +81,54 @@ async fn a_pinned_setting_reaches_every_connecting_client_and_the_rest_default()
         assert_eq!(snapshot.diagnostics, []);
     }
 
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn hiding_reasoning_pins_from_a_document_and_resets_to_the_default() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            // I do not want to read the model think.
+            "transcript": { "reasoningVisibility": "hidden" },
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-reasoning")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (client, opening) = attach(state_dir.path(), "settings-reasoning").await;
+    assert_eq!(
+        opening.settings.transcript.reasoning_visibility,
+        ReasoningVisibility::Hidden
+    );
+    assert_eq!(
+        opening.settings.provider.codex.reasoning_summary,
+        ReasoningSummaryDetail::Auto,
+        "hiding Reasoning is presentation and asks Codex for no less of it"
+    );
+    assert_eq!(opening.pinned, ["transcript.reasoningVisibility"]);
+    assert_eq!(opening.diagnostics, []);
+
+    let answered = client
+        .mutate_setting(SettingMutation::TranscriptReasoningVisibility { value: None })
+        .await
+        .expect("reset the Setting");
+    assert_eq!(
+        answered.settings.transcript.reasoning_visibility,
+        ReasoningVisibility::Shown,
+        "unpinning it lets the built-in default resume"
+    );
+    assert_eq!(answered.pinned, [] as [String; 0]);
+
+    drop(client);
     server.shutdown().await.expect("shut down server");
 }
 

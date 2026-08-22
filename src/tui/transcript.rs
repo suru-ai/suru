@@ -43,8 +43,8 @@ use crate::{
     ansi::{AnsiScanner, FragmentRole, sgr_parameter_code, sgr_parameters},
     protocol::{
         Activity, ActivityId, FileChange, FoldPosture, InitialPrompt, Message, MessageId,
-        MessageRole, PromptId, SessionId, SessionRevision, SessionSnapshot, TranscriptItem, Turn,
-        TurnId, TurnStatus,
+        MessageRole, PromptId, ReasoningVisibility, SessionId, SessionRevision, SessionSnapshot,
+        TranscriptItem, Turn, TurnId, TurnStatus,
     },
     theme::Theme,
 };
@@ -369,15 +369,19 @@ impl TranscriptTurnFolds {
     }
 }
 
-/// The three disclosure axes a client renders a Transcript through: Turn Folds
-/// decide which entries reach the projection at all, Groups which of the
-/// survivors share a row, and Folds how much of a row shows. Rendering reads
-/// all three, so they travel as one input.
+/// The disclosure axes a client renders a Transcript through: Reasoning
+/// visibility and Turn Folds decide which entries reach the projection at all,
+/// Groups which of the survivors share a row, and Folds how much of a row
+/// shows. Rendering reads all four, so they travel as one input. Three are the
+/// reader's own clicks, held per Session; the fourth is a Setting, which is
+/// why it arrives by value from the effective settings rather than as view
+/// state a Session keeps.
 #[derive(Clone, Copy)]
 pub(super) struct TranscriptDisclosure<'a> {
     pub(super) folds: &'a TranscriptFolds,
     pub(super) groups: &'a TranscriptGroups,
     pub(super) turns: &'a TranscriptTurnFolds,
+    pub(super) reasoning_visibility: ReasoningVisibility,
 }
 
 /// A kind of Provider stream Suru stores under a cap. The kind decides what a
@@ -470,6 +474,7 @@ impl TranscriptCache {
             revision: snapshot.revision,
             theme: *theme,
             width,
+            reasoning_visibility: disclosure.reasoning_visibility,
             provisional_fingerprint: provisional_fingerprint(provisional),
             folds_fingerprint: disclosure.folds.fingerprint(),
             groups_fingerprint: disclosure.groups.fingerprint(),
@@ -506,6 +511,12 @@ struct ViewKey {
     revision: SessionRevision,
     theme: Theme,
     width: u16,
+    /// Whether Reasoning is drawn at all, which the Settings decide rather than
+    /// the reader's clicks. It is a rendering input outside the Session
+    /// snapshot all the same, so ADR 0007 puts it in the key: a Setting edited
+    /// mid-Session moves the Transcript already on screen, where a default Fold
+    /// posture only decides where a fresh view starts.
+    reasoning_visibility: ReasoningVisibility,
     provisional_fingerprint: u64,
     /// Folds are a rendering input outside the Session snapshot, so ADR 0007
     /// requires them in the key or a flipped Fold would render a stale frame.
@@ -980,11 +991,15 @@ struct TurnEntry {
 struct TranscriptContent<'a> {
     messages: HashMap<MessageId, &'a Message>,
     activities: HashMap<ActivityId, &'a Activity>,
+    /// Whether Reasoning is one of the things this reader is shown, which the
+    /// lookup answers alongside every other reason an entry draws nothing.
+    reasoning_visibility: ReasoningVisibility,
 }
 
 impl<'a> TranscriptContent<'a> {
-    fn of(snapshot: &'a SessionSnapshot) -> Self {
+    fn of(snapshot: &'a SessionSnapshot, reasoning_visibility: ReasoningVisibility) -> Self {
         Self {
+            reasoning_visibility,
             messages: snapshot
                 .messages
                 .iter()
@@ -1014,19 +1029,28 @@ impl<'a> TranscriptContent<'a> {
                 .activities
                 .get(activity_id)
                 .copied()
-                .filter(|activity| !transcript_shows_nothing(activity))
+                .filter(|activity| !transcript_shows_nothing(activity, self.reasoning_visibility))
                 .map(TranscriptEntry::Activity),
         }
     }
 }
 
-/// Whether the Transcript shows nothing at all for an Activity. A Reasoning
-/// block that settles without the Provider ever describing it — no heading and
-/// no content — has nothing a row could carry, so the Transcript draws none:
-/// not a folded row, not an expanded one, and not the duration it spent
-/// arriving at nothing. The Activity stays stored exactly as it arrived; it is
-/// simply absent from the projection rather than empty within it, which is
-/// what makes it neither join nor end the run around it and leave no gap in
+/// Whether the Transcript shows nothing at all for an Activity. A reader who
+/// hid Reasoning is shown none of it, however fully the Provider described it:
+/// the Setting decides the whole kind at once, where the rules below decide one
+/// block at a time. Either way the Activity stays stored and is simply absent
+/// from the projection, so showing Reasoning again brings back every block that
+/// arrived while it was hidden — and a settled Turn whose only work was
+/// Reasoning loses its Turn Fold marker along with it, because a fold with
+/// nothing left to disclose stands for nothing. A Turn that did anything else
+/// keeps its marker, and the duration that marker reports.
+///
+/// A Reasoning block that settles without the Provider ever describing it — no
+/// heading and no content — has nothing a row could carry, so the Transcript
+/// draws none: not a folded row, not an expanded one, and not the duration it
+/// spent arriving at nothing. The Activity stays stored exactly as it arrived;
+/// it is simply absent from the projection rather than empty within it, which
+/// is what makes it neither join nor end the run around it and leave no gap in
 /// the Transcript's spacing.
 ///
 /// The rule reads Settle rather than success, so a block the Provider failed
@@ -1036,8 +1060,9 @@ impl<'a> TranscriptContent<'a> {
 /// first delta — that an agent is thinking is itself progress worth a row —
 /// and neither is one whose content the cap cut away, because content the
 /// reader cannot see still happened and its truncation marker says so.
-fn transcript_shows_nothing(activity: &Activity) -> bool {
+fn transcript_shows_nothing(activity: &Activity, visibility: ReasoningVisibility) -> bool {
     match activity {
+        Activity::Reasoning { .. } if visibility == ReasoningVisibility::Hidden => true,
         Activity::Reasoning {
             status,
             title,
@@ -1322,8 +1347,9 @@ fn plan_units<'a>(
     provisional: &[&'a InitialPrompt],
     groups: &TranscriptGroups,
     turns: &TranscriptTurnFolds,
+    reasoning_visibility: ReasoningVisibility,
 ) -> Vec<RenderUnit<'a>> {
-    let content = TranscriptContent::of(snapshot);
+    let content = TranscriptContent::of(snapshot, reasoning_visibility);
     let folding = TurnFolding::plan(snapshot, &content, turns);
     let mut units = Vec::with_capacity(snapshot.transcript.len() + provisional.len());
     let mut run: Option<GroupRun<'a>> = None;
@@ -1485,7 +1511,13 @@ fn rebuild(
                 .collect()
         })
         .unwrap_or_default();
-    let planned = plan_units(snapshot, provisional, disclosure.groups, disclosure.turns);
+    let planned = plan_units(
+        snapshot,
+        provisional,
+        disclosure.groups,
+        disclosure.turns,
+        disclosure.reasoning_visibility,
+    );
     let mut units = planned
         .iter()
         .map(|unit| reuse_or_render(&mut reusable, unit, disclosure.folds, theme, width))
@@ -3122,8 +3154,9 @@ mod tests {
     use crate::{
         protocol::{
             Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus,
-            ModelAvailability, PromptId, Session, SessionRevision, SessionSnapshot, SessionStatus,
-            SessionTimestamp, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+            ModelAvailability, PromptId, ReasoningVisibility, Session, SessionRevision,
+            SessionSnapshot, SessionStatus, SessionTimestamp, TranscriptItem, Turn, TurnId,
+            TurnStatus, Workspace,
         },
         theme::Theme,
     };
@@ -3368,6 +3401,7 @@ mod tests {
                 folds: &folds,
                 groups: &TranscriptGroups::default(),
                 turns: &TranscriptTurnFolds::default(),
+                reasoning_visibility: ReasoningVisibility::Shown,
             },
             &first_theme,
             80,
@@ -3385,6 +3419,7 @@ mod tests {
                 folds: &folds,
                 groups: &TranscriptGroups::default(),
                 turns: &TranscriptTurnFolds::default(),
+                reasoning_visibility: ReasoningVisibility::Shown,
             },
             &second_theme,
             80,
@@ -3434,6 +3469,7 @@ mod tests {
                     folds: &folds,
                     groups: &groups,
                     turns: &TranscriptTurnFolds::default(),
+                    reasoning_visibility: ReasoningVisibility::Shown,
                 },
                 &theme,
                 80,
@@ -3449,6 +3485,7 @@ mod tests {
                     folds: &folds,
                     groups: &groups,
                     turns: &TranscriptTurnFolds::default(),
+                    reasoning_visibility: ReasoningVisibility::Shown,
                 },
                 &theme,
                 80,
@@ -4702,6 +4739,7 @@ mod tests {
                 folds,
                 groups,
                 turns,
+                reasoning_visibility: ReasoningVisibility::Shown,
             },
             &Theme::system(),
             80,
