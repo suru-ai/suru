@@ -466,6 +466,20 @@ pub(super) struct ItemDeltaParams {
     pub(super) delta: String,
 }
 
+/// One step of a Reasoning summary: which item, which of that item's summary
+/// sections, and the text the section added. Codex names the section outright,
+/// which is what lets Suru give each section a Reasoning Activity of its own
+/// without counting the breaks between them.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ReasoningSummaryDeltaParams {
+    pub(super) thread_id: String,
+    pub(super) turn_id: String,
+    pub(super) item_id: String,
+    pub(super) delta: String,
+    pub(super) summary_index: usize,
+}
+
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) enum NativeCommandStatus {
@@ -514,14 +528,15 @@ pub(super) enum NativeFileChangeStatus {
     Declined,
 }
 
-/// Progress Codex reports about an item without adding any text to it, such as
-/// the break between one Reasoning summary section and the next.
+/// The break Codex reports between one Reasoning summary section and the next,
+/// naming the section the break opens.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ItemProgressParams {
+pub(super) struct ReasoningSectionBreakParams {
     pub(super) thread_id: String,
     pub(super) turn_id: String,
     pub(super) item_id: String,
+    pub(super) summary_index: usize,
 }
 
 #[derive(Deserialize)]
@@ -685,11 +700,13 @@ pub(super) enum NativeNotification {
         turn_id: String,
         item_id: String,
         delta: String,
+        summary_index: usize,
     },
     ReasoningSectionBreak {
         thread_id: String,
         turn_id: String,
         item_id: String,
+        summary_index: usize,
     },
     ReasoningCompleted {
         thread_id: String,
@@ -703,12 +720,6 @@ pub(super) enum NativeNotification {
         outcome: NativeTurnOutcome,
     },
 }
-
-/// What separates one Reasoning summary section from the next once Suru has
-/// joined them into the single body a Reasoning Activity stores. Codex reports
-/// the break on its own, and the same separator joins the sections it sends
-/// back with the completed item, so the two forms stay comparable.
-pub(super) const NATIVE_REASONING_SECTION_SEPARATOR: &str = "\n\n";
 
 pub(super) enum NativeTurnOutcome {
     Completed,

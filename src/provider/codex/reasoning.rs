@@ -1,12 +1,13 @@
 //! Splitting the title Codex leads a Reasoning summary with off its body.
 //!
-//! OpenAI's Responses API opens a reasoning summary with a bolded title block —
-//! `**Inspecting the provider seam**`, a blank line, then the prose. Suru stores
-//! that title as a typed property of the Reasoning Activity rather than leaving
-//! it in the content, so a client can head a folded block with it instead of
-//! parsing it back out. The split happens as the summary streams, which is why
-//! it needs the state this module holds: the head is withheld until the block
-//! either resolves into a title or is ruled out.
+//! OpenAI's Responses API opens each reasoning summary section with a bolded
+//! title block — `**Inspecting the provider seam**`, a blank line, then the
+//! prose. Suru stores that title as a typed property of the Reasoning Activity
+//! the section becomes, rather than leaving it in the content, so a client can
+//! head a folded block with it instead of parsing it back out. The split happens
+//! as the section streams, which is why it needs the state this module holds:
+//! the head is withheld until the block either resolves into a title or is
+//! ruled out.
 
 /// The most characters withheld while the title block is undecided. A title is
 /// a short phrase, so a head that runs past this is prose that merely happened
@@ -25,13 +26,13 @@ pub(super) struct ReasoningSegment {
     pub(super) content: String,
 }
 
-/// The running split of one Reasoning summary's stream.
+/// The running split of one Reasoning summary section's stream.
 ///
 /// A summary can run to several sections, each opening with its own bold
-/// heading. Only the first becomes the block's title: it says what the whole
-/// block set out to do, whereas retitling on every section would leave the
-/// folded header showing whichever heading happened to be last. Later headings
-/// stay in the body, where they render as the Markdown they already are.
+/// heading, and each becoming a Reasoning Activity of its own. The projection
+/// therefore starts a splitter per section, so every heading titles the block
+/// its own section fills rather than being buried in the body of the block
+/// before it, and no block ever carries more than one title.
 #[derive(Debug, Default)]
 pub(super) struct ReasoningSummarySplitter {
     /// The head withheld while the title block is undecided.

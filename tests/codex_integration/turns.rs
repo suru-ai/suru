@@ -345,7 +345,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     assert_eq!(agent_message.status, MessageStatus::Completed);
     assert_eq!(agent_message.content, "Hello from Codex");
     assert!(!agent_message.content.contains("fixture diagnostic"));
-    assert_eq!(completed.activities.len(), 3);
+    assert_eq!(completed.activities.len(), 4);
     let Activity::Command {
         id: command_activity_id,
         status,
@@ -395,34 +395,41 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         1,
         "Codex file-change updates must update one transcript row"
     );
-    let Activity::Reasoning {
-        id: reasoning_activity_id,
-        status: reasoning_status,
-        title,
-        content,
-        content_truncated,
-        duration_ms,
-        ..
-    } = &completed.activities[2]
-    else {
-        panic!("Codex Reasoning must project as a Reasoning Activity");
-    };
-    assert_eq!(*reasoning_status, ActivityStatus::Completed);
-    assert_eq!(title.as_deref(), Some("Inspecting the harness"));
-    assert_eq!(content, "Reading the fixture.\n\nThen the store.");
-    assert!(!content_truncated);
-    assert!(duration_ms.is_some());
-    assert_eq!(
-        completed
-            .transcript
-            .iter()
-            .filter(|item| matches!(item,
-                TranscriptItem::Activity { activity_id }
-                    if activity_id == reasoning_activity_id))
-            .count(),
-        1,
-        "Codex Reasoning deltas must update one transcript row"
-    );
+    // Each summary section Codex sent is a Reasoning Activity of its own, headed
+    // by the title that section led with and timed over its own stretch of the Turn.
+    for (index, expected_title, expected_content) in [
+        (2, Some("Inspecting the harness"), "Reading the fixture."),
+        (3, None, "Then the store."),
+    ] {
+        let Activity::Reasoning {
+            id: reasoning_activity_id,
+            status: reasoning_status,
+            title,
+            content,
+            content_truncated,
+            duration_ms,
+            ..
+        } = &completed.activities[index]
+        else {
+            panic!("Codex Reasoning must project as a Reasoning Activity");
+        };
+        assert_eq!(*reasoning_status, ActivityStatus::Completed);
+        assert_eq!(title.as_deref(), expected_title);
+        assert_eq!(content, expected_content);
+        assert!(!content_truncated);
+        assert!(duration_ms.is_some());
+        assert_eq!(
+            completed
+                .transcript
+                .iter()
+                .filter(|item| matches!(item,
+                    TranscriptItem::Activity { activity_id }
+                        if activity_id == reasoning_activity_id))
+                .count(),
+            1,
+            "Codex Reasoning deltas must update one transcript row"
+        );
+    }
 
     let persisted = serde_json::to_string(&completed).expect("encode completed Session");
     for excluded in [

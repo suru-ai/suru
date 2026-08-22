@@ -1,7 +1,7 @@
 //! Projection of Codex's native notifications onto Suru's Provider events.
 //!
 //! [`NativeCorrelation`] is the running state this projection needs: which native Turn is active
-//! and which Messages, commands, file changes, and Reasoning blocks are still open within it.
+//! and which Messages, commands, file changes, and native Reasoning items are still open within it.
 //! Notifications that belong to a Turn Suru is no longer tracking are dropped, notifications that
 //! contradict the recorded state fail the Session, and everything else becomes the Provider events
 //! a Session consumes.
@@ -20,11 +20,11 @@ use super::{
     DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
     codex_error,
     process::ProcessGuard,
-    reasoning::ReasoningSummarySplitter,
+    reasoning::{ReasoningSegment, ReasoningSummarySplitter},
     shell_wrapper::strip_launcher_wrapper,
     wire::{
-        NATIVE_REASONING_SECTION_SEPARATOR, NativeCommandStatus, NativeField, NativeFileChange,
-        NativeFileChangeStatus, NativeNotification, NativeTurnFailureKind, NativeTurnOutcome,
+        NativeCommandStatus, NativeField, NativeFileChange, NativeFileChangeStatus,
+        NativeNotification, NativeTurnFailureKind, NativeTurnOutcome,
     },
 };
 use crate::{
@@ -63,13 +63,44 @@ struct ActiveNativeFileChange {
     changes: Vec<FileChange>,
 }
 
-/// A Reasoning block Codex is still streaming. `streamed_summary` is the raw
-/// summary text as Codex sent it — section breaks included — so the completed
-/// item, which repeats the whole summary, can be reconciled against it, while
-/// `splitter` holds the title block back from the content until it resolves.
+/// The Reasoning item Codex is still streaming. Each of its summary sections
+/// becomes a Reasoning Activity of its own, so the item is tracked one section
+/// at a time: `open_section` is where the streaming section sits in the item's
+/// summary — the index the wire names outright, rather than one counted from
+/// the breaks — which is what names its Activity apart from its neighbours';
+/// `streamed` is the raw text that section has carried, against which the
+/// completed item's repeat of it is reconciled; and `splitter` holds that
+/// section's title block back from its content until it resolves. A break
+/// leaves the section behind and starts the next one on its own text and its
+/// own splitter, so every section resolves a title and a body of its own.
 struct ActiveNativeReasoning {
-    streamed_summary: String,
+    open_section: usize,
+    streamed: String,
     splitter: ReasoningSummarySplitter,
+}
+
+impl ActiveNativeReasoning {
+    fn new() -> Self {
+        Self {
+            open_section: 0,
+            streamed: String::new(),
+            splitter: ReasoningSummarySplitter::default(),
+        }
+    }
+
+    /// Admits the next chunk of the open section, yielding whatever of it the
+    /// splitter resolved.
+    fn push_delta(&mut self, delta: &str) -> ReasoningSegment {
+        self.streamed.push_str(delta);
+        self.splitter.push(delta)
+    }
+
+    /// Leaves the settled section behind for the one Codex has moved on to.
+    fn begin_section(&mut self, section: usize) {
+        self.open_section = section;
+        self.streamed = String::new();
+        self.splitter = ReasoningSummarySplitter::default();
+    }
 }
 
 impl NativeCorrelation {
@@ -301,12 +332,27 @@ fn project_native_notification(
             turn_id,
             item_id,
             delta,
-        } => project_reasoning_delta(correlation, &thread_id, &turn_id, item_id, &delta),
+            summary_index,
+        } => project_reasoning_delta(
+            correlation,
+            &thread_id,
+            &turn_id,
+            item_id,
+            &delta,
+            summary_index,
+        ),
         NativeNotification::ReasoningSectionBreak {
             thread_id,
             turn_id,
             item_id,
-        } => project_reasoning_section_break(correlation, &thread_id, &turn_id, item_id),
+            summary_index,
+        } => project_reasoning_section_break(
+            correlation,
+            &thread_id,
+            &turn_id,
+            item_id,
+            summary_index,
+        ),
         NativeNotification::ReasoningCompleted {
             thread_id,
             turn_id,
@@ -335,15 +381,11 @@ fn project_reasoning_started(
             "Codex reused an active Reasoning item identity",
         ));
     }
-    correlation.active_reasoning.insert(
-        item_id.clone(),
-        ActiveNativeReasoning {
-            streamed_summary: String::new(),
-            splitter: ReasoningSummarySplitter::default(),
-        },
-    );
+    correlation
+        .active_reasoning
+        .insert(item_id.clone(), ActiveNativeReasoning::new());
     Ok(vec![ProviderEvent::ReasoningStarted {
-        activity_id: ProviderActivityId::new(item_id),
+        activity_id: reasoning_section_activity_id(&item_id, 0),
     }])
 }
 
@@ -353,6 +395,7 @@ fn project_reasoning_delta(
     turn_id: &str,
     item_id: String,
     delta: &str,
+    summary_index: usize,
 ) -> Result<Vec<ProviderEvent>, ProviderError> {
     if !correlation.is_active_turn(thread_id, turn_id) {
         return Ok(Vec::new());
@@ -360,40 +403,60 @@ fn project_reasoning_delta(
     let Some(reasoning) = correlation.active_reasoning.get_mut(&item_id) else {
         return Ok(Vec::new());
     };
-    reasoning.streamed_summary.push_str(delta);
-    let segment = reasoning.splitter.push(delta);
-    Ok(reasoning_segment_events(&item_id, segment))
+    let mut projected = open_reasoning_section(&item_id, reasoning, summary_index);
+    if summary_index < reasoning.open_section {
+        // The block this section streamed into settled when Codex moved past
+        // it, and a settled block takes no more content.
+        return Ok(projected);
+    }
+    let segment = reasoning.push_delta(delta);
+    projected.extend(reasoning_segment_events(&item_id, summary_index, segment));
+    Ok(projected)
 }
 
-/// Projects the break between two Reasoning summary sections as the separator
-/// that joins them. Codex announces the first section's break too, so a break
-/// that arrives before any of the summary has streamed opens nothing and is
-/// dropped: separating an empty section from the first real one would put a
-/// blank line at the head of the block and leave the streamed summary no longer
-/// a prefix of the one the completed item repeats.
+/// Projects the break between two Reasoning summary sections as the settling of
+/// the block the section streamed into and the start of the next one's, because
+/// each section is a Reasoning Activity of its own, carrying at most the one
+/// title its section led with and the duration the orchestrator stamps between
+/// these two events. Codex announces the break that opens the first section
+/// too, and that section is the block Codex already started, so a break naming
+/// a section no later than the open one opens nothing.
 fn project_reasoning_section_break(
     correlation: &mut NativeCorrelation,
     thread_id: &str,
     turn_id: &str,
     item_id: String,
+    summary_index: usize,
 ) -> Result<Vec<ProviderEvent>, ProviderError> {
     if !correlation.is_active_turn(thread_id, turn_id) {
         return Ok(Vec::new());
     }
-    if correlation
-        .active_reasoning
-        .get(&item_id)
-        .is_none_or(|reasoning| reasoning.streamed_summary.is_empty())
-    {
+    let Some(reasoning) = correlation.active_reasoning.get_mut(&item_id) else {
         return Ok(Vec::new());
+    };
+    Ok(open_reasoning_section(&item_id, reasoning, summary_index))
+}
+
+/// Moves the item on to the summary section Codex is reporting on, settling the
+/// block the section before it streamed into and starting the section's own.
+/// Codex names the section on every break and every delta, so following the
+/// name rather than counting breaks keeps Suru's blocks aligned with the
+/// sections the completed item repeats, however many breaks Codex sends.
+fn open_reasoning_section(
+    item_id: &str,
+    reasoning: &mut ActiveNativeReasoning,
+    summary_index: usize,
+) -> Vec<ProviderEvent> {
+    if summary_index <= reasoning.open_section {
+        return Vec::new();
     }
-    project_reasoning_delta(
-        correlation,
-        thread_id,
-        turn_id,
-        item_id,
-        NATIVE_REASONING_SECTION_SEPARATOR,
-    )
+    let mut projected =
+        settle_reasoning_section(item_id, reasoning.open_section, &mut reasoning.splitter);
+    reasoning.begin_section(summary_index);
+    projected.push(ProviderEvent::ReasoningStarted {
+        activity_id: reasoning_section_activity_id(item_id, summary_index),
+    });
+    projected
 }
 
 fn project_reasoning_completed(
@@ -410,53 +473,91 @@ fn project_reasoning_completed(
     // about it fails a Turn: losing the Turn over a Reasoning summary would cost
     // the reader the answer it led to. A completion for a block Suru never saw
     // start has nowhere to land, and is dropped the way a stray delta is.
-    let Some(reasoning) = correlation.active_reasoning.get_mut(&item_id) else {
+    let Some(mut reasoning) = correlation.active_reasoning.remove(&item_id) else {
         return Ok(Vec::new());
     };
-    // Codex repeats the whole summary here, and only streams it when the block
-    // was streaming to a client at all. Take whatever the stream had not
-    // already carried; when the two disagree, the stream already showed the
-    // reader a coherent block, so repeating the completed summary on top of it
-    // would double the text rather than correct it.
-    let completed_summary = summary.join(NATIVE_REASONING_SECTION_SEPARATOR);
-    let remaining = completed_summary
-        .strip_prefix(&reasoning.streamed_summary)
-        .unwrap_or_default();
+    // Codex repeats every section of the summary here, and only streams them
+    // when the block was streaming to a client at all. The open section takes
+    // whatever the stream had not already carried of it; when the two disagree,
+    // the stream already showed the reader a coherent section, so repeating the
+    // completed one on top of it would double the text rather than correct it.
+    // Sections the stream settled earlier are left as the reader saw them.
+    let open = reasoning.open_section;
     let mut projected = Vec::new();
+    let remaining = summary
+        .get(open)
+        .and_then(|section| section.strip_prefix(reasoning.streamed.as_str()))
+        .unwrap_or_default();
     if !remaining.is_empty() {
         projected.extend(reasoning_segment_events(
             &item_id,
+            open,
             reasoning.splitter.push(remaining),
         ));
     }
-    projected.extend(reasoning_segment_events(
+    projected.extend(settle_reasoning_section(
         &item_id,
-        reasoning.splitter.finish(),
+        open,
+        &mut reasoning.splitter,
     ));
-    correlation.active_reasoning.remove(&item_id);
-    projected.push(ProviderEvent::ReasoningCompleted {
-        activity_id: ProviderActivityId::new(item_id),
-    });
+    // Sections the stream never reached open and settle here, in arrival order,
+    // so a summary Codex only sent whole still splits the way a streamed one
+    // does.
+    for (section, text) in summary.iter().enumerate().skip(open + 1) {
+        let mut splitter = ReasoningSummarySplitter::default();
+        projected.push(ProviderEvent::ReasoningStarted {
+            activity_id: reasoning_section_activity_id(&item_id, section),
+        });
+        projected.extend(reasoning_segment_events(
+            &item_id,
+            section,
+            splitter.push(text),
+        ));
+        projected.extend(settle_reasoning_section(&item_id, section, &mut splitter));
+    }
     Ok(projected)
 }
 
-/// Lowers one split step of a Reasoning summary onto the Provider events that
-/// carry it, dropping the step that resolved nothing because the splitter is
-/// still withholding the head.
+/// Names the Activity one summary section of a Reasoning item projects onto.
+/// Codex identifies the item as a whole, so the section's place within it is
+/// what tells one section's block from the next's.
+fn reasoning_section_activity_id(item_id: &str, section: usize) -> ProviderActivityId {
+    ProviderActivityId::new(format!("{item_id}#{section}"))
+}
+
+/// Settles the block one summary section streamed into, releasing whatever the
+/// splitter still withholds before completing it, so no section's block is left
+/// open for a Turn to settle around.
+fn settle_reasoning_section(
+    item_id: &str,
+    section: usize,
+    splitter: &mut ReasoningSummarySplitter,
+) -> Vec<ProviderEvent> {
+    let mut events = reasoning_segment_events(item_id, section, splitter.finish());
+    events.push(ProviderEvent::ReasoningCompleted {
+        activity_id: reasoning_section_activity_id(item_id, section),
+    });
+    events
+}
+
+/// Lowers one split step of a Reasoning summary section onto the Provider
+/// events that carry it, dropping the step that resolved nothing because the
+/// splitter is still withholding the head.
 fn reasoning_segment_events(
     item_id: &str,
-    segment: super::reasoning::ReasoningSegment,
+    section: usize,
+    segment: ReasoningSegment,
 ) -> Vec<ProviderEvent> {
     let mut events = Vec::new();
     if let Some(title) = segment.title {
         events.push(ProviderEvent::ReasoningTitleChanged {
-            activity_id: ProviderActivityId::new(item_id.to_owned()),
+            activity_id: reasoning_section_activity_id(item_id, section),
             title,
         });
     }
     if !segment.content.is_empty() {
         events.push(ProviderEvent::ReasoningDelta {
-            activity_id: ProviderActivityId::new(item_id.to_owned()),
+            activity_id: reasoning_section_activity_id(item_id, section),
             content: segment.content,
         });
     }
@@ -988,20 +1089,22 @@ mod tests {
         }
     }
 
-    fn delta(delta: &str) -> NativeNotification {
+    fn delta(section: usize, delta: &str) -> NativeNotification {
         NativeNotification::ReasoningDelta {
             thread_id: THREAD.to_owned(),
             turn_id: TURN.to_owned(),
             item_id: ITEM.to_owned(),
             delta: delta.to_owned(),
+            summary_index: section,
         }
     }
 
-    fn section_break() -> NativeNotification {
+    fn section_break(section: usize) -> NativeNotification {
         NativeNotification::ReasoningSectionBreak {
             thread_id: THREAD.to_owned(),
             turn_id: TURN.to_owned(),
             item_id: ITEM.to_owned(),
+            summary_index: section,
         }
     }
 
@@ -1017,8 +1120,34 @@ mod tests {
         }
     }
 
-    fn activity_id() -> ProviderActivityId {
-        ProviderActivityId::new(ITEM)
+    fn section_activity_id(section: usize) -> ProviderActivityId {
+        ProviderActivityId::new(format!("{ITEM}#{section}"))
+    }
+
+    fn started_section(section: usize) -> ProviderEvent {
+        ProviderEvent::ReasoningStarted {
+            activity_id: section_activity_id(section),
+        }
+    }
+
+    fn titled_section(section: usize, title: &str) -> ProviderEvent {
+        ProviderEvent::ReasoningTitleChanged {
+            activity_id: section_activity_id(section),
+            title: title.to_owned(),
+        }
+    }
+
+    fn section_content(section: usize, content: &str) -> ProviderEvent {
+        ProviderEvent::ReasoningDelta {
+            activity_id: section_activity_id(section),
+            content: content.to_owned(),
+        }
+    }
+
+    fn completed_section(section: usize) -> ProviderEvent {
+        ProviderEvent::ReasoningCompleted {
+            activity_id: section_activity_id(section),
+        }
     }
 
     fn command_started(command: &str) -> NativeNotification {
@@ -1122,25 +1251,17 @@ mod tests {
 
         assert_eq!(
             project(&mut correlation, started()),
-            vec![ProviderEvent::ReasoningStarted {
-                activity_id: activity_id(),
-            }]
+            vec![started_section(0)]
         );
         assert_eq!(
-            project(&mut correlation, delta("**Inspecting the")),
+            project(&mut correlation, delta(0, "**Inspecting the")),
             Vec::new()
         );
         assert_eq!(
-            project(&mut correlation, delta(" seam**\n\nReading it.")),
+            project(&mut correlation, delta(0, " seam**\n\nReading it.")),
             vec![
-                ProviderEvent::ReasoningTitleChanged {
-                    activity_id: activity_id(),
-                    title: "Inspecting the seam".to_owned(),
-                },
-                ProviderEvent::ReasoningDelta {
-                    activity_id: activity_id(),
-                    content: "Reading it.".to_owned(),
-                },
+                titled_section(0, "Inspecting the seam"),
+                section_content(0, "Reading it."),
             ]
         );
         assert_eq!(
@@ -1148,61 +1269,133 @@ mod tests {
                 &mut correlation,
                 completed(&["**Inspecting the seam**\n\nReading it."]),
             ),
-            vec![ProviderEvent::ReasoningCompleted {
-                activity_id: activity_id(),
-            }]
+            vec![completed_section(0)]
         );
     }
 
     #[test]
-    fn a_section_break_joins_the_sections_the_completed_summary_reports() {
+    fn each_summary_section_becomes_its_own_titled_block() {
         let mut correlation = reasoning_turn();
 
         project(&mut correlation, started());
-        project(&mut correlation, delta("**Seam**\n\nReading it."));
+        project(&mut correlation, delta(0, "**Seam**\n\nReading it."));
         assert_eq!(
-            project(&mut correlation, section_break()),
-            vec![ProviderEvent::ReasoningDelta {
-                activity_id: activity_id(),
-                content: "\n\n".to_owned(),
-            }]
+            project(&mut correlation, section_break(1)),
+            vec![completed_section(0), started_section(1)]
         );
-        project(&mut correlation, delta("Now the store."));
+        assert_eq!(
+            project(&mut correlation, delta(1, "**Store**\n\nNow the store.")),
+            vec![
+                titled_section(1, "Store"),
+                section_content(1, "Now the store."),
+            ]
+        );
+
+        assert_eq!(
+            project(
+                &mut correlation,
+                completed(&["**Seam**\n\nReading it.", "**Store**\n\nNow the store."]),
+            ),
+            vec![completed_section(1)]
+        );
+    }
+
+    #[test]
+    fn a_section_that_leads_with_no_heading_becomes_an_untitled_block() {
+        let mut correlation = reasoning_turn();
+
+        project(&mut correlation, started());
+        project(&mut correlation, delta(0, "**Seam**\n\nReading it."));
+        project(&mut correlation, section_break(1));
+
+        assert_eq!(
+            project(&mut correlation, delta(1, "Now the store.")),
+            vec![section_content(1, "Now the store.")]
+        );
+        assert_eq!(
+            project(
+                &mut correlation,
+                completed(&["**Seam**\n\nReading it.", "Now the store."]),
+            ),
+            vec![completed_section(1)]
+        );
+    }
+
+    #[test]
+    fn the_completed_item_carries_the_rest_of_the_section_the_stream_stopped_short_of() {
+        let mut correlation = reasoning_turn();
+
+        project(&mut correlation, started());
+        project(&mut correlation, delta(0, "**Seam**\n\nReading it."));
+        project(&mut correlation, section_break(1));
+        project(&mut correlation, delta(1, "Now the"));
 
         assert_eq!(
             project(
                 &mut correlation,
                 completed(&["**Seam**\n\nReading it.", "Now the store."]),
             ),
-            vec![ProviderEvent::ReasoningCompleted {
-                activity_id: activity_id(),
-            }]
+            vec![section_content(1, " store."), completed_section(1)]
         );
     }
 
     #[test]
-    fn the_break_codex_announces_before_the_first_section_separates_nothing() {
+    fn the_break_codex_announces_before_the_first_section_opens_no_further_block() {
         let mut correlation = reasoning_turn();
 
         project(&mut correlation, started());
-        assert_eq!(project(&mut correlation, section_break()), Vec::new());
+        assert_eq!(project(&mut correlation, section_break(0)), Vec::new());
 
-        // An untitled section shows the separator a dropped break would have
-        // left: its content would open on a blank line the Provider never sent.
+        // The break the started block already stands for opens nothing, so the
+        // section streams into that block rather than into an empty one after it.
         assert_eq!(
-            project(&mut correlation, delta("Reading it.")),
-            vec![ProviderEvent::ReasoningDelta {
-                activity_id: activity_id(),
-                content: "Reading it.".to_owned(),
-            }]
+            project(&mut correlation, delta(0, "Reading it.")),
+            vec![section_content(0, "Reading it.")]
         );
-        // Dropping the break also left the stream a prefix of the summary the
-        // completed item repeats, so the block reconciles and adds nothing.
         assert_eq!(
             project(&mut correlation, completed(&["Reading it."])),
-            vec![ProviderEvent::ReasoningCompleted {
-                activity_id: activity_id(),
-            }]
+            vec![completed_section(0)]
+        );
+    }
+
+    #[test]
+    fn a_section_streams_into_the_block_codex_names_rather_than_the_next_one_along() {
+        let mut correlation = reasoning_turn();
+
+        project(&mut correlation, started());
+        // Codex opens a section it then says nothing in. Counting the breaks
+        // would leave the section that follows streaming into the block its
+        // predecessor opened, and the completed item would repeat it into a
+        // second block beside it.
+        project(&mut correlation, section_break(0));
+        assert_eq!(
+            project(&mut correlation, section_break(1)),
+            vec![completed_section(0), started_section(1)]
+        );
+        assert_eq!(
+            project(&mut correlation, delta(1, "Reading it.")),
+            vec![section_content(1, "Reading it.")]
+        );
+        assert_eq!(
+            project(&mut correlation, completed(&["", "Reading it."])),
+            vec![completed_section(1)]
+        );
+    }
+
+    #[test]
+    fn a_section_whose_break_never_arrived_still_opens_a_block_of_its_own() {
+        let mut correlation = reasoning_turn();
+
+        project(&mut correlation, started());
+        project(&mut correlation, delta(0, "**Seam**\n\nReading it."));
+
+        assert_eq!(
+            project(&mut correlation, delta(1, "Now the store.")),
+            vec![
+                completed_section(0),
+                started_section(1),
+                section_content(1, "Now the store."),
+            ]
         );
     }
 
@@ -1223,19 +1416,18 @@ mod tests {
         project(&mut correlation, started());
 
         assert_eq!(
-            project(&mut correlation, completed(&["**Seam**\n\nReading it."])),
+            project(
+                &mut correlation,
+                completed(&["**Seam**\n\nReading it.", "**Store**\n\nNow the store."]),
+            ),
             vec![
-                ProviderEvent::ReasoningTitleChanged {
-                    activity_id: activity_id(),
-                    title: "Seam".to_owned(),
-                },
-                ProviderEvent::ReasoningDelta {
-                    activity_id: activity_id(),
-                    content: "Reading it.".to_owned(),
-                },
-                ProviderEvent::ReasoningCompleted {
-                    activity_id: activity_id(),
-                },
+                titled_section(0, "Seam"),
+                section_content(0, "Reading it."),
+                completed_section(0),
+                started_section(1),
+                titled_section(1, "Store"),
+                section_content(1, "Now the store."),
+                completed_section(1),
             ]
         );
     }
@@ -1245,13 +1437,11 @@ mod tests {
         let mut correlation = reasoning_turn();
 
         project(&mut correlation, started());
-        project(&mut correlation, delta("**Seam**\n\nReading it."));
+        project(&mut correlation, delta(0, "**Seam**\n\nReading it."));
 
         assert_eq!(
             project(&mut correlation, completed(&["Something else entirely."])),
-            vec![ProviderEvent::ReasoningCompleted {
-                activity_id: activity_id(),
-            }]
+            vec![completed_section(0)]
         );
     }
 

@@ -31,9 +31,10 @@ use super::{
     wire::{
         ClientError, ClientErrorResponse, ClientInfo, ClientNotification, ClientRequest,
         FileChangeUpdatedParams, IncomingMessage, InitializeCapabilities, InitializeParams,
-        ItemDeltaParams, ItemNotificationParams, ItemProgressParams, NativeCodexErrorInfo,
-        NativeItem, NativeNotification, NativeTurnFailureKind, NativeTurnOutcome, NativeTurnStatus,
-        RequestId, ThreadSettingsUpdatedParams, TurnCompletedParams,
+        ItemDeltaParams, ItemNotificationParams, NativeCodexErrorInfo, NativeItem,
+        NativeNotification, NativeTurnFailureKind, NativeTurnOutcome, NativeTurnStatus,
+        ReasoningSectionBreakParams, ReasoningSummaryDeltaParams, RequestId,
+        ThreadSettingsUpdatedParams, TurnCompletedParams,
     },
 };
 use crate::provider::ProviderError;
@@ -485,20 +486,22 @@ fn decode_notification(
             }))
         }
         "item/reasoning/summaryTextDelta" => {
-            let params: ItemDeltaParams = decode_notification_params(method, params)?;
+            let params: ReasoningSummaryDeltaParams = decode_notification_params(method, params)?;
             Ok(Some(NativeNotification::ReasoningDelta {
                 thread_id: params.thread_id,
                 turn_id: params.turn_id,
                 item_id: params.item_id,
                 delta: params.delta,
+                summary_index: params.summary_index,
             }))
         }
         "item/reasoning/summaryPartAdded" => {
-            let params: ItemProgressParams = decode_notification_params(method, params)?;
+            let params: ReasoningSectionBreakParams = decode_notification_params(method, params)?;
             Ok(Some(NativeNotification::ReasoningSectionBreak {
                 thread_id: params.thread_id,
                 turn_id: params.turn_id,
                 item_id: params.item_id,
+                summary_index: params.summary_index,
             }))
         }
         "item/fileChange/patchUpdated" => {
