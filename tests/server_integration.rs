@@ -876,6 +876,15 @@ async fn managed_client_connects_without_periodic_domain_events() {
     assert_eq!(identity.instance_id, descriptor.instance_id);
     assert_eq!(identity.pid, descriptor.pid);
     assert!(
+        matches!(
+            timeout(Duration::from_secs(1), client.next())
+                .await
+                .expect("settings snapshot arrives"),
+            Some(ManagedEvent::SettingsSnapshot(_))
+        ),
+        "the one-time settings snapshot follows the connection"
+    );
+    assert!(
         timeout(Duration::from_millis(1_100), client.next())
             .await
             .is_err(),
@@ -930,7 +939,12 @@ async fn sse_keepalive_comments_are_periodic_and_event_neutral() {
     let text = String::from_utf8(raw).expect("SSE response is UTF-8");
     assert!(text.contains(": connected\n\n"));
     assert!(text.contains(": keep-alive\n\n"));
-    assert!(!text.contains("event:"));
+    assert_eq!(
+        text.matches("event:").count(),
+        1,
+        "only the one-time settings snapshot is an event; keepalives stay comment-only"
+    );
+    assert!(text.contains("event: settings_snapshot\n"));
     assert!(!text.contains("id:"));
 
     server.shutdown().await.expect("shut down server");

@@ -45,6 +45,7 @@ pub struct RuntimeConfig {
     data_base_dir: PathBuf,
     state_dir: PathBuf,
     data_dir: PathBuf,
+    config_dir: Option<PathBuf>,
     channel: Channel,
 }
 
@@ -58,6 +59,7 @@ impl RuntimeConfig {
             data_base_dir: state_base_dir,
             data_dir: state_dir.clone(),
             state_dir,
+            config_dir: None,
             channel,
         })
     }
@@ -65,6 +67,15 @@ impl RuntimeConfig {
     pub fn with_data_dir(mut self, data_base_dir: impl AsRef<Path>) -> Self {
         self.data_base_dir = data_base_dir.as_ref().to_path_buf();
         self.data_dir = self.channel.resolve_root(&self.data_base_dir);
+        self
+    }
+
+    /// Points the server at the Config Document root. Unlike state and data,
+    /// the config root is shared across Channels, so no Channel suffix is
+    /// applied. Without this, no Config Documents load and every Setting
+    /// keeps its built-in default.
+    pub fn with_config_dir(mut self, config_dir: impl AsRef<Path>) -> Self {
+        self.config_dir = Some(config_dir.as_ref().to_path_buf());
         self
     }
 
@@ -82,6 +93,10 @@ impl RuntimeConfig {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn config_dir(&self) -> Option<&Path> {
+        self.config_dir.as_deref()
     }
 
     pub fn channel(&self) -> &str {

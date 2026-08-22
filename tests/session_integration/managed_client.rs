@@ -976,9 +976,7 @@ async fn malformed_fixture_server_events(
     if !fixture_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let first =
-        stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) });
-    Sse::new(first.chain(stream::pending())).into_response()
+    Sse::new(fixture_lifecycle_stream().chain(stream::pending())).into_response()
 }
 
 async fn malformed_fixture_catalog_events(
@@ -1143,11 +1141,7 @@ async fn reconnecting_fixture_server_events(
     if !fixture_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Sse::new(
-        stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) })
-            .chain(stream::pending()),
-    )
-    .into_response()
+    Sse::new(fixture_lifecycle_stream().chain(stream::pending())).into_response()
 }
 
 async fn reconnecting_fixture_catalog_events(
@@ -1155,6 +1149,22 @@ async fn reconnecting_fixture_catalog_events(
     headers: HeaderMap,
 ) -> Response {
     fixture_catalog_events_response(&headers, &state.descriptor.token, state.initial.session.id)
+}
+
+/// The lifecycle-stream opening every conforming server sends: the connected
+/// comment followed by the effective-settings snapshot.
+fn fixture_lifecycle_stream()
+-> impl futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static {
+    stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) }).chain(
+        stream::once(async move {
+            Ok::<_, Infallible>(
+                Event::default()
+                    .event(suru::protocol::SETTINGS_SNAPSHOT_EVENT)
+                    .json_data(suru::protocol::SettingsSnapshot::default())
+                    .expect("serialize fixture settings snapshot"),
+            )
+        }),
+    )
 }
 
 fn fixture_catalog_events_response(

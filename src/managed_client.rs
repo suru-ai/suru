@@ -17,8 +17,8 @@ use crate::{
     protocol::{
         AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, LifecycleState,
         ModelCatalog, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
-        SessionDeleted, SessionError, SessionId, SessionListItem, SessionSnapshot, ShutdownReason,
-        Turn, TurnId, UpdateAgentSelectionRequest,
+        SessionDeleted, SessionError, SessionId, SessionListItem, SessionSnapshot,
+        SettingsSnapshot, ShutdownReason, Turn, TurnId, UpdateAgentSelectionRequest,
     },
 };
 
@@ -83,6 +83,13 @@ impl ManagedClientConfig {
         self
     }
 
+    /// Points a server this client launches at the Config Document root,
+    /// mirroring how `SURU_CONFIG_DIR` points a real run at one.
+    pub fn with_config_dir(mut self, config_dir: impl AsRef<Path>) -> Self {
+        self.runtime = self.runtime.with_config_dir(config_dir);
+        self
+    }
+
     pub fn runtime(&self) -> &RuntimeConfig {
         &self.runtime
     }
@@ -116,6 +123,9 @@ impl ManagedClientConfig {
 pub enum ManagedEvent {
     Connecting,
     Connected(Health),
+    /// The server's effective-settings view: pushed right after every connect
+    /// and again whenever the server replaces it.
+    SettingsSnapshot(SettingsSnapshot),
     Recovering(RecoveryStatus),
     ServerShutdown(ServerShutdown),
     SessionDeleted(SessionDeleted),

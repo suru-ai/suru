@@ -26,8 +26,8 @@ use suru::{
     },
     protocol::{
         Health, LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
-        SESSION_CATALOG_SNAPSHOT_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision,
-        SessionCatalogSnapshot, ShutdownReason,
+        SESSION_CATALOG_SNAPSHOT_EVENT, SETTINGS_SNAPSHOT_EVENT, ServerIdentity, ServerShutdown,
+        SessionCatalogRevision, SessionCatalogSnapshot, SettingsSnapshot, ShutdownReason,
     },
     server::{self, ServerConfig},
 };
@@ -428,6 +428,7 @@ async fn simultaneous_launchers_converge_on_one_authenticated_server() {
                     .args(["server", "start"])
                     .env("SURU_STATE_DIR", &state_dir)
                     .env("SURU_DATA_DIR", &state_dir)
+                    .env("SURU_CONFIG_DIR", &state_dir)
                     .env("SURU_CHANNEL", channel)
                     .output()
                     .expect("run concurrent server start command")
@@ -1061,6 +1062,7 @@ async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
             .args(["-qef", "/dev/null", "-c", &tui_command])
             .env("SURU_STATE_DIR", state_dir.path())
             .env("SURU_DATA_DIR", state_dir.path())
+            .env("SURU_CONFIG_DIR", state_dir.path())
             .env("SURU_CHANNEL", channel)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1257,6 +1259,7 @@ impl AttachedTuiGuard {
                 .args(["-qef", "/dev/null", "-c", tui_command])
                 .env("SURU_STATE_DIR", state_dir)
                 .env("SURU_DATA_DIR", state_dir)
+                .env("SURU_CONFIG_DIR", state_dir)
                 .env("SURU_CHANNEL", channel)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1309,6 +1312,7 @@ async fn run_server_cli(
             .args(["server", &command])
             .env("SURU_STATE_DIR", &state_dir)
             .env("SURU_DATA_DIR", &state_dir)
+            .env("SURU_CONFIG_DIR", &state_dir)
             .env("SURU_CHANNEL", channel)
             .output()
             .expect("run server CLI command")
@@ -1325,6 +1329,7 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
         .args(["server", "start"])
         .env("SURU_STATE_DIR", state_dir.path())
         .env("SURU_DATA_DIR", state_dir.path())
+        .env("SURU_CONFIG_DIR", state_dir.path())
         .env("SURU_CHANNEL", channel)
         .output()
         .expect("run server start command");
@@ -1341,6 +1346,7 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
         .args(["server", "start"])
         .env("SURU_STATE_DIR", state_dir.path())
         .env("SURU_DATA_DIR", state_dir.path())
+        .env("SURU_CONFIG_DIR", state_dir.path())
         .env("SURU_CHANNEL", channel)
         .output()
         .expect("repeat server start command");
@@ -1385,6 +1391,7 @@ fn build_profile_selects_isolated_default_state_and_data_roots() {
         .args(["server", "start"])
         .env("SURU_STATE_DIR", state_dir.path())
         .env("SURU_DATA_DIR", data_dir.path())
+        .env("SURU_CONFIG_DIR", state_dir.path())
         .env_remove("SURU_CHANNEL")
         .output()
         .expect("start server on the build profile's default channel");
@@ -1770,6 +1777,9 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
         stream::once(std::future::ready(Ok::<_, Infallible>(
             Event::default().comment("connected"),
         )))
+        .chain(stream::once(std::future::ready(Ok::<_, Infallible>(
+            fixture_settings_snapshot_event(),
+        ))))
     };
     match state.event_behavior {
         FixtureEventBehavior::StayConnected => {
@@ -1834,6 +1844,13 @@ fn protocol_violation_events(_state: &ReadinessState, violation: ProtocolViolati
                 .expect("serialize shutdown intent for an unexpected server"),
         ],
     }
+}
+
+fn fixture_settings_snapshot_event() -> Event {
+    Event::default()
+        .event(SETTINGS_SNAPSHOT_EVENT)
+        .json_data(SettingsSnapshot::default())
+        .expect("serialize fixture settings snapshot")
 }
 
 fn fixture_authenticated(headers: &HeaderMap, token: &str) -> bool {
@@ -2016,7 +2033,10 @@ async fn build_replacement_events(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let first =
-        stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) });
+        stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) })
+            .chain(stream::once(async move {
+                Ok::<_, Infallible>(fixture_settings_snapshot_event())
+            }));
     let shutdowns = stream::unfold(
         state.shutdown_intent.subscribe(),
         |mut shutdown_intent| async move {
@@ -2131,4 +2151,147 @@ fn test_runtime_root(base_dir: &std::path::Path, channel: &str) -> std::path::Pa
     } else {
         base_dir.join(channel)
     }
+}
+
+#[tokio::test]
+async fn suru_config_dir_steers_a_real_server_and_config_problems_reach_the_log() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            "transcript": { "defaultFoldPosture": "expanded" },
+            "mysteryKnob": 1
+        }"#,
+    )
+    .expect("write Config Document");
+    let channel = "config-env-test";
+    let started = Command::new(env!("CARGO_BIN_EXE_suru"))
+        .args(["server", "start"])
+        .env("SURU_STATE_DIR", state_dir.path())
+        .env("SURU_DATA_DIR", state_dir.path())
+        .env("SURU_CONFIG_DIR", config_dir.path())
+        .env("SURU_CHANNEL", channel)
+        .output()
+        .expect("start server with a config directory override");
+    assert!(
+        started.status.success(),
+        "server start failed despite the imperfect Config Document: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
+    )
+    .await
+    .expect("connect to the environment-configured server");
+    assert!(matches!(
+        timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("connecting event arrives"),
+        Some(ManagedEvent::Connecting)
+    ));
+    assert!(matches!(
+        timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("connected event arrives"),
+        Some(ManagedEvent::Connected(_))
+    ));
+    let event = timeout(Duration::from_secs(1), client.next())
+        .await
+        .expect("settings snapshot arrives")
+        .expect("managed client remains open");
+    let ManagedEvent::SettingsSnapshot(snapshot) = event else {
+        panic!("expected a settings snapshot event, got {event:?}");
+    };
+    assert_eq!(
+        snapshot.settings.transcript.default_fold_posture,
+        suru::protocol::FoldPosture::Expanded,
+        "the override directory's pin reaches a connecting client"
+    );
+    assert!(
+        snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.key.as_deref() == Some("mysteryKnob")),
+        "the unknown key is reported in the snapshot: {:?}",
+        snapshot.diagnostics
+    );
+
+    let log_dir = test_runtime_root(state_dir.path(), channel).join("log");
+    let log_contents = timeout(Duration::from_secs(5), async {
+        loop {
+            let combined = std::fs::read_dir(&log_dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().contains("-server-"))
+                .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                .collect::<String>();
+            if combined.contains("mysteryKnob") {
+                return combined;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the server Log names the ignored key");
+    assert!(
+        log_contents.contains("configuration problem"),
+        "the Log carries the configuration diagnostic: {log_contents}"
+    );
+
+    drop(client);
+    stop_test_server(state_dir.path(), channel);
+}
+
+#[tokio::test]
+async fn a_syntax_broken_config_document_reaches_the_log_and_the_server_still_starts() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(config_dir.path().join("suru.jsonc"), r#"{ "transcript": "#)
+        .expect("write broken Config Document");
+    let channel = "config-broken-log-test";
+    let started = Command::new(env!("CARGO_BIN_EXE_suru"))
+        .args(["server", "start"])
+        .env("SURU_STATE_DIR", state_dir.path())
+        .env("SURU_DATA_DIR", state_dir.path())
+        .env("SURU_CONFIG_DIR", config_dir.path())
+        .env("SURU_CHANNEL", channel)
+        .output()
+        .expect("start server with a broken Config Document");
+    assert!(
+        started.status.success(),
+        "a broken Config Document must never prevent startup: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let log_dir = test_runtime_root(state_dir.path(), channel).join("log");
+    let log_contents = timeout(Duration::from_secs(5), async {
+        loop {
+            let combined = std::fs::read_dir(&log_dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().contains("-server-"))
+                .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                .collect::<String>();
+            if combined.contains("configuration problem") {
+                return combined;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the server Log reports the broken Config Document");
+    assert!(
+        log_contents.contains("ERROR") && log_contents.contains("not valid JSONC"),
+        "the Log states the file was ignored and why: {log_contents}"
+    );
+
+    stop_test_server(state_dir.path(), channel);
 }

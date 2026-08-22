@@ -37,6 +37,14 @@ pub async fn receive_initial_state(client: &mut ManagedClient) -> Health {
     let ManagedEvent::Connected(identity) = connected else {
         panic!("expected connected event, got {connected:?}");
     };
+    let settings = timeout(Duration::from_secs(1), client.next())
+        .await
+        .expect("settings snapshot arrives")
+        .expect("managed client remains open");
+    assert!(
+        matches!(settings, ManagedEvent::SettingsSnapshot(_)),
+        "expected settings snapshot event, got {settings:?}"
+    );
     identity
 }
 

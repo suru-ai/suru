@@ -30,6 +30,8 @@ enum CliCommand {
         state_base_dir: PathBuf,
         #[arg(long = "data-dir")]
         data_base_dir: PathBuf,
+        #[arg(long = "config-dir")]
+        config_dir: Option<PathBuf>,
         #[arg(long)]
         channel: String,
     },
@@ -80,9 +82,14 @@ async fn main() -> Result<()> {
         Some(CliCommand::InternalServer {
             state_base_dir,
             data_base_dir,
+            config_dir,
             channel,
         }) => {
-            let config = ServerConfig::new(state_base_dir, channel)?.with_data_dir(data_base_dir);
+            let mut config =
+                ServerConfig::new(state_base_dir, channel)?.with_data_dir(data_base_dir);
+            if let Some(config_dir) = config_dir {
+                config = config.with_config_dir(config_dir);
+            }
             let _log_guard = logging::init(&config, logging::Role::Server)
                 .context("initialize server logging")?;
             server::spawn(config).await?.run_until_ctrl_c().await
@@ -113,6 +120,11 @@ fn default_client_config() -> Result<ManagedClientConfig> {
             .context("determine the current user's data directory")?
             .join("suru"),
     };
+    let config_dir = suru::settings::resolve_config_root(
+        std::env::var_os("SURU_CONFIG_DIR").as_deref(),
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        dirs::home_dir().as_deref(),
+    );
     let channel = std::env::var("SURU_CHANNEL").unwrap_or_else(|_| {
         if cfg!(debug_assertions) {
             "debug".to_owned()
@@ -120,5 +132,10 @@ fn default_client_config() -> Result<ManagedClientConfig> {
             "release".to_owned()
         }
     });
-    Ok(ManagedClientConfig::new(state_base_dir, channel)?.with_data_dir(data_base_dir))
+    let mut config =
+        ManagedClientConfig::new(state_base_dir, channel)?.with_data_dir(data_base_dir);
+    if let Some(config_dir) = config_dir {
+        config = config.with_config_dir(config_dir);
+    }
+    Ok(config)
 }

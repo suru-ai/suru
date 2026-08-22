@@ -83,4 +83,8 @@ pub async fn receive_managed_client_initial_state(client: &mut ManagedClient) {
         client.next().await,
         Some(suru::managed_client::ManagedEvent::Connected(_))
     ));
+    assert!(matches!(
+        client.next().await,
+        Some(suru::managed_client::ManagedEvent::SettingsSnapshot(_))
+    ));
 }

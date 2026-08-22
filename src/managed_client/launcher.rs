@@ -160,7 +160,11 @@ fn spawn_detached(config: &ManagedClientConfig) -> Result<Child> {
         .arg("--data-dir")
         .arg(config.runtime.data_base_dir())
         .arg("--channel")
-        .arg(config.channel())
+        .arg(config.channel());
+    if let Some(config_dir) = config.runtime.config_dir() {
+        command.arg("--config-dir").arg(config_dir);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));

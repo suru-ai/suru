@@ -5,7 +5,10 @@ use eventsource_stream::{Event, EventStreamError, Eventsource};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::protocol::{RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, ServerShutdown, ShutdownReason};
+use crate::protocol::{
+    RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SETTINGS_SNAPSHOT_EVENT, ServerShutdown,
+    SettingsSnapshot, ShutdownReason,
+};
 
 use super::ManagedEvent;
 
@@ -60,6 +63,11 @@ pub(super) async fn consume(
 
 fn decode_event(event: Event, expected_instance_id: uuid::Uuid) -> Result<ManagedEvent> {
     match event.event.as_str() {
+        SETTINGS_SNAPSHOT_EVENT => {
+            let snapshot: SettingsSnapshot =
+                serde_json::from_str(&event.data).context("decode settings snapshot")?;
+            Ok(ManagedEvent::SettingsSnapshot(snapshot))
+        }
         SERVER_SHUTDOWN_EVENT => {
             let shutdown: ServerShutdown =
                 serde_json::from_str(&event.data).context("decode server shutdown intent")?;

@@ -3,8 +3,9 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
+pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SESSION_CATALOG_SNAPSHOT_EVENT: &str = "session_catalog_snapshot";
 pub const SESSION_CATALOG_UPDATED_EVENT: &str = "session_catalog_updated";
 pub const SESSION_SNAPSHOT_EVENT: &str = "session_snapshot";
@@ -364,6 +365,98 @@ pub struct AgentSelection {
 pub struct AgentIdentity {
     pub agent: AgentId,
     pub selection: AgentSelection,
+}
+
+/// Where a Setting applies: a Client Setting governs a client's presentation,
+/// a Server Setting governs server or Provider behavior. Dormant data until a
+/// machine-local overlay distinguishes the two, but declared from day one so
+/// that overlay never reshapes the schema.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingScope {
+    Client,
+    Server,
+}
+
+/// The default Fold posture a Session view opens with.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FoldPosture {
+    #[default]
+    Folded,
+    Expanded,
+}
+
+/// How much Reasoning summary detail a Turn requests from Codex.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummaryDetail {
+    #[default]
+    Auto,
+    Concise,
+    Detailed,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptSettings {
+    pub default_fold_posture: FoldPosture,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexSettings {
+    pub reasoning_summary: ReasoningSummaryDetail,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSettings {
+    pub codex: CodexSettings,
+}
+
+/// The effective value of every defined Setting: what a Config Document
+/// pinned where it did, the built-in default everywhere else.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveSettings {
+    pub transcript: TranscriptSettings,
+    pub provider: ProviderSettings,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsDiagnosticSeverity {
+    /// One key was ignored; the rest of the Config Document applied.
+    Warning,
+    /// A whole Config Document was ignored.
+    Error,
+}
+
+/// One configuration problem found while loading Config Documents, carrying
+/// enough that the Log alone is sufficient to fix it: the file, the key path
+/// when the problem is scoped to one key, and why the value was ignored.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsDiagnostic {
+    pub severity: SettingsDiagnosticSeverity,
+    pub file: PathBuf,
+    pub key: Option<String>,
+    pub message: String,
+}
+
+/// The effective-settings view the server pushes to every client on connect.
+/// Carries the startup diagnostics so a client can surface configuration
+/// problems without a side channel.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsSnapshot {
+    pub settings: EffectiveSettings,
+    /// Dotted schema key paths a Config Document pins, so a client can tell a
+    /// deliberate choice from a built-in default without reading the file.
+    pub pinned: Vec<String>,
+    pub diagnostics: Vec<SettingsDiagnostic>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

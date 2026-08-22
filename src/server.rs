@@ -32,9 +32,10 @@ use crate::protocol::{
     Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, LifecycleState, Message,
     MessageId, MessageRole, MessageStatus, PROTOCOL_VERSION, ProviderId, RuntimeDescriptor,
     SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
-    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown,
-    SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode, SessionId,
-    SessionRevision, SessionUpdate, ShutdownReason, TurnId, UpdateAgentSelectionRequest,
+    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT, ServerIdentity,
+    ServerShutdown, SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode,
+    SessionId, SessionRevision, SessionUpdate, SettingsSnapshot, ShutdownReason, TurnId,
+    UpdateAgentSelectionRequest,
 };
 use crate::provider::{
     CodexRuntime, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, wait_for_shutdown,
@@ -293,6 +294,10 @@ struct AppState {
     providers: ProviderOrchestrator,
     model_catalog: ModelCatalogService,
     landing_agent_selection: LandingAgentSelectionStore,
+    /// The loaded effective-settings view. A watch channel so every attached
+    /// lifecycle stream re-pushes the snapshot when a mutation (or a future
+    /// Config Document watcher) replaces it.
+    settings: Arc<watch::Sender<SettingsSnapshot>>,
     shutdown: ShutdownController,
     provider_id: ProviderId,
     timings: ServerTimings,
@@ -334,6 +339,10 @@ pub async fn spawn_with_provider_and_timings(
     lock.try_lock_exclusive()
         .context("another server already owns this channel")?;
     protect_current_user_file(&config.lock_path())?;
+
+    let settings = crate::settings::load(config.config_dir());
+    crate::settings::log_diagnostics(&settings.diagnostics);
+    let (settings, _) = watch::channel(settings);
 
     let repository = StorageRepository::open(config.data_dir())
         .await
@@ -394,6 +403,7 @@ pub async fn spawn_with_provider_and_timings(
         providers: providers.clone(),
         model_catalog,
         landing_agent_selection,
+        settings: Arc::new(settings),
         shutdown: shutdown.clone(),
         provider_id,
         timings,
@@ -519,6 +529,7 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
 
     Sse::new(event_stream(
         state.shutdown.subscribe_to_intent(),
+        state.settings.subscribe(),
         state.timings.sse_keepalive_interval,
     ))
     .into_response()
@@ -526,19 +537,28 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
 
 struct EventStreamState {
     shutdown: watch::Receiver<Option<ServerShutdown>>,
+    settings: watch::Receiver<SettingsSnapshot>,
     keepalive: tokio::time::Interval,
     finished: bool,
 }
 
 fn event_stream(
     shutdown: watch::Receiver<Option<ServerShutdown>>,
+    mut settings: watch::Receiver<SettingsSnapshot>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
+    // Every connecting client receives the effective-settings snapshot before
+    // any other protocol event; later replacements re-push through the watch.
+    let snapshot = settings_snapshot_event(&settings.borrow_and_update());
     let first = stream::once(async move {
         Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
-    });
+    })
+    .chain(stream::once(async move {
+        Ok::<_, std::convert::Infallible>(snapshot)
+    }));
     let state = EventStreamState {
         shutdown,
+        settings,
         keepalive: tokio::time::interval_at(
             Instant::now() + keepalive_interval,
             keepalive_interval,
@@ -563,6 +583,13 @@ fn event_stream(
                 state.finished = true;
                 Some((Ok::<_, std::convert::Infallible>(event), state))
             }
+            changed = state.settings.changed() => {
+                if changed.is_err() {
+                    return None;
+                }
+                let event = settings_snapshot_event(&state.settings.borrow_and_update());
+                Some((Ok::<_, std::convert::Infallible>(event), state))
+            }
             _ = state.keepalive.tick() => Some((
                 Ok::<_, std::convert::Infallible>(
                     Event::default().comment("keep-alive"),
@@ -573,6 +600,13 @@ fn event_stream(
     });
 
     first.chain(updates)
+}
+
+fn settings_snapshot_event(snapshot: &SettingsSnapshot) -> Event {
+    Event::default()
+        .event(SETTINGS_SNAPSHOT_EVENT)
+        .json_data(snapshot)
+        .expect("settings snapshots always serialize")
 }
 
 async fn session_catalog_events(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1309,8 +1343,17 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_streams_receive_shutdown_intent_independently() {
         let (shutdown, _) = watch::channel(None);
-        let first = event_stream(shutdown.subscribe(), Duration::from_secs(60));
-        let second = event_stream(shutdown.subscribe(), Duration::from_secs(60));
+        let (settings, _) = watch::channel(SettingsSnapshot::default());
+        let first = event_stream(
+            shutdown.subscribe(),
+            settings.subscribe(),
+            Duration::from_secs(60),
+        );
+        let second = event_stream(
+            shutdown.subscribe(),
+            settings.subscribe(),
+            Duration::from_secs(60),
+        );
         pin_mut!(first);
         pin_mut!(second);
 
@@ -1319,8 +1362,16 @@ mod tests {
             "first connected comment arrives"
         );
         assert!(
+            first.next().await.is_some(),
+            "first settings snapshot arrives"
+        );
+        assert!(
             second.next().await.is_some(),
             "second connected comment arrives"
+        );
+        assert!(
+            second.next().await.is_some(),
+            "second settings snapshot arrives"
         );
 
         let intent = ServerShutdown {

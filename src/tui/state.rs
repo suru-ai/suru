@@ -387,6 +387,10 @@ impl TuiState {
                 self.manually_stopped = false;
                 self.fatal_error = None;
             }
+            ManagedEvent::SettingsSnapshot(_) => {
+                // No Setting governs client presentation yet; the slice
+                // Settings take effect in a follow-up.
+            }
             ManagedEvent::Recovering(status) => {
                 if self.recovery.is_none() {
                     self.reconnect_overlay_visible = false;
