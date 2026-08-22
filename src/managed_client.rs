@@ -83,6 +83,10 @@ impl ManagedClientConfig {
         self
     }
 
+    pub fn runtime(&self) -> &RuntimeConfig {
+        &self.runtime
+    }
+
     pub fn state_dir(&self) -> &Path {
         self.runtime.state_dir()
     }

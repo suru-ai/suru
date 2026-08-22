@@ -83,3 +83,7 @@ _Avoid_: Thread mapping, provider cache
 **Channel**:
 The build variant (release or a development channel) whose sessions and runtime state are kept separate so development runs never touch real data.
 _Avoid_: Environment, profile
+
+**Log**:
+The operator-facing diagnostic record a Suru process writes about its own run. A Log is about Suru's behavior, never about conversation content — the user-visible history of a Session is its Transcript.
+_Avoid_: Diagnostics, telemetry, trace

@@ -171,7 +171,8 @@ pub(super) struct ProcessStdio {
     pub(super) stdout: ChildStdout,
 }
 
-/// Launches `codex app-server` in its own process tree, draining its stderr.
+/// Launches `codex app-server` in its own process tree, forwarding its stderr
+/// to the Log.
 pub(super) fn spawn_codex_process(
     executable: &OsStr,
 ) -> Result<(SpawnedProcess, ProcessStdio), ProviderError> {
@@ -201,10 +202,13 @@ pub(super) fn spawn_codex_process(
         .stderr
         .take()
         .ok_or_else(|| codex_error("Codex app-server stderr was unavailable"))?;
+    tracing::info!(pid = child.id(), "launched Codex app-server");
     tokio::spawn(async move {
-        let mut stderr = stderr;
-        let mut sink = tokio::io::sink();
-        let _ = tokio::io::copy(&mut stderr, &mut sink).await;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::debug!(target: "suru::provider::codex::stderr", "{line}");
+        }
     });
 
     Ok((
@@ -310,6 +314,7 @@ async fn supervise_child(supervisor: ChildSupervisor) {
         Ok(status) => format!("Codex app-server exited unexpectedly with {status}"),
         Err(error) => format!("could not wait for Codex app-server: {error}"),
     };
+    tracing::warn!("{message}");
     let error = codex_error(message);
     exit.send_replace(Some(error.clone()));
     transport.terminate(error);

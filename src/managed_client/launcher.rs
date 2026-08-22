@@ -148,6 +148,10 @@ fn spawn_detached(config: &ManagedClientConfig) -> Result<Child> {
     protect_current_user_file(&log_path)?;
     let stderr = stdout.try_clone().context("clone server log handle")?;
 
+    tracing::info!(
+        executable = %config.server_executable.display(),
+        "launching detached Suru server"
+    );
     let mut command = Command::new(&config.server_executable);
     command
         .arg("__server")
@@ -172,6 +176,7 @@ fn describe_exit(status: ExitStatus) -> String {
 }
 
 pub(super) fn startup_error(config: &ManagedClientConfig, message: &str) -> anyhow::Error {
+    tracing::error!("{message}");
     let log_path = log_path(config);
     match read_log_tail(&log_path) {
         Ok(tail) if !tail.is_empty() => anyhow!(

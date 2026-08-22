@@ -1150,9 +1150,15 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = disable_terminal_features(self.terminal.backend_mut());
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show);
-        let _ = disable_raw_mode();
+        if let Err(error) = disable_terminal_features(self.terminal.backend_mut()) {
+            tracing::warn!("could not disable terminal features: {error}");
+        }
+        if let Err(error) = execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show) {
+            tracing::warn!("could not leave the alternate screen: {error}");
+        }
+        if let Err(error) = disable_raw_mode() {
+            tracing::warn!("could not disable raw mode: {error}");
+        }
     }
 }
 

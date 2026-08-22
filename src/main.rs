@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use suru::{
+    logging,
     managed_client::{
         ManagedClient, ManagedClientConfig, ServerStatus, server_status, start_server, stop_server,
     },
@@ -81,13 +82,16 @@ async fn main() -> Result<()> {
             data_base_dir,
             channel,
         }) => {
-            server::spawn(ServerConfig::new(state_base_dir, channel)?.with_data_dir(data_base_dir))
-                .await?
-                .run_until_ctrl_c()
-                .await
+            let config = ServerConfig::new(state_base_dir, channel)?.with_data_dir(data_base_dir);
+            let _log_guard = logging::init(&config, logging::Role::Server)
+                .context("initialize server logging")?;
+            server::spawn(config).await?.run_until_ctrl_c().await
         }
         None => {
-            let client = ManagedClient::connect(default_client_config()?)
+            let config = default_client_config()?;
+            let _log_guard = logging::init(config.runtime(), logging::Role::Client)
+                .context("initialize client logging")?;
+            let client = ManagedClient::connect(config)
                 .await
                 .context("prepare the managed Suru server connection")?;
             tui::run(client).await

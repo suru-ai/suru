@@ -1,5 +1,6 @@
 mod ansi;
 pub mod build_identity;
+pub mod logging;
 pub mod managed_client;
 mod model_catalog;
 pub mod protocol;

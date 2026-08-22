@@ -144,6 +144,11 @@ async fn run_managed_client(
         let stream_result = match stream_result {
             Some(stream_result) => stream_result,
             None => {
+                tracing::info!(
+                    instance_id = %connection.health.instance_id,
+                    pid = connection.health.pid,
+                    "connected to Suru server"
+                );
                 if events
                     .send(ManagedEvent::Connected(connection.health))
                     .await
@@ -202,12 +207,14 @@ async fn run_managed_client(
                 session_catalog_stream::StreamOutcome::Disconnected,
             )) => None,
             ActiveStreamResult::Lifecycle(Err(error)) | ActiveStreamResult::Catalog(Err(error)) => {
+                tracing::error!("managed server stream failed: {error:#}");
                 let _ = events.send(ManagedEvent::Fatal(error.to_string())).await;
                 return;
             }
         };
 
         if let Some(replaced_instance_id) = replaced_instance_id {
+            tracing::info!(%replaced_instance_id, "managed server is being replaced");
             if events
                 .send(ManagedEvent::Recovering(RecoveryStatus {
                     attempt: 1,
@@ -232,20 +239,20 @@ async fn run_managed_client(
                     continue;
                 }
                 ConnectionWait::Incompatible(protocol_version) => {
-                    let _ = events
-                        .send(ManagedEvent::Fatal(format!(
-                            "replacement server protocol version {protocol_version} is incompatible with client protocol version {PROTOCOL_VERSION}"
-                        )))
-                        .await;
+                    let message = format!(
+                        "replacement server protocol version {protocol_version} is incompatible with client protocol version {PROTOCOL_VERSION}"
+                    );
+                    tracing::error!("{message}");
+                    let _ = events.send(ManagedEvent::Fatal(message)).await;
                     return;
                 }
                 ConnectionWait::TimedOut => {
-                    let _ = events
-                        .send(ManagedEvent::Fatal(format!(
-                            "replacement Suru server did not become ready within {:?}",
-                            config.startup_timeout
-                        )))
-                        .await;
+                    let message = format!(
+                        "replacement Suru server did not become ready within {:?}",
+                        config.startup_timeout
+                    );
+                    tracing::error!("{message}");
+                    let _ = events.send(ManagedEvent::Fatal(message)).await;
                     return;
                 }
             }
@@ -257,6 +264,11 @@ async fn run_managed_client(
         let mut attempt = 1;
         let mut retry_in = Duration::ZERO;
         loop {
+            tracing::warn!(
+                attempt,
+                retry_in_ms = retry_in.as_millis() as u64,
+                "recovering managed server connection"
+            );
             if events
                 .send(ManagedEvent::Recovering(RecoveryStatus {
                     attempt,
@@ -277,11 +289,11 @@ async fn run_managed_client(
                 {
                     ConnectionWait::Ready(replacement) => Ok(*replacement),
                     ConnectionWait::Incompatible(protocol_version) => {
-                        let _ = events
-                            .send(ManagedEvent::Fatal(format!(
-                                "recovery server protocol version {protocol_version} is incompatible with client protocol version {PROTOCOL_VERSION}"
-                            )))
-                            .await;
+                        let message = format!(
+                            "recovery server protocol version {protocol_version} is incompatible with client protocol version {PROTOCOL_VERSION}"
+                        );
+                        tracing::error!("{message}");
+                        let _ = events.send(ManagedEvent::Fatal(message)).await;
                         return;
                     }
                     ConnectionWait::TimedOut => Err(anyhow!("compatible Suru server is not ready")),

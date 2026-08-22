@@ -235,6 +235,7 @@ impl ShutdownController {
         let Some(shutdown) = shutdown else {
             return;
         };
+        tracing::info!(reason = ?request.reason, "server shutdown accepted");
         self.provider_updates.stop();
         self.lifecycle.send_replace(LifecycleState::Stopping);
         self.shutdown_intent.send_replace(Some(request));
@@ -458,7 +459,8 @@ pub async fn spawn_with_provider_and_timings(
             .shutdown()
             .await
             .context("shut down storage writer");
-        if result.is_err() {
+        if let Err(error) = &result {
+            tracing::error!("server task failed: {error:#}");
             task_lifecycle.send_replace(LifecycleState::Failed);
         }
         remove_own_descriptor(&descriptor_path, instance_id);
@@ -474,6 +476,13 @@ pub async fn spawn_with_provider_and_timings(
             false
         }
     });
+    tracing::info!(
+        %address,
+        instance_id = %descriptor.identity.instance_id,
+        pid = descriptor.identity.pid,
+        channel = config.channel(),
+        "Suru server ready"
+    );
 
     Ok(RunningServer {
         descriptor,
