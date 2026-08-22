@@ -1830,6 +1830,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "shlex",
  "sysinfo",
  "tempfile",
  "time",

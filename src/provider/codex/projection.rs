@@ -21,6 +21,7 @@ use super::{
     codex_error,
     process::ProcessGuard,
     reasoning::ReasoningSummarySplitter,
+    shell_wrapper::strip_launcher_wrapper,
     wire::{
         NATIVE_REASONING_SECTION_SEPARATOR, NativeCommandStatus, NativeField, NativeFileChange,
         NativeFileChangeStatus, NativeNotification, NativeTurnFailureKind, NativeTurnOutcome,
@@ -610,7 +611,7 @@ fn project_command_started(
     );
     Ok(vec![ProviderEvent::CommandStarted {
         activity_id: ProviderActivityId::new(item_id),
-        command,
+        command: strip_launcher_wrapper(command),
         cwd,
     }])
 }
@@ -947,8 +948,9 @@ mod tests {
     };
 
     use super::{
-        NativeCorrelation, NativeNotification, NativeTurnFailureKind, ProviderActivityId,
-        ProviderEvent, is_native_selection_rejection, project_native_notification,
+        NativeCommandStatus, NativeCorrelation, NativeNotification, NativeTurnFailureKind,
+        ProviderActivityId, ProviderEvent, is_native_selection_rejection,
+        project_native_notification,
     };
 
     const THREAD: &str = "thread-fixture";
@@ -1017,6 +1019,101 @@ mod tests {
 
     fn activity_id() -> ProviderActivityId {
         ProviderActivityId::new(ITEM)
+    }
+
+    fn command_started(command: &str) -> NativeNotification {
+        NativeNotification::CommandStarted {
+            thread_id: THREAD.to_owned(),
+            turn_id: TURN.to_owned(),
+            item_id: ITEM.to_owned(),
+            command: command.to_owned(),
+            cwd: None,
+            status: NativeCommandStatus::InProgress,
+        }
+    }
+
+    fn recorded_command(events: Vec<ProviderEvent>) -> String {
+        match events.into_iter().next() {
+            Some(ProviderEvent::CommandStarted { command, .. }) => command,
+            other => panic!("expected a started command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_powershell_launcher_wrapper_is_stripped_from_the_recorded_command() {
+        let mut correlation = reasoning_turn();
+        let events = project(
+            &mut correlation,
+            command_started("pwsh -NoProfile -Command 'Get-ChildItem -Recurse'"),
+        );
+        assert_eq!(recorded_command(events), "Get-ChildItem -Recurse");
+    }
+
+    #[test]
+    fn a_powershell_executable_path_and_lowercased_flags_still_strip() {
+        let mut correlation = reasoning_turn();
+        let events = project(
+            &mut correlation,
+            command_started("powershell.exe -nologo -command 'Write-Host hi'"),
+        );
+        assert_eq!(recorded_command(events), "Write-Host hi");
+    }
+
+    #[test]
+    fn a_bare_sh_dash_c_wrapper_is_stripped_from_the_recorded_command() {
+        let mut correlation = reasoning_turn();
+        let events = project(&mut correlation, command_started("sh -c ls"));
+        assert_eq!(recorded_command(events), "ls");
+    }
+
+    #[test]
+    fn a_command_that_is_not_launcher_plumbing_is_recorded_verbatim() {
+        let mut correlation = reasoning_turn();
+        let events = project(
+            &mut correlation,
+            command_started("git -c core.pager=cat log -1"),
+        );
+        assert_eq!(recorded_command(events), "git -c core.pager=cat log -1");
+    }
+
+    #[test]
+    fn a_shell_run_with_more_than_a_wrapped_script_is_recorded_verbatim() {
+        let mut correlation = reasoning_turn();
+        let events = project(
+            &mut correlation,
+            command_started("bash -lc 'echo hi' trailing"),
+        );
+        assert_eq!(recorded_command(events), "bash -lc 'echo hi' trailing");
+    }
+
+    #[test]
+    fn a_powershell_run_with_a_flag_codex_never_passes_is_recorded_verbatim() {
+        let mut correlation = reasoning_turn();
+        let events = project(
+            &mut correlation,
+            command_started("pwsh -ExecutionPolicy Bypass -Command 'Write-Host hi'"),
+        );
+        assert_eq!(
+            recorded_command(events),
+            "pwsh -ExecutionPolicy Bypass -Command 'Write-Host hi'"
+        );
+    }
+
+    #[test]
+    fn quoting_that_does_not_split_back_to_an_argv_is_recorded_verbatim() {
+        let mut correlation = reasoning_turn();
+        let events = project(&mut correlation, command_started("zsh -lc 'unbalanced"));
+        assert_eq!(recorded_command(events), "zsh -lc 'unbalanced");
+    }
+
+    #[test]
+    fn a_posix_shell_launcher_wrapper_is_stripped_from_the_recorded_command() {
+        let mut correlation = reasoning_turn();
+        let events = project(
+            &mut correlation,
+            command_started("/usr/bin/zsh -lc 'cargo test'"),
+        );
+        assert_eq!(recorded_command(events), "cargo test");
     }
 
     #[test]

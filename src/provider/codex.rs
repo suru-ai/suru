@@ -10,6 +10,7 @@ mod process;
 mod projection;
 mod reasoning;
 mod session;
+mod shell_wrapper;
 mod transport;
 mod wire;
 

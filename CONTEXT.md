@@ -60,6 +60,10 @@ _Avoid_: Function, action
 The account a Provider gives of an agent's thinking during a Turn, carried as Activity because it reports progress rather than the prose the agent authored for the user. A Reasoning block may carry a **title** — a short heading the Provider leads it with, kept beside the content as a typed property so a client can head a Fold with it instead of reading it out of the prose. Distinct from the Reasoning Effort Model Option, which tunes how much of it a Model does. Suru's own name for the concept is Reasoning everywhere except the words a Transcript shows a reader, which deliberately say _Thinking_ while a block runs and _Thought_ once it settles.
 _Avoid_: Chain of thought, and — outside a Transcript's own wording — thinking, thought
 
+**Command**:
+The Activity recording one command a Provider ran while working a Turn. Its command text is the command as a reader should see it: each Provider strips its own launcher plumbing — such as the shell wrapper it launches scripts through — before the Activity is recorded, so the stored text is the command itself, never the machinery around it. A command that arrives in a shape the Provider doesn't recognize as its own plumbing is recorded verbatim.
+_Avoid_: Shell invocation, exec
+
 **Transcript**:
 The ordered, user-visible history of a Session: its Messages and Activities in presentation order.
 _Avoid_: History, log, conversation
