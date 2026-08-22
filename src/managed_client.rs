@@ -17,7 +17,7 @@ use crate::{
     protocol::{
         AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, LifecycleState,
         ModelCatalog, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
-        SessionDeleted, SessionError, SessionId, SessionListItem, SessionSnapshot,
+        SessionDeleted, SessionError, SessionId, SessionListItem, SessionSnapshot, SettingMutation,
         SettingsSnapshot, ShutdownReason, Turn, TurnId, UpdateAgentSelectionRequest,
     },
 };
@@ -237,6 +237,13 @@ impl ManagedClient {
             .await
     }
 
+    /// Changes one Setting in the server's Config Document. The answer is the
+    /// effective-settings snapshot the edit leaves in force, which every
+    /// attached client — this one included — also receives on its event stream.
+    pub async fn mutate_setting(&self, mutation: SettingMutation) -> Result<SettingsSnapshot> {
+        self.session_commands().mutate_setting(mutation).await
+    }
+
     pub async fn subscribe_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
         self.session_commands().subscribe_session(session_id).await
     }
@@ -451,6 +458,14 @@ impl SessionCommandClient {
             .await
             .with_context(|| format!("send {operation} command"))?;
         decode_api_response(response, operation).await
+    }
+
+    pub(crate) async fn mutate_setting(
+        &self,
+        mutation: SettingMutation,
+    ) -> Result<SettingsSnapshot> {
+        self.post_session_command("/v1/settings", &mutation, "Setting mutation")
+            .await
     }
 
     pub(crate) async fn subscribe_session(

@@ -34,8 +34,8 @@ use crate::protocol::{
     SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
     SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT, ServerIdentity,
     ServerShutdown, SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode,
-    SessionId, SessionRevision, SessionUpdate, SettingsSnapshot, ShutdownReason, TurnId,
-    UpdateAgentSelectionRequest,
+    SessionId, SessionRevision, SessionUpdate, SettingMutation, SettingsSnapshot, ShutdownReason,
+    TurnId, UpdateAgentSelectionRequest,
 };
 use crate::provider::{
     CodexRuntime, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, wait_for_shutdown,
@@ -46,6 +46,7 @@ use crate::sessions::{
     InterruptTurnError, ListSessionsError, PromptAdmissionDisposition, PromptMutationError,
     SessionCatalogFeed, SessionFeed, SessionStore, StoreOutcome,
 };
+use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::storage::{StorageRepository, StorageSink, StorageWriter};
 
 pub type ServerConfig = RuntimeConfig;
@@ -298,6 +299,11 @@ struct AppState {
     /// lifecycle stream re-pushes the snapshot when a mutation (or a future
     /// Config Document watcher) replaces it.
     settings: Arc<watch::Sender<SettingsSnapshot>>,
+    /// The Config Documents behind that view, which this server alone writes.
+    config_documents: ConfigDocuments,
+    /// Held so an accepted mutation can hand the Provider runtime the Server
+    /// Settings it now runs under.
+    runtime: Arc<dyn ProviderRuntime>,
     shutdown: ShutdownController,
     provider_id: ProviderId,
     timings: ServerTimings,
@@ -340,13 +346,11 @@ pub async fn spawn_with_provider_and_timings(
         .context("another server already owns this channel")?;
     protect_current_user_file(&config.lock_path())?;
 
-    let settings = crate::settings::load(config.config_dir());
-    crate::settings::log_diagnostics(&settings.diagnostics);
+    let config_documents = ConfigDocuments::new(config.config_dir());
+    let (settings, _) = watch::channel(SettingsSnapshot::default());
     // Before any Session starts, so the first Turn already runs under the
-    // Server Settings the Config Documents pinned. A mutation — or a future
-    // Config Document watcher — hands the runtime the new view the same way.
-    runtime.apply_settings(&settings.settings);
-    let (settings, _) = watch::channel(settings);
+    // Server Settings the Config Documents pinned.
+    adopt_settings(&settings, runtime.as_ref(), &config_documents.load());
 
     let repository = StorageRepository::open(config.data_dir())
         .await
@@ -396,7 +400,7 @@ pub async fn spawn_with_provider_and_timings(
         LandingAgentSelectionStore::new(persisted_landing_agent_selection, storage);
     let model_catalog = ModelCatalogService::new([runtime.clone()]);
     let providers = ProviderOrchestrator::new(
-        runtime,
+        runtime.clone(),
         sessions.clone(),
         provider_shutdown_rx,
         provider_updates,
@@ -408,6 +412,8 @@ pub async fn spawn_with_provider_and_timings(
         model_catalog,
         landing_agent_selection,
         settings: Arc::new(settings),
+        config_documents,
+        runtime,
         shutdown: shutdown.clone(),
         provider_id,
         timings,
@@ -416,6 +422,7 @@ pub async fn spawn_with_provider_and_timings(
         .route("/health", get(health))
         .route("/v1/events", get(events))
         .route("/v1/session-events", get(session_catalog_events))
+        .route("/v1/settings", post(mutate_setting))
         .route("/v1/models", get(list_models))
         .route("/v1/models/refresh", post(refresh_models))
         .route(
@@ -604,6 +611,70 @@ fn event_stream(
     });
 
     first.chain(updates)
+}
+
+/// The one way a client changes a Setting. The server applies the typed
+/// mutation to its Config Document, hands the Provider runtime the Server
+/// Settings the edit leaves in force, and pushes the refreshed snapshot to
+/// every attached client — the mutating one included, which also reads it
+/// back as this command's answer.
+async fn mutate_setting(State(state): State<AppState>, request: Request) -> Response {
+    let mutation = match decode_session_command::<SettingMutation>(
+        &state,
+        request,
+        "Setting mutation",
+    )
+    .await
+    {
+        Ok(mutation) => mutation,
+        Err(response) => return response,
+    };
+    // The edit is filesystem work, and the CST handles it parses the document
+    // into are not `Send`; both stay on a blocking thread, where the read,
+    // the edit, and the write are one scope.
+    let documents = state.config_documents.clone();
+    let mutated = tokio::task::spawn_blocking(move || documents.mutate(&mutation))
+        .await
+        .expect("Config Document edit runs to completion");
+    match mutated {
+        Ok(snapshot) => {
+            adopt_settings(&state.settings, state.runtime.as_ref(), &snapshot);
+            Json(snapshot).into_response()
+        }
+        Err(error @ SettingsMutationError::NoConfigRoot) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::ConfigRootUnavailable,
+            error.to_string(),
+        ),
+        Err(error @ SettingsMutationError::NotEditable { .. }) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::ConfigDocumentNotEditable,
+            error.to_string(),
+        ),
+        Err(error @ SettingsMutationError::Io { .. }) => {
+            tracing::error!("Setting mutation failed: {error}");
+            session_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                SessionErrorCode::ConfigDocumentWriteFailed,
+                error.to_string(),
+            )
+        }
+    }
+}
+
+/// Puts a freshly loaded effective-settings view in force: its problems reach
+/// the Log, the Provider runtime takes the Server Settings it now runs under,
+/// and every attached client receives the snapshot. Startup and an accepted
+/// mutation adopt a view the same way, and a future Config Document watcher
+/// will too.
+fn adopt_settings(
+    settings: &watch::Sender<SettingsSnapshot>,
+    runtime: &dyn ProviderRuntime,
+    snapshot: &SettingsSnapshot,
+) {
+    crate::settings::log_diagnostics(&snapshot.diagnostics);
+    runtime.apply_settings(&snapshot.settings);
+    settings.send_replace(snapshot.clone());
 }
 
 fn settings_snapshot_event(snapshot: &SettingsSnapshot) -> Event {

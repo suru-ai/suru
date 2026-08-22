@@ -11,8 +11,9 @@ use suru::{
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, CreateSessionRequest,
         FileChange, InitialPrompt, MessageRole, MessageStatus, ModelId, PromptDelivery, PromptId,
-        PromptStatus, ProviderId, RuntimeDescriptor, SessionChange, SessionSnapshot, SessionStatus,
-        ShutdownReason, TranscriptItem, TurnStatus, Workspace,
+        PromptStatus, ProviderId, ReasoningSummaryDetail, RuntimeDescriptor, SessionChange,
+        SessionSnapshot, SessionStatus, SettingMutation, ShutdownReason, TranscriptItem,
+        TurnStatus, Workspace,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -212,6 +213,64 @@ async fn the_pinned_reasoning_summary_setting_is_what_a_turn_asks_codex_for() {
     assert_eq!(
         started["params"]["summary"], "detailed",
         "the Turn asks Codex for the Reasoning summary detail the Config Document pinned"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_mutated_reasoning_summary_setting_governs_the_next_turn() {
+    let fixture = ScriptedCodex::new_multiprocess(REASONING_SUMMARY_CODEX);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-reasoning-summary-mutation")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-reasoning-summary-mutation")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+
+    client
+        .mutate_setting(SettingMutation::ProviderCodexReasoningSummary {
+            value: Some(ReasoningSummaryDetail::Concise),
+        })
+        .await
+        .expect("change the Setting over the protocol");
+    client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Explain the changed Setting".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+
+    fixture.wait_for_method("turn/start").await;
+
+    let requests = fixture.requests();
+    let started = requests
+        .iter()
+        .find(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
+        .expect("the Turn reached Codex");
+    assert_eq!(
+        started["params"]["summary"], "concise",
+        "a Turn asks Codex for the Reasoning summary detail the mutation left in force"
     );
 
     drop(client);

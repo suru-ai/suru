@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SESSION_CATALOG_SNAPSHOT_EVENT: &str = "session_catalog_snapshot";
@@ -430,6 +430,23 @@ pub struct ProviderSettings {
 pub struct EffectiveSettings {
     pub transcript: TranscriptSettings,
     pub provider: ProviderSettings,
+}
+
+/// A typed change to exactly one Setting: the whole surface through which a
+/// client edits a Config Document. Every Setting the schema defines has its own
+/// variant carrying its own value type, so a client can neither misspell a key
+/// path nor pin a value the Setting cannot hold. A `value` pins that value even
+/// when it equals the built-in default, so a deliberate choice survives a later
+/// change of that default; `null` removes the pin and lets the default resume.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "setting", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SettingMutation {
+    TranscriptDefaultFoldPosture {
+        value: Option<FoldPosture>,
+    },
+    ProviderCodexReasoningSummary {
+        value: Option<ReasoningSummaryDetail>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -925,6 +942,9 @@ pub enum SessionErrorCode {
     TurnInterruptionFailed,
     AgentSelectionOperationConflict,
     AgentSelectionProviderConflict,
+    ConfigRootUnavailable,
+    ConfigDocumentNotEditable,
+    ConfigDocumentWriteFailed,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
