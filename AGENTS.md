@@ -11,7 +11,7 @@ support others down the line.
 - This application is very early in development. Freely make breaking changes if they result in better code.
 - Do not account for backwards compatibility with previous versions.
 - Build using interfaces designed for an eventual plugin architecture based on that of OpenCode.
-- User-facing configuration is deferred. When hardcoding a value a user would plausibly tune, add it to the candidate-settings inventory in issue #71 rather than building config machinery.
+- User-facing configuration has a surface: Settings are declared in the compile-time schema in `src/settings.rs`, pinned by Config Documents under the config root, and edited from the settings panel. Promoting a value to a Setting is a schema entry, not new machinery — but promote deliberately. When hardcoding a value a user would plausibly tune, still add it to the candidate-settings inventory in issue #71 rather than promoting it on the spot.
 - Run tests with `cargo nextest run` (parallelizes across test binaries and reports per-test timings); `cargo test` also works. Tests must not wait out production-scale delays: timing constants (timeouts, backoff, keepalive) are injectable via builders such as `ManagedClientConfig::with_startup_timeout`, `ServerTimings`, and `CodexRuntime::with_interrupt_request_timeout`, so inject millisecond-scale values instead of sleeping.
 
 ## Plugins
