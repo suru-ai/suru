@@ -4,8 +4,8 @@
 //! render as one block, and is what keying, memoization, and click hit-testing
 //! address, so which entries share a unit is answered in one walk rather than
 //! in each of those four places. Most units hold exactly one entry; a Group
-//! holds a run of adjacent, successfully settled command Activities; a Turn
-//! Fold's marker holds none, standing instead where the entries its Turn hides
+//! holds a run of adjacent Activities of one groupable kind; a Turn Fold's
+//! marker holds none, standing instead where the entries its Turn hides
 //! would have been. Which entries a folded Turn hides is decided before the
 //! walk, in [`TurnFolding`], because a Turn Fold keys on the Turn's Settle
 //! rather than on the entry adjacency the walk reads.
@@ -608,18 +608,19 @@ pub(super) struct TranscriptWindow {
 enum RenderUnit<'a> {
     Message(&'a Message),
     Activity(&'a Activity),
-    /// A Group: a run of two or more adjacent command Activities, each settled
-    /// Completed with exit status 0. Collapsed it is the run's single row;
-    /// expanded it is the header the run re-collapses from, with its members
-    /// following as their own units. Never empty and never a run of one;
-    /// [`close_command_run`] holds that invariant.
+    /// A Group: a run of two or more adjacent Activities of one groupable
+    /// kind. Collapsed it is the run's single row; expanded it is the header
+    /// the run re-collapses from, followed by whatever its kind opens onto.
+    /// Never empty and never a run of one; [`close_run`] holds that invariant.
     Group {
+        kind: GroupableKind,
         members: Vec<&'a Activity>,
         expanded: bool,
     },
     /// One member of an expanded Group: an ordinary Activity drawn in the
     /// member gutter. A member is its own unit so its Fold, its cached lines,
-    /// and its click target all work exactly as they do standalone.
+    /// and its click target all work exactly as they do standalone. Only the
+    /// kinds whose expansion opens onto their members plan these.
     GroupMember(&'a Activity),
     /// A settled Turn's fold: the single marker row standing where the work
     /// the fold hides happened. The entries behind it are absent from the
@@ -651,7 +652,11 @@ impl RenderUnit<'_> {
             Self::Activity(activity) => {
                 activity_fingerprint(activity, resolved_fold_step(folds, activity))
             }
-            Self::Group { members, expanded } => group_fingerprint(members, *expanded),
+            Self::Group {
+                kind,
+                members,
+                expanded,
+            } => group_fingerprint(*kind, members, *expanded),
             // Member-ness joins the content signals: the same Activity keeps
             // its key when it moves between standalone and member rendering,
             // and only the fingerprint stops a cached standalone render from
@@ -682,15 +687,15 @@ impl RenderUnit<'_> {
 
     /// The unit-local line carrying a Spinner in its Marker cell, so the
     /// draw-time overlay (ADR 0009) knows where to patch the current frame.
-    /// Only an Active Activity animates, and its Marker leads its first line.
+    /// An Active Activity animates, its Marker leading its first line; a Group
+    /// animates only if its kind's header ever stands for live work.
     fn spinner_line(&self) -> Option<usize> {
         match self {
             Self::Activity(activity) | Self::GroupMember(activity) => {
                 (activity.status() == Some(crate::protocol::ActivityStatus::Active)).then_some(0)
             }
-            Self::Message(_) | Self::Group { .. } | Self::TurnFold(_) | Self::Provisional(_) => {
-                None
-            }
+            Self::Group { kind, .. } => kind.header_spinner_line(),
+            Self::Message(_) | Self::TurnFold(_) | Self::Provisional(_) => None,
         }
     }
 
@@ -748,9 +753,11 @@ impl RenderUnit<'_> {
                 theme,
                 width,
             ),
-            Self::Group { members, expanded } => {
-                Some(render_group(lines, members.len(), *expanded, theme))
-            }
+            Self::Group {
+                kind,
+                members,
+                expanded,
+            } => Some(render_group(lines, *kind, members, *expanded, theme)),
             Self::GroupMember(activity) => {
                 let start = lines.len();
                 let anchor = render_activity(
@@ -997,8 +1004,8 @@ impl<'a> TranscriptContent<'a> {
 /// not a folded row, not an expanded one, and not the duration it spent
 /// arriving at nothing. The Activity stays stored exactly as it arrived; it is
 /// simply absent from the projection rather than empty within it, which is
-/// what makes it neither join nor end the run of commands around it and leave
-/// no gap in the Transcript's spacing.
+/// what makes it neither join nor end the run around it and leave no gap in
+/// the Transcript's spacing.
 ///
 /// The rule reads Settle rather than success, so a block the Provider failed
 /// or a Turn interrupted before either arrived is as invisible as one that
@@ -1177,6 +1184,81 @@ impl TurnFolding {
     }
 }
 
+/// A kind of Activity a Transcript gathers runs of into a Group. Everything a
+/// Group's presentation depends on hangs off its kind — which Activities join
+/// a run, what the marker reads, and what expanding it opens onto — so adding
+/// a kind is a matter of answering those three questions rather than of
+/// finding every place that quietly assumed another.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum GroupableKind {
+    /// Commands, which join a run only once they settle successfully.
+    Command,
+}
+
+impl GroupableKind {
+    /// The kind of run an Activity extends, or `None` when it groups with
+    /// nothing and so ends whatever run it follows. A command joins only once
+    /// it settles Completed with exit status 0, so a failed, interrupted, or
+    /// still-running one — anything worth scanning for — never hides behind a
+    /// Group row.
+    const fn joined_by(activity: &Activity) -> Option<Self> {
+        match activity {
+            Activity::Command {
+                status: crate::protocol::ActivityStatus::Completed,
+                exit_status: Some(0),
+                ..
+            } => Some(Self::Command),
+            _ => None,
+        }
+    }
+
+    /// The line of a Group's header carrying a Spinner in its Marker cell, or
+    /// `None` for a kind whose header never stands for work in progress. A
+    /// command joins a run only once it has settled, so a command Group only
+    /// ever speaks for work already done.
+    const fn header_spinner_line(self) -> Option<usize> {
+        match self {
+            Self::Command => None,
+        }
+    }
+
+    /// What a Group's header reads off one member, and so what its rendering
+    /// must re-key on when the member changes (ADR 0007). A command Group's
+    /// header counts its members, so which Activities they are is the whole of
+    /// it; a kind whose header speaks for its members' content keys on that
+    /// content here instead.
+    fn member_fingerprint(self, member: &Activity) -> u64 {
+        let mut hasher = std::hash::DefaultHasher::new();
+        match self {
+            Self::Command => member.id().hash(&mut hasher),
+        }
+        hasher.finish()
+    }
+
+    /// The units an expanded Group plans after its header. A command Group
+    /// opens onto its members, each as its own unit, so a member's Fold, its
+    /// cached lines, and its click target need no Group-specific machinery. A
+    /// kind whose expansion is the header's own content plans nothing here and
+    /// renders it in [`render_group`] instead.
+    fn expansion_units<'a>(self, members: &[&'a Activity]) -> Vec<RenderUnit<'a>> {
+        match self {
+            Self::Command => members
+                .iter()
+                .copied()
+                .map(RenderUnit::GroupMember)
+                .collect(),
+        }
+    }
+}
+
+/// The run of adjacent Activities a walk is gathering: the groupable kind they
+/// share and the members so far. A run only ever holds one kind, because an
+/// Activity of another kind ends it before starting its own.
+struct GroupRun<'a> {
+    kind: GroupableKind,
+    members: Vec<&'a Activity>,
+}
+
 /// Walks a Session's transcript into the units a view renders. Which entries
 /// share a unit is decided here and nowhere else, so gathering a run of them
 /// into one stays a change to this walk rather than to rendering or layout.
@@ -1189,14 +1271,14 @@ fn plan_units<'a>(
     let content = TranscriptContent::of(snapshot);
     let folding = TurnFolding::plan(snapshot, &content, turns);
     let mut units = Vec::with_capacity(snapshot.transcript.len() + provisional.len());
-    let mut run: Vec<&Activity> = Vec::new();
+    let mut run: Option<GroupRun<'a>> = None;
     // A transcript entry the Transcript shows nothing for projects nothing
-    // rather than a gap, so it does not end a run either: the commands around
+    // rather than a gap, so it does not end a run either: the entries around
     // it are still adjacent as presented. An entry a Turn Fold hides projects
     // nothing for the same reason and is read the same way.
     for (position, item) in snapshot.transcript.iter().enumerate() {
         if let Some(marker) = folding.marker_at(position) {
-            close_command_run(&mut units, &mut run, groups);
+            close_run(&mut units, &mut run, groups);
             units.push(RenderUnit::TurnFold(marker));
         }
         if folding.hides(position) {
@@ -1204,66 +1286,64 @@ fn plan_units<'a>(
         }
         match content.entry(item) {
             Some(TranscriptEntry::Message(message)) => {
-                close_command_run(&mut units, &mut run, groups);
+                close_run(&mut units, &mut run, groups);
                 units.push(RenderUnit::Message(message));
             }
-            Some(TranscriptEntry::Activity(activity)) => {
-                if joins_command_run(activity) {
-                    run.push(activity);
-                } else {
-                    close_command_run(&mut units, &mut run, groups);
+            Some(TranscriptEntry::Activity(activity)) => match GroupableKind::joined_by(activity) {
+                Some(kind) => {
+                    if run.as_ref().is_some_and(|open| open.kind != kind) {
+                        close_run(&mut units, &mut run, groups);
+                    }
+                    run.get_or_insert(GroupRun {
+                        kind,
+                        members: Vec::new(),
+                    })
+                    .members
+                    .push(activity);
+                }
+                None => {
+                    close_run(&mut units, &mut run, groups);
                     units.push(RenderUnit::Activity(activity));
                 }
-            }
+            },
             None => {}
         }
     }
-    close_command_run(&mut units, &mut run, groups);
+    close_run(&mut units, &mut run, groups);
     units.extend(provisional.iter().copied().map(RenderUnit::Provisional));
     units
 }
 
-/// Whether an Activity extends a run of groupable commands: a command settled
-/// Completed with exit status 0. Every other entry kind breaks the run, as
-/// does a failed, interrupted, or still-running command, so anything worth
-/// scanning for never hides behind a Group row.
-fn joins_command_run(activity: &Activity) -> bool {
-    matches!(
-        activity,
-        Activity::Command {
-            status: crate::protocol::ActivityStatus::Completed,
-            exit_status: Some(0),
-            ..
-        }
-    )
-}
-
-/// Ends the current run of groupable commands: two or more become one Group,
-/// while a run of one stays the ordinary command row it is, so grouping never
-/// adds a layer where it saves nothing. A Group the reader expanded plans as
-/// its header followed by each member as its own unit, so member Folds,
-/// caching, and clicks need no Group-specific machinery.
-fn close_command_run<'a>(
+/// Ends the run in progress: two or more members become one Group, while a run
+/// of one stays the ordinary row it is, so grouping never adds a layer where it
+/// saves nothing. A Group the reader expanded plans as its header followed by
+/// whatever its kind opens onto.
+fn close_run<'a>(
     units: &mut Vec<RenderUnit<'a>>,
-    run: &mut Vec<&'a Activity>,
+    run: &mut Option<GroupRun<'a>>,
     groups: &TranscriptGroups,
 ) {
-    if run.len() >= 2 {
-        let members = std::mem::take(run);
-        if groups.is_collapsed(members[0].id()) {
-            units.push(RenderUnit::Group {
-                members,
-                expanded: false,
-            });
-        } else {
-            units.push(RenderUnit::Group {
-                members: members.clone(),
-                expanded: true,
-            });
-            units.extend(members.into_iter().map(RenderUnit::GroupMember));
-        }
+    let Some(GroupRun { kind, members }) = run.take() else {
+        return;
+    };
+    if members.len() < 2 {
+        units.extend(members.into_iter().map(RenderUnit::Activity));
+        return;
+    }
+    if groups.is_collapsed(members[0].id()) {
+        units.push(RenderUnit::Group {
+            kind,
+            members,
+            expanded: false,
+        });
     } else {
-        units.extend(run.drain(..).map(RenderUnit::Activity));
+        let expansion = kind.expansion_units(&members);
+        units.push(RenderUnit::Group {
+            kind,
+            members,
+            expanded: true,
+        });
+        units.extend(expansion);
     }
 }
 
@@ -1277,8 +1357,8 @@ pub(super) enum UnitKey {
     Message(MessageId),
     Activity(ActivityId),
     /// A Group, identified by its first member: the anchor a run keeps as it
-    /// absorbs a command settling behind it, where a key over the member set
-    /// would read the grown Group as a new unit and re-render it every settle.
+    /// absorbs the next Activity to join it, where a key over the member set
+    /// would read the grown Group as a new unit and re-render it every time.
     Group(ActivityId),
     /// A Turn Fold, identified by the Turn it stands for: the marker keeps its
     /// key as the Turn's hidden work grows behind it.
@@ -1615,16 +1695,19 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
     hasher.finish()
 }
 
-/// A Group unit renders from its membership and which way it is flipped, the
-/// collapsed row and the expanded header being two drawings of the same unit.
-/// Folds are deliberately absent: they act on the members, which render as
-/// their own units when they render at all.
-fn group_fingerprint(members: &[&Activity], expanded: bool) -> u64 {
+/// A Group unit renders from its kind, its membership, and which way it is
+/// flipped, the collapsed row and the expanded header being two drawings of
+/// the same unit. What each member contributes is the kind's answer, since
+/// that is what decides how much of a member the header speaks for. Folds are
+/// deliberately absent: they act on the members, which key themselves as the
+/// units they render as.
+fn group_fingerprint(kind: GroupableKind, members: &[&Activity], expanded: bool) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
+    kind.hash(&mut hasher);
     expanded.hash(&mut hasher);
     members.len().hash(&mut hasher);
     for member in members {
-        member.id().hash(&mut hasher);
+        kind.member_fingerprint(member).hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -1791,13 +1874,28 @@ fn render_activity(
     }
 }
 
-/// Projects a Group's header: one row in the settled Activity-header idiom,
-/// with the `Ran N commands` count styled as the toggle affordance it is.
-/// Collapsed, the row stands in for its members and the count doubles as the
-/// hidden-ness indicator, so no fold-marker line follows; expanded, the same
-/// header leads the member units and is the one place the Group re-collapses
-/// from. `member_count` is always at least two.
+/// Projects a Group, which each groupable kind words and opens in its own way.
+/// What every kind shares is the shape: a header row that stands in for the
+/// run while collapsed and heads it while expanded, being the one row the
+/// Group re-collapses from. `members` always holds at least two.
 fn render_group(
+    lines: &mut Vec<Line<'static>>,
+    kind: GroupableKind,
+    members: &[&Activity],
+    expanded: bool,
+    theme: &Theme,
+) -> UnitAnchor {
+    match kind {
+        GroupableKind::Command => render_command_group(lines, members.len(), expanded, theme),
+    }
+}
+
+/// Projects a command Group's header: one row in the settled Activity-header
+/// idiom, with the `Ran N commands` count styled as the toggle affordance it
+/// is. Collapsed, the row stands in for its members and the count doubles as
+/// the hidden-ness indicator, so no fold-marker line follows; expanded, the
+/// same header leads the member units.
+fn render_command_group(
     lines: &mut Vec<Line<'static>>,
     member_count: usize,
     expanded: bool,
