@@ -1404,6 +1404,19 @@ fn left_click_at(row: u16) -> InputEvent {
     })
 }
 
+/// Presses the Ctrl+X leader chord followed by `key`, the way a reader
+/// invokes a leader-bound semantic command.
+fn press_leader_chord(application: &mut Application, key: char) {
+    for key in [
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+    ] {
+        application
+            .handle_terminal_event(InputEvent::Key(key))
+            .expect("invoke the leader-bound semantic command");
+    }
+}
+
 #[test]
 fn settled_command_output_folds_to_a_head_and_tail_around_a_fold_marker() {
     let workspace = tempfile::tempdir().expect("create Workspace");
@@ -1593,28 +1606,14 @@ fn toggling_the_fold_posture_expands_every_entry_and_clears_per_entry_overrides(
         ))
         .expect("expand one entry by hand");
 
-    for key in [
-        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
-    ] {
-        application
-            .handle_terminal_event(InputEvent::Key(key))
-            .expect("invoke transcript.folds.toggle");
-    }
+    press_leader_chord(&mut application, 'f');
     let expanded = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
         expanded.contains("output line 6") && !expanded.contains("… +"),
         "the expanded posture shows every entry in full: {expanded}"
     );
 
-    for key in [
-        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
-    ] {
-        application
-            .handle_terminal_event(InputEvent::Key(key))
-            .expect("invoke transcript.folds.toggle again");
-    }
+    press_leader_chord(&mut application, 'f');
     let refolded = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
         refolded.contains("… +6 lines"),
@@ -2914,5 +2913,133 @@ fn a_command_settling_successfully_is_absorbed_into_an_expanded_group() {
     assert!(
         !rendered.contains("$ command 3"),
         "the standalone running row is gone: {rendered}"
+    );
+}
+
+#[test]
+fn toggling_the_group_posture_flips_every_group_and_clears_per_group_overrides() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            RunEntry::Command(ActivityStatus::Failed, Some(2)),
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with two Groups");
+    let collapsed_rows = rendered_application_rows_at(&application, 80, 36);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
+        ))
+        .expect("expand the first Group by hand");
+
+    press_leader_chord(&mut application, 'g');
+    let expanded = rendered_application_rows_at(&application, 80, 36).join("\n");
+    assert_eq!(
+        expanded.matches("Ran 2 commands").count(),
+        2,
+        "both Group headers stay when the posture expands: {expanded}"
+    );
+    for member in ["✓ command 1", "✓ command 2", "✓ command 4", "✓ command 5"] {
+        assert!(
+            expanded.contains(member),
+            "the expanded posture shows every Group's members, missing {member:?}: {expanded}"
+        );
+    }
+
+    press_leader_chord(&mut application, 'g');
+    let recollapsed = rendered_application_rows_at(&application, 80, 36).join("\n");
+    assert_eq!(
+        recollapsed.matches("Ran 2 commands").count(),
+        2,
+        "both Groups collapse back to their single rows: {recollapsed}"
+    );
+    for member in ["command 1", "command 2", "command 4", "command 5"] {
+        assert!(
+            !recollapsed.contains(member),
+            "flipping back collapses even the Group the reader expanded by hand, \
+             but {member:?} rendered: {recollapsed}"
+        );
+    }
+}
+
+#[test]
+fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            RunEntry::Command(ActivityStatus::Failed, Some(2)),
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+        ],
+    );
+    set_member_output(&mut snapshot, "command 1", prefixed_output("member", 12));
+    set_member_output(&mut snapshot, "command 3", prefixed_output("breaker", 12));
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with two Groups and long outputs");
+    let collapsed_rows = rendered_application_rows_at(&application, 80, 50);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
+        ))
+        .expect("expand the first Group by hand");
+    let member_rows = rendered_application_rows_at(&application, 80, 50);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&member_rows, "… +6 lines") as u16
+        ))
+        .expect("expand the first member's Fold by hand");
+
+    press_leader_chord(&mut application, 'g');
+    let groups_expanded = rendered_application_rows_at(&application, 80, 50).join("\n");
+    assert!(
+        groups_expanded.contains("member line 6"),
+        "the Groups toggle leaves the member's Fold override in place: {groups_expanded}"
+    );
+    assert!(
+        !groups_expanded.contains("breaker line 6"),
+        "the Groups toggle leaves an untouched Fold folded: {groups_expanded}"
+    );
+
+    press_leader_chord(&mut application, 'g');
+    let collapsed_again = rendered_application_rows_at(&application, 80, 50);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&collapsed_again, "Ran 2 commands") as u16,
+        ))
+        .expect("expand the first Group by hand again");
+
+    press_leader_chord(&mut application, 'f');
+    let folds_expanded = rendered_application_rows_at(&application, 80, 50).join("\n");
+    assert!(
+        folds_expanded.contains("breaker line 6"),
+        "the Folds toggle expands every Fold: {folds_expanded}"
+    );
+    assert!(
+        folds_expanded.contains("✓ command 1"),
+        "the Folds toggle leaves the hand-expanded Group expanded: {folds_expanded}"
+    );
+    assert!(
+        !folds_expanded.contains("command 4"),
+        "the Folds toggle leaves the collapsed Group collapsed: {folds_expanded}"
+    );
+    assert_eq!(
+        folds_expanded.matches("Ran 2 commands").count(),
+        2,
+        "both Group headers survive the Folds toggle: {folds_expanded}"
     );
 }

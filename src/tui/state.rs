@@ -710,6 +710,14 @@ impl TuiState {
         }
     }
 
+    /// Flips the Session view between collapsed-by-default and
+    /// expanded-by-default Groups.
+    fn toggle_group_posture(&mut self) {
+        if let Some(interaction) = self.current_interaction() {
+            interaction.groups.borrow_mut().toggle_posture();
+        }
+    }
+
     /// Expands every Activity still Active in `turn_id`. An interrupted Turn
     /// leaves its work half-done, and the reader was already watching it, so
     /// the Fold must not hide what they were reading.
@@ -1799,6 +1807,11 @@ impl Application {
             }
             SemanticCommandId::TranscriptFoldsToggle => {
                 self.state.toggle_fold_posture();
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::TranscriptGroupsToggle => {
+                self.state.toggle_group_posture();
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::Continue)
             }

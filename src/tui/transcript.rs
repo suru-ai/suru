@@ -74,66 +74,86 @@ const REASONING_ACTIVE_LABEL: &str = "Thinking";
 const REASONING_COMPLETED_LABEL: &str = "Thought";
 const REASONING_FAILED_LABEL: &str = "Thinking interrupted";
 
-/// Which way a Session's Transcript leans before any per-entry override.
+/// Which way a disclosure axis leans before any per-entry override.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) enum FoldPosture {
-    /// Entries are folded unless the reader expanded that one.
+enum DisclosurePosture {
+    /// Entries keep their compact presentation unless the reader opened that
+    /// one.
     #[default]
-    Folded,
-    /// Entries are expanded unless the reader folded that one.
-    Expanded,
+    Closed,
+    /// Entries show everything unless the reader closed that one.
+    Open,
 }
 
-/// One client's Fold state for one Session's Transcript: the posture the view
-/// leans to, plus the entries the reader flipped away from it. Folds are
-/// presentation only, so this never reaches the Session, never syncs between
-/// clients, and dies with the process.
+/// One client's state for one disclosure axis of one Session's Transcript:
+/// the posture the view leans to, plus the entries the reader flipped away
+/// from it. Disclosure is presentation only, so this never reaches the
+/// Session, never syncs between clients, and dies with the process.
 #[derive(Clone, Debug, Default)]
-pub(super) struct TranscriptFolds {
-    posture: FoldPosture,
+struct DisclosureAxis {
+    posture: DisclosurePosture,
     overrides: HashSet<ActivityId>,
 }
 
-impl TranscriptFolds {
-    pub(super) fn is_folded(&self, activity_id: ActivityId) -> bool {
-        (self.posture == FoldPosture::Folded) != self.overrides.contains(&activity_id)
+impl DisclosureAxis {
+    fn is_closed(&self, activity_id: ActivityId) -> bool {
+        (self.posture == DisclosurePosture::Closed) != self.overrides.contains(&activity_id)
     }
 
-    /// Flips the whole view between folded-by-default and expanded-by-default.
+    /// Flips the whole axis between closed-by-default and open-by-default.
     /// Per-entry overrides are dropped so one invocation always reaches a
     /// posture the reader can predict.
-    pub(super) fn toggle_posture(&mut self) {
+    fn toggle_posture(&mut self) {
         self.posture = match self.posture {
-            FoldPosture::Folded => FoldPosture::Expanded,
-            FoldPosture::Expanded => FoldPosture::Folded,
+            DisclosurePosture::Closed => DisclosurePosture::Open,
+            DisclosurePosture::Open => DisclosurePosture::Closed,
         };
         self.overrides.clear();
     }
 
-    pub(super) fn expand(&mut self, activity_id: ActivityId) {
-        self.set_folded(activity_id, false);
-    }
-
-    pub(super) fn fold(&mut self, activity_id: ActivityId) {
-        self.set_folded(activity_id, true);
-    }
-
-    fn set_folded(&mut self, activity_id: ActivityId, folded: bool) {
-        if (self.posture == FoldPosture::Folded) == folded {
+    fn set_closed(&mut self, activity_id: ActivityId, closed: bool) {
+        if (self.posture == DisclosurePosture::Closed) == closed {
             self.overrides.remove(&activity_id);
         } else {
             self.overrides.insert(activity_id);
         }
     }
 
-    /// Digest of the Fold state, so the view cache rebuilds when a Fold
-    /// changes.
+    /// Digest of the axis state, so the view cache rebuilds when it changes.
     fn fingerprint(&self) -> u64 {
         let mut hasher = std::hash::DefaultHasher::new();
         (self.posture as u8).hash(&mut hasher);
         self.overrides.len().hash(&mut hasher);
         activity_id_set_digest(&self.overrides).hash(&mut hasher);
         hasher.finish()
+    }
+}
+
+/// One client's Fold state for one Session's Transcript: an entry whose axis
+/// is closed folds down to its marker. See `DisclosureAxis` for the posture
+/// and locality semantics.
+#[derive(Clone, Debug, Default)]
+pub(super) struct TranscriptFolds(DisclosureAxis);
+
+impl TranscriptFolds {
+    pub(super) fn is_folded(&self, activity_id: ActivityId) -> bool {
+        self.0.is_closed(activity_id)
+    }
+
+    pub(super) fn toggle_posture(&mut self) {
+        self.0.toggle_posture();
+    }
+
+    pub(super) fn expand(&mut self, activity_id: ActivityId) {
+        self.0.set_closed(activity_id, false);
+    }
+
+    pub(super) fn fold(&mut self, activity_id: ActivityId) {
+        self.0.set_closed(activity_id, true);
+    }
+
+    fn fingerprint(&self) -> u64 {
+        self.0.fingerprint()
     }
 }
 
@@ -149,37 +169,31 @@ fn activity_id_set_digest(ids: &HashSet<ActivityId>) -> u64 {
     digest
 }
 
-/// One client's Group state for one Session's Transcript: the Groups the
-/// reader expanded away from the collapsed default, each named by its first
-/// member. Like a Fold, Group state is presentation only, so it never reaches
-/// the Session, never syncs between clients, and dies with the process. The
-/// global Group posture and its toggle arrive with `transcript.groups.toggle`
-/// (#82).
+/// One client's Group state for one Session's Transcript: a Group, named by
+/// its first member, collapses to its single header row while its axis is
+/// closed. See `DisclosureAxis` for the posture and locality semantics.
 #[derive(Clone, Debug, Default)]
-pub(super) struct TranscriptGroups {
-    expanded: HashSet<ActivityId>,
-}
+pub(super) struct TranscriptGroups(DisclosureAxis);
 
 impl TranscriptGroups {
     pub(super) fn is_collapsed(&self, group_id: ActivityId) -> bool {
-        !self.expanded.contains(&group_id)
+        self.0.is_closed(group_id)
+    }
+
+    pub(super) fn toggle_posture(&mut self) {
+        self.0.toggle_posture();
     }
 
     pub(super) fn expand(&mut self, group_id: ActivityId) {
-        self.expanded.insert(group_id);
+        self.0.set_closed(group_id, false);
     }
 
     pub(super) fn collapse(&mut self, group_id: ActivityId) {
-        self.expanded.remove(&group_id);
+        self.0.set_closed(group_id, true);
     }
 
-    /// Digest of the Group state, so the view cache rebuilds when a Group
-    /// flips.
     fn fingerprint(&self) -> u64 {
-        let mut hasher = std::hash::DefaultHasher::new();
-        self.expanded.len().hash(&mut hasher);
-        activity_id_set_digest(&self.expanded).hash(&mut hasher);
-        hasher.finish()
+        self.0.fingerprint()
     }
 }
 
@@ -2289,6 +2303,31 @@ mod tests {
         assert!(
             folds.is_folded(expanded_by_hand) && folds.is_folded(untouched),
             "flipping back folds everything again"
+        );
+    }
+
+    #[test]
+    fn flipping_the_group_posture_drops_the_overrides_taken_against_the_previous_one() {
+        let expanded_by_hand = ActivityId::new();
+        let untouched = ActivityId::new();
+        let mut groups = TranscriptGroups::default();
+        groups.expand(expanded_by_hand);
+        assert!(!groups.is_collapsed(expanded_by_hand));
+        assert!(groups.is_collapsed(untouched));
+
+        groups.toggle_posture();
+
+        assert!(
+            !groups.is_collapsed(expanded_by_hand) && !groups.is_collapsed(untouched),
+            "the expanded posture opens every Group, whatever the reader flipped before"
+        );
+
+        groups.collapse(untouched);
+        assert!(groups.is_collapsed(untouched));
+        groups.toggle_posture();
+        assert!(
+            groups.is_collapsed(expanded_by_hand) && groups.is_collapsed(untouched),
+            "flipping back collapses everything again"
         );
     }
 
