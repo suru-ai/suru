@@ -388,6 +388,13 @@ pub enum FoldPosture {
 }
 
 /// How much Reasoning summary detail a Turn requests from Codex.
+///
+/// Codex resolves a Turn's summary detail as what the Turn asked for or,
+/// failing that, the Model's own default — and every Model in the current
+/// catalog ships that default as `none`. A Turn that states no preference
+/// therefore gets Reasoning with no summary at all: nothing streams and the
+/// completed block carries an empty summary. Suru's default is `auto`, which
+/// lets the Model choose how much to say.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningSummaryDetail {

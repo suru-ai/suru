@@ -18,12 +18,15 @@ use ratatui::{
 };
 use std::time::Duration;
 use suru::{
-    managed_client::{ManagedClient, ManagedClientConfig, SessionEvent, SessionSubscription},
+    managed_client::{
+        ManagedClient, ManagedClientConfig, ManagedEvent, SessionEvent, SessionSubscription,
+    },
     protocol::{
-        Activity, ActivityId, ActivityStatus, CreateSessionRequest, FileChange, InitialPrompt,
-        Message, MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId,
-        PromptOrder, PromptStatus, SessionChange, SessionId, SessionRevision, SessionStatus,
-        SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        Activity, ActivityId, ActivityStatus, CreateSessionRequest, EffectiveSettings, FileChange,
+        FoldPosture, InitialPrompt, Message, MessageId, MessageRole, MessageStatus, Prompt,
+        PromptDelivery, PromptId, PromptOrder, PromptStatus, SessionChange, SessionId,
+        SessionRevision, SessionStatus, SessionUpdate, SettingsSnapshot, TranscriptItem,
+        TranscriptSettings, Turn, TurnId, TurnStatus, Workspace,
     },
     server::{AgentOutput, ServerConfig},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId},
@@ -1936,6 +1939,126 @@ fn toggling_the_fold_posture_expands_every_entry_and_clears_per_entry_overrides(
     assert!(
         refolded.contains("✓ cargo test") && !refolded.contains("output line"),
         "flipping back folds the entry the reader had opened by hand: {refolded}"
+    );
+}
+
+/// A client that received the effective-settings snapshot on connect and then
+/// opened `snapshot`, which is the order the protocol guarantees: the snapshot
+/// is the first event on the lifecycle stream, and attaching a Session takes a
+/// reader's action after that.
+fn session_opened_at(
+    workspace: &std::path::Path,
+    posture: FoldPosture,
+    snapshot: suru::protocol::SessionSnapshot,
+) -> Application {
+    let mut application = connected_application(workspace);
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
+                settings: EffectiveSettings {
+                    transcript: TranscriptSettings {
+                        default_fold_posture: posture,
+                    },
+                    ..EffectiveSettings::default()
+                },
+                pinned: vec!["transcript.defaultFoldPosture".to_owned()],
+                diagnostics: Vec::new(),
+            },
+        )))
+        .expect("receive the effective-settings snapshot");
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("open a Session view under the pinned posture");
+    application
+}
+
+#[test]
+fn the_pinned_default_fold_posture_opens_a_fresh_session_view_expanded() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+
+    let application = session_opened_at(workspace.path(), FoldPosture::Expanded, snapshot);
+
+    let opened = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        opened.contains("output line 6") && !opened.contains("… +"),
+        "the pinned expanded posture opens the view with every Fold expanded: {opened}"
+    );
+}
+
+#[test]
+fn the_folded_default_fold_posture_keeps_a_fresh_session_view_folded() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+
+    let application = session_opened_at(workspace.path(), FoldPosture::Folded, snapshot);
+
+    let opened = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        opened.contains("✓ cargo test") && !opened.contains("output line"),
+        "the folded posture opens the view the way an unpinned Setting does: {opened}"
+    );
+}
+
+#[test]
+fn the_expanded_default_fold_posture_leaves_the_fold_toggle_flipping_as_before() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    let mut application = session_opened_at(workspace.path(), FoldPosture::Expanded, snapshot);
+
+    press_leader_chord(&mut application, 'f');
+    let folded = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        folded.contains("✓ cargo test") && !folded.contains("output line"),
+        "the toggle folds the view away from the pinned posture: {folded}"
+    );
+
+    press_leader_chord(&mut application, 'f');
+    let expanded = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        expanded.contains("output line 6") && !expanded.contains("… +"),
+        "flipping back reaches the expanded posture again: {expanded}"
+    );
+}
+
+#[test]
+fn the_expanded_default_fold_posture_leaves_the_turn_fold_axis_alone() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = settled_turn_session(
+        workspace.path(),
+        "Run the workflow",
+        "The workflow is green.",
+    );
+    let mut application = session_opened_at(workspace.path(), FoldPosture::Expanded, snapshot);
+
+    let opened = rendered_application_rows_at(&application, 80, 36).join("\n");
+    assert!(
+        opened.contains("✓ Worked") && !opened.contains("Reading the workflow"),
+        "the Fold Setting speaks for Folds alone: a settled Turn still stands \
+         as its Turn Fold marker: {opened}"
+    );
+
+    press_leader_chord(&mut application, 't');
+
+    let expanded = rendered_application_rows_at(&application, 80, 36).join("\n");
+    assert!(
+        expanded.contains("Reading the workflow"),
+        "the Turn posture toggle opens every Turn Fold as it did before: {expanded}"
     );
 }
 

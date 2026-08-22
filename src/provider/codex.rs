@@ -21,16 +21,6 @@ use super::ProviderError;
 /// Codex messages are user-visible once they surface as a Provider failure, so they are capped.
 const MAX_REMOTE_ERROR_CHARS: usize = 384;
 
-/// The Reasoning summary detail Suru asks Codex for on every Turn.
-///
-/// Codex resolves a Turn's summary detail as the client's setting or, failing
-/// that, the Model's own default — and every Model in the current catalog ships
-/// that default as `none`. A client that never states a preference therefore
-/// gets Reasoning with no summary at all: nothing streams and the completed
-/// block carries an empty summary. Suru asks for `auto` and lets the Model
-/// choose how much to say. Recorded as a candidate setting in issue #71.
-const REASONING_SUMMARY_DETAIL: &str = "auto";
-
 const REASONING_EFFORT_OPTION_ID: &str = "reasoning_effort";
 const SERVICE_TIER_OPTION_ID: &str = "service_tier";
 const DEFAULT_SERVICE_TIER_CHOICE_ID: &str = "default";

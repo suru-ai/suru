@@ -20,21 +20,23 @@ use tokio::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, REASONING_SUMMARY_DETAIL,
-    SERVICE_TIER_OPTION_ID, codex_error, codex_error_context,
+    DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
+    codex_error, codex_error_context,
     process::{ProcessGuard, ProcessRegistry},
     projection::{NativeCorrelation, provider_events},
     transport::{CodexConnection, JsonRpcTransport},
     wire::{
         ModelListParams, NativeField, NativeModelList, TextInput, ThreadConnectionResult,
         ThreadResumeParams, ThreadStartParams, TurnInterruptParams, TurnStartParams,
-        TurnStartResult, TurnSteerParams, TurnSteerResult, lower_turn_options,
+        TurnStartResult, TurnSteerParams, TurnSteerResult, lower_reasoning_summary,
+        lower_turn_options,
     },
 };
 use crate::{
     protocol::{
-        AgentId, AgentIdentity, AgentSelection, ModelDescriptor, ModelId, ModelOptionChoiceId,
-        ModelOptionId, ModelOptionSelection, ModelOptionValue, ProviderId,
+        AgentId, AgentIdentity, AgentSelection, EffectiveSettings, ModelDescriptor, ModelId,
+        ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue, ProviderId,
+        ReasoningSummaryDetail,
     },
     provider::{
         ProviderError, ProviderFuture, ProviderResumeState, ProviderRuntime, ProviderSession,
@@ -54,6 +56,10 @@ pub struct CodexRuntime {
     processes: ProcessRegistry,
     interrupt_request_timeout: Duration,
     shutdown_interrupt_timeout: Duration,
+    /// The Reasoning summary detail Turns ask for, shared with every Session
+    /// this runtime started so the value each Turn sends is the one in force
+    /// when it starts rather than the one its Session opened with.
+    reasoning_summary: Arc<StdMutex<ReasoningSummaryDetail>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -78,6 +84,7 @@ impl CodexRuntime {
             processes: ProcessRegistry::new(),
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
             shutdown_interrupt_timeout: SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT,
+            reasoning_summary: Arc::new(StdMutex::new(ReasoningSummaryDetail::default())),
         }
     }
 
@@ -135,15 +142,26 @@ impl ProviderRuntime for CodexRuntime {
     ) -> ProviderFuture<'_, ProviderSessionConnection> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
-        let timeouts = SessionTimeouts {
-            interrupt_request: self.interrupt_request_timeout,
-            shutdown_interrupt: self.shutdown_interrupt_timeout,
+        let context = SessionContext {
+            timeouts: SessionTimeouts {
+                interrupt_request: self.interrupt_request_timeout,
+                shutdown_interrupt: self.shutdown_interrupt_timeout,
+            },
+            reasoning_summary: self.reasoning_summary.clone(),
         };
-        Box::pin(async move { start_codex_session(executable, request, processes, timeouts).await })
+        Box::pin(async move { start_codex_session(executable, request, processes, context).await })
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move { self.processes.shutdown().await })
+    }
+
+    fn apply_settings(&self, settings: &EffectiveSettings) {
+        *self
+            .reasoning_summary
+            .lock()
+            .expect("Codex Reasoning summary Setting lock is not poisoned") =
+            settings.provider.codex.reasoning_summary;
     }
 }
 
@@ -205,20 +223,30 @@ struct SessionTimeouts {
     shutdown_interrupt: Duration,
 }
 
+/// What a Session carries over from the [`CodexRuntime`] that started it: the
+/// timeouts it was built with, and the handle on the Server Settings it reads
+/// each Turn from. One value rather than two parameters, because every Server
+/// Setting Codex grows lands here beside the first.
+#[derive(Clone, Debug)]
+struct SessionContext {
+    timeouts: SessionTimeouts,
+    reasoning_summary: Arc<StdMutex<ReasoningSummaryDetail>>,
+}
+
 async fn start_codex_session(
     executable: OsString,
     request: ProviderSessionRequest,
     processes: ProcessRegistry,
-    timeouts: SessionTimeouts,
+    context: SessionContext,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let connection = JsonRpcTransport::launch(&executable, processes).await?;
-    start_codex_thread(connection, request, timeouts).await
+    start_codex_thread(connection, request, context).await
 }
 
 async fn start_codex_thread(
     connection: CodexConnection,
     request: ProviderSessionRequest,
-    timeouts: SessionTimeouts,
+    context: SessionContext,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let CodexConnection {
         transport,
@@ -320,7 +348,7 @@ async fn start_codex_thread(
     let turn_start_changed = Arc::new(Notify::new());
     let session = Arc::new(CodexSession {
         thread_id: started.thread.id,
-        timeouts,
+        context,
         transport,
         correlation: correlation.clone(),
         turn_start_changed,
@@ -345,7 +373,7 @@ async fn start_codex_thread(
 
 struct CodexSession {
     thread_id: String,
-    timeouts: SessionTimeouts,
+    context: SessionContext,
     transport: JsonRpcTransport,
     correlation: Arc<StdMutex<NativeCorrelation>>,
     turn_start_changed: Arc<Notify>,
@@ -366,10 +394,20 @@ impl ProviderSession for CodexSession {
                 }
                 correlation.begin_turn_start()?;
             }
+            // Read here rather than held from Session startup, so the Turn
+            // about to run asks for the detail the Setting names now.
+            let summary = lower_reasoning_summary(
+                *self
+                    .context
+                    .reasoning_summary
+                    .lock()
+                    .expect("Codex Reasoning summary Setting lock is not poisoned"),
+            );
             let task = tokio::spawn(start_native_turn(
                 self.thread_id.clone(),
                 input.prompt,
                 input.selection,
+                summary,
                 self.transport.clone(),
                 self.correlation.clone(),
                 self.turn_start_changed.clone(),
@@ -431,7 +469,7 @@ impl ProviderSession for CodexSession {
                         thread_id: &self.thread_id,
                         turn_id: &turn_id,
                     },
-                    self.timeouts.interrupt_request,
+                    self.context.timeouts.interrupt_request,
                 )
                 .await
                 .map_err(|error| codex_error_context("Codex Turn interruption failed", error))?;
@@ -463,7 +501,7 @@ impl ProviderSession for CodexSession {
             }
             if let Some(turn_id) = active_turn_id {
                 let _ = timeout(
-                    self.timeouts.shutdown_interrupt,
+                    self.context.timeouts.shutdown_interrupt,
                     self.transport.request(
                         "turn/interrupt",
                         &TurnInterruptParams {
@@ -486,6 +524,7 @@ async fn start_native_turn(
     thread_id: String,
     prompt: String,
     selection: AgentSelection,
+    summary: &'static str,
     transport: JsonRpcTransport,
     correlation: Arc<StdMutex<NativeCorrelation>>,
     turn_start_changed: Arc<Notify>,
@@ -502,7 +541,7 @@ async fn start_native_turn(
                         text: &prompt,
                     }],
                     model: selection.model.as_str(),
-                    summary: REASONING_SUMMARY_DETAIL,
+                    summary,
                     effort: options.effort,
                     service_tier: options.service_tier,
                 },

@@ -146,6 +146,78 @@ const PERSISTED_RESUME_CODEX: &str = r#"
       ;;
 "#;
 
+const REASONING_SUMMARY_CODEX: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"summary-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"summary-turn"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"summary-thread","turn":{"id":"summary-turn","status":"completed","items":[]}}}'
+      ;;
+"#;
+
+#[tokio::test]
+async fn the_pinned_reasoning_summary_setting_is_what_a_turn_asks_codex_for() {
+    let fixture = ScriptedCodex::new_multiprocess(REASONING_SUMMARY_CODEX);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            // Say as much about the thinking as the Model will.
+            "provider": { "codex": { "reasoningSummary": "detailed" } },
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-reasoning-summary")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-reasoning-summary")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Explain the pinned Setting".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+
+    fixture.wait_for_method("turn/start").await;
+
+    let requests = fixture.requests();
+    let started = requests
+        .iter()
+        .find(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
+        .expect("the Turn reached Codex");
+    assert_eq!(
+        started["params"]["summary"], "detailed",
+        "the Turn asks Codex for the Reasoning summary detail the Config Document pinned"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
 #[tokio::test]
 async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     let fixture = ScriptedCodex::new(SCRIPTED_CODEX);
@@ -478,7 +550,8 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     assert_eq!(requests[3]["params"]["model"], "gpt-fixture");
     assert_eq!(
         requests[3]["params"]["summary"], "auto",
-        "Codex only summarizes its Reasoning when a Turn asks it to"
+        "with the Reasoning summary Setting unpinned a Turn asks for its \
+         built-in default, because Codex only summarizes when asked to"
     );
 
     drop(feed);

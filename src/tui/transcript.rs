@@ -42,8 +42,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     ansi::{AnsiScanner, FragmentRole, sgr_parameter_code, sgr_parameters},
     protocol::{
-        Activity, ActivityId, FileChange, InitialPrompt, Message, MessageId, MessageRole, PromptId,
-        SessionId, SessionRevision, SessionSnapshot, TranscriptItem, Turn, TurnId, TurnStatus,
+        Activity, ActivityId, FileChange, FoldPosture, InitialPrompt, Message, MessageId,
+        MessageRole, PromptId, SessionId, SessionRevision, SessionSnapshot, TranscriptItem, Turn,
+        TurnId, TurnStatus,
     },
     theme::Theme,
 };
@@ -96,6 +97,17 @@ enum DisclosurePosture {
     Closed,
     /// Entries show everything unless the reader closed that one.
     Open,
+}
+
+/// The Fold axis is the one a Setting speaks for, so the posture a Session
+/// view opens at is stated in the protocol's terms and lowered here.
+impl From<FoldPosture> for DisclosurePosture {
+    fn from(posture: FoldPosture) -> Self {
+        match posture {
+            FoldPosture::Folded => Self::Closed,
+            FoldPosture::Expanded => Self::Open,
+        }
+    }
 }
 
 /// One client's state for one disclosure axis of one Session's Transcript:
@@ -197,6 +209,16 @@ pub(super) struct TranscriptFolds {
 }
 
 impl TranscriptFolds {
+    /// A fresh Session view's Fold state: nothing the reader has touched yet,
+    /// leaning the way the `transcript.defaultFoldPosture` Setting says a view
+    /// opens.
+    pub(super) fn opening_at(posture: FoldPosture) -> Self {
+        Self {
+            posture: posture.into(),
+            overrides: HashMap::new(),
+        }
+    }
+
     /// The step an entry presents at: the reader's override if they set one,
     /// otherwise `default` under the closed posture and everything under the
     /// open one. The default is the entry's own because it depends on what the

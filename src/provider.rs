@@ -7,8 +7,8 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::protocol::{
-    AgentIdentity, AgentSelection, FileChange, ModelDescriptor, ModelOptionKind, ModelOptionRole,
-    ProviderId, SessionId,
+    AgentIdentity, AgentSelection, EffectiveSettings, FileChange, ModelDescriptor, ModelOptionKind,
+    ModelOptionRole, ProviderId, SessionId,
 };
 
 mod codex;
@@ -210,6 +210,17 @@ pub trait ProviderRuntime: Send + Sync + 'static {
 
     /// Stops in-progress Session startups and releases runtime-owned resources.
     fn shutdown(&self) -> ProviderFuture<'_, ()>;
+
+    /// Hands the runtime the effective Settings. A runtime honors the Server
+    /// Settings under its own `provider.<id>` key and ignores the rest, and it
+    /// reads them when it acts rather than when a Session began, so a Setting
+    /// that changes mid-run governs the next Turn rather than only the next
+    /// Session. Startup is the only caller today; Setting mutations and a
+    /// Config Document watcher hand over a replaced view the same way.
+    /// Runtimes that honor no Setting need not implement it.
+    fn apply_settings(&self, settings: &EffectiveSettings) {
+        let _ = settings;
+    }
 }
 
 pub(crate) fn validate_models(models: &[ModelDescriptor]) -> Result<(), ProviderError> {

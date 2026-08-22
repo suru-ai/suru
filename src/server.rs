@@ -342,6 +342,10 @@ pub async fn spawn_with_provider_and_timings(
 
     let settings = crate::settings::load(config.config_dir());
     crate::settings::log_diagnostics(&settings.diagnostics);
+    // Before any Session starts, so the first Turn already runs under the
+    // Server Settings the Config Documents pinned. A mutation — or a future
+    // Config Document watcher — hands the runtime the new view the same way.
+    runtime.apply_settings(&settings.settings);
     let (settings, _) = watch::channel(settings);
 
     let repository = StorageRepository::open(config.data_dir())

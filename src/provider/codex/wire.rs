@@ -14,7 +14,7 @@ use crate::{
     protocol::{
         AgentSelection, FileChange, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
         ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
-        ModelOptionRole, ModelOptionValue, ProviderId,
+        ModelOptionRole, ModelOptionValue, ProviderId, ReasoningSummaryDetail,
     },
     provider::ProviderError,
 };
@@ -361,6 +361,19 @@ where
             serializer.serialize_none()
         }
         NativeServiceTierOverride::Value(value) => serializer.serialize_str(value),
+    }
+}
+
+/// Lowers the Reasoning summary Setting onto the value Codex names it by. The
+/// two vocabularies agree today, which is why the Setting's accepted values
+/// are what they are, but the mapping stays explicit so a rename on either
+/// side is caught here rather than silently sent on the wire.
+pub(super) fn lower_reasoning_summary(detail: ReasoningSummaryDetail) -> &'static str {
+    match detail {
+        ReasoningSummaryDetail::Auto => "auto",
+        ReasoningSummaryDetail::Concise => "concise",
+        ReasoningSummaryDetail::Detailed => "detailed",
+        ReasoningSummaryDetail::None => "none",
     }
 }
 

@@ -15,9 +15,10 @@ use crate::{
     managed_client::{ManagedEvent, RecoveryStatus, SessionEvent, SessionProjection},
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, AgentSelection, AgentSelectionOperationId,
-        CreateSessionRequest, InitialPrompt, MessageId, ModelCatalog, PromptDelivery, PromptId,
-        PromptStatus, ServerIdentity, SessionChange, SessionId, SessionListItem, SessionSnapshot,
-        SessionStatus, ShutdownReason, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        CreateSessionRequest, EffectiveSettings, FoldPosture, InitialPrompt, MessageId,
+        ModelCatalog, PromptDelivery, PromptId, PromptStatus, ServerIdentity, SessionChange,
+        SessionId, SessionListItem, SessionSnapshot, SessionStatus, ShutdownReason, TurnId,
+        TurnStatus, UpdateAgentSelectionRequest, Workspace,
     },
     theme::Theme,
 };
@@ -113,13 +114,16 @@ pub(super) struct SessionInteraction {
     pub(super) turns: RefCell<TranscriptTurnFolds>,
 }
 
-impl Default for SessionInteraction {
-    fn default() -> Self {
+impl SessionInteraction {
+    /// A Session view the reader has not touched yet. Only the Fold axis takes
+    /// its opening posture from a Setting; the Group and Turn Fold axes have
+    /// no Setting of their own and always open closed.
+    fn opening_at(fold_posture: FoldPosture) -> Self {
         Self {
             follow_latest: Cell::new(true),
             anchor: Cell::new(None),
             viewport: RefCell::new(None),
-            folds: RefCell::new(TranscriptFolds::default()),
+            folds: RefCell::new(TranscriptFolds::opening_at(fold_posture)),
             groups: RefCell::new(TranscriptGroups::default()),
             turns: RefCell::new(TranscriptTurnFolds::default()),
         }
@@ -192,6 +196,10 @@ pub struct TuiState {
     pub(super) workspace: PathBuf,
     pub(super) composers: ComposerMemory,
     session_interactions: HashMap<SessionId, SessionInteraction>,
+    /// The effective value of every Setting, as the server last pushed it.
+    /// Client Settings govern presentation from here. The snapshot leads the
+    /// lifecycle stream, so it is in hand before any Session view opens.
+    settings: EffectiveSettings,
     pub(super) transcript_cache: TranscriptCache,
     /// Bumped whenever the Session projection is replaced wholesale, so the
     /// transcript cache never trusts a revision across snapshot swaps.
@@ -287,6 +295,7 @@ impl TuiState {
             workspace: workspace.clone(),
             composers: ComposerMemory::default(),
             session_interactions: HashMap::new(),
+            settings: EffectiveSettings::default(),
             transcript_cache: TranscriptCache::default(),
             transcript_generation: 0,
             spinner_frame: 0,
@@ -387,9 +396,11 @@ impl TuiState {
                 self.manually_stopped = false;
                 self.fatal_error = None;
             }
-            ManagedEvent::SettingsSnapshot(_) => {
-                // No Setting governs client presentation yet; the slice
-                // Settings take effect in a follow-up.
+            ManagedEvent::SettingsSnapshot(snapshot) => {
+                // Session views already open keep the posture they opened at:
+                // a default is what a view starts from, not something that
+                // reaches back and moves what the reader is looking at.
+                self.settings = snapshot.settings;
             }
             ManagedEvent::Recovering(status) => {
                 if self.recovery.is_none() {
@@ -540,9 +551,7 @@ impl TuiState {
     }
 
     fn hydrate_session(&mut self, snapshot: SessionSnapshot) {
-        self.session_interactions
-            .entry(snapshot.session.id)
-            .or_default();
+        self.ensure_interaction(snapshot.session.id);
         self.submission_error = None;
         self.session = Some(SessionProjection::new(snapshot));
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
@@ -681,11 +690,22 @@ impl TuiState {
         interaction.anchor.set(anchor);
     }
 
+    /// One Session's interaction state, opened at the posture the Settings ask
+    /// for if this is the first thing to reach for it. Rendering reads it back
+    /// expecting it to be there, so hydrating a Session view calls this before
+    /// the first frame.
+    fn ensure_interaction(&mut self, session_id: SessionId) -> &mut SessionInteraction {
+        let fold_posture = self.settings.transcript.default_fold_posture;
+        self.session_interactions
+            .entry(session_id)
+            .or_insert_with(|| SessionInteraction::opening_at(fold_posture))
+    }
+
     /// The attached Session's interaction state, created if this is the first
     /// thing to reach for it.
     fn current_interaction(&mut self) -> Option<&SessionInteraction> {
         let session_id = self.session.as_ref().map(SessionProjection::session_id)?;
-        Some(self.session_interactions.entry(session_id).or_default())
+        Some(self.ensure_interaction(session_id))
     }
 
     /// Toggles the disclosure of the unit drawn at `screen_row`: the Fold of
@@ -847,7 +867,7 @@ impl TuiState {
         let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id) else {
             return;
         };
-        let interaction = self.session_interactions.entry(session_id).or_default();
+        let interaction = self.ensure_interaction(session_id);
         interaction.follow_latest.set(true);
         interaction.anchor.set(None);
     }
