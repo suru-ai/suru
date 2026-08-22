@@ -2,6 +2,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::protocol::TurnId;
+
 const AUTOCOMPLETE_LIMIT: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -20,9 +22,48 @@ pub enum SemanticCommandId {
     SessionNew,
     TranscriptFoldsToggle,
     TranscriptGroupsToggle,
+    TranscriptTurnToggle,
+    TranscriptTurnsToggle,
+}
+
+/// What a semantic command acts on. Most act on the view as a whole; one that
+/// names a subject carries it here rather than letting the surface that
+/// invoked it reach into view state itself, so a click, a keybinding, and a
+/// future plugin all drive the very same command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SemanticSubject {
+    View,
+    Turn(TurnId),
+}
+
+/// One invocation of a semantic command: which command, and what it acts on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SemanticInvocation {
+    pub(super) id: SemanticCommandId,
+    pub(super) subject: SemanticSubject,
+}
+
+/// A bare command ID is an invocation against the view as a whole, which is
+/// what every command that names no subject means.
+impl From<SemanticCommandId> for SemanticInvocation {
+    fn from(id: SemanticCommandId) -> Self {
+        Self {
+            id,
+            subject: SemanticSubject::View,
+        }
+    }
 }
 
 impl SemanticCommandId {
+    /// This command invoked against one Turn, which is what a reader asks for
+    /// by clicking that Turn's Fold marker.
+    pub(super) const fn on_turn(self, turn_id: TurnId) -> SemanticInvocation {
+        SemanticInvocation {
+            id: self,
+            subject: SemanticSubject::Turn(turn_id),
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ApplicationExit => "application.exit",
@@ -39,6 +80,8 @@ impl SemanticCommandId {
             Self::SessionNew => "session.new",
             Self::TranscriptFoldsToggle => "transcript.folds.toggle",
             Self::TranscriptGroupsToggle => "transcript.groups.toggle",
+            Self::TranscriptTurnToggle => "transcript.turn.fold.toggle",
+            Self::TranscriptTurnsToggle => "transcript.turns.toggle",
         }
     }
 }
@@ -202,6 +245,28 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             code: KeyCode::Char('g'),
             modifiers: KeyModifiers::NONE,
             label: "Ctrl+X G",
+        }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::TranscriptTurnToggle,
+        title: "Toggle Turn Fold",
+        description: "Fold one settled Turn to its marker, or open the work behind it",
+        // The command names the Turn it acts on, so it is invoked from that
+        // Turn's marker rather than from a key or a slash that would have no
+        // way to say which Turn it meant.
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::TranscriptTurnsToggle,
+        title: "Toggle Turn Folds",
+        description: "Open every settled Turn's Fold, or fold them back down",
+        slash: None,
+        keybinding: Some(SemanticKeybinding {
+            prefix: Some(LEADER_PREFIX),
+            code: KeyCode::Char('t'),
+            modifiers: KeyModifiers::NONE,
+            label: "Ctrl+X T",
         }),
     },
     SemanticCommandDescriptor {

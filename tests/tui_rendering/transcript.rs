@@ -3394,21 +3394,11 @@ fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
 #[test]
 fn a_settled_turn_renders_as_one_marker_between_its_prompt_and_its_answer() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let mut snapshot = command_run_snapshot(
-        SessionId::new(),
+    let snapshot = settled_turn_session(
         workspace.path(),
-        &[
-            RunEntry::UserMessage("Run the workflow"),
-            SUCCESSFUL_COMMAND,
-            SUCCESSFUL_COMMAND,
-            RunEntry::Reasoning("Reading the workflow"),
-            RunEntry::AgentMessage("The workflow is green."),
-        ],
+        "Run the workflow",
+        "The workflow is green.",
     );
-    // The reader has stopped watching: the Turn settled and the Session went
-    // back to idle.
-    snapshot.session.status = SessionStatus::Idle;
-    snapshot.turns[0].status = TurnStatus::Completed;
     let mut application = connected_application(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
@@ -3433,6 +3423,205 @@ fn a_settled_turn_renders_as_one_marker_between_its_prompt_and_its_answer() {
              {rows}"
         );
     }
+}
+
+/// A Session whose Turn settled after doing work worth folding away: the
+/// fixture every Turn Fold interaction test drives.
+fn settled_turn_session(
+    workspace: &std::path::Path,
+    prompt: &'static str,
+    answer: &'static str,
+) -> suru::protocol::SessionSnapshot {
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace,
+        &[
+            RunEntry::UserMessage(prompt),
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            RunEntry::Reasoning("Reading the workflow"),
+            RunEntry::AgentMessage(answer),
+        ],
+    );
+    // The reader has stopped watching: the Turn settled and the Session went
+    // back to idle.
+    snapshot.session.status = SessionStatus::Idle;
+    snapshot.turns[0].status = TurnStatus::Completed;
+    snapshot
+}
+
+/// Appends a second settled Turn to `snapshot`, so a test can watch what one
+/// Turn Fold does to the Turns around it.
+fn append_settled_turn(
+    snapshot: &mut suru::protocol::SessionSnapshot,
+    prompt: &str,
+    reasoning: &str,
+    answer: &str,
+) {
+    let turn_id = TurnId::new();
+    snapshot.turns.push(Turn {
+        id: turn_id,
+        prompt_id: PromptId::new(),
+        agent: None,
+        status: TurnStatus::Completed,
+        started_at: None,
+        settled_at: None,
+    });
+    for (role, content) in [(MessageRole::User, prompt), (MessageRole::Agent, answer)] {
+        let message = Message {
+            id: MessageId::new(),
+            turn_id,
+            role,
+            status: MessageStatus::Completed,
+            content: content.to_owned(),
+            truncated: false,
+        };
+        if role == MessageRole::Agent {
+            let activity = Activity::Reasoning {
+                id: ActivityId::new(),
+                turn_id,
+                status: ActivityStatus::Completed,
+                title: Some(reasoning.to_owned()),
+                content: "Weighed the options.".to_owned(),
+                content_truncated: false,
+                duration_ms: None,
+            };
+            snapshot.transcript.push(TranscriptItem::Activity {
+                activity_id: activity.id(),
+            });
+            snapshot.activities.push(activity);
+        }
+        snapshot.transcript.push(TranscriptItem::Message {
+            message_id: message.id,
+        });
+        snapshot.messages.push(message);
+    }
+}
+
+#[test]
+fn clicking_a_turn_fold_marker_opens_the_turn_and_folds_it_back() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = settled_turn_session(
+        workspace.path(),
+        "Run the workflow",
+        "The workflow is green.",
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Turn has settled");
+    let folded_rows = rendered_application_rows_at(&application, 80, 24);
+
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&folded_rows, "✓ Worked") as u16))
+        .expect("click the Turn Fold marker");
+
+    let expanded_rows = rendered_application_rows_at(&application, 80, 24);
+    let expanded = expanded_rows.join("\n");
+    for revealed in ["Ran 2 commands", "Reading the workflow"] {
+        assert!(
+            expanded.contains(revealed),
+            "clicking the marker reveals the work the Turn Fold hid, but {revealed:?} is \
+             missing: {expanded}"
+        );
+    }
+    assert!(
+        expanded.contains("✓ Worked"),
+        "the marker stays as the row the Turn folds back from: {expanded}"
+    );
+    assert_eq!(
+        rendered_row(&expanded_rows, "✓ Worked"),
+        rendered_row(&folded_rows, "✓ Worked"),
+        "the Turn's entries open below the marker, so the row the reader clicked stays put"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&expanded_rows, "The workflow is green.") as u16,
+        ))
+        .expect("click the Transcript's output body");
+
+    assert_eq!(
+        rendered_application_rows_at(&application, 80, 24),
+        expanded_rows,
+        "clicking Transcript body text changes nothing"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&expanded_rows, "✓ Worked") as u16
+        ))
+        .expect("click the Turn Fold marker again");
+
+    let refolded = rendered_application_rows_at(&application, 80, 24).join("\n");
+    for hidden in ["Ran 2 commands", "Reading the workflow"] {
+        assert!(
+            !refolded.contains(hidden),
+            "clicking the marker again folds the Turn back, but {hidden:?} rendered: {refolded}"
+        );
+    }
+    assert!(
+        refolded.contains("✓ Worked") && refolded.contains("The workflow is green."),
+        "the folded Turn is its marker and its answer again: {refolded}"
+    );
+}
+
+#[test]
+fn toggling_the_turn_posture_flips_every_turn_fold_and_clears_per_turn_overrides() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut snapshot = settled_turn_session(
+        workspace.path(),
+        "Run the workflow",
+        "The workflow is green.",
+    );
+    append_settled_turn(
+        &mut snapshot,
+        "Now ship it",
+        "Checking the release notes",
+        "Shipped.",
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with two settled Turns");
+    let folded_rows = rendered_application_rows_at(&application, 80, 36);
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&folded_rows, "✓ Worked") as u16))
+        .expect("expand the first Turn by hand");
+
+    press_leader_chord(&mut application, 't');
+
+    let expanded = rendered_application_rows_at(&application, 80, 36).join("\n");
+    for revealed in [
+        "Ran 2 commands",
+        "Reading the workflow",
+        "Checking the release notes",
+    ] {
+        assert!(
+            expanded.contains(revealed),
+            "the expanded posture opens every Turn Fold, but {revealed:?} is missing: {expanded}"
+        );
+    }
+
+    press_leader_chord(&mut application, 't');
+
+    let refolded = rendered_application_rows_at(&application, 80, 36).join("\n");
+    for hidden in [
+        "Ran 2 commands",
+        "Reading the workflow",
+        "Checking the release notes",
+    ] {
+        assert!(
+            !refolded.contains(hidden),
+            "flipping back folds even the Turn the reader expanded by hand, but {hidden:?} \
+             rendered: {refolded}"
+        );
+    }
+    assert_eq!(
+        refolded.matches("✓ Worked").count(),
+        2,
+        "both Turns stand as their markers again: {refolded}"
+    );
 }
 
 #[test]

@@ -137,6 +137,12 @@ impl<Id: Copy + Eq + Hash> DisclosureAxis<Id> {
         self.overrides.clear();
     }
 
+    /// Flips one entry between the axis's two steps, whichever way the reader
+    /// left it.
+    fn toggle(&mut self, id: Id) {
+        self.set_closed(id, !self.is_closed(id));
+    }
+
     fn set_closed(&mut self, id: Id, closed: bool) {
         if (self.posture == DisclosurePosture::Closed) == closed {
             self.overrides.remove(&id);
@@ -294,14 +300,22 @@ impl TranscriptTurnFolds {
         self.0.is_closed(turn_id)
     }
 
-    // The posture toggle and the per-Turn flips below reach the Transcript
-    // with the Turn Fold's interaction and lifecycle:
-    // <https://github.com/jake-tucker/suru/issues/88>.
-    #[allow(dead_code)]
+    /// Flips the whole axis between folded-by-default and expanded-by-default.
+    /// Per-Turn flips are dropped so one invocation always reaches a posture
+    /// the reader can predict.
     pub(super) fn toggle_posture(&mut self) {
         self.0.toggle_posture();
     }
 
+    /// Flips one Turn between its marker and the work behind it, which is what
+    /// a reader asks for by clicking that marker.
+    pub(super) fn toggle(&mut self, turn_id: TurnId) {
+        self.0.toggle(turn_id);
+    }
+
+    // The one-way flips below reach the Transcript with the Turn Fold's
+    // lifecycle — an interrupt opens a Turn, a newer Turn folds the older ones
+    // back: <https://github.com/jake-tucker/suru/issues/89>.
     #[allow(dead_code)]
     pub(super) fn expand(&mut self, turn_id: TurnId) {
         self.0.set_closed(turn_id, false);
@@ -614,12 +628,14 @@ impl RenderUnit<'_> {
                 hasher.finish()
             }
             // A Turn Fold's marker says how the Turn settled and how long it
-            // took, so those two are the whole of its rendering input; which
-            // Turn it stands for is already its key.
+            // took, and answers a click by how its fold stands, so those three
+            // are the whole of its rendering input; which Turn it stands for is
+            // already its key.
             Self::TurnFold(marker) => {
                 let mut hasher = std::hash::DefaultHasher::new();
                 (marker.outcome as u64).hash(&mut hasher);
                 marker.duration_ms.hash(&mut hasher);
+                marker.folded.hash(&mut hasher);
                 hasher.finish()
             }
             // A provisional prompt's text only grows and carries no Fold, so
@@ -801,8 +817,11 @@ impl SettledTurn {
     }
 }
 
-/// The marker one folded Turn stands as: which Turn it speaks for, how that
-/// Turn settled, and how long it took to get there.
+/// The marker one settled Turn's fold stands as: which Turn it speaks for, how
+/// that Turn settled, how long it took to get there, and whether its fold is
+/// closed as drawn. The marker outlives the fold closing, because it is the row
+/// the reader clicks in both directions — folded it stands for the work, and
+/// expanded it heads the work it opened onto.
 #[derive(Clone, Copy, Debug)]
 struct TurnMarker {
     turn_id: TurnId,
@@ -810,16 +829,18 @@ struct TurnMarker {
     /// How long the Turn ran, or `None` when it is missing either of its
     /// timestamps — which is every Turn stored before Suru recorded them.
     duration_ms: Option<u64>,
+    folded: bool,
 }
 
 impl TurnMarker {
     /// The marker a Turn would stand as, or `None` while it is still Active:
     /// a marker only ever speaks for a Turn that has settled.
-    fn of(turn: &Turn) -> Option<Self> {
+    fn of(turn: &Turn, folded: bool) -> Option<Self> {
         SettledTurn::of(turn.status).map(|outcome| Self {
             turn_id: turn.id,
             outcome,
             duration_ms: turn_duration_ms(turn),
+            folded,
         })
     }
 
@@ -944,40 +965,44 @@ impl TranscriptEntry<'_> {
     }
 }
 
-/// What each folded Turn hides, decided in one pass over the Transcript so the
-/// unit walk only has to ask by position. A Turn Fold keys on the Turn's
-/// Settle rather than on entry adjacency, so it is answered here rather than
-/// inside the walk that gathers adjacent entries into Groups.
+/// What each settled Turn's fold covers, decided in one pass over the
+/// Transcript so the unit walk only has to ask by position. A Turn Fold keys on
+/// the Turn's Settle rather than on entry adjacency, so it is answered here
+/// rather than inside the walk that gathers adjacent entries into Groups.
 #[derive(Debug, Default)]
 struct TurnFolding {
     /// Whether the entry at each Transcript position is hidden by its Turn's
-    /// fold.
+    /// fold, which only a closed fold does.
     hidden: Vec<bool>,
     /// The Turn whose marker stands at a Transcript position, which is the
-    /// position of the first entry that Turn hides, or of its final agent
-    /// Message when every hidden entry trails that — so the marker stands
-    /// where the hidden work happened without ever falling past the answer.
-    /// A Turn that hides nothing has no entry here, which is how a marker
-    /// that would disclose nothing is suppressed.
+    /// position of the first entry that Turn's fold covers, or of its final
+    /// agent Message when every covered entry trails that — so the marker
+    /// stands where the hidden work happened without ever falling past the
+    /// answer. A marker stands in the same place open or closed, so expanding
+    /// a Turn never moves the row the reader clicked. A Turn whose fold covers
+    /// nothing has no entry here, which is how a marker that would disclose
+    /// nothing is suppressed.
     markers: HashMap<usize, TurnMarker>,
 }
 
 impl TurnFolding {
-    /// Decides every folded Turn's fold from the Transcript and the client's
-    /// axis. Only settled Turns the reader has left folded take part; an
-    /// Active Turn and an expanded one alike project every entry they own.
+    /// Decides every settled Turn's fold from the Transcript and the client's
+    /// axis. Every settled Turn takes part, because a Turn the reader expanded
+    /// still shows the marker it folds back from; only an Active Turn has no
+    /// fold at all. Which of them hide their work is the axis's answer alone.
     fn plan(
         snapshot: &SessionSnapshot,
         content: &TranscriptContent<'_>,
         axis: &TranscriptTurnFolds,
     ) -> Self {
-        let folded: HashMap<TurnId, TurnMarker> = snapshot
+        let settled: HashMap<TurnId, TurnMarker> = snapshot
             .turns
             .iter()
-            .filter(|turn| axis.is_folded(turn.id))
-            .filter_map(|turn| TurnMarker::of(turn).map(|marker| (turn.id, marker)))
+            .filter_map(|turn| {
+                TurnMarker::of(turn, axis.is_folded(turn.id)).map(|marker| (turn.id, marker))
+            })
             .collect();
-        if folded.is_empty() {
+        if settled.is_empty() {
             return Self::default();
         }
         let mut entries: Vec<Option<TurnEntry>> = Vec::with_capacity(snapshot.transcript.len());
@@ -987,7 +1012,7 @@ impl TurnFolding {
             // nothing, so it is not one of the entries a fold decides about.
             let entry = content.entry(item).map(TranscriptEntry::in_turn);
             if let Some(entry) = entry
-                && folded.contains_key(&entry.turn_id)
+                && settled.contains_key(&entry.turn_id)
             {
                 positions.entry(entry.turn_id).or_default().push(position);
             }
@@ -996,7 +1021,7 @@ impl TurnFolding {
         let mut hidden = vec![false; snapshot.transcript.len()];
         let mut markers = HashMap::new();
         for (turn_id, positions) in positions {
-            let turn_marker = folded[&turn_id];
+            let turn_marker = settled[&turn_id];
             let role_at = |position: usize| entries[position].map(|entry| entry.role);
             let final_agent_message = positions
                 .iter()
@@ -1024,7 +1049,9 @@ impl TurnFolding {
                 {
                     continue;
                 }
-                hidden[position] = true;
+                // What the fold covers is the same whichever way the reader
+                // left it; only a closed one hides what it covers.
+                hidden[position] = turn_marker.folded;
                 marker.get_or_insert(position);
             }
             if let Some(position) = marker {
@@ -1677,10 +1704,11 @@ fn render_group(
     UnitAnchor::binary(1, !expanded)
 }
 
-/// Projects a Turn Fold's marker: the single row a settled Turn stands as,
-/// drawn in the settled Activity-header idiom with the outcome word styled as
-/// the toggle affordance it is. The marker only exists when the fold hides
-/// something, so it always reports as holding content back.
+/// Projects a Turn Fold's marker: the row a settled Turn stands as, drawn in
+/// the settled Activity-header idiom with the outcome word styled as the toggle
+/// affordance it is. The marker only exists when its fold covers something, so
+/// closed it reports as holding content back; open it is the header the Turn
+/// folds back from, exactly as a Group's header is.
 fn render_turn_fold(
     lines: &mut Vec<Line<'static>>,
     marker: TurnMarker,
@@ -1695,7 +1723,7 @@ fn render_turn_fold(
         Span::styled(format!("  {glyph}"), style),
         Span::styled(marker.label(), theme.action.primary),
     ]));
-    UnitAnchor::binary(1, true)
+    UnitAnchor::binary(1, marker.folded)
 }
 
 struct ActivityProjection<'a> {
@@ -2633,7 +2661,7 @@ mod tests {
     use super::{
         CappedStream, FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, TranscriptCache,
         TranscriptDisclosure, TranscriptFolds, TranscriptGroups, TranscriptTurnFolds,
-        TranscriptView, UnitKey, render_activity, render_message, split_oversized_line,
+        TranscriptView, UnitKey, UnitStart, render_activity, render_message, split_oversized_line,
         wrapped_line_count,
     };
 
@@ -3841,13 +3869,14 @@ mod tests {
 
     #[test]
     fn a_turn_that_hides_nothing_shows_no_marker() {
-        let (snapshot, _) = turn_snapshot(vec![(
+        let (snapshot, turn_ids) = turn_snapshot(vec![(
             TurnStatus::Completed,
             vec![
                 Entry::Message(user_message("say hello")),
                 Entry::Message(agent_message("Hello.")),
             ],
         )]);
+        let mut turns = TranscriptTurnFolds::default();
 
         let rows = projected_rows(
             &snapshot,
@@ -3859,6 +3888,20 @@ mod tests {
             rows,
             ["┃ say hello", "", "  Hello."],
             "a marker that discloses nothing is noise"
+        );
+
+        turns.toggle(turn_ids[0]);
+        let expanded = projected_rows_through(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+            &turns,
+        );
+
+        assert_eq!(
+            expanded, rows,
+            "a suppressed marker stays suppressed however the reader left the axis: there is \
+             nothing for it to open onto"
         );
     }
 
@@ -3948,6 +3991,7 @@ mod tests {
             [
                 "┃ tidy the tree",
                 "",
+                "  ✓ Worked",
                 "  ✓ Ran 2 commands",
                 "    ✓ cargo fmt",
                 "      reformatted 1 file",
@@ -3993,6 +4037,7 @@ mod tests {
                 "",
                 "┃ now ship it",
                 "",
+                "  ✓ Worked",
                 "  Preparing the workspace",
                 "  ✓ cargo test",
                 "",
@@ -4049,6 +4094,70 @@ mod tests {
             turns.is_folded(expanded_by_hand) && turns.is_folded(untouched),
             "flipping back folds every Turn again"
         );
+    }
+
+    #[test]
+    fn an_expanded_turn_keeps_the_marker_row_that_folds_it_back() {
+        let mut entries = vec![Entry::Message(user_message("run the tests"))];
+        entries.extend(hidden_work());
+        entries.push(Entry::Message(agent_message("All green.")));
+        let (snapshot, turn_ids) = turn_snapshot(vec![(TurnStatus::Completed, entries)]);
+        let cache = TranscriptCache::default();
+        let folds = TranscriptFolds::default();
+        let groups = TranscriptGroups::default();
+        let mut turns = TranscriptTurnFolds::default();
+        let folded = turn_fold_start(
+            &projected_view_through(&cache, &snapshot, &folds, &groups, &turns),
+            turn_ids[0],
+        );
+
+        turns.toggle(turn_ids[0]);
+        let expanded = turn_fold_start(
+            &projected_view_through(&cache, &snapshot, &folds, &groups, &turns),
+            turn_ids[0],
+        );
+
+        assert!(
+            folded.hides_content && !expanded.hides_content,
+            "the marker holds the Turn's work back folded and heads it expanded: \
+             {folded:?} then {expanded:?}"
+        );
+        assert_eq!(
+            folded.row, expanded.row,
+            "expanding reveals the Turn's entries at the marker's position, so the row the \
+             reader clicked never moves under them"
+        );
+    }
+
+    #[test]
+    fn toggling_one_turn_fold_leaves_every_other_turn_where_it_was() {
+        let clicked = TurnId::new();
+        let untouched = TurnId::new();
+        let mut turns = TranscriptTurnFolds::default();
+
+        turns.toggle(clicked);
+
+        assert!(
+            !turns.is_folded(clicked) && turns.is_folded(untouched),
+            "a toggle answers for the one Turn it names"
+        );
+
+        turns.toggle(clicked);
+
+        assert!(
+            turns.is_folded(clicked),
+            "toggling the same Turn again folds it back"
+        );
+    }
+
+    /// The click target a Turn's marker projects, for the tests that read what
+    /// a pointer landing on it would find.
+    fn turn_fold_start(view: &TranscriptView, turn_id: TurnId) -> UnitStart {
+        view.unit_starts()
+            .iter()
+            .copied()
+            .find(|start| start.key == UnitKey::TurnFold(turn_id))
+            .expect("a settled Turn with hidden work projects its marker")
     }
 
     /// Projects a Transcript and hands back the view, for the tests that read

@@ -23,7 +23,7 @@ use crate::{
 };
 
 use super::{
-    commands::{CommandAutocomplete, SemanticCommandId},
+    commands::{CommandAutocomplete, SemanticCommandId, SemanticInvocation, SemanticSubject},
     composer::{ComposerKey, ComposerMemory},
     keymap::{
         command_for_autocomplete_event, command_for_interrupt_confirmation_event,
@@ -668,7 +668,8 @@ impl TuiState {
     }
 
     /// Toggles the disclosure of the unit drawn at `screen_row`: the Fold of
-    /// a unit projecting a single Activity, or the expansion of a Group. A
+    /// a unit projecting a single Activity, or the expansion of a Group,
+    /// answering with the semantic command a unit driven by one asks for. A
     /// binary Fold and a Group speak one grammar: a unit holding content back
     /// expands wherever it is clicked; one already showing everything closes
     /// again only from its header line, so pointing at content never hides
@@ -680,18 +681,17 @@ impl TuiState {
     /// idle click never records state that changes nothing. An expanded
     /// Group's members are their own units, which is why a member click
     /// toggles that member's Fold and never the Group.
-    fn toggle_disclosure_at(&mut self, screen_row: u16) {
-        let Some(interaction) = self.current_interaction() else {
-            return;
-        };
-        let Some((start, row)) = interaction
+    ///
+    /// A Turn Fold's marker is not toggled here: the pointer resolves to the
+    /// Turn it stands for and the caller invokes that Turn's semantic command,
+    /// so a click, a keybinding, and a future plugin all reach one behavior.
+    fn toggle_disclosure_at(&mut self, screen_row: u16) -> Option<SemanticInvocation> {
+        let interaction = self.current_interaction()?;
+        let (start, row) = interaction
             .viewport
             .borrow()
             .as_ref()
-            .and_then(|viewport| viewport.unit_at(screen_row))
-        else {
-            return;
-        };
+            .and_then(|viewport| viewport.unit_at(screen_row))?;
         match start.key {
             UnitKey::Activity(activity_id) => {
                 let mut folds = interaction.folds.borrow_mut();
@@ -730,10 +730,12 @@ impl TuiState {
                     groups.collapse(group_id);
                 }
             }
-            // A Turn Fold's marker takes its own semantic command rather than
-            // this one: <https://github.com/jake-tucker/suru/issues/88>.
-            UnitKey::Message(_) | UnitKey::TurnFold(_) | UnitKey::Provisional(_) => {}
+            UnitKey::TurnFold(turn_id) => {
+                return Some(SemanticCommandId::TranscriptTurnToggle.on_turn(turn_id));
+            }
+            UnitKey::Message(_) | UnitKey::Provisional(_) => {}
         }
+        None
     }
 
     /// Flips the Session view between folded-by-default and expanded-by-default.
@@ -748,6 +750,21 @@ impl TuiState {
     fn toggle_group_posture(&mut self) {
         if let Some(interaction) = self.current_interaction() {
             interaction.groups.borrow_mut().toggle_posture();
+        }
+    }
+
+    /// Flips the Session view between folded-by-default and
+    /// expanded-by-default Turn Folds.
+    fn toggle_turn_posture(&mut self) {
+        if let Some(interaction) = self.current_interaction() {
+            interaction.turns.borrow_mut().toggle_posture();
+        }
+    }
+
+    /// Flips one settled Turn between its marker and the work behind it.
+    fn toggle_turn_fold(&mut self, turn_id: TurnId) {
+        if let Some(interaction) = self.current_interaction() {
+            interaction.turns.borrow_mut().toggle(turn_id);
         }
     }
 
@@ -1272,7 +1289,7 @@ impl Application {
             | CommandId::ScrollTranscriptLinesDown
             | CommandId::FollowLatest
             | CommandId::ToggleTranscriptDisclosureAt { .. }) => {
-                Ok(self.handle_transcript_command(command))
+                self.handle_transcript_command(command)
             }
             command @ (CommandId::SelectPreviousAutocomplete
             | CommandId::SelectNextAutocomplete
@@ -1369,7 +1386,7 @@ impl Application {
 
     /// Handles the transcript navigation commands routed here; any other
     /// command leaves the viewport where it is.
-    fn handle_transcript_command(&mut self, command: CommandId) -> ApplicationTransition {
+    fn handle_transcript_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
         match command {
             CommandId::ScrollTranscriptPageUp => {
                 self.state.navigate_transcript_page(TranscriptDirection::Up);
@@ -1388,11 +1405,13 @@ impl Application {
             }
             CommandId::FollowLatest => self.state.follow_latest(),
             CommandId::ToggleTranscriptDisclosureAt { screen_row } => {
-                self.state.toggle_disclosure_at(screen_row);
+                if let Some(invocation) = self.state.toggle_disclosure_at(screen_row) {
+                    return self.invoke_semantic(invocation);
+                }
             }
             _ => {}
         }
-        ApplicationTransition::Continue
+        Ok(ApplicationTransition::Continue)
     }
 
     /// Handles the slash command autocomplete commands routed here; any other
@@ -1805,7 +1824,16 @@ impl Application {
         Ok(ApplicationTransition::Continue)
     }
 
-    fn invoke_semantic(&mut self, command: SemanticCommandId) -> Result<ApplicationTransition> {
+    /// Runs one semantic command against what it names. Every surface that can
+    /// drive the view — a keybinding, a slash command, a click, and one day a
+    /// plugin — arrives here, so a behavior is defined once and invoked by
+    /// its ID rather than reimplemented per input.
+    fn invoke_semantic(
+        &mut self,
+        invocation: impl Into<SemanticInvocation>,
+    ) -> Result<ApplicationTransition> {
+        let invocation = invocation.into();
+        let command = invocation.id;
         if self.state.selection_update_pending()
             && matches!(
                 command,
@@ -1852,6 +1880,19 @@ impl Application {
             SemanticCommandId::TranscriptGroupsToggle => {
                 self.state.toggle_group_posture();
                 self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::TranscriptTurnsToggle => {
+                self.state.toggle_turn_posture();
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::Continue)
+            }
+            // The Turn is the command's subject, so an invocation that names
+            // none has no Turn to flip and leaves the view where it is.
+            SemanticCommandId::TranscriptTurnToggle => {
+                if let SemanticSubject::Turn(turn_id) = invocation.subject {
+                    self.state.toggle_turn_fold(turn_id);
+                }
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::SessionDelete => {
