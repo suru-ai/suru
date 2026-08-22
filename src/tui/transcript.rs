@@ -3523,6 +3523,8 @@ mod tests {
                 prompt_id: PromptId::new(),
                 agent: None,
                 status,
+                started_at: None,
+                settled_at: None,
             });
             snapshot.messages.append(&mut turn.messages);
             snapshot.activities.append(&mut turn.activities);

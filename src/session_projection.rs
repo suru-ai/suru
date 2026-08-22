@@ -431,19 +431,19 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 *current_status = *status;
                 *current_duration_ms = *duration_ms;
             }
-            SessionChange::TurnStatusChanged { turn_id, status } => {
+            SessionChange::TurnStatusChanged {
+                turn_id,
+                status,
+                settled_at,
+            } => {
                 let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {
                     bail!("Session update referenced an unknown Turn");
                 };
-                if turn.status != TurnStatus::Active
-                    || !matches!(
-                        status,
-                        TurnStatus::Completed | TurnStatus::Failed | TurnStatus::Interrupted
-                    )
-                {
+                if turn.status.is_terminal() || !status.is_terminal() {
                     bail!("Session update contained an invalid Turn status transition");
                 }
                 turn.status = *status;
+                turn.settled_at = *settled_at;
             }
             SessionChange::SessionStatusChanged { status } => next.session.status = *status,
         }
@@ -467,4 +467,93 @@ fn reasoning_activity<'a>(
         bail!("Session update referenced an unknown Activity");
     };
     Ok(matches!(activity, Activity::Reasoning { .. }).then_some(activity))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::protocol::{
+        ModelAvailability, Prompt, PromptId, PromptOrder, Session, SessionId, SessionRevision,
+        SessionStatus, SessionTimestamp, Turn, TurnId, Workspace,
+    };
+
+    use super::*;
+
+    #[test]
+    fn a_client_reads_turn_timing_off_the_changes_the_server_committed() {
+        let session_id = SessionId::new();
+        let prompt_id = PromptId::new();
+        let turn_id = TurnId::new();
+        let mut snapshot = SessionSnapshot {
+            session: Session {
+                id: session_id,
+                workspace: Workspace {
+                    path: PathBuf::from("/workspace"),
+                },
+                agent_selection: None,
+                agent_selection_availability: ModelAvailability::Available,
+                status: SessionStatus::Idle,
+            },
+            revision: SessionRevision::INITIAL,
+            prompts: vec![Prompt {
+                id: prompt_id,
+                text: "Work on this".to_owned(),
+                delivery: PromptDelivery::Steer,
+                admission_order: PromptOrder::INITIAL,
+                status: PromptStatus::Pending,
+            }],
+            turns: Vec::new(),
+            messages: Vec::new(),
+            activities: Vec::new(),
+            transcript: Vec::new(),
+        };
+
+        apply_update(
+            &mut snapshot,
+            &SessionUpdate {
+                session_id,
+                revision: SessionRevision(2),
+                changes: vec![SessionChange::TurnAdded {
+                    turn: Turn {
+                        id: turn_id,
+                        prompt_id,
+                        agent: None,
+                        status: TurnStatus::Active,
+                        started_at: Some(SessionTimestamp(1_755_000_000_000)),
+                        settled_at: None,
+                    },
+                }],
+            },
+        )
+        .expect("a delivered Turn joins the Session");
+        assert_eq!(
+            snapshot.turns[0].started_at,
+            Some(SessionTimestamp(1_755_000_000_000))
+        );
+        assert_eq!(snapshot.turns[0].settled_at, None);
+
+        apply_update(
+            &mut snapshot,
+            &SessionUpdate {
+                session_id,
+                revision: SessionRevision(3),
+                changes: vec![SessionChange::TurnStatusChanged {
+                    turn_id,
+                    status: TurnStatus::Completed,
+                    settled_at: Some(SessionTimestamp(1_755_000_004_200)),
+                }],
+            },
+        )
+        .expect("the Turn settles");
+        assert_eq!(
+            snapshot.turns[0].started_at,
+            Some(SessionTimestamp(1_755_000_000_000)),
+            "settling a Turn leaves when it started alone"
+        );
+        assert_eq!(
+            snapshot.turns[0].settled_at,
+            Some(SessionTimestamp(1_755_000_004_200))
+        );
+    }
 }

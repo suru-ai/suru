@@ -42,9 +42,10 @@ impl SessionRecord {
         &mut self,
         storage: &StorageSink,
         session_id: SessionId,
-        changes: Vec<SessionChange>,
+        mut changes: Vec<SessionChange>,
         updated_at: SessionTimestamp,
     ) -> anyhow::Result<SessionUpdate> {
+        stamp_turn_timing(&mut changes, updated_at);
         let update = self.publish(session_id, changes)?;
         self.summary.updated_at = updated_at;
         storage.updated(self.summary.clone(), &update)?;
@@ -71,11 +72,9 @@ impl SessionRecord {
         let terminal_turns = changes
             .iter()
             .filter_map(|change| match change {
-                SessionChange::TurnStatusChanged { turn_id, status }
-                    if *status != TurnStatus::Active =>
-                {
-                    Some(*turn_id)
-                }
+                SessionChange::TurnStatusChanged {
+                    turn_id, status, ..
+                } if status.is_terminal() => Some(*turn_id),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -106,6 +105,29 @@ impl SessionRecord {
         self.snapshot = next;
         self.summary.session = self.snapshot.session.clone();
         Ok(update)
+    }
+}
+
+/// Stamps the commit's own timestamp onto the Turn timing the changes carry:
+/// a Turn starts when the commit that delivers its opening Prompt lands, and
+/// settles when the commit that settles it lands. Minting timestamps is the
+/// store's job, so the change builders leave both absent and the commit fills
+/// them in — including for a Turn that arrives already settled, which starts
+/// and settles in the one commit.
+fn stamp_turn_timing(changes: &mut [SessionChange], committed_at: SessionTimestamp) {
+    for change in changes {
+        match change {
+            SessionChange::TurnAdded { turn } => {
+                turn.started_at = Some(committed_at);
+                if turn.status.is_terminal() {
+                    turn.settled_at = Some(committed_at);
+                }
+            }
+            SessionChange::TurnStatusChanged {
+                status, settled_at, ..
+            } if status.is_terminal() => *settled_at = Some(committed_at),
+            _ => {}
+        }
     }
 }
 

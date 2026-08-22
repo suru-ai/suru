@@ -72,6 +72,8 @@ fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
             prompt_id,
             agent: None,
             status: TurnStatus::Completed,
+            started_at: None,
+            settled_at: None,
         });
         snapshot.messages.extend([
             Message {

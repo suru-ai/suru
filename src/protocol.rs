@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SESSION_CATALOG_SNAPSHOT_EVENT: &str = "session_catalog_snapshot";
 pub const SESSION_CATALOG_UPDATED_EVENT: &str = "session_catalog_updated";
@@ -397,6 +397,13 @@ pub enum TurnStatus {
     Interrupted,
 }
 
+impl TurnStatus {
+    /// Whether the Turn has Settled, and so accepts no further Provider output.
+    pub const fn is_terminal(self) -> bool {
+        !matches!(self, Self::Active)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
@@ -634,6 +641,12 @@ pub struct Turn {
     pub prompt_id: PromptId,
     pub agent: Option<AgentIdentity>,
     pub status: TurnStatus,
+    /// When the commit that delivered this Turn's opening Prompt landed, and
+    /// when the commit that settled it landed. Both are absent on a Turn stored
+    /// before Suru recorded Turn timing, so a client states how long a Turn
+    /// worked only when it knows.
+    pub started_at: Option<SessionTimestamp>,
+    pub settled_at: Option<SessionTimestamp>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -758,6 +771,10 @@ pub enum SessionChange {
     TurnStatusChanged {
         turn_id: TurnId,
         status: TurnStatus,
+        /// Stamped by the settle commit itself, so every client settles the
+        /// Turn at the moment the server did rather than when it read the
+        /// change.
+        settled_at: Option<SessionTimestamp>,
     },
     SessionStatusChanged {
         status: SessionStatus,

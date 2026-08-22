@@ -146,6 +146,7 @@ async fn scripted_codex_interrupt_acknowledges_before_trailing_output_and_termin
                             suru::protocol::SessionChange::TurnStatusChanged {
                                 turn_id: changed_turn_id,
                                 status: TurnStatus::Interrupted,
+                                ..
                             } if *changed_turn_id == turn_id
                         )
                     })

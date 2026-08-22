@@ -378,6 +378,8 @@ impl TurnRow {
                 &StoredTurnPayload {
                     agent: turn.agent.map(StoredAgentIdentity::from),
                     status: turn.status,
+                    started_at: turn.started_at,
+                    settled_at: turn.settled_at,
                 },
             )?,
         })
@@ -391,6 +393,8 @@ impl TurnRow {
             prompt_id: parse_id(&self.prompt_id, "Turn Prompt ID", PromptId::from_uuid)?,
             agent: payload.agent.map(AgentIdentity::from),
             status: payload.status,
+            started_at: payload.started_at,
+            settled_at: payload.settled_at,
         })
     }
 }
@@ -628,6 +632,12 @@ struct StoredPromptPayload {
 struct StoredTurnPayload {
     agent: Option<StoredAgentIdentity>,
     status: TurnStatus,
+    /// Absent in every Turn stored before Suru recorded Turn timing, which is
+    /// why these decode as `None` rather than needing a schema migration.
+    #[serde(default)]
+    started_at: Option<SessionTimestamp>,
+    #[serde(default)]
+    settled_at: Option<SessionTimestamp>,
 }
 
 #[derive(Deserialize, Serialize)]

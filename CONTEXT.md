@@ -33,7 +33,7 @@ The working context in which an agent operates, initially rooted at a local dire
 _Avoid_: Project, working directory, location
 
 **Turn**:
-A unit of work that begins when a Prompt is delivered while a Session is idle and includes the resulting Agent activity. A Turn retains its effective Agent identity and may accept delivered steer Prompts without beginning another Turn.
+A unit of work that begins when a Prompt is delivered while a Session is idle and includes the resulting Agent activity. A Turn retains its effective Agent identity and may accept delivered steer Prompts without beginning another Turn. A Turn records when it began and when it Settled, so any surface reading it can state how long it worked.
 _Avoid_: Request, exchange
 
 **Settle**:

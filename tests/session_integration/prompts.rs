@@ -473,6 +473,8 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                         prompt_id: active_prompt_id,
                         agent: None,
                         status: TurnStatus::Active,
+                        started_at: None,
+                        settled_at: None,
                     },
                 },
                 SessionChange::MessageAdded {
@@ -519,6 +521,8 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                             prompt_id: rejected_prompt_id,
                             agent: None,
                             status: TurnStatus::Active,
+                            started_at: None,
+                            settled_at: None,
                         },
                     },
                 ],
@@ -623,6 +627,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
             vec![SessionChange::TurnStatusChanged {
                 turn_id: active_turn_id,
                 status: TurnStatus::Completed,
+                settled_at: None,
             }],
         )
         .expect("complete active Turn at an idle boundary");
@@ -828,7 +833,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
         panic!("observer must receive an interruption update");
     };
     assert!(interrupt_update.changes.iter().any(|change| {
-        matches!(change, SessionChange::TurnStatusChanged { turn_id, status: TurnStatus::Interrupted }
+        matches!(change, SessionChange::TurnStatusChanged { turn_id, status: TurnStatus::Interrupted, .. }
             if *turn_id == active_turn_id)
     }));
 
@@ -889,6 +894,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
                 vec![SessionChange::TurnStatusChanged {
                     turn_id: active_turn_id,
                     status: TurnStatus::Active,
+                    settled_at: None,
                 }],
             )
             .is_err(),

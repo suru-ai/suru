@@ -311,6 +311,7 @@ impl SessionStore {
             SessionChange::TurnStatusChanged {
                 turn_id,
                 status: TurnStatus::Failed,
+                settled_at: None,
             },
         ]);
         if mark_unavailable {

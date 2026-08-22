@@ -754,3 +754,132 @@ async fn an_undecodable_stored_session_does_not_block_startup_and_remains_listed
         .await
         .expect("stop replacement server");
 }
+
+#[tokio::test]
+async fn turn_timing_survives_a_restart_and_a_session_stored_before_it_stays_readable() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "turn-timing-storage-test")
+        .expect("configure original server")
+        .with_data_dir(data_dir.path());
+    let (original_runtime, mut original_provider) = ControlledProvider::new();
+    let original = server::spawn_with_provider(config.clone(), original_runtime)
+        .await
+        .expect("spawn original server");
+    let descriptor = original.descriptor().clone();
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Persist when this Turn worked".to_owned(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+
+    let mut provider_session = timeout(Duration::from_secs(1), original_provider.next_start())
+        .await
+        .expect("Provider startup begins")
+        .succeed(AgentIdentity {
+            agent: AgentId::new("controlled-agent"),
+            selection: controlled_selection("gpt-timed", "high", "fast"),
+        });
+    timeout(Duration::from_secs(1), provider_session.next_turn())
+        .await
+        .expect("initial Turn reaches Provider")
+        .succeed();
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    let completed = read_session_at_least_revision(
+        &client,
+        &descriptor,
+        created.session.id,
+        SessionRevision(4),
+    )
+    .await;
+    assert_eq!(completed.turns[0].status, TurnStatus::Completed);
+    assert!(
+        completed.turns[0].started_at.is_some() && completed.turns[0].settled_at.is_some(),
+        "a settled Turn knows when it started and when it settled"
+    );
+    drop(provider_session);
+    original.shutdown().await.expect("stop original server");
+
+    let (restart_runtime, _restart_provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(config.clone(), restart_runtime)
+        .await
+        .expect("spawn restarted server");
+    let reopened = read_persisted_session(restarted.descriptor(), created.session.id).await;
+    assert_eq!(
+        reopened.turns, completed.turns,
+        "Turn timing survives a restart"
+    );
+    restarted.shutdown().await.expect("stop restarted server");
+
+    let database_path = config.data_dir().join("suru.db");
+    let mut database = SqliteConnection::establish(
+        database_path
+            .to_str()
+            .expect("fixture database path is valid UTF-8"),
+    )
+    .expect("open persisted Turn fixture");
+    database
+        .batch_execute(
+            "UPDATE turns SET payload = json_remove(payload, '$.started_at', '$.settled_at');",
+        )
+        .expect("age the stored Turn back to before Suru recorded Turn timing");
+    drop(database);
+
+    let (replacement_runtime, _replacement_provider) = ControlledProvider::new();
+    let replacement = server::spawn_with_provider(config, replacement_runtime)
+        .await
+        .expect("spawn replacement server");
+    let aged = read_persisted_session(replacement.descriptor(), created.session.id).await;
+    assert_eq!(
+        aged.turns[0].started_at, None,
+        "a Turn stored before Suru recorded Turn timing decodes without it"
+    );
+    assert_eq!(aged.turns[0].settled_at, None);
+    assert_eq!(
+        SessionSnapshot {
+            turns: completed.turns.clone(),
+            ..aged.clone()
+        },
+        completed,
+        "only Turn timing is missing from a Session stored before it"
+    );
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement server");
+}
+
+async fn read_persisted_session(
+    descriptor: &suru::protocol::RuntimeDescriptor,
+    session_id: SessionId,
+) -> SessionSnapshot {
+    reqwest::Client::new()
+        .get(format!("{}/v1/sessions/{session_id}", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("reopen persisted Session")
+        .error_for_status()
+        .expect("persisted Session remains readable")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode reopened Session")
+}

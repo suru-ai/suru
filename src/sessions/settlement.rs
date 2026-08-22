@@ -72,6 +72,7 @@ impl SessionStore {
             SessionChange::TurnStatusChanged {
                 turn_id,
                 status: TurnStatus::Failed,
+                settled_at: None,
             },
         ]);
         let updated_at = state.next_timestamp();
@@ -181,7 +182,11 @@ impl SessionStore {
                 },
             });
         }
-        changes.push(SessionChange::TurnStatusChanged { turn_id, status });
+        changes.push(SessionChange::TurnStatusChanged {
+            turn_id,
+            status,
+            settled_at: None,
+        });
 
         let next_turn = next_queued_prompt.map(|prompt| {
             let (delivered, delivery_changes) =
@@ -336,6 +341,8 @@ mod tests {
                 prompt_id: PromptId::new(),
                 agent: None,
                 status: TurnStatus::Active,
+                started_at: None,
+                settled_at: None,
             }],
             transcript: messages
                 .iter()

@@ -185,6 +185,8 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
                         prompt_id,
                         agent: None,
                         status: TurnStatus::Active,
+                        started_at: None,
+                        settled_at: None,
                     },
                 },
                 SessionChange::MessageAdded {

@@ -851,9 +851,8 @@ fn fail_active_turn(
 }
 
 fn provider_turn_start(delivered: DeliveredTurn) -> (TurnId, ProviderTurnInput) {
-    let turn_id = delivered.turn.id;
+    let turn_id = delivered.turn_id;
     let selection = delivered
-        .turn
         .agent
         .expect("a connected Provider delivers a selected Turn")
         .selection;

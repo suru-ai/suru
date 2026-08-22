@@ -55,9 +55,14 @@ pub(crate) enum PromptAdmissionDisposition {
     RemainPending,
 }
 
+/// What starting a delivered Turn with its Provider takes. It names the Turn
+/// rather than carrying a copy of it: the commit that delivers a Turn stamps
+/// when it started, so a copy taken before that commit would disagree with the
+/// Turn every other reader sees.
 pub(crate) struct DeliveredTurn {
     pub(crate) prompt: Prompt,
-    pub(crate) turn: Turn,
+    pub(crate) turn_id: TurnId,
+    pub(crate) agent: Option<AgentIdentity>,
 }
 
 pub(crate) enum DeliveredTurnStatus {
@@ -357,7 +362,7 @@ impl SessionStore {
             changes.push(SessionChange::ActivityAdded {
                 activity: Activity::Error {
                     id: ActivityId::new(),
-                    turn_id: delivered.turn.id,
+                    turn_id: delivered.turn_id,
                     text: message,
                 },
             });
@@ -714,22 +719,28 @@ pub(super) fn prepare_prompt_delivery(
     agent: Option<AgentIdentity>,
     turn_status: TurnStatus,
 ) -> (DeliveredTurn, Vec<SessionChange>) {
-    let turn = Turn {
-        id: TurnId::new(),
-        prompt_id: prompt.id,
-        agent,
-        status: turn_status,
-    };
+    let turn_id = TurnId::new();
     let changes = vec![
         SessionChange::PromptStatusChanged {
             prompt_id: prompt.id,
             status: PromptStatus::Delivered,
         },
-        SessionChange::TurnAdded { turn: turn.clone() },
+        SessionChange::TurnAdded {
+            turn: Turn {
+                id: turn_id,
+                prompt_id: prompt.id,
+                agent: agent.clone(),
+                status: turn_status,
+                // The commit that lands this delivery stamps both, and settles
+                // the Turn in the same breath when it arrives already settled.
+                started_at: None,
+                settled_at: None,
+            },
+        },
         SessionChange::MessageAdded {
             message: Message {
                 id: MessageId::new(),
-                turn_id: turn.id,
+                turn_id,
                 role: MessageRole::User,
                 status: MessageStatus::Completed,
                 content: prompt.text.clone(),
@@ -737,7 +748,14 @@ pub(super) fn prepare_prompt_delivery(
             },
         },
     ];
-    (DeliveredTurn { prompt, turn }, changes)
+    (
+        DeliveredTurn {
+            prompt,
+            turn_id,
+            agent,
+        },
+        changes,
+    )
 }
 
 fn snapshot_for_owner(state: &SessionStoreState, owner: &PromptOwner) -> SessionSnapshot {

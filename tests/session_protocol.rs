@@ -161,6 +161,8 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 },
             }),
             status: TurnStatus::Failed,
+            started_at: Some(SessionTimestamp(1_755_000_000_000)),
+            settled_at: Some(SessionTimestamp(1_755_000_004_200)),
         }],
         messages: vec![Message {
             id: MessageId::from_uuid(fixture_id("0198b27e-310d-763a-9825-51cc8b2bef81")),
@@ -225,7 +227,9 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                     }]
                 }
             },
-            "status": "failed"
+            "status": "failed",
+            "started_at": 1_755_000_000_000_u64,
+            "settled_at": 1_755_000_004_200_u64
         }],
         "messages": [{
             "id": "0198b27e-310d-763a-9825-51cc8b2bef81",
@@ -880,6 +884,7 @@ fn session_delta_status_and_error_contracts_use_stable_provider_neutral_shapes()
             SessionChange::TurnStatusChanged {
                 turn_id,
                 status: TurnStatus::Completed,
+                settled_at: Some(SessionTimestamp(1_755_000_004_200)),
             },
             SessionChange::SessionStatusChanged {
                 status: SessionStatus::Idle,
@@ -905,7 +910,8 @@ fn session_delta_status_and_error_contracts_use_stable_provider_neutral_shapes()
                 {
                     "type": "turn_status_changed",
                     "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
-                    "status": "completed"
+                    "status": "completed",
+                    "settled_at": 1_755_000_004_200_u64
                 },
                 {
                     "type": "session_status_changed",

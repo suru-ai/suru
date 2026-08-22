@@ -14,7 +14,7 @@ use std::{
 use crate::{
     protocol::{
         AgentSelection, SessionChange, SessionId, SessionSnapshot, SessionStatus, SessionSummary,
-        SessionUpdate, TurnStatus,
+        SessionUpdate,
     },
     session_projection::apply_update,
 };
@@ -282,8 +282,8 @@ fn flush_sessions(
 
 fn is_turn_boundary(update: &SessionUpdate) -> bool {
     update.changes.iter().any(|change| match change {
-        SessionChange::TurnAdded { turn } => turn.status != TurnStatus::Active,
-        SessionChange::TurnStatusChanged { status, .. } => *status != TurnStatus::Active,
+        SessionChange::TurnAdded { turn } => turn.status.is_terminal(),
+        SessionChange::TurnStatusChanged { status, .. } => status.is_terminal(),
         SessionChange::SessionStatusChanged { status } => *status == SessionStatus::Idle,
         _ => false,
     })

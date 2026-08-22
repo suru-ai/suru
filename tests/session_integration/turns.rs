@@ -1429,6 +1429,13 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
         matches!(change, SessionChange::TurnAdded { turn }
             if turn.prompt_id == initial_prompt_id && turn.status == TurnStatus::Failed)
     }));
+    assert!(
+        startup_failure.changes.iter().any(|change| {
+            matches!(change, SessionChange::TurnAdded { turn }
+                if turn.started_at.is_some() && turn.started_at == turn.settled_at)
+        }),
+        "a Turn that arrives already settled starts and settles in the one commit"
+    );
     assert!(startup_failure.changes.iter().any(|change| {
         matches!(change, SessionChange::ActivityAdded {
             activity: Activity::Error { text, .. },
@@ -1493,6 +1500,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
         matches!(change, SessionChange::TurnStatusChanged {
             turn_id,
             status: TurnStatus::Failed,
+            ..
         } if *turn_id == execution_turn_id)
     }));
 
@@ -1542,6 +1550,161 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
     assert_eq!(snapshot.turns[2].id, recovery_turn_id);
     assert_eq!(snapshot.turns[2].status, TurnStatus::Completed);
     assert_eq!(snapshot.activities.len(), 2);
+
+    drop(provider_session);
+    drop(feed);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn turn_timing_spans_the_delivery_commit_and_every_settle_path() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "turn-timing-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "turn-timing-test").expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_managed_client_initial_state(&mut client).await;
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Complete this Turn".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let mut feed = client
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe to Session");
+    assert_eq!(
+        timeout(Duration::from_secs(1), feed.next())
+            .await
+            .expect("initial snapshot arrives")
+            .expect("Session stream remains open")
+            .expect("initial snapshot is valid"),
+        SessionEvent::Snapshot(created.clone())
+    );
+
+    let mut provider_session = provider.next_start().await.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-timed", "high", "fast"),
+    });
+    next_session_update(&mut feed).await;
+
+    let mut started = Vec::new();
+    let mut settled = Vec::new();
+    for (prompt_text, settle) in [
+        ("Complete this Turn", ProviderEvent::TurnCompleted),
+        (
+            "Fail this Turn",
+            ProviderEvent::TurnFailed {
+                message: "the Provider gave up".to_owned(),
+            },
+        ),
+        ("Interrupt this Turn", ProviderEvent::TurnInterrupted),
+    ] {
+        if !started.is_empty() {
+            client
+                .admit_prompt(
+                    created.session.id,
+                    AdmitPromptRequest {
+                        prompt: InitialPrompt {
+                            id: PromptId::new(),
+                            text: prompt_text.to_owned(),
+                        },
+                        delivery: PromptDelivery::Steer,
+                    },
+                )
+                .await
+                .expect("admit a Prompt while the Session is idle");
+            next_session_update(&mut feed).await;
+        }
+        let delivery = next_session_update(&mut feed).await;
+        let delivered = delivery
+            .changes
+            .iter()
+            .find_map(|change| match change {
+                SessionChange::TurnAdded { turn } => Some(turn.clone()),
+                _ => None,
+            })
+            .expect("Prompt delivery creates a Turn");
+        assert_eq!(
+            delivered.settled_at, None,
+            "a delivered Turn has not settled"
+        );
+        started.push((
+            delivered.id,
+            delivered
+                .started_at
+                .expect("the delivery commit stamps when the Turn started"),
+        ));
+
+        provider_session.next_turn().await.succeed();
+        provider_session.emit(settle);
+        let settlement = next_session_update(&mut feed).await;
+        settled.push(
+            settlement
+                .changes
+                .iter()
+                .find_map(|change| match change {
+                    SessionChange::TurnStatusChanged { settled_at, .. } => {
+                        Some(settled_at.expect("the settle commit stamps when the Turn settled"))
+                    }
+                    _ => None,
+                })
+                .expect("settling a Turn changes its status"),
+        );
+    }
+
+    let snapshot = client
+        .read_session(created.session.id)
+        .await
+        .expect("read the Session every Turn settled in");
+    assert_eq!(
+        snapshot
+            .turns
+            .iter()
+            .map(|turn| turn.status)
+            .collect::<Vec<_>>(),
+        vec![
+            TurnStatus::Completed,
+            TurnStatus::Failed,
+            TurnStatus::Interrupted,
+        ]
+    );
+    for (index, turn) in snapshot.turns.iter().enumerate() {
+        let (started_turn_id, started_at) = started[index];
+        assert_eq!(turn.id, started_turn_id);
+        assert_eq!(turn.started_at, Some(started_at));
+        assert_eq!(turn.settled_at, Some(settled[index]));
+        assert!(
+            started_at < settled[index],
+            "a Turn starts in an earlier commit than it settles in"
+        );
+        if let Some(previous) = index.checked_sub(1) {
+            assert!(
+                settled[previous] < started_at,
+                "these Prompts were each admitted after the Turn before them settled, \
+                 so the commits that stamp them run in that order"
+            );
+        }
+    }
 
     drop(provider_session);
     drop(feed);

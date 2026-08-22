@@ -507,6 +507,8 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                         prompt_id,
                         agent: None,
                         status: TurnStatus::Active,
+                        started_at: None,
+                        settled_at: None,
                     },
                 },
                 SessionChange::MessageAdded {
@@ -1074,6 +1076,7 @@ fn a_scrolled_message_anchor_survives_streaming_and_terminal_resize_per_client()
             SessionChange::TurnStatusChanged {
                 turn_id: snapshot.turns.last().expect("fixture has a final Turn").id,
                 status: TurnStatus::Completed,
+                settled_at: None,
             },
             SessionChange::SessionStatusChanged {
                 status: SessionStatus::Idle,
@@ -1330,6 +1333,8 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                             prompt_id: request.prompt.id,
                             agent: None,
                             status: TurnStatus::Active,
+                            started_at: None,
+                            settled_at: None,
                         },
                     },
                     SessionChange::MessageAdded {
