@@ -2691,18 +2691,107 @@ fn clicks_do_not_reach_the_transcript_while_a_picker_covers_it() {
 /// run it drives instead of assembling Activities by hand. Commands are
 /// numbered `command 1`, `command 2`, … in transcript order so member rows are
 /// assertable by name.
+#[derive(Clone, Copy)]
 enum RunEntry {
     Command(ActivityStatus, Option<i32>),
     AgentMessage(&'static str),
     UserMessage(&'static str),
-    Reasoning(&'static str),
-    /// A Reasoning block the Provider settled without ever describing: no
-    /// title, no content, and only the duration it spent arriving at nothing
-    /// a reader could see.
-    EmptyReasoning,
+    Reasoning(ReasoningBlock),
     FileChange,
     Status(&'static str),
     Error(&'static str),
+}
+
+/// One Reasoning block a run fixture holds. Every property is spelled out
+/// because a Reasoning Group reads every one of them off its members: the
+/// heading its row leads with, the prose its expansion opens onto, whether the
+/// cap cut that prose short, how the block settled, and how long it took.
+#[derive(Clone, Copy)]
+struct ReasoningBlock {
+    status: ActivityStatus,
+    title: Option<&'static str>,
+    content: &'static str,
+    content_truncated: bool,
+    duration_ms: Option<u64>,
+}
+
+impl ReasoningBlock {
+    /// A block that settled with a heading, prose, and a duration — the shape
+    /// a described section of thinking arrives in.
+    const fn thought(title: &'static str, content: &'static str, duration_ms: u64) -> Self {
+        Self {
+            status: ActivityStatus::Completed,
+            title: Some(title),
+            content,
+            content_truncated: false,
+            duration_ms: Some(duration_ms),
+        }
+    }
+
+    /// A block that settled with prose the Provider never headed.
+    const fn untitled(content: &'static str, duration_ms: u64) -> Self {
+        Self {
+            status: ActivityStatus::Completed,
+            title: None,
+            content,
+            content_truncated: false,
+            duration_ms: Some(duration_ms),
+        }
+    }
+
+    /// A block stored before Suru recorded Reasoning durations, so it has a
+    /// heading and prose but nothing to contribute to a summed duration.
+    const fn untimed(title: &'static str, content: &'static str) -> Self {
+        Self {
+            status: ActivityStatus::Completed,
+            title: Some(title),
+            content,
+            content_truncated: false,
+            duration_ms: None,
+        }
+    }
+
+    /// A block still streaming its prose, which has not settled into anything
+    /// a Group could gather yet.
+    const fn streaming(title: &'static str, content: &'static str) -> Self {
+        Self {
+            status: ActivityStatus::Active,
+            title: Some(title),
+            content,
+            content_truncated: false,
+            duration_ms: None,
+        }
+    }
+
+    /// A block a Turn cut short partway through its prose.
+    const fn interrupted(content: &'static str) -> Self {
+        Self {
+            status: ActivityStatus::Failed,
+            title: None,
+            content,
+            content_truncated: false,
+            duration_ms: None,
+        }
+    }
+
+    /// The same block, with the cap having cut its stored prose short.
+    const fn capped(self) -> Self {
+        Self {
+            content_truncated: true,
+            ..self
+        }
+    }
+
+    /// A block the Provider settled without ever describing: no title, no
+    /// content, and only the duration it spent arriving at nothing a reader
+    /// could see.
+    const EMPTY: Self = Self {
+        status: ActivityStatus::Completed,
+        title: None,
+        content: "",
+        content_truncated: false,
+        duration_ms: Some(276),
+    };
 }
 
 /// A Session whose transcript is exactly `entries` under one Turn.
@@ -2752,23 +2841,14 @@ fn command_run_snapshot(
                     exit_status: *exit_status,
                 }
             }
-            RunEntry::Reasoning(title) => Activity::Reasoning {
+            RunEntry::Reasoning(block) => Activity::Reasoning {
                 id: ActivityId::new(),
                 turn_id,
-                status: ActivityStatus::Completed,
-                title: Some((*title).to_owned()),
-                content: "Weighed the options.".to_owned(),
-                content_truncated: false,
-                duration_ms: None,
-            },
-            RunEntry::EmptyReasoning => Activity::Reasoning {
-                id: ActivityId::new(),
-                turn_id,
-                status: ActivityStatus::Completed,
-                title: None,
-                content: String::new(),
-                content_truncated: false,
-                duration_ms: Some(276),
+                status: block.status,
+                title: block.title.map(ToOwned::to_owned),
+                content: block.content.to_owned(),
+                content_truncated: block.content_truncated,
+                duration_ms: block.duration_ms,
             },
             RunEntry::FileChange => Activity::FileChange {
                 id: ActivityId::new(),
@@ -2925,7 +3005,11 @@ fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
             "A breaking user message",
         ),
         (
-            RunEntry::Reasoning("Weighing options"),
+            RunEntry::Reasoning(ReasoningBlock::thought(
+                "Weighing options",
+                "Weighed the options.",
+                4_000,
+            )),
             "Thought: Weighing options",
         ),
         (RunEntry::FileChange, "✓ Applied file changes"),
@@ -2992,9 +3076,9 @@ fn an_empty_reasoning_block_neither_breaks_a_command_run_nor_leaves_a_gap() {
         &[
             RunEntry::UserMessage("Run the workflow"),
             SUCCESSFUL_COMMAND,
-            RunEntry::EmptyReasoning,
+            RunEntry::Reasoning(ReasoningBlock::EMPTY),
             SUCCESSFUL_COMMAND,
-            RunEntry::EmptyReasoning,
+            RunEntry::Reasoning(ReasoningBlock::EMPTY),
             RunEntry::AgentMessage("The workflow is green."),
         ],
     );
@@ -3663,6 +3747,537 @@ fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
     );
 }
 
+/// The run of described thinking every Reasoning Group test starts from:
+/// three titled sections whose durations sum to a span the humanizer reports
+/// in minutes, so a marker that summed them wrongly reads wrongly.
+const INSPECTING: ReasoningBlock =
+    ReasoningBlock::thought("Inspecting the seam", "Read the projection.", 30_000);
+const WEIGHING: ReasoningBlock =
+    ReasoningBlock::thought("Weighing the options", "Weighed the options.", 2_000);
+const SETTLING: ReasoningBlock =
+    ReasoningBlock::thought("Settling on the plan", "Settled on the plan.", 40_000);
+
+const REASONING_RUN: [RunEntry; 3] = [
+    RunEntry::Reasoning(INSPECTING),
+    RunEntry::Reasoning(WEIGHING),
+    RunEntry::Reasoning(SETTLING),
+];
+
+/// The prose the run's members hold, read off the members themselves so a
+/// test asserting it is hidden cannot drift from what they carry.
+const REASONING_RUN_PROSE: [&str; 3] = [INSPECTING.content, WEIGHING.content, SETTLING.content];
+
+#[test]
+fn a_run_of_settled_reasoning_blocks_collapses_to_one_thought_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &REASONING_RUN);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a run of settled Reasoning blocks");
+
+    let buffer = rendered_application_buffer(&application, 80, 18);
+    let rows = buffer_rows(&buffer);
+    let rendered = rows.join("\n");
+
+    assert_eq!(
+        rows[rendered_row(&rows, "Thought")].trim_end(),
+        "    ✓ Thought: Settling on the plan · 3 steps · 1m 12s",
+        "a run of three settled Reasoning blocks is one row headed by the latest \
+         member's title, counting its members and summing their durations: {rendered}"
+    );
+    assert_eq!(
+        rendered.matches("Thought").count(),
+        1,
+        "the run reads as one row, not one row per member: {rendered}"
+    );
+    for hidden in ["Inspecting the seam", "Weighing the options"] {
+        assert!(
+            !rendered.contains(hidden),
+            "a collapsed Group shows only the latest member's title, but {hidden:?} \
+             rendered: {rendered}"
+        );
+    }
+    for hidden in REASONING_RUN_PROSE {
+        assert!(
+            !rendered.contains(hidden),
+            "a collapsed Group hides its members' prose, but {hidden:?} rendered: {rendered}"
+        );
+    }
+    let affordance = text_cell(&buffer, "3 steps");
+    assert_eq!(
+        affordance.fg,
+        Color::Blue,
+        "the step count is the expand affordance, styled action-primary"
+    );
+}
+
+#[test]
+fn a_reasoning_group_marker_drops_the_description_when_its_latest_member_has_none() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::Reasoning(ReasoningBlock::thought(
+                "Inspecting the seam",
+                "Read the projection.",
+                30_000,
+            )),
+            RunEntry::Reasoning(ReasoningBlock::untitled("Kept reading.", 2_000)),
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose latest Reasoning block was never titled");
+
+    let rows = rendered_application_rows_at(&application, 80, 18);
+
+    assert_eq!(
+        rows[rendered_row(&rows, "Thought")].trim_end(),
+        "    ✓ Thought · 2 steps · 32s",
+        "the marker says where the thinking ended up, so an untitled latest member \
+         leaves it with no description to give: {}",
+        rows.join("\n")
+    );
+}
+
+#[test]
+fn a_run_of_one_visible_reasoning_block_keeps_the_presentation_it_has_alone() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[RunEntry::Reasoning(ReasoningBlock::thought(
+            "Inspecting the seam",
+            "Read the projection.",
+            4_000,
+        ))],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with one settled Reasoning block");
+
+    let rows = rendered_application_rows_at(&application, 80, 18);
+
+    assert_eq!(
+        rows[rendered_row(&rows, "Thought")].trim_end(),
+        "    ✓ Thought: Inspecting the seam · 4s · +1 lines",
+        "a lone block keeps its own header-and-fold row, counting the lines it hides \
+         rather than steps it does not have: {}",
+        rows.join("\n")
+    );
+}
+
+#[test]
+fn clicking_a_reasoning_group_opens_onto_every_members_prose_and_folds_back() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &REASONING_RUN);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a run of settled Reasoning blocks");
+
+    let collapsed = rendered_application_rows_at(&application, 80, 24);
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&collapsed, "Thought") as u16))
+        .expect("expand the Reasoning Group");
+
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let expanded_rows = buffer_rows(&buffer);
+    let expanded = expanded_rows.join("\n");
+    let header = rendered_row(&expanded_rows, "Thought");
+    assert_eq!(
+        expanded_rows[header..header + 9]
+            .iter()
+            .map(|row| row.trim_end())
+            .collect::<Vec<_>>(),
+        [
+            "    ✓ Thought: Settling on the plan · 3 steps · 1m 12s",
+            "      Inspecting the seam",
+            "      Read the projection.",
+            "",
+            "      Weighing the options",
+            "      Weighed the options.",
+            "",
+            "      Settling on the plan",
+            "      Settled on the plan.",
+        ],
+        "expanding opens straight onto every member's prose in the order it happened, \
+         each section under the title that heads it, below the header the Group \
+         re-collapses from: {expanded}"
+    );
+    for heading in ["Inspecting the seam", "Weighing the options"] {
+        let cell = text_cell(&buffer, heading);
+        assert!(
+            cell.modifier.contains(Modifier::BOLD),
+            "each member's title heads its own section in bold, but {heading:?} did not: \
+             {expanded}"
+        );
+    }
+
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&expanded_rows, "Thought") as u16))
+        .expect("fold the Reasoning Group back");
+
+    let refolded = rendered_application_rows_at(&application, 80, 24);
+    assert_eq!(
+        refolded, collapsed,
+        "folding back returns the Transcript to the single marker it opened from"
+    );
+}
+
+#[test]
+fn clicking_an_expanded_reasoning_groups_prose_leaves_it_open() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &REASONING_RUN);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a run of settled Reasoning blocks");
+
+    let collapsed = rendered_application_rows_at(&application, 80, 24);
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&collapsed, "Thought") as u16))
+        .expect("expand the Reasoning Group");
+    let expanded = rendered_application_rows_at(&application, 80, 24);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&expanded, "Read the projection.") as u16,
+        ))
+        .expect("click the revealed prose");
+
+    assert_eq!(
+        rendered_application_rows_at(&application, 80, 24),
+        expanded,
+        "revealed prose is reading surface, not an affordance: only the header folds \
+         the Group back"
+    );
+}
+
+#[test]
+fn an_interrupted_reasoning_block_ends_the_run_and_stands_outside_the_group() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::Reasoning(ReasoningBlock::thought("Reading", "Read the plan.", 300)),
+            RunEntry::Reasoning(ReasoningBlock::thought("Weighing", "Weighed it.", 400)),
+            RunEntry::Reasoning(ReasoningBlock::interrupted("Got halfway.")),
+            RunEntry::Reasoning(ReasoningBlock::thought("Retrying", "Read it again.", 300)),
+            RunEntry::Reasoning(ReasoningBlock::thought("Settling", "Settled on it.", 400)),
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Reasoning run an interrupt cut in two");
+
+    let rows = rendered_application_rows_at(&application, 80, 24);
+    let rendered = rows.join("\n");
+
+    assert_eq!(
+        rendered.matches("· 2 steps · 700ms").count(),
+        2,
+        "the interrupted block ends the run, leaving one Group on either side: {rendered}"
+    );
+    assert!(
+        rendered.contains("× Thinking interrupted"),
+        "the interrupted block stands outside the Groups as its own row: {rendered}"
+    );
+    let interrupted = rendered_row(&rows, "Thinking interrupted");
+    assert!(
+        rendered_row(&rows, "Thought: Weighing") < interrupted
+            && rows[interrupted + 1..]
+                .iter()
+                .any(|row| row.contains("Thought: Settling")),
+        "presentation order is preserved: {rendered}"
+    );
+}
+
+#[test]
+fn an_empty_reasoning_block_neither_joins_a_reasoning_group_nor_counts_toward_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::Reasoning(ReasoningBlock::thought("Reading", "Read the plan.", 300)),
+            RunEntry::Reasoning(ReasoningBlock::EMPTY),
+            RunEntry::Reasoning(ReasoningBlock::thought("Settling", "Settled on it.", 400)),
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Reasoning run is interleaved with an empty block");
+
+    let rows = rendered_application_rows_at(&application, 80, 18);
+
+    assert_eq!(
+        rows[rendered_row(&rows, "Thought")].trim_end(),
+        "    ✓ Thought: Settling · 2 steps · 700ms",
+        "an invisible block neither ends the run nor counts toward the step count or \
+         the duration the marker sums: {}",
+        rows.join("\n")
+    );
+}
+
+#[test]
+fn every_other_visible_entry_kind_ends_a_reasoning_run() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let breakers: [(RunEntry, &str); 6] = [
+        (
+            RunEntry::AgentMessage("A breaking message"),
+            "A breaking message",
+        ),
+        (
+            RunEntry::UserMessage("A breaking user message"),
+            "A breaking user message",
+        ),
+        (SUCCESSFUL_COMMAND, "✓ command 1"),
+        (RunEntry::FileChange, "✓ Applied file changes"),
+        (
+            RunEntry::Status("Agent Selection changed"),
+            "Agent Selection changed",
+        ),
+        (RunEntry::Error("Provider failed"), "Error: Provider failed"),
+    ];
+    for (breaker, visible) in breakers {
+        let snapshot = command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[
+                RunEntry::Reasoning(ReasoningBlock::thought("Reading", "Read the plan.", 300)),
+                RunEntry::Reasoning(ReasoningBlock::thought("Weighing", "Weighed it.", 400)),
+                breaker,
+                RunEntry::Reasoning(ReasoningBlock::thought("Retrying", "Read it again.", 300)),
+                RunEntry::Reasoning(ReasoningBlock::thought("Settling", "Settled on it.", 400)),
+            ],
+        );
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach a Session with a broken Reasoning run");
+
+        let rows = rendered_application_rows_at(&application, 80, 24);
+        let rendered = rows.join("\n");
+        assert_eq!(
+            rendered.matches("· 2 steps · 700ms").count(),
+            2,
+            "{visible:?} splits the run into two Groups: {rendered}"
+        );
+        let breaker_row = rendered_row(&rows, visible);
+        assert!(
+            rendered_row(&rows, "Thought: Weighing") < breaker_row
+                && rows[breaker_row + 1..]
+                    .iter()
+                    .any(|row| row.contains("Thought: Settling")),
+            "presentation order is preserved: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn a_reasoning_group_whose_members_were_never_timed_reports_no_duration() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::Reasoning(ReasoningBlock::untimed("Reading", "Read the plan.")),
+            RunEntry::Reasoning(ReasoningBlock::untimed("Settling", "Settled on it.")),
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Reasoning blocks predate recorded durations");
+
+    let rows = rendered_application_rows_at(&application, 80, 18);
+
+    assert_eq!(
+        rows[rendered_row(&rows, "Thought")].trim_end(),
+        "    ✓ Thought: Settling · 2 steps",
+        "a run with no durations to sum states none, exactly as a lone block \
+         without one does: {}",
+        rows.join("\n")
+    );
+}
+
+#[test]
+fn an_expanded_reasoning_group_marks_the_member_whose_prose_the_cap_cut_short() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::Reasoning(ReasoningBlock::thought("Reading", "Read the plan.", 300).capped()),
+            RunEntry::Reasoning(ReasoningBlock::thought("Settling", "Settled on it.", 400)),
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose first Reasoning block the cap cut short");
+
+    let collapsed = rendered_application_rows_at(&application, 80, 18);
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&collapsed, "Thought") as u16))
+        .expect("expand the Reasoning Group");
+
+    let rows = rendered_application_rows_at(&application, 80, 18);
+    let header = rendered_row(&rows, "Thought");
+    assert_eq!(
+        rows[header..header + 6]
+            .iter()
+            .map(|row| row.trim_end())
+            .collect::<Vec<_>>(),
+        [
+            "    ✓ Thought: Settling · 2 steps · 700ms",
+            "      Reading",
+            "      Read the plan.",
+            "      [Reasoning truncated]",
+            "",
+            "      Settling",
+        ],
+        "a member the cap cut short ends in the marker that says so, inside the \
+         Group as it does outside one: {}",
+        rows.join("\n")
+    );
+}
+
+#[test]
+fn a_reasoning_block_settling_is_absorbed_into_the_group_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let mut snapshot = command_run_snapshot(
+        session_id,
+        workspace.path(),
+        &[
+            RunEntry::Reasoning(ReasoningBlock::thought("Reading", "Read the plan.", 300)),
+            RunEntry::Reasoning(ReasoningBlock::thought("Weighing", "Weighed it.", 400)),
+            RunEntry::Reasoning(ReasoningBlock::streaming("Settling", "Settling on it.")),
+        ],
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    let streaming_id = snapshot.activities[2].id();
+    let next_revision = SessionRevision(snapshot.revision.0 + 1);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session still thinking after a settled run");
+
+    let before = rendered_application_rows_at(&application, 80, 18);
+    assert_eq!(
+        before[rendered_row(&before, "Thought")].trim_end(),
+        "    ✓ Thought: Weighing · 2 steps · 700ms",
+        "the settled run groups while the block after it is still streaming: {}",
+        before.join("\n")
+    );
+    assert!(
+        before.join("\n").contains("⠋ Thinking: Settling"),
+        "the streaming block stays outside the Group: {}",
+        before.join("\n")
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: next_revision,
+                changes: vec![SessionChange::ReasoningStatusChanged {
+                    activity_id: streaming_id,
+                    status: ActivityStatus::Completed,
+                    duration_ms: Some(600),
+                }],
+            },
+        )))
+        .expect("project the Reasoning block settling");
+
+    let after = rendered_application_rows_at(&application, 80, 18);
+    assert_eq!(
+        after[rendered_row(&after, "Thought")].trim_end(),
+        "    ✓ Thought: Settling · 3 steps · 1s",
+        "the memoized projection re-reads the Group when a member settles into it, \
+         so the row absorbs the block, leads with its title, and re-sums: {}",
+        after.join("\n")
+    );
+    assert!(
+        !after.join("\n").contains("Thinking"),
+        "the settled block left no standalone row behind: {}",
+        after.join("\n")
+    );
+}
+
+#[test]
+fn a_turn_fold_reveals_its_reasoning_group_in_the_state_the_reader_left_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Explain the Transcript"),
+            REASONING_RUN[0],
+            REASONING_RUN[1],
+            REASONING_RUN[2],
+            RunEntry::AgentMessage("It is the history of a Session."),
+        ],
+    );
+    snapshot.session.status = SessionStatus::Idle;
+    snapshot.turns[0].status = TurnStatus::Completed;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose settled Turn only ever thought");
+
+    let folded = rendered_application_rows_at(&application, 80, 24);
+    assert!(
+        !folded.join("\n").contains("Thought"),
+        "the Turn Fold hides the Reasoning Group it stands for: {}",
+        folded.join("\n")
+    );
+
+    let toggle_turn = |application: &mut Application| {
+        let rows = rendered_application_rows_at(application, 80, 24);
+        application
+            .handle_terminal_event(left_click_at(rendered_row(&rows, "Worked") as u16))
+            .expect("toggle the Turn Fold");
+    };
+
+    toggle_turn(&mut application);
+    let opened = rendered_application_rows_at(&application, 80, 24);
+    assert!(
+        opened.join("\n").contains("3 steps")
+            && !opened.join("\n").contains("Read the projection."),
+        "expanding the Turn reveals the Group collapsed, so opening a Turn spills no \
+         thinking prose: {}",
+        opened.join("\n")
+    );
+
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&opened, "Thought") as u16))
+        .expect("expand the Reasoning Group inside the opened Turn");
+    let group_expanded = rendered_application_rows_at(&application, 80, 24);
+    assert!(
+        group_expanded.join("\n").contains("Read the projection."),
+        "the Group opens onto its members' prose: {}",
+        group_expanded.join("\n")
+    );
+
+    toggle_turn(&mut application);
+    toggle_turn(&mut application);
+    assert_eq!(
+        rendered_application_rows_at(&application, 80, 24),
+        group_expanded,
+        "expanding a Turn again reveals its Group in whatever state the reader left it"
+    );
+}
+
 #[test]
 fn a_settled_turn_renders_as_one_marker_between_its_prompt_and_its_answer() {
     let workspace = tempfile::tempdir().expect("create Workspace");
@@ -3711,7 +4326,11 @@ fn settled_turn_session(
             RunEntry::UserMessage(prompt),
             SUCCESSFUL_COMMAND,
             SUCCESSFUL_COMMAND,
-            RunEntry::Reasoning("Reading the workflow"),
+            RunEntry::Reasoning(ReasoningBlock::thought(
+                "Reading the workflow",
+                "Weighed the options.",
+                4_000,
+            )),
             RunEntry::AgentMessage(answer),
         ],
     );
@@ -3778,7 +4397,7 @@ fn a_settled_turn_whose_only_work_was_empty_reasoning_shows_no_marker() {
         workspace.path(),
         &[
             RunEntry::UserMessage("Explain the Transcript"),
-            RunEntry::EmptyReasoning,
+            RunEntry::Reasoning(ReasoningBlock::EMPTY),
             RunEntry::AgentMessage("It is the history of a Session."),
         ],
     );
@@ -3987,7 +4606,11 @@ fn interrupting_a_turn_holds_its_fold_open_until_a_newer_turn_begins() {
             RunEntry::UserMessage("Run the workflow"),
             SUCCESSFUL_COMMAND,
             SUCCESSFUL_COMMAND,
-            RunEntry::Reasoning("Reading the workflow"),
+            RunEntry::Reasoning(ReasoningBlock::thought(
+                "Reading the workflow",
+                "Weighed the options.",
+                4_000,
+            )),
             RunEntry::AgentMessage("Two suites in, still going."),
         ],
     );
@@ -4082,7 +4705,11 @@ fn a_queued_prompt_starting_in_the_settle_commit_refolds_the_interrupted_turn_at
             RunEntry::UserMessage("Run the workflow"),
             SUCCESSFUL_COMMAND,
             SUCCESSFUL_COMMAND,
-            RunEntry::Reasoning("Reading the workflow"),
+            RunEntry::Reasoning(ReasoningBlock::thought(
+                "Reading the workflow",
+                "Weighed the options.",
+                4_000,
+            )),
             RunEntry::AgentMessage("Two suites in, still going."),
         ],
     );

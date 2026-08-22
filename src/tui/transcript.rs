@@ -1193,6 +1193,9 @@ impl TurnFolding {
 enum GroupableKind {
     /// Commands, which join a run only once they settle successfully.
     Command,
+    /// Reasoning blocks, which join a run once they settle having said
+    /// something.
+    Reasoning,
 }
 
 impl GroupableKind {
@@ -1200,7 +1203,11 @@ impl GroupableKind {
     /// nothing and so ends whatever run it follows. A command joins only once
     /// it settles Completed with exit status 0, so a failed, interrupted, or
     /// still-running one — anything worth scanning for — never hides behind a
-    /// Group row.
+    /// Group row. A Reasoning block joins once it settles Completed, so a
+    /// block a Turn interrupted ends the run and stands outside it: a Group
+    /// row only ever summarizes thinking that finished. A block the reader
+    /// sees nothing for never reaches here at all, because the walk resolves
+    /// it to no entry.
     const fn joined_by(activity: &Activity) -> Option<Self> {
         match activity {
             Activity::Command {
@@ -1208,17 +1215,21 @@ impl GroupableKind {
                 exit_status: Some(0),
                 ..
             } => Some(Self::Command),
+            Activity::Reasoning {
+                status: crate::protocol::ActivityStatus::Completed,
+                ..
+            } => Some(Self::Reasoning),
             _ => None,
         }
     }
 
     /// The line of a Group's header carrying a Spinner in its Marker cell, or
-    /// `None` for a kind whose header never stands for work in progress. A
-    /// command joins a run only once it has settled, so a command Group only
-    /// ever speaks for work already done.
+    /// `None` for a kind whose header never stands for work in progress.
+    /// Neither kind joins a run before it has settled, so neither Group ever
+    /// speaks for work still going on.
     const fn header_spinner_line(self) -> Option<usize> {
         match self {
-            Self::Command => None,
+            Self::Command | Self::Reasoning => None,
         }
     }
 
@@ -1231,6 +1242,18 @@ impl GroupableKind {
         let mut hasher = std::hash::DefaultHasher::new();
         match self {
             Self::Command => member.id().hash(&mut hasher),
+            // A Reasoning Group's header leads with the latest member's title
+            // and sums every member's duration, and its expansion draws each
+            // member's whole prose, so all of what a member shows is header
+            // input.
+            Self::Reasoning => {
+                if let Some(reasoning) = ReasoningActivity::of(member) {
+                    reasoning.title.hash(&mut hasher);
+                    reasoning.content.len().hash(&mut hasher);
+                    reasoning.content_truncated.hash(&mut hasher);
+                    reasoning.duration_ms.hash(&mut hasher);
+                }
+            }
         }
         hasher.finish()
     }
@@ -1247,6 +1270,10 @@ impl GroupableKind {
                 .copied()
                 .map(RenderUnit::GroupMember)
                 .collect(),
+            // A Reasoning Group opens straight onto its members' prose with no
+            // per-member fold stage to keep state for, so the whole expansion
+            // is the Group unit's own content.
+            Self::Reasoning => Vec::new(),
         }
     }
 }
@@ -1852,25 +1879,14 @@ fn render_activity(
             step != FoldStep::Expanded,
             theme,
         )),
-        Activity::Reasoning {
-            status,
-            title,
-            content,
-            content_truncated,
-            duration_ms,
-            ..
-        } => Some(push_reasoning_activity(
-            projection.lines,
-            ReasoningActivity {
-                status: *status,
-                title: title.as_deref(),
-                content,
-                content_truncated: *content_truncated,
-                duration_ms: *duration_ms,
-            },
-            step != FoldStep::Expanded,
-            theme,
-        )),
+        Activity::Reasoning { .. } => ReasoningActivity::of(activity).map(|reasoning| {
+            push_reasoning_activity(
+                projection.lines,
+                reasoning,
+                step != FoldStep::Expanded,
+                theme,
+            )
+        }),
     }
 }
 
@@ -1887,6 +1903,7 @@ fn render_group(
 ) -> UnitAnchor {
     match kind {
         GroupableKind::Command => render_command_group(lines, members.len(), expanded, theme),
+        GroupableKind::Reasoning => render_reasoning_group(lines, members, expanded, theme),
     }
 }
 
@@ -1906,6 +1923,110 @@ fn render_command_group(
         Span::styled(format!("Ran {member_count} commands"), theme.action.primary),
     ]));
     UnitAnchor::binary(1, !expanded)
+}
+
+/// Projects a Reasoning Group: the run's single row, and — when the reader
+/// opened it — every member's prose beneath it. The row leads with the latest
+/// member's title, because what a reader wants from a settled run of thinking
+/// is where it arrived rather than where it set out; a latest member the
+/// Provider never headed leaves the row with no description to give, and it
+/// gives none rather than reaching back for an earlier heading. The step count
+/// stands as the toggle affordance, the way a command Group's count does, and
+/// always speaks for more than one member: a run of one is never a Group, so a
+/// lone block keeps the header-and-fold row it has alone instead of gaining a
+/// count of one. Expanded, the same row heads the sections it opened onto.
+fn render_reasoning_group(
+    lines: &mut Vec<Line<'static>>,
+    members: &[&Activity],
+    expanded: bool,
+    theme: &Theme,
+) -> UnitAnchor {
+    let style = theme.text.subdued;
+    let header =
+        reasoning_header_text(REASONING_COMPLETED_LABEL, latest_reasoning_heading(members));
+    push_prefixed_lines(lines, "  ✓ ", &header, style);
+    let header_line = lines
+        .last_mut()
+        .expect("a Reasoning Group always projects a header line");
+    header_line.spans.push(Span::styled(" · ", style));
+    header_line.spans.push(Span::styled(
+        format!("{} steps", members.len()),
+        theme.action.primary,
+    ));
+    if let Some(duration_ms) = summed_reasoning_duration(members) {
+        header_line.spans.push(Span::styled(
+            format!(" · {}", humanized_duration(duration_ms)),
+            style,
+        ));
+    }
+    let header_source_lines = lines.len();
+    if !expanded {
+        return UnitAnchor::binary(header_source_lines, true);
+    }
+    for (index, member) in members
+        .iter()
+        .copied()
+        .filter_map(ReasoningActivity::of)
+        .enumerate()
+    {
+        if index > 0 {
+            lines.push(Line::default());
+        }
+        push_reasoning_section(lines, member, theme);
+    }
+    UnitAnchor::binary(header_source_lines, false)
+}
+
+/// Projects one section of an expanded Reasoning Group: the heading the
+/// Provider led that section with, in bold so a reader scans the sections by
+/// their titles, over the prose it heads. There is no per-member fold marker
+/// because there is no per-member Fold: a Reasoning Group opens onto
+/// everything its members hold in one step, so nothing here is holding
+/// anything back.
+fn push_reasoning_section(
+    lines: &mut Vec<Line<'static>>,
+    reasoning: ReasoningActivity<'_>,
+    theme: &Theme,
+) {
+    let style = theme.text.subdued;
+    if let Some(title) = reasoning_heading(reasoning.title) {
+        push_prefixed_lines(
+            lines,
+            OUTPUT_INDENT,
+            title,
+            style.add_modifier(Modifier::BOLD),
+        );
+    }
+    lines.append(&mut reasoning_body_lines(&reasoning, theme));
+}
+
+/// The description a Reasoning Group's row leads with, or `None` when its
+/// latest member carries no heading. Read off the last member rather than the
+/// last member that has one, because the row states where the thinking ended
+/// up: a run whose final section the Provider left unheaded ended up somewhere
+/// it did not name.
+fn latest_reasoning_heading<'a>(members: &[&'a Activity]) -> Option<&'a str> {
+    reasoning_heading(
+        members
+            .last()
+            .copied()
+            .and_then(ReasoningActivity::of)?
+            .title,
+    )
+}
+
+/// The duration a Reasoning Group's row reports: the sum of what its members
+/// each spent, not the wall-clock span they cover, so the row stands for the
+/// thinking time it gathered rather than for the stretch of Transcript it
+/// occupies. A run whose members carry no durations reports none, exactly as a
+/// lone block without one does.
+fn summed_reasoning_duration(members: &[&Activity]) -> Option<u64> {
+    members
+        .iter()
+        .copied()
+        .filter_map(ReasoningActivity::of)
+        .filter_map(|reasoning| reasoning.duration_ms)
+        .reduce(u64::saturating_add)
 }
 
 /// Projects a Turn Fold's marker: the row a settled Turn stands as, drawn in
@@ -2230,6 +2351,63 @@ struct ReasoningActivity<'a> {
     duration_ms: Option<u64>,
 }
 
+impl<'a> ReasoningActivity<'a> {
+    /// The Reasoning an Activity holds, or `None` for an Activity of another
+    /// kind. Every member of a Reasoning Group is a Reasoning Activity,
+    /// because the groupable kind is what gathered it; reading that back out
+    /// as an Option keeps the guarantee a fact about the walk rather than a
+    /// panic waiting in a renderer.
+    fn of(activity: &'a Activity) -> Option<Self> {
+        match activity {
+            Activity::Reasoning {
+                status,
+                title,
+                content,
+                content_truncated,
+                duration_ms,
+                ..
+            } => Some(Self {
+                status: *status,
+                title: title.as_deref(),
+                content,
+                content_truncated: *content_truncated,
+                duration_ms: *duration_ms,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// What a Reasoning header states before any count or duration: the word for
+/// the state the block is in, and the heading the Provider led it with when
+/// there is one. A lone block's header and a Group's row both open with this,
+/// so the two cannot drift apart in wording.
+fn reasoning_header_text(label: &str, title: Option<&str>) -> String {
+    let mut header = label.to_owned();
+    if let Some(title) = reasoning_heading(title) {
+        header.push_str(": ");
+        header.push_str(title);
+    }
+    header
+}
+
+/// The lines a Reasoning block's stored content projects: the summary the
+/// Provider wrote, rendered as the Markdown it is but drained of colour so
+/// Reasoning never competes with the answer it led to, followed by the
+/// truncation marker when the cap cut it short. A lone block's Fold and a
+/// Group's expansion both open onto exactly this.
+fn reasoning_body_lines(reasoning: &ReasoningActivity<'_>, theme: &Theme) -> Vec<Line<'static>> {
+    let content = sanitize_content(reasoning.content);
+    let mut body = markdown::render(&content, theme)
+        .into_iter()
+        .map(|line| subdued_line(line, OUTPUT_INDENT, theme))
+        .collect::<Vec<_>>();
+    if reasoning.content_truncated {
+        push_truncation_marker(&mut body, CappedStream::Reasoning, OUTPUT_INDENT, theme);
+    }
+    body
+}
+
 /// Projects a Reasoning Activity. Folded — the posture a Transcript leans to —
 /// it is the single header line the reader skims past; expanded it opens into
 /// the summary the Provider wrote, rendered as the Markdown it is but drained of
@@ -2242,14 +2420,7 @@ fn push_reasoning_activity(
 ) -> UnitAnchor {
     use crate::protocol::ActivityStatus;
 
-    let ReasoningActivity {
-        status,
-        title,
-        content,
-        content_truncated,
-        duration_ms,
-    } = activity;
-    let (marker, label, style) = match status {
+    let (marker, label, style) = match activity.status {
         ActivityStatus::Active => (
             spinner::MARKER,
             REASONING_ACTIVE_LABEL,
@@ -2258,25 +2429,14 @@ fn push_reasoning_activity(
         ActivityStatus::Completed => ("✓ ", REASONING_COMPLETED_LABEL, theme.text.subdued),
         ActivityStatus::Failed => ("× ", REASONING_FAILED_LABEL, theme.feedback.error),
     };
-    let mut header = label.to_owned();
-    if let Some(title) = reasoning_heading(title) {
-        header.push_str(": ");
-        header.push_str(title);
-    }
-    if let Some(duration_ms) = duration_ms {
+    let mut header = reasoning_header_text(label, activity.title);
+    if let Some(duration_ms) = activity.duration_ms {
         header.push_str(" · ");
         header.push_str(&humanized_duration(duration_ms));
     }
     // The body is projected whether or not it will be shown, because a Fold
     // that hides all of it still has to say how many lines that is.
-    let content = sanitize_content(content);
-    let mut body = markdown::render(&content, theme)
-        .into_iter()
-        .map(|line| subdued_line(line, OUTPUT_INDENT, theme))
-        .collect::<Vec<_>>();
-    if content_truncated {
-        push_truncation_marker(&mut body, CappedStream::Reasoning, OUTPUT_INDENT, theme);
-    }
+    let mut body = reasoning_body_lines(&activity, theme);
     let header_start = lines.len();
     push_prefixed_lines(lines, &format!("  {marker}"), &header, style);
     // A Reasoning Fold hides the entry's whole body rather than the middle of
