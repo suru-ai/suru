@@ -41,6 +41,10 @@ const MINIMUM_TERMINAL_WIDTH: u16 = 28;
 const MINIMUM_TERMINAL_HEIGHT: u16 = 5;
 const LANDING_BRAND_MINIMUM_HEIGHT: u16 = 9;
 const SESSION_HEADER_MINIMUM_HEIGHT: u16 = 8;
+/// Rows of air the layout keeps below the Transcript, so its last entry never
+/// abuts whatever is docked underneath.
+/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
+const TRANSCRIPT_BOTTOM_MARGIN: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResponsiveDetail {
@@ -903,6 +907,7 @@ fn render_session(
         .saturating_add(desired_composer_height)
         .saturating_add(composer_top.height())
         .saturating_add(footer.height())
+        .saturating_add(TRANSCRIPT_BOTTOM_MARGIN)
         .saturating_add(1);
     let pending_room = frame.area().height.saturating_sub(core_height);
     let pending_height = if pending_room >= 3 {
@@ -914,6 +919,7 @@ fn render_session(
         .saturating_add(pending_height)
         .saturating_add(composer_top.height())
         .saturating_add(footer.height())
+        .saturating_add(TRANSCRIPT_BOTTOM_MARGIN)
         .saturating_add(1);
     let composer_height =
         desired_composer_height.min(frame.area().height.saturating_sub(reserved_height).max(1));
@@ -934,7 +940,7 @@ fn render_session(
         theme,
         content_width,
     );
-    let [_, transcript_without_latest, _, _, _, _, _] = session_areas(
+    let [_, transcript_without_latest, _, _, _, _, _, _] = session_areas(
         frame.area(),
         u16::from(show_header),
         pending_height,
@@ -944,7 +950,7 @@ fn render_session(
         footer.height(),
     );
     let viewport_without_latest = transcript_viewport_height(transcript_without_latest);
-    let [_, transcript_with_latest, _, _, _, _, _] = session_areas(
+    let [_, transcript_with_latest, _, _, _, _, _, _] = session_areas(
         frame.area(),
         u16::from(show_header),
         pending_height,
@@ -999,6 +1005,7 @@ fn render_session(
     let [
         header_area,
         transcript_area,
+        _transcript_margin,
         pending_area,
         latest_area,
         composer_top_area,
@@ -1144,10 +1151,15 @@ fn session_areas(
     composer_top_height: u16,
     composer_height: u16,
     footer_height: u16,
-) -> [Rect; 7] {
+) -> [Rect; 8] {
     Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Min(1),
+        // The Transcript's bottom margin. Vertical rhythm inside the
+        // Transcript separates its own entries; this row keeps the last of
+        // them off the composer below, and is layout's to draw rather than a
+        // trailing blank the projection pads itself with.
+        Constraint::Length(TRANSCRIPT_BOTTOM_MARGIN),
         Constraint::Length(pending_height),
         Constraint::Length(latest_height),
         Constraint::Length(composer_top_height),

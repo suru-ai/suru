@@ -6,6 +6,13 @@
 //! in each of those four places. Most units hold exactly one entry; a Group
 //! holds a run of adjacent, successfully settled command Activities.
 //!
+//! Vertical rhythm is decided between units rather than inside them. A
+//! renderer never pads itself, because whitespace at a boundary is a property
+//! of the pair of entries it falls between and no renderer can see what
+//! follows it; the walk that lays units out inserts a blank row instead. See
+//! [`Spacing::separates`] for the rule and [`assign_separators`] for the two
+//! boundaries exempt from it.
+//!
 //! Rendering happens on every input event, so this module memoizes the
 //! expensive work at two levels. The whole view is keyed on the Session
 //! revision and content width: unchanged frames reuse it outright. When the
@@ -456,7 +463,21 @@ impl TranscriptView {
             .partition_point(|unit| unit.start_line <= first_line)
             .saturating_sub(1);
         'units: for unit in &self.units[first_unit.min(self.units.len())..] {
-            let skip = first_line.saturating_sub(unit.start_line);
+            let mut skip = first_line.saturating_sub(unit.start_line);
+            if unit.leading_separator {
+                // The separator is the unit's first line for indexing, so a
+                // window opening on it draws it and one opening past it skips
+                // it along with the lines before `first_line`.
+                if skip == 0 {
+                    lines.push(Line::default());
+                    rows += 1;
+                    if rows >= rows_needed {
+                        break 'units;
+                    }
+                } else {
+                    skip -= 1;
+                }
+            }
             for (line, rows_of_line) in unit.lines.iter().zip(&unit.rows_per_line).skip(skip) {
                 lines.push(line.clone());
                 rows += rows_of_line;
@@ -542,6 +563,24 @@ impl RenderUnit<'_> {
         }
     }
 
+    const fn spacing_kind(&self) -> SpacingKind {
+        match self {
+            Self::Message(_) | Self::Provisional(_) => SpacingKind::Message,
+            Self::Activity(activity) | Self::GroupMember(activity) => match activity {
+                Activity::Error { .. } => SpacingKind::Error,
+                _ => SpacingKind::Activity,
+            },
+            Self::Group { .. } => SpacingKind::Activity,
+        }
+    }
+
+    /// Whether this unit is the first member of the expanded Group headed by
+    /// `previous`, the one seam the separator rule never opens.
+    const fn heads_the_group(&self, previous: &Self) -> bool {
+        matches!(self, Self::GroupMember(_))
+            && matches!(previous, Self::Group { expanded: true, .. })
+    }
+
     /// Projects the unit's lines, reporting the anchor a click acts on when
     /// the unit has one.
     fn render(
@@ -587,6 +626,46 @@ impl RenderUnit<'_> {
                 push_user_message(lines, &prompt.text, theme, width);
                 None
             }
+        }
+    }
+}
+
+/// Which of the Transcript's registers a unit speaks in, which is all the
+/// separator rule needs to know about it. See [`Spacing::separates`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpacingKind {
+    /// A Message, or a Prompt this client has not seen echoed back yet: a turn
+    /// of the conversation, which always takes air around it.
+    Message,
+    /// An Activity, a Group, or a Group member: progress and operational
+    /// detail, which packs into a tight list while each entry stays one line.
+    Activity,
+    /// An Error Activity, which takes air whatever its size, because a failure
+    /// is the one thing a reader must never have to hunt for.
+    Error,
+}
+
+/// What the separator rule reads off one unit: the register it speaks in, and
+/// how much of the Transcript it occupies.
+#[derive(Clone, Copy, Debug)]
+struct Spacing {
+    kind: SpacingKind,
+    /// The unit's own projected lines, counted before layout wrapped any of
+    /// them, so resizing the terminal reflows the text without ever changing
+    /// the Transcript's vertical rhythm.
+    lines: usize,
+}
+
+impl Spacing {
+    /// Whether a blank row separates this unit from the one after it. The
+    /// answer comes from the pair alone: whitespace at a boundary is a
+    /// property of the boundary, not of either entry, which is why no renderer
+    /// decides it. A run of compact Activities stays a tight list; every other
+    /// boundary takes one blank row.
+    const fn separates(self, next: Self) -> bool {
+        match (self.kind, next.kind) {
+            (SpacingKind::Activity, SpacingKind::Activity) => self.lines > 1 || next.lines > 1,
+            _ => true,
         }
     }
 }
@@ -708,6 +787,17 @@ struct UnitView {
     /// Wrapped row count per line at the view width, so layout is a prefix sum
     /// instead of a re-wrap.
     rows_per_line: Vec<usize>,
+    /// Lines the unit projected before layout split any oversized one, which
+    /// is what the separator rule measures compactness in.
+    source_lines: usize,
+    /// Whether a blank row is drawn above this unit. Decided per rebuild from
+    /// this unit and the one before it, and deliberately outside the cache
+    /// fingerprint: a boundary is not a property of either unit, so a unit
+    /// reused unchanged can still take a separator it did not take last frame.
+    leading_separator: bool,
+    /// Index of the unit's first line across the view, counting its own
+    /// separator as that first line so a window opening mid-unit lands by
+    /// simple subtraction.
     start_line: usize,
     message_id: Option<MessageId>,
     anchor: Option<LaidOutAnchor>,
@@ -748,10 +838,12 @@ fn rebuild(
                 .collect()
         })
         .unwrap_or_default();
-    let mut units = plan_units(snapshot, provisional, disclosure.groups)
-        .into_iter()
-        .map(|unit| reuse_or_render(&mut reusable, &unit, disclosure.folds, theme, width))
+    let planned = plan_units(snapshot, provisional, disclosure.groups);
+    let mut units = planned
+        .iter()
+        .map(|unit| reuse_or_render(&mut reusable, unit, disclosure.folds, theme, width))
         .collect::<Vec<_>>();
+    assign_separators(&planned, &mut units);
 
     let mut row_count = 0;
     let mut line_count = 0;
@@ -760,11 +852,19 @@ fn rebuild(
     let mut line_starts = Vec::new();
     for unit in &mut units {
         unit.start_line = line_count;
+        if unit.leading_separator {
+            line_starts.push(row_count);
+            row_count += 1;
+            line_count += 1;
+        }
+        // Every row offset a caller acts on — a click target, a scroll anchor —
+        // points past the separator, so the blank row belongs to no unit's
+        // extent and a click on it resolves to nothing.
         let unit_start_row = row_count;
         if let Some(message_id) = unit.message_id {
             message_starts.push(MessageStart {
                 message_id,
-                row: row_count,
+                row: unit_start_row,
             });
         }
         for rows_of_line in &unit.rows_per_line {
@@ -796,6 +896,39 @@ fn rebuild(
     }
 }
 
+/// Decides which units take a blank row above them. The walk runs over the
+/// planned units because the rule reads their kinds, and over the rendered
+/// ones because it reads their sizes; the two are the same sequence.
+///
+/// Two boundaries are exempt from [`Spacing::separates`]. A unit that projected
+/// nothing is not a boundary at all, so it neither takes a separator nor
+/// becomes the entry the next one is measured against — the walk carries that
+/// one predecessor, so every question about what came before this unit gets the
+/// same answer. And an expanded Group's header is
+/// always tight to its first member: that seam is inside one construct rather
+/// than between two entries, so air there would read as detaching a header
+/// from the very thing it heads.
+fn assign_separators<'a>(planned: &'a [RenderUnit<'_>], rendered: &mut [UnitView]) {
+    let mut previous: Option<(&'a RenderUnit<'_>, Spacing)> = None;
+    for (plan, unit) in planned.iter().zip(rendered.iter_mut()) {
+        if unit.source_lines == 0 {
+            unit.leading_separator = false;
+            continue;
+        }
+        let spacing = Spacing {
+            kind: plan.spacing_kind(),
+            lines: unit.source_lines,
+        };
+        unit.leading_separator = match previous {
+            Some((previous_plan, previous_spacing)) => {
+                !plan.heads_the_group(previous_plan) && previous_spacing.separates(spacing)
+            }
+            None => false,
+        };
+        previous = Some((plan, spacing));
+    }
+}
+
 /// Renders one unit, or returns the cached render when nothing it depends on
 /// changed. The unit reports its own anchor, whose header line count is
 /// re-derived here because oversized lines split during layout.
@@ -816,6 +949,7 @@ fn reuse_or_render(
     let mut rendered = Vec::new();
     let mut links = Vec::new();
     let rendered_anchor = unit.render(&mut rendered, &mut links, folds, theme, width);
+    let source_lines = rendered.len();
     let mut measured = Vec::with_capacity(rendered.len());
     let mut header_lines = 0;
     let mut marker_line = None;
@@ -835,6 +969,8 @@ fn reuse_or_render(
         lines,
         links,
         rows_per_line,
+        source_lines,
+        leading_separator: false,
         start_line: 0,
         message_id: unit.message_id(),
         anchor: rendered_anchor.map(|anchor| LaidOutAnchor {
@@ -1578,7 +1714,6 @@ fn push_user_message(
             Span::styled(" ".repeat(padding), surface),
         ]));
     }
-    lines.push(Line::default());
 }
 
 fn wrapped_content_lines(content: &str, width: usize) -> Vec<String> {
@@ -1619,9 +1754,6 @@ fn push_agent_message(
     }
     if truncated {
         push_truncation_marker(lines, CappedStream::Message, "  ", theme);
-    }
-    if !content.is_empty() || truncated {
-        lines.push(Line::default());
     }
 }
 
@@ -2097,8 +2229,8 @@ mod tests {
 
     use super::{
         CappedStream, FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, TranscriptCache,
-        TranscriptDisclosure, TranscriptFolds, TranscriptGroups, render_activity, render_message,
-        split_oversized_line, wrapped_line_count,
+        TranscriptDisclosure, TranscriptFolds, TranscriptGroups, TranscriptView, UnitKey,
+        render_activity, render_message, split_oversized_line, wrapped_line_count,
     };
 
     fn rendered_text(line: &Line<'static>) -> String {
@@ -2320,25 +2452,7 @@ mod tests {
             output_truncated: false,
             exit_status: Some(0),
         };
-        let snapshot = SessionSnapshot {
-            session: Session {
-                id: crate::protocol::SessionId::new(),
-                workspace: Workspace {
-                    path: PathBuf::from("/workspace"),
-                },
-                agent_selection: None,
-                agent_selection_availability: ModelAvailability::Available,
-                status: SessionStatus::Idle,
-            },
-            revision: SessionRevision::INITIAL,
-            prompts: Vec::new(),
-            turns: Vec::new(),
-            messages: Vec::new(),
-            activities: vec![activity.clone()],
-            transcript: vec![TranscriptItem::Activity {
-                activity_id: activity.id(),
-            }],
-        };
+        let snapshot = transcript_snapshot(vec![Entry::Activity(activity.clone())]);
         let cache = TranscriptCache::default();
         let mut folds = TranscriptFolds::default();
         folds.expand(activity.id());
@@ -2401,25 +2515,7 @@ mod tests {
             output_truncated: false,
             exit_status: Some(0),
         };
-        let snapshot = SessionSnapshot {
-            session: Session {
-                id: crate::protocol::SessionId::new(),
-                workspace: Workspace {
-                    path: PathBuf::from("/workspace"),
-                },
-                agent_selection: None,
-                agent_selection_availability: ModelAvailability::Available,
-                status: SessionStatus::Idle,
-            },
-            revision: SessionRevision::INITIAL,
-            prompts: Vec::new(),
-            turns: Vec::new(),
-            messages: Vec::new(),
-            activities: vec![activity.clone()],
-            transcript: vec![TranscriptItem::Activity {
-                activity_id: activity.id(),
-            }],
-        };
+        let snapshot = transcript_snapshot(vec![Entry::Activity(activity.clone())]);
         let theme = Theme::system();
         let cache = TranscriptCache::default();
         let mut folds = TranscriptFolds::default();
@@ -2737,5 +2833,390 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["https://example.com/first", "file:///tmp/second"]
         );
+    }
+
+    /// One entry a spacing fixture puts in the Transcript, in presentation
+    /// order.
+    enum Entry {
+        Message(Message),
+        Activity(Activity),
+    }
+
+    fn user_message(content: &str) -> Message {
+        Message {
+            id: MessageId::new(),
+            turn_id: TurnId::new(),
+            role: MessageRole::User,
+            status: MessageStatus::Completed,
+            content: content.to_owned(),
+            truncated: false,
+        }
+    }
+
+    fn agent_message(content: &str) -> Message {
+        Message {
+            role: MessageRole::Agent,
+            ..user_message(content)
+        }
+    }
+
+    fn command(command: &str, output: &str) -> Activity {
+        Activity::Command {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Completed,
+            command: command.to_owned(),
+            cwd: None,
+            output: output.to_owned(),
+            output_truncated: false,
+            exit_status: Some(0),
+        }
+    }
+
+    fn error(text: &str) -> Activity {
+        Activity::Error {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            text: text.to_owned(),
+        }
+    }
+
+    fn status(text: &str) -> Activity {
+        Activity::Status {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            text: text.to_owned(),
+        }
+    }
+
+    /// Builds a Session snapshot whose Transcript holds `entries` in order, so
+    /// a spacing test reads as the conversation it is describing.
+    fn transcript_snapshot(entries: Vec<Entry>) -> SessionSnapshot {
+        let mut messages = Vec::new();
+        let mut activities = Vec::new();
+        let mut transcript = Vec::new();
+        for entry in entries {
+            match entry {
+                Entry::Message(message) => {
+                    transcript.push(TranscriptItem::Message {
+                        message_id: message.id,
+                    });
+                    messages.push(message);
+                }
+                Entry::Activity(activity) => {
+                    transcript.push(TranscriptItem::Activity {
+                        activity_id: activity.id(),
+                    });
+                    activities.push(activity);
+                }
+            }
+        }
+        SessionSnapshot {
+            session: Session {
+                id: crate::protocol::SessionId::new(),
+                workspace: Workspace {
+                    path: PathBuf::from("/workspace"),
+                },
+                agent_selection: None,
+                agent_selection_availability: ModelAvailability::Available,
+                status: SessionStatus::Idle,
+            },
+            revision: SessionRevision::INITIAL,
+            prompts: Vec::new(),
+            turns: Vec::new(),
+            messages,
+            activities,
+            transcript,
+        }
+    }
+
+    /// The text of each projected row, trailing padding trimmed, which is what
+    /// a spacing test is asserting about.
+    fn row_text(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(rendered_text)
+            .map(|row| row.trim_end().to_owned())
+            .collect()
+    }
+
+    /// Projects the whole Transcript as the text of each row.
+    fn projected_rows(
+        snapshot: &SessionSnapshot,
+        folds: &TranscriptFolds,
+        groups: &TranscriptGroups,
+    ) -> Vec<String> {
+        let cache = TranscriptCache::default();
+        let view = projected_view(&cache, snapshot, folds, groups);
+        let row_count = view.row_count();
+        row_text(&view.window(0, row_count).0)
+    }
+
+    #[test]
+    fn an_agent_message_takes_a_blank_row_after_a_folded_command() {
+        let snapshot = transcript_snapshot(vec![
+            Entry::Activity(command("cargo build", "")),
+            Entry::Message(agent_message("Build is green.")),
+        ]);
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(rows, ["  ✓ cargo build", "", "  Build is green."]);
+    }
+
+    #[test]
+    fn a_run_of_compact_activities_stays_a_tight_list() {
+        let snapshot = transcript_snapshot(vec![
+            Entry::Activity(status("Preparing the workspace")),
+            Entry::Activity(command("cargo build", "")),
+            Entry::Activity(status("Done")),
+        ]);
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(
+            rows,
+            ["  Preparing the workspace", "  ✓ cargo build", "  Done"]
+        );
+    }
+
+    #[test]
+    fn an_activity_with_a_body_takes_air_on_both_sides() {
+        let noisy = command("cargo test", "running 2 tests\nall green");
+        let mut folds = TranscriptFolds::default();
+        folds.expand(noisy.id());
+        let snapshot = transcript_snapshot(vec![
+            Entry::Activity(status("Preparing the workspace")),
+            Entry::Activity(noisy),
+            Entry::Activity(status("Done")),
+        ]);
+
+        let rows = projected_rows(&snapshot, &folds, &TranscriptGroups::default());
+
+        assert_eq!(
+            rows,
+            [
+                "  Preparing the workspace",
+                "",
+                "  ✓ cargo test",
+                "    running 2 tests",
+                "    all green",
+                "",
+                "  Done",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_error_takes_air_even_between_compact_activities() {
+        let snapshot = transcript_snapshot(vec![
+            Entry::Activity(status("Preparing the workspace")),
+            Entry::Activity(error("the Provider dropped the Turn")),
+            Entry::Activity(status("Done")),
+        ]);
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(
+            rows,
+            [
+                "  Preparing the workspace",
+                "",
+                "  Error: the Provider dropped the Turn",
+                "",
+                "  Done",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_compact_activity_wrapping_at_the_view_width_still_counts_as_one_line() {
+        let snapshot = transcript_snapshot(vec![
+            Entry::Activity(status(&"wordy ".repeat(30))),
+            Entry::Activity(command("cargo build", "")),
+        ]);
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert!(
+            !rows.contains(&String::new()),
+            "vertical rhythm is counted in projected lines, not in wrapped rows, so a Status \
+             long enough to wrap must not gain a separator: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn an_expanded_group_header_stays_tight_to_its_first_member() {
+        let first = command("cargo fmt", "reformatted 3 files\nreformatted 1 file");
+        let second = command("cargo clippy", "");
+        let mut groups = TranscriptGroups::default();
+        groups.expand(first.id());
+        let mut folds = TranscriptFolds::default();
+        folds.expand(first.id());
+        let snapshot = transcript_snapshot(vec![Entry::Activity(first), Entry::Activity(second)]);
+
+        let rows = projected_rows(&snapshot, &folds, &groups);
+
+        assert_eq!(
+            rows,
+            [
+                "  ✓ Ran 2 commands",
+                "    ✓ cargo fmt",
+                "      reformatted 3 files",
+                "      reformatted 1 file",
+                "",
+                "    ✓ cargo clippy",
+            ]
+        );
+    }
+
+    /// Projects a Transcript and hands back the view, for the tests that read
+    /// its row accounting rather than its text.
+    fn projected_view<'a>(
+        cache: &'a TranscriptCache,
+        snapshot: &SessionSnapshot,
+        folds: &TranscriptFolds,
+        groups: &TranscriptGroups,
+    ) -> std::cell::Ref<'a, TranscriptView> {
+        cache.view(
+            0,
+            snapshot,
+            &[],
+            TranscriptDisclosure { folds, groups },
+            &Theme::system(),
+            80,
+        )
+    }
+
+    #[test]
+    fn a_separator_row_belongs_to_no_units_click_extent() {
+        let noisy = command("cargo test", "running 2 tests\nall green");
+        let noisy_id = noisy.id();
+        let mut folds = TranscriptFolds::default();
+        folds.expand(noisy_id);
+        let snapshot = transcript_snapshot(vec![
+            Entry::Activity(status("Preparing the workspace")),
+            Entry::Activity(noisy),
+        ]);
+        let cache = TranscriptCache::default();
+
+        let view = projected_view(&cache, &snapshot, &folds, &TranscriptGroups::default());
+
+        let start = view
+            .unit_starts()
+            .iter()
+            .find(|start| start.key == UnitKey::Activity(noisy_id))
+            .expect("the expanded command anchors a click");
+        assert_eq!(
+            view.window(0, view.row_count())
+                .0
+                .get(1)
+                .map(rendered_text)
+                .as_deref(),
+            Some(""),
+            "row 1 is the separator the expanded command took"
+        );
+        assert_eq!(start.row, 2, "the unit starts past its own separator");
+        assert!(
+            !start.contains(1),
+            "a click on the separator row must resolve to no unit"
+        );
+    }
+
+    #[test]
+    fn a_message_anchor_points_past_the_separator_above_it() {
+        let spoke = agent_message("Build is green.");
+        let spoke_id = spoke.id;
+        let snapshot = transcript_snapshot(vec![
+            Entry::Activity(command("cargo build", "")),
+            Entry::Message(spoke),
+        ]);
+        let cache = TranscriptCache::default();
+
+        let view = projected_view(
+            &cache,
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        let start = view
+            .message_starts()
+            .iter()
+            .find(|start| start.message_id == spoke_id)
+            .expect("the agent Message anchors the scroll position");
+        assert_eq!(
+            start.row, 2,
+            "scrolling to a Message lands on the Message, not on the blank above it"
+        );
+    }
+
+    #[test]
+    fn a_window_opening_on_a_separator_draws_it_once() {
+        let noisy = command("cargo test", "running 2 tests\nall green");
+        let mut folds = TranscriptFolds::default();
+        folds.expand(noisy.id());
+        let snapshot = transcript_snapshot(vec![
+            Entry::Activity(status("Preparing the workspace")),
+            Entry::Activity(noisy),
+        ]);
+        let cache = TranscriptCache::default();
+        let view = projected_view(&cache, &snapshot, &folds, &TranscriptGroups::default());
+
+        let opening_on_it = view.window(1, 2).0;
+        let opening_past_it = view.window(2, 2).0;
+
+        assert_eq!(row_text(&opening_on_it), ["", "  ✓ cargo test"]);
+        assert_eq!(
+            row_text(&opening_past_it),
+            ["  ✓ cargo test", "    running 2 tests"]
+        );
+    }
+
+    #[test]
+    fn every_projected_row_is_reachable_by_scrolling_to_it() {
+        let noisy = command("cargo test", "running 2 tests\nall green");
+        let mut folds = TranscriptFolds::default();
+        folds.expand(noisy.id());
+        let snapshot = transcript_snapshot(vec![
+            Entry::Message(user_message("run the tests")),
+            Entry::Activity(status("Preparing the workspace")),
+            Entry::Activity(noisy),
+            Entry::Message(agent_message("All green.")),
+        ]);
+        let cache = TranscriptCache::default();
+        let view = projected_view(&cache, &snapshot, &folds, &TranscriptGroups::default());
+
+        let whole = view.window(0, view.row_count()).0;
+
+        assert_eq!(
+            whole.len(),
+            view.row_count(),
+            "the reported row count must cover exactly the rows the window draws"
+        );
+        for (row, drawn) in whole.iter().enumerate() {
+            let (lines, local_scroll) = view.window(row, 1);
+            assert_eq!(
+                rendered_text(&lines[local_scroll]),
+                rendered_text(drawn),
+                "scrolling to row {row} must land on the same row the whole window draws"
+            );
+        }
     }
 }

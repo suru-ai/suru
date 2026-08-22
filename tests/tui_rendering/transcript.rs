@@ -3351,3 +3351,61 @@ fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
         "both Group headers survive the Folds toggle: {folds_expanded}"
     );
 }
+
+#[test]
+fn the_transcript_keeps_a_row_of_air_above_the_composer() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = connected_application(workspace.path());
+    let (session_id, _) = crate::support::enter_session(&mut application, workspace.path());
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+            navigable_session_snapshot(session_id, workspace.path(), 8),
+        )))
+        .expect("attach a Transcript longer than the viewport");
+
+    let rows = rendered_application_rows_at(&application, 80, 15);
+
+    let composer_top = rendered_row(&rows, "Prompt ·");
+    let gap = composer_top
+        .checked_sub(1)
+        .expect("the composer is not the first row");
+    assert!(
+        rows[gap].trim().is_empty(),
+        "the Transcript keeps a row of air above the composer, but row {gap} reads {:?}\nframe:\n{}",
+        rows[gap],
+        rows.join("\n")
+    );
+}
+
+#[test]
+fn the_transcript_keeps_its_margin_when_a_pending_panel_docks_below_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = connected_application(workspace.path());
+    let (session_id, _) = crate::support::enter_session(&mut application, workspace.path());
+    let mut snapshot = navigable_session_snapshot(session_id, workspace.path(), 8);
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.prompts.push(Prompt {
+        id: PromptId::new(),
+        text: "Run this later".to_owned(),
+        delivery: PromptDelivery::Queue,
+        admission_order: PromptOrder(99),
+        status: PromptStatus::Pending,
+    });
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(snapshot)))
+        .expect("attach a long Transcript with a queued Prompt");
+
+    let rows = rendered_application_rows_at(&application, 80, 20);
+
+    let pending_top = rendered_row(&rows, "Pending ·");
+    let margin = pending_top
+        .checked_sub(1)
+        .expect("the pending panel is not the first row");
+    assert!(
+        rows[margin].trim().is_empty(),
+        "the margin belongs to the Transcript, so it stays under the last entry whatever docks \
+         below it, but row {margin} reads {:?}\nframe:\n{}",
+        rows[margin],
+        rows.join("\n")
+    );
+}
