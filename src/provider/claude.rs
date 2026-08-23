@@ -22,6 +22,7 @@ mod catalog;
 mod projection;
 mod runtime;
 mod session;
+mod thinking;
 mod transport;
 mod wire;
 

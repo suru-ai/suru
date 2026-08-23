@@ -17,6 +17,7 @@ mod copilot;
 pub(crate) mod harness;
 mod orchestration;
 mod reasoning;
+mod shell_wrapper;
 
 pub use claude::ClaudeRuntime;
 pub use codex::CodexRuntime;

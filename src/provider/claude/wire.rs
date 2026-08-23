@@ -100,13 +100,23 @@ pub(super) struct StreamEvent {
     pub(super) delta: Option<ContentDelta>,
 }
 
-/// The content block a `content_block_start` opens.
+/// The content block a `content_block_start` opens: the text or thinking it opens with, and for a
+/// `tool_use` block the tool's identity and whatever of its input rode along rather than streaming
+/// in `input_json_delta` increments.
 #[derive(Deserialize)]
 pub(super) struct ContentBlock {
     #[serde(rename = "type", default)]
     pub(super) kind: String,
     #[serde(default)]
     pub(super) text: Option<String>,
+    #[serde(default)]
+    pub(super) thinking: Option<String>,
+    #[serde(default)]
+    pub(super) id: Option<String>,
+    #[serde(default)]
+    pub(super) name: Option<String>,
+    #[serde(default)]
+    pub(super) input: Option<Value>,
 }
 
 /// The increment a `content_block_delta` carries. A `message_delta`'s delta object carries no
@@ -117,6 +127,53 @@ pub(super) struct ContentDelta {
     pub(super) kind: String,
     #[serde(default)]
     pub(super) text: Option<String>,
+    #[serde(default)]
+    pub(super) thinking: Option<String>,
+    #[serde(default)]
+    pub(super) partial_json: Option<String>,
+}
+
+/// A conversation message the loop echoes back with the `user` role: tool results on their way
+/// into the next model call. Decoded only as far as the tool results the projection presents.
+#[derive(Deserialize)]
+pub(super) struct EchoedUserMessage {
+    pub(super) message: EchoedUserBody,
+}
+
+#[derive(Deserialize)]
+pub(super) struct EchoedUserBody {
+    #[serde(default)]
+    pub(super) content: EchoedUserContent,
+}
+
+/// An echoed user message's content: the block list tool results arrive in, or any other shape —
+/// plain Prompt text among them — that carries nothing the projection presents.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum EchoedUserContent {
+    Blocks(Vec<EchoedUserBlock>),
+    Other(serde::de::IgnoredAny),
+}
+
+impl Default for EchoedUserContent {
+    fn default() -> Self {
+        Self::Other(serde::de::IgnoredAny)
+    }
+}
+
+/// One block of an echoed user message. A `tool_result` block reports the outcome of the tool use
+/// `tool_use_id` names; `content` is free-form — a bare string or a list of typed blocks — so it
+/// stays undecoded here.
+#[derive(Deserialize)]
+pub(super) struct EchoedUserBlock {
+    #[serde(rename = "type", default)]
+    pub(super) kind: String,
+    #[serde(default)]
+    pub(super) tool_use_id: Option<String>,
+    #[serde(default)]
+    pub(super) content: Value,
+    #[serde(default)]
+    pub(super) is_error: bool,
 }
 
 /// The terminal message that Settles the Turn: `success` reports a finished Turn (which may still

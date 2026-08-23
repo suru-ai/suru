@@ -73,6 +73,12 @@ impl ReasoningSummarySplitter {
         }
     }
 
+    /// Whether the title block has been decided, so a caller feeding the
+    /// splitter from its own scan knows when to stop routing text through it.
+    pub(super) fn is_settled(&self) -> bool {
+        self.settled
+    }
+
     /// Releases whatever the splitter is still withholding, because the summary
     /// ended before the title block could resolve on its own. A summary that is
     /// nothing but a title block is still titled; anything else is body.

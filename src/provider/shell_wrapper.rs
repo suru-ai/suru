@@ -1,11 +1,13 @@
-//! Recognizes the launcher wrapper Codex reports around the commands it runs.
+//! Recognizes the launcher wrapper a Provider reports around the commands it
+//! runs, which is why this lives beside the Providers rather than inside one.
 //!
 //! Codex launches every script through a shell — `/usr/bin/zsh -lc '<script>'`
 //! on POSIX systems, `pwsh -Command '<script>'` on Windows — and reports the
-//! whole invocation, shlex-joined, as the command. That wrapper is Codex
-//! plumbing, not part of the command a reader should see, so the projection
-//! strips it before the Activity is recorded. A command in any shape this
-//! module does not recognize as Codex's own plumbing is kept verbatim.
+//! whole invocation, shlex-joined, as the command. That wrapper is launcher
+//! plumbing, not part of the command a reader should see, so a projection
+//! strips it before the Activity is recorded. Claude sends the command itself,
+//! so for it these shapes only ever appear if the wire drifts. A command in any
+//! shape this module does not recognize as plumbing is kept verbatim.
 
 use std::ffi::OsStr;
 use std::path::Path;

@@ -9,7 +9,6 @@
 
 mod projection;
 mod session;
-mod shell_wrapper;
 mod transport;
 mod wire;
 

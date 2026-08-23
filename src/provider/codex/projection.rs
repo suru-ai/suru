@@ -16,10 +16,10 @@ use futures_util::stream;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use super::super::shell_wrapper::strip_launcher_wrapper;
 use super::{
     DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
     codex_error,
-    shell_wrapper::strip_launcher_wrapper,
     wire::{
         NativeCommandStatus, NativeField, NativeFileChange, NativeFileChangeStatus,
         NativeNotification, NativeTurnFailureKind, NativeTurnOutcome,
