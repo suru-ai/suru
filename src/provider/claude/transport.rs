@@ -40,7 +40,7 @@ use crate::provider::{
 /// The arguments that put the CLI in stream-json mode: newline-delimited JSON both ways, with the
 /// user's filesystem settings left unloaded so a Suru-launched process runs no hooks and starts no
 /// MCP servers.
-pub(super) const CLAUDE_STREAM_JSON_ARGS: [&str; 8] = [
+const CLAUDE_STREAM_JSON_ARGS: [&str; 8] = [
     "--print",
     "--input-format",
     "stream-json",
@@ -249,19 +249,40 @@ async fn read_stdout(stdout: ChildStdout, state: Arc<TransportState>) {
                 return;
             }
         };
-        route_message(message, &state);
+        if let Err(error) = route_message(message, &state) {
+            terminate_transport(&state, error);
+            return;
+        }
     }
 }
 
-fn route_message(message: IncomingMessage, state: &Arc<TransportState>) {
+fn route_message(message: IncomingMessage, state: &Arc<TransportState>) -> Result<(), ProviderError> {
     // Everything except a control response is conversation — turn output, the
     // init message, the CLI's own control requests — which nothing consumes
     // until Sessions land.
     if message.kind != "control_response" {
-        return;
+        return Ok(());
     }
     let Some(response) = message.response else {
-        return;
+        return Ok(());
+    };
+    let response = match serde_json::from_value::<ControlResponse>(response.clone()) {
+        Ok(response) => response,
+        Err(error) => {
+            // A subtype this build does not know is wire drift to ride out
+            // (ADR 0010); a known subtype that fails to decode is a CLI Suru
+            // cannot trust.
+            let known_subtype = matches!(
+                response.get("subtype").and_then(Value::as_str),
+                Some("success" | "error")
+            );
+            if known_subtype {
+                return Err(claude_error(format!(
+                    "Claude Code CLI sent a malformed control response: {error}"
+                )));
+            }
+            return Ok(());
+        }
     };
     let (request_id, result) = match response {
         ControlResponse::Success {
@@ -284,6 +305,7 @@ fn route_message(message: IncomingMessage, state: &Arc<TransportState>) {
     if let Some(pending) = pending {
         let _ = pending.send(result);
     }
+    Ok(())
 }
 
 fn terminate_transport(state: &TransportState, error: ProviderError) {

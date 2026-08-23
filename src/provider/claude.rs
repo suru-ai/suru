@@ -11,6 +11,11 @@
 //! The Provider is named **Claude**, never "Claude Code": the Agent SDK asks applications not to
 //! take the product's name. Text below names the Claude Code CLI only where it factually refers to
 //! the binary being driven.
+//!
+//! ADR 0010's version floor (2.1.237, the version the wire behavior is verified against) is
+//! enforced by the availability probe, which lands with the availability slice; until then a CLI
+//! below the floor surfaces as whatever discovery failure it produces rather than the typed
+//! incompatible-version reason.
 
 mod catalog;
 mod runtime;

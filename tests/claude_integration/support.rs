@@ -62,6 +62,18 @@ pub fn list_models_arm(models: &str) -> String {
     )
 }
 
+/// A `list_models` arm that leads its real answer with a control response of a subtype this build
+/// of Suru has never heard of, standing in for a newer CLI whose wire has drifted.
+pub fn drifting_list_models_arm(models: &str) -> String {
+    format!(
+        r#"    *'"subtype":"list_models"'*)
+      printf '%s\n' '{{"type":"control_response","response":{{"subtype":"novel_subtype","request_id":"'"$request_id"'","novelty":true}}}}'
+      printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"models":{models}}}}}}}'
+      ;;
+"#
+    )
+}
+
 /// A `list_models` arm that never answers, standing in for a CLI that has stopped responding
 /// while its process still runs.
 pub fn silent_list_models_arm() -> String {

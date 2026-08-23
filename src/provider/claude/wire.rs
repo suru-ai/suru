@@ -2,8 +2,8 @@
 //!
 //! Everything below is verified against Claude Code CLI 2.1.237 and the Agent SDK type definitions
 //! 0.3.241 — the wire is an SDK implementation detail rather than a documented surface, so drift is
-//! ours to absorb (ADR 0010). Decoding tolerates fields it does not know, because the CLI grows
-//! them freely.
+//! ours to absorb (ADR 0010). Decoding tolerates fields and control-response subtypes it does not
+//! know, because the CLI grows both freely.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,11 +36,13 @@ pub(super) enum ControlRequest {
 
 /// One newline-delimited message the CLI wrote, decoded only as far as routing needs: everything
 /// that is not a control response is conversation, which lands with Sessions in a later slice.
+/// The response itself stays undecoded here so a subtype this build does not know can be told
+/// apart from a malformed one it does.
 #[derive(Deserialize)]
 pub(super) struct IncomingMessage {
     #[serde(rename = "type")]
     pub(super) kind: String,
-    pub(super) response: Option<ControlResponse>,
+    pub(super) response: Option<Value>,
 }
 
 /// The CLI's answer to one control request, correlated back by `request_id`.

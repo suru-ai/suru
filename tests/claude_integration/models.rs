@@ -6,8 +6,8 @@ use std::sync::Arc;
 use crate::{
     provider_support::ControlledProvider,
     support::{
-        CLAUDE_MODELS, ScriptedClaude, claude_catalog, hosting, hosting_runtime,
-        malformed_list_models_arm, silent_list_models_arm,
+        CLAUDE_MODELS, ScriptedClaude, claude_catalog, drifting_list_models_arm, hosting,
+        hosting_runtime, malformed_list_models_arm, silent_list_models_arm,
     },
 };
 use suru::{
@@ -332,6 +332,26 @@ async fn a_discovery_the_cli_never_answers_fails_after_the_injected_timeout() {
     );
 
     server.shutdown().await.expect("shut the server down");
+}
+
+/// The stream-json wire is an SDK implementation detail, so drift is Suru's to absorb (ADR 0010):
+/// a control response of a subtype this build has never heard of is ridden out, not a failure.
+#[tokio::test]
+async fn a_control_response_subtype_suru_does_not_know_is_ridden_out() {
+    let claude = ScriptedClaude::new(&drifting_list_models_arm(CLAUDE_MODELS));
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let (server, client) = hosting(&claude, "claude-drifted-wire", state_dir.path()).await;
+
+    let catalog = client.list_models().await.expect("discover Claude Models");
+    assert_eq!(
+        claude_catalog(&catalog).status,
+        ProviderCatalogStatus::Fresh,
+        "the discovery reads past the drifted response to the answer it was waiting for"
+    );
+    assert_eq!(claude_catalog(&catalog).models.len(), 4);
+
+    server.shutdown().await.expect("shut the server down");
+    claude.wait_for_exit().await;
 }
 
 #[tokio::test]
