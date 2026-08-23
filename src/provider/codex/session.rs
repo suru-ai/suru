@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 use super::{
     DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
     codex_error, codex_error_context,
-    process::{ProcessGuard, ProcessRegistry},
     projection::{NativeCorrelation, provider_events},
     transport::{CodexConnection, JsonRpcTransport},
     wire::{
@@ -41,6 +40,7 @@ use crate::{
     provider::{
         ProviderError, ProviderFuture, ProviderResumeState, ProviderRuntime, ProviderSession,
         ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
+        harness::{ProcessGuard, ProcessRegistry},
     },
 };
 
@@ -81,7 +81,7 @@ impl CodexRuntime {
     pub fn new(executable: impl AsRef<OsStr>) -> Self {
         Self {
             executable: executable.as_ref().to_owned(),
-            processes: ProcessRegistry::new(),
+            processes: ProcessRegistry::new("Codex app-server"),
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
             shutdown_interrupt_timeout: SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT,
             reasoning_summary: Arc::new(StdMutex::new(ReasoningSummaryDetail::default())),

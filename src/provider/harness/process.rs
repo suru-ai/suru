@@ -1,12 +1,17 @@
-//! Ownership of the Codex app-server child processes Suru launches.
+//! Ownership of the harness server child processes Suru launches.
 //!
 //! Every launched process is registered with a [`ProcessRegistry`] and supervised by a task that
 //! outlives its transport, so a Session shutdown, a runtime shutdown, and an unexpected exit all
-//! converge on the same terminated process tree and the same reported failure.
+//! converge on the same terminated process tree and the same reported failure. The machinery is
+//! Provider-neutral: a [`HarnessSpec`] names the executable to launch and how the harness is
+//! called in the Log and in failures, and a [`HarnessLink`] is the supervisor's handle into
+//! whatever transport the Provider runs over the process's stdio.
 
 use std::{
     collections::HashMap,
-    ffi::OsStr,
+    ffi::OsString,
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
@@ -19,15 +24,38 @@ use tokio::{
     time::{Duration, timeout},
 };
 
-use super::{codex_error, transport::TransportLink};
 use crate::provider::{ProviderError, wait_for_shutdown};
 
 const PROCESS_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(500);
 const PROCESS_KILL_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Tracks every live Codex app-server process so a runtime shutdown can stop them all.
+/// The harness server process a Provider runtime launches: its executable, the arguments that put
+/// it in server mode, and the name the Log and failures call it, such as `Codex app-server`.
 #[derive(Clone, Debug)]
-pub(super) struct ProcessRegistry {
+pub(crate) struct HarnessSpec {
+    pub(crate) executable: OsString,
+    pub(crate) args: Vec<OsString>,
+    pub(crate) name: String,
+}
+
+/// The supervisor's handle into the transport running over the process it owns.
+///
+/// The supervisor decides when the connection ends; this is everything it needs to say so.
+pub(crate) trait HarnessLink: Send + Sync + 'static {
+    /// Fails the in-flight requests without publishing a Provider failure, for an intended stop.
+    fn close(&self);
+
+    /// Closes the harness's stdin so it can exit on its own.
+    fn close_stdin(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+    /// Fails the in-flight requests and publishes `error` as a lost Provider Session.
+    fn terminate(&self, error: ProviderError);
+}
+
+/// Tracks every live harness process one runtime launched so a runtime shutdown can stop them all.
+#[derive(Clone, Debug)]
+pub(crate) struct ProcessRegistry {
+    name: Arc<str>,
     next_id: Arc<AtomicU64>,
     exit_grace: Duration,
     state: Arc<StdMutex<ProcessRegistryState>>,
@@ -40,8 +68,9 @@ struct ProcessRegistryState {
 }
 
 impl ProcessRegistry {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
         Self {
+            name: Arc::from(name.into()),
             next_id: Arc::new(AtomicU64::new(1)),
             exit_grace: PROCESS_EXIT_GRACE_PERIOD,
             state: Arc::new(StdMutex::new(ProcessRegistryState {
@@ -53,17 +82,27 @@ impl ProcessRegistry {
 
     /// Overrides how long a stopping process may exit gracefully before it is
     /// forced down. Takes effect for processes launched after the call.
-    pub(super) fn set_exit_grace(&mut self, exit_grace: Duration) {
+    pub(crate) fn set_exit_grace(&mut self, exit_grace: Duration) {
         self.exit_grace = exit_grace;
+    }
+
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.state
+            .lock()
+            .expect("harness process registry lock is not poisoned")
+            .shutting_down
     }
 
     fn register(&self, process: ProcessControl) -> Result<u64, ProviderError> {
         let mut state = self
             .state
             .lock()
-            .expect("Codex process registry lock is not poisoned");
+            .expect("harness process registry lock is not poisoned");
         if state.shutting_down {
-            return Err(codex_error("Codex runtime is shutting down"));
+            return Err(ProviderError::new(format!(
+                "{} is shutting down",
+                self.name
+            )));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         state.processes.insert(id, process);
@@ -73,17 +112,17 @@ impl ProcessRegistry {
     fn remove(&self, id: u64) {
         self.state
             .lock()
-            .expect("Codex process registry lock is not poisoned")
+            .expect("harness process registry lock is not poisoned")
             .processes
             .remove(&id);
     }
 
-    pub(super) async fn shutdown(&self) -> Result<(), ProviderError> {
+    pub(crate) async fn shutdown(&self) -> Result<(), ProviderError> {
         let processes = {
             let mut state = self
                 .state
                 .lock()
-                .expect("Codex process registry lock is not poisoned");
+                .expect("harness process registry lock is not poisoned");
             state.shutting_down = true;
             state.processes.values().cloned().collect::<Vec<_>>()
         };
@@ -107,6 +146,7 @@ impl ProcessRegistry {
 
 #[derive(Clone, Debug)]
 struct ProcessControl {
+    name: Arc<str>,
     shutdown: watch::Sender<bool>,
     stopped: watch::Receiver<bool>,
     /// The exit grace, forced-kill wait, and margin a stop may take in total.
@@ -123,32 +163,38 @@ impl ProcessControl {
         if *stopped.borrow() {
             return Ok(());
         }
+        let name = self.name.clone();
         let wait = async move {
             stopped
                 .wait_for(|stopped| *stopped)
                 .await
                 .map(|_| ())
                 .map_err(|_| {
-                    codex_error("Codex app-server process supervisor stopped unexpectedly")
+                    ProviderError::new(format!(
+                        "{name} process supervisor stopped unexpectedly"
+                    ))
                 })
         };
         timeout(self.wait_budget, wait).await.map_err(|_| {
-            codex_error("Codex app-server did not stop within the shutdown deadline")
+            ProviderError::new(format!(
+                "{} did not stop within the shutdown deadline",
+                self.name
+            ))
         })?
     }
 }
 
 /// Keeps one supervised process alive; dropping it asks that process to stop.
-pub(super) struct ProcessGuard {
+pub(crate) struct ProcessGuard {
     control: ProcessControl,
 }
 
 impl ProcessGuard {
-    pub(super) fn begin_shutdown(&self) {
+    pub(crate) fn begin_shutdown(&self) {
         self.control.begin_shutdown();
     }
 
-    pub(super) async fn wait_until_stopped(&self) -> Result<(), ProviderError> {
+    pub(crate) async fn wait_until_stopped(&self) -> Result<(), ProviderError> {
         self.control.wait_until_stopped().await
     }
 }
@@ -159,60 +205,64 @@ impl Drop for ProcessGuard {
     }
 }
 
-/// A launched app-server that nothing supervises yet.
-pub(super) struct SpawnedProcess {
+/// A launched harness server that nothing supervises yet.
+pub(crate) struct SpawnedProcess {
+    name: Arc<str>,
     child: Child,
     process_tree: ProcessTree,
 }
 
-/// The launched app-server's piped stdio, ready for a transport to speak over.
-pub(super) struct ProcessStdio {
-    pub(super) stdin: ChildStdin,
-    pub(super) stdout: ChildStdout,
+/// The launched harness server's piped stdio, ready for a transport to speak over.
+pub(crate) struct ProcessStdio {
+    pub(crate) stdin: ChildStdin,
+    pub(crate) stdout: ChildStdout,
 }
 
-/// Launches `codex app-server` in its own process tree, forwarding its stderr
-/// to the Log.
-pub(super) fn spawn_codex_process(
-    executable: &OsStr,
+/// Launches the harness server `spec` names in its own process tree, forwarding its stderr to
+/// the Log.
+pub(crate) fn spawn_harness_process(
+    spec: &HarnessSpec,
 ) -> Result<(SpawnedProcess, ProcessStdio), ProviderError> {
-    let mut command = Command::new(executable);
+    let name: Arc<str> = Arc::from(spec.name.as_str());
+    let mut command = Command::new(&spec.executable);
     command
-        .arg("app-server")
+        .args(&spec.args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let (mut child, process_tree) = spawn_codex_child(&mut command).map_err(|error| {
-        codex_error(format!(
-            "could not launch Codex app-server `{}`: {error}",
-            executable.to_string_lossy()
+    let (mut child, process_tree) = spawn_harness_child(&mut command).map_err(|error| {
+        ProviderError::new(format!(
+            "could not launch {name} `{}`: {error}",
+            spec.executable.to_string_lossy()
         ))
     })?;
 
     let stdin = child
         .stdin
         .take()
-        .ok_or_else(|| codex_error("Codex app-server stdin was unavailable"))?;
+        .ok_or_else(|| ProviderError::new(format!("{name} stdin was unavailable")))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| codex_error("Codex app-server stdout was unavailable"))?;
+        .ok_or_else(|| ProviderError::new(format!("{name} stdout was unavailable")))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| codex_error("Codex app-server stderr was unavailable"))?;
-    tracing::info!(pid = child.id(), "launched Codex app-server");
+        .ok_or_else(|| ProviderError::new(format!("{name} stderr was unavailable")))?;
+    tracing::info!(pid = child.id(), harness = %name, "launched harness server process");
+    let stderr_name = name.clone();
     tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            tracing::debug!(target: "suru::provider::codex::stderr", "{line}");
+            tracing::debug!(target: "suru::provider::harness::stderr", harness = %stderr_name, "{line}");
         }
     });
 
     Ok((
         SpawnedProcess {
+            name,
             child,
             process_tree,
         },
@@ -224,12 +274,13 @@ pub(super) fn spawn_codex_process(
 ///
 /// The returned guard stops the process when it is dropped, and the returned receiver publishes
 /// the process's exit failure once the supervisor observes it.
-pub(super) async fn supervise_codex_process(
+pub(crate) async fn supervise_harness_process<L: HarnessLink>(
     process: SpawnedProcess,
     processes: ProcessRegistry,
-    transport: TransportLink,
+    link: L,
 ) -> Result<(Arc<ProcessGuard>, watch::Receiver<Option<ProviderError>>), ProviderError> {
     let SpawnedProcess {
+        name,
         mut child,
         process_tree,
     } = process;
@@ -237,6 +288,7 @@ pub(super) async fn supervise_codex_process(
     let (stopped_tx, stopped_rx) = watch::channel(false);
     let (exit_tx, exit_rx) = watch::channel(None::<ProviderError>);
     let control = ProcessControl {
+        name: name.clone(),
         shutdown: shutdown_tx,
         stopped: stopped_rx,
         wait_budget: processes.exit_grace + PROCESS_KILL_TIMEOUT + Duration::from_millis(250),
@@ -250,11 +302,12 @@ pub(super) async fn supervise_codex_process(
         }
     };
     tokio::spawn(supervise_child(ChildSupervisor {
+        name,
         child,
         shutdown: shutdown_rx,
         stopped: stopped_tx,
         exit: exit_tx,
-        transport,
+        link,
         processes,
         registration_id,
         process_tree,
@@ -262,24 +315,26 @@ pub(super) async fn supervise_codex_process(
     Ok((Arc::new(ProcessGuard { control }), exit_rx))
 }
 
-struct ChildSupervisor {
+struct ChildSupervisor<L: HarnessLink> {
+    name: Arc<str>,
     child: Child,
     shutdown: watch::Receiver<bool>,
     stopped: watch::Sender<bool>,
     exit: watch::Sender<Option<ProviderError>>,
-    transport: TransportLink,
+    link: L,
     processes: ProcessRegistry,
     registration_id: u64,
     process_tree: ProcessTree,
 }
 
-async fn supervise_child(supervisor: ChildSupervisor) {
+async fn supervise_child<L: HarnessLink>(supervisor: ChildSupervisor<L>) {
     let ChildSupervisor {
+        name,
         mut child,
         mut shutdown,
         stopped,
         exit,
-        transport,
+        link,
         processes,
         registration_id,
         process_tree,
@@ -287,9 +342,9 @@ async fn supervise_child(supervisor: ChildSupervisor) {
     let status = tokio::select! {
         biased;
         _ = wait_for_shutdown(&mut shutdown) => {
-            transport.close();
+            link.close();
             match timeout(processes.exit_grace, async {
-                transport.close_stdin().await;
+                link.close_stdin().await;
                 child.wait().await
             }).await {
                 Ok(status) => status,
@@ -299,7 +354,7 @@ async fn supervise_child(supervisor: ChildSupervisor) {
                         Ok(status) => status,
                         Err(_) => Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
-                            "forced Codex termination did not complete before the deadline",
+                            "forced harness termination did not complete before the deadline",
                         )),
                     }
                 }
@@ -310,14 +365,14 @@ async fn supervise_child(supervisor: ChildSupervisor) {
     let _ = process_tree.terminate(&mut child);
 
     let message = match status {
-        Ok(status) if status.success() => "Codex app-server exited unexpectedly".to_owned(),
-        Ok(status) => format!("Codex app-server exited unexpectedly with {status}"),
-        Err(error) => format!("could not wait for Codex app-server: {error}"),
+        Ok(status) if status.success() => format!("{name} exited unexpectedly"),
+        Ok(status) => format!("{name} exited unexpectedly with {status}"),
+        Err(error) => format!("could not wait for {name}: {error}"),
     };
     tracing::warn!("{message}");
-    let error = codex_error(message);
+    let error = ProviderError::new(message);
     exit.send_replace(Some(error.clone()));
-    transport.terminate(error);
+    link.terminate(error);
     processes.remove(registration_id);
     process_tree.close();
     stopped.send_replace(true);
@@ -329,7 +384,7 @@ struct ProcessTree {
 }
 
 #[cfg(unix)]
-fn spawn_codex_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
+fn spawn_harness_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
     command.process_group(0);
     let child = command.spawn()?;
     let process_group_id = child
@@ -339,7 +394,7 @@ fn spawn_codex_child(command: &mut Command) -> std::io::Result<(Child, ProcessTr
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "Codex app-server had no process group ID",
+                "harness server process had no process group ID",
             )
         })?;
     Ok((child, ProcessTree { process_group_id }))
@@ -369,7 +424,7 @@ struct ProcessTree {
 }
 
 #[cfg(windows)]
-fn spawn_codex_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
+fn spawn_harness_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
     use std::{mem, os::windows::io::FromRawHandle, ptr};
     use windows_sys::Win32::System::{
         JobObjects::{
@@ -409,7 +464,7 @@ fn spawn_codex_child(command: &mut Command) -> std::io::Result<(Child, ProcessTr
     let mut child = command.spawn()?;
     let process_handle = child
         .raw_handle()
-        .ok_or_else(|| std::io::Error::other("Codex app-server had no process handle"))?;
+        .ok_or_else(|| std::io::Error::other("harness server process had no process handle"))?;
     let assigned = unsafe {
         use std::os::windows::io::AsRawHandle;
         AssignProcessToJobObject(job.as_raw_handle(), process_handle)
@@ -426,7 +481,7 @@ fn spawn_codex_child(command: &mut Command) -> std::io::Result<(Child, ProcessTr
             TerminateJobObject(job.as_raw_handle(), 1);
         }
         return Err(std::io::Error::other(format!(
-            "could not resume Codex app-server: NTSTATUS {resumed:#x}"
+            "could not resume harness server process: NTSTATUS {resumed:#x}"
         )));
     }
 
@@ -451,7 +506,7 @@ impl ProcessTree {
 struct ProcessTree;
 
 #[cfg(not(any(unix, windows)))]
-fn spawn_codex_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
+fn spawn_harness_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
     command.spawn().map(|child| (child, ProcessTree))
 }
 

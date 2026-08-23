@@ -12,6 +12,7 @@ use crate::protocol::{
 };
 
 mod codex;
+pub(crate) mod harness;
 mod orchestration;
 
 pub use codex::CodexRuntime;

@@ -25,9 +25,6 @@ use tokio::{
 
 use super::{
     codex_error, codex_error_context, concise_remote_message,
-    process::{
-        ProcessGuard, ProcessRegistry, ProcessStdio, spawn_codex_process, supervise_codex_process,
-    },
     wire::{
         ClientError, ClientErrorResponse, ClientInfo, ClientNotification, ClientRequest,
         FileChangeUpdatedParams, IncomingMessage, InitializeCapabilities, InitializeParams,
@@ -37,7 +34,13 @@ use super::{
         ThreadSettingsUpdatedParams, TurnCompletedParams,
     },
 };
-use crate::provider::ProviderError;
+use crate::provider::{
+    ProviderError,
+    harness::{
+        HarnessLink, HarnessSpec, ProcessGuard, ProcessRegistry, ProcessStdio,
+        spawn_harness_process, supervise_harness_process,
+    },
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UNSUPPORTED_INTERACTION_ERROR_CODE: i64 = -32000;
@@ -72,7 +75,12 @@ impl JsonRpcTransport {
         executable: &OsStr,
         processes: ProcessRegistry,
     ) -> Result<CodexConnection, ProviderError> {
-        let (process, ProcessStdio { stdin, stdout }) = spawn_codex_process(executable)?;
+        let spec = HarnessSpec {
+            executable: executable.to_owned(),
+            args: vec!["app-server".into()],
+            name: "Codex app-server".to_owned(),
+        };
+        let (process, ProcessStdio { stdin, stdout }) = spawn_harness_process(&spec)?;
         let (events, notifications) = mpsc::unbounded_channel();
         let state = Arc::new(TransportState {
             pending: StdMutex::new(HashMap::new()),
@@ -84,7 +92,7 @@ impl JsonRpcTransport {
             writer: writer.clone(),
             state: state.clone(),
         };
-        let (process, exit) = supervise_codex_process(process, processes, link).await?;
+        let (process, exit) = supervise_harness_process(process, processes, link).await?;
         tokio::spawn(read_stdout(stdout, writer.clone(), state.clone(), exit));
 
         let transport = Self {
@@ -207,22 +215,19 @@ pub(super) struct TransportLink {
     state: Arc<TransportState>,
 }
 
-impl TransportLink {
-    /// Fails the in-flight requests without publishing a Provider failure, for an intended stop.
-    pub(super) fn close(&self) {
+impl HarnessLink for TransportLink {
+    fn close(&self) {
         close_transport(
             &self.state,
             codex_error("Codex app-server transport closed during shutdown"),
         );
     }
 
-    /// Closes the app-server's stdin so it can exit on its own.
-    pub(super) async fn close_stdin(&self) {
-        close_stdin(&self.writer).await;
+    fn close_stdin(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(close_stdin(&self.writer))
     }
 
-    /// Fails the in-flight requests and publishes `error` as a lost Provider Session.
-    pub(super) fn terminate(&self, error: ProviderError) {
+    fn terminate(&self, error: ProviderError) {
         terminate_transport(&self.state, error);
     }
 }
