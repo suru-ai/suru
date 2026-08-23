@@ -823,9 +823,13 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             Err(response) => return *response,
         };
     } else {
+        // A persisted Landing selection can predate this server's hosted set,
+        // so an unhosted one yields to the built-in default rather than
+        // opening a Session on a Provider this server cannot run.
         request.agent_selection = state
             .landing_agent_selection
             .current()
+            .filter(|selection| state.hosted_providers.contains(&selection.provider))
             .or_else(|| state.model_catalog.default_selection());
     }
 

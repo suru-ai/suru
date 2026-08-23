@@ -476,3 +476,127 @@ async fn a_stored_session_on_an_unhosted_provider_fails_its_next_prompt_legibly(
         .await
         .expect("shut down replacement server");
 }
+
+#[tokio::test]
+async fn a_stale_landing_selection_on_an_unhosted_provider_yields_to_the_built_in_default() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "stale-landing-test")
+        .expect("configure server")
+        .with_data_dir(data_dir.path());
+    let (alpha_runtime, _alpha) = ControlledProvider::with_provider(
+        ProviderId::new("alpha"),
+        vec![hosted_model("alpha", "alpha-default")],
+    );
+    let original = server::spawn_with_providers(config.clone(), vec![alpha_runtime])
+        .await
+        .expect("spawn original server");
+    let original_descriptor = original.descriptor().clone();
+    reqwest::Client::new()
+        .put(format!(
+            "{}/v1/landing-agent-selection",
+            original_descriptor.base_url
+        ))
+        .bearer_auth(&original_descriptor.token)
+        .json(&hosted_selection("alpha", "alpha-default"))
+        .send()
+        .await
+        .expect("confirm the Landing selection")
+        .error_for_status()
+        .expect("Landing selection confirmation succeeds");
+    original.shutdown().await.expect("stop original server");
+
+    let (beta_runtime, _beta) = ControlledProvider::with_provider(
+        ProviderId::new("beta"),
+        vec![hosted_model("beta", "beta-default")],
+    );
+    let replacement = server::spawn_with_providers(config, vec![beta_runtime])
+        .await
+        .expect("spawn replacement server");
+    let replacement_descriptor = replacement.descriptor().clone();
+    reqwest::Client::new()
+        .post(format!(
+            "{}/v1/models/refresh",
+            replacement_descriptor.base_url
+        ))
+        .bearer_auth(&replacement_descriptor.token)
+        .send()
+        .await
+        .expect("refresh Model catalog")
+        .error_for_status()
+        .expect("Model refresh succeeds");
+
+    let created = create_session(
+        &replacement_descriptor,
+        &CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Start despite the stale Landing selection".to_owned(),
+            },
+        },
+    )
+    .await;
+    assert_eq!(
+        created.session.agent_selection,
+        Some(hosted_selection("beta", "beta-default")),
+        "a Landing selection naming an unhosted Provider yields to the hosted default"
+    );
+
+    replacement
+        .shutdown()
+        .await
+        .expect("shut down replacement server");
+}
+
+#[tokio::test]
+async fn the_landing_default_falls_to_the_next_provider_when_the_first_has_no_catalog() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (beta_runtime, _beta) = ControlledProvider::with_provider(
+        ProviderId::new("beta"),
+        vec![hosted_model("beta", "beta-default")],
+    );
+    let server = server::spawn_with_providers(
+        ServerConfig::new(state_dir.path(), "default-fallthrough-test").expect("configure server"),
+        vec![Arc::new(FailingProviderRuntime), beta_runtime],
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+
+    reqwest::Client::new()
+        .post(format!("{}/v1/models/refresh", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("refresh Model catalog")
+        .error_for_status()
+        .expect("Model refresh succeeds");
+
+    let created = create_session(
+        &descriptor,
+        &CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Default past a Provider with no catalog".to_owned(),
+            },
+        },
+    )
+    .await;
+    assert_eq!(
+        created.session.agent_selection,
+        Some(hosted_selection("beta", "beta-default")),
+        "the Landing default falls past a Provider whose catalog holds no default"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
