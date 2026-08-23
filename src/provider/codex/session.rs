@@ -41,10 +41,12 @@ use crate::{
         ProviderError, ProviderFuture, ProviderResumeState, ProviderRuntime, ProviderSession,
         ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
         harness::{ProcessGuard, ProcessRegistry},
+        resolve_executable,
     },
 };
 
 const CODEX_PATH_ENV: &str = "SURU_CODEX_PATH";
+const CODEX_EXECUTABLE_NAME: &str = "codex";
 const INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 const PENDING_TURN_START_GRACE_PERIOD: Duration = Duration::from_millis(250);
@@ -112,10 +114,7 @@ impl CodexRuntime {
     }
 
     pub fn from_environment() -> Self {
-        let executable = std::env::var_os(CODEX_PATH_ENV)
-            .filter(|path| !path.is_empty())
-            .unwrap_or_else(|| OsString::from("codex"));
-        Self::new(executable)
+        Self::new(resolve_executable(CODEX_PATH_ENV, CODEX_EXECUTABLE_NAME))
     }
 }
 
@@ -568,49 +567,4 @@ async fn start_native_turn(
         .finish_turn_start(started, selection);
     turn_start_changed.notify_one();
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{ffi::OsString, sync::Mutex};
-
-    use super::{CODEX_PATH_ENV, CodexRuntime};
-
-    static ENVIRONMENT: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn runtime_uses_the_override_or_codex_from_path() {
-        let _environment = ENVIRONMENT
-            .lock()
-            .expect("Codex environment test lock is not poisoned");
-        let original = std::env::var_os(CODEX_PATH_ENV);
-
-        // SAFETY: this unit test serializes every mutation of this process variable and restores it
-        // before releasing the lock. No production task is running in the unit-test process.
-        unsafe {
-            std::env::set_var(CODEX_PATH_ENV, "/fixture/custom-codex");
-        }
-        assert_eq!(
-            CodexRuntime::from_environment().executable,
-            OsString::from("/fixture/custom-codex")
-        );
-
-        // SAFETY: covered by the serialized test scope described above.
-        unsafe {
-            std::env::remove_var(CODEX_PATH_ENV);
-        }
-        assert_eq!(
-            CodexRuntime::from_environment().executable,
-            OsString::from("codex")
-        );
-
-        // SAFETY: restore the exact environment observed before the serialized test scope.
-        unsafe {
-            if let Some(original) = original {
-                std::env::set_var(CODEX_PATH_ENV, original);
-            } else {
-                std::env::remove_var(CODEX_PATH_ENV);
-            }
-        }
-    }
 }

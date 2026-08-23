@@ -43,6 +43,25 @@ pub(crate) fn concise_remote_message(message: &str, fallback: &str) -> String {
     concise
 }
 
+/// Resolves a Provider's harness executable: the `variable` override first, then `name` for the
+/// PATH to answer. Every Provider follows this convention, and Suru installs or updates none of
+/// them — the user owns their own CLI.
+pub(crate) fn resolve_executable(variable: &str, name: &str) -> std::ffi::OsString {
+    std::env::var_os(variable)
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| std::ffi::OsString::from(name))
+}
+
+/// The reading version of an identifier a Provider names in wire case, such as `long_context`.
+pub(crate) fn humanized_wire_id(value: &str) -> String {
+    let spaced = value.replace(['_', '-'], " ");
+    let mut characters = spaced.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
 pub type ProviderFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ProviderError>> + Send + 'a>>;
 pub type ProviderEventStream =
@@ -381,6 +400,63 @@ pub(crate) async fn wait_for_shutdown(signal: &mut watch::Receiver<bool>) {
     while !*signal.borrow() {
         if signal.changed().await.is_err() {
             break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{ffi::OsString, sync::Mutex};
+
+    use super::resolve_executable;
+
+    /// Every Provider's binary resolution shares this scope, so they share its lock.
+    static ENVIRONMENT: Mutex<()> = Mutex::new(());
+
+    const FIXTURE_PATH_ENV: &str = "SURU_FIXTURE_PROVIDER_PATH";
+
+    #[test]
+    fn an_executable_resolves_from_the_override_and_otherwise_from_path() {
+        let _environment = ENVIRONMENT
+            .lock()
+            .expect("Provider environment test lock is not poisoned");
+        let original = std::env::var_os(FIXTURE_PATH_ENV);
+
+        // SAFETY: this unit test serializes every mutation of this process variable and restores it
+        // before releasing the lock. No production task is running in the unit-test process.
+        unsafe {
+            std::env::set_var(FIXTURE_PATH_ENV, "/fixture/custom-harness");
+        }
+        assert_eq!(
+            resolve_executable(FIXTURE_PATH_ENV, "harness"),
+            OsString::from("/fixture/custom-harness")
+        );
+
+        // SAFETY: covered by the serialized test scope described above.
+        unsafe {
+            std::env::set_var(FIXTURE_PATH_ENV, "");
+        }
+        assert_eq!(
+            resolve_executable(FIXTURE_PATH_ENV, "harness"),
+            OsString::from("harness"),
+            "an empty override is no override"
+        );
+
+        // SAFETY: covered by the serialized test scope described above.
+        unsafe {
+            std::env::remove_var(FIXTURE_PATH_ENV);
+        }
+        assert_eq!(
+            resolve_executable(FIXTURE_PATH_ENV, "harness"),
+            OsString::from("harness")
+        );
+
+        // SAFETY: restore the exact environment observed before the serialized test scope.
+        unsafe {
+            match original {
+                Some(original) => std::env::set_var(FIXTURE_PATH_ENV, original),
+                None => std::env::remove_var(FIXTURE_PATH_ENV),
+            }
         }
     }
 }

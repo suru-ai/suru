@@ -16,7 +16,7 @@ use crate::{
         ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
         ModelOptionRole, ModelOptionValue, ProviderId, ReasoningSummaryDetail,
     },
-    provider::ProviderError,
+    provider::{ProviderError, humanized_wire_id},
 };
 
 // JSON-RPC envelope.
@@ -171,7 +171,7 @@ impl From<NativeModel> for ModelDescriptor {
                         .supported_reasoning_efforts
                         .into_iter()
                         .map(|effort| ModelOptionChoice {
-                            label: title_case_id(&effort.reasoning_effort),
+                            label: humanized_wire_id(&effort.reasoning_effort),
                             id: ModelOptionChoiceId::new(effort.reasoning_effort),
                             description: Some(effort.description),
                             availability: ModelAvailability::Available,
@@ -226,14 +226,6 @@ impl From<NativeModel> for ModelDescriptor {
             availability: ModelAvailability::Available,
             options,
         }
-    }
-}
-
-fn title_case_id(value: &str) -> String {
-    let mut characters = value.chars();
-    match characters.next() {
-        Some(first) => first.to_uppercase().chain(characters).collect(),
-        None => String::new(),
     }
 }
 

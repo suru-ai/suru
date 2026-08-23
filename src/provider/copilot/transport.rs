@@ -14,7 +14,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use github_copilot_sdk::Client;
+use github_copilot_sdk::{Client, rpc::Model};
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
     process::ChildStdin,
@@ -86,8 +86,18 @@ enum ConnectionEnd {
 }
 
 impl CopilotConnection {
-    pub(super) fn client(&self) -> &Client {
-        &self.client
+    /// The Models Copilot offers the signed-in user right now.
+    ///
+    /// The SDK's own `list_models` memoizes for the life of its client, and this connection outlives
+    /// every catalog refresh, so this asks the CLI each time.
+    pub(super) async fn list_models(&self) -> Result<Vec<Model>, ProviderError> {
+        self.client
+            .rpc()
+            .models()
+            .list()
+            .await
+            .map(|listed| listed.models)
+            .map_err(|error| self.failure("Copilot Model discovery failed", error))
     }
 
     /// The Provider failure to report for `error` under `context`.
@@ -95,7 +105,7 @@ impl CopilotConnection {
     /// Once the process is gone every in-flight and later request fails with a transport-shaped SDK
     /// error that says nothing about why. The supervisor already decided what the exit meant — and
     /// whether it lost a Provider Session — so its account wins wherever it exists.
-    pub(super) fn failure(&self, context: &str, error: impl std::fmt::Display) -> ProviderError {
+    fn failure(&self, context: &str, error: impl std::fmt::Display) -> ProviderError {
         match self.end() {
             Some(ConnectionEnd::Terminated(exit)) => copilot_error_context(context, exit),
             Some(ConnectionEnd::Closed) => copilot_error(format!(

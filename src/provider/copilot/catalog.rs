@@ -4,21 +4,34 @@
 //! reasoning effort, from the efforts a Model declares support for, and context tier, which trades
 //! context window against cost. A Model that advertises neither carries no Options at all.
 
-use github_copilot_sdk::rpc::{Model, ModelPickerCategory, ModelPolicyState};
+use github_copilot_sdk::{
+    rpc::{Model, ModelPickerCategory, ModelPolicyState},
+    session_events::ContextTier,
+};
+use serde_json::Value;
 
-use super::{CONTEXT_TIER_OPTION_ID, DEFAULT_CONTEXT_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID};
-use crate::protocol::{
-    ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
-    ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole, ProviderId,
+use super::{CONTEXT_TIER_OPTION_ID, REASONING_EFFORT_OPTION_ID};
+use crate::{
+    protocol::{
+        ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
+        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole, ProviderId,
+    },
+    provider::humanized_wire_id,
 };
 
 /// The Model Copilot routes on the user's behalf. Copilot's catalog names no default of its own, so
 /// when it offers this one Suru defaults to it rather than guessing between concrete Models.
 const AUTO_MODEL_ID: &str = "auto";
 
-/// The extended context tier, which Copilot's own Models publish as a second set of token prices
-/// rather than by name.
-const LONG_CONTEXT_TIER_CHOICE_ID: &str = "long_context";
+/// The wire name Copilot knows `tier` by, read out of the SDK's own serialization rather than
+/// written here: a Session lowers these same IDs back over the wire, so a tier Copilot renames must
+/// arrive renamed rather than quietly going stale.
+fn tier_id(tier: ContextTier) -> String {
+    let Ok(Value::String(id)) = serde_json::to_value(tier) else {
+        unreachable!("the SDK serializes a Copilot context tier as its wire name");
+    };
+    id
+}
 
 /// Turns the Models Copilot reports into Suru's catalog, marking exactly one of them the default.
 pub(super) fn model_descriptors(models: Vec<Model>) -> Vec<ModelDescriptor> {
@@ -32,15 +45,12 @@ pub(super) fn model_descriptors(models: Vec<Model>) -> Vec<ModelDescriptor> {
 /// The Model a fresh Agent Selection starts from: Copilot's own routed Model when it is offered and
 /// usable, otherwise the first usable Model Copilot listed — its catalog arrives in picker order.
 fn default_model_index(descriptors: &[ModelDescriptor]) -> Option<usize> {
-    let mut usable = descriptors
+    let usable =
+        |descriptor: &ModelDescriptor| descriptor.availability == ModelAvailability::Available;
+    descriptors
         .iter()
-        .enumerate()
-        .filter(|(_, descriptor)| descriptor.availability == ModelAvailability::Available);
-    let (first, _) = usable.next()?;
-    let routed = usable
-        .find(|(_, descriptor)| descriptor.id.as_str() == AUTO_MODEL_ID)
-        .map(|(index, _)| index);
-    Some(routed.unwrap_or(first))
+        .position(|descriptor| usable(descriptor) && descriptor.id.as_str() == AUTO_MODEL_ID)
+        .or_else(|| descriptors.iter().position(usable))
 }
 
 fn model_descriptor(model: Model) -> ModelDescriptor {
@@ -91,20 +101,21 @@ fn reasoning_effort_option(model: &Model) -> Option<ModelOptionDescriptor> {
         label: "Reasoning effort".to_owned(),
         description: None,
         role: ModelOptionRole::ReasoningEffort,
-        kind: select(efforts, default),
+        kind: select_of(efforts, default),
     })
 }
 
 /// The context tiers a Model offers, however Copilot publishes them.
 fn context_tier_option(model: &Model) -> Option<ModelOptionDescriptor> {
     let tiers = declared_context_tiers(model).or_else(|| priced_context_tiers(model))?;
-    let default = preferred_default(&tiers, Some(DEFAULT_CONTEXT_TIER_CHOICE_ID))?;
+    let standard = tier_id(ContextTier::Default);
+    let default = preferred_default(&tiers, Some(&standard))?;
     Some(ModelOptionDescriptor {
         id: ModelOptionId::new(CONTEXT_TIER_OPTION_ID),
         label: "Context".to_owned(),
         description: None,
         role: ModelOptionRole::Context,
-        kind: select(&tiers, default),
+        kind: select_of(&tiers, default),
     })
 }
 
@@ -129,8 +140,8 @@ fn priced_context_tiers(model: &Model) -> Option<Vec<String>> {
         .long_context
         .as_ref()?;
     Some(vec![
-        DEFAULT_CONTEXT_TIER_CHOICE_ID.to_owned(),
-        LONG_CONTEXT_TIER_CHOICE_ID.to_owned(),
+        tier_id(ContextTier::Default),
+        tier_id(ContextTier::LongContext),
     ])
 }
 
@@ -142,27 +153,18 @@ fn preferred_default<'a>(choices: &'a [String], preferred: Option<&'a str>) -> O
     named.or_else(|| choices.first().map(String::as_str))
 }
 
-fn select(choices: &[String], default: &str) -> ModelOptionKind {
+/// A Select Model Option over `choices`, each labelled for reading.
+fn select_of(choices: &[String], default: &str) -> ModelOptionKind {
     ModelOptionKind::Select {
         choices: choices
             .iter()
             .map(|choice| ModelOptionChoice {
-                label: humanize_id(choice),
+                label: humanized_wire_id(choice),
                 id: ModelOptionChoiceId::new(choice.clone()),
                 description: None,
                 availability: ModelAvailability::Available,
             })
             .collect(),
         default: ModelOptionChoiceId::new(default),
-    }
-}
-
-/// Copilot names its choices in wire case (`long_context`); this is the reading version.
-fn humanize_id(value: &str) -> String {
-    let spaced = value.replace(['_', '-'], " ");
-    let mut characters = spaced.chars();
-    match characters.next() {
-        Some(first) => first.to_uppercase().chain(characters).collect(),
-        None => String::new(),
     }
 }

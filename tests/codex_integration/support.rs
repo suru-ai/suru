@@ -1,7 +1,7 @@
 //! Scripted Codex programs and fixtures shared by more than one area of the tests.
 
+use crate::scripted_binary_support::{captured_methods, captured_requests, write_executable};
 use serde_json::Value;
-use std::os::unix::fs::PermissionsExt;
 use suru::managed_client::{ManagedClient, ManagedEvent};
 use tokio::time::{Duration, timeout};
 
@@ -85,12 +85,7 @@ impl ScriptedCodex {
                 "$CODEX_FIXTURE_ATTEMPTS",
                 attempts.to_str().expect("fixture attempts path is UTF-8"),
             );
-        std::fs::write(&executable, script).expect("write scripted Codex executable");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("read scripted Codex metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions).expect("make scripted Codex executable");
+        write_executable(&executable, &script);
         Self {
             _directory: directory,
             executable,
@@ -186,22 +181,10 @@ impl ScriptedCodex {
     }
 
     pub fn requests(&self) -> Vec<Value> {
-        std::fs::read_to_string(&self.log)
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("decode captured Codex request"))
-            .collect()
+        captured_requests(&self.log)
     }
 
     pub fn methods(&self) -> Vec<String> {
-        self.requests()
-            .into_iter()
-            .filter_map(|request| {
-                request
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .collect()
+        captured_methods(&self.log)
     }
 }

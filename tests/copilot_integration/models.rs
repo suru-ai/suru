@@ -3,7 +3,11 @@
 
 use std::sync::Arc;
 
-use crate::{provider_support::ControlledProvider, support::ScriptedCopilot};
+use crate::{
+    provider_support::ControlledProvider,
+    server_support,
+    support::{ScriptedCopilot, connect_arm},
+};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
@@ -14,8 +18,6 @@ use suru::{
     provider::CopilotRuntime,
     server::{self, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
-
 /// One Model of every shape the normalization has to tell apart: Copilot's routed default, a Model
 /// whose context tiers ride its tiered pricing, one that declares its tiers outright, and one an
 /// administrator's policy has disabled.
@@ -38,14 +40,7 @@ async fn connect(state_dir: &std::path::Path, name: &str) -> ManagedClient {
     )
     .await
     .expect("connect client");
-    assert!(matches!(
-        timeout(Duration::from_secs(1), client.next()).await,
-        Ok(Some(suru::managed_client::ManagedEvent::Connecting))
-    ));
-    assert!(matches!(
-        timeout(Duration::from_secs(1), client.next()).await,
-        Ok(Some(suru::managed_client::ManagedEvent::Connected(_)))
-    ));
+    server_support::receive_initial_state(&mut client).await;
     client
 }
 
@@ -308,4 +303,53 @@ async fn a_catalog_without_the_routed_model_defaults_to_the_first_usable_one() {
 
     server.shutdown().await.expect("shut the server down");
     copilot.wait_for_exit().await;
+}
+
+#[tokio::test]
+async fn a_harness_that_dies_mid_discovery_fails_the_catalog_and_the_next_refresh_relaunches() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}",
+        connect_arm(),
+        r#"    *'"method":"models.list"'*)
+      if [ "$attempt" -gt 1 ]; then
+        reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"models":[{"id":"auto","name":"Auto","capabilities":{}}]}}'
+      else
+        exit 9
+      fi
+      ;;
+"#,
+    ));
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "copilot-harness-crash").expect("configure server"),
+        Arc::new(CopilotRuntime::new(copilot.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let client = connect(state_dir.path(), "copilot-harness-crash").await;
+
+    let catalog = client
+        .list_models()
+        .await
+        .expect("the catalog request itself is answered");
+    let ProviderCatalogStatus::Failed { message } = &copilot_catalog(&catalog).status else {
+        panic!(
+            "a harness that dies mid-discovery fails the Copilot catalog, got {:?}",
+            copilot_catalog(&catalog).status
+        );
+    };
+    assert!(
+        message.contains("Copilot Model discovery failed"),
+        "the failure names the operation that lost the process, got: {message}"
+    );
+
+    let refreshed = client.refresh_models().await.expect("refresh the catalog");
+    assert_eq!(
+        copilot_catalog(&refreshed).status,
+        ProviderCatalogStatus::Fresh,
+        "the demand after a crash launches a fresh process, with no restart in between"
+    );
+    assert_eq!(copilot.launches(), 2);
+
+    server.shutdown().await.expect("shut the server down");
 }

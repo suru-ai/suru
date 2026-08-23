@@ -25,15 +25,18 @@ const REASONING_EFFORT_OPTION_ID: &str = "reasoning_effort";
 const SERVICE_TIER_OPTION_ID: &str = "service_tier";
 const DEFAULT_SERVICE_TIER_CHOICE_ID: &str = "default";
 
+/// What a Codex failure is called when Codex itself said nothing usable.
+const CODEX_FAILURE_FALLBACK: &str = "Codex Provider failed";
+
 fn codex_error(message: impl AsRef<str>) -> ProviderError {
     ProviderError::new(concise_remote_message(
         message.as_ref(),
-        "Codex Provider failed",
+        CODEX_FAILURE_FALLBACK,
     ))
 }
 
 /// Wraps `error` in the operation that failed, preserving the classification it already carries.
 fn codex_error_context(context: &str, error: ProviderError) -> ProviderError {
-    let message = concise_remote_message(&format!("{context}: {error}"), "Codex Provider failed");
+    let message = concise_remote_message(&format!("{context}: {error}"), CODEX_FAILURE_FALLBACK);
     error.reworded(message)
 }

@@ -9,6 +9,10 @@
 #[allow(dead_code)]
 mod server_support;
 
+#[path = "../support/scripted_binary.rs"]
+#[allow(dead_code)]
+mod scripted_binary_support;
+
 #[path = "../support/provider.rs"]
 #[allow(dead_code)]
 mod provider_support;

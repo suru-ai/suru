@@ -27,25 +27,19 @@ const COPILOT_SERVER_ARGS: [&str; 3] = ["--server", "--stdio", "--no-auto-update
 
 const REASONING_EFFORT_OPTION_ID: &str = "reasoning_effort";
 const CONTEXT_TIER_OPTION_ID: &str = "context_tier";
-const DEFAULT_CONTEXT_TIER_CHOICE_ID: &str = "default";
+
+/// What a Copilot failure is called when Copilot itself said nothing usable.
+const COPILOT_FAILURE_FALLBACK: &str = "Copilot Provider failed";
 
 fn copilot_error(message: impl AsRef<str>) -> ProviderError {
     ProviderError::new(concise_remote_message(
         message.as_ref(),
-        "Copilot Provider failed",
+        COPILOT_FAILURE_FALLBACK,
     ))
 }
 
 /// Wraps `error` in the operation that failed, preserving the classification it already carries.
 fn copilot_error_context(context: &str, error: ProviderError) -> ProviderError {
-    let session_lost = error.is_session_lost();
-    let selection_rejected = error.is_selection_rejected();
-    let mut contextual = copilot_error(format!("{context}: {error}"));
-    if session_lost {
-        contextual = contextual.mark_session_lost();
-    }
-    if selection_rejected {
-        contextual = contextual.mark_selection_rejected();
-    }
-    contextual
+    let message = concise_remote_message(&format!("{context}: {error}"), COPILOT_FAILURE_FALLBACK);
+    error.reworded(message)
 }

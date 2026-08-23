@@ -106,6 +106,9 @@ impl<C: HarnessConnector> SharedHarness<C> {
 
     /// Bounds how long the stopping process may exit gracefully before it is forced down;
     /// injectable so tests with fixtures that ignore stdin closure do not wait out the default.
+    /// This module's own tests are the only injector until a Provider runtime needs to pass one
+    /// through — Copilot's fixtures exit as soon as their stdin closes.
+    #[allow(dead_code)]
     pub(crate) fn with_process_exit_grace(mut self, exit_grace: tokio::time::Duration) -> Self {
         self.processes.set_exit_grace(exit_grace);
         self
