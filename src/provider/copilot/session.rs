@@ -4,7 +4,10 @@
 //! its reasoning effort, and its context tier are Session state the CLI holds between Turns. A
 //! Turn whose Selection differs from the one in force therefore switches the Session onto it
 //! before delivering the Prompt, which is also how a Session created before Suru knew the
-//! Selection — [`ProviderSessionRequest`] carries none — arrives at the right Model.
+//! Selection — [`ProviderSessionRequest`] carries none — arrives at the right Model. A fresh
+//! Session may report no Model at all, because Suru creates it without one and the CLI resolves
+//! nothing until asked: that is a Session with no Selection in force, not a failure, and the first
+//! Turn puts one in force by switching.
 //!
 //! Copilot addresses its own Session by the identifier the client gave it at creation and keeps
 //! the work behind it on disk, so that identifier is the whole of Suru's Resume State here: a Suru
@@ -27,15 +30,15 @@ use tokio::time::{Duration, timeout};
 use super::{
     CONTEXT_TIER_OPTION_ID, COPILOT_AGENT_ID, COPILOT_CLIENT_NAME, COPILOT_HARNESS_NAME,
     COPILOT_PROVIDER_ID, REASONING_EFFORT_OPTION_ID,
-    catalog::tier_id,
+    catalog::{model_descriptors, tier_id},
     copilot_error, copilot_error_context,
     projection::{CopilotCorrelation, provider_events},
     transport::CopilotConnection,
 };
 use crate::{
     protocol::{
-        AgentId, AgentIdentity, AgentSelection, ModelId, ModelOptionChoiceId, ModelOptionId,
-        ModelOptionSelection, ModelOptionValue, ProviderId,
+        AgentId, AgentIdentity, AgentSelection, ModelDescriptor, ModelId, ModelOptionChoiceId,
+        ModelOptionId, ModelOptionSelection, ModelOptionValue, ProviderId,
     },
     provider::{
         ProviderError, ProviderFuture, ProviderResumeState, ProviderSession,
@@ -114,7 +117,11 @@ pub(super) async fn start_copilot_session(
         }
     };
     let current = until_crash(&handle, context, native.rpc().model().get_current()).await?;
-    let selection = agent_selection(context, current)?;
+    let in_force = agent_selection(current);
+    let selection = match &in_force {
+        Some(selection) => selection.clone(),
+        None => default_selection(&handle, context).await?,
+    };
     let resume_state = ProviderResumeState::new(
         serde_json::to_value(CopilotResumeState {
             session_id: copilot_session_id,
@@ -128,7 +135,7 @@ pub(super) async fn start_copilot_session(
         native,
         handle,
         correlation,
-        selection: StdMutex::new(selection.clone()),
+        selection: StdMutex::new(in_force),
         interrupt_request_timeout,
     });
     Ok(ProviderSessionConnection::new(
@@ -176,13 +183,10 @@ async fn until_crash<T>(
 }
 
 /// The Agent Selection the Copilot Session is running under, read back from the CLI so the
-/// Selection Suru reports is the one Copilot actually resolved rather than the one Suru guessed.
-fn agent_selection(context: &str, current: CurrentModel) -> Result<AgentSelection, ProviderError> {
-    let Some(model) = current.model_id.filter(|model| !model.is_empty()) else {
-        return Err(copilot_error(format!(
-            "{context}: the Session reported no active Model"
-        )));
-    };
+/// Selection Suru reports is the one Copilot actually resolved rather than the one Suru guessed —
+/// or nothing, for a fresh Session the CLI has resolved no Model on yet.
+fn agent_selection(current: CurrentModel) -> Option<AgentSelection> {
+    let model = current.model_id.filter(|model| !model.is_empty())?;
     let mut options = Vec::new();
     if let Some(effort) = current.reasoning_effort {
         options.push(model_option_selection(REASONING_EFFORT_OPTION_ID, effort));
@@ -197,11 +201,38 @@ fn agent_selection(context: &str, current: CurrentModel) -> Result<AgentSelectio
             tier_id(tier),
         ));
     }
-    Ok(AgentSelection {
+    Some(AgentSelection {
         provider: ProviderId::new(COPILOT_PROVIDER_ID),
         model: ModelId::new(model),
         options,
     })
+}
+
+/// The Agent Selection a Session with no Model in force is reported under: the catalog's default,
+/// which is what the first Turn will put in force when the user never chooses.
+async fn default_selection(
+    handle: &SharedHarnessHandle<CopilotConnection>,
+    context: &str,
+) -> Result<AgentSelection, ProviderError> {
+    let listed = tokio::select! {
+        biased;
+        crashed = handle.crashed() => return Err(copilot_error_context(context, crashed)),
+        listed = handle.connection().list_models() => {
+            listed.map_err(|error| {
+                let message = format!("{context}: {error}");
+                error.reworded(message)
+            })?
+        }
+    };
+    model_descriptors(listed)
+        .iter()
+        .find(|descriptor| descriptor.is_default)
+        .map(ModelDescriptor::default_agent_selection)
+        .ok_or_else(|| {
+            copilot_error(format!(
+                "{context}: the Session reported no active Model and the catalog offers no default"
+            ))
+        })
 }
 
 fn model_option_selection(option: &str, choice: impl Into<String>) -> ModelOptionSelection {
@@ -226,9 +257,9 @@ struct CopilotSession {
     native: NativeSession,
     handle: Arc<SharedHarnessHandle<CopilotConnection>>,
     correlation: Arc<StdMutex<CopilotCorrelation>>,
-    /// The Agent Selection in force on the Copilot Session, which the next Turn switches away from
-    /// when it was selected under a different one.
-    selection: StdMutex<AgentSelection>,
+    /// The Agent Selection in force on the Copilot Session — nothing until the CLI has resolved a
+    /// Model — which the next Turn switches away from when it was selected under a different one.
+    selection: StdMutex<Option<AgentSelection>>,
     /// How long an interrupt waits for Copilot to acknowledge it before giving up.
     interrupt_request_timeout: Duration,
 }
@@ -254,11 +285,12 @@ impl CopilotSession {
 
     /// Puts `selection` in force on the Copilot Session, doing nothing when it already is.
     async fn apply_selection(&self, selection: &AgentSelection) -> Result<(), ProviderError> {
-        if *self
+        if self
             .selection
             .lock()
             .expect("Copilot Agent Selection lock is not poisoned")
-            == *selection
+            .as_ref()
+            == Some(selection)
         {
             return Ok(());
         }
@@ -273,7 +305,7 @@ impl CopilotSession {
         *self
             .selection
             .lock()
-            .expect("Copilot Agent Selection lock is not poisoned") = selection.clone();
+            .expect("Copilot Agent Selection lock is not poisoned") = Some(selection.clone());
         Ok(())
     }
 }

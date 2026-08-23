@@ -194,6 +194,16 @@ pub fn current_model_arm(model: &str, effort: &str, tier: &str) -> String {
     )
 }
 
+/// A `session.model.getCurrent` arm from a CLI with no Model in force on the Session — what a
+/// real CLI reports for a fresh Session created without a Model, before anything has resolved one.
+pub fn modelless_current_model_arm() -> String {
+    r#"    *'"method":"session.model.getCurrent"'*)
+      reply '{"jsonrpc":"2.0","id":'"$id"',"result":{}}'
+      ;;
+"#
+    .to_owned()
+}
+
 /// A `session.model.switchTo` arm that accepts whatever Model the Turn asks for.
 pub fn switch_model_arm() -> String {
     r#"    *'"method":"session.model.switchTo"'*)

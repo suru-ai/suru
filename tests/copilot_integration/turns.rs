@@ -4,8 +4,10 @@
 use std::sync::Arc;
 
 use crate::support::{
-    agent_messages, connect, conversation_fixture, resumable_conversation_fixture, settled_session,
-    settled_session_on,
+    COPILOT_MODELS, ScriptedCopilot, agent_messages, connect, connect_arm, conversation_fixture,
+    create_session_arm, modelless_current_model_arm, models_arm, permission_decision_arm,
+    resumable_conversation_fixture, send_arm, settled_session, settled_session_on, signed_in_arm,
+    switch_model_arm,
 };
 use serde_json::Value;
 use suru::{
@@ -181,6 +183,115 @@ async fn a_turn_selected_under_another_model_switches_copilot_onto_it_first() {
             "session.send"
         ],
         "the Model switch precedes the Prompt so the Turn runs under the chosen Selection"
+    );
+
+    server.shutdown().await.expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_session_whose_cli_reports_no_active_model_runs_under_the_selected_one() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}{}{}{}{}",
+        connect_arm(),
+        signed_in_arm(),
+        models_arm(COPILOT_MODELS),
+        create_session_arm(),
+        modelless_current_model_arm(),
+        switch_model_arm(),
+        permission_decision_arm(),
+        send_arm(STREAMED_MESSAGE),
+    ));
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "copilot-modelless-startup").expect("configure server"),
+        Arc::new(CopilotRuntime::new(copilot.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let client = connect(state_dir.path(), "copilot-modelless-startup").await;
+    // The Agent Selection is normalized against the catalog, so discover it before naming one.
+    client.list_models().await.expect("discover Copilot Models");
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(selection("claude-fixture", "low", "long_context")),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Say hello".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session under a chosen Agent Selection");
+
+    let settled = settled_session(&client, created.session.id, 0).await;
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+
+    let switched = copilot.wait_for_request("session.model.switchTo").await;
+    assert_eq!(
+        switched["params"]["modelId"], "claude-fixture",
+        "with nothing in force, the first Turn switches Copilot onto its Selection"
+    );
+
+    server.shutdown().await.expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_modelless_session_with_no_chosen_selection_runs_under_the_catalog_default() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}{}{}{}{}",
+        connect_arm(),
+        signed_in_arm(),
+        models_arm(COPILOT_MODELS),
+        create_session_arm(),
+        modelless_current_model_arm(),
+        switch_model_arm(),
+        permission_decision_arm(),
+        send_arm(STREAMED_MESSAGE),
+    ));
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "copilot-modelless-default").expect("configure server"),
+        Arc::new(CopilotRuntime::new(copilot.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let client = connect(state_dir.path(), "copilot-modelless-default").await;
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Say hello".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session without choosing an Agent Selection");
+
+    let settled = settled_session(&client, created.session.id, 0).await;
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        settled
+            .session
+            .agent_selection
+            .as_ref()
+            .map(|selection| selection.model.as_str()),
+        Some("auto"),
+        "with nothing in force and nothing chosen, the Session settles on the catalog default"
+    );
+
+    let switched = copilot.wait_for_request("session.model.switchTo").await;
+    assert_eq!(
+        switched["params"]["modelId"], "auto",
+        "the first Turn puts the catalog default in force"
     );
 
     server.shutdown().await.expect("shut the server down");
