@@ -12,13 +12,14 @@ use std::{
 };
 
 use github_copilot_sdk::{
-    SessionConfig, SessionId as CopilotSessionId, SetModelOptions, rpc::CurrentModel,
-    session::Session as NativeSession, session_events::ContextTier,
+    DeliveryMode, MessageOptions, SessionConfig, SessionId as CopilotSessionId, SetModelOptions,
+    rpc::CurrentModel, session::Session as NativeSession, session_events::ContextTier,
 };
+use tokio::time::{Duration, timeout};
 
 use super::{
-    CONTEXT_TIER_OPTION_ID, COPILOT_AGENT_ID, COPILOT_CLIENT_NAME, COPILOT_PROVIDER_ID,
-    REASONING_EFFORT_OPTION_ID,
+    CONTEXT_TIER_OPTION_ID, COPILOT_AGENT_ID, COPILOT_CLIENT_NAME, COPILOT_HARNESS_NAME,
+    COPILOT_PROVIDER_ID, REASONING_EFFORT_OPTION_ID,
     catalog::tier_id,
     copilot_error, copilot_error_context,
     projection::{CopilotCorrelation, provider_events},
@@ -36,10 +37,16 @@ use crate::{
     },
 };
 
+/// How long an interrupt waits for the CLI to acknowledge the whole-loop abort. Long enough for a
+/// busy loop to answer, short enough that a user who asked for the work to stop is not left
+/// watching a Turn that is never going to settle.
+pub(super) const INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Opens a Copilot Session on the shared harness process `handle` was granted from.
 pub(super) async fn start_copilot_session(
     handle: SharedHarnessHandle<CopilotConnection>,
     request: ProviderSessionRequest,
+    interrupt_request_timeout: Duration,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let handle = Arc::new(handle);
     // Copilot resumes a Session by its own identifier, so #121 stores this one as Resume State;
@@ -78,6 +85,7 @@ pub(super) async fn start_copilot_session(
         handle,
         correlation,
         selection: StdMutex::new(selection.clone()),
+        interrupt_request_timeout,
     });
     Ok(ProviderSessionConnection::new(
         AgentIdentity {
@@ -158,9 +166,29 @@ struct CopilotSession {
     /// The Agent Selection in force on the Copilot Session, which the next Turn switches away from
     /// when it was selected under a different one.
     selection: StdMutex<AgentSelection>,
+    /// How long an interrupt waits for Copilot to acknowledge it before giving up.
+    interrupt_request_timeout: Duration,
 }
 
 impl CopilotSession {
+    /// Fails unless a Turn is running for `operation` to act on. Copilot takes both live-Turn
+    /// operations as Session-level requests, so nothing about them says which Turn they meant:
+    /// delivered with no Turn running, a steer would begin one and an interrupt would stop
+    /// whatever the Session picked up next.
+    fn require_running_turn(&self, operation: &str) -> Result<(), ProviderError> {
+        if self
+            .correlation
+            .lock()
+            .expect("Copilot correlation lock is not poisoned")
+            .is_turn_running()
+        {
+            return Ok(());
+        }
+        Err(copilot_error(format!(
+            "Copilot has no active Turn to {operation}"
+        )))
+    }
+
     /// Puts `selection` in force on the Copilot Session, doing nothing when it already is.
     async fn apply_selection(&self, selection: &AgentSelection) -> Result<(), ProviderError> {
         if *self
@@ -253,14 +281,44 @@ impl ProviderSession for CopilotSession {
         })
     }
 
-    fn steer_turn(&self, _input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
-        // Live-Turn control lands one ticket on from the streaming conversation (#120).
-        Box::pin(async move { Err(copilot_error("Copilot cannot steer a Turn yet")) })
+    fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            self.require_running_turn("steer")?;
+            // Immediate delivery injects the Prompt into the loop already running, where Copilot's
+            // default would hold it back and run it as a Turn of its own once this one stopped.
+            //
+            // Nothing here names the Turn being steered, because Copilot's send does not take one:
+            // a steer that reaches the CLI after its loop has stopped falls back to that default
+            // and begins a Turn Suru is no longer expecting. Codex pins its steer to the Turn it
+            // meant and lets the Provider reject a stale one; the closest this wire comes is
+            // refusing to send once Suru's own Turn has settled, which leaves the stretch between
+            // Copilot stopping and Suru hearing about it.
+            until_crash(
+                &self.handle,
+                "Copilot Turn steering failed",
+                self.native
+                    .send(MessageOptions::new(input.prompt).with_mode(DeliveryMode::Immediate)),
+            )
+            .await
+            .map(|_message_id| ())
+        })
     }
 
     fn interrupt_turn(&self) -> ProviderFuture<'_, ()> {
-        // Live-Turn control lands one ticket on from the streaming conversation (#120).
-        Box::pin(async move { Err(copilot_error("Copilot cannot interrupt a Turn yet")) })
+        Box::pin(async move {
+            self.require_running_turn("interrupt")?;
+            // The Turn is Copilot's whole agentic loop, so stopping it is the whole-loop abort. The
+            // Turn settles on the aborted idle that follows, not on this acknowledgement — which is
+            // why an unanswered abort is bounded here rather than left to the loop to end.
+            const CONTEXT: &str = "Copilot Turn interruption failed";
+            let aborted = until_crash(&self.handle, CONTEXT, self.native.abort());
+            match timeout(self.interrupt_request_timeout, aborted).await {
+                Ok(aborted) => aborted,
+                Err(_elapsed) => Err(copilot_error(format!(
+                    "{CONTEXT}: {COPILOT_HARNESS_NAME} timed out handling `session.abort`"
+                ))),
+            }
+        })
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {

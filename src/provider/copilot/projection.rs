@@ -117,6 +117,12 @@ impl CopilotCorrelation {
     pub(super) fn abandon_turn(&mut self) {
         self.turn = None;
     }
+
+    /// Whether a Turn is running, which is what makes a Prompt delivered now a steer rather than
+    /// the start of another Turn, and what there is for an interrupt to stop.
+    pub(super) fn is_turn_running(&self) -> bool {
+        self.turn.is_some()
+    }
 }
 
 /// Streams the Provider events projected from one Copilot Session's timeline, failing the stream

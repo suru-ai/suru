@@ -18,6 +18,8 @@ mod scripted_binary_support;
 mod provider_support;
 
 mod activity;
+mod interruption;
 mod models;
+mod steering;
 mod support;
 mod turns;

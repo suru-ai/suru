@@ -2,9 +2,14 @@
 
 use std::ffi::{OsStr, OsString};
 
+use tokio::time::Duration;
+
 use super::{
-    COPILOT_HARNESS_NAME, COPILOT_PROVIDER_ID, COPILOT_SERVER_ARGS, catalog::model_descriptors,
-    copilot_error_context, session::start_copilot_session, transport::CopilotConnector,
+    COPILOT_HARNESS_NAME, COPILOT_PROVIDER_ID, COPILOT_SERVER_ARGS,
+    catalog::model_descriptors,
+    copilot_error_context,
+    session::{INTERRUPT_REQUEST_TIMEOUT, start_copilot_session},
+    transport::CopilotConnector,
 };
 use crate::{
     protocol::{ModelDescriptor, ProviderId},
@@ -22,6 +27,7 @@ const COPILOT_EXECUTABLE_NAME: &str = "copilot";
 /// process, launched on the first demand and relaunched fresh after a crash.
 pub struct CopilotRuntime {
     harness: SharedHarness<CopilotConnector>,
+    interrupt_request_timeout: Duration,
 }
 
 impl CopilotRuntime {
@@ -33,7 +39,15 @@ impl CopilotRuntime {
         };
         Self {
             harness: SharedHarness::new(spec, CopilotConnector::new()),
+            interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Bounds how long an interrupt waits for Copilot to acknowledge it; injectable so tests can
+    /// exercise the timeout without waiting out the default.
+    pub fn with_interrupt_request_timeout(mut self, timeout: Duration) -> Self {
+        self.interrupt_request_timeout = timeout;
+        self
     }
 
     pub fn from_environment() -> Self {
@@ -80,7 +94,7 @@ impl ProviderRuntime for CopilotRuntime {
             // Launches the shared process if this is the first demand, or the first since a crash,
             // which is how the Prompt after a harness crash recovers without a restart.
             let handle = self.harness.demand().await?;
-            start_copilot_session(handle, request).await
+            start_copilot_session(handle, request, self.interrupt_request_timeout).await
         })
     }
 

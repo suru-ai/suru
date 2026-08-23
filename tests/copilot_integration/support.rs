@@ -8,7 +8,12 @@
 
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
-    protocol::{Message, MessageRole, SessionId, SessionSnapshot, TurnStatus},
+    protocol::{
+        CreateSessionRequest, InitialPrompt, Message, MessageRole, PromptId, SessionId,
+        SessionSnapshot, TurnId, TurnStatus, Workspace,
+    },
+    provider::CopilotRuntime,
+    server::{self, RunningServer, ServerConfig},
 };
 use tokio::time::{Duration, timeout};
 
@@ -112,6 +117,27 @@ pub fn send_arm(timeline: &str) -> String {
 {timeline}      ;;
 "#
     )
+}
+
+/// A `session.abort` arm that acknowledges the whole-loop abort and then plays `timeline` — the
+/// aborted idle a real CLI reports once its loop has stopped, and whatever else the test wants.
+pub fn abort_arm(timeline: &str) -> String {
+    format!(
+        r#"    *'"method":"session.abort"'*)
+      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{}}}}'
+{timeline}      ;;
+"#
+    )
+}
+
+/// A `session.abort` arm that never answers, standing in for a CLI that has stopped acknowledging
+/// while its read loop still runs.
+pub fn silent_abort_arm() -> String {
+    r#"    *'"method":"session.abort"'*)
+      :
+      ;;
+"#
+    .to_owned()
 }
 
 /// An arm accepting the permission decision the harness answers a request with, so a fixture that
@@ -253,19 +279,121 @@ fn fixture_path(path: &std::path::Path) -> &str {
     path.to_str().expect("fixture path is UTF-8")
 }
 
-/// A fixture that carries a Session from creation through one Turn, playing `timeline` while it
-/// runs.
-pub fn conversation_fixture(timeline: &str) -> ScriptedCopilot {
-    ScriptedCopilot::new(&format!(
-        "{}{}{}{}{}{}{}",
+/// The arms every Copilot conversation needs before a Prompt reaches it — the handshake, the
+/// catalog, Session creation, and the Model the Session runs under — for a test that adds arms of
+/// its own beside them.
+pub fn conversation_arms() -> String {
+    format!(
+        "{}{}{}{}{}{}",
         connect_arm(),
         models_arm(COPILOT_MODELS),
         create_session_arm(),
         current_model_arm("claude-fixture", "high", "default"),
         switch_model_arm(),
         permission_decision_arm(),
-        send_arm(timeline),
-    ))
+    )
+}
+
+/// A fixture that carries a Session from creation through one Turn, playing `timeline` while it
+/// runs.
+pub fn conversation_fixture(timeline: &str) -> ScriptedCopilot {
+    ScriptedCopilot::new(&format!("{}{}", conversation_arms(), send_arm(timeline)))
+}
+
+/// A Copilot Session whose first Turn is running, which is what a steer or an interrupt needs
+/// something to act on. Holds everything the Turn runs on for as long as the test does — the state
+/// directory and Workspace included, which are only alive while this is.
+pub struct LiveTurn {
+    _state_dir: tempfile::TempDir,
+    _workspace: tempfile::TempDir,
+    server: RunningServer,
+    pub client: ManagedClient,
+    pub feed: SessionSubscription,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+}
+
+impl LiveTurn {
+    /// Opens a Session on `runtime` under `name`, delivers `prompt`, and comes back once the Turn
+    /// it began is running. `name` is the client channel, so each test needs its own.
+    pub async fn start(runtime: CopilotRuntime, name: &'static str, prompt: &str) -> Self {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let workspace = tempfile::tempdir().expect("create valid Workspace");
+        let server = server::spawn_with_provider(
+            ServerConfig::new(state_dir.path(), name).expect("configure server"),
+            std::sync::Arc::new(runtime),
+        )
+        .await
+        .expect("spawn server");
+        let client = connect(state_dir.path(), name).await;
+        let created = client
+            .create_session(CreateSessionRequest {
+                agent_selection: None,
+                workspace: Workspace {
+                    path: workspace.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: prompt.to_owned(),
+                },
+            })
+            .await
+            .expect("create Session");
+        let mut feed = client
+            .subscribe_session(created.session.id)
+            .await
+            .expect("subscribe to Session SSE");
+        let running = session_where(
+            &client,
+            &mut feed,
+            created.session.id,
+            "the Prompt begins a Turn Copilot is running",
+            |snapshot| {
+                snapshot
+                    .turns
+                    .first()
+                    .is_some_and(|turn| turn.status == TurnStatus::Active)
+            },
+        )
+        .await;
+        Self {
+            _state_dir: state_dir,
+            _workspace: workspace,
+            server,
+            client,
+            feed,
+            session_id: created.session.id,
+            turn_id: running.turns[0].id,
+        }
+    }
+
+    /// The Session once `predicate` holds of it, over this fixture's own feed.
+    pub async fn wait_for(
+        &mut self,
+        what: &str,
+        predicate: impl Fn(&SessionSnapshot) -> bool,
+    ) -> SessionSnapshot {
+        session_where(
+            &self.client,
+            &mut self.feed,
+            self.session_id,
+            what,
+            predicate,
+        )
+        .await
+    }
+
+    pub async fn shutdown(self) {
+        let Self {
+            server,
+            client,
+            feed,
+            ..
+        } = self;
+        drop(feed);
+        drop(client);
+        server.shutdown().await.expect("shut the server down");
+    }
 }
 
 pub async fn connect(state_dir: &std::path::Path, name: &str) -> ManagedClient {
@@ -310,25 +438,45 @@ pub async fn settled_session_on(
     session_id: SessionId,
     turn_index: usize,
 ) -> SessionSnapshot {
+    session_where(
+        client,
+        feed,
+        session_id,
+        &format!("Copilot Turn {turn_index} settles"),
+        |snapshot| {
+            snapshot
+                .turns
+                .get(turn_index)
+                .is_some_and(|turn| turn.status != TurnStatus::Active)
+        },
+    )
+    .await
+}
+
+/// The Session once `predicate` holds of it, read from a feed the caller already holds. `what`
+/// names what was being waited for, so a wait that runs out says which one did.
+pub async fn session_where(
+    client: &ManagedClient,
+    feed: &mut SessionSubscription,
+    session_id: SessionId,
+    what: &str,
+    predicate: impl Fn(&SessionSnapshot) -> bool,
+) -> SessionSnapshot {
     timeout(Duration::from_secs(10), async {
         loop {
-            feed.next()
-                .await
-                .expect("Session feed remains open")
-                .expect("Session event is valid");
             let snapshot = client
                 .read_session(session_id)
                 .await
                 .expect("read Session while its Turn runs");
-            if snapshot
-                .turns
-                .get(turn_index)
-                .is_some_and(|turn| turn.status != TurnStatus::Active)
-            {
+            if predicate(&snapshot) {
                 return snapshot;
             }
+            feed.next()
+                .await
+                .expect("Session feed remains open")
+                .expect("Session event is valid");
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("Copilot Turn {turn_index} settles"))
+    .unwrap_or_else(|_| panic!("{what}"))
 }
