@@ -4,10 +4,10 @@
 //! refresh after the user fixes it outside Suru.
 
 use crate::support::{
-    CLAUDE_FLOOR_VERSION, CLAUDE_MODELS, SIGNED_OUT_ACCOUNT, ScriptedClaude, claude_catalog,
-    connect, hosting, hosting_runtime, initialize_arm, list_models_arm, probe_arms,
-    settled_session, signed_out_initialize_arm, unknown_version_request_arm,
-    upgradable_version_arm, version_arm,
+    CLAUDE_MODELS, CLAUDE_VERSION_FLOOR, SIGNED_IN_ACCOUNT, SIGNED_OUT_ACCOUNT, ScriptedClaude,
+    after_probe, claude_catalog, connect, crashing_list_models_arm, hosting, hosting_runtime,
+    initialize_arm, list_models_arm, probe_arms, settled_session, signed_out_initialize_arm,
+    silent_version_arm, unknown_version_request_arm, upgradable_version_arm, version_arm,
 };
 use std::sync::Arc;
 use suru::{
@@ -81,7 +81,7 @@ async fn a_cli_below_the_version_floor_is_reported_as_incompatible_until_it_is_u
     let claude = ScriptedClaude::new(&format!(
         "{}{}{}",
         upgradable_version_arm(),
-        initialize_arm(crate::support::SIGNED_IN_ACCOUNT),
+        initialize_arm(SIGNED_IN_ACCOUNT),
         list_models_arm(CLAUDE_MODELS),
     ));
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -94,7 +94,7 @@ async fn a_cli_below_the_version_floor_is_reported_as_incompatible_until_it_is_u
     let (reason, message) = condition(&claude_catalog(&catalog).status);
     assert_eq!(reason, ProviderUnavailability::IncompatibleVersion);
     assert!(
-        message.contains("2.1.236") && message.contains(CLAUDE_FLOOR_VERSION),
+        message.contains("2.1.236") && message.contains(CLAUDE_VERSION_FLOOR),
         "the condition names the version the CLI reported and the floor it is under, got: {message}"
     );
     assert_eq!(
@@ -102,7 +102,13 @@ async fn a_cli_below_the_version_floor_is_reported_as_incompatible_until_it_is_u
         ["get_binary_version"],
         "a CLI Suru cannot drive is never asked anything else"
     );
+    assert!(
+        claude_catalog(&catalog).models.is_empty(),
+        "an unusable Provider offers no Model for a Session to be started on"
+    );
 
+    // No TTL is injected, so the refresh clearing the condition is also what shows an unusable
+    // verdict is never kept: the recovery is the refresh itself, with nothing to wait out.
     claude.upgrade();
     assert_the_refresh_clears_the_condition(&client).await;
 
@@ -135,11 +141,46 @@ async fn a_cli_that_cannot_tell_suru_its_version_is_reported_as_incompatible() {
     claude.wait_for_exits(claude.launches()).await;
 }
 
+/// A CLI that answers nothing at all is not one the user updates away from: it is a Provider that
+/// has stopped working, and telling the user to update their CLI would send them after the wrong
+/// thing.
+#[tokio::test]
+async fn a_cli_that_answers_nothing_at_all_fails_rather_than_naming_a_condition() {
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}",
+        silent_version_arm(),
+        list_models_arm(CLAUDE_MODELS),
+    ));
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let runtime = ClaudeRuntime::new(claude.executable())
+        .with_control_request_timeout(Duration::from_millis(100))
+        .with_process_exit_grace(Duration::from_millis(50));
+    let (server, client) = hosting_runtime(runtime, "claude-silent-probe", state_dir.path()).await;
+
+    let catalog = client
+        .list_models()
+        .await
+        .expect("the catalog request itself is answered");
+    let ProviderCatalogStatus::Failed { message } = &claude_catalog(&catalog).status else {
+        panic!(
+            "a CLI that never answers the probe fails the catalog rather than naming a condition \
+             the user fixes, got {:?}",
+            claude_catalog(&catalog).status
+        );
+    };
+    assert!(
+        message.contains("timed out"),
+        "the failure says the CLI stopped answering, got: {message}"
+    );
+
+    server.shutdown().await.expect("shut the server down");
+}
+
 #[tokio::test]
 async fn a_cli_no_one_is_signed_in_to_is_reported_as_such_until_the_user_signs_in() {
     let claude = ScriptedClaude::new(&format!(
         "{}{}{}",
-        version_arm(CLAUDE_FLOOR_VERSION),
+        version_arm(CLAUDE_VERSION_FLOOR),
         signed_out_initialize_arm(),
         list_models_arm(CLAUDE_MODELS),
     ));
@@ -161,7 +202,12 @@ async fn a_cli_no_one_is_signed_in_to_is_reported_as_such_until_the_user_signs_i
         ["get_binary_version", "initialize"],
         "the account is read from the init handshake, and a signed-out CLI is never asked for Models"
     );
+    assert!(
+        claude_catalog(&catalog).models.is_empty(),
+        "an unusable Provider offers no Model for a Session to be started on"
+    );
 
+    // No TTL is injected here either, so signing in and refreshing is the whole recovery.
     claude.sign_in();
     assert_the_refresh_clears_the_condition(&client).await;
 
@@ -213,7 +259,7 @@ async fn the_account_probe_starts_no_turn_and_persists_no_session() {
     );
     assert_eq!(
         claude.control_subtypes(),
-        ["get_binary_version", "initialize", "list_models"],
+        after_probe(["list_models"]),
         "the probe asks the CLI its version and who is signed in, and nothing more"
     );
 
@@ -236,13 +282,7 @@ async fn catalog_reads_within_the_ttl_reuse_the_probes_verdict() {
 
     assert_eq!(
         claude.control_subtypes(),
-        [
-            "get_binary_version",
-            "initialize",
-            "list_models",
-            "list_models",
-            "list_models"
-        ],
+        after_probe(["list_models", "list_models", "list_models"]),
         "a usable Claude is probed once and asked for its Models on every read"
     );
     assert_eq!(
@@ -270,14 +310,7 @@ async fn a_verdict_older_than_the_injected_ttl_is_probed_again() {
 
     assert_eq!(
         claude.control_subtypes(),
-        [
-            "get_binary_version",
-            "initialize",
-            "list_models",
-            "get_binary_version",
-            "initialize",
-            "list_models"
-        ],
+        [after_probe(["list_models"]), after_probe(["list_models"])].concat(),
         "a verdict older than the TTL is asked of the CLI again rather than replayed"
     );
 
@@ -289,7 +322,7 @@ async fn a_verdict_older_than_the_injected_ttl_is_probed_again() {
 async fn a_turn_reaching_an_unavailable_claude_fails_with_the_condition_leading_the_message() {
     let claude = ScriptedClaude::new(&format!(
         "{}{}{}",
-        version_arm(CLAUDE_FLOOR_VERSION),
+        version_arm(CLAUDE_VERSION_FLOOR),
         initialize_arm(SIGNED_OUT_ACCOUNT),
         list_models_arm(CLAUDE_MODELS),
     ));
@@ -345,10 +378,7 @@ async fn a_turn_reaching_an_unavailable_claude_fails_with_the_condition_leading_
 /// the discovery that follows a good verdict is what fails, not the probe.
 #[tokio::test]
 async fn a_usable_cli_whose_discovery_fails_is_a_failure_rather_than_a_condition() {
-    let claude = ScriptedClaude::new(&format!(
-        "{}    *'\"subtype\":\"list_models\"'*)\n      exit 9\n      ;;\n",
-        probe_arms(),
-    ));
+    let claude = ScriptedClaude::new(&format!("{}{}", probe_arms(), crashing_list_models_arm()));
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let (server, client) = hosting(&claude, "claude-probe-then-failure", state_dir.path()).await;
 

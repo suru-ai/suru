@@ -396,12 +396,12 @@ impl ProviderSession for ClaudeSession {
                 )
                 .await
                 .map(|_receipt| ())
-                .map_err(|error| {
+                .map_err(|failure| {
                     // An interrupt Suru could not deliver fails the Turn, so the Turn is over
                     // whatever the loop does next: nothing the CLI still owes it is its to settle,
                     // and a later steer must not join a Turn Suru has already closed.
                     self.turn.abandon_turn();
-                    claude_error_context(CONTEXT, error)
+                    claude_error_context(CONTEXT, failure.into_error())
                 })
         })
     }

@@ -68,13 +68,13 @@ const SCRIPT_LOOP: &str = r#"while IFS= read -r line; do
 
 /// The version the fixture reports when nothing has downgraded it: the floor itself, which is the
 /// version Suru's wire behavior is verified against.
-pub const CLAUDE_FLOOR_VERSION: &str = "2.1.237";
+pub const CLAUDE_VERSION_FLOOR: &str = "2.1.237";
 
 /// A version below the floor, standing in for a CLI too old for Suru to drive.
-pub const CLAUDE_OLD_VERSION: &str = "2.1.236";
+pub const CLAUDE_VERSION_BELOW_FLOOR: &str = "2.1.236";
 
 /// A version above the floor, standing in for the CLI the user updates to.
-pub const CLAUDE_NEW_VERSION: &str = "2.2.0";
+pub const CLAUDE_VERSION_ABOVE_FLOOR: &str = "2.2.0";
 
 /// What the CLI reports about the account once a user is signed in to it.
 pub const SIGNED_IN_ACCOUNT: &str = concat!(
@@ -109,8 +109,8 @@ pub fn upgradable_version_arm() -> String {
       fi
       ;;
 "#,
-        new = CLAUDE_NEW_VERSION,
-        old = CLAUDE_OLD_VERSION,
+        new = CLAUDE_VERSION_ABOVE_FLOOR,
+        old = CLAUDE_VERSION_BELOW_FLOOR,
     )
 }
 
@@ -119,6 +119,16 @@ pub fn upgradable_version_arm() -> String {
 pub fn unknown_version_request_arm() -> String {
     r#"    *'"subtype":"get_binary_version"'*)
       printf '%s\n' '{"type":"control_response","response":{"subtype":"error","request_id":"'"$request_id"'","error":"Unsupported control request subtype: get_binary_version"}}'
+      ;;
+"#
+    .to_owned()
+}
+
+/// A `get_binary_version` arm that never answers, standing in for a CLI that has stopped responding
+/// while its process still runs.
+pub fn silent_version_arm() -> String {
+    r#"    *'"subtype":"get_binary_version"'*)
+      :
       ;;
 "#
     .to_owned()
@@ -153,12 +163,23 @@ pub fn signed_out_initialize_arm() -> String {
     )
 }
 
+/// The control-request subtypes a fixture's log reads as when `subtypes` were asked of a CLI the
+/// availability probe found usable: every probe leads with the two questions it puts to the CLI
+/// before Suru asks it to do anything.
+pub fn after_probe<const N: usize>(subtypes: [&str; N]) -> Vec<String> {
+    ["get_binary_version", "initialize"]
+        .into_iter()
+        .chain(subtypes)
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The arms an availability probe asks of every usable CLI: the version Suru's wire is verified
 /// against, and an account a user is signed in to.
 pub fn probe_arms() -> String {
     format!(
         "{}{}",
-        version_arm(CLAUDE_FLOOR_VERSION),
+        version_arm(CLAUDE_VERSION_FLOOR),
         initialize_arm(SIGNED_IN_ACCOUNT)
     )
 }
@@ -196,6 +217,16 @@ pub fn drifting_list_models_arm(models: &str) -> String {
 pub fn silent_list_models_arm() -> String {
     r#"    *'"subtype":"list_models"'*)
       :
+      ;;
+"#
+    .to_owned()
+}
+
+/// A `list_models` arm that takes the process down with it, standing in for a CLI that dies
+/// mid-discovery.
+pub fn crashing_list_models_arm() -> String {
+    r#"    *'"subtype":"list_models"'*)
+      exit 9
       ;;
 "#
     .to_owned()

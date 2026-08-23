@@ -2,8 +2,8 @@
 //! loop itself, and the Turn Settles as interrupted on the result that follows.
 
 use crate::support::{
-    CLAUDE_MODELS, LiveTurn, ScriptedClaude, agent_messages, discovery_arms, interrupt_arm,
-    silent_interrupt_arm, stop_task_arm, user_turn_arm,
+    CLAUDE_MODELS, LiveTurn, ScriptedClaude, after_probe, agent_messages, discovery_arms,
+    interrupt_arm, silent_interrupt_arm, stop_task_arm, user_turn_arm,
 };
 use suru::{
     protocol::{
@@ -106,13 +106,7 @@ async fn an_interrupt_stops_the_background_work_first_and_settles_the_turn_as_in
 
     assert_eq!(
         claude.control_subtypes(),
-        [
-            "get_binary_version",
-            "initialize",
-            "list_models",
-            "stop_task",
-            "interrupt"
-        ],
+        after_probe(["list_models", "stop_task", "interrupt"]),
         "the background work is stopped before the loop is, because an interrupt alone \
          leaves it running"
     );
@@ -176,12 +170,7 @@ async fn an_interrupt_with_no_background_work_asks_the_cli_to_stop_nothing() {
     assert_eq!(interrupted.turns[0].status, TurnStatus::Interrupted);
     assert_eq!(
         claude.control_subtypes(),
-        [
-            "get_binary_version",
-            "initialize",
-            "list_models",
-            "interrupt"
-        ],
+        after_probe(["list_models", "interrupt"]),
         "a Turn with nothing running in the background is stopped by the interrupt alone"
     );
 

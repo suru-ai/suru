@@ -157,7 +157,9 @@ async fn discover_claude_models(
     let result = transport
         .control_request(&ControlRequest::ListModels, request_timeout)
         .await
-        .map_err(|error| claude_error_context("Claude Model discovery failed", error))?;
+        .map_err(|failure| {
+            claude_error_context("Claude Model discovery failed", failure.into_error())
+        })?;
     let listed: NativeModelList = serde_json::from_value(result).map_err(|error| {
         claude_error(format!(
             "Claude Code CLI returned an invalid list_models response: {error}"

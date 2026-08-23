@@ -123,14 +123,15 @@ async fn probe(
         processes,
     )
     .await?;
-    let verdict = ask_the_cli(&transport, request_timeout).await;
+    let verdict = ask_for_a_verdict(&transport, request_timeout).await;
     transport.close().await;
     // The verdict is the answer the probe was launched for, so a process that then stops badly only
     // has a story to tell when there is no verdict to report.
     verdict.and(process.wait_until_stopped().await)
 }
 
-async fn ask_the_cli(
+/// Everything the CLI has to answer before Suru will drive it.
+async fn ask_for_a_verdict(
     transport: &StreamJsonTransport,
     request_timeout: Duration,
 ) -> Result<(), ProviderError> {
@@ -141,10 +142,11 @@ async fn ask_the_cli(
 /// Fails with the typed incompatible-version condition unless the CLI reports a version Suru's wire
 /// behavior has been verified against.
 ///
-/// A CLI that will not say which version it is, is one Suru cannot vouch for either: the ask itself
-/// predates nothing this Provider needs, so a refusal or a silence is the same condition as a
-/// version below the floor. A process that died under the question is a Provider that broke, not a
-/// version the user updates away from.
+/// A CLI that refuses the question is one Suru cannot vouch for either: nothing this Provider needs
+/// postdates the question, so a CLI old enough not to know it is a CLI too old to drive — the same
+/// condition as a version below the floor, told the same way. A CLI that answers nothing at all is
+/// something else: a Provider that has stopped working rather than one the user updates away from,
+/// so it fails the way any unanswered request does.
 async fn verify_version(
     transport: &StreamJsonTransport,
     request_timeout: Duration,
@@ -152,13 +154,14 @@ async fn verify_version(
     let reported = transport
         .control_request(&ControlRequest::GetBinaryVersion, request_timeout)
         .await
-        .map_err(|error| {
-            if error.is_session_lost() {
-                return claude_error_context("Claude availability probe failed", error);
+        .map_err(|failure| {
+            if failure.is_refusal() {
+                return version_drift(format!(
+                    "the Claude Code CLI could not tell Suru its version: {}",
+                    failure.into_error()
+                ));
             }
-            version_drift(format!(
-                "the Claude Code CLI could not tell Suru its version: {error}"
-            ))
+            claude_error_context("Claude availability probe failed", failure.into_error())
         })?;
     let reported: NativeBinaryVersion = serde_json::from_value(reported).map_err(|error| {
         version_drift(format!(
@@ -201,7 +204,9 @@ async fn verify_signed_in(
     let handshake = transport
         .control_request(&ControlRequest::Initialize, request_timeout)
         .await
-        .map_err(|error| claude_error_context("Claude sign-in check failed", error))?;
+        .map_err(|failure| {
+            claude_error_context("Claude sign-in check failed", failure.into_error())
+        })?;
     let handshake: NativeInitialize = serde_json::from_value(handshake).map_err(|error| {
         claude_error(format!(
             "Claude Code CLI returned an invalid initialize response: {error}"

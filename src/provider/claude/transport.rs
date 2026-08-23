@@ -57,7 +57,34 @@ const CLAUDE_STREAM_JSON_ARGS: [&str; 8] = [
     "",
 ];
 
-type PendingResponse = oneshot::Sender<Result<Value, ProviderError>>;
+/// Why a control request produced no answer.
+///
+/// The two are told apart because they say different things about the CLI: one Suru asked
+/// something it will not serve, against one that said nothing at all — a request it ignored, or a
+/// process that went down under it. Only the first is the CLI's own account of itself, which is
+/// what a caller reading the CLI's capabilities — the availability probe — has to go on.
+pub(super) enum ControlFailure {
+    /// The CLI answered the request by refusing it.
+    Refused(ProviderError),
+    /// Everything else: a request never answered, a transport that ended, a process that was lost.
+    Failed(ProviderError),
+}
+
+impl ControlFailure {
+    /// The failure as a caller that draws no distinction reports it.
+    pub(super) fn into_error(self) -> ProviderError {
+        match self {
+            Self::Refused(error) | Self::Failed(error) => error,
+        }
+    }
+
+    /// Whether the CLI itself refused the request, rather than leaving it unanswered.
+    pub(super) fn is_refusal(&self) -> bool {
+        matches!(self, Self::Refused(_))
+    }
+}
+
+type PendingResponse = oneshot::Sender<Result<Value, ControlFailure>>;
 
 struct TransportState {
     pending: StdMutex<HashMap<String, PendingResponse>>,
@@ -129,9 +156,11 @@ impl StreamJsonTransport {
         &self,
         request: &ControlRequest,
         request_timeout: Duration,
-    ) -> Result<Value, ProviderError> {
+    ) -> Result<Value, ControlFailure> {
         if self.state.terminated.load(Ordering::Acquire) {
-            return Err(claude_error("Claude Code CLI transport has ended").mark_session_lost());
+            return Err(ControlFailure::Failed(
+                claude_error("Claude Code CLI transport has ended").mark_session_lost(),
+            ));
         }
         let key = format!("suru-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let (response_tx, response_rx) = oneshot::channel();
@@ -152,25 +181,25 @@ impl StreamJsonTransport {
                 .lock()
                 .expect("Claude pending request lock is not poisoned")
                 .remove(&key);
-            return Err(error);
+            return Err(ControlFailure::Failed(error));
         }
 
         match timeout(request_timeout, response_rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(claude_error(
-                "Claude Code CLI ended before the control request completed",
-            )
-            .mark_session_lost()),
+            Ok(Err(_)) => Err(ControlFailure::Failed(
+                claude_error("Claude Code CLI ended before the control request completed")
+                    .mark_session_lost(),
+            )),
             Err(_) => {
                 self.state
                     .pending
                     .lock()
                     .expect("Claude pending request lock is not poisoned")
                     .remove(&key);
-                Err(claude_error(format!(
+                Err(ControlFailure::Failed(claude_error(format!(
                     "Claude Code CLI timed out handling `{}`",
                     request.subtype()
-                )))
+                ))))
             }
         }
     }
@@ -321,10 +350,10 @@ fn route_message(message: Value, state: &Arc<TransportState>) -> Result<(), Prov
         } => (request_id, Ok(response.unwrap_or(Value::Null))),
         ControlResponse::Error { request_id, error } => (
             request_id,
-            Err(claude_error(format!(
+            Err(ControlFailure::Refused(claude_error(format!(
                 "Claude Code CLI rejected the request: {}",
                 concise_remote_message(&error, "unknown control error")
-            ))),
+            )))),
         ),
     };
     let pending = state
@@ -361,7 +390,7 @@ fn finish_transport(state: &TransportState, error: ProviderError, conversation_l
             .collect::<Vec<_>>()
     };
     for response in pending {
-        let _ = response.send(Err(error.clone()));
+        let _ = response.send(Err(ControlFailure::Failed(error.clone())));
     }
     // An intended close ends the conversation without a story; a lost process
     // is the conversation's failure, told exactly once.

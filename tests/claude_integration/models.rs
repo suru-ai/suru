@@ -6,8 +6,8 @@ use std::sync::Arc;
 use crate::{
     provider_support::ControlledProvider,
     support::{
-        CLAUDE_MODELS, ScriptedClaude, claude_catalog, drifting_list_models_arm, hosting,
-        hosting_runtime, malformed_list_models_arm, probe_arms, silent_list_models_arm,
+        CLAUDE_MODELS, ScriptedClaude, after_probe, claude_catalog, drifting_list_models_arm,
+        hosting, hosting_runtime, malformed_list_models_arm, probe_arms, silent_list_models_arm,
     },
 };
 use suru::{
@@ -163,12 +163,7 @@ async fn each_discovery_launches_its_own_short_lived_stream_json_process() {
     );
     assert_eq!(
         claude.control_subtypes(),
-        [
-            "get_binary_version",
-            "initialize",
-            "list_models",
-            "list_models"
-        ],
+        after_probe(["list_models", "list_models"]),
         "past the probe that opened the first discovery, \
          discovery asks the CLI for its models and nothing else"
     );
@@ -349,23 +344,19 @@ async fn a_malformed_list_models_response_fails_the_catalog() {
 /// a first failed launch left the runtime's process registry wedged.
 #[tokio::test]
 async fn a_discovery_after_a_crashed_one_launches_a_fresh_process() {
-    // The probe's own process is the first launch and the crashing discovery the second, so the
-    // revived answer belongs to every launch after them.
-    let claude = ScriptedClaude::new(&format!(
-        "{}{}",
-        probe_arms(),
-        format_args!(
-            r#"    *'"subtype":"list_models"'*)
+    /// A CLI that dies on the discovery it is first asked for and answers every one after it. The
+    /// probe's own process is the first launch and the crashing discovery the second, so the
+    /// revived answer belongs to every launch past them.
+    const CRASH_THEN_REVIVE: &str = r#"    *'"subtype":"list_models"'*)
       if [ "$attempt" -gt 2 ]; then
-{}      else
+        printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{"models":[{"value":"revived","displayName":"Revived","description":"Back after a crash"}]}}}'
+      else
         exit 9
       fi
       ;;
-"#,
-            r#"        printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{"models":[{"value":"revived","displayName":"Revived","description":"Back after a crash"}]}}}'
-"#
-        )
-    ));
+"#;
+
+    let claude = ScriptedClaude::new(&format!("{}{CRASH_THEN_REVIVE}", probe_arms()));
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let (server, client) = hosting(&claude, "claude-crash-recovery", state_dir.path()).await;
 
@@ -388,7 +379,11 @@ async fn a_discovery_after_a_crashed_one_launches_a_fresh_process() {
         ProviderCatalogStatus::Fresh,
         "the demand after a crash launches a fresh process, with no restart in between"
     );
-    assert_eq!(claude.launches(), 3);
+    assert_eq!(
+        claude.launches(),
+        3,
+        "the probe's process, the discovery that crashed, and the fresh one that replaced it"
+    );
 
     server.shutdown().await.expect("shut the server down");
 }
