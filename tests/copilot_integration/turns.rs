@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use crate::support::{
-    agent_messages, connect, conversation_fixture, settled_session, settled_session_on,
+    agent_messages, connect, conversation_fixture, resumable_conversation_fixture, settled_session,
+    settled_session_on,
 };
 use serde_json::Value;
 use suru::{
@@ -311,8 +312,10 @@ const CRASH_MID_TURN: &str = r#"      if [ "$attempt" -gt 1 ]; then
 "#;
 
 #[tokio::test]
-async fn a_harness_crash_mid_turn_loses_the_session_and_the_next_prompt_respawns_it() {
-    let copilot = conversation_fixture(CRASH_MID_TURN);
+async fn a_harness_crash_mid_turn_loses_the_session_and_the_next_prompt_resumes_it() {
+    // The replacement process is asked to resume rather than create, because the Session it lost
+    // has Resume State by the time the crash takes it.
+    let copilot = resumable_conversation_fixture(CRASH_MID_TURN);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let server = server::spawn_with_provider(
@@ -382,6 +385,11 @@ async fn a_harness_crash_mid_turn_loses_the_session_and_the_next_prompt_respawns
         copilot.launches(),
         2,
         "the demand after a crash launches a fresh process, with no restart in between"
+    );
+    assert!(
+        copilot.methods().contains(&"session.resume".to_owned()),
+        "the respawned harness picks the lost Copilot Session back up rather than opening one: {:?}",
+        copilot.methods()
     );
 
     drop(feed);

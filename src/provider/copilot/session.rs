@@ -5,6 +5,11 @@
 //! Turn whose Selection differs from the one in force therefore switches the Session onto it
 //! before delivering the Prompt, which is also how a Session created before Suru knew the
 //! Selection — [`ProviderSessionRequest`] carries none — arrives at the right Model.
+//!
+//! Copilot addresses its own Session by the identifier the client gave it at creation and keeps
+//! the work behind it on disk, so that identifier is the whole of Suru's Resume State here: a Suru
+//! Session that was restored asks Copilot to resume its Copilot Session rather than to create one,
+//! and it picks up where it stopped.
 
 use std::{
     future::Future,
@@ -12,9 +17,11 @@ use std::{
 };
 
 use github_copilot_sdk::{
-    DeliveryMode, MessageOptions, SessionConfig, SessionId as CopilotSessionId, SetModelOptions,
-    rpc::CurrentModel, session::Session as NativeSession, session_events::ContextTier,
+    DeliveryMode, MessageOptions, ResumeSessionConfig, SessionConfig,
+    SessionId as CopilotSessionId, SetModelOptions, rpc::CurrentModel,
+    session::Session as NativeSession, session_events::ContextTier,
 };
+use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, timeout};
 
 use super::{
@@ -31,8 +38,8 @@ use crate::{
         ModelOptionSelection, ModelOptionValue, ProviderId,
     },
     provider::{
-        ProviderError, ProviderFuture, ProviderSession, ProviderSessionConnection,
-        ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
+        ProviderError, ProviderFuture, ProviderResumeState, ProviderSession,
+        ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
         harness::SharedHarnessHandle,
     },
 };
@@ -42,41 +49,78 @@ use crate::{
 /// watching a Turn that is never going to settle.
 pub(super) const INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Opens a Copilot Session on the shared harness process `handle` was granted from.
+/// Everything Suru must remember about a Copilot Session to continue it after a restart: the
+/// identifier Copilot files it under. Suru never reads what Copilot keeps behind that identifier,
+/// which is why this is all the Resume State carries.
+#[derive(Deserialize, Serialize)]
+struct CopilotResumeState {
+    session_id: CopilotSessionId,
+}
+
+/// What a failure opening the Copilot Session is reported under, which is the operation Suru asked
+/// for rather than the phase of it that went wrong.
+const STARTUP_CONTEXT: &str = "Copilot Session startup failed";
+const RESUME_CONTEXT: &str = "Copilot Session resume failed";
+
+/// Opens a Copilot Session on the shared harness process `handle` was granted from — resuming the
+/// one the Resume State names when the Suru Session was restored with one, and creating a fresh one
+/// otherwise.
+///
+/// Either way the harness answers Copilot's permission requests itself, matching the Codex posture:
+/// full auto, with no approval concept crossing the Provider seam.
 pub(super) async fn start_copilot_session(
     handle: SharedHarnessHandle<CopilotConnection>,
     request: ProviderSessionRequest,
     interrupt_request_timeout: Duration,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let handle = Arc::new(handle);
-    // Copilot resumes a Session by its own identifier, so #121 stores this one as Resume State;
-    // until then every Session starts a fresh Copilot conversation.
-    let _ = request.resume_state;
-    // The SDK registers the identifier before it asks the CLI to create the Session, which is what
-    // gives the Session-scoped requests the CLI may issue mid-creation somewhere to land.
-    let copilot_session_id = CopilotSessionId::new(uuid::Uuid::new_v4().to_string());
-    let config = SessionConfig::default()
-        .with_session_id(copilot_session_id)
-        .with_client_name(COPILOT_CLIENT_NAME)
-        .with_working_directory(request.workspace)
-        .with_streaming(true)
-        // Full auto, matching the Codex posture: the harness answers Copilot's permission requests
-        // itself and no approval concept crosses the Provider seam.
-        .approve_all_permissions();
-
-    let native = until_crash(
-        &handle,
-        "Copilot Session startup failed",
-        handle.connection().client().create_session(config),
-    )
-    .await?;
-    let current = until_crash(
-        &handle,
-        "Copilot Session startup failed",
-        native.rpc().model().get_current(),
-    )
-    .await?;
-    let selection = agent_selection(current)?;
+    let (context, copilot_session_id, native) = match known_session_id(request.resume_state)? {
+        // A restored Suru Session keeps the identifier its Copilot Session was created under,
+        // because that is what Copilot filed the work under. A resume that fails is not an
+        // invitation to start over: a Suru Session that quietly opened an empty Copilot Session
+        // would read as continuous while having forgotten everything, so the failure stands and the
+        // Transcript the Session was restored with stays readable.
+        Some(session_id) => {
+            let config = ResumeSessionConfig::new(session_id.clone())
+                .with_client_name(COPILOT_CLIENT_NAME)
+                .with_working_directory(request.workspace)
+                .with_streaming(true)
+                .approve_all_permissions();
+            let native = until_crash(
+                &handle,
+                RESUME_CONTEXT,
+                handle.connection().client().resume_session(config),
+            )
+            .await?;
+            (RESUME_CONTEXT, session_id, native)
+        }
+        // The SDK registers the identifier before it asks the CLI to create the Session, which is
+        // what gives the Session-scoped requests the CLI may issue mid-creation somewhere to land.
+        None => {
+            let session_id = CopilotSessionId::new(uuid::Uuid::new_v4().to_string());
+            let config = SessionConfig::default()
+                .with_session_id(session_id.clone())
+                .with_client_name(COPILOT_CLIENT_NAME)
+                .with_working_directory(request.workspace)
+                .with_streaming(true)
+                .approve_all_permissions();
+            let native = until_crash(
+                &handle,
+                STARTUP_CONTEXT,
+                handle.connection().client().create_session(config),
+            )
+            .await?;
+            (STARTUP_CONTEXT, session_id, native)
+        }
+    };
+    let current = until_crash(&handle, context, native.rpc().model().get_current()).await?;
+    let selection = agent_selection(context, current)?;
+    let resume_state = ProviderResumeState::new(
+        serde_json::to_value(CopilotResumeState {
+            session_id: copilot_session_id,
+        })
+        .expect("Copilot Resume State serialization is infallible"),
+    );
 
     let correlation = Arc::new(StdMutex::new(CopilotCorrelation::new()));
     let events = provider_events(native.subscribe(), handle.clone(), correlation.clone());
@@ -92,10 +136,29 @@ pub(super) async fn start_copilot_session(
             agent: AgentId::new(COPILOT_AGENT_ID),
             selection,
         },
-        None,
+        Some(resume_state),
         session,
         events,
     ))
+}
+
+/// The Copilot Session `resume_state` names, or nothing when the Suru Session has never reached
+/// Copilot. Resume State Suru cannot read is a failure rather than a reason to start over: the
+/// Session it belongs to has work behind it that opening a new Copilot Session would abandon.
+fn known_session_id(
+    resume_state: Option<ProviderResumeState>,
+) -> Result<Option<CopilotSessionId>, ProviderError> {
+    let Some(state) = resume_state else {
+        return Ok(None);
+    };
+    let state: CopilotResumeState = serde_json::from_value(state.into_payload())
+        .map_err(|error| copilot_error(format!("Copilot Resume State is invalid: {error}")))?;
+    if state.session_id.is_empty() {
+        return Err(copilot_error(
+            "Copilot Resume State is invalid: the Copilot Session identifier was empty",
+        ));
+    }
+    Ok(Some(state.session_id))
 }
 
 /// Runs `work` against the CLI, giving up the moment the shared harness process hosting it dies:
@@ -114,11 +177,11 @@ async fn until_crash<T>(
 
 /// The Agent Selection the Copilot Session is running under, read back from the CLI so the
 /// Selection Suru reports is the one Copilot actually resolved rather than the one Suru guessed.
-fn agent_selection(current: CurrentModel) -> Result<AgentSelection, ProviderError> {
+fn agent_selection(context: &str, current: CurrentModel) -> Result<AgentSelection, ProviderError> {
     let Some(model) = current.model_id.filter(|model| !model.is_empty()) else {
-        return Err(copilot_error(
-            "Copilot Session startup failed: the Session reported no active Model",
-        ));
+        return Err(copilot_error(format!(
+            "{context}: the Session reported no active Model"
+        )));
     };
     let mut options = Vec::new();
     if let Some(effort) = current.reasoning_effort {
@@ -325,9 +388,53 @@ impl ProviderSession for CopilotSession {
         Box::pin(async move {
             // The harness process is the runtime's and hosts every other Copilot Session, so a
             // Session that is done with it lets go of its own event loop and leaves the process
-            // running. Copilot keeps the conversation on disk, which is what #121 resumes from.
+            // running. Copilot keeps its own Session on disk, which is what a later resume of the
+            // Suru Session picks back up.
             self.native.stop_event_loop().await;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{CopilotSessionId, known_session_id};
+    use crate::provider::ProviderResumeState;
+
+    #[test]
+    fn a_session_that_never_reached_copilot_opens_a_new_copilot_session() {
+        assert_eq!(
+            known_session_id(None).expect("no Resume State is not a failure"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_copilot_session_identifier_survives_a_round_trip_through_resume_state() {
+        let state = ProviderResumeState::new(json!({ "session_id": "copilot-session" }));
+        assert_eq!(
+            known_session_id(Some(state)).expect("the Resume State is readable"),
+            Some(CopilotSessionId::new("copilot-session"))
+        );
+    }
+
+    #[test]
+    fn resume_state_suru_cannot_read_fails_rather_than_opening_a_new_copilot_session() {
+        for unusable in [
+            json!({}),
+            json!({ "session_id": "" }),
+            json!("copilot-session"),
+        ] {
+            let error = known_session_id(Some(ProviderResumeState::new(unusable.clone())))
+                .expect_err("unusable Resume State fails the Session startup");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Copilot Resume State is invalid"),
+                "{unusable} reports what is wrong with it: {error}"
+            );
+        }
     }
 }

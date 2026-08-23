@@ -88,6 +88,38 @@ pub fn create_session_arm() -> String {
     .to_owned()
 }
 
+/// A `session.resume` arm answering with the identifier Suru asked to resume, and holding on to it
+/// so the arms that follow can address their events at that Session — a resumed Session carries on
+/// under the identifier it was created with.
+pub fn resume_session_arm() -> String {
+    r#"    *'"method":"session.resume"'*)
+      sid=$(printf '%s' "$body" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+      reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"sessionId":"'"$sid"'"}}'
+      ;;
+"#
+    .to_owned()
+}
+
+/// A `session.resume` arm refusing the resume, standing in for a CLI that no longer holds the
+/// Session the Resume State names.
+pub fn forgotten_session_arm() -> String {
+    r#"    *'"method":"session.resume"'*)
+      reply '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32602,"message":"session not found"}}'
+      ;;
+"#
+    .to_owned()
+}
+
+/// A `session.skills.reload` arm, which the SDK issues on every resume and waits for before it
+/// hands the Session back.
+pub fn skills_reload_arm() -> String {
+    r#"    *'"method":"session.skills.reload"'*)
+      reply '{"jsonrpc":"2.0","id":'"$id"',"result":{}}'
+      ;;
+"#
+    .to_owned()
+}
+
 /// A `session.model.getCurrent` arm reporting the Model the Session resolved to, with the reasoning
 /// effort and context tier in force on it.
 pub fn current_model_arm(model: &str, effort: &str, tier: &str) -> String {
@@ -300,6 +332,18 @@ pub fn conversation_fixture(timeline: &str) -> ScriptedCopilot {
     ScriptedCopilot::new(&format!("{}{}", conversation_arms(), send_arm(timeline)))
 }
 
+/// The same fixture for a Session that outlives the CLI process it was created on: it answers the
+/// resume Suru comes back with, and plays `timeline` for every Turn either side of that.
+pub fn resumable_conversation_fixture(timeline: &str) -> ScriptedCopilot {
+    ScriptedCopilot::new(&format!(
+        "{}{}{}{}",
+        conversation_arms(),
+        resume_session_arm(),
+        skills_reload_arm(),
+        send_arm(timeline),
+    ))
+}
+
 /// A Copilot Session whose first Turn is running, which is what a steer or an interrupt needs
 /// something to act on. Holds everything the Turn runs on for as long as the test does — the state
 /// directory and Workspace included, which are only alive while this is.
@@ -397,11 +441,15 @@ impl LiveTurn {
 }
 
 pub async fn connect(state_dir: &std::path::Path, name: &str) -> ManagedClient {
-    let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir, name).expect("configure client"),
-    )
-    .await
-    .expect("connect client");
+    connect_in(ManagedClientConfig::new(state_dir, name).expect("configure client")).await
+}
+
+/// The same connection over a client `config` the caller has already tuned — a test that outlives
+/// one server needs its own data directory pinned so the replacement finds the same Sessions.
+pub async fn connect_in(config: ManagedClientConfig) -> ManagedClient {
+    let mut client = ManagedClient::connect(config)
+        .await
+        .expect("connect client");
     receive_initial_state(&mut client).await;
     client
 }
