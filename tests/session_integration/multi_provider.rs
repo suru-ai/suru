@@ -671,9 +671,11 @@ async fn an_unavailable_provider_is_listed_with_its_reason_until_a_refresh_finds
     );
     assert_eq!(catalog.providers[1].status, ProviderCatalogStatus::Fresh);
 
-    // A plain listing re-arms a background refresh; the condition must survive
-    // it rather than yielding to `Refreshing`, or a client would offer the
-    // Provider's Models again for the length of every re-check.
+    // A listing with nothing cached to serve waits for its discovery, so this
+    // reports the condition the settled re-check found. The listing path that
+    // answers from cache is where a re-check could hand the Models back out;
+    // `an_unavailable_provider_keeps_its_condition_through_a_re_check_of_its_cached_models`
+    // holds that line.
     let listed = list_catalog(&descriptor).await;
     assert!(
         matches!(
@@ -695,6 +697,51 @@ async fn an_unavailable_provider_is_listed_with_its_reason_until_a_refresh_finds
         repaired.providers[0].models,
         vec![hosted_model("alpha", "alpha-default")],
         "the fixed Provider serves its Models again"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A listing serves the cached catalog and re-arms a background refresh, so it
+/// is the path on which a Provider that has gone unavailable could hand its
+/// Models back out — for the length of every re-check — if the refresh in
+/// flight were allowed to outrank the condition.
+#[tokio::test]
+async fn an_unavailable_provider_keeps_its_condition_through_a_re_check_of_its_cached_models() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let (alpha_runtime, _alpha) = ControlledProvider::with_provider(
+        ProviderId::new("alpha"),
+        vec![hosted_model("alpha", "alpha-default")],
+    );
+    let alpha_handle = Arc::clone(&alpha_runtime);
+    let server = server::spawn_with_providers(
+        ServerConfig::new(state_dir.path(), "unavailable-re-check-test").expect("configure server"),
+        vec![alpha_runtime],
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+
+    refresh_catalog(&descriptor).await;
+    alpha_handle.set_unavailable(Some(ProviderUnavailability::NotSignedIn));
+    refresh_catalog(&descriptor).await;
+
+    let listed = list_catalog(&descriptor).await;
+    assert!(
+        matches!(
+            listed.providers[0].status,
+            ProviderCatalogStatus::Unavailable {
+                reason: ProviderUnavailability::NotSignedIn,
+                ..
+            }
+        ),
+        "the re-check a listing arms must not clear the condition, got {:?}",
+        listed.providers[0].status
+    );
+    assert_eq!(
+        listed.providers[0].models,
+        vec![hosted_model("alpha", "alpha-default")],
+        "the Models stay on show — unselectable — rather than disappearing"
     );
 
     server.shutdown().await.expect("shut down server");
