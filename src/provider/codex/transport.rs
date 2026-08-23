@@ -8,6 +8,8 @@
 use std::{
     collections::HashMap,
     ffi::OsStr,
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicI64, Ordering},
@@ -78,7 +80,7 @@ impl JsonRpcTransport {
         let spec = HarnessSpec {
             executable: executable.to_owned(),
             args: vec!["app-server".into()],
-            name: "Codex app-server".to_owned(),
+            name: super::CODEX_HARNESS_NAME.to_owned(),
         };
         let (process, ProcessStdio { stdin, stdout }) = spawn_harness_process(&spec)?;
         let (events, notifications) = mpsc::unbounded_channel();
@@ -223,7 +225,7 @@ impl HarnessLink for TransportLink {
         );
     }
 
-    fn close_stdin(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    fn close_stdin(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(close_stdin(&self.writer))
     }
 

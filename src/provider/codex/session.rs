@@ -81,7 +81,7 @@ impl CodexRuntime {
     pub fn new(executable: impl AsRef<OsStr>) -> Self {
         Self {
             executable: executable.as_ref().to_owned(),
-            processes: ProcessRegistry::new("Codex app-server"),
+            processes: ProcessRegistry::new(super::CODEX_HARNESS_NAME),
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
             shutdown_interrupt_timeout: SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT,
             reasoning_summary: Arc::new(StdMutex::new(ReasoningSummaryDetail::default())),

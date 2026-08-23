@@ -86,11 +86,27 @@ impl ProcessRegistry {
         self.exit_grace = exit_grace;
     }
 
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.state
             .lock()
             .expect("harness process registry lock is not poisoned")
             .shutting_down
+    }
+
+    /// The refusal every demand and registration meets once shutdown has begun.
+    pub(crate) fn refuse_if_shutting_down(&self) -> Result<(), ProviderError> {
+        if self.is_shutting_down() {
+            return Err(self.shutting_down_error());
+        }
+        Ok(())
+    }
+
+    fn shutting_down_error(&self) -> ProviderError {
+        ProviderError::new(format!("{} is shutting down", self.name))
     }
 
     fn register(&self, process: ProcessControl) -> Result<u64, ProviderError> {
@@ -99,10 +115,7 @@ impl ProcessRegistry {
             .lock()
             .expect("harness process registry lock is not poisoned");
         if state.shutting_down {
-            return Err(ProviderError::new(format!(
-                "{} is shutting down",
-                self.name
-            )));
+            return Err(self.shutting_down_error());
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         state.processes.insert(id, process);
@@ -370,7 +383,9 @@ async fn supervise_child<L: HarnessLink>(supervisor: ChildSupervisor<L>) {
         Err(error) => format!("could not wait for {name}: {error}"),
     };
     tracing::warn!("{message}");
-    let error = ProviderError::new(message);
+    // The process is gone, so whatever it hosted is lost with it; marking that
+    // here keeps every observer — the exit watch and the link — on one truth.
+    let error = ProviderError::new(message).mark_session_lost();
     exit.send_replace(Some(error.clone()));
     link.terminate(error);
     processes.remove(registration_id);

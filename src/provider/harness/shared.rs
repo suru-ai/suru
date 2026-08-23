@@ -25,7 +25,9 @@ pub(crate) trait HarnessConnector: Send + Sync + 'static {
     /// supervised, so it must not wait on the harness; the handshake belongs in `initialize`.
     fn connect(&self, io: ProcessStdio) -> Result<Self::Connection, ProviderError>;
 
-    /// Completes the Provider's startup handshake over the now-supervised connection.
+    /// Completes the Provider's startup handshake over the now-supervised connection. Must fail
+    /// once the connection's `HarnessLink` is terminated or closed — the launch holds every later
+    /// demand behind it, so a handshake that outlives its process must not hang.
     fn initialize(&self, connection: &Self::Connection) -> ProviderFuture<'_, ()>;
 }
 
@@ -54,19 +56,29 @@ impl<T> SharedHarnessHandle<T> {
     /// crashes. An intended shutdown is not a crash: across one, this pends forever.
     pub(crate) async fn crashed(&self) -> ProviderError {
         let mut crash = self.crash.clone();
-        loop {
-            if let Some(error) = crash.borrow_and_update().clone() {
-                return error;
-            }
-            if crash.changed().await.is_err() {
-                std::future::pending::<()>().await;
-            }
+        match published_failure(&mut crash).await {
+            Some(error) => error,
+            None => std::future::pending().await,
         }
+    }
+}
+
+/// The failure `watch` eventually publishes, or `None` once its sender ends without one.
+async fn published_failure(
+    watch: &mut watch::Receiver<Option<ProviderError>>,
+) -> Option<ProviderError> {
+    loop {
+        if let Some(error) = watch.borrow_and_update().clone() {
+            return Some(error);
+        }
+        watch.changed().await.ok()?;
     }
 }
 
 struct LiveHarness<T> {
     connection: T,
+    /// Held so the process stays supervised while it is the live harness; nothing reads it —
+    /// dropping it is what asks the process to stop.
     guard: Arc<ProcessGuard>,
     crash: watch::Receiver<Option<ProviderError>>,
 }
@@ -105,17 +117,14 @@ impl<C: HarnessConnector> SharedHarness<C> {
         &self,
     ) -> Result<SharedHarnessHandle<C::Connection>, ProviderError> {
         let mut state = self.state.lock().await;
-        if self.processes.is_shutting_down() {
-            return Err(ProviderError::new(format!(
-                "{} is shutting down",
-                self.spec.name
-            )));
-        }
+        self.processes.refuse_if_shutting_down()?;
         if let Some(live) = state.as_ref() {
+            // A demand racing the supervisor's own notice of a crash may still
+            // be granted the dying process; its handle observes the crash like
+            // any other, and the demand after that launches fresh.
             if live.crash.borrow().is_none() {
                 return Ok(live.handle());
             }
-            // The process crashed since it was last demanded: launch fresh.
             *state = None;
         }
         let live = self.launch().await?;
@@ -131,12 +140,7 @@ impl<C: HarnessConnector> SharedHarness<C> {
             supervise_harness_process(process, self.processes.clone(), connection.clone()).await?;
         self.connector.initialize(&connection).await?;
         let (crash_tx, crash_rx) = watch::channel(None);
-        tokio::spawn(fan_out_crash(
-            exit,
-            crash_tx,
-            self.processes.clone(),
-            self.spec.name.clone(),
-        ));
+        tokio::spawn(fan_out_crash(exit, crash_tx, self.processes.clone()));
         Ok(LiveHarness {
             connection,
             guard,
@@ -153,34 +157,30 @@ impl<C: HarnessConnector> SharedHarness<C> {
     }
 }
 
-/// Publishes the supervised process's exit to every handle as a lost Provider Session — unless
-/// the registry is shutting down, in which case the exit was asked for and no Session loses
-/// anything it wasn't already losing.
+/// Publishes the supervised process's exit — already marked a lost Provider Session by the
+/// supervisor — to every handle, unless the registry is shutting down, in which case the exit was
+/// asked for and no Session loses anything it wasn't already losing.
 async fn fan_out_crash(
     mut exit: watch::Receiver<Option<ProviderError>>,
     crash: watch::Sender<Option<ProviderError>>,
     processes: ProcessRegistry,
-    name: String,
 ) {
-    let error = loop {
-        if let Some(error) = exit.borrow_and_update().clone() {
-            break error;
-        }
-        if exit.changed().await.is_err() {
-            return;
-        }
+    let Some(error) = published_failure(&mut exit).await else {
+        return;
     };
     if processes.is_shutting_down() {
         return;
     }
     tracing::warn!(
-        harness = %name,
+        harness = %processes.name(),
         "shared harness process crashed; its hosted Sessions lose their active Turns"
     );
-    crash.send_replace(Some(error.mark_session_lost()));
+    crash.send_replace(Some(error));
 }
 
-#[cfg(test)]
+// The scripted fixtures are `sh` programs and the liveness probe is `libc::kill`, so these tests
+// are Unix-only; the machinery itself carries its own per-platform process-tree paths.
+#[cfg(all(test, unix))]
 mod tests {
     use std::{
         future::Future,
@@ -244,12 +244,9 @@ STUBBORN_TAIL
                 )
                 .replace("STUBBORN_TAIL", tail);
             std::fs::write(&executable, script).expect("write scripted harness");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
-                    .expect("make scripted harness executable");
-            }
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                .expect("make scripted harness executable");
             Self { directory }
         }
 
