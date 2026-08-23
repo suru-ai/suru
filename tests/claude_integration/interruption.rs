@@ -2,7 +2,7 @@
 //! loop itself, and the Turn Settles as interrupted on the result that follows.
 
 use crate::support::{
-    CLAUDE_MODELS, LiveTurn, ScriptedClaude, agent_messages, interrupt_arm, list_models_arm,
+    CLAUDE_MODELS, LiveTurn, ScriptedClaude, agent_messages, discovery_arms, interrupt_arm,
     silent_interrupt_arm, stop_task_arm, user_turn_arm,
 };
 use suru::{
@@ -36,7 +36,7 @@ const ABORTED_RESULT: &str = r#"      emit '{"type":"user","message":{"role":"us
 async fn an_interrupt_stops_the_background_work_first_and_settles_the_turn_as_interrupted() {
     let claude = ScriptedClaude::new(&format!(
         "{}{}{}{}",
-        list_models_arm(CLAUDE_MODELS),
+        discovery_arms(CLAUDE_MODELS),
         user_turn_arm(WORK_IN_FLIGHT),
         stop_task_arm(),
         interrupt_arm(ABORTED_RESULT),
@@ -106,7 +106,13 @@ async fn an_interrupt_stops_the_background_work_first_and_settles_the_turn_as_in
 
     assert_eq!(
         claude.control_subtypes(),
-        ["list_models", "stop_task", "interrupt"],
+        [
+            "get_binary_version",
+            "initialize",
+            "list_models",
+            "stop_task",
+            "interrupt"
+        ],
         "the background work is stopped before the loop is, because an interrupt alone \
          leaves it running"
     );
@@ -141,7 +147,7 @@ const NOTHING_IN_THE_BACKGROUND: &str = r#"      emit '{"type":"stream_event","e
 async fn an_interrupt_with_no_background_work_asks_the_cli_to_stop_nothing() {
     let claude = ScriptedClaude::new(&format!(
         "{}{}{}{}",
-        list_models_arm(CLAUDE_MODELS),
+        discovery_arms(CLAUDE_MODELS),
         user_turn_arm(NOTHING_IN_THE_BACKGROUND),
         stop_task_arm(),
         interrupt_arm(ABORTED_RESULT),
@@ -170,7 +176,12 @@ async fn an_interrupt_with_no_background_work_asks_the_cli_to_stop_nothing() {
     assert_eq!(interrupted.turns[0].status, TurnStatus::Interrupted);
     assert_eq!(
         claude.control_subtypes(),
-        ["list_models", "interrupt"],
+        [
+            "get_binary_version",
+            "initialize",
+            "list_models",
+            "interrupt"
+        ],
         "a Turn with nothing running in the background is stopped by the interrupt alone"
     );
 
@@ -203,7 +214,7 @@ const ABORTED_WITH_A_SURVIVING_STEER: &str = r#"      emit '{"type":"result","su
 async fn an_interrupted_turn_takes_its_steer_with_it_and_keeps_nothing_that_lands_after() {
     let claude = ScriptedClaude::new(&format!(
         "{}{}{}",
-        list_models_arm(CLAUDE_MODELS),
+        discovery_arms(CLAUDE_MODELS),
         user_turn_arm(STEERED_THEN_STOPPED),
         interrupt_arm(ABORTED_WITH_A_SURVIVING_STEER),
     ));
@@ -294,7 +305,7 @@ async fn an_interrupted_turn_takes_its_steer_with_it_and_keeps_nothing_that_land
 async fn an_interrupt_the_cli_never_answers_fails_the_turn_within_the_injected_timeout() {
     let claude = ScriptedClaude::new(&format!(
         "{}{}{}{}",
-        list_models_arm(CLAUDE_MODELS),
+        discovery_arms(CLAUDE_MODELS),
         user_turn_arm(WORK_IN_FLIGHT),
         stop_task_arm(),
         silent_interrupt_arm(),

@@ -6,19 +6,23 @@
 //! [`wire`] holds the serde types Suru exchanges with the CLI, [`transport`] carries control
 //! requests and conversation over a supervised CLI process's stdio, [`projection`] turns the
 //! conversation into Provider events, [`catalog`] presents the Models the CLI reports verbatim as
-//! Suru's Model catalog, [`session`] runs one Session per long-lived CLI process, [`turn_in_flight`]
-//! holds what a Session and its projection must agree on about the Turn in flight, and [`runtime`]
-//! composes them into the Provider runtime the rest of Suru uses.
+//! Suru's Model catalog, [`availability`] decides whether the CLI can be driven at all before
+//! anything asks it to work, [`session`] runs one Session per long-lived CLI process,
+//! [`turn_in_flight`] holds what a Session and its projection must agree on about the Turn in
+//! flight, and [`runtime`] composes them into the Provider runtime the rest of Suru uses.
 //!
 //! The Provider is named **Claude**, never "Claude Code": the Agent SDK asks applications not to
 //! take the product's name. Text below names the Claude Code CLI only where it factually refers to
 //! the binary being driven.
 //!
-//! ADR 0010's version floor (2.1.237, the version the wire behavior is verified against) is
-//! enforced by the availability probe, which lands with the availability slice; until then a CLI
-//! below the floor surfaces as whatever discovery failure it produces rather than the typed
-//! incompatible-version reason.
+//! Three conditions leave Claude unusable until the user fixes them outside Suru, and each reaches
+//! a Model discovery — and so a Turn's Session startup — as its own typed reason rather than as a
+//! failure: a CLI that is not installed, which the harness machinery reports for every Provider
+//! alike; one below ADR 0010's version floor (2.1.237, the version the wire behavior is verified
+//! against); and one no user is signed in to. The last two are what [`availability`] probes for,
+//! and a catalog refresh re-running all three checks is the whole of the recovery.
 
+mod availability;
 mod catalog;
 mod projection;
 mod runtime;

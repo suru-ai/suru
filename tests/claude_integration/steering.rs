@@ -2,7 +2,7 @@
 //! rather than one that begins another Turn.
 
 use crate::support::{
-    CLAUDE_MODELS, LiveTurn, ScriptedClaude, agent_messages, list_models_arm, settled_session,
+    CLAUDE_MODELS, LiveTurn, ScriptedClaude, agent_messages, discovery_arms, settled_session,
     user_turn_arm,
 };
 use serde_json::Value;
@@ -42,7 +42,7 @@ const STEERED_CONVERSATION: &str = r#"      prompts=$(( ${prompts:-0} + 1 ))
 async fn a_steer_prompt_joins_the_running_turn_rather_than_beginning_another() {
     let claude = ScriptedClaude::new(&format!(
         "{}{}",
-        list_models_arm(CLAUDE_MODELS),
+        discovery_arms(CLAUDE_MODELS),
         user_turn_arm(STEERED_CONVERSATION)
     ));
     let mut live = LiveTurn::start(

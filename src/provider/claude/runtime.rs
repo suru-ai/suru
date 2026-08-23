@@ -11,6 +11,7 @@ use tokio::time::Duration;
 
 use super::{
     CLAUDE_PROVIDER_ID,
+    availability::ClaudeAvailability,
     catalog::model_descriptors,
     claude_error, claude_error_context,
     session::{ClaudeTimings, start_claude_session},
@@ -32,11 +33,12 @@ const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// that go ahead of it — gives the CLI far less time than an ordinary control request gets.
 const INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Launches one short-lived Claude Code CLI process per Model discovery.
+/// Launches one short-lived Claude Code CLI process per availability probe and per Model discovery.
 #[derive(Clone, Debug)]
 pub struct ClaudeRuntime {
     executable: OsString,
     processes: ProcessRegistry,
+    availability: ClaudeAvailability,
     control_request_timeout: Duration,
     interrupt_request_timeout: Duration,
 }
@@ -46,9 +48,17 @@ impl ClaudeRuntime {
         Self {
             executable: executable.as_ref().to_owned(),
             processes: ProcessRegistry::new(super::CLAUDE_HARNESS_NAME),
+            availability: ClaudeAvailability::new(),
             control_request_timeout: CONTROL_REQUEST_TIMEOUT,
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Bounds how long a verdict that Claude is usable stands before the CLI is probed again;
+    /// injectable so tests can watch one expire without waiting out the default.
+    pub fn with_availability_ttl(mut self, ttl: Duration) -> Self {
+        self.availability.set_ttl(ttl);
+        self
     }
 
     /// Bounds how long a control request waits for the CLI to answer; injectable so tests with
@@ -92,10 +102,11 @@ impl ProviderRuntime for ClaudeRuntime {
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
+        let availability = self.availability.clone();
         let request_timeout = self.control_request_timeout;
-        Box::pin(
-            async move { discover_claude_models(executable, processes, request_timeout).await },
-        )
+        Box::pin(async move {
+            usable_claude_models(executable, processes, availability, request_timeout).await
+        })
     }
 
     fn start_session(
@@ -104,11 +115,14 @@ impl ProviderRuntime for ClaudeRuntime {
     ) -> ProviderFuture<'_, ProviderSessionConnection> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
+        let availability = self.availability.clone();
         let timings = ClaudeTimings {
             control_request: self.control_request_timeout,
             interrupt_request: self.interrupt_request_timeout,
         };
-        Box::pin(async move { start_claude_session(executable, request, processes, timings).await })
+        Box::pin(async move {
+            start_claude_session(executable, request, processes, availability, timings).await
+        })
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
@@ -116,7 +130,24 @@ impl ProviderRuntime for ClaudeRuntime {
     }
 }
 
-pub(super) async fn discover_claude_models(
+/// The Models a Claude that can be used at all offers.
+///
+/// The probe goes first, and its condition is the answer whenever there is one: a Provider the user
+/// has to install, sign in to, or update is one whose Model catalog would fail anyway, and saying
+/// which condition it is, is what a client needs to tell the user what to do about it.
+pub(super) async fn usable_claude_models(
+    executable: OsString,
+    processes: ProcessRegistry,
+    availability: ClaudeAvailability,
+    request_timeout: Duration,
+) -> Result<Vec<ModelDescriptor>, ProviderError> {
+    availability
+        .verify(&executable, &processes, request_timeout)
+        .await?;
+    discover_claude_models(executable, processes, request_timeout).await
+}
+
+async fn discover_claude_models(
     executable: OsString,
     processes: ProcessRegistry,
     request_timeout: Duration,

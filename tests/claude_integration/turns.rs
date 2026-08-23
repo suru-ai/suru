@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::support::{
-    ScriptedClaude, agent_messages, connect, conversation_fixture, settled_session,
+    ScriptedClaude, agent_messages, connect, conversation_fixture, probe_arms, settled_session,
     silent_user_turn_arm,
 };
 use serde_json::Value;
@@ -380,8 +380,8 @@ async fn a_second_prompt_runs_its_turn_on_the_same_long_lived_child() {
     );
     assert_eq!(
         claude.launches(),
-        2,
-        "one discovery process at startup and one long-lived conversation child, \
+        3,
+        "one probe and one discovery process at startup and one long-lived conversation child, \
          not a spawn per Turn"
     );
 
@@ -421,8 +421,9 @@ async fn deleting_the_session_terminates_the_child_and_shutdown_stays_clean() {
         .delete_session(created.session.id)
         .await
         .expect("delete the Session");
-    // The startup discovery's process already exited; the second exit is the Session child's.
-    claude.wait_for_exits(2).await;
+    // The startup probe's and discovery's processes already exited; the third exit is the Session
+    // child's.
+    claude.wait_for_exits(3).await;
 
     // The Session's child is already down, so the server shutdown finds nothing left to stop and
     // stays clean — the Session shutdown path is idempotent.
@@ -486,9 +487,9 @@ async fn a_child_crash_mid_turn_fails_the_turn_and_keeps_what_streamed() {
 
 #[tokio::test]
 async fn a_prompt_to_a_session_whose_discovery_fails_settles_its_turn_as_failed() {
-    // A fixture with no list_models arm never answers the startup discovery; the injected
-    // control-request timeout is what bounds the wait.
-    let claude = ScriptedClaude::new(&silent_user_turn_arm());
+    // A fixture the probe finds usable but with no list_models arm never answers the startup
+    // discovery; the injected control-request timeout is what bounds the wait.
+    let claude = ScriptedClaude::new(&format!("{}{}", probe_arms(), silent_user_turn_arm()));
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let runtime = ClaudeRuntime::new(claude.executable())

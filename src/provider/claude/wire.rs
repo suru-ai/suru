@@ -32,6 +32,13 @@ impl<'a> ControlRequestEnvelope<'a> {
 #[serde(tag = "subtype", rename_all = "snake_case")]
 pub(super) enum ControlRequest {
     ListModels,
+    /// Asks the CLI which version it is, which is what the availability probe checks against the
+    /// version floor ADR 0010 pins.
+    GetBinaryVersion,
+    /// Opens the session handshake without starting anything: the CLI answers with what it would
+    /// run the conversation under, the account it holds credentials for among it. The probe sends
+    /// it bare — no hooks, no SDK MCP servers, no agents — because all it reads is the account.
+    Initialize,
     /// Stops the running loop. The CLI answers with an interrupt receipt and ends the Turn with a
     /// terminal result of its own.
     Interrupt {
@@ -54,6 +61,8 @@ impl ControlRequest {
     pub(super) const fn subtype(&self) -> &'static str {
         match self {
             Self::ListModels => "list_models",
+            Self::GetBinaryVersion => "get_binary_version",
+            Self::Initialize => "initialize",
             Self::Interrupt { .. } => "interrupt",
             Self::StopTask { .. } => "stop_task",
         }
@@ -242,6 +251,44 @@ pub(super) enum ControlResponse {
         request_id: String,
         error: String,
     },
+}
+
+/// What `get_binary_version` answers with. The build time rides along on the wire and is not
+/// decoded, because the floor is a version.
+#[derive(Deserialize)]
+pub(super) struct NativeBinaryVersion {
+    pub(super) version: String,
+}
+
+/// What `initialize` answers with, decoded as far as the availability probe reads: the account the
+/// CLI would make requests under. A CLI holding no credentials answers with an account naming
+/// none rather than by omitting it, but an absent account decodes as one naming none all the same.
+#[derive(Deserialize)]
+pub(super) struct NativeInitialize {
+    #[serde(default)]
+    pub(super) account: NativeAccount,
+}
+
+/// The account the CLI reports at the init handshake. Every field is optional on the wire and each
+/// says something different about where the credentials come from, so the probe reads the shape as
+/// a whole rather than any one field.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct NativeAccount {
+    /// The signed-in user, present only for an Anthropic login.
+    #[serde(default)]
+    pub(super) email: Option<String>,
+    /// Where an API key in use came from, such as `ANTHROPIC_API_KEY`.
+    #[serde(default)]
+    pub(super) api_key_source: Option<String>,
+    /// Where a bearer token in use came from; `none` when there is no token.
+    #[serde(default)]
+    pub(super) token_source: Option<String>,
+    /// Which API backend the CLI is configured against: `firstParty` for an Anthropic login, and a
+    /// third-party cloud — Bedrock, Vertex, an enterprise gateway — for credentials held entirely
+    /// outside the CLI.
+    #[serde(default)]
+    pub(super) api_provider: Option<String>,
 }
 
 /// What `list_models` answers with: the rows the CLI's own model picker offers.

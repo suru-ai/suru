@@ -7,7 +7,7 @@ use crate::{
     provider_support::ControlledProvider,
     support::{
         CLAUDE_MODELS, ScriptedClaude, claude_catalog, drifting_list_models_arm, hosting,
-        hosting_runtime, malformed_list_models_arm, silent_list_models_arm,
+        hosting_runtime, malformed_list_models_arm, probe_arms, silent_list_models_arm,
     },
 };
 use suru::{
@@ -15,7 +15,7 @@ use suru::{
     protocol::{
         ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoiceId, ModelOptionId,
         ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
-        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderUnavailability,
+        ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
     },
     provider::ClaudeRuntime,
     server::{self, ServerConfig},
@@ -157,13 +157,20 @@ async fn each_discovery_launches_its_own_short_lived_stream_json_process() {
 
     assert_eq!(
         claude.launches(),
-        2,
-        "every discovery is its own short-lived process rather than a shared server"
+        3,
+        "every discovery is its own short-lived process rather than a shared server, \
+         beside the one the availability probe ran in"
     );
     assert_eq!(
         claude.control_subtypes(),
-        ["list_models", "list_models"],
-        "discovery asks the CLI for its models and nothing else"
+        [
+            "get_binary_version",
+            "initialize",
+            "list_models",
+            "list_models"
+        ],
+        "past the probe that opened the first discovery, \
+         discovery asks the CLI for its models and nothing else"
     );
     let arguments = claude.arguments();
     assert_eq!(
@@ -260,61 +267,9 @@ async fn claude_models_are_listed_beside_another_hosted_provider() {
     claude.wait_for_exit().await;
 }
 
-/// Issue #126: a Claude Code CLI that isn't installed is a condition the user fixes outside Suru,
-/// so the catalog reports it as typed unavailability and the next refresh clears it without a
-/// restart.
-#[tokio::test]
-async fn a_missing_claude_binary_is_reported_as_not_installed_until_it_is_installed() {
-    let claude = ScriptedClaude::with_models(CLAUDE_MODELS);
-    claude.uninstall();
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let (server, client) = hosting(&claude, "claude-not-installed", state_dir.path()).await;
-
-    let catalog = client
-        .list_models()
-        .await
-        .expect("the catalog request itself is answered");
-    let ProviderCatalogStatus::Unavailable { reason, message } = &claude_catalog(&catalog).status
-    else {
-        panic!(
-            "a missing Claude binary is typed unavailability, got {:?}",
-            claude_catalog(&catalog).status
-        );
-    };
-    assert_eq!(*reason, ProviderUnavailability::NotInstalled);
-    assert!(
-        message.contains("could not launch"),
-        "the condition names the CLI Suru could not launch, got: {message}"
-    );
-    assert_eq!(
-        claude.launches(),
-        0,
-        "a CLI that isn't there is answered without a process"
-    );
-    assert!(claude_catalog(&catalog).models.is_empty());
-
-    claude.install();
-    let installed = client
-        .refresh_models()
-        .await
-        .expect("refresh once the CLI is installed");
-    assert_eq!(
-        claude_catalog(&installed).status,
-        ProviderCatalogStatus::Fresh,
-        "the refresh re-checks the condition and finds it fixed, with no restart in between"
-    );
-    assert!(
-        !claude_catalog(&installed).models.is_empty(),
-        "the installed Provider serves its Models without a restart"
-    );
-
-    server.shutdown().await.expect("shut the server down");
-    claude.wait_for_exit().await;
-}
-
 #[tokio::test]
 async fn a_discovery_the_cli_never_answers_fails_after_the_injected_timeout() {
-    let claude = ScriptedClaude::new(&silent_list_models_arm());
+    let claude = ScriptedClaude::new(&format!("{}{}", probe_arms(), silent_list_models_arm()));
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let runtime = ClaudeRuntime::new(claude.executable())
         .with_control_request_timeout(Duration::from_millis(100))
@@ -344,7 +299,11 @@ async fn a_discovery_the_cli_never_answers_fails_after_the_injected_timeout() {
 /// a control response of a subtype this build has never heard of is ridden out, not a failure.
 #[tokio::test]
 async fn a_control_response_subtype_suru_does_not_know_is_ridden_out() {
-    let claude = ScriptedClaude::new(&drifting_list_models_arm(CLAUDE_MODELS));
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}",
+        probe_arms(),
+        drifting_list_models_arm(CLAUDE_MODELS)
+    ));
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let (server, client) = hosting(&claude, "claude-drifted-wire", state_dir.path()).await;
 
@@ -362,7 +321,7 @@ async fn a_control_response_subtype_suru_does_not_know_is_ridden_out() {
 
 #[tokio::test]
 async fn a_malformed_list_models_response_fails_the_catalog() {
-    let claude = ScriptedClaude::new(&malformed_list_models_arm());
+    let claude = ScriptedClaude::new(&format!("{}{}", probe_arms(), malformed_list_models_arm()));
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let (server, client) = hosting(&claude, "claude-malformed-models", state_dir.path()).await;
 
@@ -390,16 +349,22 @@ async fn a_malformed_list_models_response_fails_the_catalog() {
 /// a first failed launch left the runtime's process registry wedged.
 #[tokio::test]
 async fn a_discovery_after_a_crashed_one_launches_a_fresh_process() {
+    // The probe's own process is the first launch and the crashing discovery the second, so the
+    // revived answer belongs to every launch after them.
     let claude = ScriptedClaude::new(&format!(
-        r#"    *'"subtype":"list_models"'*)
-      if [ "$attempt" -gt 1 ]; then
+        "{}{}",
+        probe_arms(),
+        format_args!(
+            r#"    *'"subtype":"list_models"'*)
+      if [ "$attempt" -gt 2 ]; then
 {}      else
         exit 9
       fi
       ;;
 "#,
-        r#"        printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{"models":[{"value":"revived","displayName":"Revived","description":"Back after a crash"}]}}}'
+            r#"        printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{"models":[{"value":"revived","displayName":"Revived","description":"Back after a crash"}]}}}'
 "#
+        )
     ));
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let (server, client) = hosting(&claude, "claude-crash-recovery", state_dir.path()).await;
@@ -423,7 +388,7 @@ async fn a_discovery_after_a_crashed_one_launches_a_fresh_process() {
         ProviderCatalogStatus::Fresh,
         "the demand after a crash launches a fresh process, with no restart in between"
     );
-    assert_eq!(claude.launches(), 2);
+    assert_eq!(claude.launches(), 3);
 
     server.shutdown().await.expect("shut the server down");
 }

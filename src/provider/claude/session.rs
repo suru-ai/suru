@@ -35,10 +35,11 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, time::Duration};
 
 use super::{
-    CLAUDE_AGENT_ID, CLAUDE_PROVIDER_ID, REASONING_EFFORT_OPTION_ID, claude_error,
-    claude_error_context,
+    CLAUDE_AGENT_ID, CLAUDE_PROVIDER_ID, REASONING_EFFORT_OPTION_ID,
+    availability::ClaudeAvailability,
+    claude_error, claude_error_context,
     projection::provider_events,
-    runtime::discover_claude_models,
+    runtime::usable_claude_models,
     transport::{ClaudeConnection, ConversationSink, StreamJsonTransport},
     turn_in_flight::TurnInFlight,
     wire::{ControlRequest, UserMessageEnvelope},
@@ -102,6 +103,7 @@ pub(super) async fn start_claude_session(
     executable: OsString,
     request: ProviderSessionRequest,
     processes: ProcessRegistry,
+    availability: ClaudeAvailability,
     timings: ClaudeTimings,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     // Read before anything is launched: Resume State Suru cannot read fails the startup outright
@@ -112,6 +114,7 @@ pub(super) async fn start_claude_session(
     let selection = default_selection(
         executable.clone(),
         processes.clone(),
+        availability,
         timings.control_request,
     )
     .await?;
@@ -177,14 +180,17 @@ fn known_session_id(
 }
 
 /// The Agent Selection a Session with none chosen runs under: the catalog's default row with its
-/// default Model Options, asked of the CLI the same way the catalog is.
+/// default Model Options, asked of the CLI the same way the catalog is — the availability probe
+/// ahead of it included, so a Turn reaching a Claude the user has to install, sign in to, or update
+/// fails with that condition rather than with whatever the CLI does about it.
 async fn default_selection(
     executable: OsString,
     processes: ProcessRegistry,
+    availability: ClaudeAvailability,
     control_request_timeout: Duration,
 ) -> Result<AgentSelection, ProviderError> {
     const CONTEXT: &str = "Claude Session startup failed";
-    let models = discover_claude_models(executable, processes, control_request_timeout)
+    let models = usable_claude_models(executable, processes, availability, control_request_timeout)
         .await
         .map_err(|error| claude_error_context(CONTEXT, error))?;
     models

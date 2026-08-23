@@ -66,6 +66,109 @@ const SCRIPT_LOOP: &str = r#"while IFS= read -r line; do
   case "$line" in
 "#;
 
+/// The version the fixture reports when nothing has downgraded it: the floor itself, which is the
+/// version Suru's wire behavior is verified against.
+pub const CLAUDE_FLOOR_VERSION: &str = "2.1.237";
+
+/// A version below the floor, standing in for a CLI too old for Suru to drive.
+pub const CLAUDE_OLD_VERSION: &str = "2.1.236";
+
+/// A version above the floor, standing in for the CLI the user updates to.
+pub const CLAUDE_NEW_VERSION: &str = "2.2.0";
+
+/// What the CLI reports about the account once a user is signed in to it.
+pub const SIGNED_IN_ACCOUNT: &str = concat!(
+    r#"{"email":"fixture@example.com","organization":"Fixture Org","#,
+    r#""subscriptionType":"Claude Max","apiProvider":"firstParty"}"#,
+);
+
+/// What it reports while no one is, which is all a signed-out CLI has to say about it.
+pub const SIGNED_OUT_ACCOUNT: &str = r#"{"tokenSource":"none","apiProvider":"firstParty"}"#;
+
+/// A `get_binary_version` arm reporting `version`, the way a live CLI answers the probe's first
+/// question.
+pub fn version_arm(version: &str) -> String {
+    format!(
+        r#"    *'"subtype":"get_binary_version"'*)
+      printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"version":"{version}","buildTime":"2026-08-19T22:15:38Z"}}}}}}'
+      ;;
+"#
+    )
+}
+
+/// The same arm for a CLI below the version floor — until [`ScriptedClaude::upgrade`] leaves the
+/// marker that makes it report a version above the floor, which is the user updating their CLI
+/// while Suru is running.
+pub fn upgradable_version_arm() -> String {
+    format!(
+        r#"    *'"subtype":"get_binary_version"'*)
+      if [ -e "$CLAUDE_FIXTURE_UPGRADED" ]; then
+        printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"version":"{new}"}}}}}}'
+      else
+        printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"version":"{old}"}}}}}}'
+      fi
+      ;;
+"#,
+        new = CLAUDE_NEW_VERSION,
+        old = CLAUDE_OLD_VERSION,
+    )
+}
+
+/// A `get_binary_version` arm from a CLI that has never heard of the request, which is how one too
+/// old for the wire Suru speaks answers a question it predates.
+pub fn unknown_version_request_arm() -> String {
+    r#"    *'"subtype":"get_binary_version"'*)
+      printf '%s\n' '{"type":"control_response","response":{"subtype":"error","request_id":"'"$request_id"'","error":"Unsupported control request subtype: get_binary_version"}}'
+      ;;
+"#
+    .to_owned()
+}
+
+/// An `initialize` arm answering the account probe with `account`, alongside the rest of the
+/// handshake a live CLI answers with.
+pub fn initialize_arm(account: &str) -> String {
+    format!(
+        r#"    *'"subtype":"initialize"'*)
+      printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"commands":[],"agents":[],"output_style":"default","account":{account}}}}}}}'
+      ;;
+"#
+    )
+}
+
+/// The same arm for a CLI no one is signed in to — until [`ScriptedClaude::sign_in`] leaves the
+/// marker that makes it report an account, which is the user signing in with the Claude Code CLI
+/// while Suru is running.
+pub fn signed_out_initialize_arm() -> String {
+    format!(
+        r#"    *'"subtype":"initialize"'*)
+      if [ -e "$CLAUDE_FIXTURE_SIGNED_IN" ]; then
+        printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"account":{signed_in}}}}}}}'
+      else
+        printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"account":{signed_out}}}}}}}'
+      fi
+      ;;
+"#,
+        signed_in = SIGNED_IN_ACCOUNT,
+        signed_out = SIGNED_OUT_ACCOUNT,
+    )
+}
+
+/// The arms an availability probe asks of every usable CLI: the version Suru's wire is verified
+/// against, and an account a user is signed in to.
+pub fn probe_arms() -> String {
+    format!(
+        "{}{}",
+        version_arm(CLAUDE_FLOOR_VERSION),
+        initialize_arm(SIGNED_IN_ACCOUNT)
+    )
+}
+
+/// Everything a Model discovery asks of the CLI: the probe deciding whether Claude can be used at
+/// all, and the rows it lists once it can.
+pub fn discovery_arms(models: &str) -> String {
+    format!("{}{}", probe_arms(), list_models_arm(models))
+}
+
 /// A `list_models` arm answering with `models`, a JSON array literal in the CLI's row shape.
 pub fn list_models_arm(models: &str) -> String {
     format!(
@@ -146,12 +249,14 @@ pub struct ScriptedClaude {
     argv: std::path::PathBuf,
     exited: std::path::PathBuf,
     release: std::path::PathBuf,
+    signed_in: std::path::PathBuf,
+    upgraded: std::path::PathBuf,
 }
 
 impl ScriptedClaude {
-    /// A fixture that answers `list_models` with `models`.
+    /// A fixture a probe finds usable, answering `list_models` with `models`.
     pub fn with_models(models: &str) -> Self {
-        Self::new(&list_models_arm(models))
+        Self::new(&discovery_arms(models))
     }
 
     /// A fixture whose request handling is exactly `case_arms`, each an `sh` `case` arm over the
@@ -171,12 +276,16 @@ impl ScriptedClaude {
         let argv = path("argv");
         let exited = path("exited");
         let release = path("release");
+        let signed_in = path("signed-in");
+        let upgraded = path("upgraded");
         let script = format!("{SCRIPT_PREFIX}{preamble}{SCRIPT_LOOP}{case_arms}  esac\ndone\n")
             .replace("$CLAUDE_FIXTURE_LOG", fixture_path(&log))
             .replace("$CLAUDE_FIXTURE_ATTEMPTS", fixture_path(&attempts))
             .replace("$CLAUDE_FIXTURE_ARGV", fixture_path(&argv))
             .replace("$CLAUDE_FIXTURE_EXITED", fixture_path(&exited))
-            .replace("$CLAUDE_FIXTURE_RELEASE", fixture_path(&release));
+            .replace("$CLAUDE_FIXTURE_RELEASE", fixture_path(&release))
+            .replace("$CLAUDE_FIXTURE_SIGNED_IN", fixture_path(&signed_in))
+            .replace("$CLAUDE_FIXTURE_UPGRADED", fixture_path(&upgraded));
         write_executable(&executable, &script);
         Self {
             _directory: directory,
@@ -187,6 +296,8 @@ impl ScriptedClaude {
             argv,
             exited,
             release,
+            signed_in,
+            upgraded,
         }
     }
 
@@ -206,6 +317,18 @@ impl ScriptedClaude {
     /// Puts the program back at the path the runtime resolves.
     pub fn install(&self) {
         write_executable(&self.executable, &self.script);
+    }
+
+    /// Signs the fixture's user in, which is what [`signed_out_initialize_arm`] answers the account
+    /// probe with from here on — the user signing in through the CLI while Suru runs.
+    pub fn sign_in(&self) {
+        std::fs::write(&self.signed_in, b"signed in").expect("sign the scripted Claude in");
+    }
+
+    /// Moves the fixture above the version floor, which is what [`upgradable_version_arm`] reports
+    /// from here on — the user updating their CLI while Suru runs.
+    pub fn upgrade(&self) {
+        std::fs::write(&self.upgraded, b"upgraded").expect("upgrade the scripted Claude");
     }
 
     pub fn executable(&self) -> &std::path::Path {
@@ -387,7 +510,7 @@ pub fn silent_user_turn_arm() -> String {
 pub fn conversation_arms(timeline: &str) -> String {
     format!(
         "{}{}",
-        list_models_arm(CLAUDE_MODELS),
+        discovery_arms(CLAUDE_MODELS),
         user_turn_arm(timeline)
     )
 }
