@@ -32,6 +32,32 @@ impl<'a> ControlRequestEnvelope<'a> {
 #[serde(tag = "subtype", rename_all = "snake_case")]
 pub(super) enum ControlRequest {
     ListModels,
+    /// Stops the running loop. The CLI answers with an interrupt receipt and ends the Turn with a
+    /// terminal result of its own.
+    Interrupt {
+        /// Whether the messages the user queued into the loop are dropped with it. Suru always
+        /// asks for that: a steer already queued would otherwise survive the interrupt and be
+        /// answered afterwards — work the user has just asked to stop, on a Turn that has Settled.
+        /// The CLI advertises this as the `interrupt_cancel_queued_v1` capability on its init
+        /// message, which ADR 0010's version floor carries.
+        cancel_queued: bool,
+    },
+    /// Stops one of the background tasks the agent spawned, named by the id the CLI reported it
+    /// started under.
+    StopTask {
+        task_id: String,
+    },
+}
+
+impl ControlRequest {
+    /// What the CLI calls this request, so a failure can say which one went unanswered.
+    pub(super) const fn subtype(&self) -> &'static str {
+        match self {
+            Self::ListModels => "list_models",
+            Self::Interrupt { .. } => "interrupt",
+            Self::StopTask { .. } => "stop_task",
+        }
+    }
 }
 
 /// A Prompt on its way into the running loop, in the envelope stream-json input takes user
@@ -187,6 +213,20 @@ pub(super) struct ResultMessage {
     pub(super) result: Option<Value>,
     #[serde(default)]
     pub(super) errors: Vec<String>,
+    /// Why the loop stopped. An interrupted Turn is the reason this is read at all: the CLI reports
+    /// one as an unerrored `success` carrying no answer, so an abort is legible nowhere else.
+    #[serde(default)]
+    pub(super) terminal_reason: Option<String>,
+}
+
+/// A `system` message: the CLI's own bookkeeping alongside the conversation. Only the task
+/// lifecycle is decoded, because the background work the agent spawns is what an interrupt has to
+/// stop before it stops the loop.
+#[derive(Deserialize)]
+pub(super) struct SystemMessage {
+    pub(super) subtype: String,
+    #[serde(default)]
+    pub(super) task_id: Option<String>,
 }
 
 /// The CLI's answer to one control request, correlated back by `request_id`.

@@ -6,7 +6,8 @@
 //! [`wire`] holds the serde types Suru exchanges with the CLI, [`transport`] carries control
 //! requests and conversation over a supervised CLI process's stdio, [`projection`] turns the
 //! conversation into Provider events, [`catalog`] presents the Models the CLI reports verbatim as
-//! Suru's Model catalog, [`session`] runs one Session per long-lived CLI process, and [`runtime`]
+//! Suru's Model catalog, [`session`] runs one Session per long-lived CLI process, [`turn_in_flight`]
+//! holds what a Session and its projection must agree on about the Turn in flight, and [`runtime`]
 //! composes them into the Provider runtime the rest of Suru uses.
 //!
 //! The Provider is named **Claude**, never "Claude Code": the Agent SDK asks applications not to
@@ -24,6 +25,7 @@ mod runtime;
 mod session;
 mod thinking;
 mod transport;
+mod turn_in_flight;
 mod wire;
 
 pub use runtime::ClaudeRuntime;

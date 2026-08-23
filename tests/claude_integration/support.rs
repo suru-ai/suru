@@ -9,8 +9,9 @@
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
     protocol::{
-        Message, MessageRole, ModelCatalog, ProviderId, ProviderModelCatalog, SessionId,
-        SessionSnapshot, TurnStatus,
+        CreateSessionRequest, InitialPrompt, Message, MessageRole, ModelCatalog, PromptId,
+        ProviderId, ProviderModelCatalog, SessionId, SessionSnapshot, TurnId, TurnStatus,
+        Workspace,
     },
     provider::ClaudeRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -102,6 +103,36 @@ pub fn malformed_list_models_arm() -> String {
     .to_owned()
 }
 
+/// An `interrupt` arm that acknowledges the control request the way a live CLI does — an empty
+/// interrupt receipt — and then plays `timeline`, the output the stopped loop ends with.
+pub fn interrupt_arm(timeline: &str) -> String {
+    format!(
+        r#"    *'"subtype":"interrupt"'*)
+      printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"still_queued":[]}}}}}}'
+{timeline}      ;;
+"#
+    )
+}
+
+/// An `interrupt` arm that never answers, standing in for a CLI that takes the request and says
+/// nothing back.
+pub fn silent_interrupt_arm() -> String {
+    r#"    *'"subtype":"interrupt"'*)
+      :
+      ;;
+"#
+    .to_owned()
+}
+
+/// A `stop_task` arm that acknowledges every task it is asked to stop.
+pub fn stop_task_arm() -> String {
+    r#"    *'"subtype":"stop_task"'*)
+      printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{}}}'
+      ;;
+"#
+    .to_owned()
+}
+
 pub struct ScriptedClaude {
     _directory: tempfile::TempDir,
     executable: std::path::PathBuf,
@@ -110,6 +141,7 @@ pub struct ScriptedClaude {
     attempts: std::path::PathBuf,
     argv: std::path::PathBuf,
     exited: std::path::PathBuf,
+    release: std::path::PathBuf,
 }
 
 impl ScriptedClaude {
@@ -128,11 +160,13 @@ impl ScriptedClaude {
         let attempts = path("attempts");
         let argv = path("argv");
         let exited = path("exited");
+        let release = path("release");
         let script = format!("{SCRIPT_PREFIX}{case_arms}  esac\ndone\n")
             .replace("$CLAUDE_FIXTURE_LOG", fixture_path(&log))
             .replace("$CLAUDE_FIXTURE_ATTEMPTS", fixture_path(&attempts))
             .replace("$CLAUDE_FIXTURE_ARGV", fixture_path(&argv))
-            .replace("$CLAUDE_FIXTURE_EXITED", fixture_path(&exited));
+            .replace("$CLAUDE_FIXTURE_EXITED", fixture_path(&exited))
+            .replace("$CLAUDE_FIXTURE_RELEASE", fixture_path(&release));
         write_executable(&executable, &script);
         Self {
             _directory: directory,
@@ -142,7 +176,14 @@ impl ScriptedClaude {
             attempts,
             argv,
             exited,
+            release,
         }
+    }
+
+    /// Lets a fixture holding at `$CLAUDE_FIXTURE_RELEASE` carry on, so a test can arrange the
+    /// Session it wants while the Turn is still running.
+    pub fn release(&self) {
+        std::fs::write(&self.release, b"release").expect("release the scripted Claude timeline");
     }
 
     /// Takes the program off disk, standing in for a Claude Code CLI the user has not installed.
@@ -311,6 +352,100 @@ pub fn agent_messages(snapshot: &SessionSnapshot) -> Vec<&Message> {
         .iter()
         .filter(|message| message.role == MessageRole::Agent)
         .collect()
+}
+
+/// A Session whose first Turn is running, with everything a test needs to steer or interrupt it.
+pub struct LiveTurn {
+    _state_dir: tempfile::TempDir,
+    _workspace: tempfile::TempDir,
+    server: RunningServer,
+    pub client: ManagedClient,
+    pub feed: SessionSubscription,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+}
+
+impl LiveTurn {
+    /// Opens a Session on `runtime` under `name`, delivers `prompt`, and comes back once the Turn
+    /// it began is running. `name` is the client channel, so each test needs its own.
+    pub async fn start(runtime: ClaudeRuntime, name: &'static str, prompt: &str) -> Self {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let workspace = tempfile::tempdir().expect("create valid Workspace");
+        let server = server::spawn_with_provider(
+            ServerConfig::new(state_dir.path(), name).expect("configure server"),
+            std::sync::Arc::new(runtime),
+        )
+        .await
+        .expect("spawn server");
+        let client = connect(state_dir.path(), name).await;
+        let created = client
+            .create_session(CreateSessionRequest {
+                agent_selection: None,
+                workspace: Workspace {
+                    path: workspace.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: prompt.to_owned(),
+                },
+            })
+            .await
+            .expect("create Session");
+        let mut feed = client
+            .subscribe_session(created.session.id)
+            .await
+            .expect("subscribe to Session SSE");
+        let running = session_where(
+            &client,
+            &mut feed,
+            created.session.id,
+            "the Prompt begins a Turn Claude is running",
+            |snapshot| {
+                snapshot
+                    .turns
+                    .first()
+                    .is_some_and(|turn| turn.status == TurnStatus::Active)
+            },
+        )
+        .await;
+        Self {
+            _state_dir: state_dir,
+            _workspace: workspace,
+            server,
+            client,
+            feed,
+            session_id: created.session.id,
+            turn_id: running.turns[0].id,
+        }
+    }
+
+    /// The Session once `predicate` holds of it, over this fixture's own feed.
+    pub async fn wait_for(
+        &mut self,
+        what: &str,
+        predicate: impl Fn(&SessionSnapshot) -> bool,
+    ) -> SessionSnapshot {
+        session_where(
+            &self.client,
+            &mut self.feed,
+            self.session_id,
+            what,
+            predicate,
+        )
+        .await
+    }
+
+    pub async fn shutdown(self) {
+        let Self {
+            server,
+            client,
+            feed,
+            ..
+        } = self;
+        drop(feed);
+        drop(client);
+        server.shutdown().await.expect("shut the server down");
+    }
 }
 
 /// The Session once the Turn at `turn_index` has stopped running, whatever it settled as, read

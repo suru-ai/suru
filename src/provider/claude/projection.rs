@@ -7,9 +7,14 @@
 //! tool results the loop echoes back as user messages. Chunks owned by a subagent contribute only
 //! their tool uses — their narration is the subagent's own conversation, not this Transcript.
 //! Every block kind this slice does not present is passed over rather than failed, because the
-//! wire grows freely (ADR 0010). A `result` Settles the Turn as completed or failed.
+//! wire grows freely (ADR 0010). A `result` Settles the Turn as completed, interrupted, or failed —
+//! except where a steer's own result is still to come, since the CLI answers every message queued
+//! into a running loop with a result while Suru keeps them all inside the Turn the steer joined.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
 
 use futures_util::stream;
 use serde_json::Value;
@@ -19,9 +24,10 @@ use super::super::shell_wrapper::strip_launcher_wrapper;
 use super::{
     CLAUDE_FAILURE_FALLBACK, claude_error,
     thinking::{ThinkingEvent, ThinkingSplitter},
+    turn_in_flight::TurnInFlight,
     wire::{
         ContentBlock, EchoedUserContent, EchoedUserMessage, ResultMessage, StreamEvent,
-        StreamEventMessage,
+        StreamEventMessage, SystemMessage,
     },
 };
 use crate::provider::{
@@ -35,11 +41,12 @@ const COMMAND_TOOL: &str = "Bash";
 
 pub(super) fn provider_events(
     messages: mpsc::UnboundedReceiver<Result<Value, ProviderError>>,
+    turn: Arc<TurnInFlight>,
 ) -> ProviderEventStream {
     Box::pin(stream::unfold(
         EventReceiver {
             messages,
-            projection: ClaudeProjection::default(),
+            projection: ClaudeProjection::new(turn),
             pending: VecDeque::new(),
         },
         next_provider_event,
@@ -94,24 +101,62 @@ struct OpenThinking {
 /// What the projection remembers between conversation messages: the streaming text block that is
 /// the agent Message currently open, the thinking block feeding Reasoning Activity, the tool-use
 /// blocks still streaming their input, and the commands running until a tool result settles them.
-#[derive(Default)]
 struct ClaudeProjection {
     open_text_block: Option<u64>,
     open_thinking: Option<OpenThinking>,
     open_tools: BTreeMap<ToolBlockKey, OpenToolUse>,
     running_commands: BTreeMap<String, ProviderActivityId>,
     reasoning_blocks: u64,
+    /// What the Session reads back out of the conversation: whether the Turn it started is still
+    /// running, and the background work it must stop before interrupting.
+    turn: Arc<TurnInFlight>,
 }
 
 impl ClaudeProjection {
+    fn new(turn: Arc<TurnInFlight>) -> Self {
+        Self {
+            open_text_block: None,
+            open_thinking: None,
+            open_tools: BTreeMap::new(),
+            running_commands: BTreeMap::new(),
+            reasoning_blocks: 0,
+            turn,
+        }
+    }
+
     fn project(&mut self, message: Value) -> Result<Vec<ProviderEvent>, ProviderError> {
         match message.get("type").and_then(Value::as_str) {
             Some("stream_event") => self.project_stream_event(message),
             Some("user") => Ok(self.project_tool_results(message)),
             Some("result") => self.project_result(message),
-            // The init message and full-message snapshots of what already streamed — nothing
-            // this projection presents.
+            Some("system") => {
+                self.project_task_lifecycle(message);
+                Ok(Vec::new())
+            }
+            // Full-message snapshots of what already streamed, and everything else the CLI says
+            // about itself — nothing this projection presents.
             _ => Ok(Vec::new()),
+        }
+    }
+
+    /// The task lifecycle the CLI reports beside the conversation. None of it is Transcript
+    /// material: it is the roster of background work an interrupt stops before it stops the loop,
+    /// kept from the tasks' own start and settle rather than from the roster snapshot the CLI also
+    /// sends, because that snapshot covers only work already in the background — a subagent still
+    /// running in the foreground of the Turn is exactly what an interrupt alone would leave behind.
+    fn project_task_lifecycle(&mut self, message: Value) {
+        let Ok(message) = serde_json::from_value::<SystemMessage>(message) else {
+            return;
+        };
+        let Some(task_id) = message.task_id else {
+            return;
+        };
+        match message.subtype.as_str() {
+            "task_started" => self.turn.task_started(task_id),
+            // However a task ends — finished, failed, or stopped — the CLI notifies, so the
+            // notification alone is enough to take it off the roster.
+            "task_notification" => self.turn.task_settled(&task_id),
+            _ => {}
         }
     }
 
@@ -419,15 +464,36 @@ impl ClaudeProjection {
                 exit_status: None,
             });
         }
-        if result.subtype == "success" && !result.is_error {
-            projected.push(ProviderEvent::TurnCompleted);
+        if was_interrupted(&result) {
+            self.turn.abandon_turn();
+            projected.push(ProviderEvent::TurnInterrupted);
+        } else if result.subtype == "success" && !result.is_error {
+            // A steered Turn is answered stretch by stretch: the CLI ends every user message
+            // queued into the loop with a result of its own, and only the last one Settles the
+            // Turn that holds them all.
+            if self.turn.result_settles_turn() {
+                projected.push(ProviderEvent::TurnCompleted);
+            }
         } else {
+            self.turn.abandon_turn();
             projected.push(ProviderEvent::TurnFailed {
                 message: result_failure_message(&result),
             });
         }
         Ok(projected)
     }
+}
+
+/// Whether a result is a Turn the user stopped. The CLI reports an interrupted loop as an unerrored
+/// `success` carrying no answer, so the abort is legible only in `terminal_reason` — verified
+/// against 2.1.237, whose interrupted result reads `aborted_streaming`. Which of the two abort
+/// reasons the CLI gives says only where its loop was when the interrupt landed: streaming an
+/// answer, or waiting on a tool it had already called.
+fn was_interrupted(result: &ResultMessage) -> bool {
+    matches!(
+        result.terminal_reason.as_deref(),
+        Some("aborted_streaming" | "aborted_tools")
+    )
 }
 
 /// The next Reasoning block's identity. Blocks are numbered across the Session, in a namespace

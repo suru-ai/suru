@@ -167,9 +167,10 @@ impl StreamJsonTransport {
                     .lock()
                     .expect("Claude pending request lock is not poisoned")
                     .remove(&key);
-                Err(claude_error(
-                    "Claude Code CLI timed out handling the control request",
-                ))
+                Err(claude_error(format!(
+                    "Claude Code CLI timed out handling `{}`",
+                    request.subtype()
+                )))
             }
         }
     }

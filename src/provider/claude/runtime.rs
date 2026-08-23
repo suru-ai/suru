@@ -13,7 +13,7 @@ use super::{
     CLAUDE_PROVIDER_ID,
     catalog::model_descriptors,
     claude_error, claude_error_context,
-    session::start_claude_session,
+    session::{ClaudeTimings, start_claude_session},
     transport::{ClaudeConnection, StreamJsonTransport},
     wire::{ControlRequest, NativeModelList},
 };
@@ -28,6 +28,9 @@ use crate::{
 const CLAUDE_PATH_ENV: &str = "SURU_CLAUDE_PATH";
 const CLAUDE_EXECUTABLE_NAME: &str = "claude";
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// A user stopping a Turn is waiting on the answer, so an interrupt — and each of the task stops
+/// that go ahead of it — gives the CLI far less time than an ordinary control request gets.
+const INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Launches one short-lived Claude Code CLI process per Model discovery.
 #[derive(Clone, Debug)]
@@ -35,6 +38,7 @@ pub struct ClaudeRuntime {
     executable: OsString,
     processes: ProcessRegistry,
     control_request_timeout: Duration,
+    interrupt_request_timeout: Duration,
 }
 
 impl ClaudeRuntime {
@@ -43,6 +47,7 @@ impl ClaudeRuntime {
             executable: executable.as_ref().to_owned(),
             processes: ProcessRegistry::new(super::CLAUDE_HARNESS_NAME),
             control_request_timeout: CONTROL_REQUEST_TIMEOUT,
+            interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
         }
     }
 
@@ -50,6 +55,14 @@ impl ClaudeRuntime {
     /// unresponsive fixtures do not wait out the default.
     pub fn with_control_request_timeout(mut self, timeout: Duration) -> Self {
         self.control_request_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long an interrupt waits for the CLI to acknowledge it, and how long each of the
+    /// task stops that precede it does; injectable so tests with fixtures that never answer do not
+    /// wait out the default.
+    pub fn with_interrupt_request_timeout(mut self, timeout: Duration) -> Self {
+        self.interrupt_request_timeout = timeout;
         self
     }
 
@@ -91,10 +104,11 @@ impl ProviderRuntime for ClaudeRuntime {
     ) -> ProviderFuture<'_, ProviderSessionConnection> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
-        let request_timeout = self.control_request_timeout;
-        Box::pin(async move {
-            start_claude_session(executable, request, processes, request_timeout).await
-        })
+        let timings = ClaudeTimings {
+            control_request: self.control_request_timeout,
+            interrupt_request: self.interrupt_request_timeout,
+        };
+        Box::pin(async move { start_claude_session(executable, request, processes, timings).await })
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
