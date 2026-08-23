@@ -6,7 +6,7 @@ use tokio::sync::watch;
 use crate::{
     protocol::{
         AgentSelection, ModelCatalog, ModelDescriptor, ProviderCatalogStatus, ProviderId,
-        ProviderModelCatalog,
+        ProviderModelCatalog, ProviderUnavailability,
     },
     provider::{ProviderError, ProviderRuntime, validate_models},
 };
@@ -27,8 +27,16 @@ struct ProviderCatalog {
 #[derive(Default)]
 struct CatalogState {
     models: Option<Vec<ModelDescriptor>>,
-    error: Option<String>,
+    failure: Option<CatalogFailure>,
     refreshing: bool,
+}
+
+/// How the last discovery failed: what it said, and — when it failed because
+/// the Provider cannot be used at all rather than because the catalog call
+/// itself went wrong — the typed condition the user fixes outside Suru.
+struct CatalogFailure {
+    message: String,
+    unavailable: Option<ProviderUnavailability>,
 }
 
 impl ModelCatalogService {
@@ -61,15 +69,14 @@ impl ModelCatalogService {
     }
 
     /// The Agent Selection a fresh Landing starts from: hosted Providers are
-    /// consulted in their fixed built-in order, and the first whose cached
-    /// catalog carries a default Model supplies it.
+    /// consulted in their fixed built-in order, and the first available one
+    /// whose cached catalog carries a default Model supplies it. A Provider the
+    /// user cannot use yet is passed over, so a first Prompt never lands on a
+    /// Provider that cannot work.
     pub(crate) fn default_selection(&self) -> Option<AgentSelection> {
-        self.providers.iter().find_map(|catalog| {
-            self.cached_models(&catalog.provider)?
-                .iter()
-                .find(|model| model.is_default)
-                .map(ModelDescriptor::default_agent_selection)
-        })
+        self.providers
+            .iter()
+            .find_map(ProviderCatalog::default_selection)
     }
 
     pub(crate) fn normalize_selection(
@@ -102,6 +109,24 @@ impl ModelCatalogService {
 }
 
 impl ProviderCatalog {
+    /// The selection this Provider's cached default Model makes, or nothing
+    /// while the Provider cannot be used.
+    fn default_selection(&self) -> Option<AgentSelection> {
+        let state = self
+            .state
+            .lock()
+            .expect("Model catalog lock is not poisoned");
+        if state.is_unavailable() {
+            return None;
+        }
+        state
+            .models
+            .as_ref()?
+            .iter()
+            .find(|model| model.is_default)
+            .map(ModelDescriptor::default_agent_selection)
+    }
+
     async fn list(&self) -> ProviderModelCatalog {
         {
             let mut state = self
@@ -175,9 +200,14 @@ impl ProviderCatalog {
         match result {
             Ok(models) => {
                 state.models = Some(models);
-                state.error = None;
+                state.failure = None;
             }
-            Err(error) => state.error = Some(error.to_string()),
+            Err(error) => {
+                state.failure = Some(CatalogFailure {
+                    message: error.to_string(),
+                    unavailable: error.unavailability(),
+                });
+            }
         }
         state.refreshing = false;
         drop(state);
@@ -206,15 +236,39 @@ impl ProviderCatalog {
     }
 }
 
+impl CatalogState {
+    fn is_unavailable(&self) -> bool {
+        self.failure
+            .as_ref()
+            .is_some_and(|failure| failure.unavailable.is_some())
+    }
+}
+
 fn catalog_status(state: &CatalogState) -> ProviderCatalogStatus {
-    match (&state.models, &state.error, state.refreshing) {
-        (_, _, true) => ProviderCatalogStatus::Refreshing,
-        (Some(_), Some(message), false) => ProviderCatalogStatus::Stale {
+    match (&state.models, &state.failure, state.refreshing) {
+        // Unavailability outranks every other status, a refresh in flight
+        // included: whatever Models the Provider served before, none of them
+        // can be used until the user fixes the condition, and a client that
+        // heard `Refreshing` in the meantime would offer them for the length of
+        // the re-check.
+        (
+            _,
+            Some(CatalogFailure {
+                message,
+                unavailable: Some(reason),
+            }),
+            _,
+        ) => ProviderCatalogStatus::Unavailable {
+            reason: *reason,
             message: message.clone(),
         },
+        (_, _, true) => ProviderCatalogStatus::Refreshing,
+        (Some(_), Some(failure), false) => ProviderCatalogStatus::Stale {
+            message: failure.message.clone(),
+        },
         (Some(_), None, false) => ProviderCatalogStatus::Fresh,
-        (None, Some(message), false) => ProviderCatalogStatus::Failed {
-            message: message.clone(),
+        (None, Some(failure), false) => ProviderCatalogStatus::Failed {
+            message: failure.message.clone(),
         },
         (None, None, false) => ProviderCatalogStatus::Failed {
             message: "Model catalog has not been loaded".to_owned(),

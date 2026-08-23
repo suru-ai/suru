@@ -11,7 +11,7 @@ use suru::{
         AgentSelection, ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice,
         ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
         ModelOptionRole, ModelOptionValue, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
-        SessionChange, SessionId, SessionRevision, SessionUpdate,
+        ProviderUnavailability, SessionChange, SessionId, SessionRevision, SessionUpdate,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId},
 };
@@ -1002,5 +1002,187 @@ fn open_model_picker_refocuses_on_an_authoritative_multi_client_update() {
             .find(|row| row.contains("Old Model"))
             .expect("keep old Model available")
             .contains('›')
+    );
+}
+
+#[test]
+fn model_picker_shows_an_unavailable_provider_with_its_reason_and_refuses_selection() {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request: request.clone(),
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![model_descriptor(
+                        "codex",
+                        "gpt-fixture",
+                        "GPT Fixture",
+                        true,
+                        ModelAvailability::Available,
+                    )],
+                    status: ProviderCatalogStatus::Unavailable {
+                        reason: ProviderUnavailability::NotInstalled,
+                        message: "could not launch Codex app-server `codex`".to_owned(),
+                    },
+                }],
+            },
+        })
+        .expect("load an unavailable Provider");
+
+    let rows = rendered_application_rows(&application);
+    let screen = rows.join("\n");
+    assert!(
+        screen.contains("Retry codex: not installed"),
+        "the picker states the typed reason, got {screen}"
+    );
+    assert!(
+        screen.contains("could not launch Codex app-server"),
+        "the picker keeps the Provider's own account of the condition, got {screen}"
+    );
+    assert!(
+        rows.iter()
+            .find(|row| row.contains("GPT Fixture"))
+            .expect("the unavailable Provider keeps its place with its Models")
+            .contains("unavailable"),
+        "no Model of an unavailable Provider may be selected, got {screen}"
+    );
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("attempt to select an unavailable Model"),
+        ApplicationTransition::Continue
+    );
+    let refused = rendered_application_rows(&application).join("\n");
+    assert!(
+        !refused.contains("Model Options"),
+        "selecting an unavailable Model does nothing, got {refused}"
+    );
+    assert!(
+        refused.contains("Retry codex: not installed"),
+        "the picker stays open on the unavailable Provider, got {refused}"
+    );
+
+    // The user installs the CLI; the picker's own refresh clears the condition
+    // without a restart, and the Model becomes selectable.
+    application
+        .handle_event(ApplicationEvent::ModelsRefreshed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![model_descriptor(
+                        "codex",
+                        "gpt-fixture",
+                        "GPT Fixture",
+                        true,
+                        ModelAvailability::Available,
+                    )],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("merge the repaired Provider");
+    let repaired = rendered_application_rows(&application);
+    assert!(
+        !repaired.join("\n").contains("not installed"),
+        "a fixed Provider drops its reason, got {}",
+        repaired.join("\n")
+    );
+    assert!(
+        !repaired
+            .iter()
+            .find(|row| row.contains("GPT Fixture"))
+            .expect("the repaired Provider keeps its Models")
+            .contains("unavailable")
+    );
+    assert!(
+        matches!(
+            application
+                .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )))
+                .expect("select the repaired Model"),
+            ApplicationTransition::ConfirmLandingAgentSelection(selection)
+                if selection.model == ModelId::new("gpt-fixture")
+        ),
+        "the Model a fixed Provider serves is selectable again"
+    );
+}
+
+#[test]
+fn model_picker_keeps_an_unavailable_provider_with_no_models_in_the_list() {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("codex"),
+                        models: Vec::new(),
+                        status: ProviderCatalogStatus::Unavailable {
+                            reason: ProviderUnavailability::NotInstalled,
+                            message: "could not launch Codex app-server `codex`".to_owned(),
+                        },
+                    },
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("other"),
+                        models: vec![model_descriptor(
+                            "other",
+                            "other-default",
+                            "Other Default",
+                            true,
+                            ModelAvailability::Available,
+                        )],
+                        status: ProviderCatalogStatus::Fresh,
+                    },
+                ],
+            },
+        })
+        .expect("load a Provider that served nothing");
+
+    let rows = rendered_application_rows(&application);
+    let screen = rows.join("\n");
+    assert!(
+        screen.contains("Provider codex"),
+        "a Provider with no Models still keeps its place, got {screen}"
+    );
+    assert!(
+        screen.contains("Retry codex: not installed"),
+        "its reason stands in for the Models it has none of, got {screen}"
+    );
+    assert!(
+        rendered_row(&rows, "Provider codex") < rendered_row(&rows, "Retry codex"),
+        "the reason sits under its own Provider, got {screen}"
+    );
+    assert!(
+        rendered_row(&rows, "Retry codex") < rendered_row(&rows, "Provider other"),
+        "the available Provider follows rather than absorbing the reason, got {screen}"
+    );
+    assert!(
+        !screen.contains("No Models found"),
+        "the list is not empty, got {screen}"
     );
 }

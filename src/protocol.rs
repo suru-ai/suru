@@ -279,13 +279,47 @@ pub enum ModelOptionValue {
     Toggle { enabled: bool },
 }
 
+/// Why a Provider cannot be used right now. Each reason names a condition the
+/// user fixes outside Suru — installing the Provider's CLI, signing in to it,
+/// or moving to a version Suru speaks — which the next catalog refresh
+/// re-evaluates.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderUnavailability {
+    NotInstalled,
+    NotSignedIn,
+    IncompatibleVersion,
+}
+
+impl ProviderUnavailability {
+    /// The reason as a client states it to the user.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotInstalled => "not installed",
+            Self::NotSignedIn => "not signed in",
+            Self::IncompatibleVersion => "incompatible version",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderCatalogStatus {
     Fresh,
     Refreshing,
-    Stale { message: String },
-    Failed { message: String },
+    Stale {
+        message: String,
+    },
+    Failed {
+        message: String,
+    },
+    /// The Provider cannot be used at all until the user fixes `reason`
+    /// outside Suru. Whatever Models the catalog still holds stay listed so
+    /// the Provider keeps its place, but none of them may be selected.
+    Unavailable {
+        reason: ProviderUnavailability,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

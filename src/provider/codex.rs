@@ -56,14 +56,6 @@ fn codex_error(message: impl AsRef<str>) -> ProviderError {
 
 /// Wraps `error` in the operation that failed, preserving the classification it already carries.
 fn codex_error_context(context: &str, error: ProviderError) -> ProviderError {
-    let session_lost = error.is_session_lost();
-    let selection_rejected = error.is_selection_rejected();
-    let mut contextual = codex_error(format!("{context}: {error}"));
-    if session_lost {
-        contextual = contextual.mark_session_lost();
-    }
-    if selection_rejected {
-        contextual = contextual.mark_selection_rejected();
-    }
-    contextual
+    let message = concise_remote_message(&format!("{context}: {error}"), "Codex Provider failed");
+    error.reworded(message)
 }

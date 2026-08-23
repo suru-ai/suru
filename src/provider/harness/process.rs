@@ -24,7 +24,10 @@ use tokio::{
     time::{Duration, timeout},
 };
 
-use crate::provider::{ProviderError, wait_for_shutdown};
+use crate::{
+    protocol::ProviderUnavailability,
+    provider::{ProviderError, wait_for_shutdown},
+};
 
 const PROCESS_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(500);
 const PROCESS_KILL_TIMEOUT: Duration = Duration::from_millis(500);
@@ -245,10 +248,17 @@ pub(crate) fn spawn_harness_process(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let (mut child, process_tree) = spawn_harness_child(&mut command).map_err(|error| {
-        ProviderError::new(format!(
+        let failure = ProviderError::new(format!(
             "could not launch {name} `{}`: {error}",
             spec.executable.to_string_lossy()
-        ))
+        ));
+        // A harness executable that isn't there is the user's to install, not a
+        // fault of the run — every Provider launching a CLI reports it the same
+        // typed way, so a client can say so instead of quoting an OS error.
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return failure.mark_unavailable(ProviderUnavailability::NotInstalled);
+        }
+        failure
     })?;
 
     let stdin = child

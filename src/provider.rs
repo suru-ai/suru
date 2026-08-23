@@ -8,7 +8,7 @@ use tokio::sync::watch;
 
 use crate::protocol::{
     AgentIdentity, AgentSelection, EffectiveSettings, FileChange, ModelDescriptor, ModelOptionKind,
-    ModelOptionRole, ProviderId, SessionId,
+    ModelOptionRole, ProviderId, ProviderUnavailability, SessionId,
 };
 
 mod codex;
@@ -34,6 +34,11 @@ pub struct ProviderError {
 enum ProviderErrorKind {
     Failure,
     SelectionRejected,
+    /// The Provider itself cannot be used yet, for a reason the user fixes
+    /// outside Suru. Carried on the error so whatever asked the runtime to
+    /// work — Model discovery above all — can report the condition rather
+    /// than a bare failure.
+    Unavailable(ProviderUnavailability),
 }
 
 impl ProviderError {
@@ -53,6 +58,14 @@ impl ProviderError {
         }
     }
 
+    pub fn unavailable(reason: ProviderUnavailability, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            session_lost: false,
+            kind: ProviderErrorKind::Unavailable(reason),
+        }
+    }
+
     pub(crate) fn mark_session_lost(mut self) -> Self {
         self.session_lost = true;
         self
@@ -62,13 +75,29 @@ impl ProviderError {
         self.session_lost
     }
 
-    pub(crate) fn mark_selection_rejected(mut self) -> Self {
-        self.kind = ProviderErrorKind::SelectionRejected;
+    pub(crate) fn is_selection_rejected(&self) -> bool {
+        self.kind == ProviderErrorKind::SelectionRejected
+    }
+
+    /// The typed reason the Provider is unusable, when the failure carries one.
+    pub(crate) fn unavailability(&self) -> Option<ProviderUnavailability> {
+        match self.kind {
+            ProviderErrorKind::Unavailable(reason) => Some(reason),
+            ProviderErrorKind::Failure | ProviderErrorKind::SelectionRejected => None,
+        }
+    }
+
+    pub(crate) fn mark_unavailable(mut self, reason: ProviderUnavailability) -> Self {
+        self.kind = ProviderErrorKind::Unavailable(reason);
         self
     }
 
-    pub(crate) fn is_selection_rejected(&self) -> bool {
-        self.kind == ProviderErrorKind::SelectionRejected
+    /// Restates the failure in `message`, keeping how it is classified. Lets a
+    /// Provider wrap a failure in the operation that met it without having to
+    /// know — and re-apply — every facet the original carried.
+    pub(crate) fn reworded(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
     }
 }
 

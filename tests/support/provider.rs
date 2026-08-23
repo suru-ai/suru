@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures_util::stream;
-use suru::protocol::{AgentIdentity, ModelDescriptor, ProviderId};
+use suru::protocol::{AgentIdentity, ModelDescriptor, ProviderId, ProviderUnavailability};
 use suru::provider::{
     ProviderError, ProviderEvent, ProviderEventStream, ProviderFuture, ProviderRuntime,
     ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
@@ -17,6 +17,10 @@ pub struct ControlledProvider {
 pub struct ControlledProviderRuntime {
     provider: ProviderId,
     models: Vec<ModelDescriptor>,
+    /// The condition Model discovery reports instead of the catalog, standing
+    /// in for a Provider the user has yet to install or sign in to. Shared so a
+    /// test can fix it the way a user would and refresh.
+    unavailable: Arc<Mutex<Option<ProviderUnavailability>>>,
     starts: mpsc::UnboundedSender<StartRequest>,
 }
 
@@ -71,6 +75,7 @@ impl ControlledProvider {
             Arc::new(ControlledProviderRuntime {
                 provider,
                 models,
+                unavailable: Arc::new(Mutex::new(None)),
                 starts: starts_tx,
             }),
             Self { starts: starts_rx },
@@ -82,6 +87,17 @@ impl ControlledProvider {
             .recv()
             .await
             .expect("Provider runtime remains connected")
+    }
+}
+
+impl ControlledProviderRuntime {
+    /// Makes Model discovery report `reason`, or — with `None` — serve the
+    /// catalog again, as a user fixing the condition outside Suru would.
+    pub fn set_unavailable(&self, reason: Option<ProviderUnavailability>) {
+        *self
+            .unavailable
+            .lock()
+            .expect("controlled Provider availability lock is not poisoned") = reason;
     }
 }
 
@@ -219,7 +235,20 @@ impl ProviderRuntime for ControlledProviderRuntime {
 
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
         let models = self.models.clone();
-        Box::pin(async move { Ok(models) })
+        let unavailable = *self
+            .unavailable
+            .lock()
+            .expect("controlled Provider availability lock is not poisoned");
+        let provider = self.provider.clone();
+        Box::pin(async move {
+            match unavailable {
+                Some(reason) => Err(ProviderError::unavailable(
+                    reason,
+                    format!("the {provider} CLI is {}", reason.label()),
+                )),
+                None => Ok(models),
+            }
+        })
     }
 
     fn start_session(

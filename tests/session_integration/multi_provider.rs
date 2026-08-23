@@ -11,8 +11,8 @@ use suru::{
         Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection,
         AgentSelectionOperationId, CreateSessionRequest, InitialPrompt, ModelAvailability,
         ModelCatalog, ModelDescriptor, ModelId, PromptDelivery, PromptId, ProviderCatalogStatus,
-        ProviderId, SessionError, SessionErrorCode, SessionId, SessionSnapshot, TurnStatus,
-        UpdateAgentSelectionRequest, Workspace,
+        ProviderId, ProviderUnavailability, SessionError, SessionErrorCode, SessionId,
+        SessionSnapshot, TurnStatus, UpdateAgentSelectionRequest, Workspace,
     },
     provider::ProviderEvent,
     server::{self, ServerConfig},
@@ -72,6 +72,34 @@ async fn create_session(
         .json::<SessionSnapshot>()
         .await
         .expect("decode created Session")
+}
+
+async fn list_catalog(descriptor: &suru::protocol::RuntimeDescriptor) -> ModelCatalog {
+    reqwest::Client::new()
+        .get(format!("{}/v1/models", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("list Models")
+        .error_for_status()
+        .expect("Model listing succeeds")
+        .json::<ModelCatalog>()
+        .await
+        .expect("decode Model catalog")
+}
+
+async fn refresh_catalog(descriptor: &suru::protocol::RuntimeDescriptor) -> ModelCatalog {
+    reqwest::Client::new()
+        .post(format!("{}/v1/models/refresh", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("refresh Model catalog")
+        .error_for_status()
+        .expect("Model refresh succeeds")
+        .json::<ModelCatalog>()
+        .await
+        .expect("decode refreshed Model catalog")
 }
 
 async fn read_session(
@@ -596,6 +624,153 @@ async fn the_landing_default_falls_to_the_next_provider_when_the_first_has_no_ca
         created.session.agent_selection,
         Some(hosted_selection("beta", "beta-default")),
         "the Landing default falls past a Provider whose catalog holds no default"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn an_unavailable_provider_is_listed_with_its_reason_until_a_refresh_finds_it_fixed() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let (alpha_runtime, _alpha) = ControlledProvider::with_provider(
+        ProviderId::new("alpha"),
+        vec![hosted_model("alpha", "alpha-default")],
+    );
+    let alpha_handle = Arc::clone(&alpha_runtime);
+    alpha_handle.set_unavailable(Some(ProviderUnavailability::NotInstalled));
+    let (beta_runtime, _beta) = ControlledProvider::with_provider(
+        ProviderId::new("beta"),
+        vec![hosted_model("beta", "beta-default")],
+    );
+    let server = server::spawn_with_providers(
+        ServerConfig::new(state_dir.path(), "provider-unavailability-test")
+            .expect("configure server"),
+        vec![alpha_runtime, beta_runtime],
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+
+    let catalog = refresh_catalog(&descriptor).await;
+    assert_eq!(
+        catalog.providers[0].provider,
+        ProviderId::new("alpha"),
+        "an unavailable Provider keeps its place in the catalog"
+    );
+    let ProviderCatalogStatus::Unavailable { reason, message } = &catalog.providers[0].status
+    else {
+        panic!(
+            "the unavailable Provider carries a typed reason, got {:?}",
+            catalog.providers[0].status
+        );
+    };
+    assert_eq!(*reason, ProviderUnavailability::NotInstalled);
+    assert!(
+        message.contains("alpha"),
+        "the reason keeps the Provider's own account of the condition, got {message:?}"
+    );
+    assert_eq!(catalog.providers[1].status, ProviderCatalogStatus::Fresh);
+
+    // A plain listing re-arms a background refresh; the condition must survive
+    // it rather than yielding to `Refreshing`, or a client would offer the
+    // Provider's Models again for the length of every re-check.
+    let listed = list_catalog(&descriptor).await;
+    assert!(
+        matches!(
+            listed.providers[0].status,
+            ProviderCatalogStatus::Unavailable {
+                reason: ProviderUnavailability::NotInstalled,
+                ..
+            }
+        ),
+        "a re-check in flight does not clear the condition, got {:?}",
+        listed.providers[0].status
+    );
+
+    // The user installs the missing CLI and refreshes; no restart involved.
+    alpha_handle.set_unavailable(None);
+    let repaired = refresh_catalog(&descriptor).await;
+    assert_eq!(repaired.providers[0].status, ProviderCatalogStatus::Fresh);
+    assert_eq!(
+        repaired.providers[0].models,
+        vec![hosted_model("alpha", "alpha-default")],
+        "the fixed Provider serves its Models again"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_fresh_landing_default_skips_an_unavailable_provider() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (alpha_runtime, _alpha) = ControlledProvider::with_provider(
+        ProviderId::new("alpha"),
+        vec![hosted_model("alpha", "alpha-default")],
+    );
+    let alpha_handle = Arc::clone(&alpha_runtime);
+    let (beta_runtime, mut beta) = ControlledProvider::with_provider(
+        ProviderId::new("beta"),
+        vec![hosted_model("beta", "beta-default")],
+    );
+    let server = server::spawn_with_providers(
+        ServerConfig::new(state_dir.path(), "unavailable-landing-default-test")
+            .expect("configure server"),
+        vec![alpha_runtime, beta_runtime],
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+
+    // Alpha's Models are cached from a refresh that found it healthy; the user
+    // then signs out of it, so the catalog still holds Models the Landing
+    // default must nonetheless pass over.
+    refresh_catalog(&descriptor).await;
+    alpha_handle.set_unavailable(Some(ProviderUnavailability::NotSignedIn));
+    let catalog = refresh_catalog(&descriptor).await;
+    assert!(
+        matches!(
+            catalog.providers[0].status,
+            ProviderCatalogStatus::Unavailable {
+                reason: ProviderUnavailability::NotSignedIn,
+                ..
+            }
+        ),
+        "a Provider that goes unavailable reports the condition over its stale catalog, got {:?}",
+        catalog.providers[0].status
+    );
+    assert_eq!(
+        catalog.providers[0].models,
+        vec![hosted_model("alpha", "alpha-default")],
+        "an unavailable Provider keeps the Models it last served on show"
+    );
+
+    let created = create_session(
+        &descriptor,
+        &CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Start on a Provider that can actually work".to_owned(),
+            },
+        },
+    )
+    .await;
+    assert_eq!(
+        created.session.agent_selection,
+        Some(hosted_selection("beta", "beta-default")),
+        "a fresh Landing defaults past the Provider the user cannot use yet"
+    );
+    assert!(
+        beta.next_start().await.workspace()
+            == workspace
+                .path()
+                .canonicalize()
+                .expect("canonicalize Workspace"),
+        "the defaulted Session routes to the first available Provider"
     );
 
     server.shutdown().await.expect("shut down server");

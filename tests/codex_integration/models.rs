@@ -8,8 +8,8 @@ use suru::{
     protocol::{
         Activity, AgentSelection, CreateSessionRequest, InitialPrompt, ModelAvailability, ModelId,
         ModelOptionChoiceId, ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection,
-        ModelOptionValue, PromptId, PromptStatus, ProviderCatalogStatus, ProviderId, TurnStatus,
-        Workspace,
+        ModelOptionValue, PromptId, PromptStatus, ProviderCatalogStatus, ProviderId,
+        ProviderUnavailability, TurnStatus, Workspace,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -1004,5 +1004,61 @@ async fn generic_codex_turn_rejection_does_not_mark_the_model_unavailable() {
     assert_eq!(failed.prompts.len(), 1);
 
     drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// Issue #116: a Codex CLI that isn't installed is a condition the user fixes
+/// outside Suru, so the catalog reports it as typed unavailability and the next
+/// refresh clears it without a restart.
+#[tokio::test]
+async fn a_missing_codex_binary_is_reported_as_a_provider_that_is_not_installed() {
+    let codex = ScriptedCodex::new(MODEL_CATALOG_CODEX);
+    let uninstalled = codex.executable().with_extension("uninstalled");
+    std::fs::rename(codex.executable(), &uninstalled).expect("uninstall the scripted Codex");
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "codex-not-installed").expect("configure server"),
+        Arc::new(CodexRuntime::new(codex.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-not-installed")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+
+    let missing = client
+        .list_models()
+        .await
+        .expect("the catalog reports the condition rather than failing the call");
+    let ProviderCatalogStatus::Unavailable { reason, message } = &missing.providers[0].status
+    else {
+        panic!(
+            "a missing Codex binary is typed unavailability, got {:?}",
+            missing.providers[0].status
+        );
+    };
+    assert_eq!(*reason, ProviderUnavailability::NotInstalled);
+    assert!(
+        message.contains("could not launch"),
+        "the reason keeps Codex's own account of the condition, got {message:?}"
+    );
+    assert!(missing.providers[0].models.is_empty());
+
+    std::fs::rename(&uninstalled, codex.executable()).expect("install the scripted Codex");
+    let installed = client
+        .refresh_models()
+        .await
+        .expect("refresh once the CLI is installed");
+    assert_eq!(installed.providers[0].status, ProviderCatalogStatus::Fresh);
+    assert_eq!(
+        installed.providers[0].models[0].id,
+        ModelId::new("gpt-opaque"),
+        "the installed Provider serves its Models without a restart"
+    );
+
     server.shutdown().await.expect("shut down server");
 }

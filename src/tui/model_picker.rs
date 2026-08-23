@@ -3,6 +3,7 @@
 use crate::protocol::{
     AgentSelection, ModelAvailability, ModelCatalog, ModelDescriptor, ModelId, ModelOptionKind,
     ModelOptionRole, ModelOptionValue, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
+    ProviderUnavailability,
 };
 
 use super::ModelListRequest;
@@ -66,6 +67,15 @@ pub(super) enum ModelPickerRow<'a> {
     },
     Error {
         provider: &'a ProviderId,
+        message: &'a str,
+        selected: bool,
+    },
+    /// A Provider the user cannot use yet. It keeps its place in the list with
+    /// its reason on show, its Models render unselectable, and choosing the row
+    /// re-lists the catalog for a user who has just fixed the condition.
+    Unavailable {
+        provider: &'a ProviderId,
+        reason: ProviderUnavailability,
         message: &'a str,
         selected: bool,
     },
@@ -279,14 +289,15 @@ impl ModelPicker {
         current: Option<&AgentSelection>,
     ) -> impl Iterator<Item = ModelPickerRow<'_>> {
         let rows = self.rows(current);
-        let selected =
-            rows.iter()
-                .position(|row| match row {
-                    ModelPickerRow::Model { selected, .. }
-                    | ModelPickerRow::Error { selected, .. } => *selected,
-                    ModelPickerRow::Provider { .. } => false,
-                })
-                .unwrap_or(0);
+        let selected = rows
+            .iter()
+            .position(|row| match row {
+                ModelPickerRow::Model { selected, .. }
+                | ModelPickerRow::Error { selected, .. }
+                | ModelPickerRow::Unavailable { selected, .. } => *selected,
+                ModelPickerRow::Provider { .. } => false,
+            })
+            .unwrap_or(0);
         let start = selected.saturating_add(1).saturating_sub(capacity);
         rows.into_iter().skip(start).take(capacity)
     }
@@ -449,8 +460,8 @@ impl ModelPicker {
                 .iter()
                 .filter(|model| model_matches(&self.query, model))
                 .collect::<Vec<_>>();
-            let error = provider_error(&provider.status);
-            if models.is_empty() && error.is_none() {
+            let condition = provider_condition(&provider.status);
+            if models.is_empty() && condition.is_none() {
                 continue;
             }
             rows.push(ModelPickerRow::Provider {
@@ -465,12 +476,23 @@ impl ModelPicker {
                     current: current.as_ref() == Some(&key),
                 }
             }));
-            if let Some(message) = error {
-                rows.push(ModelPickerRow::Error {
-                    provider: &provider.provider,
-                    message,
-                    selected: self.selected
-                        == Some(PickerSelection::Retry(provider.provider.clone())),
+            if let Some(condition) = condition {
+                let selected =
+                    self.selected == Some(PickerSelection::Retry(provider.provider.clone()));
+                rows.push(match condition {
+                    ProviderCondition::Failing(message) => ModelPickerRow::Error {
+                        provider: &provider.provider,
+                        message,
+                        selected,
+                    },
+                    ProviderCondition::Unavailable { reason, message } => {
+                        ModelPickerRow::Unavailable {
+                            provider: &provider.provider,
+                            reason,
+                            message,
+                            selected,
+                        }
+                    }
                 });
             }
         }
@@ -515,7 +537,7 @@ impl ModelPicker {
                     .filter(|model| model_matches(&self.query, model))
                     .map(|model| PickerSelection::Model(ModelKey::from_model(model))),
             );
-            if provider_error(&provider.status).is_some() {
+            if provider_condition(&provider.status).is_some() {
                 selectable.push(PickerSelection::Retry(provider.provider.clone()));
             }
         }
@@ -523,7 +545,13 @@ impl ModelPicker {
     }
 }
 
+/// The Provider's default Model, when the Provider can actually be used: a
+/// Model nothing may select is no basis for the options editor's implicit
+/// choice either.
 fn default_model(provider: &ProviderModels) -> Option<&ModelDescriptor> {
+    if is_unavailable(&provider.status) {
+        return None;
+    }
     provider.models.iter().find(|model| model.is_default)
 }
 
@@ -534,6 +562,13 @@ fn normalize_catalog(mut catalog: Vec<ProviderModelCatalog>) -> Vec<ProviderMode
 
 fn normalize_provider(mut catalog: ProviderModelCatalog) -> ProviderModels {
     sort_models(&mut catalog.models);
+    if is_unavailable(&catalog.status) {
+        // No Model of a Provider the user cannot use can start a Session, so
+        // the whole Provider renders — and refuses selection — as unavailable.
+        for model in &mut catalog.models {
+            model.availability = ModelAvailability::Unavailable;
+        }
+    }
     ProviderModels {
         provider: catalog.provider,
         models: catalog.models,
@@ -562,13 +597,38 @@ fn fuzzy_matches(query: &str, candidate: &str) -> bool {
         .all(|character| candidate.by_ref().any(|candidate| candidate == character))
 }
 
-fn provider_error(status: &ProviderCatalogStatus) -> Option<&str> {
+/// What a Provider's catalog status puts in the list beyond its Models: the
+/// failure a reader may retry, or the condition making the Provider unusable.
+/// Either way the row it becomes is the Provider's retry target.
+#[derive(Clone, Copy, Debug)]
+enum ProviderCondition<'a> {
+    Failing(&'a str),
+    Unavailable {
+        reason: ProviderUnavailability,
+        message: &'a str,
+    },
+}
+
+fn provider_condition(status: &ProviderCatalogStatus) -> Option<ProviderCondition<'_>> {
     match status {
         ProviderCatalogStatus::Stale { message } | ProviderCatalogStatus::Failed { message } => {
-            Some(message)
+            Some(ProviderCondition::Failing(message))
+        }
+        ProviderCatalogStatus::Unavailable { reason, message } => {
+            Some(ProviderCondition::Unavailable {
+                reason: *reason,
+                message,
+            })
         }
         ProviderCatalogStatus::Fresh | ProviderCatalogStatus::Refreshing => None,
     }
+}
+
+fn is_unavailable(status: &ProviderCatalogStatus) -> bool {
+    matches!(
+        provider_condition(status),
+        Some(ProviderCondition::Unavailable { .. })
+    )
 }
 
 fn option_is_default(kind: &ModelOptionKind, value: &ModelOptionValue) -> bool {

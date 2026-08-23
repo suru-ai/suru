@@ -281,23 +281,29 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
                         theme.text.primary
                     },
                 ),
+                // A failing Provider and an unavailable one are the same row:
+                // the retry the reader may take, with what it is about to
+                // re-check. Only the account of the condition differs.
                 ModelPickerRow::Error {
                     provider,
                     message,
                     selected,
-                } => Line::styled(
-                    truncate_to_width(
-                        &format!(
-                            "{}Retry {provider}: {message}",
-                            if selected { "› " } else { "  " }
-                        ),
-                        usize::from(content_width),
-                    ),
-                    if selected {
-                        theme.selection.focused
-                    } else {
-                        theme.feedback.error
-                    },
+                } => model_picker_retry_row(
+                    &format!("Retry {provider}: {message}"),
+                    selected,
+                    content_width,
+                    theme,
+                ),
+                ModelPickerRow::Unavailable {
+                    provider,
+                    reason,
+                    message,
+                    selected,
+                } => model_picker_retry_row(
+                    &format!("Retry {provider}: {} · {message}", reason.label()),
+                    selected,
+                    content_width,
+                    theme,
                 ),
             })
             .collect::<Vec<_>>();
@@ -560,6 +566,26 @@ fn render_overlay_box(
         ),
         area,
     );
+}
+
+/// The row standing for a Provider's condition, which choosing re-checks.
+fn model_picker_retry_row<'a>(
+    text: &str,
+    selected: bool,
+    content_width: u16,
+    theme: &Theme,
+) -> Line<'a> {
+    Line::styled(
+        truncate_to_width(
+            &format!("{}{text}", if selected { "› " } else { "  " }),
+            usize::from(content_width),
+        ),
+        if selected {
+            theme.selection.focused
+        } else {
+            theme.feedback.error
+        },
+    )
 }
 
 fn model_picker_row_text(
