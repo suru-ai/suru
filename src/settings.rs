@@ -180,19 +180,19 @@ pub const SCHEMA: &[SettingDescriptor] = &[
     SettingDescriptor {
         key: TRANSCRIPT_REASONING_VISIBILITY,
         label: "Reasoning visibility",
-        description: "Whether a Transcript draws Reasoning or hides it",
+        description: "Whether a Transcript hides Reasoning or draws it",
         scope: SettingScope::Client,
         choices: &[
-            SettingChoice {
-                value: "shown",
-                pin: SettingMutation::TranscriptReasoningVisibility {
-                    value: Some(ReasoningVisibility::Shown),
-                },
-            },
             SettingChoice {
                 value: "hidden",
                 pin: SettingMutation::TranscriptReasoningVisibility {
                     value: Some(ReasoningVisibility::Hidden),
+                },
+            },
+            SettingChoice {
+                value: "shown",
+                pin: SettingMutation::TranscriptReasoningVisibility {
+                    value: Some(ReasoningVisibility::Shown),
                 },
             },
         ],
@@ -799,7 +799,7 @@ mod tests {
             expected,
             vec![
                 "one of \"folded\" or \"expanded\"".to_owned(),
-                "one of \"shown\" or \"hidden\"".to_owned(),
+                "one of \"hidden\" or \"shown\"".to_owned(),
                 "one of \"auto\", \"concise\", \"detailed\", or \"none\"".to_owned(),
             ]
         );

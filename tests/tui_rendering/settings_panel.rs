@@ -127,8 +127,8 @@ fn every_defined_setting_shows_its_effective_value_and_whether_a_config_document
     );
     let visibility = row(&application, "Reasoning visibility");
     assert!(
-        visibility.contains("shown") && visibility.contains("[default]"),
-        "a Transcript shows Reasoning until a reader says otherwise: {visibility:?}"
+        visibility.contains("hidden") && visibility.contains("[default]"),
+        "a Transcript hides Reasoning until a reader asks for it: {visibility:?}"
     );
     assert!(
         rendered_application_rows(&application)

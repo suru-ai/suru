@@ -513,9 +513,9 @@ struct ViewKey {
     width: u16,
     /// Whether Reasoning is drawn at all, which the Settings decide rather than
     /// the reader's clicks. It is a rendering input outside the Session
-    /// snapshot all the same, so ADR 0007 puts it in the key: a Setting edited
-    /// mid-Session moves the Transcript already on screen, where a default Fold
-    /// posture only decides where a fresh view starts.
+    /// snapshot all the same, so ADR 0007 puts it in the key: a reader asking
+    /// for Reasoning mid-Session moves the Transcript already on screen, where
+    /// a default Fold posture only decides where a fresh view starts.
     reasoning_visibility: ReasoningVisibility,
     provisional_fingerprint: u64,
     /// Folds are a rendering input outside the Session snapshot, so ADR 0007
@@ -1036,12 +1036,13 @@ impl<'a> TranscriptContent<'a> {
 }
 
 /// Whether the Transcript shows nothing at all for an Activity. A reader who
-/// hid Reasoning is shown none of it, however fully the Provider described it:
-/// the Setting decides the whole kind at once, where the rules below decide one
-/// block at a time. Either way the Activity stays stored and is simply absent
-/// from the projection, so showing Reasoning again brings back every block that
-/// arrived while it was hidden — and a settled Turn whose only work was
-/// Reasoning loses its Turn Fold marker along with it, because a fold with
+/// has not asked for Reasoning — which is every reader until one does, since
+/// Suru hides it by default — is shown none of it, however fully the Provider
+/// described it: the Setting decides the whole kind at once, where the rules
+/// below decide one block at a time. Either way the Activity stays stored and
+/// is simply absent from the projection, so asking for Reasoning brings back
+/// every block that arrived while it was hidden — and a settled Turn whose only
+/// work was Reasoning has no Turn Fold marker while it is, because a fold with
 /// nothing left to disclose stands for nothing. A Turn that did anything else
 /// keeps its marker, and the duration that marker reports.
 ///

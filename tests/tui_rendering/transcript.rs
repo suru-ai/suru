@@ -1974,8 +1974,9 @@ fn deliver_settings(application: &mut Application, settings: EffectiveSettings, 
         .expect("receive the effective-settings snapshot");
 }
 
-/// The same client, opened under one pinned default Fold posture and built-in
-/// defaults everywhere else.
+/// The same client, opened under one pinned default Fold posture — and with
+/// Reasoning shown, because a posture is only visible in entries the reader is
+/// shown and these fixtures think as well as work.
 fn session_opened_at(
     workspace: &std::path::Path,
     posture: FoldPosture,
@@ -1986,13 +1987,30 @@ fn session_opened_at(
         EffectiveSettings {
             transcript: TranscriptSettings {
                 default_fold_posture: posture,
-                ..TranscriptSettings::default()
+                reasoning_visibility: ReasoningVisibility::Shown,
             },
             ..EffectiveSettings::default()
         },
-        &["transcript.defaultFoldPosture"],
+        &[
+            "transcript.defaultFoldPosture",
+            "transcript.reasoningVisibility",
+        ],
         snapshot,
     )
+}
+
+/// A connected client whose reader asked to see Reasoning. Suru hides it by
+/// default — a Transcript leads with the work and the answer rather than the
+/// account of how the agent got there — so every test about how a Reasoning
+/// row, Group, or Fold presents starts by turning it on.
+fn client_showing_reasoning(workspace: &std::path::Path) -> Application {
+    let mut application = connected_application(workspace);
+    deliver_settings(
+        &mut application,
+        settings_with_reasoning(ReasoningVisibility::Shown),
+        &["transcript.reasoningVisibility"],
+    );
+    application
 }
 
 /// Effective settings whose only departure from the built-in defaults is
@@ -2244,7 +2262,7 @@ fn folded_reasoning_is_one_line_naming_its_title_and_how_long_it_took() {
         "Reading the projection.\n\nThen the store.",
         Some(72_000),
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a settled Reasoning Activity");
@@ -2294,7 +2312,7 @@ fn reasoning_still_running_heads_with_its_running_label_and_no_duration() {
         "Reading the projection.",
         None,
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a streaming Reasoning Activity");
@@ -2324,7 +2342,7 @@ fn untitled_reasoning_heads_with_the_label_alone() {
         "Reading the projection.",
         Some(4_200),
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with an untitled Reasoning Activity");
@@ -2421,7 +2439,7 @@ fn hidden_reasoning_shows_no_row_however_fully_the_provider_described_it() {
 }
 
 #[test]
-fn flipping_reasoning_visibility_moves_the_transcript_the_reader_is_looking_at() {
+fn reasoning_stays_hidden_until_a_reader_asks_for_it_and_arrives_in_the_open_view() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let (snapshot, _) = reasoning_activity_session(
         workspace.path(),
@@ -2437,31 +2455,32 @@ fn flipping_reasoning_visibility_moves_the_transcript_the_reader_is_looking_at()
         snapshot,
     );
     assert!(
-        rendered_application_rows_at(&application, 72, 24)
+        !rendered_application_rows_at(&application, 72, 24)
             .join("\n")
-            .contains("Thought: Inspecting the seam"),
-        "Reasoning shows by default"
+            .contains("Thought"),
+        "the built-in default keeps thinking out of the Transcript"
     );
 
     deliver_settings(
         &mut application,
-        settings_with_reasoning(ReasoningVisibility::Hidden),
+        settings_with_reasoning(ReasoningVisibility::Shown),
         &["transcript.reasoningVisibility"],
     );
-    assert!(
-        !rendered_application_rows_at(&application, 72, 24)
-            .join("\n")
-            .contains("Thought"),
-        "hiding Reasoning reaches the view the reader already has open, \
-         unlike a default Fold posture, which only decides where a view starts"
-    );
-
-    deliver_settings(&mut application, EffectiveSettings::default(), &[]);
     assert!(
         rendered_application_rows_at(&application, 72, 24)
             .join("\n")
             .contains("Thought: Inspecting the seam"),
-        "showing it again brings back the block, which was stored all along"
+        "asking for Reasoning reaches the view the reader already has open — \
+         unlike a default Fold posture, which only decides where a view starts — \
+         and brings back the block that arrived while it was hidden"
+    );
+
+    deliver_settings(&mut application, EffectiveSettings::default(), &[]);
+    assert!(
+        !rendered_application_rows_at(&application, 72, 24)
+            .join("\n")
+            .contains("Thought"),
+        "unpinning the Setting returns the Transcript to its quiet default"
     );
 }
 
@@ -2496,7 +2515,7 @@ fn an_interrupted_reasoning_block_that_said_something_keeps_its_row() {
         "Reading the projection.",
         None,
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose Reasoning block was cut off mid-summary");
@@ -2529,7 +2548,7 @@ fn a_reasoning_block_whose_content_the_cap_dropped_keeps_its_row() {
         panic!("the fixture's Activity is the Reasoning block");
     };
     *content_truncated = true;
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose Reasoning block lost its content to the cap");
@@ -2556,7 +2575,7 @@ fn a_live_reasoning_block_that_settles_empty_loses_the_row_it_was_streaming_in()
         reasoning_activity_session(workspace.path(), ActivityStatus::Active, None, "", None);
     snapshot.session.id = session_id;
     let next_revision = SessionRevision(snapshot.revision.0 + 1);
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose Reasoning block has only just started");
@@ -2597,7 +2616,7 @@ fn a_reasoning_block_the_provider_only_titled_still_renders_its_row() {
         "",
         Some(4_200),
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a titled but wordless Reasoning block");
@@ -2615,7 +2634,7 @@ fn a_reasoning_block_still_running_renders_before_the_provider_describes_it() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let (snapshot, _) =
         reasoning_activity_session(workspace.path(), ActivityStatus::Active, None, "", None);
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose Reasoning block has only just started");
@@ -3287,7 +3306,7 @@ fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
                 SUCCESSFUL_COMMAND,
             ],
         );
-        let mut application = connected_application(workspace.path());
+        let mut application = client_showing_reasoning(workspace.path());
         application
             .handle_event(ApplicationEvent::SessionAttached(snapshot))
             .expect("attach a Session with a broken command run");
@@ -4131,7 +4150,7 @@ fn hidden_reasoning_leaves_a_live_run_nothing_to_stream_into() {
 fn a_run_of_settled_reasoning_blocks_collapses_to_one_thought_row() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &REASONING_RUN);
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a run of settled Reasoning blocks");
@@ -4187,7 +4206,7 @@ fn a_reasoning_group_marker_drops_the_description_when_its_latest_member_has_non
             RunEntry::Reasoning(ReasoningBlock::untitled("Kept reading.", 2_000)),
         ],
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose latest Reasoning block was never titled");
@@ -4215,7 +4234,7 @@ fn a_run_of_one_visible_reasoning_block_keeps_the_presentation_it_has_alone() {
             4_000,
         ))],
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with one settled Reasoning block");
@@ -4235,7 +4254,7 @@ fn a_run_of_one_visible_reasoning_block_keeps_the_presentation_it_has_alone() {
 fn clicking_a_reasoning_group_opens_onto_every_members_prose_and_folds_back() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &REASONING_RUN);
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a run of settled Reasoning blocks");
@@ -4293,7 +4312,7 @@ fn clicking_a_reasoning_group_opens_onto_every_members_prose_and_folds_back() {
 fn clicking_an_expanded_reasoning_groups_prose_leaves_it_open() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &REASONING_RUN);
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a run of settled Reasoning blocks");
@@ -4331,7 +4350,7 @@ fn an_interrupted_reasoning_block_ends_the_run_and_stands_outside_the_group() {
             RunEntry::Reasoning(ReasoningBlock::thought("Settling", "Settled on it.", 400)),
         ],
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose Reasoning run an interrupt cut in two");
@@ -4370,7 +4389,7 @@ fn an_empty_reasoning_block_neither_joins_a_reasoning_group_nor_counts_toward_it
             RunEntry::Reasoning(ReasoningBlock::thought("Settling", "Settled on it.", 400)),
         ],
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose Reasoning run is interleaved with an empty block");
@@ -4418,7 +4437,7 @@ fn every_other_visible_entry_kind_ends_a_reasoning_run() {
                 RunEntry::Reasoning(ReasoningBlock::thought("Settling", "Settled on it.", 400)),
             ],
         );
-        let mut application = connected_application(workspace.path());
+        let mut application = client_showing_reasoning(workspace.path());
         application
             .handle_event(ApplicationEvent::SessionAttached(snapshot))
             .expect("attach a Session with a broken Reasoning run");
@@ -4452,7 +4471,7 @@ fn a_reasoning_group_whose_members_were_never_timed_reports_no_duration() {
             RunEntry::Reasoning(ReasoningBlock::untimed("Settling", "Settled on it.")),
         ],
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose Reasoning blocks predate recorded durations");
@@ -4479,7 +4498,7 @@ fn an_expanded_reasoning_group_marks_the_member_whose_prose_the_cap_cut_short() 
             RunEntry::Reasoning(ReasoningBlock::thought("Settling", "Settled on it.", 400)),
         ],
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose first Reasoning block the cap cut short");
@@ -4518,7 +4537,7 @@ fn a_streaming_reasoning_block_joins_the_group_as_its_live_thinking_row() {
         workspace.path(),
         ReasoningBlock::streaming("Settling", "Settling on it."),
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session still thinking after a settled run");
@@ -4554,7 +4573,7 @@ fn a_live_reasoning_row_holds_its_last_title_while_an_untitled_section_streams()
         workspace.path(),
         ReasoningBlock::streaming_untitled("Still going."),
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose streaming section the Provider has not headed");
@@ -4578,7 +4597,7 @@ fn clicking_the_live_reasoning_row_reveals_the_streaming_prose_and_hides_it_agai
         workspace.path(),
         ReasoningBlock::streaming("Settling", "Settling on it."),
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session still thinking after a settled run");
@@ -4635,7 +4654,7 @@ fn a_live_reasoning_group_settles_into_its_thought_row_without_moving() {
     );
     let streaming_id = snapshot.activities[2].id();
     let next_revision = SessionRevision(snapshot.revision.0 + 1);
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session still thinking after a settled run");
@@ -4689,7 +4708,7 @@ fn an_interrupted_streaming_block_leaves_the_group_it_was_living_in() {
     );
     let streaming_id = snapshot.activities[2].id();
     let next_revision = SessionRevision(snapshot.revision.0 + 1);
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session still thinking after a settled run");
@@ -4739,7 +4758,7 @@ fn interrupting_a_turn_keeps_the_live_reasoning_row_the_reader_had_opened() {
     let streaming_id = snapshot.activities[2].id();
     let interrupted_turn = snapshot.turns[0].id;
     let revision = snapshot.revision;
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session still thinking after a settled run");
@@ -4810,7 +4829,7 @@ fn a_turn_fold_reveals_its_reasoning_group_in_the_state_the_reader_left_it() {
     );
     snapshot.session.status = SessionStatus::Idle;
     snapshot.turns[0].status = TurnStatus::Completed;
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose settled Turn only ever thought");
@@ -5066,7 +5085,7 @@ fn clicking_a_turn_fold_marker_opens_the_turn_and_folds_it_back() {
         "Run the workflow",
         "The workflow is green.",
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose Turn has settled");
@@ -5140,7 +5159,7 @@ fn toggling_the_turn_posture_flips_every_turn_fold_and_clears_per_turn_overrides
         "Checking the release notes",
         "Shipped.",
     );
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with two settled Turns");
@@ -5253,11 +5272,11 @@ fn interrupting_a_turn_holds_its_fold_open_until_a_newer_turn_begins() {
     let interrupted_turn = snapshot.turns[0].id;
     set_turn_in_flight(&mut snapshot, interrupted_turn);
     let revision = snapshot.revision;
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     // A second client watching the same Session, so the test reads what the
     // interrupt does to the reader who asked for it and what it does to a view
     // that did not.
-    let mut observer = connected_application(workspace.path());
+    let mut observer = client_showing_reasoning(workspace.path());
     for client in [&mut application, &mut observer] {
         client
             .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
@@ -5415,7 +5434,7 @@ fn a_newer_turn_refolds_the_turn_the_reader_expanded_by_hand() {
     );
     let session_id = snapshot.session.id;
     let revision = snapshot.revision;
-    let mut application = connected_application(workspace.path());
+    let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose Turn has settled");

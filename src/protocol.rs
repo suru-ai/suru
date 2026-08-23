@@ -407,17 +407,21 @@ pub enum ReasoningSummaryDetail {
 
 /// Whether a Transcript draws the Reasoning a Session stored.
 ///
-/// Hiding is presentation and nothing more: the blocks keep arriving, keep
-/// being stored, and keep being what a Provider was asked for — a reader who
-/// does not want thinking in front of them simply is not shown it. Distinct
-/// from the `provider.codex.reasoningSummary` Setting, which decides how much
-/// Reasoning a Turn asks for in the first place.
+/// Hidden is the built-in default: thinking is the agent's working-out, and a
+/// Transcript leads with the work and the answer rather than the account of
+/// how the agent got there. Showing it is a reader's deliberate choice.
+///
+/// Either way it is presentation and nothing more: the blocks keep arriving,
+/// keep being stored, and keep being what a Provider was asked for, so a
+/// reader who turns Reasoning on is shown every block that arrived while it
+/// was off. Distinct from the `provider.codex.reasoningSummary` Setting, which
+/// decides how much Reasoning a Turn asks for in the first place.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningVisibility {
     #[default]
-    Shown,
     Hidden,
+    Shown,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

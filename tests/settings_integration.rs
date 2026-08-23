@@ -85,14 +85,14 @@ async fn a_pinned_setting_reaches_every_connecting_client_and_the_rest_default()
 }
 
 #[tokio::test]
-async fn hiding_reasoning_pins_from_a_document_and_resets_to_the_default() {
+async fn showing_reasoning_pins_from_a_document_and_resets_to_the_hidden_default() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
     std::fs::write(
         config_dir.path().join("suru.jsonc"),
         r#"{
-            // I do not want to read the model think.
-            "transcript": { "reasoningVisibility": "hidden" },
+            // I want to read the model think.
+            "transcript": { "reasoningVisibility": "shown" },
         }"#,
     )
     .expect("write Config Document");
@@ -107,12 +107,12 @@ async fn hiding_reasoning_pins_from_a_document_and_resets_to_the_default() {
     let (client, opening) = attach(state_dir.path(), "settings-reasoning").await;
     assert_eq!(
         opening.settings.transcript.reasoning_visibility,
-        ReasoningVisibility::Hidden
+        ReasoningVisibility::Shown
     );
     assert_eq!(
         opening.settings.provider.codex.reasoning_summary,
         ReasoningSummaryDetail::Auto,
-        "hiding Reasoning is presentation and asks Codex for no less of it"
+        "what a Transcript draws is presentation and asks Codex for nothing different"
     );
     assert_eq!(opening.pinned, ["transcript.reasoningVisibility"]);
     assert_eq!(opening.diagnostics, []);
@@ -123,7 +123,7 @@ async fn hiding_reasoning_pins_from_a_document_and_resets_to_the_default() {
         .expect("reset the Setting");
     assert_eq!(
         answered.settings.transcript.reasoning_visibility,
-        ReasoningVisibility::Shown,
+        ReasoningVisibility::Hidden,
         "unpinning it lets the built-in default resume"
     );
     assert_eq!(answered.pinned, [] as [String; 0]);
