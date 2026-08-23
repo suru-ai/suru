@@ -17,4 +17,4 @@ pub(crate) use process::{
     HarnessLink, HarnessSpec, ProcessGuard, ProcessRegistry, ProcessStdio, spawn_harness_process,
     supervise_harness_process,
 };
-pub(crate) use shared::{HarnessConnector, SharedHarness};
+pub(crate) use shared::{HarnessConnector, SharedHarness, SharedHarnessHandle};

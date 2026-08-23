@@ -10,7 +10,7 @@ use github_copilot_sdk::{
 };
 use serde_json::Value;
 
-use super::{CONTEXT_TIER_OPTION_ID, REASONING_EFFORT_OPTION_ID};
+use super::{CONTEXT_TIER_OPTION_ID, COPILOT_PROVIDER_ID, REASONING_EFFORT_OPTION_ID};
 use crate::{
     protocol::{
         ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
@@ -26,7 +26,7 @@ const AUTO_MODEL_ID: &str = "auto";
 /// The wire name Copilot knows `tier` by, read out of the SDK's own serialization rather than
 /// written here: a Session lowers these same IDs back over the wire, so a tier Copilot renames must
 /// arrive renamed rather than quietly going stale.
-fn tier_id(tier: ContextTier) -> String {
+pub(super) fn tier_id(tier: ContextTier) -> String {
     let Ok(Value::String(id)) = serde_json::to_value(tier) else {
         unreachable!("the SDK serializes a Copilot context tier as its wire name");
     };
@@ -62,7 +62,7 @@ fn model_descriptor(model: Model) -> ModelDescriptor {
         options.push(tier);
     }
     ModelDescriptor {
-        provider: ProviderId::new("copilot"),
+        provider: ProviderId::new(COPILOT_PROVIDER_ID),
         id: ModelId::new(model.id),
         display_name: model.name,
         description: category_description(model.model_picker_category),

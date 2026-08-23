@@ -3,8 +3,8 @@
 use std::ffi::{OsStr, OsString};
 
 use super::{
-    COPILOT_HARNESS_NAME, COPILOT_SERVER_ARGS, catalog::model_descriptors, copilot_error,
-    copilot_error_context, transport::CopilotConnector,
+    COPILOT_HARNESS_NAME, COPILOT_PROVIDER_ID, COPILOT_SERVER_ARGS, catalog::model_descriptors,
+    copilot_error_context, session::start_copilot_session, transport::CopilotConnector,
 };
 use crate::{
     protocol::{ModelDescriptor, ProviderId},
@@ -52,7 +52,7 @@ impl Default for CopilotRuntime {
 
 impl ProviderRuntime for CopilotRuntime {
     fn provider_id(&self) -> ProviderId {
-        ProviderId::new("copilot")
+        ProviderId::new(COPILOT_PROVIDER_ID)
     }
 
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
@@ -74,11 +74,14 @@ impl ProviderRuntime for CopilotRuntime {
 
     fn start_session(
         &self,
-        _request: ProviderSessionRequest,
+        request: ProviderSessionRequest,
     ) -> ProviderFuture<'_, ProviderSessionConnection> {
-        // Copilot's Model catalog lands one ticket ahead of its Sessions (#118): the Provider is
-        // selectable in the picker before a Turn can run against it.
-        Box::pin(async move { Err(copilot_error("Copilot cannot open a Session yet")) })
+        Box::pin(async move {
+            // Launches the shared process if this is the first demand, or the first since a crash,
+            // which is how the Prompt after a harness crash recovers without a restart.
+            let handle = self.harness.demand().await?;
+            start_copilot_session(handle, request).await
+        })
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {

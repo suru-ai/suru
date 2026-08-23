@@ -8,9 +8,13 @@
 //!
 //! Unlike Codex, one Copilot CLI process hosts every Copilot Session, so the runtime owns a single
 //! [`shared harness`](super::harness::SharedHarness) that Model discovery and Sessions alike demand.
+//! [`session`] opens one Copilot Session on that process and runs its Turns, and [`projection`]
+//! turns the Session's event timeline into the Provider events the rest of Suru consumes.
 
 mod catalog;
+mod projection;
 mod runtime;
+mod session;
 mod transport;
 
 pub use runtime::CopilotRuntime;
@@ -27,6 +31,13 @@ const COPILOT_SERVER_ARGS: [&str; 3] = ["--server", "--stdio", "--no-auto-update
 
 const REASONING_EFFORT_OPTION_ID: &str = "reasoning_effort";
 const CONTEXT_TIER_OPTION_ID: &str = "context_tier";
+
+/// What Suru knows this Provider as, and the Agent its Sessions' Turns are attributed to.
+const COPILOT_PROVIDER_ID: &str = "copilot";
+const COPILOT_AGENT_ID: &str = "copilot";
+
+/// What Copilot records as the application driving its Sessions.
+const COPILOT_CLIENT_NAME: &str = "suru";
 
 /// What a Copilot failure is called when Copilot itself said nothing usable.
 const COPILOT_FAILURE_FALLBACK: &str = "Copilot Provider failed";

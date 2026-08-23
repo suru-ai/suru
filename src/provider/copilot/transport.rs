@@ -100,12 +100,17 @@ impl CopilotConnection {
             .map_err(|error| self.failure("Copilot Model discovery failed", error))
     }
 
+    /// The SDK client every request on this connection goes through.
+    pub(super) fn client(&self) -> &Client {
+        &self.client
+    }
+
     /// The Provider failure to report for `error` under `context`.
     ///
     /// Once the process is gone every in-flight and later request fails with a transport-shaped SDK
     /// error that says nothing about why. The supervisor already decided what the exit meant — and
     /// whether it lost a Provider Session — so its account wins wherever it exists.
-    fn failure(&self, context: &str, error: impl std::fmt::Display) -> ProviderError {
+    pub(super) fn failure(&self, context: &str, error: impl std::fmt::Display) -> ProviderError {
         match self.end() {
             Some(ConnectionEnd::Terminated(exit)) => copilot_error_context(context, exit),
             Some(ConnectionEnd::Closed) => copilot_error(format!(

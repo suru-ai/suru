@@ -8,7 +8,7 @@
 
 use tokio::time::{Duration, timeout};
 
-use crate::scripted_binary_support::{captured_methods, write_executable};
+use crate::scripted_binary_support::{captured_methods, captured_requests, write_executable};
 
 /// Reads one Content-Length-framed request at a time, records it, and dispatches it to the test's
 /// arms. `read` on a pipe consumes a byte at a time, so `dd` picks up exactly where the blank line
@@ -24,6 +24,12 @@ trap 'printf exited > "$COPILOT_FIXTURE_EXITED"' EXIT
 
 reply() {
   printf 'Content-Length: %s\r\n\r\n%s' "$(printf '%s' "$1" | wc -c | tr -d ' ')" "$1"
+}
+
+# One entry on the Session's timeline: `event <id> <type> <data-object>`. The Session it belongs to
+# is the one the create arm recorded, so the SDK routes it to the Session Suru is driving.
+event() {
+  reply '{"jsonrpc":"2.0","method":"session.event","params":{"sessionId":"'"$sid"'","event":{"id":"'"$1"'","timestamp":"2026-01-01T00:00:00Z","type":"'"$2"'","data":'"$3"'}}}'
 }
 
 while IFS= read -r header; do
@@ -51,8 +57,60 @@ pub fn connect_arm() -> String {
     )
 }
 
+/// A `session.create` arm answering with the identifier Suru generated for the Session, and holding
+/// on to it so the arms that follow can address their events at that Session.
+pub fn create_session_arm() -> String {
+    r#"    *'"method":"session.create"'*)
+      sid=$(printf '%s' "$body" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+      reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"sessionId":"'"$sid"'"}}'
+      ;;
+"#
+    .to_owned()
+}
+
+/// A `session.model.getCurrent` arm reporting the Model the Session resolved to, with the reasoning
+/// effort and context tier in force on it.
+pub fn current_model_arm(model: &str, effort: &str, tier: &str) -> String {
+    format!(
+        r#"    *'"method":"session.model.getCurrent"'*)
+      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"modelId":"{model}","reasoningEffort":"{effort}","contextTier":"{tier}"}}}}'
+      ;;
+"#
+    )
+}
+
+/// A `session.model.switchTo` arm that accepts whatever Model the Turn asks for.
+pub fn switch_model_arm() -> String {
+    r#"    *'"method":"session.model.switchTo"'*)
+      reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"modelId":"switched"}}'
+      ;;
+"#
+    .to_owned()
+}
+
+/// A `session.send` arm that accepts the Prompt and then plays `timeline` — `event` lines, and
+/// whatever else the test wants the CLI to do while the Turn runs.
+pub fn send_arm(timeline: &str) -> String {
+    format!(
+        r#"    *'"method":"session.send"'*)
+      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"messageId":"fixture-message"}}}}'
+{timeline}      ;;
+"#
+    )
+}
+
+/// An arm accepting the permission decision the harness answers a request with, so a fixture that
+/// asks for one is not left waiting.
+pub fn permission_decision_arm() -> String {
+    r#"    *'"method":"session.permissions.handlePendingPermissionRequest"'*)
+      reply '{"jsonrpc":"2.0","id":'"$id"',"result":{}}'
+      ;;
+"#
+    .to_owned()
+}
+
 /// A `models.list` arm answering with `models`, a JSON array literal.
-fn models_arm(models: &str) -> String {
+pub fn models_arm(models: &str) -> String {
     format!(
         r#"    *'"method":"models.list"'*)
       reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"models":{models}}}}}'
@@ -68,6 +126,7 @@ pub struct ScriptedCopilot {
     attempts: std::path::PathBuf,
     argv: std::path::PathBuf,
     exited: std::path::PathBuf,
+    release: std::path::PathBuf,
 }
 
 impl ScriptedCopilot {
@@ -86,11 +145,13 @@ impl ScriptedCopilot {
         let attempts = path("attempts");
         let argv = path("argv");
         let exited = path("exited");
+        let release = path("release");
         let script = format!("{SCRIPT_PREFIX}{case_arms}  esac\ndone\n")
             .replace("$COPILOT_FIXTURE_LOG", fixture_path(&log))
             .replace("$COPILOT_FIXTURE_ATTEMPTS", fixture_path(&attempts))
             .replace("$COPILOT_FIXTURE_ARGV", fixture_path(&argv))
-            .replace("$COPILOT_FIXTURE_EXITED", fixture_path(&exited));
+            .replace("$COPILOT_FIXTURE_EXITED", fixture_path(&exited))
+            .replace("$COPILOT_FIXTURE_RELEASE", fixture_path(&release));
         write_executable(&executable, &script);
         Self {
             _directory: directory,
@@ -99,7 +160,14 @@ impl ScriptedCopilot {
             attempts,
             argv,
             exited,
+            release,
         }
+    }
+
+    /// Lets a fixture holding at `$COPILOT_FIXTURE_RELEASE` carry on, so a test can arrange the
+    /// Session it wants before the CLI plays the rest of its timeline.
+    pub fn release(&self) {
+        std::fs::write(&self.release, b"release").expect("release the scripted Copilot timeline");
     }
 
     pub fn executable(&self) -> &std::path::Path {
@@ -127,6 +195,32 @@ impl ScriptedCopilot {
     /// The methods the runtime asked the CLI for, in the order they arrived.
     pub fn methods(&self) -> Vec<String> {
         captured_methods(&self.log)
+    }
+
+    /// Everything the runtime sent the CLI, in the order it arrived.
+    pub fn requests(&self) -> Vec<serde_json::Value> {
+        captured_requests(&self.log)
+    }
+
+    /// The first request the runtime made for `method`, once it has.
+    pub async fn wait_for_request(&self, method: &str) -> serde_json::Value {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(request) = self.requests().into_iter().find(|request| {
+                    request.get("method").and_then(serde_json::Value::as_str) == Some(method)
+                }) {
+                    return request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "scripted Copilot receives {method}; captured methods: {:?}",
+                self.methods()
+            )
+        })
     }
 
     pub async fn wait_for_exit(&self) {
