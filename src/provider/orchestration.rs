@@ -55,7 +55,10 @@ const MAX_STORED_REASONING_CHARS: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct ProviderOrchestrator {
-    runtime: Arc<dyn ProviderRuntime>,
+    /// Every Provider runtime this server hosts, in the fixed built-in order.
+    /// A Session routes to the runtime its Agent Selection names, and a
+    /// Session that has no selection yet routes to the first runtime.
+    runtimes: Arc<Vec<Arc<dyn ProviderRuntime>>>,
     sessions: SessionStore,
     actors: Arc<Mutex<ProviderActors>>,
     shutdown: watch::Receiver<bool>,
@@ -224,14 +227,18 @@ enum ProviderEventProjection {
 
 impl ProviderOrchestrator {
     pub(crate) fn new(
-        runtime: Arc<dyn ProviderRuntime>,
+        runtimes: Vec<Arc<dyn ProviderRuntime>>,
         sessions: SessionStore,
         shutdown: watch::Receiver<bool>,
         updates: ProviderUpdateGate,
     ) -> Self {
+        assert!(
+            !runtimes.is_empty(),
+            "Provider orchestration requires at least one hosted runtime"
+        );
         let (shutdown_complete, _) = watch::channel(false);
         Self {
-            runtime,
+            runtimes: Arc::new(runtimes),
             sessions,
             actors: Arc::new(Mutex::new(ProviderActors {
                 shutting_down: false,
@@ -249,18 +256,81 @@ impl ProviderOrchestrator {
         workspace: PathBuf,
         prompt_id: PromptId,
     ) {
-        let commands_tx = self
-            .get_or_spawn_actor_commands(session_id, workspace)
-            .expect("new Session accepts its initial Prompt");
-        commands_tx
-            .send(ProviderCommand::StartPrompt { prompt_id })
-            .expect("new Provider actor accepts its initial Prompt");
+        if let Ok(commands_tx) =
+            self.actor_commands_or_fail_prompt(session_id, workspace, prompt_id)
+        {
+            commands_tx
+                .send(ProviderCommand::StartPrompt { prompt_id })
+                .expect("new Provider actor accepts its initial Prompt");
+        }
+    }
+
+    /// The Session's Provider runtime under this server's hosted set. A Session
+    /// keeps the Provider it was selected with (ADR-0005); one that has no
+    /// Agent Selection yet takes the first hosted runtime, the built-in
+    /// default order's head.
+    fn resolve_runtime(&self, session_id: SessionId) -> Result<Arc<dyn ProviderRuntime>, String> {
+        let Some(provider) = self.sessions.provider(session_id) else {
+            return Ok(self.runtimes[0].clone());
+        };
+        self.runtimes
+            .iter()
+            .find(|runtime| runtime.provider_id() == provider)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "Provider startup failed: Provider `{provider}` is not hosted by this server."
+                )
+            })
+    }
+
+    /// Returns the Session's actor, resolving the Session's runtime only when
+    /// no actor is running yet: an existing actor already owns the Session's
+    /// Provider conversation and keeps it (ADR-0005). When a new actor is
+    /// needed and the Session's Provider is not hosted here — a Session
+    /// stored under a Provider this server no longer hosts — the Prompt's
+    /// Turn settles as failed legibly rather than running on the wrong
+    /// Provider.
+    fn actor_commands_or_fail_prompt(
+        &self,
+        session_id: SessionId,
+        workspace: PathBuf,
+        prompt_id: PromptId,
+    ) -> Result<mpsc::UnboundedSender<ProviderCommand>> {
+        if let Some(commands) = self
+            .actors
+            .lock()
+            .expect("Provider actor registry lock is not poisoned")
+            .entries
+            .get(&session_id)
+            .map(|actor| actor.commands.clone())
+        {
+            return Ok(commands);
+        }
+        let runtime = match self.resolve_runtime(session_id) {
+            Ok(runtime) => runtime,
+            Err(message) => {
+                let _ = self.updates.apply(|| {
+                    self.sessions.deliver_prompt(
+                        session_id,
+                        prompt_id,
+                        None,
+                        DeliveredTurnStatus::Failed { message },
+                    )
+                });
+                return Err(anyhow::anyhow!(
+                    "Session's Provider is not hosted by this server"
+                ));
+            }
+        };
+        self.get_or_spawn_actor_commands(session_id, workspace, runtime)
     }
 
     fn get_or_spawn_actor_commands(
         &self,
         session_id: SessionId,
         workspace: PathBuf,
+        runtime: Arc<dyn ProviderRuntime>,
     ) -> Result<mpsc::UnboundedSender<ProviderCommand>> {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let mut actors = self
@@ -273,7 +343,6 @@ impl ProviderOrchestrator {
         if actors.shutting_down || *self.shutdown.borrow() {
             return Err(anyhow::anyhow!("Provider orchestrator is shutting down"));
         }
-        let runtime = self.runtime.clone();
         let sessions = self.sessions.clone();
         let (session_shutdown, session_shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(run_provider_session(
@@ -304,7 +373,13 @@ impl ProviderOrchestrator {
             .sessions
             .workspace(session_id)
             .ok_or_else(|| anyhow::anyhow!("Session does not exist on this server instance"))?;
-        self.get_or_spawn_actor_commands(session_id, workspace)?
+        let Ok(commands) = self.actor_commands_or_fail_prompt(session_id, workspace, prompt_id)
+        else {
+            // The Prompt's Turn was already settled as failed; scheduling has
+            // nothing left to deliver.
+            return Ok(());
+        };
+        commands
             .send(ProviderCommand::StartPrompt { prompt_id })
             .map_err(|_| anyhow::anyhow!("Session Provider actor stopped unexpectedly"))
     }
@@ -447,7 +522,11 @@ impl ProviderOrchestrator {
                 let _ = task.await;
             }
         }
-        let _ = timeout(Duration::from_secs(2), self.runtime.shutdown()).await;
+        let _ = timeout(
+            Duration::from_secs(2),
+            futures_util::future::join_all(self.runtimes.iter().map(|runtime| runtime.shutdown())),
+        )
+        .await;
         self.shutdown_complete.send_replace(true);
     }
 }

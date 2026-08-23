@@ -217,6 +217,19 @@ impl SessionStore {
             .map(|record| record.snapshot.session.workspace.path.clone())
     }
 
+    /// The Provider the Session was selected with, or `None` while no Agent
+    /// Selection has reached it yet. ADR-0005 fixes this per Session: the
+    /// orchestrator routes by it, and selection mutations may not change it.
+    pub(crate) fn provider(&self, session_id: SessionId) -> Option<ProviderId> {
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .sessions
+            .get(&session_id)
+            .and_then(|record| record.snapshot.session.agent_selection.as_ref())
+            .map(|selection| selection.provider.clone())
+    }
+
     pub(crate) fn resume_state(
         &self,
         session_id: SessionId,

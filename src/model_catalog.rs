@@ -60,11 +60,16 @@ impl ModelCatalogService {
         }
     }
 
-    pub(crate) fn default_selection(&self, provider: &ProviderId) -> Option<AgentSelection> {
-        self.cached_models(provider)?
-            .iter()
-            .find(|model| model.is_default)
-            .map(ModelDescriptor::default_agent_selection)
+    /// The Agent Selection a fresh Landing starts from: hosted Providers are
+    /// consulted in their fixed built-in order, and the first whose cached
+    /// catalog carries a default Model supplies it.
+    pub(crate) fn default_selection(&self) -> Option<AgentSelection> {
+        self.providers.iter().find_map(|catalog| {
+            self.cached_models(&catalog.provider)?
+                .iter()
+                .find(|model| model.is_default)
+                .map(ModelDescriptor::default_agent_selection)
+        })
     }
 
     pub(crate) fn normalize_selection(

@@ -10,6 +10,7 @@ mod failing_provider_support;
 mod provider_support;
 
 mod managed_client;
+mod multi_provider;
 mod prompts;
 mod selection;
 mod storage;

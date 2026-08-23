@@ -301,31 +301,40 @@ struct AppState {
     settings: Arc<watch::Sender<SettingsSnapshot>>,
     /// The Config Documents behind that view, which this server alone writes.
     config_documents: ConfigDocuments,
-    /// Held so an accepted mutation can hand the Provider runtime the Server
-    /// Settings it now runs under.
-    runtime: Arc<dyn ProviderRuntime>,
+    /// Held so an accepted mutation can hand every hosted Provider runtime
+    /// the Server Settings it now runs under.
+    runtimes: Arc<Vec<Arc<dyn ProviderRuntime>>>,
+    /// The Providers this server hosts, in the fixed built-in order. Agent
+    /// Selections normalize against this set rather than any single Provider
+    /// identity.
+    hosted_providers: Arc<Vec<ProviderId>>,
     shutdown: ShutdownController,
-    provider_id: ProviderId,
     timings: ServerTimings,
 }
 
 pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
-    spawn_with_provider(config, Arc::new(CodexRuntime::from_environment())).await
+    spawn_with_providers(config, built_in_runtimes()).await
 }
 
 pub async fn spawn_with_provider(
     config: ServerConfig,
     runtime: Arc<dyn ProviderRuntime>,
 ) -> Result<RunningServer> {
-    spawn_with_provider_and_timings(config, runtime, ServerTimings::default()).await
+    spawn_with_providers(config, vec![runtime]).await
+}
+
+pub async fn spawn_with_providers(
+    config: ServerConfig,
+    runtimes: Vec<Arc<dyn ProviderRuntime>>,
+) -> Result<RunningServer> {
+    spawn_with_providers_and_timings(config, runtimes, ServerTimings::default()).await
 }
 
 pub async fn spawn_with_timings(
     config: ServerConfig,
     timings: ServerTimings,
 ) -> Result<RunningServer> {
-    spawn_with_provider_and_timings(config, Arc::new(CodexRuntime::from_environment()), timings)
-        .await
+    spawn_with_providers_and_timings(config, built_in_runtimes(), timings).await
 }
 
 pub async fn spawn_with_provider_and_timings(
@@ -333,6 +342,38 @@ pub async fn spawn_with_provider_and_timings(
     runtime: Arc<dyn ProviderRuntime>,
     timings: ServerTimings,
 ) -> Result<RunningServer> {
+    spawn_with_providers_and_timings(config, vec![runtime], timings).await
+}
+
+/// The Provider runtimes a production server hosts, in the fixed built-in
+/// order a fresh Landing defaults from. This is the one place the server
+/// names a concrete Provider.
+fn built_in_runtimes() -> Vec<Arc<dyn ProviderRuntime>> {
+    vec![Arc::new(CodexRuntime::from_environment())]
+}
+
+pub async fn spawn_with_providers_and_timings(
+    config: ServerConfig,
+    runtimes: Vec<Arc<dyn ProviderRuntime>>,
+    timings: ServerTimings,
+) -> Result<RunningServer> {
+    anyhow::ensure!(
+        !runtimes.is_empty(),
+        "server requires at least one Provider runtime"
+    );
+    let hosted_providers: Vec<ProviderId> = runtimes
+        .iter()
+        .map(|runtime| runtime.provider_id())
+        .collect();
+    {
+        let mut seen = std::collections::HashSet::new();
+        for provider in &hosted_providers {
+            anyhow::ensure!(
+                seen.insert(provider),
+                "server hosts Provider `{provider}` more than once"
+            );
+        }
+    }
     config.create_private_runtime_dir()?;
 
     let lock = OpenOptions::new()
@@ -350,7 +391,7 @@ pub async fn spawn_with_provider_and_timings(
     let (settings, _) = watch::channel(SettingsSnapshot::default());
     // Before any Session starts, so the first Turn already runs under the
     // Server Settings the Config Documents pinned.
-    adopt_settings(&settings, runtime.as_ref(), &config_documents.load());
+    adopt_settings(&settings, &runtimes, &config_documents.load());
 
     let repository = StorageRepository::open(config.data_dir())
         .await
@@ -393,14 +434,13 @@ pub async fn spawn_with_provider_and_timings(
         provider_updates: provider_updates.clone(),
         shutdown_grace: timings.shutdown_grace,
     };
-    let provider_id = runtime.provider_id();
     let (storage_writer, storage) = StorageWriter::spawn(repository, &persisted_sessions.readable);
     let sessions = SessionStore::new(persisted_sessions, storage.clone());
     let landing_agent_selection =
         LandingAgentSelectionStore::new(persisted_landing_agent_selection, storage);
-    let model_catalog = ModelCatalogService::new([runtime.clone()]);
+    let model_catalog = ModelCatalogService::new(runtimes.iter().cloned());
     let providers = ProviderOrchestrator::new(
-        runtime.clone(),
+        runtimes.clone(),
         sessions.clone(),
         provider_shutdown_rx,
         provider_updates,
@@ -413,9 +453,9 @@ pub async fn spawn_with_provider_and_timings(
         landing_agent_selection,
         settings: Arc::new(settings),
         config_documents,
-        runtime,
+        runtimes: Arc::new(runtimes),
+        hosted_providers: Arc::new(hosted_providers),
         shutdown: shutdown.clone(),
-        provider_id,
         timings,
     };
     let app = Router::new()
@@ -638,7 +678,7 @@ async fn mutate_setting(State(state): State<AppState>, request: Request) -> Resp
         .expect("Config Document edit runs to completion");
     match mutated {
         Ok(snapshot) => {
-            adopt_settings(&state.settings, state.runtime.as_ref(), &snapshot);
+            adopt_settings(&state.settings, &state.runtimes, &snapshot);
             Json(snapshot).into_response()
         }
         Err(error @ SettingsMutationError::NoConfigRoot) => session_error_response(
@@ -663,17 +703,19 @@ async fn mutate_setting(State(state): State<AppState>, request: Request) -> Resp
 }
 
 /// Puts a freshly loaded effective-settings view in force: its problems reach
-/// the Log, the Provider runtime takes the Server Settings it now runs under,
-/// and every attached client receives the snapshot. Startup and an accepted
-/// mutation adopt a view the same way, and a future Config Document watcher
-/// will too.
+/// the Log, every hosted Provider runtime takes the Server Settings it now
+/// runs under, and every attached client receives the snapshot. Startup and an
+/// accepted mutation adopt a view the same way, and a future Config Document
+/// watcher will too.
 fn adopt_settings(
     settings: &watch::Sender<SettingsSnapshot>,
-    runtime: &dyn ProviderRuntime,
+    runtimes: &[Arc<dyn ProviderRuntime>],
     snapshot: &SettingsSnapshot,
 ) {
     crate::settings::log_diagnostics(&snapshot.diagnostics);
-    runtime.apply_settings(&snapshot.settings);
+    for runtime in runtimes {
+        runtime.apply_settings(&snapshot.settings);
+    }
     settings.send_replace(snapshot.clone());
 }
 
@@ -784,7 +826,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         request.agent_selection = state
             .landing_agent_selection
             .current()
-            .or_else(|| state.model_catalog.default_selection(&state.provider_id));
+            .or_else(|| state.model_catalog.default_selection());
     }
 
     match state.sessions.create(request) {
@@ -890,7 +932,7 @@ fn normalize_agent_selection(
     selection: AgentSelection,
     provider_conflict_response: fn() -> Response,
 ) -> std::result::Result<AgentSelection, Box<Response>> {
-    if selection.provider != state.provider_id {
+    if !state.hosted_providers.contains(&selection.provider) {
         return Err(Box::new(provider_conflict_response()));
     }
     state

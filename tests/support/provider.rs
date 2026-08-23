@@ -15,6 +15,8 @@ pub struct ControlledProvider {
 
 #[derive(Clone)]
 pub struct ControlledProviderRuntime {
+    provider: ProviderId,
+    models: Vec<ModelDescriptor>,
     starts: mpsc::UnboundedSender<StartRequest>,
 }
 
@@ -54,9 +56,23 @@ struct ControlledSessionHandle {
 
 impl ControlledProvider {
     pub fn new() -> (Arc<ControlledProviderRuntime>, Self) {
+        Self::with_provider(ProviderId::new("controlled"), Vec::new())
+    }
+
+    /// A controlled runtime hosted under a chosen Provider identity, serving
+    /// the given Model catalog. Lets one server host several distinguishable
+    /// doubles side by side.
+    pub fn with_provider(
+        provider: ProviderId,
+        models: Vec<ModelDescriptor>,
+    ) -> (Arc<ControlledProviderRuntime>, Self) {
         let (starts_tx, starts_rx) = mpsc::unbounded_channel();
         (
-            Arc::new(ControlledProviderRuntime { starts: starts_tx }),
+            Arc::new(ControlledProviderRuntime {
+                provider,
+                models,
+                starts: starts_tx,
+            }),
             Self { starts: starts_rx },
         )
     }
@@ -198,11 +214,12 @@ impl TurnInterrupt {
 
 impl ProviderRuntime for ControlledProviderRuntime {
     fn provider_id(&self) -> ProviderId {
-        ProviderId::new("controlled")
+        self.provider.clone()
     }
 
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
-        Box::pin(async { Ok(Vec::new()) })
+        let models = self.models.clone();
+        Box::pin(async move { Ok(models) })
     }
 
     fn start_session(
