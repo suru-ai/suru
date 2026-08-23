@@ -72,9 +72,9 @@ const LIVE_COMMAND_TAIL_ROWS: usize = 3;
 /// truncation marker lines up with the lines it stands in for.
 const OUTPUT_INDENT: &str = "    ";
 
-/// The extra gutter an expanded Group's members sit in, so a member reads as
-/// subordinate to the Group header above it.
-const GROUP_MEMBER_INDENT: &str = "  ";
+/// The extra gutter an expanded Group's or Turn Fold's members sit in, so a
+/// member reads as subordinate to the header row it folds back into.
+const MEMBER_INDENT: &str = "  ";
 
 /// Paths a folded FileChange Activity lists before its fold marker.
 /// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
@@ -655,6 +655,13 @@ enum RenderUnit<'a> {
     /// and its click target all work exactly as they do standalone. Only the
     /// kinds whose expansion opens onto their members plan these.
     GroupMember(&'a Activity),
+    /// A unit an expanded Turn Fold disclosed: the unit it would be
+    /// standalone, drawn in the member gutter so the disclosed work reads as
+    /// subordinate to the marker it folds back into, exactly as an expanded
+    /// Group's members read under their header. Wrapping rather than flagging
+    /// keeps member-ness one seam: the inner unit's key, Fold, and click
+    /// target all work exactly as they do standalone.
+    TurnMember(Box<RenderUnit<'a>>),
     /// A settled Turn's fold: the single marker row standing where the work
     /// the fold hides happened. The entries behind it are absent from the
     /// plan rather than held by this unit, because a Turn Fold hides entries
@@ -672,6 +679,7 @@ impl RenderUnit<'_> {
             Self::Activity(activity) => UnitKey::Activity(activity.id()),
             Self::Group { members, .. } => UnitKey::Group(members[0].id()),
             Self::GroupMember(activity) => UnitKey::Activity(activity.id()),
+            Self::TurnMember(unit) => unit.key(),
             Self::TurnFold(marker) => UnitKey::TurnFold(marker.turn_id),
             Self::Provisional(prompt) => UnitKey::Provisional(prompt.id),
         }
@@ -698,6 +706,15 @@ impl RenderUnit<'_> {
                 let mut hasher = std::hash::DefaultHasher::new();
                 activity_fingerprint(activity, resolved_fold_step(folds, activity))
                     .hash(&mut hasher);
+                true.hash(&mut hasher);
+                hasher.finish()
+            }
+            // Turn-member-ness joins the inner unit's own signals, so a
+            // cached standalone render never survives the move into the
+            // member gutter, nor the move back out.
+            Self::TurnMember(unit) => {
+                let mut hasher = std::hash::DefaultHasher::new();
+                unit.fingerprint(folds).hash(&mut hasher);
                 true.hash(&mut hasher);
                 hasher.finish()
             }
@@ -728,6 +745,7 @@ impl RenderUnit<'_> {
                 (activity.status() == Some(crate::protocol::ActivityStatus::Active)).then_some(0)
             }
             Self::Group { kind, members, .. } => kind.header_spinner_line(members),
+            Self::TurnMember(unit) => unit.spinner_line(),
             Self::Message(_) | Self::TurnFold(_) | Self::Provisional(_) => None,
         }
     }
@@ -737,6 +755,7 @@ impl RenderUnit<'_> {
     fn message_id(&self) -> Option<MessageId> {
         match self {
             Self::Message(message) => Some(message.id),
+            Self::TurnMember(unit) => unit.message_id(),
             Self::Activity(_)
             | Self::Group { .. }
             | Self::GroupMember(_)
@@ -745,8 +764,9 @@ impl RenderUnit<'_> {
         }
     }
 
-    const fn spacing_kind(&self) -> SpacingKind {
+    fn spacing_kind(&self) -> SpacingKind {
         match self {
+            Self::TurnMember(unit) => unit.spacing_kind(),
             Self::Message(_) | Self::Provisional(_) => SpacingKind::Message,
             Self::Activity(activity) | Self::GroupMember(activity) => match activity {
                 Activity::Error { .. } => SpacingKind::Error,
@@ -757,8 +777,13 @@ impl RenderUnit<'_> {
     }
 
     /// Whether this unit is the first member of the expanded Group headed by
-    /// `previous`, the one seam the separator rule never opens.
-    const fn heads_the_group(&self, previous: &Self) -> bool {
+    /// `previous`, the one seam the separator rule never opens. A Group an
+    /// expanded Turn Fold disclosed keeps that seam, so both sides unwrap
+    /// their member gutter before the question is asked.
+    fn heads_the_group(&self, previous: &Self) -> bool {
+        if let (Self::TurnMember(unit), Self::TurnMember(previous)) = (self, previous) {
+            return unit.heads_the_group(previous);
+        }
         matches!(self, Self::GroupMember(_))
             && matches!(previous, Self::Group { expanded: true, .. })
     }
@@ -799,10 +824,24 @@ impl RenderUnit<'_> {
                     activity,
                     resolved_fold_step(folds, activity),
                     theme,
-                    width.saturating_sub(GROUP_MEMBER_INDENT.len() as u16),
+                    width.saturating_sub(MEMBER_INDENT.len() as u16),
                 );
                 for line in &mut lines[start..] {
-                    line.spans.insert(0, Span::raw(GROUP_MEMBER_INDENT));
+                    line.spans.insert(0, Span::raw(MEMBER_INDENT));
+                }
+                anchor
+            }
+            Self::TurnMember(unit) => {
+                let start = lines.len();
+                let anchor = unit.render(
+                    lines,
+                    links,
+                    folds,
+                    theme,
+                    width.saturating_sub(MEMBER_INDENT.len() as u16),
+                );
+                for line in &mut lines[start..] {
+                    line.spans.insert(0, Span::raw(MEMBER_INDENT));
                 }
                 anchor
             }
@@ -1129,6 +1168,11 @@ struct TurnFolding {
     /// Whether the entry at each Transcript position is hidden by its Turn's
     /// fold, which only a closed fold does.
     hidden: Vec<bool>,
+    /// Whether the entry at each Transcript position is covered by a fold the
+    /// reader expanded: work the marker stands for, shown because they asked.
+    /// A disclosed entry renders in the member gutter, so the disclosure
+    /// reads as subordinate to the marker it folds back into.
+    disclosed: Vec<bool>,
     /// The Turn whose marker stands at a Transcript position, which is the
     /// position of the first entry that Turn's fold covers, or of its final
     /// agent Message when every covered entry trails that — so the marker
@@ -1175,6 +1219,7 @@ impl TurnFolding {
             entries.push(entry);
         }
         let mut hidden = vec![false; snapshot.transcript.len()];
+        let mut disclosed = vec![false; snapshot.transcript.len()];
         let mut markers = HashMap::new();
         for (turn_id, positions) in positions {
             let turn_marker = settled[&turn_id];
@@ -1206,8 +1251,10 @@ impl TurnFolding {
                     continue;
                 }
                 // What the fold covers is the same whichever way the reader
-                // left it; only a closed one hides what it covers.
+                // left it; only a closed one hides what it covers, and only
+                // an open one discloses it.
                 hidden[position] = turn_marker.folded;
+                disclosed[position] = !turn_marker.folded;
                 marker.get_or_insert(position);
             }
             if let Some(position) = marker {
@@ -1220,11 +1267,19 @@ impl TurnFolding {
                 markers.insert(position, turn_marker);
             }
         }
-        Self { hidden, markers }
+        Self {
+            hidden,
+            disclosed,
+            markers,
+        }
     }
 
     fn hides(&self, position: usize) -> bool {
         self.hidden.get(position).copied().unwrap_or(false)
+    }
+
+    fn discloses(&self, position: usize) -> bool {
+        self.disclosed.get(position).copied().unwrap_or(false)
     }
 
     fn marker_at(&self, position: usize) -> Option<TurnMarker> {
@@ -1337,6 +1392,10 @@ impl GroupableKind {
 /// Activity of another kind ends it before starting its own.
 struct GroupRun<'a> {
     kind: GroupableKind,
+    /// Whether an expanded Turn Fold disclosed the run's members, which the
+    /// whole run shares: a run never spans a fold boundary, so its Group and
+    /// every unit it opens onto sit in one gutter.
+    disclosed: bool,
     members: Vec<&'a Activity>,
 }
 
@@ -1366,10 +1425,17 @@ fn plan_units<'a>(
         if folding.hides(position) {
             continue;
         }
+        let disclosed = folding.discloses(position);
+        // A run never crosses a fold boundary: an Activity inside the
+        // disclosure and one outside it sit in different gutters, so they
+        // never share a Group row.
+        if run.as_ref().is_some_and(|open| open.disclosed != disclosed) {
+            close_run(&mut units, &mut run, groups);
+        }
         match content.entry(item) {
             Some(TranscriptEntry::Message(message)) => {
                 close_run(&mut units, &mut run, groups);
-                units.push(RenderUnit::Message(message));
+                units.push(in_turn_gutter(RenderUnit::Message(message), disclosed));
             }
             Some(TranscriptEntry::Activity(activity)) => match GroupableKind::joined_by(activity) {
                 Some(kind) => {
@@ -1378,6 +1444,7 @@ fn plan_units<'a>(
                     }
                     run.get_or_insert(GroupRun {
                         kind,
+                        disclosed,
                         members: Vec::new(),
                     })
                     .members
@@ -1385,7 +1452,7 @@ fn plan_units<'a>(
                 }
                 None => {
                     close_run(&mut units, &mut run, groups);
-                    units.push(RenderUnit::Activity(activity));
+                    units.push(in_turn_gutter(RenderUnit::Activity(activity), disclosed));
                 }
             },
             None => {}
@@ -1405,27 +1472,46 @@ fn close_run<'a>(
     run: &mut Option<GroupRun<'a>>,
     groups: &TranscriptGroups,
 ) {
-    let Some(GroupRun { kind, members }) = run.take() else {
+    let Some(GroupRun {
+        kind,
+        disclosed,
+        members,
+    }) = run.take()
+    else {
         return;
     };
+    let mut closed = Vec::new();
     if members.len() < 2 {
-        units.extend(members.into_iter().map(RenderUnit::Activity));
-        return;
-    }
-    if groups.is_collapsed(members[0].id()) {
-        units.push(RenderUnit::Group {
+        closed.extend(members.into_iter().map(RenderUnit::Activity));
+    } else if groups.is_collapsed(members[0].id()) {
+        closed.push(RenderUnit::Group {
             kind,
             members,
             expanded: false,
         });
     } else {
         let expansion = kind.expansion_units(&members);
-        units.push(RenderUnit::Group {
+        closed.push(RenderUnit::Group {
             kind,
             members,
             expanded: true,
         });
-        units.extend(expansion);
+        closed.extend(expansion);
+    }
+    units.extend(
+        closed
+            .into_iter()
+            .map(|unit| in_turn_gutter(unit, disclosed)),
+    );
+}
+
+/// Seats a unit in the member gutter when an expanded Turn Fold disclosed it,
+/// and leaves it standalone otherwise, so every planning path speaks one rule.
+fn in_turn_gutter(unit: RenderUnit<'_>, disclosed: bool) -> RenderUnit<'_> {
+    if disclosed {
+        RenderUnit::TurnMember(Box::new(unit))
+    } else {
+        unit
     }
 }
 
@@ -4485,6 +4571,44 @@ mod tests {
     }
 
     #[test]
+    fn an_expanded_turns_disclosed_work_sits_in_the_markers_member_gutter() {
+        let (snapshot, turn_ids) = turn_snapshot(vec![(
+            TurnStatus::Completed,
+            vec![
+                Entry::Message(user_message("start the migration")),
+                Entry::Activity(command("cargo test", "")),
+                Entry::Message(agent_message("Working on it.")),
+                Entry::Message(agent_message("Migration done.")),
+            ],
+        )]);
+        let mut turns = TranscriptTurnFolds::default();
+        turns.expand(turn_ids[0]);
+
+        let rows = projected_rows_through(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+            &turns,
+        );
+
+        assert_eq!(
+            rows,
+            [
+                "┃ start the migration",
+                "",
+                "  ✓ Worked",
+                "    ✓ cargo test",
+                "",
+                "    Working on it.",
+                "",
+                "  Migration done.",
+            ],
+            "everything the marker disclosed sits in its member gutter — the interim \
+             Message included — while the answer outside the fold keeps its own"
+        );
+    }
+
+    #[test]
     fn expanding_a_turn_leaves_its_entries_at_their_own_fold_and_group_state() {
         let first = command("cargo fmt", "reformatted 1 file");
         let second = command("cargo clippy", "");
@@ -4512,15 +4636,16 @@ mod tests {
                 "┃ tidy the tree",
                 "",
                 "  ✓ Worked",
-                "  ✓ Ran 2 commands",
-                "    ✓ cargo fmt",
-                "      reformatted 1 file",
+                "    ✓ Ran 2 commands",
+                "      ✓ cargo fmt",
+                "        reformatted 1 file",
                 "",
-                "    ✓ cargo clippy",
+                "      ✓ cargo clippy",
                 "",
                 "  Tidied.",
             ],
-            "a Turn Fold opens onto the Groups and Folds the reader left behind it"
+            "a Turn Fold opens onto the Groups and Folds the reader left behind it, each \
+             drawn in the member gutter of the marker it folds back into"
         );
     }
 
@@ -4558,8 +4683,8 @@ mod tests {
                 "┃ now ship it",
                 "",
                 "  ✓ Worked",
-                "  Preparing the workspace",
-                "  ✓ cargo test",
+                "    Preparing the workspace",
+                "    ✓ cargo test",
                 "",
                 "  Shipped.",
             ],
