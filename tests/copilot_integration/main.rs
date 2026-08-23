@@ -18,6 +18,7 @@ mod scripted_binary_support;
 mod provider_support;
 
 mod activity;
+mod availability;
 mod interruption;
 mod models;
 mod resume;

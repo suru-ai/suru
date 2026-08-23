@@ -14,16 +14,19 @@ use std::{
     task::{Context, Poll},
 };
 
-use github_copilot_sdk::{Client, rpc::Model};
+use github_copilot_sdk::{Client, ErrorKind, ProtocolErrorKind, rpc::Model};
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
     process::ChildStdin,
 };
 
-use super::{copilot_error, copilot_error_context};
-use crate::provider::{
-    ProviderError, ProviderFuture,
-    harness::{HarnessConnector, HarnessLink, ProcessStdio},
+use super::{concise_remote_message, copilot_error, copilot_error_context};
+use crate::{
+    protocol::ProviderUnavailability,
+    provider::{
+        ProviderError, ProviderFuture,
+        harness::{HarnessConnector, HarnessLink, ProcessStdio},
+    },
 };
 
 /// Builds the Copilot client over each freshly launched harness process.
@@ -62,9 +65,45 @@ impl HarnessConnector for CopilotConnector {
                 .client
                 .verify_protocol_version()
                 .await
-                .map_err(|error| connection.failure("Copilot CLI server handshake failed", error))
+                .map_err(|error| {
+                    // The version the CLI reported is the SDK's own answer rather than anything
+                    // the process's exit could explain, so drift is reported from the handshake
+                    // itself while every other way it can fail defers to the supervisor.
+                    if is_version_drift(&error) {
+                        return version_drift(&error);
+                    }
+                    connection.failure("Copilot CLI server handshake failed", error)
+                })
         })
     }
+}
+
+/// JSON-RPC's own code for a method the server does not have. The SDK keeps its copy private, so
+/// Suru names the wire constant itself.
+const METHOD_NOT_FOUND: i32 = -32601;
+
+/// Whether `error` is the handshake refusing the CLI's protocol version rather than the transport
+/// failing under it. Every shape the SDK reports drift in counts: a version outside the range it
+/// speaks, one it cannot even read, and one that changed under a live connection.
+fn is_version_drift(error: &github_copilot_sdk::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::Protocol(
+            ProtocolErrorKind::VersionMismatch { .. }
+                | ProtocolErrorKind::InvalidProtocolVersion { .. }
+                | ProtocolErrorKind::VersionChanged { .. }
+        )
+    )
+}
+
+/// A CLI too old or too new for the protocol Suru speaks, as the typed condition. The user owns
+/// their own CLI, so version drift is theirs to fix: reported this way it reads as an actionable
+/// condition rather than as a Provider that broke.
+fn version_drift(error: &impl std::fmt::Display) -> ProviderError {
+    copilot_error(format!(
+        "Copilot CLI server speaks another protocol: {error}"
+    ))
+    .mark_unavailable(ProviderUnavailability::IncompatibleVersion)
 }
 
 /// The live connection to one Copilot CLI server process: the SDK client every demand speaks
@@ -88,9 +127,14 @@ enum ConnectionEnd {
 impl CopilotConnection {
     /// The Models Copilot offers the signed-in user right now.
     ///
+    /// The Models are that user's, so a discovery asks the CLI about its credentials before it asks
+    /// for a catalog: a CLI holding none reports the typed not-signed-in condition rather than
+    /// whatever it answers a catalog request with.
+    ///
     /// The SDK's own `list_models` memoizes for the life of its client, and this connection outlives
     /// every catalog refresh, so this asks the CLI each time.
     pub(super) async fn list_models(&self) -> Result<Vec<Model>, ProviderError> {
+        self.verify_signed_in().await?;
         self.client
             .rpc()
             .models()
@@ -98,6 +142,38 @@ impl CopilotConnection {
             .await
             .map(|listed| listed.models)
             .map_err(|error| self.failure("Copilot Model discovery failed", error))
+    }
+
+    /// Fails with the typed not-signed-in condition unless the CLI holds credentials it can work
+    /// with right now.
+    ///
+    /// Authentication is entirely between the user and the Copilot CLI — its own login, `gh`
+    /// credentials, or an environment token — so Suru neither asks for nor stores any of it. All a
+    /// discovery can do about a signed-out CLI is say so, and ask again on the next refresh.
+    async fn verify_signed_in(&self) -> Result<(), ProviderError> {
+        let auth = self
+            .client
+            .rpc()
+            .account()
+            .get_current_auth()
+            .await
+            .map_err(|error| {
+                // A CLI that has never heard of the sign-in query is one Suru cannot ask, which is
+                // version drift the handshake could not catch: the SDK falls back to a legacy ping
+                // for a CLI too old to answer `connect`, so the first unknown method is where such
+                // a CLI gives itself away.
+                if error.rpc_code() == Some(METHOD_NOT_FOUND) {
+                    return version_drift(&error);
+                }
+                self.failure("Copilot sign-in check failed", error)
+            })?;
+        if auth.auth_info.is_some() {
+            return Ok(());
+        }
+        Err(ProviderError::unavailable(
+            ProviderUnavailability::NotSignedIn,
+            signed_out_message(auth.auth_errors.unwrap_or_default()),
+        ))
     }
 
     /// The SDK client every request on this connection goes through.
@@ -150,6 +226,16 @@ impl HarnessLink for CopilotConnection {
     fn terminate(&self, error: ProviderError) {
         self.record(ConnectionEnd::Terminated(error));
     }
+}
+
+/// What a user reads about a CLI holding no usable credentials: what to do about it, and whatever
+/// the CLI said went wrong last time it tried, which is the only account of why there are none.
+fn signed_out_message(auth_errors: Vec<String>) -> String {
+    let mut message = "sign in with the Copilot CLI".to_owned();
+    if !auth_errors.is_empty() {
+        message.push_str(&format!(": {}", auth_errors.join("; ")));
+    }
+    concise_remote_message(&message, super::COPILOT_FAILURE_FALLBACK)
 }
 
 /// The harness process's stdin, writable by the SDK client and closable by the supervisor.

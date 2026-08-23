@@ -11,6 +11,14 @@
 //! [`session`] opens one Copilot Session on that process and runs its Turns, [`projection`] turns
 //! the Session's event timeline into the Provider events the rest of Suru consumes, and [`tools`]
 //! decides what one Tool execution reads as once it gets there.
+//!
+//! Three conditions leave Copilot unusable until the user fixes them outside Suru, and each reaches
+//! a Model discovery as its own typed reason rather than as a failure: a CLI that is not installed,
+//! which the harness machinery reports for every Provider alike; one speaking another protocol than
+//! the SDK, which the handshake in [`transport`] refuses and which a CLI old enough to predate the
+//! requests that follow gives itself away in anyway; and one holding no credentials, which the same
+//! module asks the CLI about before every discovery. Suru handles no credentials itself, so the
+//! catalog refresh re-running all three checks is the whole of its part in the recovery.
 
 mod catalog;
 mod projection;

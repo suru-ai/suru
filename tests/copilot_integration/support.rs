@@ -9,8 +9,9 @@
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
     protocol::{
-        CreateSessionRequest, InitialPrompt, Message, MessageRole, PromptId, SessionId,
-        SessionSnapshot, TurnId, TurnStatus, Workspace,
+        CreateSessionRequest, InitialPrompt, Message, MessageRole, ModelCatalog, PromptId,
+        ProviderId, ProviderModelCatalog, SessionId, SessionSnapshot, TurnId, TurnStatus,
+        Workspace,
     },
     provider::CopilotRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -75,6 +76,68 @@ pub fn connect_arm() -> String {
 "#,
         github_copilot_sdk::SDK_PROTOCOL_VERSION
     )
+}
+
+/// A `connect` arm reporting a protocol version well outside the range this SDK build speaks,
+/// standing in for a CLI too new for Suru — until [`ScriptedCopilot::upgrade`] leaves the marker
+/// that makes the same fixture answer compatibly, which is the user fixing the version outside
+/// Suru.
+pub fn upgradable_connect_arm() -> String {
+    format!(
+        r#"    *'"method":"connect"'*)
+      if [ -e "$COPILOT_FIXTURE_UPGRADED" ]; then
+        reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"ok":true,"protocolVersion":{compatible},"version":"0.0.0-fixture"}}}}'
+      else
+        reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"ok":true,"protocolVersion":{drifted},"version":"9.9.9-fixture"}}}}'
+      fi
+      ;;
+"#,
+        compatible = github_copilot_sdk::SDK_PROTOCOL_VERSION,
+        drifted = github_copilot_sdk::SDK_PROTOCOL_VERSION + 1_000,
+    )
+}
+
+/// What the CLI answers the sign-in check with once it holds credentials it can work with.
+const SIGNED_IN: &str = r#"{"authInfo":{"type":"user","login":"fixture-user","host":"https://github.com","token":"fixture-token"}}"#;
+
+/// What it answers while it holds none, which is all a signed-out CLI has to say about why.
+const SIGNED_OUT: &str = r#"{"authErrors":["no credentials on file"]}"#;
+
+/// An `account.getCurrentAuth` arm for a CLI a user is already signed in to, which is what every
+/// fixture that gets as far as a catalog needs.
+pub fn signed_in_arm() -> String {
+    format!(
+        r#"    *'"method":"account.getCurrentAuth"'*)
+      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{SIGNED_IN}}}'
+      ;;
+"#
+    )
+}
+
+/// The same arm for a CLI holding no credentials at all — until [`ScriptedCopilot::sign_in`] leaves
+/// the marker that makes it answer signed in, which is the user signing in with the Copilot CLI
+/// while Suru is running.
+pub fn signed_out_arm() -> String {
+    format!(
+        r#"    *'"method":"account.getCurrentAuth"'*)
+      if [ -e "$COPILOT_FIXTURE_SIGNED_IN" ]; then
+        reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{SIGNED_IN}}}'
+      else
+        reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{SIGNED_OUT}}}'
+      fi
+      ;;
+"#
+    )
+}
+
+/// An `account.getCurrentAuth` arm from a CLI that has never heard of the method, which is how one
+/// too old for the protocol Suru speaks answers a query it predates.
+pub fn unknown_method_arm() -> String {
+    r#"    *'"method":"account.getCurrentAuth"'*)
+      reply '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"unknown method"}}'
+      ;;
+"#
+    .to_owned()
 }
 
 /// A `session.create` arm answering with the identifier Suru generated for the Session, and holding
@@ -195,17 +258,26 @@ pub fn models_arm(models: &str) -> String {
 pub struct ScriptedCopilot {
     _directory: tempfile::TempDir,
     executable: std::path::PathBuf,
+    script: String,
     log: std::path::PathBuf,
     attempts: std::path::PathBuf,
     argv: std::path::PathBuf,
     exited: std::path::PathBuf,
     release: std::path::PathBuf,
+    signed_in: std::path::PathBuf,
+    upgraded: std::path::PathBuf,
 }
 
 impl ScriptedCopilot {
-    /// A fixture that handles the handshake and answers `models.list` with `models`.
+    /// A fixture that handles the handshake, answers a discovery's sign-in check with a signed-in
+    /// user, and answers `models.list` with `models`.
     pub fn with_models(models: &str) -> Self {
-        Self::new(&format!("{}{}", connect_arm(), models_arm(models)))
+        Self::new(&format!(
+            "{}{}{}",
+            connect_arm(),
+            signed_in_arm(),
+            models_arm(models)
+        ))
     }
 
     /// A fixture whose request handling is exactly `case_arms`, each an `sh` `case` arm over the
@@ -219,22 +291,53 @@ impl ScriptedCopilot {
         let argv = path("argv");
         let exited = path("exited");
         let release = path("release");
+        let signed_in = path("signed-in");
+        let upgraded = path("upgraded");
         let script = format!("{SCRIPT_PREFIX}{case_arms}  esac\ndone\n")
             .replace("$COPILOT_FIXTURE_LOG", fixture_path(&log))
             .replace("$COPILOT_FIXTURE_ATTEMPTS", fixture_path(&attempts))
             .replace("$COPILOT_FIXTURE_ARGV", fixture_path(&argv))
             .replace("$COPILOT_FIXTURE_EXITED", fixture_path(&exited))
-            .replace("$COPILOT_FIXTURE_RELEASE", fixture_path(&release));
+            .replace("$COPILOT_FIXTURE_RELEASE", fixture_path(&release))
+            .replace("$COPILOT_FIXTURE_SIGNED_IN", fixture_path(&signed_in))
+            .replace("$COPILOT_FIXTURE_UPGRADED", fixture_path(&upgraded));
         write_executable(&executable, &script);
         Self {
             _directory: directory,
             executable,
+            script,
             log,
             attempts,
             argv,
             exited,
             release,
+            signed_in,
+            upgraded,
         }
+    }
+
+    /// Takes the program off disk, standing in for a Copilot CLI the user has not installed. The
+    /// runtime already holds the path, so [`install`](Self::install) is the user installing it
+    /// while Suru runs.
+    pub fn uninstall(&self) {
+        std::fs::remove_file(&self.executable).expect("uninstall the scripted Copilot");
+    }
+
+    /// Puts the program back at the path the runtime resolves.
+    pub fn install(&self) {
+        write_executable(&self.executable, &self.script);
+    }
+
+    /// Signs the fixture's user in, which is what [`sign_in_arm`] answers a discovery with from
+    /// here on.
+    pub fn sign_in(&self) {
+        std::fs::write(&self.signed_in, b"signed in").expect("sign the scripted Copilot in");
+    }
+
+    /// Moves the fixture to a protocol version Suru speaks, which is what
+    /// [`upgradable_connect_arm`] answers the handshake with from here on.
+    pub fn upgrade(&self) {
+        std::fs::write(&self.upgraded, b"upgraded").expect("upgrade the scripted Copilot");
     }
 
     /// Lets a fixture holding at `$COPILOT_FIXTURE_RELEASE` carry on, so a test can arrange the
@@ -316,8 +419,9 @@ fn fixture_path(path: &std::path::Path) -> &str {
 /// its own beside them.
 pub fn conversation_arms() -> String {
     format!(
-        "{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}",
         connect_arm(),
+        signed_in_arm(),
         models_arm(COPILOT_MODELS),
         create_session_arm(),
         current_model_arm("claude-fixture", "high", "default"),
@@ -438,6 +542,31 @@ impl LiveTurn {
         drop(client);
         server.shutdown().await.expect("shut the server down");
     }
+}
+
+/// A server hosting Copilot alone, driven against `copilot`, and a client connected to it. `name`
+/// is the client channel, so each test needs its own.
+pub async fn hosting(
+    copilot: &ScriptedCopilot,
+    name: &'static str,
+    state_dir: &std::path::Path,
+) -> (RunningServer, ManagedClient) {
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir, name).expect("configure server"),
+        std::sync::Arc::new(CopilotRuntime::new(copilot.executable())),
+    )
+    .await
+    .expect("spawn server");
+    (server, connect(state_dir, name).await)
+}
+
+/// Copilot's own place in a catalog covering every hosted Provider.
+pub fn copilot_catalog(catalog: &ModelCatalog) -> &ProviderModelCatalog {
+    catalog
+        .providers
+        .iter()
+        .find(|provider| provider.provider == ProviderId::new("copilot"))
+        .expect("the catalog lists the Copilot Provider")
 }
 
 pub async fn connect(state_dir: &std::path::Path, name: &str) -> ManagedClient {

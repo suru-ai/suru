@@ -5,14 +5,12 @@ use std::sync::Arc;
 
 use crate::{
     provider_support::ControlledProvider,
-    server_support,
-    support::{ScriptedCopilot, connect_arm},
+    support::{ScriptedCopilot, connect, connect_arm, copilot_catalog, hosting, signed_in_arm},
 };
 use suru::{
-    managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        ModelAvailability, ModelCatalog, ModelDescriptor, ModelId, ModelOptionChoiceId,
-        ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
+        ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoiceId, ModelOptionId,
+        ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
     },
     provider::CopilotRuntime,
@@ -33,24 +31,6 @@ const COPILOT_MODELS: &str = concat!(
     r#"{"id":"blocked-fixture","name":"Blocked Fixture","capabilities":{},"#,
     r#""policy":{"state":"disabled"}}]"#,
 );
-
-async fn connect(state_dir: &std::path::Path, name: &str) -> ManagedClient {
-    let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir, name).expect("configure client"),
-    )
-    .await
-    .expect("connect client");
-    server_support::receive_initial_state(&mut client).await;
-    client
-}
-
-fn copilot_catalog(catalog: &ModelCatalog) -> &ProviderModelCatalog {
-    catalog
-        .providers
-        .iter()
-        .find(|provider| provider.provider == ProviderId::new("copilot"))
-        .expect("the catalog lists the Copilot Provider")
-}
 
 fn model<'a>(catalog: &'a ProviderModelCatalog, id: &str) -> &'a ModelDescriptor {
     catalog
@@ -79,13 +59,7 @@ fn choices(model: &ModelDescriptor, option: &str) -> (Vec<String>, String) {
 async fn copilot_models_reach_the_catalog_with_reasoning_effort_and_context_tier_options() {
     let copilot = ScriptedCopilot::with_models(COPILOT_MODELS);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let server = server::spawn_with_provider(
-        ServerConfig::new(state_dir.path(), "copilot-model-catalog").expect("configure server"),
-        Arc::new(CopilotRuntime::new(copilot.executable())),
-    )
-    .await
-    .expect("spawn server");
-    let client = connect(state_dir.path(), "copilot-model-catalog").await;
+    let (server, client) = hosting(&copilot, "copilot-model-catalog", state_dir.path()).await;
 
     let catalog = client.list_models().await.expect("discover Copilot Models");
     let copilot_models = copilot_catalog(&catalog);
@@ -179,13 +153,7 @@ async fn copilot_models_reach_the_catalog_with_reasoning_effort_and_context_tier
 async fn discovery_and_refresh_share_one_stdio_server_process() {
     let copilot = ScriptedCopilot::with_models(COPILOT_MODELS);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let server = server::spawn_with_provider(
-        ServerConfig::new(state_dir.path(), "copilot-shared-process").expect("configure server"),
-        Arc::new(CopilotRuntime::new(copilot.executable())),
-    )
-    .await
-    .expect("spawn server");
-    let client = connect(state_dir.path(), "copilot-shared-process").await;
+    let (server, client) = hosting(&copilot, "copilot-shared-process", state_dir.path()).await;
 
     client.list_models().await.expect("discover Copilot Models");
     let refreshed = client.refresh_models().await.expect("refresh the catalog");
@@ -207,8 +175,14 @@ async fn discovery_and_refresh_share_one_stdio_server_process() {
     );
     assert_eq!(
         copilot.methods(),
-        ["connect", "models.list", "models.list"],
-        "one handshake serves both discoveries"
+        [
+            "connect",
+            "account.getCurrentAuth",
+            "models.list",
+            "account.getCurrentAuth",
+            "models.list"
+        ],
+        "one handshake serves both discoveries, each of which re-checks the sign-in state"
     );
 
     server.shutdown().await.expect("shut the server down");
@@ -273,13 +247,7 @@ const AWKWARD_MODELS: &str = concat!(
 async fn a_catalog_without_the_routed_model_defaults_to_the_first_usable_one() {
     let copilot = ScriptedCopilot::with_models(AWKWARD_MODELS);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let server = server::spawn_with_provider(
-        ServerConfig::new(state_dir.path(), "copilot-awkward-catalog").expect("configure server"),
-        Arc::new(CopilotRuntime::new(copilot.executable())),
-    )
-    .await
-    .expect("spawn server");
-    let client = connect(state_dir.path(), "copilot-awkward-catalog").await;
+    let (server, client) = hosting(&copilot, "copilot-awkward-catalog", state_dir.path()).await;
 
     let catalog = client.list_models().await.expect("discover Copilot Models");
     let copilot_models = copilot_catalog(&catalog);
@@ -308,8 +276,9 @@ async fn a_catalog_without_the_routed_model_defaults_to_the_first_usable_one() {
 #[tokio::test]
 async fn a_harness_that_dies_mid_discovery_fails_the_catalog_and_the_next_refresh_relaunches() {
     let copilot = ScriptedCopilot::new(&format!(
-        "{}{}",
+        "{}{}{}",
         connect_arm(),
+        signed_in_arm(),
         r#"    *'"method":"models.list"'*)
       if [ "$attempt" -gt 1 ]; then
         reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"models":[{"id":"auto","name":"Auto","capabilities":{}}]}}'
@@ -320,13 +289,7 @@ async fn a_harness_that_dies_mid_discovery_fails_the_catalog_and_the_next_refres
 "#,
     ));
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let server = server::spawn_with_provider(
-        ServerConfig::new(state_dir.path(), "copilot-harness-crash").expect("configure server"),
-        Arc::new(CopilotRuntime::new(copilot.executable())),
-    )
-    .await
-    .expect("spawn server");
-    let client = connect(state_dir.path(), "copilot-harness-crash").await;
+    let (server, client) = hosting(&copilot, "copilot-harness-crash", state_dir.path()).await;
 
     let catalog = client
         .list_models()
