@@ -9,8 +9,8 @@ use suru::{
     protocol::{
         AgentSelection, ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice,
         ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
-        ModelOptionRole, ModelOptionValue, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
-        SessionId,
+        ModelOptionRole, ModelOptionSelection, ModelOptionValue, ProviderCatalogStatus, ProviderId,
+        ProviderModelCatalog, SessionId,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId},
 };
@@ -754,5 +754,186 @@ fn refreshed_options_keep_invalidated_choice_visible_and_disable_apply() {
                 value: ModelOptionValue::Toggle { enabled: true },
             },
         ]
+    );
+}
+
+/// A Model with the two dimensions Copilot advertises: reasoning effort, and a context tier that
+/// trades context window against cost.
+fn tiered_model() -> suru::protocol::ModelDescriptor {
+    let mut model = model_descriptor(
+        "copilot",
+        "tiered",
+        "Tiered Fixture",
+        true,
+        ModelAvailability::Available,
+    );
+    model.options = vec![
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("reasoning_effort"),
+            label: "Reasoning effort".to_owned(),
+            description: None,
+            role: ModelOptionRole::ReasoningEffort,
+            kind: ModelOptionKind::Select {
+                choices: vec![ModelOptionChoice {
+                    id: ModelOptionChoiceId::new("high"),
+                    label: "High".to_owned(),
+                    description: None,
+                    availability: ModelAvailability::Available,
+                }],
+                default: ModelOptionChoiceId::new("high"),
+            },
+        },
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("context_tier"),
+            label: "Context".to_owned(),
+            description: None,
+            role: ModelOptionRole::Context,
+            kind: ModelOptionKind::Select {
+                choices: vec![
+                    ModelOptionChoice {
+                        id: ModelOptionChoiceId::new("default"),
+                        label: "Default".to_owned(),
+                        description: None,
+                        availability: ModelAvailability::Available,
+                    },
+                    ModelOptionChoice {
+                        id: ModelOptionChoiceId::new("long_context"),
+                        label: "Long context".to_owned(),
+                        description: None,
+                        availability: ModelAvailability::Available,
+                    },
+                ],
+                default: ModelOptionChoiceId::new("default"),
+            },
+        },
+    ];
+    model
+}
+
+/// Opens the landing Model picker on `tiered_model` and selects it, leaving the Model Options panel
+/// open on its Provider defaults.
+fn landing_on_the_tiered_model() -> Application {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open the landing Model picker")
+    else {
+        panic!("the Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("copilot"),
+                    models: vec![tiered_model()],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("load the landing Models");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("select the tiered Model");
+    application
+}
+
+#[test]
+fn context_tier_is_configurable_and_surfaces_once_it_leaves_its_default() {
+    let mut application = landing_on_the_tiered_model();
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Context · Default"),
+        "the context tier is one of the Model's configurable Options"
+    );
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus the context tier");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("open the context tier choices");
+    let choices = rendered_application_rows(&application).join("\n");
+    assert!(choices.contains("Context Choices"));
+    assert!(choices.contains("Default [current]"));
+    assert!(choices.contains("Long context"));
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus the extended tier");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("stage the extended tier");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Context · Long context")
+    );
+
+    let ApplicationTransition::ConfirmLandingAgentSelection(confirmed) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+        )))
+        .expect("apply the staged context tier")
+    else {
+        panic!("landing options should confirm the complete Agent Selection");
+    };
+    assert!(confirmed.options.contains(&ModelOptionSelection {
+        id: ModelOptionId::new("context_tier"),
+        value: ModelOptionValue::Select {
+            choice: ModelOptionChoiceId::new("long_context"),
+        },
+    }));
+    assert!(
+        rendered_application_rows_at(&application, 140, 16)
+            .join("\n")
+            .contains("Context Long context"),
+        "a context tier off its default is worth a place in the Agent Selection summary"
+    );
+}
+
+#[test]
+fn a_context_tier_left_at_its_default_stays_out_of_the_selection_summary() {
+    let mut application = landing_on_the_tiered_model();
+    let ApplicationTransition::ConfirmLandingAgentSelection(confirmed) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+        )))
+        .expect("apply the Provider defaults")
+    else {
+        panic!("landing options should confirm the complete Agent Selection");
+    };
+    assert!(confirmed.options.contains(&ModelOptionSelection {
+        id: ModelOptionId::new("context_tier"),
+        value: ModelOptionValue::Select {
+            choice: ModelOptionChoiceId::new("default"),
+        },
+    }));
+    // Wide enough that an absent Option is absent rather than truncated away.
+    let summary = rendered_application_rows_at(&application, 140, 16).join("\n");
+    assert!(summary.contains("Reasoning effort High"));
+    assert!(
+        !summary.contains("Context Default"),
+        "the default tier is the unremarkable case and stays out of the summary"
     );
 }

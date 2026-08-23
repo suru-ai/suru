@@ -30,8 +30,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "=0.2.0"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 jsonc-parser = { version = "0.33.1", features = ["cst", "serde"] }
+github-copilot-sdk = { version = "1.0.12-preview.0", default-features = false }
 
 [dev-dependencies]
+# The Copilot fixtures answer the SDK's own protocol handshake, so they read the version it speaks
+# from the crate rather than pinning a literal that silently rots on an upgrade.
+github-copilot-sdk = { version = "1.0.12-preview.0", default-features = false }
 sysinfo = "0.37.2"
 
 [target.'cfg(unix)'.dependencies]

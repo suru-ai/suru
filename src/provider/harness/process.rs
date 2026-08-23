@@ -186,9 +186,7 @@ impl ProcessControl {
                 .await
                 .map(|_| ())
                 .map_err(|_| {
-                    ProviderError::new(format!(
-                        "{name} process supervisor stopped unexpectedly"
-                    ))
+                    ProviderError::new(format!("{name} process supervisor stopped unexpectedly"))
                 })
         };
         timeout(self.wait_budget, wait).await.map_err(|_| {

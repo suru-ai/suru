@@ -38,7 +38,8 @@ use crate::protocol::{
     TurnId, UpdateAgentSelectionRequest,
 };
 use crate::provider::{
-    CodexRuntime, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, wait_for_shutdown,
+    CodexRuntime, CopilotRuntime, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate,
+    wait_for_shutdown,
 };
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
@@ -349,7 +350,10 @@ pub async fn spawn_with_provider_and_timings(
 /// order a fresh Landing defaults from. This is the one place the server
 /// names a concrete Provider.
 fn built_in_runtimes() -> Vec<Arc<dyn ProviderRuntime>> {
-    vec![Arc::new(CodexRuntime::from_environment())]
+    vec![
+        Arc::new(CodexRuntime::from_environment()),
+        Arc::new(CopilotRuntime::from_environment()),
+    ]
 }
 
 pub async fn spawn_with_providers_and_timings(

@@ -12,11 +12,36 @@ use crate::protocol::{
 };
 
 mod codex;
+mod copilot;
 pub(crate) mod harness;
 mod orchestration;
 
 pub use codex::CodexRuntime;
+pub use copilot::CopilotRuntime;
 pub(crate) use orchestration::{ProviderOrchestrator, ProviderUpdateGate};
+
+/// A Provider-authored message is user-visible once it surfaces as a Provider failure, so it is
+/// capped.
+const MAX_REMOTE_ERROR_CHARS: usize = 384;
+
+/// Collapses a Provider-authored message onto a single bounded line fit for a Provider failure.
+pub(crate) fn concise_remote_message(message: &str, fallback: &str) -> String {
+    let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let message = if single_line.is_empty() {
+        fallback
+    } else {
+        &single_line
+    };
+    let mut chars = message.chars();
+    let mut concise = chars
+        .by_ref()
+        .take(MAX_REMOTE_ERROR_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        concise.push('\u{2026}');
+    }
+    concise
+}
 
 pub type ProviderFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ProviderError>> + Send + 'a>>;

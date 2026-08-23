@@ -1,0 +1,8 @@
+# The GitHub Copilot SDK's build script downloads the Copilot CLI so it can be
+# bundled or cached alongside the crate. Suru resolves the user's own installed
+# CLI instead (`SURU_COPILOT_PATH`, then `copilot` on PATH), so the download is
+# pure cost — and a build that reaches the network is a build that fails offline
+# or in a locked-down CI. This opt-out disables it for every cargo invocation in
+# this workspace.
+[env]
+COPILOT_SKIP_CLI_DOWNLOAD = "1"

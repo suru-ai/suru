@@ -79,6 +79,7 @@ struct LiveHarness<T> {
     connection: T,
     /// Held so the process stays supervised while it is the live harness; nothing reads it —
     /// dropping it is what asks the process to stop.
+    #[allow(dead_code)]
     guard: Arc<ProcessGuard>,
     crash: watch::Receiver<Option<ProviderError>>,
 }
@@ -113,9 +114,7 @@ impl<C: HarnessConnector> SharedHarness<C> {
     /// Grants a handle on the live shared harness process, launching it first when no launch has
     /// happened yet. Demands arriving while a launch is in flight wait for it and share its
     /// outcome rather than launching again.
-    pub(crate) async fn demand(
-        &self,
-    ) -> Result<SharedHarnessHandle<C::Connection>, ProviderError> {
+    pub(crate) async fn demand(&self) -> Result<SharedHarnessHandle<C::Connection>, ProviderError> {
         let mut state = self.state.lock().await;
         self.processes.refuse_if_shutting_down()?;
         if let Some(live) = state.as_ref() {
@@ -303,6 +302,8 @@ STUBBORN_TAIL
     #[derive(Clone, Default)]
     struct FixtureConnection {
         stdin: Arc<TokioMutex<Option<ChildStdin>>>,
+        /// Held so the fixture's stdout stays open for it to write to; nothing reads it.
+        #[allow(dead_code)]
         stdout: Arc<StdMutex<Option<ChildStdout>>>,
         closed: Arc<AtomicBool>,
         terminated: Arc<StdMutex<Option<ProviderError>>>,
@@ -484,7 +485,11 @@ STUBBORN_TAIL
 
         harness.demand().await.expect("the next demand relaunches");
         fixture.wait_for_attempts(2).await;
-        assert_ne!(fixture.pid(), crashed_pid, "the relaunch is a fresh process");
+        assert_ne!(
+            fixture.pid(),
+            crashed_pid,
+            "the relaunch is a fresh process"
+        );
 
         harness.shutdown().await.expect("shutdown tears down");
     }

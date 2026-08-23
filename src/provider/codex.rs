@@ -16,10 +16,7 @@ mod wire;
 
 pub use session::CodexRuntime;
 
-use super::ProviderError;
-
-/// Codex messages are user-visible once they surface as a Provider failure, so they are capped.
-const MAX_REMOTE_ERROR_CHARS: usize = 384;
+use super::{ProviderError, concise_remote_message};
 
 /// What the Log and failures call the Codex harness server process.
 const CODEX_HARNESS_NAME: &str = "Codex app-server";
@@ -27,25 +24,6 @@ const CODEX_HARNESS_NAME: &str = "Codex app-server";
 const REASONING_EFFORT_OPTION_ID: &str = "reasoning_effort";
 const SERVICE_TIER_OPTION_ID: &str = "service_tier";
 const DEFAULT_SERVICE_TIER_CHOICE_ID: &str = "default";
-
-/// Collapses a Codex-authored message onto a single bounded line fit for a Provider failure.
-fn concise_remote_message(message: &str, fallback: &str) -> String {
-    let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    let message = if single_line.is_empty() {
-        fallback
-    } else {
-        &single_line
-    };
-    let mut chars = message.chars();
-    let mut concise = chars
-        .by_ref()
-        .take(MAX_REMOTE_ERROR_CHARS)
-        .collect::<String>();
-    if chars.next().is_some() {
-        concise.push('…');
-    }
-    concise
-}
 
 fn codex_error(message: impl AsRef<str>) -> ProviderError {
     ProviderError::new(concise_remote_message(
