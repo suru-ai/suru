@@ -11,12 +11,14 @@ use crate::protocol::{
     ModelOptionRole, ProviderId, ProviderUnavailability, SessionId,
 };
 
+mod claude;
 mod codex;
 mod copilot;
 pub(crate) mod harness;
 mod orchestration;
 mod reasoning;
 
+pub use claude::ClaudeRuntime;
 pub use codex::CodexRuntime;
 pub use copilot::CopilotRuntime;
 pub(crate) use orchestration::{ProviderOrchestrator, ProviderUpdateGate};

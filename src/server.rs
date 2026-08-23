@@ -38,8 +38,8 @@ use crate::protocol::{
     TurnId, UpdateAgentSelectionRequest,
 };
 use crate::provider::{
-    CodexRuntime, CopilotRuntime, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate,
-    wait_for_shutdown,
+    ClaudeRuntime, CodexRuntime, CopilotRuntime, ProviderOrchestrator, ProviderRuntime,
+    ProviderUpdateGate, wait_for_shutdown,
 };
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
@@ -353,6 +353,8 @@ fn built_in_runtimes() -> Vec<Arc<dyn ProviderRuntime>> {
     vec![
         Arc::new(CodexRuntime::from_environment()),
         Arc::new(CopilotRuntime::from_environment()),
+        // Appended last so the Landing default order the earlier Providers set is unchanged.
+        Arc::new(ClaudeRuntime::from_environment()),
     ]
 }
 
