@@ -7,11 +7,15 @@
 //! correlation ID.
 
 use suru::{
-    managed_client::{ManagedClient, ManagedClientConfig},
-    protocol::{ModelCatalog, ProviderId, ProviderModelCatalog},
+    managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
+    protocol::{
+        Message, MessageRole, ModelCatalog, ProviderId, ProviderModelCatalog, SessionId,
+        SessionSnapshot, TurnStatus,
+    },
     provider::ClaudeRuntime,
     server::{self, RunningServer, ServerConfig},
 };
+use tokio::time::{Duration, timeout};
 
 use crate::{
     scripted_binary_support::{captured_requests, write_executable},
@@ -44,7 +48,12 @@ if [ -e "$CLAUDE_FIXTURE_ATTEMPTS" ]; then
 fi
 printf '%s\n' "$attempt" > "$CLAUDE_FIXTURE_ATTEMPTS"
 printf '%s\n' "$*" > "$CLAUDE_FIXTURE_ARGV"
-trap 'printf exited > "$CLAUDE_FIXTURE_EXITED"' EXIT
+trap 'printf "exited\n" >> "$CLAUDE_FIXTURE_EXITED"' EXIT
+
+# One newline-delimited stream-json message on the CLI's stdout.
+emit() {
+  printf '%s\n' "$1"
+}
 
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CLAUDE_FIXTURE_LOG"
@@ -190,13 +199,27 @@ impl ScriptedClaude {
     }
 
     pub async fn wait_for_exit(&self) {
+        self.wait_for_exits(1).await;
+    }
+
+    /// Waits until `count` launched processes have exited cooperatively, for a test that must
+    /// tell one process's exit from another's — the short-lived discovery's from the Session
+    /// child's.
+    pub async fn wait_for_exits(&self, count: usize) {
         tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
-            while !self.exited.exists() {
+            loop {
+                let exited = std::fs::read_to_string(&self.exited)
+                    .unwrap_or_default()
+                    .lines()
+                    .count();
+                if exited >= count {
+                    return;
+                }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("scripted Claude exits cooperatively");
+        .unwrap_or_else(|_| panic!("{count} scripted Claude processes exit cooperatively"));
     }
 }
 
@@ -235,6 +258,17 @@ pub async fn hosting_runtime(
     (server, client)
 }
 
+/// A client connected to the server at `state_dir` under `name`, past its initial state.
+pub async fn connect(state_dir: &std::path::Path, name: &str) -> ManagedClient {
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir, name).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    client
+}
+
 /// Claude's own place in a catalog covering every hosted Provider.
 pub fn claude_catalog(catalog: &ModelCatalog) -> &ProviderModelCatalog {
     catalog
@@ -242,4 +276,93 @@ pub fn claude_catalog(catalog: &ModelCatalog) -> &ProviderModelCatalog {
         .iter()
         .find(|provider| provider.provider == ProviderId::new("claude"))
         .expect("the catalog lists the Claude Provider")
+}
+
+/// A user-message arm that plays `timeline` — `emit` lines of stream-json output — once a Prompt
+/// is delivered into the running loop.
+pub fn user_turn_arm(timeline: &str) -> String {
+    format!(
+        r#"    *'"type":"user"'*)
+{timeline}      ;;
+"#
+    )
+}
+
+/// A user-message arm that plays nothing at all, for a Turn a test only needs to have started.
+pub fn silent_user_turn_arm() -> String {
+    user_turn_arm("      :\n")
+}
+
+/// A fixture that carries a Session from creation through a Turn: it answers the discovery the
+/// Session startup runs, and plays `timeline` for every Prompt the spawned conversation receives.
+pub fn conversation_fixture(timeline: &str) -> ScriptedClaude {
+    ScriptedClaude::new(&format!(
+        "{}{}",
+        list_models_arm(CLAUDE_MODELS),
+        user_turn_arm(timeline)
+    ))
+}
+
+/// The agent Messages in `snapshot`, in Transcript order — the Prompt's own Message is a Message
+/// too, and it is never what a Provider produced.
+pub fn agent_messages(snapshot: &SessionSnapshot) -> Vec<&Message> {
+    snapshot
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Agent)
+        .collect()
+}
+
+/// The Session once the Turn at `turn_index` has stopped running, whatever it settled as, read
+/// from a Session feed opened for the wait.
+pub async fn settled_session(
+    client: &ManagedClient,
+    session_id: SessionId,
+    turn_index: usize,
+) -> SessionSnapshot {
+    let mut feed = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    session_where(
+        client,
+        &mut feed,
+        session_id,
+        &format!("Claude Turn {turn_index} settles"),
+        |snapshot| {
+            snapshot
+                .turns
+                .get(turn_index)
+                .is_some_and(|turn| turn.status != TurnStatus::Active)
+        },
+    )
+    .await
+}
+
+/// The Session once `predicate` holds of it, read from a feed the caller already holds. `what`
+/// names what was being waited for, so a wait that runs out says which one did.
+pub async fn session_where(
+    client: &ManagedClient,
+    feed: &mut SessionSubscription,
+    session_id: SessionId,
+    what: &str,
+    predicate: impl Fn(&SessionSnapshot) -> bool,
+) -> SessionSnapshot {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = client
+                .read_session(session_id)
+                .await
+                .expect("read Session while its Turn runs");
+            if predicate(&snapshot) {
+                return snapshot;
+            }
+            feed.next()
+                .await
+                .expect("Session feed remains open")
+                .expect("Session event is valid");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"))
 }

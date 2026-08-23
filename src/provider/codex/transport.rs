@@ -81,6 +81,7 @@ impl JsonRpcTransport {
             executable: executable.to_owned(),
             args: vec!["app-server".into()],
             name: super::CODEX_HARNESS_NAME.to_owned(),
+            cwd: None,
         };
         let (process, ProcessStdio { stdin, stdout }) = spawn_harness_process(&spec)?;
         let (events, notifications) = mpsc::unbounded_channel();

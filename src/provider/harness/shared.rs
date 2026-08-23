@@ -257,6 +257,7 @@ STUBBORN_TAIL
                 executable: self.directory.path().join("harness").into(),
                 args: Vec::new(),
                 name: "Fixture harness".to_owned(),
+                cwd: None,
             }
         }
 

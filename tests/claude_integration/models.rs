@@ -79,7 +79,10 @@ async fn claude_models_reach_the_catalog_verbatim_with_the_clis_default_row_mark
 
     let recommended = model(claude_models, "default");
     assert_eq!(recommended.display_name, "Default (recommended)");
-    assert_eq!(recommended.description, "Fixture 1 · Best for everyday tasks");
+    assert_eq!(
+        recommended.description,
+        "Fixture 1 · Best for everyday tasks"
+    );
     assert_eq!(recommended.availability, ModelAvailability::Available);
     assert_eq!(
         recommended
@@ -122,7 +125,10 @@ async fn claude_models_reach_the_catalog_verbatim_with_the_clis_default_row_mark
 
     assert_eq!(
         choices(model(claude_models, "middling"), "reasoning_effort"),
-        (vec!["low".to_owned(), "medium".to_owned()], "low".to_owned()),
+        (
+            vec!["low".to_owned(), "medium".to_owned()],
+            "low".to_owned()
+        ),
         "a row not offering the CLI's default effort defaults to its first level instead"
     );
 

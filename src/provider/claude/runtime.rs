@@ -1,15 +1,19 @@
-//! The Claude Provider runtime: short-lived stream-json spawns for Model discovery.
+//! The Claude Provider runtime: short-lived stream-json spawns for Model discovery, and one
+//! long-lived CLI process per Session.
 //!
 //! Like Codex, every demand launches its own supervised CLI process — there is no shared server
-//! process to keep alive. Sessions land in a later slice; until they do, starting one is refused
-//! outright rather than half-supported.
+//! process to keep alive. A discovery's process lives for one control request; a Session's lives
+//! from its first Turn until the Session shuts down (see [`super::session`]).
 
 use std::ffi::{OsStr, OsString};
 
 use tokio::time::Duration;
 
 use super::{
-    CLAUDE_PROVIDER_ID, catalog::model_descriptors, claude_error, claude_error_context,
+    CLAUDE_PROVIDER_ID,
+    catalog::model_descriptors,
+    claude_error, claude_error_context,
+    session::start_claude_session,
     transport::{ClaudeConnection, StreamJsonTransport},
     wire::{ControlRequest, NativeModelList},
 };
@@ -76,14 +80,21 @@ impl ProviderRuntime for ClaudeRuntime {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
         let request_timeout = self.control_request_timeout;
-        Box::pin(async move { discover_claude_models(executable, processes, request_timeout).await })
+        Box::pin(
+            async move { discover_claude_models(executable, processes, request_timeout).await },
+        )
     }
 
     fn start_session(
         &self,
-        _request: ProviderSessionRequest,
+        request: ProviderSessionRequest,
     ) -> ProviderFuture<'_, ProviderSessionConnection> {
-        Box::pin(async move { Err(claude_error("Claude Sessions are not supported yet")) })
+        let executable = self.executable.clone();
+        let processes = self.processes.clone();
+        let request_timeout = self.control_request_timeout;
+        Box::pin(async move {
+            start_claude_session(executable, request, processes, request_timeout).await
+        })
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
@@ -91,13 +102,13 @@ impl ProviderRuntime for ClaudeRuntime {
     }
 }
 
-async fn discover_claude_models(
+pub(super) async fn discover_claude_models(
     executable: OsString,
     processes: ProcessRegistry,
     request_timeout: Duration,
 ) -> Result<Vec<ModelDescriptor>, ProviderError> {
     let ClaudeConnection { transport, process } =
-        StreamJsonTransport::launch(&executable, std::iter::empty(), processes).await?;
+        StreamJsonTransport::launch(&executable, std::iter::empty(), None, None, processes).await?;
     let result = transport
         .control_request(&ControlRequest::ListModels, request_timeout)
         .await

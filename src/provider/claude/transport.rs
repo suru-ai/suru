@@ -2,14 +2,16 @@
 //!
 //! [`StreamJsonTransport::launch`] is the only way to obtain one: it spawns a supervised CLI
 //! process in stream-json mode and returns the control-request channel. Control requests correlate
-//! by `request_id`; every other message the CLI writes is conversation, which nothing consumes
-//! until Sessions land in a later slice. Every path that ends the connection fails the in-flight
-//! requests exactly once.
+//! by `request_id`; every other message the CLI writes is conversation, forwarded to the
+//! [`ConversationSink`] the caller launched with — a discovery launches without one and the
+//! conversation is dropped unread. Every path that ends the connection fails the in-flight
+//! requests exactly once, and a lost process reaches the sink as the error that took it.
 
 use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     future::Future,
+    path::PathBuf,
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
@@ -21,13 +23,13 @@ use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, ChildStdout},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, mpsc, oneshot},
     time::{Duration, timeout},
 };
 
 use super::{
     claude_error,
-    wire::{ControlRequest, ControlRequestEnvelope, ControlResponse, IncomingMessage},
+    wire::{ControlRequest, ControlRequestEnvelope, ControlResponse},
 };
 use crate::provider::{
     ProviderError, concise_remote_message,
@@ -36,6 +38,10 @@ use crate::provider::{
         spawn_harness_process, supervise_harness_process,
     },
 };
+
+/// Where a launched process's conversation messages go: everything the CLI writes that is not a
+/// control response, and the failure that ends the connection when the process is lost.
+pub(super) type ConversationSink = mpsc::UnboundedSender<Result<Value, ProviderError>>;
 
 /// The arguments that put the CLI in stream-json mode: newline-delimited JSON both ways, with the
 /// user's filesystem settings left unloaded so a Suru-launched process runs no hooks and starts no
@@ -56,6 +62,7 @@ type PendingResponse = oneshot::Sender<Result<Value, ProviderError>>;
 struct TransportState {
     pending: StdMutex<HashMap<String, PendingResponse>>,
     terminated: AtomicBool,
+    conversation: Option<ConversationSink>,
 }
 
 /// A launched connection to one supervised Claude Code CLI process.
@@ -74,10 +81,14 @@ pub(super) struct StreamJsonTransport {
 
 impl StreamJsonTransport {
     /// Launches a supervised CLI process in stream-json mode with `args` appended to the mode's
-    /// own. The CLI completes no handshake of its own; it is ready as soon as it is running.
+    /// own, working in `cwd` when one is given. Conversation messages go to `conversation`; a
+    /// caller with no interest in them — a discovery — launches with `None` and they are dropped.
+    /// The CLI completes no handshake of its own; it is ready as soon as it is running.
     pub(super) async fn launch(
         executable: &OsStr,
         args: impl IntoIterator<Item = OsString>,
+        cwd: Option<PathBuf>,
+        conversation: Option<ConversationSink>,
         processes: ProcessRegistry,
     ) -> Result<ClaudeConnection, ProviderError> {
         let spec = HarnessSpec {
@@ -88,11 +99,13 @@ impl StreamJsonTransport {
                 .chain(args)
                 .collect(),
             name: super::CLAUDE_HARNESS_NAME.to_owned(),
+            cwd,
         };
         let (process, ProcessStdio { stdin, stdout }) = spawn_harness_process(&spec)?;
         let state = Arc::new(TransportState {
             pending: StdMutex::new(HashMap::new()),
             terminated: AtomicBool::new(false),
+            conversation,
         });
         let writer = Arc::new(Mutex::new(Some(stdin)));
         let link = TransportLink {
@@ -159,6 +172,14 @@ impl StreamJsonTransport {
                 ))
             }
         }
+    }
+
+    /// Writes one conversation message — a user message carrying a Prompt — to the CLI's stdin.
+    pub(super) async fn send<T: serde::Serialize>(&self, message: &T) -> Result<(), ProviderError> {
+        if self.state.terminated.load(Ordering::Acquire) {
+            return Err(claude_error("Claude Code CLI transport has ended").mark_session_lost());
+        }
+        write_json_line(&self.writer, message, "write to Claude Code CLI").await
     }
 
     pub(super) async fn close(&self) {
@@ -239,7 +260,7 @@ async fn read_stdout(stdout: ChildStdout, state: Arc<TransportState>) {
                 return;
             }
         }
-        let message: IncomingMessage = match serde_json::from_str(&line) {
+        let message: Value = match serde_json::from_str(&line) {
             Ok(message) => message,
             Err(error) => {
                 terminate_transport(
@@ -256,14 +277,22 @@ async fn read_stdout(stdout: ChildStdout, state: Arc<TransportState>) {
     }
 }
 
-fn route_message(message: IncomingMessage, state: &Arc<TransportState>) -> Result<(), ProviderError> {
+fn route_message(message: Value, state: &Arc<TransportState>) -> Result<(), ProviderError> {
+    let Some(kind) = message.get("type").and_then(Value::as_str) else {
+        return Err(claude_error(
+            "Claude Code CLI sent a message without a type field",
+        ));
+    };
     // Everything except a control response is conversation — turn output, the
-    // init message, the CLI's own control requests — which nothing consumes
-    // until Sessions land.
-    if message.kind != "control_response" {
+    // init message, the CLI's own control requests — which the launched
+    // Session's sink consumes, and a discovery leaves unread.
+    if kind != "control_response" {
+        if let Some(conversation) = &state.conversation {
+            let _ = conversation.send(Ok(message));
+        }
         return Ok(());
     }
-    let Some(response) = message.response else {
+    let Some(response) = message.get("response") else {
         return Ok(());
     };
     let response = match serde_json::from_value::<ControlResponse>(response.clone()) {
@@ -309,14 +338,14 @@ fn route_message(message: IncomingMessage, state: &Arc<TransportState>) -> Resul
 }
 
 fn terminate_transport(state: &TransportState, error: ProviderError) {
-    finish_transport(state, error.mark_session_lost());
+    finish_transport(state, error.mark_session_lost(), true);
 }
 
 fn close_transport(state: &TransportState, error: ProviderError) {
-    finish_transport(state, error);
+    finish_transport(state, error, false);
 }
 
-fn finish_transport(state: &TransportState, error: ProviderError) {
+fn finish_transport(state: &TransportState, error: ProviderError, conversation_lost: bool) {
     if state.terminated.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -332,5 +361,10 @@ fn finish_transport(state: &TransportState, error: ProviderError) {
     };
     for response in pending {
         let _ = response.send(Err(error.clone()));
+    }
+    // An intended close ends the conversation without a story; a lost process
+    // is the conversation's failure, told exactly once.
+    if conversation_lost && let Some(conversation) = &state.conversation {
+        let _ = conversation.send(Err(error));
     }
 }

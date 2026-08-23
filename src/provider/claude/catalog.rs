@@ -30,7 +30,11 @@ pub(super) fn model_descriptors(models: Vec<NativeModel>) -> Vec<ModelDescriptor
     let default = descriptors
         .iter()
         .position(|descriptor| descriptor.id.as_str() == DEFAULT_MODEL_VALUE)
-        .or(if descriptors.is_empty() { None } else { Some(0) });
+        .or(if descriptors.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
     if let Some(default) = default {
         descriptors[default].is_default = true;
     }

@@ -4,9 +4,10 @@
 //! delimited JSON on stdio, with control requests for everything that is not conversation — rather
 //! than embedding the Claude Agent SDK (ADR 0010). The integration is layered like the Codex one:
 //! [`wire`] holds the serde types Suru exchanges with the CLI, [`transport`] carries control
-//! requests over a supervised CLI process's stdio, [`catalog`] presents the Models the CLI reports
-//! verbatim as Suru's Model catalog, and [`runtime`] composes them into the Provider runtime the
-//! rest of Suru uses.
+//! requests and conversation over a supervised CLI process's stdio, [`projection`] turns the
+//! conversation into Provider events, [`catalog`] presents the Models the CLI reports verbatim as
+//! Suru's Model catalog, [`session`] runs one Session per long-lived CLI process, and [`runtime`]
+//! composes them into the Provider runtime the rest of Suru uses.
 //!
 //! The Provider is named **Claude**, never "Claude Code": the Agent SDK asks applications not to
 //! take the product's name. Text below names the Claude Code CLI only where it factually refers to
@@ -18,7 +19,9 @@
 //! incompatible-version reason.
 
 mod catalog;
+mod projection;
 mod runtime;
+mod session;
 mod transport;
 mod wire;
 
@@ -31,6 +34,9 @@ const CLAUDE_HARNESS_NAME: &str = "Claude Code CLI";
 
 /// What Suru knows this Provider as.
 const CLAUDE_PROVIDER_ID: &str = "claude";
+
+/// What the Transcript attributes this Provider's Turns to.
+const CLAUDE_AGENT_ID: &str = "claude";
 
 const REASONING_EFFORT_OPTION_ID: &str = "reasoning_effort";
 

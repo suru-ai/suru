@@ -36,6 +36,7 @@ impl CopilotRuntime {
             executable: executable.as_ref().to_owned(),
             args: COPILOT_SERVER_ARGS.iter().map(OsString::from).collect(),
             name: COPILOT_HARNESS_NAME.to_owned(),
+            cwd: None,
         };
         Self {
             harness: SharedHarness::new(spec, CopilotConnector::new()),

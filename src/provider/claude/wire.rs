@@ -34,15 +34,102 @@ pub(super) enum ControlRequest {
     ListModels,
 }
 
-/// One newline-delimited message the CLI wrote, decoded only as far as routing needs: everything
-/// that is not a control response is conversation, which lands with Sessions in a later slice.
-/// The response itself stays undecoded here so a subtype this build does not know can be told
-/// apart from a malformed one it does.
+/// A Prompt on its way into the running loop, in the envelope stream-json input takes user
+/// messages in. The CLI owns the conversation's identity, so the envelope's `session_id` rides
+/// along empty and `parent_tool_use_id` marks the message as the user's own rather than a
+/// subagent's.
+#[derive(Serialize)]
+pub(super) struct UserMessageEnvelope<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    message: UserMessage<'a>,
+    parent_tool_use_id: Option<&'static str>,
+    session_id: &'static str,
+}
+
+impl<'a> UserMessageEnvelope<'a> {
+    pub(super) fn text(prompt: &'a str) -> Self {
+        Self {
+            kind: "user",
+            message: UserMessage {
+                role: "user",
+                content: [UserContentBlock {
+                    kind: "text",
+                    text: prompt,
+                }],
+            },
+            parent_tool_use_id: None,
+            session_id: "",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct UserMessage<'a> {
+    role: &'static str,
+    content: [UserContentBlock<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct UserContentBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+}
+
+/// A partial-message chunk of the Turn's streamed output: one Anthropic streaming event, owned by
+/// the conversation itself or by the subagent whose spawning tool use `parent_tool_use_id` names.
 #[derive(Deserialize)]
-pub(super) struct IncomingMessage {
+pub(super) struct StreamEventMessage {
+    pub(super) event: StreamEvent,
+    #[serde(default)]
+    pub(super) parent_tool_use_id: Option<String>,
+}
+
+/// One streaming event, decoded only as far as the projection reads. `kind` stays a free string so
+/// events this build does not know are ridden out rather than failed (ADR 0010).
+#[derive(Deserialize)]
+pub(super) struct StreamEvent {
     #[serde(rename = "type")]
     pub(super) kind: String,
-    pub(super) response: Option<Value>,
+    #[serde(default)]
+    pub(super) index: Option<u64>,
+    #[serde(default)]
+    pub(super) content_block: Option<ContentBlock>,
+    #[serde(default)]
+    pub(super) delta: Option<ContentDelta>,
+}
+
+/// The content block a `content_block_start` opens.
+#[derive(Deserialize)]
+pub(super) struct ContentBlock {
+    #[serde(rename = "type", default)]
+    pub(super) kind: String,
+    #[serde(default)]
+    pub(super) text: Option<String>,
+}
+
+/// The increment a `content_block_delta` carries. A `message_delta`'s delta object carries no
+/// `type` at all — verified against the live CLI — so an absent kind decodes rather than fails.
+#[derive(Deserialize)]
+pub(super) struct ContentDelta {
+    #[serde(rename = "type", default)]
+    pub(super) kind: String,
+    #[serde(default)]
+    pub(super) text: Option<String>,
+}
+
+/// The terminal message that Settles the Turn: `success` reports a finished Turn (which may still
+/// carry `is_error`), and every other subtype is a failure whose `errors` say what went wrong.
+#[derive(Deserialize)]
+pub(super) struct ResultMessage {
+    pub(super) subtype: String,
+    #[serde(default)]
+    pub(super) is_error: bool,
+    #[serde(default)]
+    pub(super) result: Option<Value>,
+    #[serde(default)]
+    pub(super) errors: Vec<String>,
 }
 
 /// The CLI's answer to one control request, correlated back by `request_id`.

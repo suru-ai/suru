@@ -39,6 +39,9 @@ pub(crate) struct HarnessSpec {
     pub(crate) executable: OsString,
     pub(crate) args: Vec<OsString>,
     pub(crate) name: String,
+    /// The directory the process starts in, for a harness that takes its working
+    /// directory from the process rather than over its wire. `None` inherits Suru's own.
+    pub(crate) cwd: Option<std::path::PathBuf>,
 }
 
 /// The supervisor's handle into the transport running over the process it owns.
@@ -239,6 +242,9 @@ pub(crate) fn spawn_harness_process(
 ) -> Result<(SpawnedProcess, ProcessStdio), ProviderError> {
     let name: Arc<str> = Arc::from(spec.name.as_str());
     let mut command = Command::new(&spec.executable);
+    if let Some(cwd) = &spec.cwd {
+        command.current_dir(cwd);
+    }
     command
         .args(&spec.args)
         .stdin(std::process::Stdio::piped())
