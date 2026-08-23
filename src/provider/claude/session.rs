@@ -2,10 +2,15 @@
 //!
 //! The Model and its reasoning effort are spawn-time flags on the CLI, so the Session launches no
 //! process until its first Turn starts: the Turn's Agent Selection is what the child is spawned
-//! under, the way Copilot puts a Selection in force at Turn start. Suru mints the provider-session
-//! UUID and passes it at spawn, and that identifier is the whole of the Resume State — though
-//! honoring it on a later startup lands in a later slice, so a restored Session fails loudly
-//! rather than silently opening a fresh conversation.
+//! under, the way Copilot puts a Selection in force at Turn start. A Turn selected under different
+//! flags therefore runs on a child of its own — the running one is torn down and its replacement
+//! resumes the same conversation, so the change takes effect while the conversation continues.
+//!
+//! Suru mints the provider-session UUID and passes it at spawn, and that identifier is the whole
+//! of the Resume State: the CLI keeps the conversation on disk behind it, so a restored Session
+//! asks the CLI to resume it rather than to mint another. A resume the CLI cannot honor is fatal,
+//! as is Resume State Suru cannot read — a Session that quietly opened an empty conversation would
+//! read as continuous while having forgotten everything.
 //!
 //! The child is launched full-auto — permissions bypassed, matching the house posture — with the
 //! Suru Session's Workspace as its working directory. A Prompt is delivered as a stream-json user
@@ -50,9 +55,38 @@ use crate::{
 /// Everything Suru must remember about a Claude Session to continue it after a restart: the
 /// provider-session UUID Suru minted and spawned the CLI under. The CLI keeps the conversation on
 /// disk behind it, which is why this is all the Resume State carries.
+///
+/// Suru reports this the moment the Session connects, while the CLI writes the conversation only
+/// once a Turn has run under the identifier. A Session whose every Turn failed before the CLI
+/// recorded anything therefore carries Resume State for a conversation that does not exist, and
+/// a later restart fails it the way any unhonorable resume is failed. That is the conservative
+/// end of the rule rather than an oversight: Suru cannot tell a conversation that was never
+/// written from one the CLI has lost, and quietly minting a new one is what this Provider must
+/// never do. Closing the gap needs a way to report Resume State once the conversation exists,
+/// which the Provider seam does not have.
 #[derive(Deserialize, Serialize)]
 struct ClaudeResumeState {
     session_id: String,
+}
+
+/// How a child addresses the provider session: minting the conversation under the identifier Suru
+/// generated, or continuing the one the CLI already keeps under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderSessionSpawn {
+    Mint,
+    Resume,
+}
+
+impl ProviderSessionSpawn {
+    /// The CLI flag that names the provider session for this kind of spawn. Resuming is asked for
+    /// without `--fork-session`, which is what keeps the conversation under the identifier Suru
+    /// minted and so keeps the Resume State good for every later child.
+    fn identity_flag(self) -> &'static str {
+        match self {
+            Self::Mint => "--session-id",
+            Self::Resume => "--resume",
+        }
+    }
 }
 
 /// The timeouts a [`super::ClaudeRuntime`] hands each Session it starts.
@@ -70,13 +104,9 @@ pub(super) async fn start_claude_session(
     processes: ProcessRegistry,
     timings: ClaudeTimings,
 ) -> Result<ProviderSessionConnection, ProviderError> {
-    // Resume lands in a later slice. Until it does, a restored Session fails loudly: silently
-    // opening a fresh conversation would read as continuous while having forgotten everything.
-    if request.resume_state.is_some() {
-        return Err(claude_error(
-            "Claude Session resume failed: resuming is not supported yet",
-        ));
-    }
+    // Read before anything is launched: Resume State Suru cannot read fails the startup outright
+    // rather than after a discovery the Session will never use.
+    let restored = known_session_id(request.resume_state)?;
     // The Selection the Session reports before the user chooses one: the catalog default, which is
     // what the first Turn will spawn under when nothing else was chosen.
     let selection = default_selection(
@@ -85,7 +115,12 @@ pub(super) async fn start_claude_session(
         timings.control_request,
     )
     .await?;
-    let provider_session_id = uuid::Uuid::new_v4().to_string();
+    // A restored Session keeps the identifier its conversation is filed under, because that is
+    // what the CLI kept the work behind.
+    let (provider_session_id, next_spawn) = match restored {
+        Some(session_id) => (session_id, ProviderSessionSpawn::Resume),
+        None => (uuid::Uuid::new_v4().to_string(), ProviderSessionSpawn::Mint),
+    };
     let resume_state = ProviderResumeState::new(
         serde_json::to_value(ClaudeResumeState {
             session_id: provider_session_id.clone(),
@@ -102,7 +137,10 @@ pub(super) async fn start_claude_session(
         workspace: request.workspace,
         provider_session_id,
         conversation,
-        child: Mutex::new(None),
+        child: Mutex::new(ChildSlot {
+            running: None,
+            next_spawn,
+        }),
         turn,
         interrupt_request_timeout: timings.interrupt_request,
         shutdown_started: AtomicBool::new(false),
@@ -116,6 +154,26 @@ pub(super) async fn start_claude_session(
         session,
         events,
     ))
+}
+
+/// The provider session `resume_state` names, or nothing when the Suru Session has never reached
+/// Claude. Resume State Suru cannot read is a failure rather than a reason to start over: the
+/// Session it belongs to has a conversation behind it that minting a fresh identifier would
+/// abandon while looking as though nothing was lost.
+fn known_session_id(
+    resume_state: Option<ProviderResumeState>,
+) -> Result<Option<String>, ProviderError> {
+    let Some(state) = resume_state else {
+        return Ok(None);
+    };
+    let state: ClaudeResumeState = serde_json::from_value(state.into_payload())
+        .map_err(|error| claude_error(format!("Claude Resume State is invalid: {error}")))?;
+    if state.session_id.is_empty() {
+        return Err(claude_error(
+            "Claude Resume State is invalid: the provider session identifier was empty",
+        ));
+    }
+    Ok(Some(state.session_id))
 }
 
 /// The Agent Selection a Session with none chosen runs under: the catalog's default row with its
@@ -145,12 +203,23 @@ struct ClaudeSession {
     /// Where every child this Session spawns delivers its conversation, so the Session's event
     /// stream outlives any one process.
     conversation: ConversationSink,
-    /// The running CLI process, from the first Turn's spawn until shutdown.
-    child: Mutex<Option<ClaudeChild>>,
+    /// The child the Session's Turns run on, and how the next one addresses the conversation.
+    child: Mutex<ChildSlot>,
     /// What the Session and the projection of its conversation agree on about the Turn in flight.
     turn: Arc<TurnInFlight>,
     interrupt_request_timeout: Duration,
     shutdown_started: AtomicBool,
+}
+
+/// The CLI process a Session's Turns run on — none until its first Turn, and none again between a
+/// Selection change's teardown and the spawn that replaces it — beside how the next spawn addresses
+/// the conversation.
+struct ChildSlot {
+    running: Option<ClaudeChild>,
+    /// Whether the CLI already keeps a conversation under this Session's identifier: a restored
+    /// Session's does from the start, and every Session's does once a child has been spawned under
+    /// it, so a replacement child resumes rather than asking the CLI to mint what it already has.
+    next_spawn: ProviderSessionSpawn,
 }
 
 /// One spawned CLI process and the Agent Selection its spawn flags put in force.
@@ -158,6 +227,17 @@ struct ClaudeChild {
     transport: StreamJsonTransport,
     process: Arc<ProcessGuard>,
     selection: AgentSelection,
+}
+
+impl ClaudeChild {
+    /// Stops the process this child runs on, leaving the conversation it ran on the CLI's disk for
+    /// the next child to resume. An intended stop like this one publishes no failure of its own,
+    /// so the Session's event stream carries on into the child that replaces it.
+    async fn stop(&self) -> Result<(), ProviderError> {
+        self.process.begin_shutdown();
+        self.transport.close().await;
+        self.process.wait_until_stopped().await
+    }
 }
 
 impl ClaudeSession {
@@ -194,40 +274,56 @@ impl ProviderSession for ClaudeSession {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             const CONTEXT: &str = "Claude Turn startup failed";
-            let mut child = self.child.lock().await;
+            let mut slot = self.child.lock().await;
             if self.shutdown_started.load(Ordering::Acquire) {
                 return Err(claude_error("Claude Session is shutting down"));
             }
-            let child = match child.as_mut() {
-                Some(child) => {
-                    // Selection changes between Turns respawn the child resuming the same
-                    // provider session — a later slice. Until then the change is rejected, so
-                    // the Session keeps the Selection its process actually runs under.
-                    if child.selection != input.selection {
-                        return Err(ProviderError::selection_rejected(
-                            "Claude cannot change the Agent Selection between Turns yet",
-                        ));
-                    }
-                    child
+            // The Model and its Options are spawn-time flags, so a Turn selected under different
+            // ones needs a child of its own; one selected under the flags the running child
+            // carries needs nothing.
+            if slot
+                .running
+                .as_ref()
+                .is_none_or(|child| child.selection != input.selection)
+            {
+                // The Selection is lowered onto flags before anything is torn down, so one the CLI
+                // has no flags for leaves the Session running on the child it had.
+                let args =
+                    spawn_args(&self.provider_session_id, &input.selection, slot.next_spawn)?;
+                if let Some(previous) = slot.running.take() {
+                    previous
+                        .stop()
+                        .await
+                        .map_err(|error| claude_error_context(CONTEXT, error))?;
                 }
-                None => {
-                    let args = spawn_args(&self.provider_session_id, &input.selection)?;
-                    let ClaudeConnection { transport, process } = StreamJsonTransport::launch(
-                        &self.executable,
-                        args,
-                        Some(self.workspace.clone()),
-                        Some(self.conversation.clone()),
-                        self.processes.clone(),
-                    )
-                    .await
-                    .map_err(|error| claude_error_context(CONTEXT, error))?;
-                    child.insert(ClaudeChild {
-                        transport,
-                        process,
-                        selection: input.selection.clone(),
-                    })
-                }
-            };
+                // A child that carries a resume is failing at the resume when it cannot be
+                // launched, which is what the Turn should say went wrong.
+                let launch_context = match slot.next_spawn {
+                    ProviderSessionSpawn::Mint => CONTEXT,
+                    ProviderSessionSpawn::Resume => "Claude Session resume failed",
+                };
+                let ClaudeConnection { transport, process } = StreamJsonTransport::launch(
+                    &self.executable,
+                    args,
+                    Some(self.workspace.clone()),
+                    Some(self.conversation.clone()),
+                    self.processes.clone(),
+                )
+                .await
+                .map_err(|error| claude_error_context(launch_context, error))?;
+                // The conversation is the CLI's to keep from here on, so every later child resumes
+                // it rather than asking for it to be minted again.
+                slot.next_spawn = ProviderSessionSpawn::Resume;
+                slot.running = Some(ClaudeChild {
+                    transport,
+                    process,
+                    selection: input.selection.clone(),
+                });
+            }
+            let child = slot
+                .running
+                .as_ref()
+                .expect("a Turn runs on the child that was just spawned for it");
             self.turn.begin_turn();
             child
                 .transport
@@ -249,8 +345,8 @@ impl ProviderSession for ClaudeSession {
             // says which Turn it joins: delivered to a Session running no Turn, the CLI would
             // answer it as a Turn of its own that Suru never began. A Turn only ever runs on a
             // spawned child, so a Session without one is running none either.
-            let child = self.child.lock().await;
-            let Some(child) = child.as_ref() else {
+            let slot = self.child.lock().await;
+            let Some(child) = slot.running.as_ref() else {
                 return Err(no_live_turn("steer"));
             };
             if !self.turn.accept_steer() {
@@ -271,8 +367,8 @@ impl ProviderSession for ClaudeSession {
         Box::pin(async move {
             const CONTEXT: &str = "Claude Turn interruption failed";
             let transport = {
-                let child = self.child.lock().await;
-                child
+                let slot = self.child.lock().await;
+                slot.running
                     .as_ref()
                     .filter(|_| self.turn.is_running())
                     .map(|child| child.transport.clone())
@@ -307,13 +403,11 @@ impl ProviderSession for ClaudeSession {
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             self.shutdown_started.store(true, Ordering::Release);
-            let child = self.child.lock().await;
-            let Some(child) = child.as_ref() else {
+            let slot = self.child.lock().await;
+            let Some(child) = slot.running.as_ref() else {
                 return Ok(());
             };
-            child.process.begin_shutdown();
-            child.transport.close().await;
-            child.process.wait_until_stopped().await
+            child.stop().await
         })
     }
 }
@@ -325,17 +419,18 @@ fn no_live_turn(operation: &str) -> ProviderError {
     claude_error(format!("Claude has no active Turn to {operation}"))
 }
 
-/// The flags one Turn's Agent Selection spawns the child under, beside the identity and the
-/// full-auto posture every Claude Session launches with.
+/// The flags one Turn's Agent Selection spawns the child under, beside the conversation `spawn`
+/// addresses and the full-auto posture every Claude Session launches with.
 fn spawn_args(
     provider_session_id: &str,
     selection: &AgentSelection,
+    spawn: ProviderSessionSpawn,
 ) -> Result<Vec<OsString>, ProviderError> {
     debug_assert_eq!(selection.provider.as_str(), CLAUDE_PROVIDER_ID);
     let mut args: Vec<OsString> = [
         "--include-partial-messages",
         "--dangerously-skip-permissions",
-        "--session-id",
+        spawn.identity_flag(),
         provider_session_id,
         "--model",
         selection.model.as_str(),
@@ -380,10 +475,15 @@ fn spawn_args(
 mod tests {
     use std::ffi::OsString;
 
-    use super::spawn_args;
-    use crate::protocol::{
-        AgentSelection, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
-        ModelOptionValue, ProviderId,
+    use serde_json::json;
+
+    use super::{ProviderSessionSpawn, known_session_id, spawn_args};
+    use crate::{
+        protocol::{
+            AgentSelection, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
+            ModelOptionValue, ProviderId,
+        },
+        provider::ProviderResumeState,
     };
 
     #[cfg(unix)]
@@ -396,7 +496,7 @@ mod tests {
         use tokio::{sync::Mutex, time::Duration};
 
         use super::{
-            super::{ClaudeSession, TurnInFlight},
+            super::{ChildSlot, ClaudeSession, ProviderSessionSpawn, TurnInFlight},
             selection,
         };
         use crate::provider::{
@@ -424,7 +524,10 @@ mod tests {
                 workspace: directory.path().to_owned(),
                 provider_session_id: "11111111-2222-3333-4444-555555555555".to_owned(),
                 conversation,
-                child: Mutex::new(None),
+                child: Mutex::new(ChildSlot {
+                    running: None,
+                    next_spawn: ProviderSessionSpawn::Mint,
+                }),
                 turn: TurnInFlight::new(),
                 interrupt_request_timeout: Duration::from_millis(200),
                 shutdown_started: AtomicBool::new(false),
@@ -538,6 +641,7 @@ mod tests {
         let args = spawn_args(
             "11111111-2222-3333-4444-555555555555",
             &selection(vec![effort("low")]),
+            ProviderSessionSpawn::Mint,
         )
         .expect("a reasoning-effort selection lowers");
         assert_eq!(
@@ -557,9 +661,28 @@ mod tests {
     }
 
     #[test]
+    fn a_child_on_a_conversation_the_cli_already_holds_spawns_resuming_it() {
+        let args = spawn_args(
+            "11111111-2222-3333-4444-555555555555",
+            &selection(Vec::new()),
+            ProviderSessionSpawn::Resume,
+        )
+        .expect("a resuming spawn lowers");
+        assert_eq!(
+            args[2..4],
+            ["--resume", "11111111-2222-3333-4444-555555555555"].map(OsString::from),
+            "the child continues the conversation rather than asking for a new one: {args:?}"
+        );
+        assert!(
+            !args.contains(&OsString::from("--fork-session")),
+            "resuming keeps the conversation under the identifier the Resume State names"
+        );
+    }
+
+    #[test]
     fn a_selection_without_effort_spawns_no_effort_flag() {
-        let args =
-            spawn_args("id", &selection(Vec::new())).expect("an effortless selection lowers");
+        let args = spawn_args("id", &selection(Vec::new()), ProviderSessionSpawn::Mint)
+            .expect("an effortless selection lowers");
         assert!(!args.contains(&OsString::from("--effort")));
     }
 
@@ -573,6 +696,7 @@ mod tests {
                     choice: ModelOptionChoiceId::new("long"),
                 },
             }]),
+            ProviderSessionSpawn::Mint,
         )
         .expect_err("an unknown Model Option is a rejected selection");
         assert!(error.is_selection_rejected());
@@ -581,8 +705,48 @@ mod tests {
 
     #[test]
     fn a_model_option_selected_twice_is_rejected() {
-        let error = spawn_args("id", &selection(vec![effort("low"), effort("high")]))
-            .expect_err("a duplicated Model Option is a rejected selection");
+        let error = spawn_args(
+            "id",
+            &selection(vec![effort("low"), effort("high")]),
+            ProviderSessionSpawn::Mint,
+        )
+        .expect_err("a duplicated Model Option is a rejected selection");
         assert!(error.is_selection_rejected());
+    }
+
+    #[test]
+    fn a_session_that_never_reached_claude_mints_a_conversation_of_its_own() {
+        assert_eq!(
+            known_session_id(None).expect("no Resume State is not a failure"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_provider_session_identifier_survives_a_round_trip_through_resume_state() {
+        let state = ProviderResumeState::new(json!({
+            "session_id": "11111111-2222-3333-4444-555555555555",
+        }));
+        assert_eq!(
+            known_session_id(Some(state)).expect("the Resume State is readable"),
+            Some("11111111-2222-3333-4444-555555555555".to_owned())
+        );
+    }
+
+    #[test]
+    fn resume_state_suru_cannot_read_fails_rather_than_opening_a_new_conversation() {
+        for unusable in [
+            json!({}),
+            json!({ "session_id": "" }),
+            json!({ "session_id": 7 }),
+            json!("11111111-2222-3333-4444-555555555555"),
+        ] {
+            let error = known_session_id(Some(ProviderResumeState::new(unusable.clone())))
+                .expect_err("unusable Resume State fails the Session startup");
+            assert!(
+                error.to_string().contains("Claude Resume State is invalid"),
+                "{unusable} reports what is wrong with it: {error}"
+            );
+        }
     }
 }

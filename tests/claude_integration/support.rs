@@ -40,15 +40,15 @@ pub const CLAUDE_MODELS: &str = concat!(
     r#""description":"Fixture 3 · Fastest for quick answers"}]"#,
 );
 
-/// Reads one newline-delimited message at a time, records it, and dispatches it to the test's
-/// arms with the control envelope's `request_id` extracted for their replies.
+/// Records the launch and its arguments — one line per launch, so a test that restarts the runtime
+/// or respawns a Session child can read each launch apart from the others — and defines `emit`.
 const SCRIPT_PREFIX: &str = r#"#!/bin/sh
 attempt=1
 if [ -e "$CLAUDE_FIXTURE_ATTEMPTS" ]; then
   attempt=$(( $(cat "$CLAUDE_FIXTURE_ATTEMPTS") + 1 ))
 fi
 printf '%s\n' "$attempt" > "$CLAUDE_FIXTURE_ATTEMPTS"
-printf '%s\n' "$*" > "$CLAUDE_FIXTURE_ARGV"
+printf '%s\n' "$*" >> "$CLAUDE_FIXTURE_ARGV"
 trap 'printf "exited\n" >> "$CLAUDE_FIXTURE_EXITED"' EXIT
 
 # One newline-delimited stream-json message on the CLI's stdout.
@@ -56,7 +56,11 @@ emit() {
   printf '%s\n' "$1"
 }
 
-while IFS= read -r line; do
+"#;
+
+/// Reads one newline-delimited message at a time, records it, and dispatches it to the test's
+/// arms with the control envelope's `request_id` extracted for their replies.
+const SCRIPT_LOOP: &str = r#"while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CLAUDE_FIXTURE_LOG"
   request_id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$line" in
@@ -153,6 +157,12 @@ impl ScriptedClaude {
     /// A fixture whose request handling is exactly `case_arms`, each an `sh` `case` arm over the
     /// request line.
     pub fn new(case_arms: &str) -> Self {
+        Self::with_preamble("", case_arms)
+    }
+
+    /// The same fixture with `preamble` — `sh` the launched process runs before it reads anything,
+    /// so a test can stand in for a CLI that answers its launch flags rather than its input.
+    pub fn with_preamble(preamble: &str, case_arms: &str) -> Self {
         let directory = tempfile::tempdir().expect("create scripted Claude directory");
         let path = |name: &str| directory.path().join(name);
         let executable = path("claude");
@@ -161,7 +171,7 @@ impl ScriptedClaude {
         let argv = path("argv");
         let exited = path("exited");
         let release = path("release");
-        let script = format!("{SCRIPT_PREFIX}{case_arms}  esac\ndone\n")
+        let script = format!("{SCRIPT_PREFIX}{preamble}{SCRIPT_LOOP}{case_arms}  esac\ndone\n")
             .replace("$CLAUDE_FIXTURE_LOG", fixture_path(&log))
             .replace("$CLAUDE_FIXTURE_ATTEMPTS", fixture_path(&attempts))
             .replace("$CLAUDE_FIXTURE_ARGV", fixture_path(&argv))
@@ -211,14 +221,26 @@ impl ScriptedClaude {
             .unwrap_or(0)
     }
 
-    /// The arguments the runtime launched the CLI with. A trailing empty argument is invisible
-    /// here — the fixture records `$*` — so assertions read the flags, not the values after them.
-    pub fn arguments(&self) -> Vec<String> {
+    /// The arguments the runtime launched the CLI with, most recent launch last. A trailing empty
+    /// argument is invisible here — the fixture records `$*` — so assertions read the flags, not
+    /// the values after them.
+    pub fn launch_arguments(&self) -> Vec<Vec<String>> {
         std::fs::read_to_string(&self.argv)
             .unwrap_or_default()
-            .split_whitespace()
-            .map(str::to_owned)
+            .lines()
+            .map(|launch| launch.split_whitespace().map(str::to_owned).collect())
             .collect()
+    }
+
+    /// The arguments of the most recent launch.
+    pub fn arguments(&self) -> Vec<String> {
+        self.launch_arguments().pop().unwrap_or_default()
+    }
+
+    /// The value the most recent launch gave `flag`, for a test reading one flag out of a launch
+    /// it already knows carries it.
+    pub fn argument_value(&self, flag: &str) -> String {
+        flag_value(&self.arguments(), flag)
     }
 
     /// Everything the runtime sent the CLI, in the order it arrived.
@@ -266,6 +288,32 @@ impl ScriptedClaude {
 
 fn fixture_path(path: &std::path::Path) -> &str {
     path.to_str().expect("fixture path is UTF-8")
+}
+
+/// The value `arguments` gives `flag`, which is the argument after it.
+pub fn flag_value(arguments: &[String], flag: &str) -> String {
+    arguments
+        .iter()
+        .position(|argument| argument == flag)
+        .and_then(|position| arguments.get(position + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("the CLI was launched with {flag} and a value, got: {arguments:?}")
+        })
+}
+
+/// A preamble standing in for a CLI asked to resume a conversation it does not have: it reports
+/// the conversation is missing and exits, which is how a live 2.1.237 CLI answers `--resume` for
+/// a session id it cannot find — a terminal `result` naming the session, then a failing exit.
+pub fn rejecting_resume_preamble() -> String {
+    r#"resumed=$(printf '%s' "$*" | sed -n 's/.*--resume \([^ ]*\).*/\1/p')
+if [ -n "$resumed" ]; then
+  emit '{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":0,"num_turns":0,"session_id":"'"$resumed"'","errors":["No conversation found with session ID: '"$resumed"'"]}'
+  exit 1
+fi
+
+"#
+    .to_owned()
 }
 
 /// A server hosting Claude alone, driven against `claude`, and a client connected to it. `name`
@@ -334,14 +382,19 @@ pub fn silent_user_turn_arm() -> String {
     user_turn_arm("      :\n")
 }
 
-/// A fixture that carries a Session from creation through a Turn: it answers the discovery the
-/// Session startup runs, and plays `timeline` for every Prompt the spawned conversation receives.
-pub fn conversation_fixture(timeline: &str) -> ScriptedClaude {
-    ScriptedClaude::new(&format!(
+/// The arms that carry a Session from creation through a Turn: the discovery its startup runs, and
+/// `timeline` played for every Prompt the spawned conversation receives.
+pub fn conversation_arms(timeline: &str) -> String {
+    format!(
         "{}{}",
         list_models_arm(CLAUDE_MODELS),
         user_turn_arm(timeline)
-    ))
+    )
+}
+
+/// A fixture answering exactly those arms.
+pub fn conversation_fixture(timeline: &str) -> ScriptedClaude {
+    ScriptedClaude::new(&conversation_arms(timeline))
 }
 
 /// The agent Messages in `snapshot`, in Transcript order — the Prompt's own Message is a Message

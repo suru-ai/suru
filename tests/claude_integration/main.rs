@@ -20,6 +20,7 @@ mod provider_support;
 mod activity;
 mod interruption;
 mod models;
+mod resume;
 mod steering;
 mod support;
 mod turns;
