@@ -15,6 +15,7 @@ mod codex;
 mod copilot;
 pub(crate) mod harness;
 mod orchestration;
+mod reasoning;
 
 pub use codex::CodexRuntime;
 pub use copilot::CopilotRuntime;

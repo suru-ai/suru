@@ -8,13 +8,15 @@
 //!
 //! Unlike Codex, one Copilot CLI process hosts every Copilot Session, so the runtime owns a single
 //! [`shared harness`](super::harness::SharedHarness) that Model discovery and Sessions alike demand.
-//! [`session`] opens one Copilot Session on that process and runs its Turns, and [`projection`]
-//! turns the Session's event timeline into the Provider events the rest of Suru consumes.
+//! [`session`] opens one Copilot Session on that process and runs its Turns, [`projection`] turns
+//! the Session's event timeline into the Provider events the rest of Suru consumes, and [`tools`]
+//! decides what one Tool execution reads as once it gets there.
 
 mod catalog;
 mod projection;
 mod runtime;
 mod session;
+mod tools;
 mod transport;
 
 pub use runtime::CopilotRuntime;

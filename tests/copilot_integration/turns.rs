@@ -3,34 +3,20 @@
 
 use std::sync::Arc;
 
-use crate::{
-    server_support::receive_initial_state,
-    support::{
-        ScriptedCopilot, connect_arm, create_session_arm, current_model_arm, models_arm,
-        permission_decision_arm, send_arm, switch_model_arm,
-    },
+use crate::support::{
+    agent_messages, connect, conversation_fixture, settled_session, settled_session_on,
 };
 use serde_json::Value;
 use suru::{
-    managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
         Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, InitialPrompt,
-        MessageRole, MessageStatus, ModelId, ModelOptionChoiceId, ModelOptionId,
-        ModelOptionSelection, ModelOptionValue, PromptDelivery, PromptId, PromptStatus, ProviderId,
-        SessionId, SessionSnapshot, TurnStatus, Workspace,
+        MessageStatus, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
+        ModelOptionValue, PromptDelivery, PromptId, PromptStatus, ProviderId, TurnStatus,
+        Workspace,
     },
     provider::CopilotRuntime,
     server::{self, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
-
-/// The catalog the picker — and the Agent Selection a test names — draws on.
-const COPILOT_MODELS: &str = concat!(
-    r#"[{"id":"auto","name":"Auto","capabilities":{}},"#,
-    r#"{"id":"claude-fixture","name":"Claude Fixture","capabilities":{},"#,
-    r#""supportedReasoningEfforts":["low","high"],"defaultReasoningEffort":"high","#,
-    r#""supportedContextTiers":["default","long_context"]}]"#,
-);
 
 /// One agent Message arriving as Copilot produces it, then the loop going idle.
 const STREAMED_MESSAGE: &str = r#"      event e1 assistant.message_start '{"messageId":"m1"}'
@@ -39,84 +25,6 @@ const STREAMED_MESSAGE: &str = r#"      event e1 assistant.message_start '{"mess
       event e4 assistant.message '{"messageId":"m1","content":"Hello from Copilot"}'
       event e5 session.idle '{}'
 "#;
-
-fn conversation_fixture(timeline: &str) -> ScriptedCopilot {
-    ScriptedCopilot::new(&format!(
-        "{}{}{}{}{}{}{}",
-        connect_arm(),
-        models_arm(COPILOT_MODELS),
-        create_session_arm(),
-        current_model_arm("claude-fixture", "high", "default"),
-        switch_model_arm(),
-        permission_decision_arm(),
-        send_arm(timeline),
-    ))
-}
-
-async fn connect(state_dir: &std::path::Path, name: &str) -> ManagedClient {
-    let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir, name).expect("configure client"),
-    )
-    .await
-    .expect("connect client");
-    receive_initial_state(&mut client).await;
-    client
-}
-
-/// The agent Messages in `snapshot`, in Transcript order — the Prompt's own Message is a Message
-/// too, and it is never what a Provider produced.
-fn agent_messages(snapshot: &SessionSnapshot) -> Vec<&suru::protocol::Message> {
-    snapshot
-        .messages
-        .iter()
-        .filter(|message| message.role == MessageRole::Agent)
-        .collect()
-}
-
-/// The Session once the Turn at `turn_index` has stopped running, whatever it settled as, read
-/// from a Session feed opened for the wait.
-async fn settled_session(
-    client: &ManagedClient,
-    session_id: SessionId,
-    turn_index: usize,
-) -> SessionSnapshot {
-    let mut feed = client
-        .subscribe_session(session_id)
-        .await
-        .expect("subscribe to Session SSE");
-    settled_session_on(client, &mut feed, session_id, turn_index).await
-}
-
-/// The same wait over a feed the caller already holds, for a test that must be subscribed before
-/// it delivers the Prompt it is waiting on.
-async fn settled_session_on(
-    client: &ManagedClient,
-    feed: &mut suru::managed_client::SessionSubscription,
-    session_id: SessionId,
-    turn_index: usize,
-) -> SessionSnapshot {
-    timeout(Duration::from_secs(10), async {
-        loop {
-            feed.next()
-                .await
-                .expect("Session feed remains open")
-                .expect("Session event is valid");
-            let snapshot = client
-                .read_session(session_id)
-                .await
-                .expect("read Session while its Turn runs");
-            if snapshot
-                .turns
-                .get(turn_index)
-                .is_some_and(|turn| turn.status != TurnStatus::Active)
-            {
-                return snapshot;
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("Copilot Turn {turn_index} settles"))
-}
 
 fn selection(model: &str, effort: &str, tier: &str) -> AgentSelection {
     AgentSelection {

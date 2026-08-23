@@ -19,7 +19,6 @@ use tokio::sync::mpsc;
 use super::{
     DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
     codex_error,
-    reasoning::{ReasoningSegment, ReasoningSummarySplitter},
     shell_wrapper::strip_launcher_wrapper,
     wire::{
         NativeCommandStatus, NativeField, NativeFileChange, NativeFileChangeStatus,
@@ -33,7 +32,9 @@ use crate::{
     },
     provider::{
         ProviderActivityId, ProviderCommandStatus, ProviderError, ProviderEvent,
-        ProviderEventStream, ProviderFileChangeStatus, harness::ProcessGuard,
+        ProviderEventStream, ProviderFileChangeStatus,
+        harness::ProcessGuard,
+        reasoning::{ReasoningSegment, ReasoningSummarySplitter},
     },
 };
 

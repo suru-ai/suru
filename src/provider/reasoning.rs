@@ -1,13 +1,14 @@
-//! Splitting the title Codex leads a Reasoning summary with off its body.
+//! Splitting the title a Provider leads a Reasoning block with off its body.
 //!
-//! OpenAI's Responses API opens each reasoning summary section with a bolded
-//! title block — `**Inspecting the provider seam**`, a blank line, then the
-//! prose. Suru stores that title as a typed property of the Reasoning Activity
-//! the section becomes, rather than leaving it in the content, so a client can
-//! head a folded block with it instead of parsing it back out. The split happens
-//! as the section streams, which is why it needs the state this module holds:
-//! the head is withheld until the block either resolves into a title or is
-//! ruled out.
+//! OpenAI's models open each reasoning summary section with a bolded title
+//! block — `**Inspecting the provider seam**`, a blank line, then the prose —
+//! and every Provider that fronts them reports it that way, which is why this
+//! lives beside the Providers rather than inside one of them. Suru stores that
+//! title as a typed property of the Reasoning Activity the section becomes,
+//! rather than leaving it in the content, so a client can head a folded block
+//! with it instead of parsing it back out. The split happens as the section
+//! streams, which is why it needs the state this module holds: the head is
+//! withheld until the block either resolves into a title or is ruled out.
 
 /// The most characters withheld while the title block is undecided. A title is
 /// a short phrase, so a head that runs past this is prose that merely happened

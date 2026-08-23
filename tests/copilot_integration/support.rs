@@ -6,9 +6,24 @@
 //! test supplies, matched against the request body, with `$COPILOT_FIXTURE_ID` standing for the
 //! request's JSON-RPC ID and `reply` framing a response body.
 
+use suru::{
+    managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
+    protocol::{Message, MessageRole, SessionId, SessionSnapshot, TurnStatus},
+};
 use tokio::time::{Duration, timeout};
 
-use crate::scripted_binary_support::{captured_methods, captured_requests, write_executable};
+use crate::{
+    scripted_binary_support::{captured_methods, captured_requests, write_executable},
+    server_support::receive_initial_state,
+};
+
+/// The catalog the picker — and the Agent Selection a test names — draws on.
+pub const COPILOT_MODELS: &str = concat!(
+    r#"[{"id":"auto","name":"Auto","capabilities":{}},"#,
+    r#"{"id":"claude-fixture","name":"Claude Fixture","capabilities":{},"#,
+    r#""supportedReasoningEfforts":["low","high"],"defaultReasoningEffort":"high","#,
+    r#""supportedContextTiers":["default","long_context"]}]"#,
+);
 
 /// Reads one Content-Length-framed request at a time, records it, and dispatches it to the test's
 /// arms. `read` on a pipe consumes a byte at a time, so `dd` picks up exactly where the blank line
@@ -236,4 +251,84 @@ impl ScriptedCopilot {
 
 fn fixture_path(path: &std::path::Path) -> &str {
     path.to_str().expect("fixture path is UTF-8")
+}
+
+/// A fixture that carries a Session from creation through one Turn, playing `timeline` while it
+/// runs.
+pub fn conversation_fixture(timeline: &str) -> ScriptedCopilot {
+    ScriptedCopilot::new(&format!(
+        "{}{}{}{}{}{}{}",
+        connect_arm(),
+        models_arm(COPILOT_MODELS),
+        create_session_arm(),
+        current_model_arm("claude-fixture", "high", "default"),
+        switch_model_arm(),
+        permission_decision_arm(),
+        send_arm(timeline),
+    ))
+}
+
+pub async fn connect(state_dir: &std::path::Path, name: &str) -> ManagedClient {
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir, name).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    client
+}
+
+/// The agent Messages in `snapshot`, in Transcript order — the Prompt's own Message is a Message
+/// too, and it is never what a Provider produced.
+pub fn agent_messages(snapshot: &SessionSnapshot) -> Vec<&Message> {
+    snapshot
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Agent)
+        .collect()
+}
+
+/// The Session once the Turn at `turn_index` has stopped running, whatever it settled as, read
+/// from a Session feed opened for the wait.
+pub async fn settled_session(
+    client: &ManagedClient,
+    session_id: SessionId,
+    turn_index: usize,
+) -> SessionSnapshot {
+    let mut feed = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    settled_session_on(client, &mut feed, session_id, turn_index).await
+}
+
+/// The same wait over a feed the caller already holds, for a test that must be subscribed before
+/// it delivers the Prompt it is waiting on.
+pub async fn settled_session_on(
+    client: &ManagedClient,
+    feed: &mut SessionSubscription,
+    session_id: SessionId,
+    turn_index: usize,
+) -> SessionSnapshot {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            feed.next()
+                .await
+                .expect("Session feed remains open")
+                .expect("Session event is valid");
+            let snapshot = client
+                .read_session(session_id)
+                .await
+                .expect("read Session while its Turn runs");
+            if snapshot
+                .turns
+                .get(turn_index)
+                .is_some_and(|turn| turn.status != TurnStatus::Active)
+            {
+                return snapshot;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Copilot Turn {turn_index} settles"))
 }
