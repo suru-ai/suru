@@ -11,8 +11,15 @@
 //! [`shared::SharedHarness`] every Session and Model discovery demand goes through.
 
 mod process;
+// The shared cell's first Provider consumer is the Copilot runtime (#110),
+// with Codex's migration tracked as #111; until one lands, only the cell's
+// own tests exercise it.
+#[allow(dead_code)]
+mod shared;
 
 pub(crate) use process::{
-    HarnessLink, HarnessSpec, ProcessGuard, ProcessRegistry, ProcessStdio,
-    spawn_harness_process, supervise_harness_process,
+    HarnessLink, HarnessSpec, ProcessGuard, ProcessRegistry, ProcessStdio, spawn_harness_process,
+    supervise_harness_process,
 };
+#[allow(unused_imports)]
+pub(crate) use shared::{HarnessConnector, SharedHarness, SharedHarnessHandle};
