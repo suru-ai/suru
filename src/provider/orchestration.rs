@@ -14,14 +14,14 @@ use tokio::{
 };
 
 use super::{
-    ProviderCommandStatus, ProviderEvent, ProviderEventStream, ProviderFileChangeStatus,
-    ProviderRuntime, ProviderSession, ProviderSessionRequest, ProviderSteerInput,
-    ProviderTurnInput,
+    ProviderCommandStatus, ProviderError, ProviderEvent, ProviderEventStream,
+    ProviderFileChangeStatus, ProviderRuntime, ProviderSession, ProviderSessionRequest,
+    ProviderSteerInput, ProviderTurnInput,
 };
 use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AgentIdentity, Message, MessageId, MessageRole,
-    MessageStatus, PromptId, SessionChange, SessionId, TurnId, TurnStatus,
+    MessageStatus, PromptId, ProviderId, SessionChange, SessionId, TurnId, TurnStatus,
 };
 use crate::sessions::{
     DeliveredTurn, DeliveredTurnStatus, InterruptTurnError, ProviderTurnOutcome, SessionStore,
@@ -600,7 +600,7 @@ async fn run_provider_session(
                                 prompt_id,
                                 None,
                                 DeliveredTurnStatus::Failed {
-                                    message: failure_message("Provider startup failed", &error),
+                                    message: startup_failure_message(&provider_id, &error),
                                 },
                             )
                         }) else {
@@ -1428,6 +1428,20 @@ fn project_provider_event(
 /// carry the escape sequences Provider output carries.
 fn failure_message(failure: &str, cause: &impl Display) -> String {
     normalize_provider_text(&format!("{failure}: {cause}"))
+}
+
+/// The message a Provider startup failure carries. A failure naming a typed
+/// condition the user fixes outside Suru — an uninstalled CLI, an account not
+/// signed in — leads with that condition, so the Turn says what to do about it
+/// rather than only that a launch went wrong.
+fn startup_failure_message(provider: &ProviderId, error: &ProviderError) -> String {
+    match error.unavailability() {
+        Some(reason) => failure_message(
+            &format!("Provider `{provider}` is {}", reason.label()),
+            error,
+        ),
+        None => failure_message("Provider startup failed", error),
+    }
 }
 
 fn fail_invalid_provider_event(

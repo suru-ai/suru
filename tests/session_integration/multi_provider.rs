@@ -822,3 +822,66 @@ async fn a_fresh_landing_default_skips_an_unavailable_provider() {
 
     server.shutdown().await.expect("shut down server");
 }
+
+/// Issue #116: a Session that opens on a Provider the user cannot use yet still
+/// fails legibly, and the typed condition leads the failure so the Turn says
+/// what to do about it rather than only that a launch went wrong.
+#[tokio::test]
+async fn a_turn_that_starts_on_an_unavailable_provider_fails_with_the_typed_condition() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (alpha_runtime, mut alpha) =
+        ControlledProvider::with_provider(ProviderId::new("alpha"), Vec::new());
+    let server = server::spawn_with_providers(
+        ServerConfig::new(state_dir.path(), "unavailable-startup-test").expect("configure server"),
+        vec![alpha_runtime],
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+
+    let session = create_session(
+        &descriptor,
+        &create_session_request(workspace.path(), "alpha", "alpha-model"),
+    )
+    .await;
+    alpha.next_start().await.fail_unavailable(
+        ProviderUnavailability::NotInstalled,
+        "could not launch the alpha CLI `alpha`: No such file or directory",
+    );
+
+    let failed = timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = read_session(&descriptor, session.session.id).await;
+            if snapshot
+                .turns
+                .last()
+                .is_some_and(|turn| turn.status == TurnStatus::Failed)
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the Turn settles as failed");
+    let error_text = failed
+        .activities
+        .iter()
+        .rev()
+        .find_map(|activity| match activity {
+            Activity::Error { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("the failed Turn carries an Error Activity");
+    assert!(
+        error_text.starts_with("Provider `alpha` is not installed"),
+        "the failure leads with the condition the user fixes, got {error_text:?}"
+    );
+    assert!(
+        error_text.contains("No such file or directory"),
+        "the Provider's own account of the condition survives, got {error_text:?}"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}

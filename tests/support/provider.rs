@@ -143,6 +143,14 @@ impl StartRequest {
             .send(Err(ProviderError::new(message)))
             .unwrap_or_else(|_| panic!("Provider startup response remains connected"));
     }
+
+    /// Fails the startup the way a Provider whose CLI the user has yet to
+    /// install or sign in to does: with the condition typed on the failure.
+    pub fn fail_unavailable(self, reason: ProviderUnavailability, message: impl Into<String>) {
+        self.response
+            .send(Err(ProviderError::unavailable(reason, message)))
+            .unwrap_or_else(|_| panic!("Provider startup response remains connected"));
+    }
 }
 
 impl ControlledProviderSession {
