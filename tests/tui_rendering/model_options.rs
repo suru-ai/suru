@@ -62,6 +62,7 @@ fn options_command_resolves_provider_default_and_explains_unavailable_configurat
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
                     models: vec![configurable],
                     status: ProviderCatalogStatus::Fresh,
                 }],
@@ -126,6 +127,7 @@ fn options_command_resolves_provider_default_and_explains_unavailable_configurat
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
                     models: vec![model_descriptor(
                         "codex",
                         "plain",
@@ -228,6 +230,7 @@ fn options_command_resolves_provider_default_and_explains_unavailable_configurat
         });
         ProviderModelCatalog {
             provider: ProviderId::new(provider),
+            display_name: provider.to_owned(),
             models: vec![model],
             status: ProviderCatalogStatus::Fresh,
         }
@@ -292,6 +295,7 @@ fn stale_catalog_failure_does_not_end_newer_options_resolution() {
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
                     models: vec![model],
                     status: ProviderCatalogStatus::Fresh,
                 }],
@@ -328,6 +332,7 @@ fn refreshed_descriptors_replace_a_cached_no_options_status() {
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
                     models: vec![plain.clone()],
                     status: ProviderCatalogStatus::Refreshing,
                 }],
@@ -369,6 +374,7 @@ fn refreshed_descriptors_replace_a_cached_no_options_status() {
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
                     models: vec![configurable],
                     status: ProviderCatalogStatus::Fresh,
                 }],
@@ -461,6 +467,7 @@ fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
                     models: vec![model],
                     status: ProviderCatalogStatus::Fresh,
                 }],
@@ -640,6 +647,7 @@ fn refreshed_options_keep_invalidated_choice_visible_and_disable_apply() {
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
                     models: vec![initial.clone()],
                     status: ProviderCatalogStatus::Refreshing,
                 }],
@@ -680,6 +688,7 @@ fn refreshed_options_keep_invalidated_choice_visible_and_disable_apply() {
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
                     models: vec![refreshed],
                     status: ProviderCatalogStatus::Fresh,
                 }],
@@ -828,6 +837,7 @@ fn landing_on_the_tiered_model() -> Application {
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("copilot"),
+                    display_name: "copilot".to_owned(),
                     models: vec![tiered_model()],
                     status: ProviderCatalogStatus::Fresh,
                 }],

@@ -129,6 +129,10 @@ impl ProviderRuntime for CodexRuntime {
         ProviderId::new("codex")
     }
 
+    fn display_name(&self) -> &str {
+        "Codex"
+    }
+
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();

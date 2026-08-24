@@ -37,6 +37,10 @@ enum PickerSelection {
 #[derive(Clone, Debug)]
 struct ProviderModels {
     provider: ProviderId,
+    /// The Provider's name as the user reads it. Catalog-served rows carry the
+    /// runtime-declared name; rows the picker invents for a Provider no catalog
+    /// answered for fall back to the wire identifier, the only name it has.
+    display_name: String,
     models: Vec<ModelDescriptor>,
     status: ProviderCatalogStatus,
 }
@@ -57,7 +61,7 @@ pub(super) struct ModelPicker {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ModelPickerRow<'a> {
     Provider {
-        provider: &'a ProviderId,
+        name: &'a str,
         refreshing: bool,
     },
     Model {
@@ -66,7 +70,7 @@ pub(super) enum ModelPickerRow<'a> {
         current: bool,
     },
     Error {
-        provider: &'a ProviderId,
+        name: &'a str,
         message: &'a str,
         selected: bool,
     },
@@ -74,7 +78,7 @@ pub(super) enum ModelPickerRow<'a> {
     /// its reason on show, its Models render unselectable, and choosing the row
     /// re-lists the catalog for a user who has just fixed the condition.
     Unavailable {
-        provider: &'a ProviderId,
+        name: &'a str,
         reason: ProviderUnavailability,
         message: &'a str,
         selected: bool,
@@ -163,6 +167,17 @@ impl ModelPicker {
         self.provider_scope.as_ref()
     }
 
+    /// The Provider's name as the user reads it, from whichever catalog the
+    /// picker has heard — the live list first, then the cache. A Provider no
+    /// catalog has named yet goes by its wire identifier, the only name known.
+    pub(super) fn provider_display_name<'a>(&'a self, provider: &'a ProviderId) -> &'a str {
+        self.providers
+            .iter()
+            .chain(self.cached_providers.iter())
+            .find(|candidate| &candidate.provider == provider)
+            .map_or(provider.as_str(), |candidate| &candidate.display_name)
+    }
+
     pub(super) fn refocus(&mut self, current: Option<&AgentSelection>) {
         if self.open {
             self.cursor_moved = false;
@@ -193,6 +208,7 @@ impl ModelPicker {
                 .any(|provider| provider.provider == *scope)
         {
             self.providers.push(ProviderModels {
+                display_name: scope.to_string(),
                 provider: scope.clone(),
                 models: Vec::new(),
                 status: ProviderCatalogStatus::Failed {
@@ -219,6 +235,7 @@ impl ModelPicker {
                 .clone()
                 .unwrap_or_else(|| ProviderId::new("catalog"));
             self.providers.push(ProviderModels {
+                display_name: provider.to_string(),
                 provider,
                 models: Vec::new(),
                 status: ProviderCatalogStatus::Failed { message: error },
@@ -316,7 +333,8 @@ impl ModelPicker {
             return if detailed {
                 format!(
                     "Model {} · Provider {}",
-                    selection.model, selection.provider
+                    selection.model,
+                    self.provider_display_name(&selection.provider)
                 )
             } else {
                 format!("Model {}", selection.model)
@@ -326,7 +344,10 @@ impl ModelPicker {
         if !detailed {
             return parts.pop().expect("Model summary always has one part");
         }
-        parts.push(format!("Provider {}", selection.provider));
+        parts.push(format!(
+            "Provider {}",
+            self.provider_display_name(&selection.provider)
+        ));
         for descriptor in &model.options {
             let Some(selected) = selection
                 .options
@@ -372,6 +393,7 @@ impl ModelPicker {
                 continue;
             };
             provider.status = update.status.clone();
+            provider.display_name.clone_from(&update.display_name);
             for existing in &mut provider.models {
                 if let Some(model) = update.models.iter().find(|model| model.id == existing.id) {
                     *existing = model.clone();
@@ -467,7 +489,7 @@ impl ModelPicker {
                 continue;
             }
             rows.push(ModelPickerRow::Provider {
-                provider: &provider.provider,
+                name: &provider.display_name,
                 refreshing: matches!(provider.status, ProviderCatalogStatus::Refreshing),
             });
             rows.extend(models.into_iter().map(|model| {
@@ -483,13 +505,13 @@ impl ModelPicker {
                     self.selected == Some(PickerSelection::Retry(provider.provider.clone()));
                 rows.push(match condition {
                     ProviderCondition::Failing(message) => ModelPickerRow::Error {
-                        provider: &provider.provider,
+                        name: &provider.display_name,
                         message,
                         selected,
                     },
                     ProviderCondition::Unavailable { reason, message } => {
                         ModelPickerRow::Unavailable {
-                            provider: &provider.provider,
+                            name: &provider.display_name,
                             reason,
                             message,
                             selected,
@@ -572,6 +594,7 @@ fn normalize_provider(mut catalog: ProviderModelCatalog) -> ProviderModels {
     }
     ProviderModels {
         provider: catalog.provider,
+        display_name: catalog.display_name,
         models: catalog.models,
         status: catalog.status,
     }

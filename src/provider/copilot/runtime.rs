@@ -70,6 +70,10 @@ impl ProviderRuntime for CopilotRuntime {
         ProviderId::new(COPILOT_PROVIDER_ID)
     }
 
+    fn display_name(&self) -> &str {
+        "Copilot"
+    }
+
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
         Box::pin(async move {
             // Launches the shared process if this is the first demand, or the first since a crash.

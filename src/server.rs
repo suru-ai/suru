@@ -1536,6 +1536,21 @@ mod tests {
         assert!(second.next().await.is_none());
     }
 
+    /// The other guard a Provider must clear before shipping: client surfaces
+    /// print whatever name the runtime declares, so a Provider with a blank
+    /// display name would surface to the user as nothing at all. The trait
+    /// makes declaring one mandatory; this guards what is declared.
+    #[test]
+    fn every_built_in_provider_has_a_display_name() {
+        for runtime in built_in_runtimes() {
+            let provider = runtime.provider_id();
+            assert!(
+                !runtime.display_name().trim().is_empty(),
+                "Provider `{provider}` declares a blank display name"
+            );
+        }
+    }
+
     /// A Provider added to the built-in set without an `enabled` Setting would
     /// be one the user cannot turn off, and would read as enabled forever
     /// through the fallback [`EffectiveSettings::provider_enabled`] keeps for

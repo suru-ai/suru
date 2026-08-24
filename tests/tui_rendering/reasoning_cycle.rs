@@ -99,6 +99,7 @@ fn warm_model_catalog(application: &mut Application, model: ModelDescriptor) {
             request,
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
+                    display_name: provider.to_string(),
                     provider,
                     models: vec![model],
                     status: ProviderCatalogStatus::Fresh,

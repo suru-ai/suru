@@ -99,6 +99,12 @@ impl ProviderRuntime for ClaudeRuntime {
         ProviderId::new(CLAUDE_PROVIDER_ID)
     }
 
+    // "Claude", deliberately not "Claude Code": Suru hosts the Provider, and
+    // the product the user is choosing between here is the model family.
+    fn display_name(&self) -> &str {
+        "Claude"
+    }
+
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();

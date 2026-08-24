@@ -72,6 +72,7 @@ fn model_picker_hands_off_to_ordered_options_and_applies_complete_landing_select
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "Codex".to_owned(),
                     models: vec![model],
                     status: ProviderCatalogStatus::Fresh,
                 }],
@@ -91,7 +92,7 @@ fn model_picker_hands_off_to_ordered_options_and_applies_complete_landing_select
     let options = rendered_application_rows(&application);
     assert!(options.join("\n").contains("Model Options"));
     assert!(options.join("\n").contains("Configurable GPT"));
-    assert!(options.join("\n").contains("Provider codex"));
+    assert!(options.join("\n").contains("Provider Codex"));
     assert!(rendered_row(&options, "Reasoning") < rendered_row(&options, "Fast"));
     assert!(options.join("\n").contains("Reasoning · Low"));
     assert!(options.join("\n").contains("Fast · Off"));
@@ -221,6 +222,7 @@ fn landing_model_picker_groups_sorts_focuses_and_searches_models() {
                 providers: vec![
                     ProviderModelCatalog {
                         provider: ProviderId::new("zeta"),
+                        display_name: "zeta".to_owned(),
                         models: vec![model_descriptor(
                             "zeta",
                             "z-native",
@@ -232,6 +234,7 @@ fn landing_model_picker_groups_sorts_focuses_and_searches_models() {
                     },
                     ProviderModelCatalog {
                         provider: ProviderId::new("alpha"),
+                        display_name: "alpha".to_owned(),
                         models: vec![
                             model_descriptor(
                                 "alpha",
@@ -326,6 +329,7 @@ fn open_model_picker_merges_refreshes_stably_and_isolates_provider_failures() {
                 providers: vec![
                     ProviderModelCatalog {
                         provider: ProviderId::new("alpha"),
+                        display_name: "alpha".to_owned(),
                         models: vec![
                             model_descriptor(
                                 "alpha",
@@ -346,6 +350,7 @@ fn open_model_picker_merges_refreshes_stably_and_isolates_provider_failures() {
                     },
                     ProviderModelCatalog {
                         provider: ProviderId::new("broken"),
+                        display_name: "broken".to_owned(),
                         models: Vec::new(),
                         status: ProviderCatalogStatus::Failed {
                             message: "credentials expired".to_owned(),
@@ -369,6 +374,7 @@ fn open_model_picker_merges_refreshes_stably_and_isolates_provider_failures() {
                 providers: vec![
                     ProviderModelCatalog {
                         provider: ProviderId::new("alpha"),
+                        display_name: "alpha".to_owned(),
                         models: vec![
                             model_descriptor(
                                 "alpha",
@@ -389,6 +395,7 @@ fn open_model_picker_merges_refreshes_stably_and_isolates_provider_failures() {
                     },
                     ProviderModelCatalog {
                         provider: ProviderId::new("broken"),
+                        display_name: "broken".to_owned(),
                         models: Vec::new(),
                         status: ProviderCatalogStatus::Failed {
                             message: "credentials expired".to_owned(),
@@ -466,6 +473,7 @@ fn model_picker_refresh_failure_preserves_the_visible_selection() {
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("alpha"),
+                    display_name: "alpha".to_owned(),
                     models: vec![
                         model_descriptor(
                             "alpha",
@@ -572,6 +580,7 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
                 providers: vec![
                     ProviderModelCatalog {
                         provider: ProviderId::new("other"),
+                        display_name: "other".to_owned(),
                         models: vec![model_descriptor(
                             "other",
                             "foreign",
@@ -583,6 +592,7 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
                     },
                     ProviderModelCatalog {
                         provider: ProviderId::new("codex"),
+                        display_name: "Codex".to_owned(),
                         models: vec![
                             model_descriptor(
                                 "codex",
@@ -600,7 +610,7 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
         })
         .expect("load Session-scoped catalog");
     let picker = rendered_application_rows(&application).join("\n");
-    assert!(picker.contains("Session Provider codex"));
+    assert!(picker.contains("Session Provider Codex"));
     assert!(picker.contains("use /new to change Provider"));
     assert!(!picker.contains("Foreign Model"));
     assert!(
@@ -787,6 +797,7 @@ fn landing_model_selection_and_new_session_inherit_complete_agent_selection() {
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
                     models: vec![model],
                     status: ProviderCatalogStatus::Fresh,
                 }],
@@ -898,6 +909,7 @@ fn open_model_picker_refocuses_on_an_authoritative_multi_client_update() {
     let catalog = ModelCatalog {
         providers: vec![ProviderModelCatalog {
             provider: ProviderId::new("codex"),
+            display_name: "codex".to_owned(),
             models: vec![
                 model_descriptor(
                     "codex",
@@ -923,6 +935,7 @@ fn open_model_picker_refocuses_on_an_authoritative_multi_client_update() {
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
                     models: vec![model_descriptor(
                         "codex",
                         "new",
@@ -1022,6 +1035,7 @@ fn model_picker_shows_an_unavailable_provider_with_its_reason_and_refuses_select
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
                     models: vec![model_descriptor(
                         "codex",
                         "gpt-fixture",
@@ -1083,6 +1097,7 @@ fn model_picker_shows_an_unavailable_provider_with_its_reason_and_refuses_select
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
                     models: vec![model_descriptor(
                         "codex",
                         "gpt-fixture",
@@ -1145,11 +1160,13 @@ fn model_picker_draws_no_row_at_all_for_a_provider_the_user_turned_off() {
                 providers: vec![
                     ProviderModelCatalog {
                         provider: ProviderId::new("codex"),
+                        display_name: "codex".to_owned(),
                         models: Vec::new(),
                         status: ProviderCatalogStatus::Disabled,
                     },
                     ProviderModelCatalog {
                         provider: ProviderId::new("copilot"),
+                        display_name: "copilot".to_owned(),
                         models: Vec::new(),
                         status: ProviderCatalogStatus::Unavailable {
                             reason: ProviderUnavailability::NotInstalled,
@@ -1158,6 +1175,7 @@ fn model_picker_draws_no_row_at_all_for_a_provider_the_user_turned_off() {
                     },
                     ProviderModelCatalog {
                         provider: ProviderId::new("other"),
+                        display_name: "other".to_owned(),
                         models: vec![model_descriptor(
                             "other",
                             "other-default",
@@ -1194,6 +1212,7 @@ fn model_picker_draws_no_row_at_all_for_a_provider_the_user_turned_off() {
             catalog: ModelCatalog {
                 providers: vec![ProviderModelCatalog {
                     provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
                     models: vec![model_descriptor(
                         "codex",
                         "gpt-fixture",
@@ -1240,6 +1259,7 @@ fn model_picker_keeps_an_unavailable_provider_with_no_models_in_the_list() {
                 providers: vec![
                     ProviderModelCatalog {
                         provider: ProviderId::new("codex"),
+                        display_name: "codex".to_owned(),
                         models: Vec::new(),
                         status: ProviderCatalogStatus::Unavailable {
                             reason: ProviderUnavailability::NotInstalled,
@@ -1248,6 +1268,7 @@ fn model_picker_keeps_an_unavailable_provider_with_no_models_in_the_list() {
                     },
                     ProviderModelCatalog {
                         provider: ProviderId::new("other"),
+                        display_name: "other".to_owned(),
                         models: vec![model_descriptor(
                             "other",
                             "other-default",
@@ -1283,5 +1304,69 @@ fn model_picker_keeps_an_unavailable_provider_with_no_models_in_the_list() {
     assert!(
         !screen.contains("No Models found"),
         "the list is not empty, got {screen}"
+    );
+}
+
+/// Issue #136: rows read as products, not wire identifiers. The catalog
+/// carries each Provider's runtime-declared display name, and the picker
+/// prints it on the Provider heading and the retry row alike.
+#[test]
+fn model_picker_shows_provider_display_names_from_the_catalog() {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("codex"),
+                        display_name: "Codex".to_owned(),
+                        models: vec![model_descriptor(
+                            "codex",
+                            "gpt",
+                            "GPT",
+                            true,
+                            ModelAvailability::Available,
+                        )],
+                        status: ProviderCatalogStatus::Fresh,
+                    },
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("copilot"),
+                        display_name: "Copilot".to_owned(),
+                        models: Vec::new(),
+                        status: ProviderCatalogStatus::Unavailable {
+                            reason: ProviderUnavailability::NotSignedIn,
+                            message: "run `copilot` to sign in".to_owned(),
+                        },
+                    },
+                ],
+            },
+        })
+        .expect("load catalog carrying display names");
+
+    let screen = rendered_application_rows(&application).join("\n");
+    assert!(
+        screen.contains("Provider Codex"),
+        "the heading reads the display name, got {screen}"
+    );
+    assert!(
+        !screen.contains("Provider codex"),
+        "the wire identifier never reaches the screen, got {screen}"
+    );
+    assert!(
+        screen.contains("Retry Copilot: not signed in"),
+        "the retry row reads the display name, got {screen}"
+    );
+    assert!(
+        !screen.contains("Retry copilot"),
+        "the retry row never falls back to the wire identifier, got {screen}"
     );
 }

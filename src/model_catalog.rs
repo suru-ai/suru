@@ -20,6 +20,7 @@ pub(crate) struct ModelCatalogService {
 struct ProviderCatalog {
     runtime: Arc<dyn ProviderRuntime>,
     provider: ProviderId,
+    display_name: String,
     state: Arc<Mutex<CatalogState>>,
     generation: watch::Sender<u64>,
     /// The effective Settings in force, read whenever this catalog is about to
@@ -59,6 +60,7 @@ impl ModelCatalogService {
                     .into_iter()
                     .map(|runtime| ProviderCatalog {
                         provider: runtime.provider_id(),
+                        display_name: runtime.display_name().to_owned(),
                         runtime,
                         state: Arc::new(Mutex::new(CatalogState::default())),
                         generation: watch::channel(0).0,
@@ -168,6 +170,7 @@ impl ProviderCatalog {
     fn disabled_catalog(&self) -> ProviderModelCatalog {
         ProviderModelCatalog {
             provider: self.provider.clone(),
+            display_name: self.display_name.clone(),
             models: Vec::new(),
             status: ProviderCatalogStatus::Disabled,
         }
@@ -303,6 +306,7 @@ impl ProviderCatalog {
     ) -> ProviderModelCatalog {
         ProviderModelCatalog {
             provider: self.provider.clone(),
+            display_name: self.display_name.clone(),
             models: state.models.clone().unwrap_or_default(),
             status,
         }
@@ -375,6 +379,10 @@ mod tests {
     impl ProviderRuntime for FailingAfterFirstRuntime {
         fn provider_id(&self) -> ProviderId {
             ProviderId::new("stub")
+        }
+
+        fn display_name(&self) -> &str {
+            "Stub"
         }
 
         fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {

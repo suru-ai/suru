@@ -453,6 +453,7 @@ fn opaque_cycling_catalog() -> ModelCatalog {
     ModelCatalog {
         providers: vec![ProviderModelCatalog {
             provider: ProviderId::new("controlled"),
+            display_name: "controlled".to_owned(),
             models: vec![ModelDescriptor {
                 provider: ProviderId::new("controlled"),
                 id: ModelId::new("gpt-cycle"),

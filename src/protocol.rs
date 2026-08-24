@@ -342,6 +342,10 @@ pub enum ProviderCatalogStatus {
 #[serde(deny_unknown_fields)]
 pub struct ProviderModelCatalog {
     pub provider: ProviderId,
+    /// The Provider's name as the user reads it, declared by its runtime —
+    /// "Codex" rather than `codex`. Rides the catalog so every client surface
+    /// prints the same name without knowing the runtimes.
+    pub display_name: String,
     pub models: Vec<ModelDescriptor>,
     pub status: ProviderCatalogStatus,
 }

@@ -279,6 +279,12 @@ pub enum ProviderEvent {
 pub trait ProviderRuntime: Send + Sync + 'static {
     fn provider_id(&self) -> ProviderId;
 
+    /// The Provider's name as the user reads it — "Codex", never `codex`.
+    /// Declared here so the runtime is the single source of the name every
+    /// surface prints, and required rather than defaulted so a new Provider
+    /// cannot ship without one.
+    fn display_name(&self) -> &str;
+
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>>;
 
     fn start_session(

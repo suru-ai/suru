@@ -16,6 +16,10 @@ impl ProviderRuntime for FailingProviderRuntime {
         ProviderId::new("failing")
     }
 
+    fn display_name(&self) -> &str {
+        "failing"
+    }
+
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
         Box::pin(async { Err(ProviderError::new("Model discovery is unavailable.")) })
     }

@@ -238,7 +238,10 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     {
         lines.push(Line::styled(
             truncate_to_width(
-                &format!("Session Provider {provider} · use /new to change Provider"),
+                &format!(
+                    "Session Provider {} · use /new to change Provider",
+                    state.model_picker.provider_display_name(provider)
+                ),
                 usize::from(content_width),
             ),
             theme.text.subdued,
@@ -254,13 +257,10 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
             .model_picker
             .visible_rows(row_capacity, current)
             .map(|row| match row {
-                ModelPickerRow::Provider {
-                    provider,
-                    refreshing,
-                } => Line::styled(
+                ModelPickerRow::Provider { name, refreshing } => Line::styled(
                     truncate_to_width(
                         &format!(
-                            "Provider {provider}{}",
+                            "Provider {name}{}",
                             if refreshing { " · refreshing" } else { "" }
                         ),
                         usize::from(content_width),
@@ -285,22 +285,22 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
                 // the retry the reader may take, with what it is about to
                 // re-check. Only the account of the condition differs.
                 ModelPickerRow::Error {
-                    provider,
+                    name,
                     message,
                     selected,
                 } => model_picker_retry_row(
-                    &format!("Retry {provider}: {message}"),
+                    &format!("Retry {name}: {message}"),
                     selected,
                     content_width,
                     theme,
                 ),
                 ModelPickerRow::Unavailable {
-                    provider,
+                    name,
                     reason,
                     message,
                     selected,
                 } => model_picker_retry_row(
-                    &format!("Retry {provider}: {} · {message}", reason.label()),
+                    &format!("Retry {name}: {} · {message}", reason.label()),
                     selected,
                     content_width,
                     theme,
@@ -424,7 +424,8 @@ fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) 
             truncate_to_width(
                 &format!(
                     "{} · Provider {}{unavailable}",
-                    model.display_name, model.provider
+                    model.display_name,
+                    state.model_picker.provider_display_name(&model.provider)
                 ),
                 content_width,
             ),

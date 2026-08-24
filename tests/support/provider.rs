@@ -264,6 +264,12 @@ impl ProviderRuntime for ControlledProviderRuntime {
         self.provider.clone()
     }
 
+    // The wire identifier doubles as the display name so tests keep asserting
+    // one vocabulary per double.
+    fn display_name(&self) -> &str {
+        self.provider.as_str()
+    }
+
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
         self.discoveries.fetch_add(1, Ordering::SeqCst);
         let models = self.models.clone();
