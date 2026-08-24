@@ -36,6 +36,14 @@ _Avoid_: Variant, trait, model setting
 A workspace for conversation between a user and an agent. A Session is independently addressable, may be viewed from multiple clients, and may exist before an agent is selected.
 _Avoid_: Chat, thread, conversation
 
+**Title**:
+The short line by which a Session is known wherever Sessions are listed, and the text a reader searches those listings by. A Title begins as the Session's first Prompt trimmed of the space around it — a real Title rather than a placeholder — and Suru replaces it once it has derived a better one through an Errand. Derivation is attempted once, when the first Prompt is admitted, and never again: a Session whose derivation was skipped, failed, or abandoned keeps the Title its Prompt gave it for good. A derived Title only replaces the Title it was derived from, so a Title since set by other means stands. A Setting decides whether Suru derives Titles at all, and which Agent Selection does the deriving.
+_Avoid_: Name, subject, summary
+
+**Emoji**:
+A single emoji standing for a Session beside its Title, derived with that Title in the same Errand and carried as a typed property rather than written into the Title's own text, so searching a listing of Sessions matches the words a reader remembers rather than the character in front of them. A Session may have none, which every surface presenting Sessions draws as readily as it draws one.
+_Avoid_: Icon, glyph — which a Marker and a Spinner already claim — avatar
+
 **Landing**:
 The view a client shows when no Session is open, carrying the Agent Selection a new Session will begin from and the composer its first Prompt is written in.
 _Avoid_: Home, launch view, start screen, welcome screen
@@ -55,6 +63,14 @@ _Avoid_: Finish, close, resolve
 **Prompt**:
 User input submitted for delivery to an agent. A delivered Prompt becomes either the user Message that begins a Turn or a later user Message that steers its active Turn.
 _Avoid_: Request, draft, message
+
+**Errand**:
+A single Provider call Suru makes for its own purposes rather than the user's: one Prompt in, one reply shaped by the schema the Errand asks for, carrying no Tools. An Errand belongs to no Session and appears in no Transcript, and it is never a Turn, because nothing about it is the user's work. A Provider runs an Errand however its own harness allows — without a Session where one-shot work is offered, and otherwise through a Session it starts and discards — and Suru stores nothing of it either way but the answer it asked for. An Errand that fails, times out, or answers outside its schema leaves no mark beyond the Log, because whatever asked for one always has something to fall back on.
+_Avoid_: Background turn, side call, utility prompt
+
+**Errand Selection**:
+The Agent Selection a Provider declares for running Errands, chosen for cheapness and speed rather than capability, and resolved against that Provider's live Models each time an Errand runs, so a Model that has gone gives way to the Provider's default rather than failing the Errand. Whatever asks for an Errand decides which Provider runs it — deriving a Title follows the Session's own Provider unless a Setting pins one, and a Session that has selected no Provider runs no Errand at all — and the Provider's own declaration then decides which Model.
+_Avoid_: Small model, cheap model, title model
 
 **Message**:
 User-visible content in a session attributed to the user or agent.
