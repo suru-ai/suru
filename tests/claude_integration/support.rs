@@ -25,7 +25,9 @@ use crate::{
 
 /// The rows the fixture's picker advertises, in the CLI's own response shape: the recommended
 /// `default` row, an alias row resolving to the same canonical model, a concrete model with effort
-/// levels, and one without any effort metadata.
+/// levels, and the cheap row without any effort metadata that Claude declares its Errands run at.
+/// That last row is named as the live CLI names it, because a declaration is resolved against the
+/// catalog by Model ID.
 pub const CLAUDE_MODELS: &str = concat!(
     r#"[{"value":"default","resolvedModel":"claude-fixture-1","displayName":"Default (recommended)","#,
     r#""description":"Fixture 1 · Best for everyday tasks","supportsEffort":true,"#,
@@ -36,12 +38,37 @@ pub const CLAUDE_MODELS: &str = concat!(
     r#"{"value":"middling","resolvedModel":"claude-fixture-2","displayName":"Middling","#,
     r#""description":"Fixture 2 · Efficient for routine tasks","supportsEffort":true,"#,
     r#""supportedEffortLevels":["low","medium"]},"#,
-    r#"{"value":"tiny","resolvedModel":"claude-fixture-3","displayName":"Tiny","#,
+    r#"{"value":"haiku","resolvedModel":"claude-fixture-3","displayName":"Haiku","#,
     r#""description":"Fixture 3 · Fastest for quick answers"}]"#,
 );
 
+/// The same catalog with the row valued `value` withdrawn, for a test about a Model the CLI has
+/// stopped serving. The row is dropped by reading the catalog rather than by re-spelling it, so a
+/// change to the fixture's rows cannot leave the withdrawal silently doing nothing.
+pub fn models_without(models: &str, value: &str) -> String {
+    let mut rows: Vec<serde_json::Value> =
+        serde_json::from_str(models).expect("the fixture's Model rows are JSON");
+    let before = rows.len();
+    rows.retain(|row| row["value"] != value);
+    assert_eq!(
+        rows.len() + 1,
+        before,
+        "the catalog served exactly one row valued {value}"
+    );
+    serde_json::to_string(&rows).expect("the remaining rows re-serialize")
+}
+
 /// Records the launch and its arguments — one line per launch, so a test that restarts the runtime
 /// or respawns a Session child can read each launch apart from the others — and defines `emit`.
+///
+/// Each launch is recorded twice: once whitespace-joined, which is what most assertions read, and
+/// once as its working directory and its arguments joined by a separator no argument carries. The
+/// second is what survives an argument that is empty or holds spaces, and it is one append of one
+/// line, so two processes launched at the same moment cannot interleave their records.
+///
+/// `$attempt` counts the launches for the arms that answer the CLI's nth launch differently from
+/// its first. It is a read-then-write of a shared file, so a fixture whose launches genuinely
+/// overlap should not be scripted against it.
 const SCRIPT_PREFIX: &str = r#"#!/bin/sh
 attempt=1
 if [ -e "$CLAUDE_FIXTURE_ATTEMPTS" ]; then
@@ -49,6 +76,7 @@ if [ -e "$CLAUDE_FIXTURE_ATTEMPTS" ]; then
 fi
 printf '%s\n' "$attempt" > "$CLAUDE_FIXTURE_ATTEMPTS"
 printf '%s\n' "$*" >> "$CLAUDE_FIXTURE_ARGV"
+( IFS=$(printf '\037'); printf '%s\t%s\n' "$PWD" "$*" >> "$CLAUDE_FIXTURE_LAUNCHES" )
 trap 'printf "exited\n" >> "$CLAUDE_FIXTURE_EXITED"' EXIT
 
 # One newline-delimited stream-json message on the CLI's stdout.
@@ -276,12 +304,48 @@ pub struct ScriptedClaude {
     executable: std::path::PathBuf,
     script: String,
     log: std::path::PathBuf,
-    attempts: std::path::PathBuf,
     argv: std::path::PathBuf,
+    /// One line per launch: its working directory, then its arguments exactly as it received them.
+    launches: std::path::PathBuf,
+    errand_prompt: std::path::PathBuf,
     exited: std::path::PathBuf,
     release: std::path::PathBuf,
     signed_in: std::path::PathBuf,
     upgraded: std::path::PathBuf,
+}
+
+/// One launch of the fixture, as a test that must tell one from another reads it.
+#[derive(Debug)]
+pub struct Launch {
+    /// Every argument the process was launched with, exactly — empty values and values carrying
+    /// spaces included.
+    pub arguments: Vec<String>,
+    /// The directory the process was started in.
+    pub working_directory: std::path::PathBuf,
+}
+
+impl Launch {
+    /// Whether the launch carried `flag`, which is how a test tells one kind of launch from
+    /// another — only an Errand's print mode is given a JSON schema, only a Session's child is
+    /// given a conversation to speak on.
+    pub fn carries(&self, flag: &str) -> bool {
+        self.arguments.iter().any(|argument| argument == flag)
+    }
+
+    /// The value the launch gave `flag`, which is the argument after it.
+    pub fn value(&self, flag: &str) -> &str {
+        self.arguments
+            .iter()
+            .position(|argument| argument == flag)
+            .and_then(|position| self.arguments.get(position + 1))
+            .map(String::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the CLI was launched with {flag} and a value, got: {:?}",
+                    self.arguments
+                )
+            })
+    }
 }
 
 impl ScriptedClaude {
@@ -303,16 +367,23 @@ impl ScriptedClaude {
         let path = |name: &str| directory.path().join(name);
         let executable = path("claude");
         let log = path("requests.jsonl");
-        let attempts = path("attempts");
         let argv = path("argv");
+        let attempts = path("attempts");
+        let launches = path("launches");
+        let errand_prompt = path("errand-prompt");
         let exited = path("exited");
         let release = path("release");
         let signed_in = path("signed-in");
         let upgraded = path("upgraded");
         let script = format!("{SCRIPT_PREFIX}{preamble}{SCRIPT_LOOP}{case_arms}  esac\ndone\n")
             .replace("$CLAUDE_FIXTURE_LOG", fixture_path(&log))
-            .replace("$CLAUDE_FIXTURE_ATTEMPTS", fixture_path(&attempts))
             .replace("$CLAUDE_FIXTURE_ARGV", fixture_path(&argv))
+            .replace("$CLAUDE_FIXTURE_ATTEMPTS", fixture_path(&attempts))
+            .replace("$CLAUDE_FIXTURE_LAUNCHES", fixture_path(&launches))
+            .replace(
+                "$CLAUDE_FIXTURE_ERRAND_PROMPT",
+                fixture_path(&errand_prompt),
+            )
             .replace("$CLAUDE_FIXTURE_EXITED", fixture_path(&exited))
             .replace("$CLAUDE_FIXTURE_RELEASE", fixture_path(&release))
             .replace("$CLAUDE_FIXTURE_SIGNED_IN", fixture_path(&signed_in))
@@ -323,8 +394,9 @@ impl ScriptedClaude {
             executable,
             script,
             log,
-            attempts,
             argv,
+            launches,
+            errand_prompt,
             exited,
             release,
             signed_in,
@@ -368,11 +440,7 @@ impl ScriptedClaude {
 
     /// How many times the fixture has been launched — one per short-lived CLI process.
     pub fn launches(&self) -> usize {
-        std::fs::read_to_string(&self.attempts)
-            .unwrap_or_default()
-            .trim()
-            .parse()
-            .unwrap_or(0)
+        self.exact_launches().len()
     }
 
     /// The arguments the runtime launched the CLI with, most recent launch last. A trailing empty
@@ -395,6 +463,42 @@ impl ScriptedClaude {
     /// it already knows carries it.
     pub fn argument_value(&self, flag: &str) -> String {
         flag_value(&self.arguments(), flag)
+    }
+
+    /// Every launch the fixture has recorded, oldest first, with each one's arguments exactly as
+    /// it received them. Unlike [`launch_arguments`](Self::launch_arguments), an empty argument and
+    /// one carrying spaces both survive here.
+    pub fn exact_launches(&self) -> Vec<Launch> {
+        std::fs::read_to_string(&self.launches)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|record| record.split_once('\t'))
+            .map(|(working_directory, arguments)| Launch {
+                arguments: arguments.split('\u{1f}').map(str::to_owned).collect(),
+                working_directory: std::path::PathBuf::from(working_directory),
+            })
+            .collect()
+    }
+
+    /// The one launch that carried `flag`, for a test reading a launch apart from every other by
+    /// what only it asks the CLI for.
+    pub fn launch_carrying(&self, flag: &str) -> Launch {
+        let mut carrying = self
+            .exact_launches()
+            .into_iter()
+            .filter(|launch| launch.carries(flag))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            carrying.len(),
+            1,
+            "exactly one launch carries {flag}, got {carrying:?}"
+        );
+        carrying.pop().expect("the launch carrying the flag")
+    }
+
+    /// The Prompts the fixture was given on stdin across every Errand it answered.
+    pub fn errand_prompts(&self) -> String {
+        std::fs::read_to_string(&self.errand_prompt).unwrap_or_default()
     }
 
     /// Everything the runtime sent the CLI, in the order it arrived.
@@ -454,6 +558,69 @@ pub fn flag_value(arguments: &[String], flag: &str) -> String {
         .unwrap_or_else(|| {
             panic!("the CLI was launched with {flag} and a value, got: {arguments:?}")
         })
+}
+
+/// A preamble answering the print-mode launch an Errand runs through: it records the Prompt it was
+/// handed on stdin, then does `answer` — `sh` of the caller's own — without ever reaching the
+/// request loop, the way the CLI's own one-shot does.
+///
+/// The launch is told apart from every other by `--json-schema`, which only an Errand asks for.
+fn errand_arm(answer: &str) -> String {
+    format!(
+        r#"case "$*" in
+  *--json-schema*)
+    cat >> "$CLAUDE_FIXTURE_ERRAND_PROMPT"
+    {answer}
+    exit 0
+    ;;
+esac
+
+"#
+    )
+}
+
+/// The preamble for an Errand the CLI answers with `envelope`, the single result object print mode
+/// prints.
+pub fn errand_preamble(envelope: &str) -> String {
+    errand_arm(&format!(r#"printf '%s\n' '{envelope}'"#))
+}
+
+/// A print-mode envelope answering an Errand with `title` and `emoji`, in the shape the CLI shapes
+/// a schema-validated answer into: the prose in `result`, and the parsed answer beside it.
+pub fn derived_title_envelope(title: &str, emoji: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"#,
+            r#""result":"a title","structured_output":{{"title":"{title}","emoji":"{emoji}"}}}}"#,
+        ),
+        title = title,
+        emoji = emoji,
+    )
+}
+
+/// The preamble for an Errand the CLI takes and never answers: it holds the process open and says
+/// nothing, standing in for a wedged CLI.
+pub fn silent_errand_preamble() -> String {
+    errand_arm("sleep 30")
+}
+
+/// The preamble for an Errand launch that dies before printing anything, standing in for a CLI that
+/// cannot run at all — one no user is signed in to, or one whose flags it does not understand.
+pub fn crashing_errand_preamble() -> String {
+    errand_arm(
+        r#"printf 'the fixture will not run\n' >&2
+    exit 9"#,
+    )
+}
+
+/// A print-mode envelope from a CLI that could not answer at all, which is how an Errand fails
+/// without the process ever failing.
+pub fn failed_errand_envelope() -> String {
+    concat!(
+        r#"{"type":"result","subtype":"error_during_execution","is_error":true,"#,
+        r#""errors":["the fixture would not write a title"]}"#,
+    )
+    .to_owned()
 }
 
 /// A preamble standing in for a CLI asked to resume a conversation it does not have: it reports

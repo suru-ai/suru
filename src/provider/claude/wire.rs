@@ -211,8 +211,9 @@ pub(super) struct EchoedUserBlock {
     pub(super) is_error: bool,
 }
 
-/// The terminal message that Settles the Turn: `success` reports a finished Turn (which may still
-/// carry `is_error`), and every other subtype is a failure whose `errors` say what went wrong.
+/// The terminal message the CLI's loop ends with, whether that loop was a Turn or an Errand's
+/// one-shot print: `success` reports a finished loop (which may still carry `is_error`), and every
+/// other subtype is a failure whose `errors` say what went wrong.
 #[derive(Deserialize)]
 pub(super) struct ResultMessage {
     pub(super) subtype: String,
@@ -226,6 +227,11 @@ pub(super) struct ResultMessage {
     /// one as an unerrored `success` carrying no answer, so an abort is legible nowhere else.
     #[serde(default)]
     pub(super) terminal_reason: Option<String>,
+    /// The answer as the JSON schema the launch asked for shaped it, which is what an Errand came
+    /// for. Absent from every result the CLI was given no schema to honor, and from one it could
+    /// not honor the schema it was given.
+    #[serde(default)]
+    pub(super) structured_output: Option<Value>,
 }
 
 /// A `system` message: the CLI's own bookkeeping alongside the conversation. Only the task

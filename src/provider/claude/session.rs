@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, time::Duration};
 
 use super::{
-    CLAUDE_AGENT_ID, CLAUDE_PROVIDER_ID, REASONING_EFFORT_OPTION_ID,
+    CLAUDE_AGENT_ID,
     availability::ClaudeAvailability,
     claude_error, claude_error_context,
     projection::provider_events,
@@ -45,7 +45,7 @@ use super::{
     wire::{ControlRequest, UserMessageEnvelope},
 };
 use crate::{
-    protocol::{AgentId, AgentIdentity, AgentSelection, ModelDescriptor, ModelOptionValue},
+    protocol::{AgentId, AgentIdentity, AgentSelection, ModelDescriptor},
     provider::{
         ProviderError, ProviderFuture, ProviderResumeState, ProviderSession,
         ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
@@ -432,48 +432,16 @@ fn spawn_args(
     selection: &AgentSelection,
     spawn: ProviderSessionSpawn,
 ) -> Result<Vec<OsString>, ProviderError> {
-    debug_assert_eq!(selection.provider.as_str(), CLAUDE_PROVIDER_ID);
     let mut args: Vec<OsString> = [
         "--include-partial-messages",
         "--dangerously-skip-permissions",
         spawn.identity_flag(),
         provider_session_id,
-        "--model",
-        selection.model.as_str(),
     ]
     .into_iter()
     .map(OsString::from)
     .collect();
-    let mut effort = None;
-    for option in &selection.options {
-        let ModelOptionValue::Select { choice } = &option.value else {
-            return Err(ProviderError::selection_rejected(format!(
-                "Claude does not support toggle Model Option `{}`",
-                option.id
-            )));
-        };
-        match option.id.as_str() {
-            REASONING_EFFORT_OPTION_ID if effort.is_none() => {
-                effort = Some(choice.as_str().to_owned());
-            }
-            REASONING_EFFORT_OPTION_ID => {
-                return Err(ProviderError::selection_rejected(format!(
-                    "Claude Model Option `{}` was selected more than once",
-                    option.id
-                )));
-            }
-            _ => {
-                return Err(ProviderError::selection_rejected(format!(
-                    "Claude does not support Model Option `{}`",
-                    option.id
-                )));
-            }
-        }
-    }
-    if let Some(effort) = effort {
-        args.push(OsString::from("--effort"));
-        args.push(OsString::from(effort));
-    }
+    args.extend(super::selection_args(selection)?);
     Ok(args)
 }
 

@@ -199,16 +199,12 @@ async fn a_turn_under_a_chosen_selection_spawns_the_child_with_its_model_and_eff
         "the Session keeps the Selection its Turn ran under"
     );
 
-    let arguments = claude.arguments();
-    let flag_value = |flag: &str| {
-        arguments
-            .iter()
-            .position(|argument| argument == flag)
-            .map(|position| arguments[position + 1].clone())
-            .unwrap_or_else(|| panic!("the child is launched with {flag}, got: {arguments:?}"))
-    };
-    assert_eq!(flag_value("--model"), "middling");
-    assert_eq!(flag_value("--effort"), "low");
+    // The conversation child is read by the conversation it was given, because it is not the only
+    // process this Session launched: a Title Errand runs its own one-shot beside it, at a Model of
+    // the Provider's own choosing.
+    let child = claude.launch_carrying("--session-id");
+    assert_eq!(child.value("--model"), "middling");
+    assert_eq!(child.value("--effort"), "low");
 
     server.shutdown().await.expect("shut the server down");
     claude.wait_for_exit().await;

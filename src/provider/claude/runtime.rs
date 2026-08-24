@@ -14,6 +14,7 @@ use super::{
     availability::ClaudeAvailability,
     catalog::model_descriptors,
     claude_error, claude_error_context,
+    errand::run_claude_errand,
     session::{ClaudeTimings, start_claude_session},
     transport::{ClaudeConnection, StreamJsonTransport},
     wire::{ControlRequest, NativeModelList},
@@ -21,7 +22,7 @@ use super::{
 use crate::{
     protocol::{AgentSelection, ModelDescriptor, ProviderId},
     provider::{
-        ProviderError, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
+        ProviderErrand, ProviderError, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
         ProviderSessionRequest, harness::ProcessRegistry, resolve_executable,
     },
 };
@@ -131,20 +132,21 @@ impl ProviderRuntime for ClaudeRuntime {
         })
     }
 
-    // Claude fulfils Errands through its own native print mode, which is its
-    // own piece of work; until that lands it declares that it runs none.
-    fn run_errand(
-        &self,
-        _errand: crate::provider::ProviderErrand,
-    ) -> ProviderFuture<'_, serde_json::Value> {
-        crate::provider::errand_unimplemented(&self.provider_id())
+    // Claude fulfils Errands through the CLI's own print mode, which takes the
+    // Errand's schema natively — so Claude never falls back to starting a
+    // Provider-side session and discarding it (ADR 0011). The launch runs no
+    // availability probe of its own: an Errand is best-effort, its Selection
+    // was already resolved against a catalog a probe stands behind, and a CLI
+    // that has become unusable since says so in the result it prints.
+    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, serde_json::Value> {
+        let executable = self.executable.clone();
+        Box::pin(async move { run_claude_errand(executable, errand).await })
     }
 
-    // Which of Claude's Models is cheap, and at which effort, is settled
-    // alongside the print mode above; until then its Errands run at whatever
-    // Model Claude already defaults to.
+    // Claude's own Errands run at the cheapest, fastest row its picker offers,
+    // which is a different question from the Model a user converses with.
     fn errand_selection(&self) -> Option<AgentSelection> {
-        None
+        Some(super::catalog::errand_selection())
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {

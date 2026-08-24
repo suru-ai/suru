@@ -9,8 +9,9 @@
 use super::{CLAUDE_PROVIDER_ID, REASONING_EFFORT_OPTION_ID, wire::NativeModel};
 use crate::{
     protocol::{
-        ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
-        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole, ProviderId,
+        AgentSelection, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
+        ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
+        ModelOptionRole, ProviderId,
     },
     provider::humanized_wire_id,
 };
@@ -19,10 +20,33 @@ use crate::{
 /// the CLI's own "Default (recommended)" entry, so when it is offered Suru defaults to it.
 const DEFAULT_MODEL_VALUE: &str = "default";
 
+/// The alias Claude runs its own Errands at: the cheapest and fastest row the CLI's picker offers,
+/// which is where six words should be written rather than at the Model a user converses with.
+const ERRAND_MODEL_VALUE: &str = "haiku";
+
 /// The effort the CLI itself runs with when the user has chosen none. The wire names no default
 /// effort per row, so Suru mirrors the CLI's default when the row offers it and falls back to the
 /// row's first level otherwise.
 const DEFAULT_EFFORT_LEVEL: &str = "high";
+
+/// The Agent Selection Claude declares its Errands run at.
+///
+/// It carries no Model Options, and that is the whole of "the least effort it offers": the CLI
+/// publishes no effort levels for this row at all, so an Errand run at it is already paying no
+/// thinking budget, and a declaration naming an effort the row does not carry would be one the live
+/// catalog could not honor — costing the Errand its cheap Model and sending it to the Model a user
+/// converses with instead.
+///
+/// This is a declaration rather than a resolution: a catalog that no longer serves the row, or
+/// serves it unavailable, gives way to the Provider's default Model wherever the declaration is
+/// resolved.
+pub(super) fn errand_selection() -> AgentSelection {
+    AgentSelection {
+        provider: ProviderId::new(CLAUDE_PROVIDER_ID),
+        model: ModelId::new(ERRAND_MODEL_VALUE),
+        options: Vec::new(),
+    }
+}
 
 /// Turns the rows the CLI reports into Suru's catalog, marking exactly one of them the default.
 pub(super) fn model_descriptors(models: Vec<NativeModel>) -> Vec<ModelDescriptor> {

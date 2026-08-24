@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 
 use super::super::shell_wrapper::strip_launcher_wrapper;
 use super::{
-    CLAUDE_FAILURE_FALLBACK, claude_error,
+    claude_error,
     thinking::{ThinkingEvent, ThinkingSplitter},
     turn_in_flight::TurnInFlight,
     wire::{
@@ -32,7 +32,6 @@ use super::{
 };
 use crate::provider::{
     ProviderActivityId, ProviderCommandStatus, ProviderError, ProviderEvent, ProviderEventStream,
-    concise_remote_message,
 };
 
 /// The tool whose executions are Command Activity. Claude sends the command itself as the tool's
@@ -477,7 +476,7 @@ impl ClaudeProjection {
         } else {
             self.turn.abandon_turn();
             projected.push(ProviderEvent::TurnFailed {
-                message: result_failure_message(&result),
+                message: super::result_failure_message("Turn", &result),
             });
         }
         Ok(projected)
@@ -516,28 +515,5 @@ fn tool_result_text(content: &Value) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         _ => String::new(),
-    }
-}
-
-/// The user-readable account of a failed result: the first user-facing error the CLI reported —
-/// `[ede_diagnostic]` entries are CLI-internal telemetry the CLI hides from its own UI — then the
-/// result text an errored `success` carries, then the bare subtype when the CLI said nothing more.
-fn result_failure_message(result: &ResultMessage) -> String {
-    let reported = result
-        .errors
-        .iter()
-        .find(|error| !error.starts_with("[ede_diagnostic]"))
-        .map(String::as_str)
-        .or_else(|| result.result.as_ref().and_then(Value::as_str))
-        .filter(|reported| !reported.trim().is_empty());
-    match reported {
-        Some(reported) => concise_remote_message(
-            &format!("Claude Turn failed: {reported}"),
-            CLAUDE_FAILURE_FALLBACK,
-        ),
-        None => format!(
-            "Claude Turn failed: the Claude Code CLI reported `{}`",
-            result.subtype
-        ),
     }
 }

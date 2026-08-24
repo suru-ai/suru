@@ -62,7 +62,7 @@ async fn claude_models_reach_the_catalog_verbatim_with_the_clis_default_row_mark
             .iter()
             .map(|model| model.id.to_string())
             .collect::<Vec<_>>(),
-        ["default", "fixture[1m]", "middling", "tiny"],
+        ["default", "fixture[1m]", "middling", "haiku"],
         "every row the CLI lists is presented, in the CLI's own order, \
          alias values included verbatim"
     );
@@ -133,7 +133,7 @@ async fn claude_models_reach_the_catalog_verbatim_with_the_clis_default_row_mark
     );
 
     assert!(
-        model(claude_models, "tiny").options.is_empty(),
+        model(claude_models, "haiku").options.is_empty(),
         "a row without effort metadata carries no Model Options"
     );
 
