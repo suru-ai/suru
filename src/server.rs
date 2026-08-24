@@ -38,8 +38,7 @@ use crate::protocol::{
     TurnId, UpdateAgentSelectionRequest,
 };
 use crate::provider::{
-    ClaudeRuntime, CodexRuntime, CopilotRuntime, ProviderOrchestrator, ProviderRuntime,
-    ProviderUpdateGate, wait_for_shutdown,
+    ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
 };
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
@@ -357,18 +356,6 @@ pub async fn spawn_with_provider_and_timings(
     timings: ServerTimings,
 ) -> Result<RunningServer> {
     spawn_with_providers_and_timings(config, vec![runtime], timings).await
-}
-
-/// The Provider runtimes a production server hosts, in the fixed built-in
-/// order a fresh Landing defaults from. This is the one place the server
-/// names a concrete Provider.
-fn built_in_runtimes() -> Vec<Arc<dyn ProviderRuntime>> {
-    vec![
-        Arc::new(CodexRuntime::from_environment()),
-        Arc::new(CopilotRuntime::from_environment()),
-        // Appended last so the Landing default order the earlier Providers set is unchanged.
-        Arc::new(ClaudeRuntime::from_environment()),
-    ]
 }
 
 pub async fn spawn_with_providers_and_timings(
@@ -1481,7 +1468,6 @@ mod tests {
     use futures_util::{StreamExt, pin_mut};
 
     use super::*;
-    use crate::protocol::EffectiveSettings;
 
     #[tokio::test]
     async fn lifecycle_streams_receive_shutdown_intent_independently() {
@@ -1534,46 +1520,5 @@ mod tests {
             .expect("lifecycle stream is infallible");
         assert!(first.next().await.is_none());
         assert!(second.next().await.is_none());
-    }
-
-    /// The other guard a Provider must clear before shipping: client surfaces
-    /// print whatever name the runtime declares, so a Provider with a blank
-    /// display name would surface to the user as nothing at all. The trait
-    /// makes declaring one mandatory; this guards what is declared.
-    #[test]
-    fn every_built_in_provider_has_a_display_name() {
-        for runtime in built_in_runtimes() {
-            let provider = runtime.provider_id();
-            assert!(
-                !runtime.display_name().trim().is_empty(),
-                "Provider `{provider}` declares a blank display name"
-            );
-        }
-    }
-
-    /// A Provider added to the built-in set without an `enabled` Setting would
-    /// be one the user cannot turn off, and would read as enabled forever
-    /// through the fallback [`EffectiveSettings::provider_enabled`] keeps for
-    /// Providers the schema does not name — a failure that presents as nothing
-    /// at all. Enablement is a hand-written table rather than a compile-time
-    /// one, so this is the guard that walks a developer to the schema entry,
-    /// the mutation, and the settings field. Its other half, that such an entry
-    /// actually reaches the gate, lives beside the schema in `settings`.
-    #[test]
-    fn every_built_in_provider_has_an_enabled_setting() {
-        for runtime in built_in_runtimes() {
-            let provider = runtime.provider_id();
-            let key = format!("provider.{provider}.enabled");
-            assert!(
-                crate::settings::SCHEMA
-                    .iter()
-                    .any(|descriptor| descriptor.key == key),
-                "Provider `{provider}` has no {key} Setting, so nothing can turn it off"
-            );
-            assert!(
-                EffectiveSettings::default().provider_enabled(&provider),
-                "Provider `{provider}` must be enabled unless the user says otherwise"
-            );
-        }
     }
 }

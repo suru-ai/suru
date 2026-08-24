@@ -29,8 +29,9 @@ use jsonc_parser::{
 use serde_json::Value;
 
 use crate::protocol::{
-    EffectiveSettings, FoldPosture, ReasoningSummaryDetail, ReasoningVisibility, SettingMutation,
-    SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot,
+    EffectiveSettings, FoldPosture, ProviderId, ReasoningSummaryDetail, ReasoningVisibility,
+    SettingMutation, SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity,
+    SettingsSnapshot,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -50,6 +51,19 @@ const PROVIDER_CLAUDE_ENABLED: &str = "provider.claude.enabled";
 /// What a Config Document that does not exist yet is edited as.
 const EMPTY_DOCUMENT: &str = "{}\n";
 
+/// Which company a Setting keeps in the settings panel, which is the whole of
+/// what a Setting says about its own presentation: the panel maps a group to
+/// the tab that lists it, so moving a Setting between tabs stays a one-line
+/// schema change and a Setting can never belong to two.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingGroup {
+    /// Settings that configure no Provider.
+    General,
+    /// Settings scoped to one Provider, which the panel presents beside the
+    /// Provider they configure rather than in a flat list.
+    Providers,
+}
+
 /// One Setting's compile-time definition: what a Config Document calls it,
 /// what it may hold, and how each of those values is read and written.
 pub struct SettingDescriptor {
@@ -59,6 +73,8 @@ pub struct SettingDescriptor {
     pub label: &'static str,
     /// What choosing between its values means, in one line.
     pub description: &'static str,
+    /// Which tab of the settings panel presents this Setting.
+    pub group: SettingGroup,
     pub scope: SettingScope,
     /// Every value the Setting can hold, in the order a reader cycles them.
     pub choices: &'static [SettingChoice],
@@ -183,6 +199,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         key: TRANSCRIPT_DEFAULT_FOLD_POSTURE,
         label: "Default Fold posture",
         description: "How a Session view opens: folded to its markers, or expanded in full",
+        group: SettingGroup::General,
         scope: SettingScope::Client,
         choices: &[
             SettingChoice {
@@ -209,6 +226,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         key: TRANSCRIPT_REASONING_VISIBILITY,
         label: "Reasoning visibility",
         description: "Whether a Transcript hides Reasoning or draws it",
+        group: SettingGroup::General,
         scope: SettingScope::Client,
         choices: &[
             SettingChoice {
@@ -232,12 +250,14 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         },
     },
     // Each Provider's Enablement is ordered immediately before that Provider's
-    // other Settings, so the flat panel still reads grouped without any
-    // grouping machinery.
+    // other Settings, which is the order the loader's diagnostics and this
+    // table itself read in; the settings panel presents Enablement on the
+    // Provider's own row rather than in this order.
     SettingDescriptor {
         key: PROVIDER_CODEX_ENABLED,
         label: "Codex Provider",
         description: "Whether Suru offers Codex, or leaves it entirely alone",
+        group: SettingGroup::Providers,
         scope: SettingScope::Server,
         choices: &[
             SettingChoice {
@@ -260,6 +280,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         key: PROVIDER_CODEX_REASONING_SUMMARY,
         label: "Codex Reasoning summary",
         description: "How much Reasoning summary detail each Turn asks Codex for",
+        group: SettingGroup::Providers,
         scope: SettingScope::Server,
         choices: &[
             SettingChoice {
@@ -298,6 +319,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         key: PROVIDER_COPILOT_ENABLED,
         label: "Copilot Provider",
         description: "Whether Suru offers Copilot, or leaves it entirely alone",
+        group: SettingGroup::Providers,
         scope: SettingScope::Server,
         choices: &[
             SettingChoice {
@@ -320,6 +342,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         key: PROVIDER_CLAUDE_ENABLED,
         label: "Claude Provider",
         description: "Whether Suru offers Claude, or leaves it entirely alone",
+        group: SettingGroup::Providers,
         scope: SettingScope::Server,
         choices: &[
             SettingChoice {
@@ -339,6 +362,15 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         },
     },
 ];
+
+/// The Setting through which the user turns one Provider on or off, which is
+/// what a surface presenting the Provider itself edits. Looked up by the key
+/// the schema keys Enablement on, so a Provider and its Enablement are tied by
+/// the Provider's own identity rather than by a second table to keep in step.
+pub fn provider_enablement(provider: &ProviderId) -> Option<&'static SettingDescriptor> {
+    let key = format!("provider.{provider}.enabled");
+    SCHEMA.iter().find(|descriptor| descriptor.key == key)
+}
 
 fn apply_value<T: serde::de::DeserializeOwned>(value: &Value, write: impl FnOnce(T)) -> bool {
     match serde_json::from_value(value.clone()) {

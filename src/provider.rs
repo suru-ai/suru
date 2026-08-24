@@ -1,6 +1,13 @@
 //! Provider-neutral runtime and per-Session execution interfaces.
 
-use std::{error::Error, fmt, future::Future, path::PathBuf, pin::Pin, sync::Arc};
+use std::{
+    error::Error,
+    fmt,
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+};
 
 use futures_util::Stream;
 use serde_json::Value;
@@ -23,6 +30,42 @@ pub use claude::ClaudeRuntime;
 pub use codex::CodexRuntime;
 pub use copilot::CopilotRuntime;
 pub(crate) use orchestration::{ProviderOrchestrator, ProviderUpdateGate};
+
+/// One built-in Provider as a surface listing Providers reads it: which
+/// Provider it is, and what its runtime calls it.
+pub struct BuiltInProvider {
+    pub id: ProviderId,
+    pub display_name: String,
+}
+
+/// The Provider runtimes a production server hosts, in the fixed built-in
+/// order a fresh Landing defaults from. This is the one place Suru names a
+/// concrete Provider.
+pub fn built_in_runtimes() -> Vec<Arc<dyn ProviderRuntime>> {
+    vec![
+        Arc::new(CodexRuntime::from_environment()),
+        Arc::new(CopilotRuntime::from_environment()),
+        // Appended last so the Landing default order the earlier Providers set is unchanged.
+        Arc::new(ClaudeRuntime::from_environment()),
+    ]
+}
+
+/// The built-in Providers as a client lists them, in that same fixed order.
+/// Read off the runtimes themselves, so a surface presenting Providers can
+/// neither miss one the server hosts nor call one a name no runtime answers
+/// to. Built once, because neither the set nor a name changes while Suru runs.
+pub fn built_in_providers() -> &'static [BuiltInProvider] {
+    static PROVIDERS: OnceLock<Vec<BuiltInProvider>> = OnceLock::new();
+    PROVIDERS.get_or_init(|| {
+        built_in_runtimes()
+            .iter()
+            .map(|runtime| BuiltInProvider {
+                id: runtime.provider_id(),
+                display_name: runtime.display_name().to_owned(),
+            })
+            .collect()
+    })
+}
 
 /// A Provider-authored message is user-visible once it surfaces as a Provider failure, so it is
 /// capped.
@@ -418,12 +461,59 @@ pub(crate) async fn wait_for_shutdown(signal: &mut watch::Receiver<bool>) {
 mod tests {
     use std::{ffi::OsString, sync::Mutex};
 
-    use super::resolve_executable;
+    use super::{built_in_providers, built_in_runtimes, resolve_executable};
+    use crate::{protocol::EffectiveSettings, settings::provider_enablement};
 
     /// Every Provider's binary resolution shares this scope, so they share its lock.
     static ENVIRONMENT: Mutex<()> = Mutex::new(());
 
     const FIXTURE_PATH_ENV: &str = "SURU_FIXTURE_PROVIDER_PATH";
+
+    /// The other guard a Provider must clear before shipping: client surfaces
+    /// print whatever name the runtime declares, so a Provider with a blank
+    /// display name would surface to the user as nothing at all. The trait
+    /// makes declaring one mandatory; this guards what is declared, and that
+    /// the list clients read carries every Provider the server hosts.
+    #[test]
+    fn every_built_in_provider_has_a_display_name() {
+        for runtime in built_in_runtimes() {
+            let provider = runtime.provider_id();
+            assert!(
+                !runtime.display_name().trim().is_empty(),
+                "Provider `{provider}` declares a blank display name"
+            );
+            assert!(
+                built_in_providers()
+                    .iter()
+                    .any(|listed| listed.id == provider
+                        && listed.display_name == runtime.display_name()),
+                "Provider `{provider}` is missing from the list clients read"
+            );
+        }
+    }
+
+    /// A Provider added to the built-in set without an `enabled` Setting would
+    /// be one the user cannot turn off, and would read as enabled forever
+    /// through the fallback [`EffectiveSettings::provider_enabled`] keeps for
+    /// Providers the schema does not name — a failure that presents as nothing
+    /// at all. Enablement is a hand-written table rather than a compile-time
+    /// one, so this is the guard that walks a developer to the schema entry,
+    /// the mutation, and the settings field. Its other half, that such an entry
+    /// actually reaches the gate, lives beside the schema in `settings`.
+    #[test]
+    fn every_built_in_provider_has_an_enabled_setting() {
+        for runtime in built_in_runtimes() {
+            let provider = runtime.provider_id();
+            assert!(
+                provider_enablement(&provider).is_some(),
+                "Provider `{provider}` has no provider.{provider}.enabled Setting, so nothing can turn it off"
+            );
+            assert!(
+                EffectiveSettings::default().provider_enabled(&provider),
+                "Provider `{provider}` must be enabled unless the user says otherwise"
+            );
+        }
+    }
 
     #[test]
     fn an_executable_resolves_from_the_override_and_otherwise_from_path() {

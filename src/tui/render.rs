@@ -27,6 +27,7 @@ use super::{
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
     session_picker::SessionPickerRow,
+    settings_panel::RowValue,
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
         PromptFooterSlotContext, PromptStatusSlotContext, RenderSlots, RenderedSlot,
@@ -334,18 +335,18 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     );
 }
 
-/// The settings panel: every defined Setting, what it is worth right now, and
-/// whether that value is the reader's own pin or the built-in default. Rows
-/// come straight from the latest effective-settings snapshot, so an edit moves
-/// a row only once the server has answered for it.
+/// The settings panel: the tab bar, the rows of the tab being shown, what each
+/// is worth right now, and whether that value is the reader's own pin or the
+/// built-in default. Rows come straight from the latest effective-settings
+/// snapshot, so an edit moves a row only once the server has answered for it.
 fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     let rows = state
         .settings_panel
         .rows(state.settings(), state.pinned_settings());
-    // The schema is a flat list of known length, so the panel is exactly as
-    // tall as it needs to be: two borders around the headline, one row per
+    // A tab lists a known number of rows, so the panel is exactly as tall as it
+    // needs to be: two borders around the tab bar and the headline, one row per
     // Setting, and the controls.
-    let wanted = u16::try_from(rows.len().saturating_add(4)).unwrap_or(u16::MAX);
+    let wanted = u16::try_from(rows.len().saturating_add(5)).unwrap_or(u16::MAX);
     let area = centered_rect(
         frame.area(),
         frame.area().width.saturating_sub(4).min(76),
@@ -354,6 +355,27 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
     let content_width = usize::from(area.width.saturating_sub(2));
     let content_height = usize::from(area.height.saturating_sub(2));
     let mut lines = Vec::with_capacity(content_height);
+    // Both tabs, always, so the reader can see what the panel holds without
+    // visiting it; the active one is drawn as the accent. A box too short for
+    // its own content gives this line up first, because a tab bar over no rows
+    // says nothing about the Settings the reader came for.
+    if content_height >= 4 {
+        let mut spans = Vec::new();
+        for tab in state.settings_panel.tabs() {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                tab.title,
+                if tab.active {
+                    theme.accent.primary.add_modifier(Modifier::BOLD)
+                } else {
+                    theme.text.subdued
+                },
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
     if content_height >= 2 {
         // What the focused Setting does, or why the last edit of it never
         // reached the Config Document — a failed edit is the more urgent of
@@ -380,21 +402,32 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
     for row in visible_window(rows, selected, capacity) {
         let marker = if row.selected { "› " } else { "  " };
         let origin = if row.pinned { "pinned" } else { "default" };
+        // A Provider Suru has been told to leave alone is the one row that
+        // reads as its own condition rather than as a value; an enabled
+        // Provider claims nothing, because the quiet state is the good one.
+        let value = match row.value {
+            RowValue::Choice(value) => format!(" · {value}"),
+            RowValue::ProviderEnabled => String::new(),
+            RowValue::ProviderDisabled => " · disabled".to_owned(),
+        };
         lines.push(Line::styled(
             truncate_to_width(
-                &format!("{marker}{} · {} [{origin}]", row.label, row.value),
+                &format!("{marker}{}{value} [{origin}]", row.label),
                 content_width,
             ),
-            if row.selected {
-                theme.selection.focused
-            } else {
-                theme.text.primary
+            match (row.selected, row.value) {
+                (true, _) => theme.selection.focused,
+                (false, RowValue::ProviderDisabled) => theme.text.subdued,
+                (false, _) => theme.text.primary,
             },
         ));
     }
     if footer_rows > 0 && lines.len() < content_height {
         lines.push(Line::styled(
-            truncate_to_width("Space cycle · Ctrl+D reset · Esc close", content_width),
+            truncate_to_width(
+                "Left/Right tabs · Space change · Ctrl+D reset · Esc close",
+                content_width,
+            ),
             theme.text.subdued,
         ));
     }

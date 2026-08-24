@@ -343,8 +343,9 @@ pub enum ProviderCatalogStatus {
 pub struct ProviderModelCatalog {
     pub provider: ProviderId,
     /// The Provider's name as the user reads it, declared by its runtime —
-    /// "Codex" rather than `codex`. Rides the catalog so every client surface
-    /// prints the same name without knowing the runtimes.
+    /// "Codex" rather than `codex`. Rides the catalog so a client showing what
+    /// the catalog holds prints the runtime's own name for a Provider without
+    /// having to ask what the runtimes are.
     pub display_name: String,
     pub models: Vec<ModelDescriptor>,
     pub status: ProviderCatalogStatus,

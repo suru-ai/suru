@@ -1984,6 +1984,8 @@ impl Application {
             command @ (SemanticCommandId::SettingsOpen
             | SemanticCommandId::SettingsPrevious
             | SemanticCommandId::SettingsNext
+            | SemanticCommandId::SettingsTabPrevious
+            | SemanticCommandId::SettingsTabNext
             | SemanticCommandId::SettingsValueCycle
             | SemanticCommandId::SettingsReset
             | SemanticCommandId::SettingsClose) => Ok(self.handle_settings_panel_command(command)),
@@ -2069,6 +2071,14 @@ impl Application {
             }
             SemanticCommandId::SettingsNext => {
                 self.state.settings_panel.select_next();
+                None
+            }
+            SemanticCommandId::SettingsTabPrevious => {
+                self.state.settings_panel.select_previous_tab();
+                None
+            }
+            SemanticCommandId::SettingsTabNext => {
+                self.state.settings_panel.select_next_tab();
                 None
             }
             SemanticCommandId::SettingsValueCycle => {

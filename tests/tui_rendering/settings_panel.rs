@@ -1,17 +1,23 @@
-//! The settings panel: every defined Setting, and editing one from the TUI.
+//! The settings panel: its General and Providers tabs, and editing a Setting
+//! from either of them.
 
 use std::path::Path;
 
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{
+    buffer::Buffer,
+    style::{Color, Modifier},
+};
 
 use crate::support::{
-    connected_application, rendered_application_rows, rendered_row, type_terminal_text,
+    connected_application, rendered_application_buffer, rendered_application_rows, text_position,
+    type_terminal_text,
 };
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
         CodexSettings, CopilotSettings, EffectiveSettings, FoldPosture, ProviderSettings,
-        ReasoningSummaryDetail, SettingMutation, SettingsSnapshot, TranscriptSettings,
+        ReasoningVisibility, SettingMutation, SettingsSnapshot, TranscriptSettings,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
@@ -44,6 +50,18 @@ fn opening_at(posture: FoldPosture) -> EffectiveSettings {
     }
 }
 
+/// Effective settings whose only departure from the built-in defaults is that
+/// the reader turned Copilot off.
+fn without_copilot() -> EffectiveSettings {
+    EffectiveSettings {
+        provider: ProviderSettings {
+            copilot: CopilotSettings { enabled: false },
+            ..ProviderSettings::default()
+        },
+        ..EffectiveSettings::default()
+    }
+}
+
 fn snapshot(settings: EffectiveSettings, pinned: &[&str]) -> SettingsSnapshot {
     SettingsSnapshot {
         settings,
@@ -67,9 +85,15 @@ fn open_panel(application: &mut Application) {
     press(application, KeyCode::Char(','), KeyModifiers::NONE);
 }
 
+/// The panel as it opens, on the Providers tab.
+fn open_providers_tab(application: &mut Application) {
+    open_panel(application);
+    press(application, KeyCode::Right, KeyModifiers::NONE);
+}
+
 /// Walks the focus down to the Setting spelling `key`, which the panel names
 /// in the focused row's headline. Navigating by the key rather than by a count
-/// of presses keeps these tests off the schema's row order, which is free to
+/// of presses keeps these tests off the row order of the tab, which is free to
 /// grow.
 fn focus_setting(application: &mut Application, key: &str) {
     for _ in 0..suru::settings::SCHEMA.len() {
@@ -84,14 +108,45 @@ fn focus_setting(application: &mut Application, key: &str) {
     panic!("the settings panel never focused {key:?}");
 }
 
-/// The panel row for one Setting, as the reader sees it.
+/// The Setting the panel says it would edit: the focused row is the only one
+/// whose key the panel spells, in its headline.
+fn focused_key(application: &Application) -> String {
+    let panel = rendered_application_rows(application).join("\n");
+    let named = suru::settings::SCHEMA
+        .iter()
+        .map(|descriptor| descriptor.key)
+        .filter(|key| panel.contains(key))
+        .collect::<Vec<_>>();
+    match named.as_slice() {
+        [key] => (*key).to_owned(),
+        _ => panic!("the settings panel named {named:?} rather than one focused Setting"),
+    }
+}
+
+/// The panel row for one Setting or Provider, as the reader sees it. Every row
+/// carries its provenance marker, which is what tells one apart from the
+/// headline naming the same Setting in prose.
 fn row(application: &Application, label: &str) -> String {
     let rows = rendered_application_rows(application);
+    rows[row_index(&rows, label)].trim().to_owned()
+}
+
+/// Where that row sits on screen, so a test can say which row comes first.
+fn row_index(rows: &[String], label: &str) -> usize {
     rows.iter()
-        .find(|row| row.contains(label))
+        .position(|row| {
+            row.contains(label) && (row.contains("[pinned]") || row.contains("[default]"))
+        })
         .unwrap_or_else(|| panic!("the settings panel showed no row for {label:?}: {rows:?}"))
-        .trim()
-        .to_owned()
+}
+
+/// How the panel drew a word, which is how a tab says it is the active one and
+/// how a Provider row says it is disabled.
+fn styling(buffer: &Buffer, needle: &str) -> (Color, Color, Modifier) {
+    let cell = buffer
+        .cell(text_position(buffer, needle))
+        .expect("rendered text position is inside the buffer");
+    (cell.fg, cell.bg, cell.modifier)
 }
 
 #[test]
@@ -106,8 +161,8 @@ fn the_leader_key_and_the_slash_command_both_open_the_panel_and_escape_closes_it
         "leader+, opens the settings panel"
     );
     assert!(
-        panel.contains("Space cycle · Ctrl+D reset · Esc close"),
-        "the footer teaches the keys the panel answers to: {panel}"
+        panel.contains("Left/Right tabs · Space change · Ctrl+D reset · Esc close"),
+        "the footer teaches the keys the panel answers to, tab switching included: {panel}"
     );
 
     press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
@@ -127,8 +182,65 @@ fn the_leader_key_and_the_slash_command_both_open_the_panel_and_escape_closes_it
     );
 }
 
+/// The tab bar is the panel's map: both tabs are always named, the active one
+/// is drawn as such, and Left and Right walk between them in a ring so neither
+/// end of the bar is a dead end.
 #[test]
-fn every_defined_setting_shows_its_effective_value_and_whether_a_config_document_pins_it() {
+fn the_tab_bar_names_both_tabs_and_left_and_right_switch_between_them_with_wrap() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+
+    let opened = rendered_application_buffer(&application, 80, 15);
+    let active = styling(&opened, "General");
+    let idle = styling(&opened, "Providers");
+    assert_ne!(
+        active, idle,
+        "the panel opens on General, drawn as the active tab"
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Default Fold posture"),
+        "and lists that tab's Settings"
+    );
+
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    let switched = rendered_application_buffer(&application, 80, 15);
+    assert_eq!(
+        (
+            styling(&switched, "Providers"),
+            styling(&switched, "General")
+        ),
+        (active, idle),
+        "Right moves the active tab on to Providers"
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Codex"),
+        "and the panel lists the Providers instead"
+    );
+
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    let wrapped = rendered_application_buffer(&application, 80, 15);
+    assert_eq!(
+        styling(&wrapped, "General"),
+        active,
+        "Right past the last tab wraps to the first"
+    );
+
+    press(&mut application, KeyCode::Left, KeyModifiers::NONE);
+    let backwards = rendered_application_buffer(&application, 80, 15);
+    assert_eq!(
+        styling(&backwards, "Providers"),
+        active,
+        "Left before the first tab wraps to the last"
+    );
+}
+
+#[test]
+fn the_general_tab_lists_every_setting_that_configures_no_provider() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = client_showing(
         workspace.path(),
@@ -142,21 +254,169 @@ fn every_defined_setting_shows_its_effective_value_and_whether_a_config_document
         fold.contains("expanded") && fold.contains("[pinned]"),
         "a Setting a Config Document pins shows its pinned value: {fold:?}"
     );
-    let summary = row(&application, "Codex Reasoning summary");
-    assert!(
-        summary.contains("auto") && summary.contains("[default]"),
-        "a Setting nothing pins rides its built-in default: {summary:?}"
-    );
     let visibility = row(&application, "Reasoning visibility");
     assert!(
         visibility.contains("hidden") && visibility.contains("[default]"),
-        "a Transcript hides Reasoning until a reader asks for it: {visibility:?}"
+        "a Setting nothing pins rides its built-in default: {visibility:?}"
+    );
+    assert_eq!(
+        focused_key(&application),
+        "transcript.defaultFoldPosture",
+        "the focused Setting names the key a Config Document would spell"
     );
     assert!(
-        rendered_application_rows(&application)
+        !rendered_application_rows(&application)
             .join("\n")
-            .contains("transcript.defaultFoldPosture"),
-        "the focused Setting names the key a Config Document would spell"
+            .contains("Codex"),
+        "a Provider is the Providers tab's business, not General's"
+    );
+}
+
+/// The Providers tab is the one place a reader manages Providers, so every
+/// built-in Provider holds its place there whatever the reader has done to it:
+/// a Provider turned off must stay findable to be turned back on.
+#[test]
+fn the_providers_tab_lists_every_built_in_provider_by_display_name_whatever_its_enablement() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(
+        workspace.path(),
+        without_copilot(),
+        &["provider.copilot.enabled"],
+    );
+    open_providers_tab(&mut application);
+
+    let rows = rendered_application_rows(&application);
+    assert!(
+        row_index(&rows, "Codex") < row_index(&rows, "Copilot")
+            && row_index(&rows, "Copilot") < row_index(&rows, "Claude"),
+        "the Providers keep the built-in order, named as the reader knows them: {rows:?}"
+    );
+
+    let copilot = row(&application, "Copilot");
+    assert!(
+        copilot.contains("disabled") && copilot.contains("[pinned]"),
+        "the Provider the reader turned off says so: {copilot:?}"
+    );
+    let claude = row(&application, "Claude");
+    assert!(
+        !claude.contains("disabled") && claude.contains("[default]"),
+        "a Provider nothing pins is on, and an enabled Provider claims nothing further: {claude:?}"
+    );
+
+    let buffer = rendered_application_buffer(&application, 80, 15);
+    assert_ne!(
+        styling(&buffer, "Copilot"),
+        styling(&buffer, "Claude"),
+        "the disabled Provider's row is dimmed beside the Providers still on"
+    );
+}
+
+#[test]
+fn space_on_a_provider_row_toggles_that_providers_enablement() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_providers_tab(&mut application);
+    focus_setting(&mut application, "provider.codex.enabled");
+
+    let headline = rendered_application_rows(&application).join("\n");
+    assert!(
+        headline.contains("Whether Suru offers Codex"),
+        "the headline says what the row's one key would do: {headline}"
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
+            value: Some(false),
+        }),
+        "Space on a Provider row turns that Provider off"
+    );
+    assert!(
+        !row(&application, "Codex").contains("disabled"),
+        "the row waits for the server rather than showing an edit the file has not taken"
+    );
+
+    application
+        .handle_event(ApplicationEvent::SettingMutated(snapshot(
+            EffectiveSettings {
+                provider: ProviderSettings {
+                    codex: CodexSettings {
+                        enabled: false,
+                        ..CodexSettings::default()
+                    },
+                    ..ProviderSettings::default()
+                },
+                ..EffectiveSettings::default()
+            },
+            &["provider.codex.enabled"],
+        )))
+        .expect("receive the settings the edit left in force");
+    let codex = row(&application, "Codex");
+    assert!(
+        codex.contains("disabled") && codex.contains("[pinned]"),
+        "the row follows the refreshed snapshot the edit produced: {codex:?}"
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
+            value: Some(true),
+        }),
+        "Space turns a Provider back on"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled { value: None }),
+        "and undoing the choice is as easy as making it"
+    );
+}
+
+/// Hopping to the Providers tab to turn something on and back is a round trip
+/// a reader makes mid-edit, so neither tab may forget where they were.
+#[test]
+fn each_tab_keeps_its_own_selected_row_while_the_panel_is_open() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "transcript.reasoningVisibility");
+
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    focus_setting(&mut application, "provider.copilot.enabled");
+
+    press(&mut application, KeyCode::Left, KeyModifiers::NONE);
+    assert_eq!(
+        focused_key(&application),
+        "transcript.reasoningVisibility",
+        "General is where the reader left it"
+    );
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    assert_eq!(
+        focused_key(&application),
+        "provider.copilot.enabled",
+        "and so is Providers"
+    );
+}
+
+#[test]
+fn reopening_the_panel_starts_at_the_first_tab_and_its_top_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    focus_setting(&mut application, "provider.claude.enabled");
+    press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+
+    open_panel(&mut application);
+    assert_eq!(
+        focused_key(&application),
+        "transcript.defaultFoldPosture",
+        "the panel opens on the first tab's top row, remembering nothing"
+    );
+    let reopened = rendered_application_buffer(&application, 80, 15);
+    assert_ne!(
+        styling(&reopened, "General"),
+        styling(&reopened, "Providers"),
+        "with General active again"
     );
 }
 
@@ -191,157 +451,51 @@ fn choosing_a_value_pins_it_and_the_row_follows_the_refreshed_snapshot() {
     );
 }
 
+/// Space is the one change key, and it only ever steps forward: a Setting
+/// holding its last value wraps to the first rather than stopping.
 #[test]
 fn space_cycles_a_setting_forward_and_wraps_past_the_last_value() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    // Onto the Setting with the most values to walk, holding its last value,
-    // which is what shows a cycle wrapping rather than merely stepping.
     let mut application = client_showing(
         workspace.path(),
         EffectiveSettings {
-            provider: ProviderSettings {
-                codex: CodexSettings {
-                    reasoning_summary: ReasoningSummaryDetail::None,
-                    ..CodexSettings::default()
-                },
-                ..ProviderSettings::default()
+            transcript: TranscriptSettings {
+                reasoning_visibility: ReasoningVisibility::Shown,
+                ..TranscriptSettings::default()
             },
             ..EffectiveSettings::default()
         },
-        &["provider.codex.reasoningSummary"],
+        &["transcript.reasoningVisibility"],
     );
     open_panel(&mut application);
-    focus_setting(&mut application, "provider.codex.reasoningSummary");
+    focus_setting(&mut application, "transcript.reasoningVisibility");
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexReasoningSummary {
-            value: Some(ReasoningSummaryDetail::Auto),
+        ApplicationTransition::MutateSetting(SettingMutation::TranscriptReasoningVisibility {
+            value: Some(ReasoningVisibility::Hidden),
         }),
         "stepping on from the last value wraps to the first"
     );
 }
 
-/// Left, Right, and Enter are reserved for tab-switching and expand/collapse
-/// meanings later tickets give them; until then they change nothing, so a
-/// reader cannot edit a Setting with a key that is about to mean navigation.
+/// Enter is reserved for the expand/collapse meaning a later ticket gives it,
+/// so until then it changes nothing: a reader cannot edit a Setting with a key
+/// that is about to mean something else.
 #[test]
-fn left_right_and_enter_change_no_settings_value() {
+fn enter_changes_no_settings_value() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
 
-    for code in [KeyCode::Left, KeyCode::Right, KeyCode::Enter] {
-        assert_eq!(
-            press(&mut application, code, KeyModifiers::NONE),
-            ApplicationTransition::Continue,
-            "{code:?} edited a Setting"
-        );
-    }
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "Enter edited a Setting"
+    );
     assert!(
         row(&application, "Default Fold posture").contains("folded [default]"),
         "every Setting stays exactly where it was"
-    );
-}
-
-/// Provider Enablement is the first boolean Setting, and each Provider gets its
-/// own row, ordered beside that Provider's other Settings so the flat list still
-/// reads grouped.
-#[test]
-fn every_provider_has_its_own_enabled_row_showing_true_or_false() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
-    let mut application = client_showing(
-        workspace.path(),
-        EffectiveSettings {
-            provider: ProviderSettings {
-                copilot: CopilotSettings { enabled: false },
-                ..ProviderSettings::default()
-            },
-            ..EffectiveSettings::default()
-        },
-        &["provider.copilot.enabled"],
-    );
-    open_panel(&mut application);
-
-    let copilot = row(&application, "Copilot Provider");
-    assert!(
-        copilot.contains("false") && copilot.contains("[pinned]"),
-        "the Provider the reader turned off shows the value they would type: {copilot:?}"
-    );
-    for label in ["Codex Provider", "Claude Provider"] {
-        let enabled = row(&application, label);
-        assert!(
-            enabled.contains("true") && enabled.contains("[default]"),
-            "a Provider nothing pins is on by default: {enabled:?}"
-        );
-    }
-    assert!(
-        row(&application, "Codex Reasoning summary").contains("auto"),
-        "a disabled Provider's other Settings stay visible and editable"
-    );
-
-    let rows = rendered_application_rows(&application);
-    assert!(
-        rendered_row(&rows, "Codex Provider") < rendered_row(&rows, "Codex Reasoning summary"),
-        "a Provider's Enablement sits immediately before that Provider's other Settings: {rows:?}"
-    );
-    assert!(
-        rendered_row(&rows, "Codex Reasoning summary") < rendered_row(&rows, "Copilot Provider"),
-        "each Provider's rows stay together: {rows:?}"
-    );
-}
-
-#[test]
-fn a_providers_enabled_row_names_its_key_and_cycles_between_true_and_false() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
-    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
-    open_panel(&mut application);
-    focus_setting(&mut application, "provider.codex.enabled");
-
-    let headline = rendered_application_rows(&application).join("\n");
-    assert!(
-        headline.contains("Whether Suru offers Codex"),
-        "and its description, so true and false are unambiguous in context: {headline}"
-    );
-
-    assert_eq!(
-        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
-            value: Some(false),
-        }),
-        "stepping on from the enabled default turns the Provider off"
-    );
-    application
-        .handle_event(ApplicationEvent::SettingMutated(snapshot(
-            EffectiveSettings {
-                provider: ProviderSettings {
-                    codex: CodexSettings {
-                        enabled: false,
-                        ..CodexSettings::default()
-                    },
-                    ..ProviderSettings::default()
-                },
-                ..EffectiveSettings::default()
-            },
-            &["provider.codex.enabled"],
-        )))
-        .expect("receive the settings the edit left in force");
-    assert!(
-        row(&application, "Codex Provider").contains("false [pinned]"),
-        "the row follows the refreshed snapshot the edit produced"
-    );
-
-    assert_eq!(
-        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
-            value: Some(true),
-        }),
-        "a boolean Setting cycles back to the other value"
-    );
-    assert_eq!(
-        press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled { value: None }),
-        "undoing the choice is as easy as making it"
     );
 }
 
@@ -393,7 +547,7 @@ fn resetting_a_setting_unpins_it_whether_or_not_the_panel_thinks_it_is_pinned() 
 fn an_edit_the_server_refuses_says_so_and_leaves_the_row_where_it_was() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
-    open_panel(&mut application);
+    open_providers_tab(&mut application);
     press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE);
 
     application
@@ -407,8 +561,8 @@ fn an_edit_the_server_refuses_says_so_and_leaves_the_row_where_it_was() {
         "the panel says why the Config Document did not change: {panel}"
     );
     assert!(
-        row(&application, "Default Fold posture").contains("folded [default]"),
-        "a refused edit leaves the Setting exactly where it was"
+        !row(&application, "Codex").contains("disabled"),
+        "a refused edit leaves the Provider exactly where it was"
     );
 
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
