@@ -296,12 +296,16 @@ impl ProviderOrchestrator {
         anyhow::anyhow!(reported)
     }
 
-    /// Why the Session's Provider cannot take another Turn, when the user has
+    /// Why the Session's Provider cannot begin another Turn, when the user has
     /// turned it off. Enablement is the one condition that has to reach a
     /// Session already running on its Provider, so it is asked separately from
     /// [`Self::resolve_runtime`], which only answers where a new actor would
     /// run. The fix is inside Suru rather than outside it, so the message names
     /// the Setting rather than reading like an unavailability reason.
+    ///
+    /// Steering deliberately does not ask: a steer Prompt joins the Turn
+    /// already under way rather than beginning another, and Enablement governs
+    /// what Suru does next rather than what it is doing.
     fn disabled_provider_failure(&self, session_id: SessionId) -> Option<String> {
         let provider = self.sessions.provider(session_id)?;
         if self.is_enabled(&provider) {

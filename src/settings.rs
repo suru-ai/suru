@@ -66,9 +66,8 @@ pub struct SettingDescriptor {
     /// so the built-in default resumes.
     pub reset: SettingMutation,
     /// Writes a pinned JSON value into the typed field it governs, or reports
-    /// that the value is not one of the accepted ones. Crate-visible so a test
-    /// elsewhere can put a Setting in force the way a Config Document would.
-    pub(crate) apply: fn(&mut EffectiveSettings, &Value) -> bool,
+    /// that the value is not one of the accepted ones.
+    apply: fn(&mut EffectiveSettings, &Value) -> bool,
 }
 
 /// One value a Setting can hold, and the pin that puts it in force.
@@ -925,6 +924,44 @@ mod tests {
                 "one of true or false".to_owned(),
             ]
         );
+    }
+
+    /// Half of the guard that a Provider cannot ship without a working
+    /// Enablement: every `provider.<id>.enabled` entry must actually reach the
+    /// gate that reads it. The other half — that every built-in Provider has
+    /// such an entry at all — lives beside the hosted Provider list in
+    /// `server`, because that is the list which grows.
+    #[test]
+    fn every_provider_enablement_setting_reaches_the_gate_that_reads_it() {
+        let mut checked = 0;
+        for descriptor in SCHEMA {
+            let Some(provider) = descriptor
+                .key
+                .strip_prefix("provider.")
+                .and_then(|rest| rest.strip_suffix(".enabled"))
+                .map(crate::protocol::ProviderId::new)
+            else {
+                continue;
+            };
+            let mut settings = EffectiveSettings::default();
+            assert!(
+                settings.provider_enabled(&provider),
+                "{} must leave its Provider on unless the user says otherwise",
+                descriptor.key
+            );
+            assert!(
+                (descriptor.apply)(&mut settings, &Value::Bool(false)),
+                "{} must accept a JSON boolean",
+                descriptor.key
+            );
+            assert!(
+                !settings.provider_enabled(&provider),
+                "{} does not reach the gate that reads Provider `{provider}`'s Enablement",
+                descriptor.key
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no Provider Enablement Setting is defined");
     }
 
     #[test]

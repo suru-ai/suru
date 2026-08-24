@@ -314,9 +314,12 @@ struct AppState {
 }
 
 impl AppState {
-    /// Whether Suru may put this Provider forward on the user's behalf: it is
-    /// one this server hosts, and one the user has left enabled. The one
-    /// predicate every site that chooses a Provider for the user consults.
+    /// Whether a remembered Agent Selection may still be handed to a new
+    /// Session: its Provider is one this server hosts, and one the user has
+    /// left enabled. Availability is deliberately not asked here — a Provider
+    /// the user can fix from outside Suru keeps the selection they made, and
+    /// the fresh-Landing default behind this is what passes over one that
+    /// cannot work.
     fn is_selectable_provider(&self, provider: &ProviderId) -> bool {
         self.hosted_providers.contains(provider)
             && self.settings.borrow().settings.provider_enabled(provider)
@@ -1536,30 +1539,25 @@ mod tests {
     /// A Provider added to the built-in set without an `enabled` Setting would
     /// be one the user cannot turn off, and would read as enabled forever
     /// through the fallback [`EffectiveSettings::provider_enabled`] keeps for
-    /// Providers the schema does not name. This is the guard that walks a
-    /// developer to the schema entry, the mutation, and the settings field.
+    /// Providers the schema does not name — a failure that presents as nothing
+    /// at all. Enablement is a hand-written table rather than a compile-time
+    /// one, so this is the guard that walks a developer to the schema entry,
+    /// the mutation, and the settings field. Its other half, that such an entry
+    /// actually reaches the gate, lives beside the schema in `settings`.
     #[test]
-    fn every_built_in_provider_can_be_turned_off_by_its_own_setting() {
+    fn every_built_in_provider_has_an_enabled_setting() {
         for runtime in built_in_runtimes() {
             let provider = runtime.provider_id();
             let key = format!("provider.{provider}.enabled");
-            let descriptor = crate::settings::SCHEMA
-                .iter()
-                .find(|descriptor| descriptor.key == key)
-                .unwrap_or_else(|| panic!("Provider `{provider}` has no {key} Setting"));
-
-            let mut settings = EffectiveSettings::default();
             assert!(
-                settings.provider_enabled(&provider),
+                crate::settings::SCHEMA
+                    .iter()
+                    .any(|descriptor| descriptor.key == key),
+                "Provider `{provider}` has no {key} Setting, so nothing can turn it off"
+            );
+            assert!(
+                EffectiveSettings::default().provider_enabled(&provider),
                 "Provider `{provider}` must be enabled unless the user says otherwise"
-            );
-            assert!(
-                (descriptor.apply)(&mut settings, &serde_json::Value::Bool(false)),
-                "{key} must accept a JSON boolean"
-            );
-            assert!(
-                !settings.provider_enabled(&provider),
-                "{key} does not reach the gate that reads Provider `{provider}`'s Enablement"
             );
         }
     }

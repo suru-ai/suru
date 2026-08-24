@@ -12,38 +12,22 @@
 
 use std::{path::Path, sync::Arc};
 
-use crate::provider_support::{ControlledProvider, ControlledProviderRuntime};
+use crate::{
+    provider_support::{ControlledProvider, ControlledProviderRuntime},
+    support::{
+        create_session, hosted_model, hosted_selection, list_catalog, read_session, refresh_catalog,
+    },
+};
 use suru::{
     protocol::{
         Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection, CreateSessionRequest,
-        InitialPrompt, ModelAvailability, ModelCatalog, ModelDescriptor, ModelId, PromptDelivery,
-        PromptId, ProviderCatalogStatus, ProviderId, RuntimeDescriptor, SessionId, SessionSnapshot,
-        SettingMutation, SettingsSnapshot, TurnStatus, Workspace,
+        InitialPrompt, ModelCatalog, PromptDelivery, PromptId, ProviderCatalogStatus, ProviderId,
+        RuntimeDescriptor, SessionId, SettingMutation, SettingsSnapshot, TurnStatus, Workspace,
     },
     provider::ProviderEvent,
     server::{self, RunningServer, ServerConfig},
 };
 use tokio::time::{Duration, timeout};
-
-fn hosted_model(provider: &str, model: &str) -> ModelDescriptor {
-    ModelDescriptor {
-        provider: ProviderId::new(provider),
-        id: ModelId::new(model),
-        display_name: model.to_owned(),
-        description: String::new(),
-        is_default: true,
-        availability: ModelAvailability::Available,
-        options: Vec::new(),
-    }
-}
-
-fn hosted_selection(provider: &str, model: &str) -> AgentSelection {
-    AgentSelection {
-        provider: ProviderId::new(provider),
-        model: ModelId::new(model),
-        options: Vec::new(),
-    }
-}
 
 /// A Provider double serving one default Model, under a real Provider identity
 /// so its `enabled` Setting exists.
@@ -70,34 +54,6 @@ fn config_dir_disabling(disabled: &[&str]) -> tempfile::TempDir {
     )
     .expect("write Config Document");
     config_dir
-}
-
-async fn list_catalog(descriptor: &RuntimeDescriptor) -> ModelCatalog {
-    reqwest::Client::new()
-        .get(format!("{}/v1/models", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("list Models")
-        .error_for_status()
-        .expect("Model listing succeeds")
-        .json::<ModelCatalog>()
-        .await
-        .expect("decode Model catalog")
-}
-
-async fn refresh_catalog(descriptor: &RuntimeDescriptor) -> ModelCatalog {
-    reqwest::Client::new()
-        .post(format!("{}/v1/models/refresh", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("refresh Model catalog")
-        .error_for_status()
-        .expect("Model refresh succeeds")
-        .json::<ModelCatalog>()
-        .await
-        .expect("decode refreshed Model catalog")
 }
 
 /// The catalog entry for one Provider, which stays present for every hosted
@@ -133,24 +89,6 @@ async fn mutate_setting(
         .expect("decode the settings the edit left in force")
 }
 
-async fn create_session(
-    descriptor: &RuntimeDescriptor,
-    request: &CreateSessionRequest,
-) -> SessionSnapshot {
-    reqwest::Client::new()
-        .post(format!("{}/v1/sessions", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .json(request)
-        .send()
-        .await
-        .expect("create Session")
-        .error_for_status()
-        .expect("Session creation succeeds")
-        .json::<SessionSnapshot>()
-        .await
-        .expect("decode created Session")
-}
-
 fn session_request(
     workspace: &Path,
     selection: Option<AgentSelection>,
@@ -166,20 +104,6 @@ fn session_request(
             text: text.to_owned(),
         },
     }
-}
-
-async fn read_session(descriptor: &RuntimeDescriptor, session_id: SessionId) -> SessionSnapshot {
-    reqwest::Client::new()
-        .get(format!("{}/v1/sessions/{session_id}", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("read Session")
-        .error_for_status()
-        .expect("Session remains readable")
-        .json::<SessionSnapshot>()
-        .await
-        .expect("decode Session")
 }
 
 async fn admit_prompt(descriptor: &RuntimeDescriptor, session_id: SessionId, text: &str) {

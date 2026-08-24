@@ -67,6 +67,23 @@ fn open_panel(application: &mut Application) {
     press(application, KeyCode::Char(','), KeyModifiers::NONE);
 }
 
+/// Walks the focus down to the Setting spelling `key`, which the panel names
+/// in the focused row's headline. Navigating by the key rather than by a count
+/// of presses keeps these tests off the schema's row order, which is free to
+/// grow.
+fn focus_setting(application: &mut Application, key: &str) {
+    for _ in 0..suru::settings::SCHEMA.len() {
+        if rendered_application_rows(application)
+            .join("\n")
+            .contains(key)
+        {
+            return;
+        }
+        press(application, KeyCode::Down, KeyModifiers::NONE);
+    }
+    panic!("the settings panel never focused {key:?}");
+}
+
 /// The panel row for one Setting, as the reader sees it.
 fn row(application: &Application, label: &str) -> String {
     let rows = rendered_application_rows(application);
@@ -176,19 +193,9 @@ fn a_setting_cycles_through_every_value_it_offers_in_both_directions() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
-    // Down onto the Setting with the most values to walk, which is the one
-    // that shows a cycle wrapping rather than merely flipping. The panel names
-    // the focused Setting's key, so the walk asserts where it landed rather
-    // than trusting a count of rows the schema is free to grow.
-    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
-    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
-    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
-    assert!(
-        rendered_application_rows(&application)
-            .join("\n")
-            .contains("provider.codex.reasoningSummary"),
-        "the walk focused the Setting this test cycles"
-    );
+    // Onto the Setting with the most values to walk, which is the one that
+    // shows a cycle wrapping rather than merely flipping.
+    focus_setting(&mut application, "provider.codex.reasoningSummary");
 
     assert_eq!(
         press(&mut application, KeyCode::Right, KeyModifiers::NONE),
@@ -258,15 +265,9 @@ fn a_providers_enabled_row_names_its_key_and_cycles_between_true_and_false() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
-    // Onto the first Provider's Enablement, past the two Transcript Settings.
-    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
-    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    focus_setting(&mut application, "provider.codex.enabled");
 
     let headline = rendered_application_rows(&application).join("\n");
-    assert!(
-        headline.contains("provider.codex.enabled"),
-        "the focused Setting names the key a Config Document would spell: {headline}"
-    );
     assert!(
         headline.contains("Whether Suru offers Codex"),
         "and its description, so true and false are unambiguous in context: {headline}"

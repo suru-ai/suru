@@ -433,29 +433,28 @@ impl ModelPicker {
         self.selected = self
             .providers
             .iter()
-            .filter(|provider| {
-                !is_disabled(&provider.status)
-                    && self
-                        .provider_scope
-                        .as_ref()
-                        .is_none_or(|scope| *scope == provider.provider)
-            })
+            .filter(|provider| self.is_listed(provider))
             .flat_map(|provider| &provider.models)
             .find(|model| model.is_default && model_matches(&self.query, model))
             .map(|model| PickerSelection::Model(ModelKey::from_model(model)))
             .or_else(|| visible.first().cloned());
     }
 
+    /// Whether this Provider belongs in the list at all: one the reader scoped
+    /// away is somebody else's row, and one the user turned off is nobody's.
+    fn is_listed(&self, provider: &ProviderModels) -> bool {
+        !is_disabled(&provider.status)
+            && self
+                .provider_scope
+                .as_ref()
+                .is_none_or(|scope| *scope == provider.provider)
+    }
+
     fn rows(&self, current: Option<&AgentSelection>) -> Vec<ModelPickerRow<'_>> {
         let current = current.map(ModelKey::from_selection);
         let mut rows = Vec::new();
         for provider in &self.providers {
-            if is_disabled(&provider.status)
-                || self
-                    .provider_scope
-                    .as_ref()
-                    .is_some_and(|scope| *scope != provider.provider)
-            {
+            if !self.is_listed(provider) {
                 continue;
             }
             let models = provider
@@ -526,12 +525,7 @@ impl ModelPicker {
     fn selectable(&self) -> Vec<PickerSelection> {
         let mut selectable = Vec::new();
         for provider in &self.providers {
-            if is_disabled(&provider.status)
-                || self
-                    .provider_scope
-                    .as_ref()
-                    .is_some_and(|scope| *scope != provider.provider)
-            {
+            if !self.is_listed(provider) {
                 continue;
             }
             selectable.extend(
@@ -566,11 +560,12 @@ fn normalize_catalog(mut catalog: Vec<ProviderModelCatalog>) -> Vec<ProviderMode
 
 fn normalize_provider(mut catalog: ProviderModelCatalog) -> ProviderModels {
     sort_models(&mut catalog.models);
-    if is_unavailable(&catalog.status) || is_disabled(&catalog.status) {
-        // No Model of a Provider the user cannot use — or has turned off — can
-        // start a Session, so the whole Provider renders, and refuses
-        // selection, as unavailable. A disabled Provider draws no row at all,
-        // but its Models are cached for the options editor to read.
+    if is_unavailable(&catalog.status) {
+        // No Model of a Provider the user cannot use can start a Session, so
+        // the whole Provider renders — and refuses selection — as unavailable.
+        // A disabled Provider needs nothing of the sort: Enablement is not
+        // Availability, and a Provider Suru never consulted serves no Model to
+        // mark either way.
         for model in &mut catalog.models {
             model.availability = ModelAvailability::Unavailable;
         }

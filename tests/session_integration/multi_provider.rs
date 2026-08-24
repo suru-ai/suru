@@ -4,40 +4,23 @@
 use std::sync::Arc;
 
 use crate::{
-    failing_provider_support::FailingProviderRuntime, provider_support::ControlledProvider,
+    failing_provider_support::FailingProviderRuntime,
+    provider_support::ControlledProvider,
+    support::{
+        create_session, hosted_model, hosted_selection, list_catalog, read_session, refresh_catalog,
+    },
 };
 use suru::{
     protocol::{
-        Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection,
-        AgentSelectionOperationId, CreateSessionRequest, InitialPrompt, ModelAvailability,
-        ModelCatalog, ModelDescriptor, ModelId, PromptDelivery, PromptId, ProviderCatalogStatus,
-        ProviderId, ProviderUnavailability, SessionError, SessionErrorCode, SessionId,
-        SessionSnapshot, TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelectionOperationId,
+        CreateSessionRequest, InitialPrompt, ModelCatalog, PromptDelivery, PromptId,
+        ProviderCatalogStatus, ProviderId, ProviderUnavailability, SessionError, SessionErrorCode,
+        TurnStatus, UpdateAgentSelectionRequest, Workspace,
     },
     provider::ProviderEvent,
     server::{self, ServerConfig},
 };
 use tokio::time::{Duration, timeout};
-
-fn hosted_model(provider: &str, model: &str) -> ModelDescriptor {
-    ModelDescriptor {
-        provider: ProviderId::new(provider),
-        id: ModelId::new(model),
-        display_name: model.to_owned(),
-        description: String::new(),
-        is_default: true,
-        availability: ModelAvailability::Available,
-        options: Vec::new(),
-    }
-}
-
-fn hosted_selection(provider: &str, model: &str) -> AgentSelection {
-    AgentSelection {
-        provider: ProviderId::new(provider),
-        model: ModelId::new(model),
-        options: Vec::new(),
-    }
-}
 
 fn create_session_request(
     workspace: &std::path::Path,
@@ -54,69 +37,6 @@ fn create_session_request(
             text: format!("Work on the {provider} Provider"),
         },
     }
-}
-
-async fn create_session(
-    descriptor: &suru::protocol::RuntimeDescriptor,
-    request: &CreateSessionRequest,
-) -> SessionSnapshot {
-    reqwest::Client::new()
-        .post(format!("{}/v1/sessions", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .json(request)
-        .send()
-        .await
-        .expect("create Session")
-        .error_for_status()
-        .expect("Session creation succeeds")
-        .json::<SessionSnapshot>()
-        .await
-        .expect("decode created Session")
-}
-
-async fn list_catalog(descriptor: &suru::protocol::RuntimeDescriptor) -> ModelCatalog {
-    reqwest::Client::new()
-        .get(format!("{}/v1/models", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("list Models")
-        .error_for_status()
-        .expect("Model listing succeeds")
-        .json::<ModelCatalog>()
-        .await
-        .expect("decode Model catalog")
-}
-
-async fn refresh_catalog(descriptor: &suru::protocol::RuntimeDescriptor) -> ModelCatalog {
-    reqwest::Client::new()
-        .post(format!("{}/v1/models/refresh", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("refresh Model catalog")
-        .error_for_status()
-        .expect("Model refresh succeeds")
-        .json::<ModelCatalog>()
-        .await
-        .expect("decode refreshed Model catalog")
-}
-
-async fn read_session(
-    descriptor: &suru::protocol::RuntimeDescriptor,
-    session_id: SessionId,
-) -> SessionSnapshot {
-    reqwest::Client::new()
-        .get(format!("{}/v1/sessions/{session_id}", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("read Session")
-        .error_for_status()
-        .expect("Session remains readable")
-        .json::<SessionSnapshot>()
-        .await
-        .expect("decode Session")
 }
 
 #[tokio::test]

@@ -44,6 +44,11 @@ struct CatalogFailure {
 }
 
 impl ModelCatalogService {
+    /// Builds the catalog over `runtimes` and arms the watch that re-discovers
+    /// a Provider the moment the user turns it back on. Arming is part of
+    /// construction rather than a step a caller takes afterwards, because a
+    /// caller that forgot it would get a service that quietly never re-consults
+    /// an enabled Provider; the cost is that this needs a reactor to spawn on.
     pub(crate) fn new(
         runtimes: impl IntoIterator<Item = Arc<dyn ProviderRuntime>>,
         settings: watch::Receiver<SettingsSnapshot>,
@@ -160,7 +165,7 @@ impl ProviderCatalog {
     /// were asked for. Whatever it discovered before a disable stays cached, so
     /// a disable/enable round-trip costs nothing — it is simply not on offer
     /// while the Provider is off.
-    fn disabled(&self) -> ProviderModelCatalog {
+    fn disabled_catalog(&self) -> ProviderModelCatalog {
         ProviderModelCatalog {
             provider: self.provider.clone(),
             models: Vec::new(),
@@ -191,7 +196,7 @@ impl ProviderCatalog {
 
     async fn list(&self) -> ProviderModelCatalog {
         if !self.is_enabled() {
-            return self.disabled();
+            return self.disabled_catalog();
         }
         {
             let mut state = self
@@ -209,7 +214,7 @@ impl ProviderCatalog {
 
     async fn refresh(&self) -> ProviderModelCatalog {
         if !self.is_enabled() {
-            return self.disabled();
+            return self.disabled_catalog();
         }
         let mut generation = self.generation.subscribe();
         self.begin_refresh();
