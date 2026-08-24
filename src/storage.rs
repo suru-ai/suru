@@ -35,13 +35,14 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20260820030000";
+const CURRENT_SCHEMA_VERSION: &str = "20260824000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
     sessions (id) {
         id -> Text,
         title -> Text,
+        emoji -> Nullable<Text>,
         created_at -> BigInt,
         updated_at -> BigInt,
         workspace -> Text,

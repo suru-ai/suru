@@ -431,6 +431,10 @@ impl TuiState {
                 self.session_picker.remove(deleted.session_id);
                 self.remove_deleted_session(deleted.session_id);
             }
+            ManagedEvent::SessionTitleChanged(retitled) => {
+                self.session_picker
+                    .retitle(retitled.session_id, retitled.title, retitled.emoji);
+            }
             ManagedEvent::SessionCatalogReconciled(snapshot) => {
                 self.session_picker.retain_catalog(&snapshot.session_ids);
                 if let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id)

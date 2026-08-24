@@ -183,6 +183,10 @@ impl SessionStore {
         let summary = SessionSummary {
             session: snapshot.session.clone(),
             title,
+            // A Session begins with none: the Emoji beside its Title arrives
+            // only once an Errand has derived one, and a Session that never
+            // gets one draws just as cleanly.
+            emoji: None,
             created_at: timestamp,
             updated_at: timestamp,
         };

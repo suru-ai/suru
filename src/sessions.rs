@@ -21,11 +21,13 @@ use crate::protocol::{
 use crate::provider::ProviderResumeState;
 use crate::storage::{PersistedSession, RestoredSessions, StorageSink, StoredResumeState};
 
+mod emoji;
 mod output;
 mod projection;
 mod prompts;
 mod selection;
 mod settlement;
+mod title;
 
 pub(crate) use output::{
     command_output_changes, message_content_changes, reasoning_content_changes,
@@ -36,6 +38,7 @@ pub(crate) use prompts::{
 };
 pub(crate) use selection::AgentSelectionMutationError;
 pub(crate) use settlement::{InterruptTurnError, ProviderTurnOutcome, TrailingCommandOutput};
+pub(crate) use title::TitleDerivation;
 
 use prompts::{PromptOrigin, PromptOwner};
 

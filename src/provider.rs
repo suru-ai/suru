@@ -15,7 +15,7 @@ use tokio::sync::watch;
 
 use crate::protocol::{
     AgentIdentity, AgentSelection, EffectiveSettings, FileChange, ModelDescriptor, ModelOptionKind,
-    ModelOptionRole, ProviderId, ProviderUnavailability, SessionId,
+    ModelOptionRole, ProviderId, ProviderUnavailability,
 };
 
 mod claude;
@@ -200,11 +200,33 @@ impl fmt::Display for ProviderError {
 
 impl Error for ProviderError {}
 
+/// What a runtime needs to start one Provider-side session. It deliberately
+/// names no Suru Session: a runtime fulfilling an Errand through the
+/// session-shaped fallback (ADR 0011) has no Suru Session to name, and no
+/// harness ever read the identifier this used to carry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderSessionRequest {
-    pub session_id: SessionId,
     pub workspace: PathBuf,
     pub resume_state: Option<ProviderResumeState>,
+}
+
+/// One Errand: a single Provider call Suru makes for its own purposes rather
+/// than the user's. It carries one Prompt, the shape the answer should take,
+/// and the Agent Selection to run under — and no Tools, no Session, and nothing
+/// the Provider is expected to remember afterwards.
+///
+/// The schema is a request rather than a guarantee: a runtime falling back to a
+/// Provider-side session has no way to be handed one, so whatever asks for an
+/// Errand validates the reply itself (ADR 0011).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderErrand {
+    pub prompt: String,
+    pub schema: Value,
+    pub selection: AgentSelection,
+    /// The directory the Errand runs in, so a Workspace's own agent
+    /// instructions can inform the answer and no harness refuses to run
+    /// outside a repository.
+    pub workspace: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -335,6 +357,18 @@ pub trait ProviderRuntime: Send + Sync + 'static {
         request: ProviderSessionRequest,
     ) -> ProviderFuture<'_, ProviderSessionConnection>;
 
+    /// Runs one Errand: delivers its Prompt, asks for its shape, and answers
+    /// with the JSON the Provider replied. How that happens is the runtime's
+    /// own business — a native one-shot mode where the harness offers one, and
+    /// otherwise a Provider-side session it starts and discards (ADR 0011) —
+    /// and the caller never learns which path ran.
+    ///
+    /// This knows nothing about Titles. It is a general "run this once, answer
+    /// in this shape" capability, so a later compaction or summarization Errand
+    /// reuses it unchanged. It is not defaulted, so a new Provider has to decide
+    /// how it runs Errands rather than silently running none.
+    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, Value>;
+
     /// Stops in-progress Session startups and releases runtime-owned resources.
     fn shutdown(&self) -> ProviderFuture<'_, ()>;
 
@@ -348,6 +382,15 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     fn apply_settings(&self, settings: &EffectiveSettings) {
         let _ = settings;
     }
+}
+
+/// The answer a built-in runtime gives while it has yet to implement the Errand
+/// capability against its own harness. It fails rather than answering nothing,
+/// so whatever asked for the Errand records why in the Log and falls back,
+/// instead of waiting on a reply that is never coming.
+pub(crate) fn errand_unimplemented(provider: &ProviderId) -> ProviderFuture<'static, Value> {
+    let message = format!("Provider `{provider}` does not run Errands yet");
+    Box::pin(async move { Err(ProviderError::new(message)) })
 }
 
 pub(crate) fn validate_models(models: &[ModelDescriptor]) -> Result<(), ProviderError> {
@@ -437,7 +480,11 @@ impl ProviderSessionConnection {
         }
     }
 
-    pub(crate) fn into_parts(
+    /// Takes the connection apart. Public because a runtime fulfilling an
+    /// Errand through the session-shaped fallback (ADR 0011) starts a
+    /// Provider-side session of its own, drives it, and discards it — which
+    /// means taking apart a connection it never hands to a caller.
+    pub fn into_parts(
         self,
     ) -> (
         AgentIdentity,

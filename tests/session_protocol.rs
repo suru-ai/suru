@@ -87,12 +87,14 @@ fn session_summary_round_trips_with_discovery_metadata() {
             status: SessionStatus::Active,
         },
         title: "Explain this workspace".to_owned(),
+        emoji: Some("\u{1F5FA}\u{FE0F}".to_owned()),
         created_at: SessionTimestamp(1_755_497_600_000),
         updated_at: SessionTimestamp(1_755_497_600_321),
     };
     let expected = json!({
         "id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
         "title": "Explain this workspace",
+        "emoji": "\u{1F5FA}\u{FE0F}",
         "workspace": { "path": "/work/suru" },
         "agent_selection": {
             "provider": "codex",
@@ -110,8 +112,22 @@ fn session_summary_round_trips_with_discovery_metadata() {
         expected
     );
     assert_eq!(
-        serde_json::from_value::<SessionSummary>(expected).expect("decode Session summary"),
+        serde_json::from_value::<SessionSummary>(expected.clone()).expect("decode Session summary"),
         summary
+    );
+
+    // A Session whose Title was never derived carries no Emoji at all, which is
+    // every Session that predates Title derivation.
+    let mut without_emoji = expected;
+    without_emoji
+        .as_object_mut()
+        .expect("the encoded summary is an object")
+        .remove("emoji");
+    assert_eq!(
+        serde_json::from_value::<SessionSummary>(without_emoji)
+            .expect("decode a Session summary carrying no Emoji")
+            .emoji,
+        None
     );
 }
 

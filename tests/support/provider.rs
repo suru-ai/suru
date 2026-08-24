@@ -3,17 +3,22 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use futures_util::stream;
-use suru::protocol::{AgentIdentity, ModelDescriptor, ProviderId, ProviderUnavailability};
+use futures_util::{StreamExt, stream};
+use serde_json::Value;
+use suru::protocol::{
+    AgentIdentity, AgentSelection, ModelDescriptor, ProviderId, ProviderUnavailability,
+};
 use suru::provider::{
-    ProviderError, ProviderEvent, ProviderEventStream, ProviderFuture, ProviderRuntime,
-    ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
-    ProviderTurnInput,
+    ProviderErrand, ProviderError, ProviderEvent, ProviderEventStream, ProviderFuture,
+    ProviderRuntime, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
+    ProviderSteerInput, ProviderTurnInput,
 };
 use tokio::sync::{mpsc, oneshot};
 
 pub struct ControlledProvider {
     starts: mpsc::UnboundedReceiver<StartRequest>,
+    errands: mpsc::UnboundedReceiver<ErrandRequest>,
+    errand_starts: mpsc::UnboundedReceiver<StartRequest>,
 }
 
 #[derive(Clone)]
@@ -32,11 +37,29 @@ pub struct ControlledProviderRuntime {
     /// the one demand that needs counting.
     discoveries: Arc<AtomicUsize>,
     starts: mpsc::UnboundedSender<StartRequest>,
+    errands: mpsc::UnboundedSender<ErrandRequest>,
+    /// Where a session-shaped Errand's startup goes. It is kept apart from
+    /// `starts` so a test can tell the Provider-side session an Errand opens
+    /// from the one the user's own first Turn opens, which arrive at the same
+    /// moment and in no fixed order.
+    errand_starts: mpsc::UnboundedSender<StartRequest>,
+    /// Whether this double fulfils an Errand the way a harness with no one-shot
+    /// mode does: by starting a Provider-side session, delivering the one
+    /// Prompt, draining for the reply, and discarding the session (ADR 0011).
+    session_shaped_errands: Arc<Mutex<bool>>,
 }
 
 pub struct StartRequest {
     request: ProviderSessionRequest,
     response: oneshot::Sender<Result<ProviderSessionConnection, ProviderError>>,
+}
+
+/// One Errand this Provider was asked to run, held until the test answers it.
+/// Holding one without answering is how a test drives an Errand that times out,
+/// because nothing else about a request that is never answered is observable.
+pub struct ErrandRequest {
+    errand: ProviderErrand,
+    response: oneshot::Sender<Result<Value, ProviderError>>,
 }
 
 pub struct ControlledProviderSession {
@@ -81,6 +104,8 @@ impl ControlledProvider {
         models: Vec<ModelDescriptor>,
     ) -> (Arc<ControlledProviderRuntime>, Self) {
         let (starts_tx, starts_rx) = mpsc::unbounded_channel();
+        let (errands_tx, errands_rx) = mpsc::unbounded_channel();
+        let (errand_starts_tx, errand_starts_rx) = mpsc::unbounded_channel();
         (
             Arc::new(ControlledProviderRuntime {
                 provider,
@@ -88,8 +113,15 @@ impl ControlledProvider {
                 unavailable: Arc::new(Mutex::new(None)),
                 discoveries: Arc::new(AtomicUsize::new(0)),
                 starts: starts_tx,
+                errands: errands_tx,
+                errand_starts: errand_starts_tx,
+                session_shaped_errands: Arc::new(Mutex::new(false)),
             }),
-            Self { starts: starts_rx },
+            Self {
+                starts: starts_rx,
+                errands: errands_rx,
+                errand_starts: errand_starts_rx,
+            },
         )
     }
 
@@ -106,6 +138,30 @@ impl ControlledProvider {
     pub fn try_next_start(&mut self) -> Option<StartRequest> {
         self.starts.try_recv().ok()
     }
+
+    pub async fn next_errand(&mut self) -> ErrandRequest {
+        self.errands
+            .recv()
+            .await
+            .expect("Provider runtime remains connected")
+    }
+
+    /// The Errand already asked for, without waiting for one. A test that must
+    /// show a Provider was *never* asked to run an Errand reads the absence
+    /// here rather than waiting out the Errand's timeout.
+    pub fn try_next_errand(&mut self) -> Option<ErrandRequest> {
+        self.errands.try_recv().ok()
+    }
+
+    /// The Provider-side session a session-shaped Errand opened, for a double
+    /// put in that mode by
+    /// [`ControlledProviderRuntime::run_errands_through_a_session`].
+    pub async fn next_errand_start(&mut self) -> StartRequest {
+        self.errand_starts
+            .recv()
+            .await
+            .expect("Provider runtime remains connected")
+    }
 }
 
 impl ControlledProviderRuntime {
@@ -121,6 +177,48 @@ impl ControlledProviderRuntime {
     /// How many times Suru has asked this Provider for its Models.
     pub fn model_discoveries(&self) -> usize {
         self.discoveries.load(Ordering::SeqCst)
+    }
+
+    /// Makes this double stand in for a Provider whose harness has no one-shot
+    /// mode: an Errand is fulfilled by starting a Provider-side session,
+    /// delivering the one Prompt, draining for the reply, and discarding the
+    /// session. Which path ran is the runtime's own business, so nothing Suru
+    /// asks of it changes.
+    pub fn run_errands_through_a_session(&self) {
+        *self
+            .session_shaped_errands
+            .lock()
+            .expect("controlled Provider Errand mode lock is not poisoned") = true;
+    }
+}
+
+impl ErrandRequest {
+    pub fn prompt(&self) -> &str {
+        &self.errand.prompt
+    }
+
+    pub fn schema(&self) -> &Value {
+        &self.errand.schema
+    }
+
+    pub fn selection(&self) -> &AgentSelection {
+        &self.errand.selection
+    }
+
+    pub fn workspace(&self) -> &std::path::Path {
+        &self.errand.workspace
+    }
+
+    pub fn succeed(self, reply: Value) {
+        self.response
+            .send(Ok(reply))
+            .unwrap_or_else(|_| panic!("Provider Errand response remains connected"));
+    }
+
+    pub fn fail(self, message: impl Into<String>) {
+        self.response
+            .send(Err(ProviderError::new(message)))
+            .unwrap_or_else(|_| panic!("Provider Errand response remains connected"));
     }
 }
 
@@ -293,24 +391,90 @@ impl ProviderRuntime for ControlledProviderRuntime {
         &self,
         request: ProviderSessionRequest,
     ) -> ProviderFuture<'_, ProviderSessionConnection> {
-        let starts = self.starts.clone();
+        dispatch_start(self.starts.clone(), request)
+    }
+
+    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, Value> {
+        if *self
+            .session_shaped_errands
+            .lock()
+            .expect("controlled Provider Errand mode lock is not poisoned")
+        {
+            let starts = self.errand_starts.clone();
+            return Box::pin(async move { run_errand_through_a_session(starts, errand).await });
+        }
+        let errands = self.errands.clone();
         Box::pin(async move {
             let (response_tx, response_rx) = oneshot::channel();
-            starts
-                .send(StartRequest {
-                    request,
+            errands
+                .send(ErrandRequest {
+                    errand,
                     response: response_tx,
                 })
                 .map_err(|_| ProviderError::new("test Provider controller disconnected"))?;
             response_rx
                 .await
-                .map_err(|_| ProviderError::new("test Provider startup was abandoned"))?
+                .map_err(|_| ProviderError::new("test Provider Errand was abandoned"))?
         })
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
+}
+
+fn dispatch_start(
+    starts: mpsc::UnboundedSender<StartRequest>,
+    request: ProviderSessionRequest,
+) -> ProviderFuture<'static, ProviderSessionConnection> {
+    Box::pin(async move {
+        let (response_tx, response_rx) = oneshot::channel();
+        starts
+            .send(StartRequest {
+                request,
+                response: response_tx,
+            })
+            .map_err(|_| ProviderError::new("test Provider controller disconnected"))?;
+        response_rx
+            .await
+            .map_err(|_| ProviderError::new("test Provider startup was abandoned"))?
+    })
+}
+
+/// The escape hatch ADR 0011 keeps for a harness with no one-shot mode: start a
+/// Provider-side session, deliver the one Prompt, drain it for the reply, and
+/// shut it down. No Suru Session is involved on any of it — the request names
+/// none, and nothing here reaches the Session store.
+async fn run_errand_through_a_session(
+    starts: mpsc::UnboundedSender<StartRequest>,
+    errand: ProviderErrand,
+) -> Result<Value, ProviderError> {
+    let connection = dispatch_start(
+        starts,
+        ProviderSessionRequest {
+            workspace: errand.workspace,
+            resume_state: None,
+        },
+    )
+    .await?;
+    let (_identity, _resume_state, session, mut events) = connection.into_parts();
+    session
+        .start_turn(ProviderTurnInput {
+            prompt: errand.prompt,
+            selection: errand.selection,
+        })
+        .await?;
+    let mut reply = String::new();
+    while let Some(event) = events.next().await {
+        match event? {
+            ProviderEvent::AgentMessageDelta { content } => reply.push_str(&content),
+            ProviderEvent::TurnCompleted => break,
+            _ => {}
+        }
+    }
+    session.shutdown().await?;
+    serde_json::from_str(&reply)
+        .map_err(|error| ProviderError::new(format!("Errand reply is not JSON: {error}")))
 }
 
 fn dispatch_prompt_operation(

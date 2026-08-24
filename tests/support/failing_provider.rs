@@ -3,7 +3,7 @@ use std::sync::Arc;
 use suru::{
     protocol::{ModelDescriptor, ProviderId},
     provider::{
-        ProviderError, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
+        ProviderErrand, ProviderError, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
         ProviderSessionRequest,
     },
     server::{self, ServerConfig},
@@ -28,6 +28,14 @@ impl ProviderRuntime for FailingProviderRuntime {
         &self,
         _request: ProviderSessionRequest,
     ) -> ProviderFuture<'_, ProviderSessionConnection> {
+        Box::pin(async {
+            Err(ProviderError::new(
+                "No Provider runtime is configured for this test server.",
+            ))
+        })
+    }
+
+    fn run_errand(&self, _errand: ProviderErrand) -> ProviderFuture<'_, serde_json::Value> {
         Box::pin(async {
             Err(ProviderError::new(
                 "No Provider runtime is configured for this test server.",

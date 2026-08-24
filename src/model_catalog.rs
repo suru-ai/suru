@@ -410,6 +410,13 @@ mod tests {
             unimplemented!("catalog tests never start Sessions")
         }
 
+        fn run_errand(
+            &self,
+            _errand: crate::provider::ProviderErrand,
+        ) -> ProviderFuture<'_, serde_json::Value> {
+            unimplemented!("catalog tests never run Errands")
+        }
+
         fn shutdown(&self) -> ProviderFuture<'_, ()> {
             Box::pin(async { Ok(()) })
         }

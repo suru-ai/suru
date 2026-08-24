@@ -54,6 +54,7 @@ impl LandingAgentSelectionRow {
 pub(super) struct SessionRow {
     pub(super) id: String,
     title: String,
+    emoji: Option<String>,
     created_at: i64,
     updated_at: i64,
     workspace: String,
@@ -255,6 +256,7 @@ impl SessionRow {
         Ok(Self {
             id: session_id.to_string(),
             title: summary.title,
+            emoji: summary.emoji,
             created_at: u64_to_i64(session_id, "created_at", summary.created_at.0)?,
             updated_at: u64_to_i64(session_id, "updated_at", summary.updated_at.0)?,
             workspace: encode(
@@ -304,6 +306,7 @@ impl SessionRow {
                 status: decode(&session_id, "Session status", &self.status)?,
             },
             title: self.title,
+            emoji: self.emoji,
             created_at: SessionTimestamp(i64_to_u64(&session_id, "created_at", self.created_at)?),
             updated_at: SessionTimestamp(i64_to_u64(&session_id, "updated_at", self.updated_at)?),
         };

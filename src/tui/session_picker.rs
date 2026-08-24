@@ -114,6 +114,21 @@ impl SessionPicker {
             .or_else(|| self.visible_ids().first().copied());
     }
 
+    /// Takes a Session's newly derived Title and Emoji into a listing already
+    /// drawn, so a Title landing while the picker is open moves the row it is
+    /// on rather than waiting for the reader to reopen the picker.
+    pub(super) fn retitle(&mut self, session_id: SessionId, title: String, emoji: Option<String>) {
+        for session in &mut self.sessions {
+            if let SessionListItem::Readable(summary) = session
+                && summary.session.id == session_id
+            {
+                summary.title = title;
+                summary.emoji = emoji;
+                return;
+            }
+        }
+    }
+
     pub(super) fn fail_listing(&mut self, request: &SessionListRequest, error: String) {
         if !self.accepts(request) {
             return;

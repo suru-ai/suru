@@ -17,4 +17,5 @@ mod selection;
 mod storage;
 mod streams;
 mod support;
+mod titles;
 mod turns;

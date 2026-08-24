@@ -131,6 +131,15 @@ impl ProviderRuntime for ClaudeRuntime {
         })
     }
 
+    // Claude fulfils Errands through its own native print mode, which is its
+    // own piece of work; until that lands it declares that it runs none.
+    fn run_errand(
+        &self,
+        _errand: crate::provider::ProviderErrand,
+    ) -> ProviderFuture<'_, serde_json::Value> {
+        crate::provider::errand_unimplemented(&self.provider_id())
+    }
+
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move { self.processes.shutdown().await })
     }

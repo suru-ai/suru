@@ -17,8 +17,9 @@ use crate::{
     protocol::{
         AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, LifecycleState,
         ModelCatalog, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
-        SessionDeleted, SessionError, SessionId, SessionListItem, SessionSnapshot, SettingMutation,
-        SettingsSnapshot, ShutdownReason, Turn, TurnId, UpdateAgentSelectionRequest,
+        SessionDeleted, SessionError, SessionId, SessionListItem, SessionSnapshot,
+        SessionTitleChanged, SettingMutation, SettingsSnapshot, ShutdownReason, Turn, TurnId,
+        UpdateAgentSelectionRequest,
     },
 };
 
@@ -129,6 +130,10 @@ pub enum ManagedEvent {
     Recovering(RecoveryStatus),
     ServerShutdown(ServerShutdown),
     SessionDeleted(SessionDeleted),
+    /// A Session's derived Title and Emoji landed. It arrives for every Session
+    /// the server holds, open or not, because the picker lists Sessions this
+    /// client has never opened.
+    SessionTitleChanged(SessionTitleChanged),
     SessionCatalogReconciled(SessionCatalogSnapshot),
     Fatal(String),
 }

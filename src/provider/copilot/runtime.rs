@@ -103,6 +103,15 @@ impl ProviderRuntime for CopilotRuntime {
         })
     }
 
+    // Copilot fulfils Errands through the SDK, which is its own piece of work;
+    // until that lands it declares that it runs none.
+    fn run_errand(
+        &self,
+        _errand: crate::provider::ProviderErrand,
+    ) -> ProviderFuture<'_, serde_json::Value> {
+        crate::provider::errand_unimplemented(&self.provider_id())
+    }
+
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move { self.harness.shutdown().await })
     }

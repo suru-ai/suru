@@ -804,6 +804,13 @@ pub struct SessionSummary {
     #[serde(flatten)]
     pub session: Session,
     pub title: String,
+    /// The single emoji standing for this Session beside its Title, derived
+    /// with that Title and carried apart from it so a reader searching a
+    /// listing matches the words rather than the character in front of them.
+    /// Absent for every Session whose derivation was skipped, failed, or
+    /// predates the feature.
+    #[serde(default)]
+    pub emoji: Option<String>,
     pub created_at: SessionTimestamp,
     pub updated_at: SessionTimestamp,
 }
@@ -832,6 +839,16 @@ impl SessionListItem {
         match self {
             Self::Readable(summary) => &summary.title,
             Self::Unreadable(summary) => &summary.title,
+        }
+    }
+
+    /// The Emoji standing for this Session, when it has one. A Session Suru
+    /// could not read carries none, because an Emoji is stored beside a Title
+    /// that only a readable Session has.
+    pub fn emoji(&self) -> Option<&str> {
+        match self {
+            Self::Readable(summary) => summary.emoji.as_deref(),
+            Self::Unreadable(_) => None,
         }
     }
 
@@ -874,11 +891,24 @@ pub struct SessionCatalogSnapshot {
     pub session_ids: Vec<SessionId>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionCatalogChange {
-    Created { session_id: SessionId },
-    Deleted { session_id: SessionId },
+    Created {
+        session_id: SessionId,
+    },
+    Deleted {
+        session_id: SessionId,
+    },
+    /// A Session's Title — and the Emoji standing beside it — was replaced by
+    /// a derivation. It rides the catalog stream rather than the Session's own,
+    /// because a client subscribes only to the Sessions it has open while the
+    /// Title it draws is for every Session it lists.
+    TitleChanged {
+        session_id: SessionId,
+        title: String,
+        emoji: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1273,4 +1303,14 @@ pub struct ServerShutdown {
 #[serde(deny_unknown_fields)]
 pub struct SessionDeleted {
     pub session_id: SessionId,
+}
+
+/// A Session's Title — and the Emoji beside it — as a derivation left them,
+/// carried to a client that may be listing that Session without having it open.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTitleChanged {
+    pub session_id: SessionId,
+    pub title: String,
+    pub emoji: Option<String>,
 }

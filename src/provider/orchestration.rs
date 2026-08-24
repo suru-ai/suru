@@ -644,7 +644,6 @@ async fn run_provider_session(
                     biased;
                     _ = shutdown.wait() => break 'actor,
                     connection = runtime.start_session(ProviderSessionRequest {
-                        session_id,
                         workspace: workspace.clone(),
                         resume_state: sessions.resume_state(session_id, &provider_id),
                     }) => connection,

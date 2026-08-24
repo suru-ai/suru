@@ -910,6 +910,7 @@ fn session_summary(
             status,
         },
         title: title.to_owned(),
+        emoji: None,
         created_at: SessionTimestamp(1),
         updated_at: SessionTimestamp(updated_at),
     })

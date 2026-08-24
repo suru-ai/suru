@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::RuntimeConfig;
 use crate::build_identity;
+use crate::errands::{DEFAULT_ERRAND_TIMEOUT, ErrandRunner};
 use crate::model_catalog::ModelCatalogService;
 use crate::protocol::{
     Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, LifecycleState, Message,
@@ -44,7 +45,7 @@ use crate::runtime::protect_current_user_file;
 use crate::sessions::{
     AdmitPromptError, AgentSelectionMutationError, CreateSessionError, DeleteSessionError,
     InterruptTurnError, ListSessionsError, PromptAdmissionDisposition, PromptMutationError,
-    SessionCatalogFeed, SessionFeed, SessionStore, StoreOutcome,
+    SessionCatalogFeed, SessionFeed, SessionStore, StoreOutcome, TitleDerivation,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::storage::{StorageRepository, StorageSink, StorageWriter};
@@ -60,6 +61,8 @@ pub struct ServerTimings {
     /// available so the final authenticated intent can reach clients before
     /// graceful transport closure.
     pub shutdown_grace: Duration,
+    /// How long an Errand may take before Suru stops waiting on it.
+    pub errand_timeout: Duration,
 }
 
 impl Default for ServerTimings {
@@ -67,7 +70,17 @@ impl Default for ServerTimings {
         Self {
             sse_keepalive_interval: Duration::from_secs(10),
             shutdown_grace: Duration::from_millis(100),
+            errand_timeout: DEFAULT_ERRAND_TIMEOUT,
         }
+    }
+}
+
+impl ServerTimings {
+    /// Bounds how long an Errand may take; injectable so tests exercise a
+    /// Provider that never answers without waiting out the default.
+    pub fn with_errand_timeout(mut self, timeout: Duration) -> Self {
+        self.errand_timeout = timeout;
+        self
     }
 }
 
@@ -293,6 +306,9 @@ struct AppState {
     descriptor: Arc<RuntimeDescriptor>,
     sessions: SessionStore,
     providers: ProviderOrchestrator,
+    /// Derives a Session's Title from its first Prompt, in the background and
+    /// beside the first Turn rather than in front of it.
+    title_derivation: TitleDerivation,
     model_catalog: ModelCatalogService,
     landing_agent_selection: LandingAgentSelectionStore,
     /// The loaded effective-settings view. A watch channel so every attached
@@ -448,19 +464,28 @@ pub async fn spawn_with_providers_and_timings(
     let providers = ProviderOrchestrator::new(
         runtimes.clone(),
         sessions.clone(),
-        provider_shutdown_rx,
+        provider_shutdown_rx.clone(),
         provider_updates,
         settings.subscribe(),
+    );
+    let runtimes = Arc::new(runtimes);
+    // Errands are abandoned on the same signal that stops Provider work, so a
+    // shutting-down server never waits on one and never resumes one.
+    let title_derivation = TitleDerivation::new(
+        ErrandRunner::new(runtimes.clone(), provider_shutdown_rx, settings.subscribe())
+            .with_timeout(timings.errand_timeout),
+        sessions.clone(),
     );
     let state = AppState {
         descriptor: Arc::new(descriptor.clone()),
         sessions: sessions.clone(),
         providers: providers.clone(),
+        title_derivation,
         model_catalog,
         landing_agent_selection,
         settings: Arc::new(settings),
         config_documents,
-        runtimes: Arc::new(runtimes),
+        runtimes,
         hosted_providers: Arc::new(hosted_providers),
         shutdown: shutdown.clone(),
         timings,
@@ -850,6 +875,17 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
                 snapshot.session.id,
                 snapshot.session.workspace.path.clone(),
                 snapshot.prompts[0].id,
+            );
+            // After the Turn is scheduled and never in front of it: a Title is
+            // cosmetic and the user's actual work does not wait on one. Only a
+            // freshly created Session reaches here, which is what makes the
+            // derivation once-per-Session — a retried creation answers with the
+            // Session it already made and asks for nothing.
+            state.title_derivation.derive(
+                snapshot.session.id,
+                snapshot.session.workspace.path.clone(),
+                snapshot.session.agent_selection.clone(),
+                &snapshot.prompts[0].text,
             );
             (StatusCode::CREATED, Json(snapshot)).into_response()
         }

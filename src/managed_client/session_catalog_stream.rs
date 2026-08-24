@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::protocol::{
     RuntimeDescriptor, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
     SessionCatalogChange, SessionCatalogRevision, SessionCatalogSnapshot, SessionCatalogUpdate,
-    SessionDeleted, SessionId,
+    SessionDeleted, SessionId, SessionTitleChanged,
 };
 
 use super::ManagedEvent;
@@ -74,13 +74,10 @@ pub(super) async fn consume(
                 }
             }
             CatalogEvent::Update(update) => {
-                let session_id = apply_update(known_session_ids, update.change)?;
+                let announced = apply_update(known_session_ids, update.change)?;
                 revision = Some(update.revision);
-                if let Some(session_id) = session_id
-                    && events
-                        .send(ManagedEvent::SessionDeleted(SessionDeleted { session_id }))
-                        .await
-                        .is_err()
+                if let Some(announced) = announced
+                    && events.send(announced).await.is_err()
                 {
                     return Ok(StreamOutcome::ReceiverClosed);
                 }
@@ -104,10 +101,13 @@ fn reconcile_snapshot(
     deleted
 }
 
+/// Folds one catalog change into what this client knows the catalog holds, and
+/// answers with the event a reader should hear about — `None` for a change that
+/// only moves the client's own bookkeeping.
 fn apply_update(
     known_session_ids: &mut Option<HashSet<SessionId>>,
     change: SessionCatalogChange,
-) -> Result<Option<SessionId>> {
+) -> Result<Option<ManagedEvent>> {
     let known = known_session_ids
         .as_mut()
         .expect("a catalog update is decoded only after its snapshot");
@@ -122,7 +122,25 @@ fn apply_update(
             if !known.remove(&session_id) {
                 bail!("Session catalog deleted an unknown Session");
             }
-            Ok(Some(session_id))
+            Ok(Some(ManagedEvent::SessionDeleted(SessionDeleted {
+                session_id,
+            })))
+        }
+        SessionCatalogChange::TitleChanged {
+            session_id,
+            title,
+            emoji,
+        } => {
+            if !known.contains(&session_id) {
+                bail!("Session catalog retitled an unknown Session");
+            }
+            Ok(Some(ManagedEvent::SessionTitleChanged(
+                SessionTitleChanged {
+                    session_id,
+                    title,
+                    emoji,
+                },
+            )))
         }
     }
 }

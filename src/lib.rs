@@ -1,5 +1,6 @@
 mod ansi;
 pub mod build_identity;
+mod errands;
 pub mod logging;
 pub mod managed_client;
 mod model_catalog;

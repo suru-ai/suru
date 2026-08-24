@@ -35,6 +35,11 @@ pub(crate) struct StorageWriter {
 
 enum WriterCommand {
     Create(Box<PersistedSession>),
+    /// A Session summary that changed without a Session update behind it. A
+    /// derived Title is the one such change: it alters nothing a Transcript
+    /// reader holds, so it neither carries changes nor bumps the revision, and
+    /// it therefore cannot ride [`WriterCommand::Update`].
+    SummaryChanged(Box<SessionSummary>),
     Update {
         summary: SessionSummary,
         update: SessionUpdate,
@@ -88,6 +93,16 @@ impl StorageWriter {
                                 dirty: true,
                             },
                         );
+                    }
+                    Ok(WriterCommand::SummaryChanged(summary)) => {
+                        // A Session the writer does not know is one already
+                        // deleted; a Title that arrives for it has nothing left
+                        // to land on and is dropped rather than resurrecting a
+                        // row.
+                        if let Some(state) = sessions.get_mut(&summary.session.id) {
+                            state.persisted.summary = *summary;
+                            state.dirty = true;
+                        }
                     }
                     Ok(WriterCommand::Update {
                         summary,
@@ -186,6 +201,16 @@ impl StorageSink {
                 snapshot,
                 resume_states: HashMap::new(),
             })));
+    }
+
+    /// Records a Session summary that changed on its own — a derived Title and
+    /// Emoji. Fire-and-forget on the same terms as [`Self::created`]: the next
+    /// idle flush lands it, and a Title lost to a crash is one the Session
+    /// simply never had.
+    pub(crate) fn summary_changed(&self, summary: SessionSummary) {
+        let _ = self
+            .commands
+            .send(WriterCommand::SummaryChanged(Box::new(summary)));
     }
 
     pub(crate) fn updated(
