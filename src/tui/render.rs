@@ -27,7 +27,7 @@ use super::{
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
     session_picker::SessionPickerRow,
-    settings_panel::RowValue,
+    settings_panel::{RowExpansion, RowValue},
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
         PromptFooterSlotContext, PromptStatusSlotContext, RenderSlots, RenderedSlot,
@@ -399,8 +399,24 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
     let footer_rows = usize::from(content_height >= 3);
     let capacity = content_height.saturating_sub(lines.len() + footer_rows);
     let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
+    // Read before the window narrows the rows, and read off the focused row:
+    // Enter acts on that row alone, so that row decides whether the key is
+    // worth teaching.
+    let expands = rows
+        .iter()
+        .any(|row| row.selected && row.expansion.expands());
     for row in visible_window(rows, selected, capacity) {
         let marker = if row.selected { "› " } else { "  " };
+        // The affordance says what Enter would do to this row and, on a tab of
+        // Providers, holds its column even for the Provider Enter passes over,
+        // so the names line up. A revealed Setting steps in past both.
+        let expansion = match row.expansion {
+            RowExpansion::Absent => "",
+            RowExpansion::Unexpandable => "  ",
+            RowExpansion::Collapsed => "▸ ",
+            RowExpansion::Expanded => "▾ ",
+            RowExpansion::Revealed => "    ",
+        };
         let origin = if row.pinned { "pinned" } else { "default" };
         // A Provider Suru has been told to leave alone is the one row that
         // reads as its own condition rather than as a value; an enabled
@@ -412,7 +428,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
         };
         lines.push(Line::styled(
             truncate_to_width(
-                &format!("{marker}{}{value} [{origin}]", row.label),
+                &format!("{marker}{expansion}{}{value} [{origin}]", row.label),
                 content_width,
             ),
             match (row.selected, row.value) {
@@ -423,9 +439,12 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
         ));
     }
     if footer_rows > 0 && lines.len() < content_height {
+        // Enter is taught only where it does something, so a reader focused on
+        // a row that does not expand is never offered a dead key.
+        let expand = if expands { "Enter expand · " } else { "" };
         lines.push(Line::styled(
             truncate_to_width(
-                "Left/Right tabs · Space change · Ctrl+D reset · Esc close",
+                &format!("{expand}Left/Right tabs · Space change · Ctrl+D reset · Esc close"),
                 content_width,
             ),
             theme.text.subdued,

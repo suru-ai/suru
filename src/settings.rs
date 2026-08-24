@@ -278,7 +278,9 @@ pub const SCHEMA: &[SettingDescriptor] = &[
     },
     SettingDescriptor {
         key: PROVIDER_CODEX_REASONING_SUMMARY,
-        label: "Codex Reasoning summary",
+        // A Provider-scoped Setting is read under the Provider it configures,
+        // which names it, so the label names the Setting alone.
+        label: "Reasoning summary",
         description: "How much Reasoning summary detail each Turn asks Codex for",
         group: SettingGroup::Providers,
         scope: SettingScope::Server,
@@ -370,6 +372,24 @@ pub const SCHEMA: &[SettingDescriptor] = &[
 pub fn provider_enablement(provider: &ProviderId) -> Option<&'static SettingDescriptor> {
     let key = format!("provider.{provider}.enabled");
     SCHEMA.iter().find(|descriptor| descriptor.key == key)
+}
+
+/// Everything else one Provider is configured by, in schema order: the
+/// Settings a surface presenting the Provider reveals under it, its Enablement
+/// left out because the Provider itself is that Setting's surface. Keyed on the
+/// Provider's own identity like [`provider_enablement`], so a Setting joins the
+/// Provider it names by being written down once.
+pub fn provider_settings(provider: &ProviderId) -> Vec<&'static SettingDescriptor> {
+    let prefix = format!("provider.{provider}.");
+    // Read off `provider_enablement` rather than spelled again here, so the
+    // key the Provider's own row stands for is written down once.
+    let enablement = provider_enablement(provider).map(|descriptor| descriptor.key);
+    SCHEMA
+        .iter()
+        .filter(|descriptor| {
+            descriptor.key.starts_with(&prefix) && Some(descriptor.key) != enablement
+        })
+        .collect()
 }
 
 fn apply_value<T: serde::de::DeserializeOwned>(value: &Value, write: impl FnOnce(T)) -> bool {

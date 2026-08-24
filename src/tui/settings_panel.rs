@@ -14,15 +14,15 @@
 //! Setting's own declaration in the schema, so the panel maps groups to tabs
 //! and invents no grouping of its own.
 //!
-//! That leaves a Provider-scoped Setting which is not an Enablement with no row
-//! of its own yet: the Providers tab reveals those under the Provider they
-//! configure, which is the expansion issue #138 builds. Until it lands, such a
-//! Setting is editable only in the Config Document itself.
+//! Everything else a Provider is configured by is revealed under it, as
+//! ordinary rows the reader expands the Provider to see. The expansion is view
+//! state and nothing more — the panel forgets it on close — so a Provider whose
+//! Settings the reader is not looking at costs the listing one line.
 
 use crate::{
     protocol::{EffectiveSettings, ProviderId, SettingMutation},
     provider::built_in_providers,
-    settings::{SCHEMA, SettingDescriptor, SettingGroup, provider_enablement},
+    settings::{SCHEMA, SettingDescriptor, SettingGroup, provider_enablement, provider_settings},
 };
 
 /// Stands in for a value the effective settings hold but the schema does not
@@ -79,6 +79,10 @@ pub(super) struct SettingsPanel {
     /// and back does not cost the reader their place in General. Ephemeral by
     /// design: an opening panel always starts at the first tab's top row.
     selected: [usize; SettingsTab::ALL.len()],
+    /// The Providers whose further Settings are on show. Ephemeral like the
+    /// selection: an opening panel expands nothing, so the reader always meets
+    /// the same short list of Providers.
+    expanded: Vec<&'static ProviderId>,
     /// Why the last edit never reached the Config Document. Cleared by the
     /// next edit, so a stale complaint never outlives the attempt that earned
     /// it.
@@ -100,6 +104,34 @@ pub(super) struct SettingRow {
     pub(super) value: RowValue,
     pub(super) pinned: bool,
     pub(super) selected: bool,
+    pub(super) expansion: RowExpansion,
+}
+
+/// Where a row sits in the one nesting the panel has: a Provider that reveals
+/// further Settings, and the Settings so revealed. A row says which it is
+/// rather than how far to indent it, so the drawing stays the client's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RowExpansion {
+    /// Neither expandable nor inside an expansion: every General row.
+    Absent,
+    /// A Provider with nothing further to configure. It offers no affordance,
+    /// but stands in the same column as the Providers that do, so a tab of
+    /// Providers reads as one list.
+    Unexpandable,
+    /// A Provider whose further Settings are hidden.
+    Collapsed,
+    /// A Provider whose further Settings follow it.
+    Expanded,
+    /// One of those Settings, drawn under the Provider it configures.
+    Revealed,
+}
+
+impl RowExpansion {
+    /// Whether Enter on this row has anything to do, which is both what the
+    /// key acts on and what decides whether the panel teaches it at all.
+    pub(super) fn expands(self) -> bool {
+        matches!(self, Self::Collapsed | Self::Expanded)
+    }
 }
 
 /// What a row says it is worth, which reads differently for a Setting the
@@ -123,6 +155,7 @@ struct PanelEntry {
     label: &'static str,
     descriptor: &'static SettingDescriptor,
     provider: Option<&'static ProviderId>,
+    expansion: RowExpansion,
 }
 
 impl SettingsPanel {
@@ -186,16 +219,18 @@ impl SettingsPanel {
     /// click — cannot reach a Setting the reader never focused.
     pub(super) fn selected_descriptor(&self) -> Option<&'static SettingDescriptor> {
         self.open.then(|| {
-            self.entries()
-                .get(self.selected_row())
+            let entries = self.entries();
+            entries
+                .get(self.selected_row(entries.len()))
                 .map(|entry| entry.descriptor)
         })?
     }
 
     /// The active tab's rows, valued from the snapshot.
     pub(super) fn rows(&self, settings: &EffectiveSettings, pinned: &[String]) -> Vec<SettingRow> {
-        let selected = self.selected_row();
-        self.entries()
+        let entries = self.entries();
+        let selected = self.selected_row(entries.len());
+        entries
             .into_iter()
             .enumerate()
             .map(|(index, entry)| SettingRow {
@@ -217,8 +252,38 @@ impl SettingsPanel {
                 },
                 pinned: pinned.iter().any(|key| key == entry.descriptor.key),
                 selected: index == selected,
+                expansion: entry.expansion,
             })
             .collect()
+    }
+
+    /// Reveals the focused Provider's further Settings beneath it, or hides
+    /// them again. Enter carries no other meaning in the panel, so a row with
+    /// nothing to reveal — a Setting, or a Provider configured by nothing
+    /// else — is left exactly as it was rather than given a second behavior.
+    /// Like an edit, this reaches a Provider only through the focused row, so a
+    /// command arriving while the panel is closed expands nothing.
+    pub(super) fn toggle_expansion(&mut self) {
+        if !self.open {
+            return;
+        }
+        let entries = self.entries();
+        let expandable = entries
+            .get(self.selected_row(entries.len()))
+            .filter(|entry| entry.expansion.expands())
+            .and_then(|entry| entry.provider);
+        let Some(provider) = expandable else {
+            return;
+        };
+        // Cleared only once the key has something to do, so a row Enter passes
+        // over does not quietly take away the complaint the reader is reading.
+        self.error = None;
+        match self.expanded.iter().position(|open| *open == provider) {
+            Some(index) => {
+                self.expanded.remove(index);
+            }
+            None => self.expanded.push(provider),
+        }
     }
 
     /// Moves the focused Setting one choice on from the value in force,
@@ -257,27 +322,52 @@ impl SettingsPanel {
                     label: descriptor.label,
                     descriptor,
                     provider: None,
+                    expansion: RowExpansion::Absent,
                 })
                 .collect(),
-            SettingsTab::Providers => built_in_providers()
-                .iter()
-                // A Provider whose Enablement the schema does not define has no
-                // row to offer, because the row is that Setting's surface. The
-                // guard beside the Provider list is what keeps that from
-                // shipping.
-                .filter_map(|provider| {
-                    Some(PanelEntry {
+            SettingsTab::Providers => {
+                let mut entries = Vec::new();
+                for provider in built_in_providers() {
+                    // A Provider whose Enablement the schema does not define
+                    // has no row to offer, because the row is that Setting's
+                    // surface. The guard beside the Provider list is what keeps
+                    // that from shipping.
+                    let Some(enablement) = provider_enablement(&provider.id) else {
+                        continue;
+                    };
+                    let further = provider_settings(&provider.id);
+                    let expanded = self.expanded.contains(&&provider.id);
+                    entries.push(PanelEntry {
                         label: provider.display_name.as_str(),
-                        descriptor: provider_enablement(&provider.id)?,
+                        descriptor: enablement,
                         provider: Some(&provider.id),
-                    })
-                })
-                .collect(),
+                        expansion: match (further.is_empty(), expanded) {
+                            (true, _) => RowExpansion::Unexpandable,
+                            (false, false) => RowExpansion::Collapsed,
+                            (false, true) => RowExpansion::Expanded,
+                        },
+                    });
+                    if expanded {
+                        entries.extend(further.into_iter().map(|descriptor| PanelEntry {
+                            label: descriptor.label,
+                            descriptor,
+                            provider: None,
+                            expansion: RowExpansion::Revealed,
+                        }));
+                    }
+                }
+                entries
+            }
         }
     }
 
-    fn selected_row(&self) -> usize {
-        self.selected[self.tab.position()]
+    /// Where the focus sits on the tab being shown, held inside a listing of
+    /// `rows`. A tab's length moves under the focus — a Provider collapsing
+    /// takes rows away beneath it — so the focus is clamped where it is read
+    /// rather than only where it is moved, and a shorter listing lands the
+    /// reader on its last row instead of on nothing at all.
+    fn selected_row(&self, rows: usize) -> usize {
+        self.selected[self.tab.position()].min(rows.saturating_sub(1))
     }
 
     fn move_selection(&mut self, distance: isize) {
@@ -336,6 +426,40 @@ mod tests {
                     entry.descriptor.key
                 );
             }
+        }
+    }
+
+    /// A Provider-scoped Setting reaches the reader as the Provider's own row
+    /// or from inside that Provider's expansion, and the two must not overlap:
+    /// one keyed on no built-in Provider would have left the panel silently,
+    /// and an Enablement repeated inside an expansion would give the reader two
+    /// rows for one value.
+    #[test]
+    fn every_provider_setting_has_exactly_one_row_among_the_expanded_providers() {
+        let panel = SettingsPanel {
+            open: true,
+            tab: SettingsTab::Providers,
+            expanded: built_in_providers()
+                .iter()
+                .map(|provider| &provider.id)
+                .collect(),
+            ..SettingsPanel::default()
+        };
+        let keys = panel
+            .entries()
+            .iter()
+            .map(|entry| entry.descriptor.key)
+            .collect::<Vec<_>>();
+        for descriptor in SCHEMA
+            .iter()
+            .filter(|descriptor| descriptor.group == SettingGroup::Providers)
+        {
+            assert_eq!(
+                keys.iter().filter(|key| **key == descriptor.key).count(),
+                1,
+                "{} does not have exactly one row on the Providers tab: {keys:?}",
+                descriptor.key
+            );
         }
     }
 

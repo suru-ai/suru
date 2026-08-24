@@ -1986,6 +1986,7 @@ impl Application {
             | SemanticCommandId::SettingsNext
             | SemanticCommandId::SettingsTabPrevious
             | SemanticCommandId::SettingsTabNext
+            | SemanticCommandId::SettingsExpansionToggle
             | SemanticCommandId::SettingsValueCycle
             | SemanticCommandId::SettingsReset
             | SemanticCommandId::SettingsClose) => Ok(self.handle_settings_panel_command(command)),
@@ -2079,6 +2080,10 @@ impl Application {
             }
             SemanticCommandId::SettingsTabNext => {
                 self.state.settings_panel.select_next_tab();
+                None
+            }
+            SemanticCommandId::SettingsExpansionToggle => {
+                self.state.settings_panel.toggle_expansion();
                 None
             }
             SemanticCommandId::SettingsValueCycle => {
