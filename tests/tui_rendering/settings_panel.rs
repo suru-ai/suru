@@ -100,11 +100,14 @@ fn the_leader_key_and_the_slash_command_both_open_the_panel_and_escape_closes_it
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
 
     open_panel(&mut application);
+    let panel = rendered_application_rows(&application).join("\n");
     assert!(
-        rendered_application_rows(&application)
-            .join("\n")
-            .contains("Settings"),
+        panel.contains("Settings"),
         "leader+, opens the settings panel"
+    );
+    assert!(
+        panel.contains("Space cycle · Ctrl+D reset · Esc close"),
+        "the footer teaches the keys the panel answers to: {panel}"
     );
 
     press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
@@ -163,7 +166,7 @@ fn choosing_a_value_pins_it_and_the_row_follows_the_refreshed_snapshot() {
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
 
-    let transition = press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    let transition = press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE);
     assert_eq!(
         transition,
         ApplicationTransition::MutateSetting(SettingMutation::TranscriptDefaultFoldPosture {
@@ -189,27 +192,55 @@ fn choosing_a_value_pins_it_and_the_row_follows_the_refreshed_snapshot() {
 }
 
 #[test]
-fn a_setting_cycles_through_every_value_it_offers_in_both_directions() {
+fn space_cycles_a_setting_forward_and_wraps_past_the_last_value() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    // Onto the Setting with the most values to walk, holding its last value,
+    // which is what shows a cycle wrapping rather than merely stepping.
+    let mut application = client_showing(
+        workspace.path(),
+        EffectiveSettings {
+            provider: ProviderSettings {
+                codex: CodexSettings {
+                    reasoning_summary: ReasoningSummaryDetail::None,
+                    ..CodexSettings::default()
+                },
+                ..ProviderSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &["provider.codex.reasoningSummary"],
+    );
     open_panel(&mut application);
-    // Onto the Setting with the most values to walk, which is the one that
-    // shows a cycle wrapping rather than merely flipping.
     focus_setting(&mut application, "provider.codex.reasoningSummary");
 
     assert_eq!(
-        press(&mut application, KeyCode::Right, KeyModifiers::NONE),
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
         ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexReasoningSummary {
-            value: Some(ReasoningSummaryDetail::Concise),
+            value: Some(ReasoningSummaryDetail::Auto),
         }),
-        "the next value follows the one in force"
+        "stepping on from the last value wraps to the first"
     );
-    assert_eq!(
-        press(&mut application, KeyCode::Left, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexReasoningSummary {
-            value: Some(ReasoningSummaryDetail::None),
-        }),
-        "stepping back from the first value wraps to the last"
+}
+
+/// Left, Right, and Enter are reserved for tab-switching and expand/collapse
+/// meanings later tickets give them; until then they change nothing, so a
+/// reader cannot edit a Setting with a key that is about to mean navigation.
+#[test]
+fn left_right_and_enter_change_no_settings_value() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+
+    for code in [KeyCode::Left, KeyCode::Right, KeyCode::Enter] {
+        assert_eq!(
+            press(&mut application, code, KeyModifiers::NONE),
+            ApplicationTransition::Continue,
+            "{code:?} edited a Setting"
+        );
+    }
+    assert!(
+        row(&application, "Default Fold posture").contains("folded [default]"),
+        "every Setting stays exactly where it was"
     );
 }
 
@@ -274,7 +305,7 @@ fn a_providers_enabled_row_names_its_key_and_cycles_between_true_and_false() {
     );
 
     assert_eq!(
-        press(&mut application, KeyCode::Right, KeyModifiers::NONE),
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
         ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
             value: Some(false),
         }),
@@ -301,7 +332,7 @@ fn a_providers_enabled_row_names_its_key_and_cycles_between_true_and_false() {
     );
 
     assert_eq!(
-        press(&mut application, KeyCode::Right, KeyModifiers::NONE),
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
         ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
             value: Some(true),
         }),
@@ -363,7 +394,7 @@ fn an_edit_the_server_refuses_says_so_and_leaves_the_row_where_it_was() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
-    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE);
 
     application
         .handle_event(ApplicationEvent::SettingMutationFailed(
@@ -398,8 +429,7 @@ fn an_edit_command_invoked_while_the_panel_is_closed_touches_no_setting() {
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
 
     for command in [
-        SemanticCommandId::SettingsValueNext,
-        SemanticCommandId::SettingsValuePrevious,
+        SemanticCommandId::SettingsValueCycle,
         SemanticCommandId::SettingsReset,
     ] {
         assert_eq!(
@@ -420,11 +450,13 @@ fn the_open_panel_takes_the_keys_the_composer_would_otherwise_get() {
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
 
-    type_terminal_text(&mut application, "not a Prompt");
+    // Space-free, because Space is the panel's own change key rather than a
+    // character the composer would have taken.
+    type_terminal_text(&mut application, "not-a-Prompt");
     assert!(
         !rendered_application_rows(&application)
             .join("\n")
-            .contains("not a Prompt"),
+            .contains("not-a-Prompt"),
         "typing over an open panel never reaches the composer"
     );
 

@@ -100,19 +100,15 @@ impl SettingsPanel {
             .collect()
     }
 
-    /// Moves the focused Setting `distance` choices along from the value in
-    /// force and pins where it lands. The step is measured against the
-    /// snapshot rather than anything staged, because a Setting is not a
-    /// transaction: each press is a whole edit that the server answers with
-    /// the snapshot the next press steps from.
-    pub(super) fn cycle(
-        &mut self,
-        settings: &EffectiveSettings,
-        distance: isize,
-    ) -> Option<SettingMutation> {
+    /// Moves the focused Setting one choice on from the value in force,
+    /// wrapping past the last, and pins where it lands. The step is measured
+    /// against the snapshot rather than anything staged, because a Setting is
+    /// not a transaction: each press is a whole edit that the server answers
+    /// with the snapshot the next press steps from.
+    pub(super) fn cycle(&mut self, settings: &EffectiveSettings) -> Option<SettingMutation> {
         self.error = None;
         let descriptor = self.selected_descriptor()?;
-        Some(descriptor.choice_after(settings, distance)?.pin)
+        Some(descriptor.next_choice(settings)?.pin)
     }
 
     /// Takes the focused Setting's pin out of the Config Document. The reset

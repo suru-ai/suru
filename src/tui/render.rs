@@ -394,7 +394,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
     }
     if footer_rows > 0 && lines.len() < content_height {
         lines.push(Line::styled(
-            truncate_to_width("Enter cycle · Ctrl+D reset · Esc close", content_width),
+            truncate_to_width("Space cycle · Ctrl+D reset · Esc close", content_width),
             theme.text.subdued,
         ));
     }

@@ -112,20 +112,13 @@ impl SettingDescriptor {
             .map(|index| &self.choices[index])
     }
 
-    /// The choice `distance` steps along from the one in force, wrapping past
-    /// either end, which is how a reader cycles a Setting through its values.
-    /// A value the schema does not name has no neighbours, so the first choice
-    /// is where the step lands instead.
-    pub fn choice_after(
-        &self,
-        settings: &EffectiveSettings,
-        distance: isize,
-    ) -> Option<&'static SettingChoice> {
-        let count = isize::try_from(self.choices.len())
-            .ok()
-            .filter(|c| *c > 0)?;
+    /// The choice one step on from the one in force, wrapping past the last,
+    /// which is how a reader cycles a Setting through its values. A value the
+    /// schema does not name has no neighbours, so the first choice is where
+    /// the step lands instead.
+    pub fn next_choice(&self, settings: &EffectiveSettings) -> Option<&'static SettingChoice> {
         let index = match self.effective_index(settings) {
-            Some(current) => (current as isize + distance).rem_euclid(count) as usize,
+            Some(current) => (current + 1) % self.choices.len(),
             None => 0,
         };
         self.choices.get(index)
@@ -869,13 +862,13 @@ mod tests {
     }
 
     #[test]
-    fn cycling_a_setting_walks_its_choices_in_order_and_wraps_at_both_ends() {
+    fn cycling_a_setting_walks_its_choices_in_order_and_wraps_past_the_last() {
         for descriptor in SCHEMA {
             let mut settings = EffectiveSettings::default();
             let mut walked = Vec::new();
             for _ in 0..descriptor.choices.len() {
                 let next = descriptor
-                    .choice_after(&settings, 1)
+                    .next_choice(&settings)
                     .expect("a Setting always offers somewhere to step");
                 assert!(
                     (descriptor.apply)(&mut settings, &pinned_value(&next.pin)),
