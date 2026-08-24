@@ -35,7 +35,7 @@
 //! the focus, because every edit runs through the focused Setting and pointing
 //! at a row is not asking for one.
 
-use std::{cell::RefCell, ops::Range};
+use std::{borrow::Cow, cell::RefCell, ops::Range};
 
 use crate::{
     protocol::{
@@ -54,8 +54,9 @@ use super::ModelListRequest;
 /// ends the read, because a row may not wait for an answer already given.
 const UNANSWERED_PROVIDER: &str = "the Model catalog answered for no such Provider";
 
-/// Stands in for a value the effective settings hold but the schema does not
-/// name, so a row says what it knows rather than claiming a wrong value.
+/// Stands in for a value the effective settings hold but the Setting can
+/// neither name nor spell, so a row says what it knows rather than claiming a
+/// wrong value.
 const UNNAMED_VALUE: &str = "unknown";
 
 /// One tab of the panel, which is one group of Settings under the name the
@@ -223,7 +224,7 @@ impl PanelLayout {
 
 /// One row as the panel presents it: what it is called, what it is worth, and
 /// whether that value is the reader's own choice or the built-in default.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct SettingRow {
     pub(super) label: &'static str,
     pub(super) value: RowValue,
@@ -302,10 +303,12 @@ impl RowExpansion {
 
 /// What a row says it is worth, which reads differently for a Setting the
 /// reader cycles through values and for a Provider whose row is its Enablement.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum RowValue {
-    /// The Setting's value, spelled as a Config Document spells it.
-    Choice(&'static str),
+    /// The Setting's value, spelled the way the Setting itself spells it —
+    /// borrowed for one of the values the schema names, owned for a value an
+    /// Open Setting had to spell for itself.
+    Choice(Cow<'static, str>),
     /// A Provider the reader has left on. The quiet state is the good one, so
     /// the row says nothing beyond the Provider's name.
     ProviderEnabled,
@@ -545,15 +548,15 @@ impl SettingsPanel {
                     // entirely alone, so its row reports that choice and never
                     // a condition nothing looked for.
                     Some(_) => (RowValue::ProviderDisabled, RowAvailability::Quiet),
-                    // A Setting holding a value the schema does not name is a
+                    // A Setting that can put no words to what it holds is a
                     // schema that fell behind its own types, not a reason to
                     // refuse the reader the rest of the panel.
                     None => (
                         RowValue::Choice(
                             entry
                                 .descriptor
-                                .effective(settings)
-                                .map_or(UNNAMED_VALUE, |choice| choice.value),
+                                .spelling(settings)
+                                .unwrap_or(Cow::Borrowed(UNNAMED_VALUE)),
                         ),
                         RowAvailability::Quiet,
                     ),

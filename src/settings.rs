@@ -16,6 +16,7 @@
 //! it — the source of truth for what every client is told.
 
 use std::{
+    borrow::Cow,
     ffi::OsStr,
     fmt, fs,
     path::{Path, PathBuf},
@@ -76,14 +77,53 @@ pub struct SettingDescriptor {
     /// Which tab of the settings panel presents this Setting.
     pub group: SettingGroup,
     pub scope: SettingScope,
-    /// Every value the Setting can hold, in the order a reader cycles them.
-    pub choices: &'static [SettingChoice],
+    /// What the Setting accepts, and whether the schema can name all of it.
+    pub values: SettingValues,
     /// The mutation that takes this Setting's pin out of the Config Document,
     /// so the built-in default resumes.
     pub reset: SettingMutation,
     /// Writes a pinned JSON value into the typed field it governs, or reports
     /// that the value is not one of the accepted ones.
     apply: fn(&mut EffectiveSettings, &Value) -> bool,
+}
+
+/// What a Setting accepts. Almost every Setting is Fixed: a set of compile-time
+/// choices, which is what lets a client cycle one through its values and what
+/// lets a diagnostic tell a reader exactly what to type. A Setting whose values
+/// are not all known until Suru is running — one holding an Agent Selection
+/// discovered from a Provider, say — cannot be written down that way, so an
+/// Open one names the values the schema can and describes the rest.
+pub enum SettingValues {
+    /// The whole of what the Setting accepts, in the order a reader cycles
+    /// them.
+    Fixed(&'static [SettingChoice]),
+    /// A Setting the schema can only partly enumerate.
+    Open {
+        /// The values the schema does name, in the order a reader cycles them.
+        named: &'static [SettingChoice],
+        /// What the values it does not name are, phrased to stand as the last
+        /// item of a diagnostic's list of accepted values — "an Agent
+        /// Selection". A reader cannot be told what to type here, so they are
+        /// told what kind of thing belongs instead.
+        accepts: &'static str,
+        /// How the value in force reads when it is none of the named ones, so
+        /// a surface presenting the Setting draws what it holds rather than a
+        /// confession that it cannot say. Total, because the Setting can spell
+        /// anything its own typed field is able to hold.
+        spell: fn(&EffectiveSettings) -> String,
+    },
+}
+
+impl SettingValues {
+    /// The values the schema names, which is everything a Fixed Setting accepts
+    /// and only part of what an Open one does. This is the list a client cycles
+    /// and the list a diagnostic spells out.
+    pub fn named(&self) -> &'static [SettingChoice] {
+        match *self {
+            Self::Fixed(choices) => choices,
+            Self::Open { named, .. } => named,
+        }
+    }
 }
 
 /// One value a Setting can hold, and the pin that puts it in force.
@@ -119,42 +159,67 @@ impl SettingChoice {
 }
 
 impl SettingDescriptor {
-    /// The choice the effective settings hold for this Setting, or `None` when
-    /// they hold a value the schema does not name — which is what a Setting
-    /// that grew a value without growing a choice for it would read as. A
-    /// client shows that honestly rather than dying on the draw.
+    /// The named choice the effective settings hold for this Setting, or `None`
+    /// when they hold a value the schema does not name — which is what an Open
+    /// Setting reads as whenever it is holding one of the values only its own
+    /// declaration could describe, and what a Fixed Setting that grew a value
+    /// without growing a choice for it would read as. Either way a client shows
+    /// it honestly rather than dying on the draw.
     pub fn effective(&self, settings: &EffectiveSettings) -> Option<&'static SettingChoice> {
         self.effective_index(settings)
-            .map(|index| &self.choices[index])
+            .map(|index| &self.values.named()[index])
     }
 
-    /// The choice one step on from the one in force, wrapping past the last,
-    /// which is how a reader cycles a Setting through its values. A value the
-    /// schema does not name has no neighbours, so the first choice is where
+    /// What the value in force reads as, which is what a surface presenting the
+    /// Setting draws: the named choice it is on, or an Open Setting's own
+    /// spelling of a value the schema never named. `None` is a Fixed Setting
+    /// holding a value outside its choices — a schema that fell behind its own
+    /// types, which a client says rather than guesses at.
+    pub fn spelling(&self, settings: &EffectiveSettings) -> Option<Cow<'static, str>> {
+        if let Some(choice) = self.effective(settings) {
+            return Some(Cow::Borrowed(choice.value));
+        }
+        match self.values {
+            SettingValues::Fixed(_) => None,
+            SettingValues::Open { spell, .. } => Some(Cow::Owned(spell(settings))),
+        }
+    }
+
+    /// The named choice one step on from the one in force, wrapping past the
+    /// last, which is how a reader cycles a Setting through its values. A value
+    /// the schema does not name has no neighbours, so the first choice is where
     /// the step lands instead.
     pub fn next_choice(&self, settings: &EffectiveSettings) -> Option<&'static SettingChoice> {
+        let named = self.values.named();
         let index = match self.effective_index(settings) {
-            Some(current) => (current + 1) % self.choices.len(),
+            Some(current) => (current + 1) % named.len(),
             None => 0,
         };
-        self.choices.get(index)
+        named.get(index)
     }
 
     fn effective_index(&self, settings: &EffectiveSettings) -> Option<usize> {
-        self.choices
+        self.values
+            .named()
             .iter()
             .position(|choice| pins_effective_value(&choice.pin, settings))
     }
 
     /// The accepted values, phrased for a diagnostic's "why" clause. Read off
-    /// the choices themselves, so a Setting that grows a value cannot leave a
-    /// diagnostic still naming the old set.
+    /// the Setting's own values, so one that grows a value cannot leave a
+    /// diagnostic still naming the old set. An Open Setting's description of
+    /// what else it takes stands as the last item, which is the only truthful
+    /// thing to say where there is no word to tell the reader to type.
     fn expected(&self) -> String {
-        let values = self
-            .choices
+        let mut values = self
+            .values
+            .named()
             .iter()
             .map(SettingChoice::spelled)
             .collect::<Vec<_>>();
+        if let SettingValues::Open { accepts, .. } = self.values {
+            values.push(accepts.to_owned());
+        }
         match values.split_last() {
             None => "a value this Setting accepts".to_owned(),
             Some((last, [])) => last.clone(),
@@ -201,7 +266,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "How a Session view opens: folded to its markers, or expanded in full",
         group: SettingGroup::General,
         scope: SettingScope::Client,
-        choices: &[
+        values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "folded",
                 pin: SettingMutation::TranscriptDefaultFoldPosture {
@@ -214,7 +279,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
                     value: Some(FoldPosture::Expanded),
                 },
             },
-        ],
+        ]),
         reset: SettingMutation::TranscriptDefaultFoldPosture { value: None },
         apply: |settings, value| {
             apply_value(value, |posture| {
@@ -228,7 +293,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether a Transcript hides Reasoning or draws it",
         group: SettingGroup::General,
         scope: SettingScope::Client,
-        choices: &[
+        values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "hidden",
                 pin: SettingMutation::TranscriptReasoningVisibility {
@@ -241,7 +306,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
                     value: Some(ReasoningVisibility::Shown),
                 },
             },
-        ],
+        ]),
         reset: SettingMutation::TranscriptReasoningVisibility { value: None },
         apply: |settings, value| {
             apply_value(value, |visibility| {
@@ -259,7 +324,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether Suru offers Codex, or leaves it entirely alone",
         group: SettingGroup::Providers,
         scope: SettingScope::Server,
-        choices: &[
+        values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "true",
                 pin: SettingMutation::ProviderCodexEnabled { value: Some(true) },
@@ -268,7 +333,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
                 value: "false",
                 pin: SettingMutation::ProviderCodexEnabled { value: Some(false) },
             },
-        ],
+        ]),
         reset: SettingMutation::ProviderCodexEnabled { value: None },
         apply: |settings, value| {
             apply_value(value, |enabled| {
@@ -284,7 +349,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "How much Reasoning summary detail each Turn asks Codex for",
         group: SettingGroup::Providers,
         scope: SettingScope::Server,
-        choices: &[
+        values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "auto",
                 pin: SettingMutation::ProviderCodexReasoningSummary {
@@ -309,7 +374,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
                     value: Some(ReasoningSummaryDetail::None),
                 },
             },
-        ],
+        ]),
         reset: SettingMutation::ProviderCodexReasoningSummary { value: None },
         apply: |settings, value| {
             apply_value(value, |detail| {
@@ -323,7 +388,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether Suru offers Copilot, or leaves it entirely alone",
         group: SettingGroup::Providers,
         scope: SettingScope::Server,
-        choices: &[
+        values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "true",
                 pin: SettingMutation::ProviderCopilotEnabled { value: Some(true) },
@@ -332,7 +397,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
                 value: "false",
                 pin: SettingMutation::ProviderCopilotEnabled { value: Some(false) },
             },
-        ],
+        ]),
         reset: SettingMutation::ProviderCopilotEnabled { value: None },
         apply: |settings, value| {
             apply_value(value, |enabled| {
@@ -346,7 +411,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether Suru offers Claude, or leaves it entirely alone",
         group: SettingGroup::Providers,
         scope: SettingScope::Server,
-        choices: &[
+        values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "true",
                 pin: SettingMutation::ProviderClaudeEnabled { value: Some(true) },
@@ -355,7 +420,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
                 value: "false",
                 pin: SettingMutation::ProviderClaudeEnabled { value: Some(false) },
             },
-        ],
+        ]),
         reset: SettingMutation::ProviderClaudeEnabled { value: None },
         apply: |settings, value| {
             apply_value(value, |enabled| {
@@ -854,10 +919,68 @@ fn apply_key(
 mod tests {
     use super::*;
 
+    use crate::protocol::TranscriptSettings;
+
     /// The JSON a pin writes into the Config Document, which is what the
     /// loader will read back and what a client shows.
     fn pinned_value(mutation: &SettingMutation) -> Value {
         serde_json::to_value(mutation).expect("Setting mutations always serialize")["value"].clone()
+    }
+
+    /// One Setting written twice, once in each shape, so that a guard reading
+    /// both is reading the same Setting and never two that differ in some
+    /// second way. It borrows the Fold posture Setting's key, typed field, and
+    /// pins, so each stand-in pins, applies, and resets exactly as the shipped
+    /// Setting does; only what it says it accepts differs.
+    const fn posture_stand_in(values: SettingValues) -> SettingDescriptor {
+        SettingDescriptor {
+            key: TRANSCRIPT_DEFAULT_FOLD_POSTURE,
+            label: "Default Fold posture",
+            description: "How a Session view opens",
+            group: SettingGroup::General,
+            scope: SettingScope::Client,
+            values,
+            reset: SettingMutation::TranscriptDefaultFoldPosture { value: None },
+            apply: |settings, value| {
+                apply_value(value, |posture| {
+                    settings.transcript.default_fold_posture = posture;
+                })
+            },
+        }
+    }
+
+    /// The one posture both stand-ins name, leaving the other a value one of
+    /// them must describe and the other cannot express at all.
+    const FOLDED: &[SettingChoice] = &[SettingChoice {
+        value: "folded",
+        pin: SettingMutation::TranscriptDefaultFoldPosture {
+            value: Some(FoldPosture::Folded),
+        },
+    }];
+
+    /// A Setting shaped the way a fixed choice list cannot express one: part of
+    /// what it holds the schema can name, and the rest it can only describe. No
+    /// shipped Setting is open yet — the first is the one this shape was added
+    /// for — so the guards below run over this stand-in as well, and cover the
+    /// shape rather than only the Settings that happen to ship today.
+    static OPEN_STAND_IN: SettingDescriptor = posture_stand_in(SettingValues::Open {
+        named: FOLDED,
+        accepts: "a posture Suru worked out for itself",
+        spell: |settings| match settings.transcript.default_fold_posture {
+            FoldPosture::Folded => "folded".to_owned(),
+            FoldPosture::Expanded => "expanded".to_owned(),
+        },
+    });
+
+    /// The same Setting written the only way the schema could write one before
+    /// an Open Setting was possible: its choices are the whole of what it
+    /// accepts, so a value outside them is one it can neither name nor spell.
+    static FIXED_STAND_IN: SettingDescriptor = posture_stand_in(SettingValues::Fixed(FOLDED));
+
+    /// Every Setting the generic guards run over: the schema itself, and the
+    /// stand-in for the shape no shipped Setting has yet.
+    fn every_setting() -> impl Iterator<Item = &'static SettingDescriptor> {
+        SCHEMA.iter().chain(std::iter::once(&OPEN_STAND_IN))
     }
 
     /// A choice is shown as the Config Document spells it, with JSON's own
@@ -865,8 +988,8 @@ mod tests {
     /// value — a boolean above all — is its literal spelling.
     #[test]
     fn every_choice_is_spelled_the_way_the_config_document_spells_it() {
-        for descriptor in SCHEMA {
-            for choice in descriptor.choices {
+        for descriptor in every_setting() {
+            for choice in descriptor.values.named() {
                 let spelled = match pinned_value(&choice.pin) {
                     Value::String(text) => text,
                     other => other.to_string(),
@@ -882,8 +1005,8 @@ mod tests {
 
     #[test]
     fn every_choice_a_setting_offers_becomes_the_effective_value_it_names() {
-        for descriptor in SCHEMA {
-            for choice in descriptor.choices {
+        for descriptor in every_setting() {
+            for choice in descriptor.values.named() {
                 let mut settings = EffectiveSettings::default();
                 assert!(
                     (descriptor.apply)(&mut settings, &pinned_value(&choice.pin)),
@@ -901,13 +1024,16 @@ mod tests {
         }
     }
 
+    /// A built-in default is a value the Setting can say out loud: a named
+    /// choice for a Fixed Setting, which has nothing else to hold, and either
+    /// that or a spelling of its own for an Open one.
     #[test]
-    fn every_setting_reads_a_choice_for_its_built_in_default() {
+    fn every_setting_reads_a_value_for_its_built_in_default() {
         let defaults = EffectiveSettings::default();
-        for descriptor in SCHEMA {
+        for descriptor in every_setting() {
             assert!(
-                descriptor.effective(&defaults).is_some(),
-                "{} defaults to a value it does not offer",
+                descriptor.spelling(&defaults).is_some(),
+                "{} defaults to a value it can neither name nor spell",
                 descriptor.key
             );
         }
@@ -915,10 +1041,10 @@ mod tests {
 
     #[test]
     fn cycling_a_setting_walks_its_choices_in_order_and_wraps_past_the_last() {
-        for descriptor in SCHEMA {
+        for descriptor in every_setting() {
             let mut settings = EffectiveSettings::default();
             let mut walked = Vec::new();
-            for _ in 0..descriptor.choices.len() {
+            for _ in 0..descriptor.values.named().len() {
                 let next = descriptor
                     .next_choice(&settings)
                     .expect("a Setting always offers somewhere to step");
@@ -930,7 +1056,8 @@ mod tests {
                 walked.push(next.value);
             }
             let offered = descriptor
-                .choices
+                .values
+                .named()
                 .iter()
                 .map(|choice| choice.value)
                 .collect::<Vec<_>>();
@@ -951,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_value_is_diagnosed_with_the_choices_the_setting_offers() {
+    fn a_rejected_value_is_diagnosed_with_the_values_the_setting_accepts() {
         let expected = SCHEMA
             .iter()
             .map(SettingDescriptor::expected)
@@ -969,6 +1096,68 @@ mod tests {
                 "one of true or false".to_owned(),
             ]
         );
+    }
+
+    /// A Setting the schema cannot enumerate has no word to tell the reader to
+    /// type for part of what it accepts, so the diagnostic names what kind of
+    /// thing belongs there instead — beside every value it can still spell out.
+    #[test]
+    fn a_setting_the_schema_cannot_enumerate_is_diagnosed_with_what_it_accepts() {
+        assert_eq!(
+            OPEN_STAND_IN.expected(),
+            "one of \"folded\" or a posture Suru worked out for itself"
+        );
+    }
+
+    /// The reading a surface draws a Setting by: a named choice while it is on
+    /// one, and the Setting's own words for a value the schema never named.
+    #[test]
+    fn an_open_setting_spells_the_value_it_holds_even_where_it_names_none() {
+        let mut settings = EffectiveSettings::default();
+        assert_eq!(OPEN_STAND_IN.spelling(&settings).as_deref(), Some("folded"));
+
+        settings.transcript.default_fold_posture = FoldPosture::Expanded;
+        assert_eq!(
+            OPEN_STAND_IN
+                .effective(&settings)
+                .map(|choice| choice.value),
+            None,
+            "a value the Setting names no choice for is on no choice"
+        );
+        assert_eq!(
+            OPEN_STAND_IN.spelling(&settings).as_deref(),
+            Some("expanded"),
+            "and the Setting spells it for whatever is drawing it"
+        );
+        assert_eq!(
+            OPEN_STAND_IN
+                .next_choice(&settings)
+                .map(|choice| choice.value),
+            Some("folded"),
+            "cycling off a value with no neighbours lands on the first named one"
+        );
+    }
+
+    /// A Fixed Setting's choices are the whole of what it accepts, so a value
+    /// outside them is a schema that fell behind its own types. It reads as
+    /// nothing at all rather than as a value the Setting made up, which is what
+    /// leaves a client free to say so.
+    #[test]
+    fn a_fixed_setting_spells_nothing_for_a_value_it_does_not_name() {
+        let settings = EffectiveSettings {
+            transcript: TranscriptSettings {
+                default_fold_posture: FoldPosture::Expanded,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            FIXED_STAND_IN
+                .effective(&settings)
+                .map(|choice| choice.value),
+            None
+        );
+        assert_eq!(FIXED_STAND_IN.spelling(&settings), None);
     }
 
     /// Half of the guard that a Provider cannot ship without a working
@@ -1011,7 +1200,7 @@ mod tests {
 
     #[test]
     fn resetting_a_setting_unpins_the_key_that_setting_owns() {
-        for descriptor in SCHEMA {
+        for descriptor in every_setting() {
             let (key, value) = pin_for(&descriptor.reset);
             assert_eq!(key, descriptor.key);
             assert_eq!(value, None, "a reset never writes a value");

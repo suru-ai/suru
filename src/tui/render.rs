@@ -472,7 +472,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
         // A Provider Suru has been told to leave alone is the one row that
         // reads as its own condition rather than as a value; an enabled
         // Provider claims nothing, because the quiet state is the good one.
-        let value = match row.value {
+        let value = match &row.value {
             RowValue::Choice(value) => format!(" · {value}"),
             RowValue::ProviderEnabled => String::new(),
             RowValue::ProviderDisabled => " · disabled".to_owned(),
@@ -496,7 +496,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
                 ),
                 content_width,
             ),
-            match (row.selected, row.value) {
+            match (row.selected, &row.value) {
                 (true, _) => theme.selection.focused,
                 (false, RowValue::ProviderDisabled) => theme.text.subdued,
                 (false, _) => theme.text.primary,
