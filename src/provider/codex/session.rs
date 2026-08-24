@@ -38,8 +38,9 @@ use crate::{
         ReasoningSummaryDetail,
     },
     provider::{
-        ProviderError, ProviderFuture, ProviderResumeState, ProviderRuntime, ProviderSession,
-        ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
+        ProviderErrand, ProviderError, ProviderFuture, ProviderResumeState, ProviderRuntime,
+        ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
+        ProviderTurnInput,
         harness::{ProcessGuard, ProcessRegistry},
         resolve_executable,
     },
@@ -155,20 +156,16 @@ impl ProviderRuntime for CodexRuntime {
         Box::pin(async move { start_codex_session(executable, request, processes, context).await })
     }
 
-    // Codex fulfils Errands through its own native one-shot mode, which is its
-    // own piece of work; until that lands it declares that it runs none.
-    fn run_errand(
-        &self,
-        _errand: crate::provider::ProviderErrand,
-    ) -> ProviderFuture<'_, serde_json::Value> {
-        crate::provider::errand_unimplemented(&self.provider_id())
+    /// Codex fulfils an Errand through `codex exec`, its own one-shot mode:
+    /// a separate, short-lived process from the app-server every Session is
+    /// driven over, which persists nothing and is never resumed.
+    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, serde_json::Value> {
+        let executable = self.executable.clone();
+        Box::pin(async move { super::errand::run(executable, errand).await })
     }
 
-    // Which of Codex's Models is cheap, and at which effort, is settled
-    // alongside the one-shot mode above; until then its Errands run at whatever
-    // Model Codex already defaults to.
     fn errand_selection(&self) -> Option<AgentSelection> {
-        None
+        Some(super::errand::declared_errand_selection())
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {

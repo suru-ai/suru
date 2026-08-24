@@ -3,6 +3,7 @@
 use crate::scripted_binary_support::{captured_methods, captured_requests, write_executable};
 use serde_json::Value;
 use suru::managed_client::{ManagedClient, ManagedEvent};
+use sysinfo::{Pid, System};
 use tokio::time::{Duration, timeout};
 
 const MULTIPROCESS_SCRIPT_PREFIX: &str = r#"#!/bin/sh
@@ -17,6 +18,21 @@ while IFS= read -r line; do
   case "$line" in
 "#;
 
+/// What a scripted Codex with nothing to say about Errands does when Suru
+/// invokes it as `codex exec`: refuse before reading a byte, so the Prompt an
+/// Errand delivers never reaches the app-server request log the rest of these
+/// fixtures are read through. A Provider that will not run an Errand leaves the
+/// Prompt-derived Title standing, which is exactly what those tests expect.
+const ONE_SHOT_REFUSAL: &str = r#"if [ "$1" = "exec" ]; then
+  printf '%s\n' 'this scripted Codex runs no Errands' >&2
+  exit 1
+fi
+"#;
+
+/// The shebang every scripted Codex opens with, and so the line the refusal
+/// above is spliced in behind.
+const SHEBANG: &str = "#!/bin/sh\n";
+
 pub async fn receive_initial_state(client: &mut ManagedClient) {
     assert!(matches!(
         timeout(Duration::from_secs(1), client.next()).await,
@@ -28,6 +44,29 @@ pub async fn receive_initial_state(client: &mut ManagedClient) {
     ));
 }
 
+/// Waits for the process `pid` names to be gone, and fails if it outlives the
+/// deadline. Used wherever Suru claims to have taken a Codex process down —
+/// server shutdown, and a wait abandoned at an Errand's deadline.
+pub async fn assert_process_exited(pid: u32) {
+    if timeout(Duration::from_secs(1), async {
+        loop {
+            if System::new_all().process(Pid::from_u32(pid)).is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let system = System::new_all();
+        if let Some(process) = system.process(Pid::from_u32(pid)) {
+            let _ = process.kill();
+        }
+        panic!("scripted Codex process {pid} outlived the wait Suru gave it");
+    }
+}
+
 pub struct ScriptedCodex {
     _directory: tempfile::TempDir,
     executable: std::path::PathBuf,
@@ -37,6 +76,10 @@ pub struct ScriptedCodex {
     pub exited: std::path::PathBuf,
     ready: std::path::PathBuf,
     child_pid: std::path::PathBuf,
+    /// The stem every file a one-shot Errand run records is named from, so one
+    /// substituted placeholder covers what Codex was invoked with, what it was
+    /// asked, and where it was asked it.
+    errand: std::path::PathBuf,
 }
 
 impl ScriptedCodex {
@@ -46,7 +89,16 @@ impl ScriptedCodex {
         ))
     }
 
+    /// A scripted Codex that answers over the app-server and runs no Errands.
     pub fn new(script: &str) -> Self {
+        let body = script
+            .strip_prefix(SHEBANG)
+            .expect("a scripted Codex opens with a shebang");
+        Self::new_running_errands(&format!("{SHEBANG}{ONE_SHOT_REFUSAL}{body}"))
+    }
+
+    /// A scripted Codex whose script answers a one-shot `codex exec` run itself.
+    pub fn new_running_errands(script: &str) -> Self {
         let directory = tempfile::tempdir().expect("create scripted Codex directory");
         let executable = directory.path().join("codex");
         let log = directory.path().join("requests.jsonl");
@@ -56,6 +108,7 @@ impl ScriptedCodex {
         let ready = directory.path().join("ready");
         let child_pid = directory.path().join("child-pid");
         let attempts = directory.path().join("attempts");
+        let errand = directory.path().join("errand");
         let script = script
             .replace(
                 "$CODEX_FIXTURE_LOG",
@@ -84,6 +137,10 @@ impl ScriptedCodex {
             .replace(
                 "$CODEX_FIXTURE_ATTEMPTS",
                 attempts.to_str().expect("fixture attempts path is UTF-8"),
+            )
+            .replace(
+                "$CODEX_FIXTURE_ERRAND",
+                errand.to_str().expect("fixture Errand path is UTF-8"),
             );
         write_executable(&executable, &script);
         Self {
@@ -95,6 +152,7 @@ impl ScriptedCodex {
             exited,
             ready,
             child_pid,
+            errand,
         }
     }
 
@@ -178,6 +236,65 @@ impl ScriptedCodex {
             .trim()
             .parse()
             .expect("scripted Codex child PID is numeric")
+    }
+
+    /// Waits until a one-shot Errand run has recorded everything about itself,
+    /// so a test may read all of it back without racing the fixture's writes.
+    pub async fn wait_for_errand(&self) {
+        timeout(Duration::from_secs(2), async {
+            while !self.errand_file("recorded").exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scripted Codex is asked to run an Errand");
+    }
+
+    /// What Codex was invoked with for its one-shot Errand run, one argument
+    /// per element and in the order they were passed.
+    pub fn errand_arguments(&self) -> Vec<String> {
+        std::fs::read_to_string(self.errand_file("arguments"))
+            .expect("read the Errand's arguments")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The Prompt the one-shot Errand run was handed on its stdin.
+    pub fn errand_prompt(&self) -> String {
+        std::fs::read_to_string(self.errand_file("prompt")).expect("read the Errand's Prompt")
+    }
+
+    /// The output schema the one-shot Errand run was handed, as the file Codex
+    /// was pointed at held it.
+    pub fn errand_schema(&self) -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(self.errand_file("schema"))
+                .expect("read the Errand's output schema"),
+        )
+        .expect("decode the Errand's output schema")
+    }
+
+    /// The process the one-shot Errand run was carried out by.
+    pub fn errand_pid(&self) -> u32 {
+        std::fs::read_to_string(self.errand_file("pid"))
+            .expect("read the Errand's PID")
+            .trim()
+            .parse()
+            .expect("the Errand's PID is numeric")
+    }
+
+    /// The directory the one-shot Errand run was started in.
+    pub fn errand_cwd(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            std::fs::read_to_string(self.errand_file("cwd"))
+                .expect("read the Errand's working directory")
+                .trim(),
+        )
+    }
+
+    fn errand_file(&self, name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}-{name}", self.errand.display()))
     }
 
     pub fn requests(&self) -> Vec<Value> {

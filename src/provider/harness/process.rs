@@ -235,12 +235,9 @@ pub(crate) struct ProcessStdio {
     pub(crate) stdout: ChildStdout,
 }
 
-/// Launches the harness server `spec` names in its own process tree, forwarding its stderr to
-/// the Log.
-pub(crate) fn spawn_harness_process(
-    spec: &HarnessSpec,
-) -> Result<(SpawnedProcess, ProcessStdio), ProviderError> {
-    let name: Arc<str> = Arc::from(spec.name.as_str());
+/// The command `spec` names, with its stdio piped and its process bound to the lifetime of the
+/// handle Suru holds on it.
+fn harness_command(spec: &HarnessSpec) -> Command {
     let mut command = Command::new(&spec.executable);
     if let Some(cwd) = &spec.cwd {
         command.current_dir(cwd);
@@ -251,19 +248,33 @@ pub(crate) fn spawn_harness_process(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let (mut child, process_tree) = spawn_harness_child(&mut command).map_err(|error| {
-        let failure = ProviderError::new(format!(
-            "could not launch {name} `{}`: {error}",
-            spec.executable.to_string_lossy()
-        ));
-        // A harness executable that isn't there is the user's to install, not a
-        // fault of the run — every Provider launching a CLI reports it the same
-        // typed way, so a client can say so instead of quoting an OS error.
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return failure.mark_unavailable(ProviderUnavailability::NotInstalled);
-        }
-        failure
-    })?;
+    command
+}
+
+/// What a harness that could not be launched at all reports.
+fn launch_failure(name: &str, spec: &HarnessSpec, error: &std::io::Error) -> ProviderError {
+    let failure = ProviderError::new(format!(
+        "could not launch {name} `{}`: {error}",
+        spec.executable.to_string_lossy()
+    ));
+    // A harness executable that isn't there is the user's to install, not a
+    // fault of the run — every Provider launching a CLI reports it the same
+    // typed way, so a client can say so instead of quoting an OS error.
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return failure.mark_unavailable(ProviderUnavailability::NotInstalled);
+    }
+    failure
+}
+
+/// Launches the harness server `spec` names in its own process tree, forwarding its stderr to
+/// the Log.
+pub(crate) fn spawn_harness_process(
+    spec: &HarnessSpec,
+) -> Result<(SpawnedProcess, ProcessStdio), ProviderError> {
+    let name: Arc<str> = Arc::from(spec.name.as_str());
+    let mut command = harness_command(spec);
+    let (mut child, process_tree) =
+        spawn_harness_child(&mut command).map_err(|error| launch_failure(&name, spec, &error))?;
 
     let stdin = child
         .stdin
@@ -295,6 +306,83 @@ pub(crate) fn spawn_harness_process(
         },
         ProcessStdio { stdin, stdout },
     ))
+}
+
+/// What a harness Suru ran once and waited out left behind.
+pub(crate) struct HarnessRun {
+    pub(crate) status: std::process::ExitStatus,
+    pub(crate) stdout: String,
+    /// Everything the harness said on its stderr. Kept rather than forwarded to
+    /// the Log as [`spawn_harness_process`] does, because a one-shot run says
+    /// here — and only here — why it would not do what it was asked.
+    pub(crate) stderr: String,
+}
+
+/// Runs the harness `spec` names to completion, handing it `input` on its stdin and collecting
+/// everything it wrote.
+///
+/// This is the one-shot counterpart to [`spawn_harness_process`]: a harness invoked to answer
+/// once and exit — the mode a Provider fulfils an Errand through where its harness offers one
+/// (ADR 0011) — rather than a server Suru speaks a protocol to for as long as a Session lives.
+/// Nothing is registered with a [`ProcessRegistry`], because there is no Session to lose and
+/// nothing for a runtime shutdown to stop: whoever asked bounds the wait with its own deadline,
+/// and abandoning that wait takes the process tree down with it.
+pub(crate) async fn run_harness_to_completion(
+    spec: &HarnessSpec,
+    input: String,
+) -> Result<HarnessRun, ProviderError> {
+    let name = spec.name.as_str();
+    let mut command = harness_command(spec);
+    let (mut child, process_tree) =
+        spawn_harness_child(&mut command).map_err(|error| launch_failure(name, spec, &error))?;
+    let missing = |stream| ProviderError::new(format!("{name} {stream} was unavailable"));
+    let mut stdin = child.stdin.take().ok_or_else(|| missing("stdin"))?;
+    let mut stdout = child.stdout.take().ok_or_else(|| missing("stdout"))?;
+    let mut stderr = child.stderr.take().ok_or_else(|| missing("stderr"))?;
+    tracing::info!(pid = child.id(), harness = %name, "launched one-shot harness process");
+    let mut process = OneShotProcess {
+        child,
+        process_tree,
+    };
+
+    // Nothing here fails the run on its own. A harness that has already made up
+    // its mind stops reading, and one that says something Suru cannot read back
+    // as text has still said it in the only place that matters — the exit
+    // status, and whatever did arrive, are what the run is judged on.
+    let mut collected_stdout = String::new();
+    let mut collected_stderr = String::new();
+    let (_delivered, _read_out, _read_err, status) = tokio::join!(
+        async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(input.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        },
+        tokio::io::AsyncReadExt::read_to_string(&mut stdout, &mut collected_stdout),
+        tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut collected_stderr),
+        process.child.wait(),
+    );
+    let status = status
+        .map_err(|error| ProviderError::new(format!("could not wait for {name}: {error}")))?;
+
+    Ok(HarnessRun {
+        status,
+        stdout: collected_stdout,
+        stderr: collected_stderr,
+    })
+}
+
+/// A harness process running one-shot, held so that whatever ends the wait —
+/// the answer, a failure, or the caller abandoning it at a deadline — takes the
+/// whole process tree down rather than leaving it running unwatched.
+struct OneShotProcess {
+    child: Child,
+    process_tree: ProcessTree,
+}
+
+impl Drop for OneShotProcess {
+    fn drop(&mut self) {
+        let _ = self.process_tree.terminate(&mut self.child);
+    }
 }
 
 /// Registers `process` and hands it to a supervisor task.

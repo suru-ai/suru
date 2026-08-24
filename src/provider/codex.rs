@@ -7,6 +7,7 @@
 //! [`reasoning`](super::reasoning) splitter taking the title off a streamed Reasoning summary, and
 //! [`session`] composes them into the Provider runtime and Session the rest of Suru uses.
 
+mod errand;
 mod projection;
 mod session;
 mod transport;
@@ -18,6 +19,10 @@ use super::{ProviderError, concise_remote_message};
 
 /// What the Log and failures call the Codex harness server process.
 const CODEX_HARNESS_NAME: &str = "Codex app-server";
+
+/// What the Log and failures call the one-shot Codex run an Errand is, which is
+/// a different process in a different mode from the app-server above.
+const CODEX_ONE_SHOT_NAME: &str = "Codex exec";
 
 const REASONING_EFFORT_OPTION_ID: &str = "reasoning_effort";
 const SERVICE_TIER_OPTION_ID: &str = "service_tier";

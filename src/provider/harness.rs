@@ -14,7 +14,7 @@ mod process;
 mod shared;
 
 pub(crate) use process::{
-    HarnessLink, HarnessSpec, ProcessGuard, ProcessRegistry, ProcessStdio, spawn_harness_process,
-    supervise_harness_process,
+    HarnessLink, HarnessSpec, ProcessGuard, ProcessRegistry, ProcessStdio,
+    run_harness_to_completion, spawn_harness_process, supervise_harness_process,
 };
 pub(crate) use shared::{HarnessConnector, SharedHarness, SharedHarnessHandle};

@@ -2,7 +2,7 @@
 
 use crate::{
     server_support::request_server_shutdown,
-    support::{ScriptedCodex, receive_initial_state},
+    support::{ScriptedCodex, assert_process_exited, receive_initial_state},
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -15,7 +15,6 @@ use suru::{
     provider::CodexRuntime,
     server::{self, ServerConfig},
 };
-use sysinfo::{Pid, System};
 use tokio::time::{Duration, timeout};
 
 const COOPERATIVE_SHUTDOWN: &str = r#"#!/bin/sh
@@ -372,24 +371,4 @@ async fn wait_for_agent_output(client: &ManagedClient, session_id: SessionId) ->
     })
     .await
     .expect("scripted Codex Agent output reaches the Session")
-}
-
-async fn assert_process_exited(pid: u32) {
-    if timeout(Duration::from_secs(1), async {
-        loop {
-            if System::new_all().process(Pid::from_u32(pid)).is_none() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        let system = System::new_all();
-        if let Some(process) = system.process(Pid::from_u32(pid)) {
-            let _ = process.kill();
-        }
-        panic!("scripted Codex process {pid} survived server shutdown");
-    }
 }

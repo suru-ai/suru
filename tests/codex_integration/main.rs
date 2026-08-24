@@ -13,6 +13,7 @@ mod server_support;
 #[allow(dead_code)]
 mod scripted_binary_support;
 
+mod errands;
 mod errors;
 mod interruption;
 mod models;
