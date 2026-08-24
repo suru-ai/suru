@@ -808,8 +808,17 @@ fn session_picker_row_text(row: SessionPickerRow<'_>, width: usize, now: u64) ->
     };
     let separator = if compact { " " } else { " · " };
     let mut metadata = status.into_iter().chain([age]).collect::<Vec<_>>();
+    // The Emoji's own columns, and the space parting it from the Title, come
+    // out of what the Title has to spend. A Session with no Emoji holds no cell
+    // open in front of its Title and spends the lot.
+    let emoji = row
+        .emoji
+        .map(|emoji| format!("{emoji} "))
+        .unwrap_or_default();
     let marker_width = marker.width();
-    let available = width.saturating_sub(marker_width);
+    let available = width
+        .saturating_sub(marker_width)
+        .saturating_sub(emoji.width());
     let fixed_metadata_width = metadata.join(separator).width();
     if let Some(workspace) = row.workspace {
         let minimum_title_width = usize::from(available > 0);
@@ -830,7 +839,10 @@ fn session_picker_row_text(row: SessionPickerRow<'_>, width: usize, now: u64) ->
         .saturating_sub(metadata.width())
         .saturating_sub(separator.width());
     let title = truncate_to_width(row.title, title_width);
-    truncate_to_width(&format!("{marker}{title}{separator}{metadata}"), width)
+    truncate_to_width(
+        &format!("{marker}{emoji}{title}{separator}{metadata}"),
+        width,
+    )
 }
 
 fn truncate_from_left_to_width(value: &str, width: usize) -> String {

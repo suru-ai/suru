@@ -26,6 +26,11 @@ pub(super) struct SessionPicker {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SessionPickerRow<'a> {
     pub(super) title: &'a str,
+    /// The Emoji standing for this Session, carried beside the Title rather
+    /// than within it so the query never meets it. A Session whose derivation
+    /// was skipped, failed, or abandoned has none, and its row is drawn as
+    /// readily without one.
+    pub(super) emoji: Option<&'a str>,
     pub(super) selected: bool,
     pub(super) current: bool,
     pub(super) active: bool,
@@ -290,6 +295,7 @@ impl SessionPicker {
                 let readable = summary.readable();
                 SessionPickerRow {
                     title: summary.title(),
+                    emoji: summary.emoji(),
                     selected: self.selected == Some(summary.id()),
                     current: readable.is_some() && current == Some(summary.id()),
                     active: readable

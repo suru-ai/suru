@@ -2,8 +2,8 @@
 
 use crate::support::{
     connected_application, enter_active_session, failed_session_snapshot,
-    navigable_session_snapshot, rendered_application_rows, rendered_application_rows_at,
-    rendered_row, type_terminal_text,
+    navigable_session_snapshot, rendered_application_buffer, rendered_application_rows,
+    rendered_application_rows_at, rendered_row, text_position, type_terminal_text,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
@@ -11,7 +11,7 @@ use suru::{
     protocol::{
         ModelAvailability, PromptId, Session, SessionCatalogRevision, SessionCatalogSnapshot,
         SessionDeleted, SessionId, SessionListItem, SessionStatus, SessionSummary,
-        SessionTimestamp, UnreadableSessionSummary, Workspace,
+        SessionTimestamp, SessionTitleChanged, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SessionListRequest,
@@ -892,6 +892,246 @@ fn session_picker_consumes_input_before_hidden_composer_actions() {
     );
 }
 
+#[test]
+fn session_picker_draws_an_emoji_beside_its_title_and_leaves_a_session_without_one_where_it_was() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let derived_id = SessionId::new();
+    let underived_id = SessionId::new();
+    let mut mixed = Application::new(workspace.path());
+    open_session_picker_with(
+        &mut mixed,
+        vec![
+            emoji_session_summary(
+                derived_id,
+                workspace.path(),
+                "Reasoning group flicker fixed",
+                "🚀",
+                20,
+            ),
+            session_summary(
+                underived_id,
+                workspace.path(),
+                "look at this stack trace",
+                SessionStatus::Idle,
+                10,
+            ),
+        ],
+    );
+
+    let rows = rendered_application_rows(&mixed);
+    assert!(
+        rows.iter()
+            .find(|row| row.contains("Reasoning group flicker fixed"))
+            .expect("render the Session with an Emoji")
+            .contains('🚀'),
+        "a Session with an Emoji draws it on its Title's row"
+    );
+    assert!(
+        !rows
+            .iter()
+            .find(|row| row.contains("look at this stack trace"))
+            .expect("render the Session without an Emoji")
+            .contains('🚀'),
+        "an Emoji belongs to one Session's row and no other"
+    );
+    // Both rows begin at the same place: the box's own left edge, which the
+    // search line above them starts at, plus the two columns every row spends
+    // on its selection marker. An Emoji takes the front of the row it belongs
+    // to, and the row without one holds no cell open where an Emoji would have
+    // gone — it is drawn exactly as it was before Emoji existed.
+    let mixed_buffer = rendered_application_buffer(&mixed, 80, 15);
+    let first_column = text_position(&mixed_buffer, "Search:").0 + SESSION_ROW_MARKER_WIDTH;
+    assert_eq!(
+        text_position(&mixed_buffer, "🚀").0,
+        first_column,
+        "an Emoji draws at the front of its own row"
+    );
+    assert!(
+        text_position(&mixed_buffer, "Reasoning group flicker fixed").0 > first_column,
+        "the Title it stands for follows it"
+    );
+    assert_eq!(
+        text_position(&mixed_buffer, "look at this").0,
+        first_column,
+        "a Session without an Emoji draws where it always did"
+    );
+
+    // The Emoji costs its own columns and no more, so a Title still reads at
+    // the narrowest terminal the picker supports.
+    let narrow = rendered_application_rows_at(&mixed, 28, 8);
+    assert!(
+        narrow
+            .iter()
+            .find(|row| row.contains("Reasoning"))
+            .expect("render the Session with an Emoji on a narrow terminal")
+            .contains('🚀')
+    );
+    assert!(narrow.join("\n").contains("look at this"));
+}
+
+/// Every Session picker row spends its first two columns on the marker naming
+/// the selected row, so what a row draws of its own begins just past them.
+const SESSION_ROW_MARKER_WIDTH: u16 = 2;
+
+#[test]
+fn session_picker_search_matches_the_words_of_a_title_and_never_the_emoji_beside_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    open_session_picker_with(
+        &mut application,
+        vec![
+            emoji_session_summary(
+                SessionId::new(),
+                workspace.path(),
+                "Rocket telemetry parsed",
+                "🚀",
+                20,
+            ),
+            emoji_session_summary(
+                SessionId::new(),
+                workspace.path(),
+                "Ledger reconciliation",
+                "🧾",
+                10,
+            ),
+        ],
+    );
+
+    type_terminal_text(&mut application, "rocket");
+    let by_word = rendered_application_rows(&application).join("\n");
+    assert!(by_word.contains("Rocket telemetry parsed"));
+    assert!(!by_word.contains("Ledger reconciliation"));
+
+    for _ in 0.."rocket".len() {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+            )))
+            .expect("clear the Session picker search");
+    }
+    type_terminal_text(&mut application, "🚀");
+    let by_emoji = rendered_application_rows(&application).join("\n");
+    assert!(
+        by_emoji.contains("No Sessions found"),
+        "an Emoji is carried beside a Title and is never matched against"
+    );
+    assert!(!by_emoji.contains("Rocket telemetry parsed"));
+}
+
+#[test]
+fn an_emoji_arriving_while_the_picker_is_open_lands_on_its_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let derived_id = SessionId::new();
+    open_session_picker_with(
+        &mut application,
+        vec![
+            session_summary(
+                derived_id,
+                workspace.path(),
+                "the reasoning group keeps flickering when",
+                SessionStatus::Idle,
+                20,
+            ),
+            session_summary(
+                SessionId::new(),
+                workspace.path(),
+                "Untouched Session",
+                SessionStatus::Idle,
+                10,
+            ),
+        ],
+    );
+
+    application
+        .handle_event(ApplicationEvent::Managed(
+            ManagedEvent::SessionTitleChanged(SessionTitleChanged {
+                session_id: derived_id,
+                title: "Reasoning group flicker fixed".to_owned(),
+                emoji: Some("🧵".to_owned()),
+            }),
+        ))
+        .expect("apply a derived Title and Emoji");
+
+    let retitled = rendered_application_rows(&application);
+    let derived_row = retitled
+        .iter()
+        .find(|row| row.contains("Reasoning group flicker fixed"))
+        .expect("redraw the retitled Session's row");
+    assert!(
+        derived_row.contains('🧵'),
+        "an Emoji landing while the picker is open lands on its own row"
+    );
+    // In place: the row keeps the position and the focus it had, so a Title
+    // landing under a reader's eyes never moves what they were about to open.
+    assert!(derived_row.contains('›'));
+    assert!(
+        rendered_row(&retitled, "Reasoning group flicker fixed")
+            < rendered_row(&retitled, "Untouched Session")
+    );
+    assert!(
+        !retitled
+            .join("\n")
+            .contains("the reasoning group keeps flickering when")
+    );
+    assert!(
+        !retitled
+            .iter()
+            .find(|row| row.contains("Untouched Session"))
+            .expect("redraw the Session the derivation was not for")
+            .contains('🧵')
+    );
+}
+
+#[test]
+fn an_emoji_leaves_an_all_workspaces_row_room_for_its_workspace_path() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    open_session_picker_with(
+        &mut application,
+        vec![session_summary(
+            SessionId::new(),
+            workspace.path(),
+            "Current Workspace Session",
+            SessionStatus::Idle,
+            10,
+        )],
+    );
+    let all_workspaces = expect_session_list_request(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+            )))
+            .expect("toggle all Workspaces"),
+        SessionListScope::AllWorkspaces,
+    );
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request: all_workspaces,
+            sessions: vec![emoji_session_summary(
+                SessionId::new(),
+                std::path::Path::new("/ws-two"),
+                "Ledger reconciliation",
+                "🧾",
+                20,
+            )],
+        })
+        .expect("hydrate all-Workspace Sessions");
+
+    let row = rendered_application_rows(&application)
+        .into_iter()
+        .find(|row| row.contains("Ledger reconciliation"))
+        .expect("render an all-Workspaces row for a Session with an Emoji");
+    assert!(row.contains('🧾'));
+    assert!(
+        row.contains("/ws-two"),
+        "an Emoji takes its columns from the Title rather than from the path \
+         that tells one Workspace's Session from another's"
+    );
+}
+
 fn session_summary(
     session_id: SessionId,
     workspace: &std::path::Path,
@@ -914,6 +1154,30 @@ fn session_summary(
         created_at: SessionTimestamp(1),
         updated_at: SessionTimestamp(updated_at),
     })
+}
+
+/// A Session listing entry whose derivation already landed, so it carries an
+/// Emoji beside its Title.
+fn emoji_session_summary(
+    session_id: SessionId,
+    workspace: &std::path::Path,
+    title: &str,
+    emoji: &str,
+    updated_at: u64,
+) -> SessionListItem {
+    match session_summary(
+        session_id,
+        workspace,
+        title,
+        SessionStatus::Idle,
+        updated_at,
+    ) {
+        SessionListItem::Readable(summary) => SessionListItem::Readable(SessionSummary {
+            emoji: Some(emoji.to_owned()),
+            ..summary
+        }),
+        unreadable => unreadable,
+    }
 }
 
 fn open_session_picker_with(application: &mut Application, sessions: Vec<SessionListItem>) {
