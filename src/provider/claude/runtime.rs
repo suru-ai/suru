@@ -19,7 +19,7 @@ use super::{
     wire::{ControlRequest, NativeModelList},
 };
 use crate::{
-    protocol::{ModelDescriptor, ProviderId},
+    protocol::{AgentSelection, ModelDescriptor, ProviderId},
     provider::{
         ProviderError, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
         ProviderSessionRequest, harness::ProcessRegistry, resolve_executable,
@@ -138,6 +138,13 @@ impl ProviderRuntime for ClaudeRuntime {
         _errand: crate::provider::ProviderErrand,
     ) -> ProviderFuture<'_, serde_json::Value> {
         crate::provider::errand_unimplemented(&self.provider_id())
+    }
+
+    // Which of Claude's Models is cheap, and at which effort, is settled
+    // alongside the print mode above; until then its Errands run at whatever
+    // Model Claude already defaults to.
+    fn errand_selection(&self) -> Option<AgentSelection> {
+        None
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {

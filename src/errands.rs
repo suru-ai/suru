@@ -169,6 +169,12 @@ mod tests {
             Box::pin(std::future::pending())
         }
 
+        // These tests hand the runner a Selection outright, so nothing here
+        // resolves a declaration.
+        fn errand_selection(&self) -> Option<AgentSelection> {
+            None
+        }
+
         fn shutdown(&self) -> ProviderFuture<'_, ()> {
             Box::pin(async { Ok(()) })
         }

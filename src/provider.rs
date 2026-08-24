@@ -369,6 +369,28 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     /// how it runs Errands rather than silently running none.
     fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, Value>;
 
+    /// The Errand Selection this Provider declares: the Model its own Errands
+    /// run at, chosen for cheapness and speed rather than capability, and the
+    /// Model Options to run it under. Nothing, for a Provider that knows
+    /// nothing cheaper than the Model it already defaults to — whoever asks for
+    /// an Errand then falls back to that default.
+    ///
+    /// It is a whole Agent Selection rather than a Model identifier because
+    /// nothing in the Model Option types conveys magnitude: reasoning efforts
+    /// are relayed in the Provider's own publication order under the Provider's
+    /// own wire identifiers, so "the least effort" is not derivable and has to
+    /// be declared by the runtime that understands its own vocabulary. Matching
+    /// effort identifiers by convention instead would break silently the day a
+    /// Provider ships an effort named something new.
+    ///
+    /// This is a declaration and not a resolution: the Model it names may have
+    /// been withdrawn since, and whoever asks for an Errand resolves it against
+    /// the live catalog every time. It is deliberately separate from
+    /// [`ModelDescriptor::is_default`] — the Model a user should converse with
+    /// and the Model that should write six words are different questions. It is
+    /// not defaulted, so a new Provider has to answer the second one.
+    fn errand_selection(&self) -> Option<AgentSelection>;
+
     /// Stops in-progress Session startups and releases runtime-owned resources.
     fn shutdown(&self) -> ProviderFuture<'_, ()>;
 

@@ -6,7 +6,7 @@ use std::sync::{
 use futures_util::{StreamExt, stream};
 use serde_json::Value;
 use suru::protocol::{
-    AgentIdentity, AgentSelection, ModelDescriptor, ProviderId, ProviderUnavailability,
+    AgentIdentity, AgentSelection, ModelDescriptor, ModelId, ProviderId, ProviderUnavailability,
 };
 use suru::provider::{
     ProviderErrand, ProviderError, ProviderEvent, ProviderEventStream, ProviderFuture,
@@ -24,7 +24,15 @@ pub struct ControlledProvider {
 #[derive(Clone)]
 pub struct ControlledProviderRuntime {
     provider: ProviderId,
-    models: Vec<ModelDescriptor>,
+    /// The catalog this Provider serves. Shared so a test can withdraw a Model
+    /// the way a Provider dropping one from its own catalog does, which is the
+    /// only way an Errand Selection resolved against a live catalog can be seen
+    /// to be resolved afresh.
+    models: Arc<Mutex<Vec<ModelDescriptor>>>,
+    /// The Agent Selection this Provider declares for its own Errands — cheap
+    /// and fast rather than capable — or nothing while it declares none and
+    /// runs Errands at its default Model.
+    errand_selection: Arc<Mutex<Option<AgentSelection>>>,
     /// The condition Model discovery reports instead of the catalog, standing
     /// in for a Provider the user has yet to install or sign in to. Shared so a
     /// test can fix it the way a user would and refresh.
@@ -109,7 +117,8 @@ impl ControlledProvider {
         (
             Arc::new(ControlledProviderRuntime {
                 provider,
-                models,
+                models: Arc::new(Mutex::new(models)),
+                errand_selection: Arc::new(Mutex::new(None)),
                 unavailable: Arc::new(Mutex::new(None)),
                 discoveries: Arc::new(AtomicUsize::new(0)),
                 starts: starts_tx,
@@ -177,6 +186,26 @@ impl ControlledProviderRuntime {
     /// How many times Suru has asked this Provider for its Models.
     pub fn model_discoveries(&self) -> usize {
         self.discoveries.load(Ordering::SeqCst)
+    }
+
+    /// Declares the Agent Selection this Provider runs its Errands under, as a
+    /// real runtime declares the Model it knows to be cheap and the least
+    /// effort it publishes.
+    pub fn declare_errand_selection(&self, selection: AgentSelection) {
+        *self
+            .errand_selection
+            .lock()
+            .expect("controlled Provider Errand Selection lock is not poisoned") = Some(selection);
+    }
+
+    /// Drops `model` from the catalog this Provider serves, the way a Provider
+    /// withdrawing a Model from its own catalog does. The next discovery is
+    /// what makes the withdrawal visible to Suru.
+    pub fn withdraw_model(&self, model: &ModelId) {
+        self.models
+            .lock()
+            .expect("controlled Provider catalog lock is not poisoned")
+            .retain(|candidate| &candidate.id != model);
     }
 
     /// Makes this double stand in for a Provider whose harness has no one-shot
@@ -370,7 +399,11 @@ impl ProviderRuntime for ControlledProviderRuntime {
 
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
         self.discoveries.fetch_add(1, Ordering::SeqCst);
-        let models = self.models.clone();
+        let models = self
+            .models
+            .lock()
+            .expect("controlled Provider catalog lock is not poisoned")
+            .clone();
         let unavailable = *self
             .unavailable
             .lock()
@@ -392,6 +425,13 @@ impl ProviderRuntime for ControlledProviderRuntime {
         request: ProviderSessionRequest,
     ) -> ProviderFuture<'_, ProviderSessionConnection> {
         dispatch_start(self.starts.clone(), request)
+    }
+
+    fn errand_selection(&self) -> Option<AgentSelection> {
+        self.errand_selection
+            .lock()
+            .expect("controlled Provider Errand Selection lock is not poisoned")
+            .clone()
     }
 
     fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, Value> {

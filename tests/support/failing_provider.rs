@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use suru::{
-    protocol::{ModelDescriptor, ProviderId},
+    protocol::{AgentSelection, ModelDescriptor, ProviderId},
     provider::{
         ProviderErrand, ProviderError, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
         ProviderSessionRequest,
@@ -41,6 +41,10 @@ impl ProviderRuntime for FailingProviderRuntime {
                 "No Provider runtime is configured for this test server.",
             ))
         })
+    }
+
+    fn errand_selection(&self) -> Option<AgentSelection> {
+        None
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {

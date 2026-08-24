@@ -10,10 +10,12 @@ use serde_json::json;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        AgentId, AgentIdentity, CreateSessionRequest, InitialPrompt, PromptId, ProviderId,
-        RuntimeDescriptor, SESSION_CATALOG_UPDATED_EVENT, SessionCatalogChange,
-        SessionCatalogUpdate, SessionDeleted, SessionId, SessionListItem, SessionTitleChanged,
-        Workspace,
+        AgentId, AgentIdentity, AgentSelection, CreateSessionRequest, InitialPrompt,
+        ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
+        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
+        ModelOptionSelection, ModelOptionValue, PromptId, ProviderId, RuntimeDescriptor,
+        SESSION_CATALOG_UPDATED_EVENT, SessionCatalogChange, SessionCatalogUpdate, SessionDeleted,
+        SessionId, SessionListItem, SessionTitleChanged, Workspace,
     },
     provider::ProviderEvent,
     server::{self, ServerConfig, ServerTimings},
@@ -22,6 +24,10 @@ use tokio::time::{Duration, timeout};
 
 const PROVIDER: &str = "controlled";
 const MODEL: &str = "controlled-default";
+/// The Model this Provider declares its Errands run at — never the one a
+/// Session converses with, and never the Provider's default.
+const ERRAND_MODEL: &str = "controlled-errand";
+const EFFORT_OPTION: &str = "reasoning_effort";
 
 fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionRequest {
     CreateSessionRequest {
@@ -44,6 +50,62 @@ fn titling_provider() -> (
         ProviderId::new(PROVIDER),
         vec![hosted_model(PROVIDER, MODEL)],
     )
+}
+
+/// A Provider serving both the Model a Session converses with and the one it
+/// declares its Errands run at. That second Model publishes its reasoning
+/// efforts in the Provider's own order, so nothing about them says which is the
+/// least — which is why the runtime declares the whole Selection rather than a
+/// Model identifier.
+fn errand_titling_provider() -> (
+    std::sync::Arc<crate::provider_support::ControlledProviderRuntime>,
+    ControlledProvider,
+) {
+    let effort = |id: &str| ModelOptionChoice {
+        id: ModelOptionChoiceId::new(id),
+        label: id.to_owned(),
+        description: None,
+        availability: ModelAvailability::Available,
+    };
+    let errand_model = ModelDescriptor {
+        provider: ProviderId::new(PROVIDER),
+        id: ModelId::new(ERRAND_MODEL),
+        display_name: ERRAND_MODEL.to_owned(),
+        description: String::new(),
+        // The default Model is the one a user converses with, and this is not
+        // it: the two questions are kept apart.
+        is_default: false,
+        availability: ModelAvailability::Available,
+        options: vec![ModelOptionDescriptor {
+            id: ModelOptionId::new(EFFORT_OPTION),
+            label: "Reasoning effort".to_owned(),
+            description: None,
+            role: ModelOptionRole::ReasoningEffort,
+            kind: ModelOptionKind::Select {
+                choices: vec![effort("thorough"), effort("brisk")],
+                default: ModelOptionChoiceId::new("thorough"),
+            },
+        }],
+    };
+    ControlledProvider::with_provider(
+        ProviderId::new(PROVIDER),
+        vec![hosted_model(PROVIDER, MODEL), errand_model],
+    )
+}
+
+/// The Errand Selection that Provider declares: its Errand Model at the least
+/// effort it publishes, which only the Provider itself can name.
+fn declared_errand_selection() -> AgentSelection {
+    AgentSelection {
+        provider: ProviderId::new(PROVIDER),
+        model: ModelId::new(ERRAND_MODEL),
+        options: vec![ModelOptionSelection {
+            id: ModelOptionId::new(EFFORT_OPTION),
+            value: ModelOptionValue::Select {
+                choice: ModelOptionChoiceId::new("brisk"),
+            },
+        }],
+    }
 }
 
 /// The Title one Session in a listing carries, alongside the Emoji beside it.
@@ -123,7 +185,7 @@ async fn an_answered_errand_becomes_the_sessions_title_and_emoji_without_touchin
     assert_eq!(
         errand.selection(),
         &hosted_selection(PROVIDER, MODEL),
-        "the Errand runs under the Session's own Agent Selection"
+        "the Session's own Provider runs the Errand, at the default Model it declares nothing cheaper than"
     );
     assert_eq!(
         errand.workspace(),
@@ -167,6 +229,136 @@ async fn an_answered_errand_becomes_the_sessions_title_and_emoji_without_touchin
             .revision,
         created.revision,
         "a Title alters nothing a Transcript reader holds, so it bumps no revision"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn an_errand_runs_at_the_providers_declared_errand_selection() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = errand_titling_provider();
+    runtime.declare_errand_selection(declared_errand_selection());
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "title-errand-selection-test")
+            .expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let client = connected_client(state_dir.path(), "title-errand-selection-test").await;
+
+    // The Session converses at the Provider's default Model, which is not the
+    // Model that writes six words.
+    client
+        .create_session(create_request(workspace.path(), "Explain the seam"))
+        .await
+        .expect("create Session");
+
+    let errand = timeout(Duration::from_secs(1), provider.next_errand())
+        .await
+        .expect("an Errand reaches the Provider");
+    assert_eq!(
+        errand.selection(),
+        &declared_errand_selection(),
+        "the Errand runs at the Model and effort the Provider declared for its own Errands"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_withdrawn_errand_model_falls_back_to_the_providers_default_model() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = errand_titling_provider();
+    runtime.declare_errand_selection(declared_errand_selection());
+    let catalog = std::sync::Arc::clone(&runtime);
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "title-errand-withdrawal-test")
+            .expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let client = connected_client(state_dir.path(), "title-errand-withdrawal-test").await;
+
+    client
+        .create_session(create_request(workspace.path(), "Explain the seam"))
+        .await
+        .expect("create Session");
+    timeout(Duration::from_secs(1), provider.next_errand())
+        .await
+        .expect("an Errand reaches the Provider")
+        .succeed(json!({ "title": "Explain the Provider seam", "emoji": "\u{1F9F5}" }));
+
+    // The Provider drops the declared Model from its catalog, as a Provider
+    // changing its catalog under a running server does.
+    catalog.withdraw_model(&ModelId::new(ERRAND_MODEL));
+    client.refresh_models().await.expect("refresh the catalog");
+
+    client
+        .create_session(create_request(workspace.path(), "Ship the picker"))
+        .await
+        .expect("create the second Session");
+    let errand = timeout(Duration::from_secs(1), provider.next_errand())
+        .await
+        .expect("a second Errand reaches the Provider");
+    assert_eq!(
+        errand.selection(),
+        &hosted_selection(PROVIDER, MODEL),
+        "a declaration naming a Model that has gone gives way to the Provider's default Model"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_provider_with_no_model_to_run_an_errand_at_is_asked_for_none() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    // A Provider serving nothing: neither a declared Errand Selection to
+    // resolve nor a default Model to fall back to.
+    let (runtime, mut provider) =
+        ControlledProvider::with_provider(ProviderId::new(PROVIDER), Vec::new());
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "title-no-errand-model-test")
+            .expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let client = connected_client(state_dir.path(), "title-no-errand-model-test").await;
+
+    let created = client
+        .create_session(create_request(workspace.path(), "Explain the seam"))
+        .await
+        .expect("create Session");
+
+    // The Session's first Turn runs its full course, which is every chance a
+    // derivation would have had to reach the Provider.
+    let mut session = timeout(Duration::from_secs(1), provider.next_start())
+        .await
+        .expect("the first Turn starts a Provider Session")
+        .succeed(AgentIdentity {
+            agent: AgentId::new("controlled-agent"),
+            selection: hosted_selection(PROVIDER, MODEL),
+        });
+    timeout(Duration::from_secs(1), session.next_turn())
+        .await
+        .expect("the first Turn reaches the Provider")
+        .succeed();
+    session.emit(ProviderEvent::TurnCompleted);
+
+    assert!(
+        provider.try_next_errand().is_none(),
+        "an Errand with no Model to run it at is skipped rather than sent"
+    );
+    assert_eq!(
+        listed_title(&client, created.session.id).await,
+        ("Explain the seam".to_owned(), None),
+        "the Prompt-derived Title stands"
     );
 
     server.shutdown().await.expect("shut down server");

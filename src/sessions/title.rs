@@ -4,7 +4,10 @@
 //! real Title rather than a placeholder but rarely a good one. The moment that
 //! Prompt is admitted, Suru asks the Session's own Provider — through an Errand
 //! — for a short line naming the subject and the outcome, with an Emoji to
-//! stand beside it, and replaces the Title with what comes back.
+//! stand beside it, and replaces the Title with what comes back. The Provider
+//! is the Session's; the Model is that Provider's declared Errand Selection,
+//! resolved when the Errand runs, so titling is paid for at the rate that
+//! Provider keeps for its own work rather than at the rate of conversing.
 //!
 //! Everything here is best-effort by construction. The derivation runs in the
 //! background alongside the real first Turn and never blocks or gates it; it is
@@ -18,7 +21,8 @@ use serde_json::{Value, json};
 
 use crate::{
     errands::ErrandRunner,
-    protocol::{AgentSelection, SessionCatalogChange, SessionId},
+    model_catalog::ModelCatalogService,
+    protocol::{ProviderId, SessionCatalogChange, SessionId},
     provider::ProviderErrand,
 };
 
@@ -83,12 +87,23 @@ struct DerivedTitleReply {
 #[derive(Clone)]
 pub(crate) struct TitleDerivation {
     errands: ErrandRunner,
+    /// The live Model catalog, which is what an Errand Selection is resolved
+    /// against — every time one runs, rather than once when the server started.
+    models: ModelCatalogService,
     sessions: SessionStore,
 }
 
 impl TitleDerivation {
-    pub(crate) fn new(errands: ErrandRunner, sessions: SessionStore) -> Self {
-        Self { errands, sessions }
+    pub(crate) fn new(
+        errands: ErrandRunner,
+        models: ModelCatalogService,
+        sessions: SessionStore,
+    ) -> Self {
+        Self {
+            errands,
+            models,
+            sessions,
+        }
     }
 
     /// Forks a derivation for a Session whose first Prompt has just been
@@ -101,14 +116,19 @@ impl TitleDerivation {
     /// will not pick a Provider the user did not choose, and deferring the
     /// attempt would give derivation a second trigger point and pending state
     /// to carry.
+    ///
+    /// The Session's own Provider is all its Agent Selection decides here. The
+    /// Model is the Provider's own business — its declared Errand Selection,
+    /// resolved when the Errand runs — because the Model a user converses with
+    /// is not the one that should be paid to write six words.
     pub(crate) fn derive(
         &self,
         session_id: SessionId,
         workspace: std::path::PathBuf,
-        selection: Option<AgentSelection>,
+        provider: Option<ProviderId>,
         prompt: &str,
     ) {
-        let Some(selection) = selection else {
+        let Some(provider) = provider else {
             tracing::debug!(
                 %session_id,
                 "no Title Errand: the Session has selected no Provider"
@@ -120,15 +140,24 @@ impl TitleDerivation {
         let Some(derived_from) = self.sessions.title(session_id) else {
             return;
         };
-        let errand = ProviderErrand {
-            prompt: errand_prompt(prompt),
-            schema: reply_schema(),
-            selection,
-            workspace,
-        };
+        let prompt = errand_prompt(prompt);
         let errands = self.errands.clone();
+        let models = self.models.clone();
         let sessions = self.sessions.clone();
         tokio::spawn(async move {
+            let Some(selection) = models.resolved_errand_selection(&provider).await else {
+                tracing::info!(
+                    %session_id,
+                    "no Title Errand: `{provider}` offers no Model to run one at"
+                );
+                return;
+            };
+            let errand = ProviderErrand {
+                prompt,
+                schema: reply_schema(),
+                selection,
+                workspace,
+            };
             let answer = match errands.run(errand).await {
                 Ok(answer) => answer,
                 Err(failure) => {

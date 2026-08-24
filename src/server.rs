@@ -474,6 +474,7 @@ pub async fn spawn_with_providers_and_timings(
     let title_derivation = TitleDerivation::new(
         ErrandRunner::new(runtimes.clone(), provider_shutdown_rx, settings.subscribe())
             .with_timeout(timings.errand_timeout),
+        model_catalog.clone(),
         sessions.clone(),
     );
     let state = AppState {
@@ -884,7 +885,11 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             state.title_derivation.derive(
                 snapshot.session.id,
                 snapshot.session.workspace.path.clone(),
-                snapshot.session.agent_selection.clone(),
+                snapshot
+                    .session
+                    .agent_selection
+                    .as_ref()
+                    .map(|selection| selection.provider.clone()),
                 &snapshot.prompts[0].text,
             );
             (StatusCode::CREATED, Json(snapshot)).into_response()

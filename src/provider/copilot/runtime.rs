@@ -12,7 +12,7 @@ use super::{
     transport::CopilotConnector,
 };
 use crate::{
-    protocol::{ModelDescriptor, ProviderId},
+    protocol::{AgentSelection, ModelDescriptor, ProviderId},
     provider::{
         ProviderFuture, ProviderRuntime, ProviderSessionConnection, ProviderSessionRequest,
         harness::{HarnessSpec, SharedHarness},
@@ -110,6 +110,13 @@ impl ProviderRuntime for CopilotRuntime {
         _errand: crate::provider::ProviderErrand,
     ) -> ProviderFuture<'_, serde_json::Value> {
         crate::provider::errand_unimplemented(&self.provider_id())
+    }
+
+    // Which of Copilot's Models is cheap, and at which effort, is settled
+    // alongside the SDK work above; until then its Errands run at whatever
+    // Model Copilot already defaults to.
+    fn errand_selection(&self) -> Option<AgentSelection> {
+        None
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {

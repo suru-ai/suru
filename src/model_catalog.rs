@@ -5,8 +5,8 @@ use tokio::sync::watch;
 
 use crate::{
     protocol::{
-        AgentSelection, ModelCatalog, ModelDescriptor, ProviderCatalogStatus, ProviderId,
-        ProviderModelCatalog, ProviderUnavailability, SettingsSnapshot,
+        AgentSelection, ModelAvailability, ModelCatalog, ModelDescriptor, ProviderCatalogStatus,
+        ProviderId, ProviderModelCatalog, ProviderUnavailability, SettingsSnapshot,
     },
     provider::{ProviderError, ProviderRuntime, validate_models},
 };
@@ -124,6 +124,27 @@ impl ModelCatalogService {
             .find_map(ProviderCatalog::default_selection)
     }
 
+    /// The Agent Selection an Errand at `provider` runs under: the Errand
+    /// Selection that Provider declares, and its default Model when the
+    /// declaration names something its catalog no longer carries. Nothing while
+    /// it has neither, which is the point at which whoever asked for the Errand
+    /// gives up on it rather than guessing at a Model.
+    ///
+    /// This resolves afresh on every Errand rather than once at startup,
+    /// because a Provider's catalog changes underneath a running server and a
+    /// Model that has gone should cost one Errand its cheapness rather than
+    /// cost every Errand its answer.
+    pub(crate) async fn resolved_errand_selection(
+        &self,
+        provider: &ProviderId,
+    ) -> Option<AgentSelection> {
+        let catalog = self
+            .providers
+            .iter()
+            .find(|catalog| &catalog.provider == provider)?;
+        catalog.resolved_errand_selection().await
+    }
+
     pub(crate) fn normalize_selection(
         &self,
         selection: &AgentSelection,
@@ -189,12 +210,53 @@ impl ProviderCatalog {
         if state.is_unavailable() {
             return None;
         }
-        state
+        default_model(state.models.as_ref()?).map(ModelDescriptor::default_agent_selection)
+    }
+
+    /// The Agent Selection an Errand at this Provider runs under, resolved
+    /// against the Models it is serving right now. It is named for the
+    /// resolution rather than the declaration because the two differ: what the
+    /// runtime declares is one input, and a Provider that has withdrawn it
+    /// answers here with its default Model instead.
+    ///
+    /// A catalog already discovered is never refreshed for an Errand's sake.
+    /// One never discovered is loaded, because the alternative is that every
+    /// Errand asked before a client first listed Models resolves against an
+    /// empty catalog and is skipped.
+    ///
+    /// Enablement is deliberately not read here, unlike in
+    /// [`Self::default_selection`]: a Provider the user turned off is refused
+    /// where the Errand is run, which is the one place that can say so, and
+    /// discovery declines to consult it either way. A Provider that is off
+    /// therefore either resolves a Selection and is refused by name, or — never
+    /// having been discovered — offers no Model, which is what a Provider that
+    /// is off does.
+    async fn resolved_errand_selection(&self) -> Option<AgentSelection> {
+        self.discover_once().await;
+        let declared = self.runtime.errand_selection();
+        let state = self
+            .state
+            .lock()
+            .expect("Model catalog lock is not poisoned");
+        if state.is_unavailable() {
+            return None;
+        }
+        errand_selection_in(state.models.as_ref()?, declared)
+    }
+
+    /// Asks this Provider for its Models if it has never been asked. A Provider
+    /// the user has turned off is not asked at all, here as anywhere.
+    async fn discover_once(&self) {
+        if self
+            .state
+            .lock()
+            .expect("Model catalog lock is not poisoned")
             .models
-            .as_ref()?
-            .iter()
-            .find(|model| model.is_default)
-            .map(ModelDescriptor::default_agent_selection)
+            .is_some()
+        {
+            return;
+        }
+        self.refresh().await;
     }
 
     async fn list(&self) -> ProviderModelCatalog {
@@ -313,6 +375,69 @@ impl ProviderCatalog {
     }
 }
 
+/// The Model a Provider serves as its default, and nothing when it serves no
+/// default.
+fn default_model(models: &[ModelDescriptor]) -> Option<&ModelDescriptor> {
+    models.iter().find(|model| model.is_default)
+}
+
+/// The Agent Selection an Errand runs under, given what a Provider is serving
+/// and what — if anything — it declares its Errands run at.
+///
+/// The declaration is tried first and the Provider's default Model stands in
+/// for one the catalog will not honor. The default has to be a Model the
+/// Provider can actually run: falling back exists so an Errand still gets an
+/// answer, and a Model the Provider is serving but cannot run is no better a
+/// fallback than one that has gone. With neither, there is nothing to run an
+/// Errand at and whoever asked for it gives up rather than guessing.
+fn errand_selection_in(
+    models: &[ModelDescriptor],
+    declared: Option<AgentSelection>,
+) -> Option<AgentSelection> {
+    declared
+        .and_then(|declared| admitted_selection(models, &declared))
+        .or_else(|| {
+            default_model(models)
+                .filter(|model| model.availability == ModelAvailability::Available)
+                .map(ModelDescriptor::default_agent_selection)
+        })
+}
+
+/// A declared Errand Selection as the live catalog admits it: the declared
+/// Model's own Option defaults with the declaration laid over the top, so a
+/// runtime declares the one Option it has something to say about — the least
+/// effort it publishes — and takes the Model's defaults for the rest.
+///
+/// A declaration the catalog cannot honor in full is not honored at all, and
+/// gives way to the Provider's default Model. An Errand Selection is declared
+/// as a whole and for cheapness, so a Model that has been withdrawn, an Option
+/// it no longer carries, and a choice it no longer offers all mean the same
+/// thing: this is no longer the Selection the Provider vouched for.
+fn admitted_selection(
+    models: &[ModelDescriptor],
+    declared: &AgentSelection,
+) -> Option<AgentSelection> {
+    let model = models
+        .iter()
+        .find(|model| model.provider == declared.provider && model.id == declared.model)?;
+    if model.availability != ModelAvailability::Available {
+        return None;
+    }
+    let mut options = declared.options.clone();
+    for default in model.default_agent_selection().options {
+        if !options.iter().any(|option| option.id == default.id) {
+            options.push(default);
+        }
+    }
+    model
+        .materialize_agent_selection(Some(&AgentSelection {
+            provider: model.provider.clone(),
+            model: model.id.clone(),
+            options,
+        }))
+        .ok()
+}
+
 impl CatalogState {
     fn is_unavailable(&self) -> bool {
         self.failure
@@ -359,7 +484,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        protocol::{ModelAvailability, ModelId},
+        protocol::{
+            ModelAvailability, ModelId, ModelOptionChoice, ModelOptionChoiceId,
+            ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
+            ModelOptionSelection, ModelOptionValue,
+        },
         provider::{ProviderFuture, ProviderSessionConnection, ProviderSessionRequest},
     };
 
@@ -417,6 +546,10 @@ mod tests {
             unimplemented!("catalog tests never run Errands")
         }
 
+        fn errand_selection(&self) -> Option<AgentSelection> {
+            None
+        }
+
         fn shutdown(&self) -> ProviderFuture<'_, ()> {
             Box::pin(async { Ok(()) })
         }
@@ -468,5 +601,198 @@ mod tests {
             hammer.await.expect("hammer task completes");
         }
         drop(settings);
+    }
+
+    const ERRAND_MODEL: &str = "cheap";
+
+    fn choice(id: &str, availability: ModelAvailability) -> ModelOptionChoice {
+        ModelOptionChoice {
+            id: ModelOptionChoiceId::new(id),
+            label: id.to_owned(),
+            description: None,
+            availability,
+        }
+    }
+
+    fn select_option(
+        id: &str,
+        choices: Vec<ModelOptionChoice>,
+        default: &str,
+    ) -> ModelOptionDescriptor {
+        ModelOptionDescriptor {
+            id: ModelOptionId::new(id),
+            label: id.to_owned(),
+            description: None,
+            role: ModelOptionRole::Other,
+            kind: ModelOptionKind::Select {
+                choices,
+                default: ModelOptionChoiceId::new(default),
+            },
+        }
+    }
+
+    fn chosen(option: &str, choice: &str) -> ModelOptionSelection {
+        ModelOptionSelection {
+            id: ModelOptionId::new(option),
+            value: ModelOptionValue::Select {
+                choice: ModelOptionChoiceId::new(choice),
+            },
+        }
+    }
+
+    /// The Model a Provider might declare its Errands run at: two Options, so a
+    /// declaration can name one and leave the other alone.
+    fn errand_model(availability: ModelAvailability) -> ModelDescriptor {
+        ModelDescriptor {
+            provider: ProviderId::new("stub"),
+            id: ModelId::new(ERRAND_MODEL),
+            display_name: "Errand".to_owned(),
+            description: String::new(),
+            is_default: false,
+            availability,
+            options: vec![
+                select_option(
+                    "effort",
+                    vec![
+                        choice("thorough", ModelAvailability::Available),
+                        choice("brisk", ModelAvailability::Available),
+                    ],
+                    "thorough",
+                ),
+                select_option(
+                    "verbosity",
+                    vec![choice("plain", ModelAvailability::Available)],
+                    "plain",
+                ),
+            ],
+        }
+    }
+
+    /// The Model a Provider serves as its default, which is what an Errand runs
+    /// at when the declaration cannot be honored.
+    fn conversing_model(availability: ModelAvailability) -> ModelDescriptor {
+        ModelDescriptor {
+            provider: ProviderId::new("stub"),
+            id: ModelId::new("conversing"),
+            display_name: "Conversing".to_owned(),
+            description: String::new(),
+            is_default: true,
+            availability,
+            options: Vec::new(),
+        }
+    }
+
+    fn declaration(options: Vec<ModelOptionSelection>) -> AgentSelection {
+        AgentSelection {
+            provider: ProviderId::new("stub"),
+            model: ModelId::new(ERRAND_MODEL),
+            options,
+        }
+    }
+
+    /// A runtime declares the one Option it has something to say about — the
+    /// least effort it publishes — and everything else it left unsaid comes
+    /// from the Model, so a Provider adding an Option never invalidates a
+    /// declaration written before it existed.
+    #[test]
+    fn a_declaration_is_laid_over_the_declared_models_own_defaults() {
+        assert_eq!(
+            errand_selection_in(
+                &[
+                    conversing_model(ModelAvailability::Available),
+                    errand_model(ModelAvailability::Available),
+                ],
+                Some(declaration(vec![chosen("effort", "brisk")])),
+            ),
+            Some(declaration(vec![
+                chosen("effort", "brisk"),
+                chosen("verbosity", "plain"),
+            ]))
+        );
+    }
+
+    /// The Selection was declared as a whole and for cheapness, so a Provider
+    /// that has withdrawn any part of it has withdrawn the vouching with it,
+    /// and the Errand runs at that Provider's default Model instead.
+    #[test]
+    fn a_declaration_the_catalog_no_longer_carries_gives_way_to_the_default_model() {
+        let served = |declared| {
+            errand_selection_in(
+                &[
+                    conversing_model(ModelAvailability::Available),
+                    errand_model(ModelAvailability::Available),
+                ],
+                Some(declared),
+            )
+        };
+        let default =
+            Some(conversing_model(ModelAvailability::Available).default_agent_selection());
+        assert_eq!(
+            served(declaration(vec![chosen("effort", "frugal")])),
+            default,
+            "an effort the Model no longer offers"
+        );
+        assert_eq!(
+            served(declaration(vec![chosen("cadence", "brisk")])),
+            default,
+            "an Option the Model does not carry at all"
+        );
+        assert_eq!(
+            errand_selection_in(
+                &[conversing_model(ModelAvailability::Available)],
+                Some(declaration(Vec::new())),
+            ),
+            default,
+            "a Model that has gone from the catalog"
+        );
+        assert_eq!(
+            errand_selection_in(
+                &[
+                    conversing_model(ModelAvailability::Available),
+                    errand_model(ModelAvailability::Unavailable),
+                ],
+                Some(declaration(Vec::new())),
+            ),
+            default,
+            "a Model the Provider is serving but cannot run"
+        );
+    }
+
+    /// Falling back exists so an Errand still gets an answer, so a fallback that
+    /// would not answer is no fallback: an Errand is skipped outright rather
+    /// than sent to a Model the Provider cannot run or to no Model at all.
+    #[test]
+    fn a_provider_with_no_default_model_to_fall_back_to_runs_no_errand() {
+        assert_eq!(
+            errand_selection_in(
+                &[conversing_model(ModelAvailability::Unavailable)],
+                Some(declaration(Vec::new())),
+            ),
+            None,
+            "a default Model the Provider is serving but cannot run"
+        );
+        assert_eq!(
+            errand_selection_in(&[errand_model(ModelAvailability::Available)], None),
+            None,
+            "a catalog with no default Model in it at all"
+        );
+        assert_eq!(errand_selection_in(&[], None), None, "an empty catalog");
+    }
+
+    /// A Provider that declares nothing runs its Errands at the Model it
+    /// already defaults to, which is what every built-in Provider does until it
+    /// has something cheaper to name.
+    #[test]
+    fn a_provider_declaring_nothing_runs_errands_at_its_default_model() {
+        assert_eq!(
+            errand_selection_in(
+                &[
+                    conversing_model(ModelAvailability::Available),
+                    errand_model(ModelAvailability::Available),
+                ],
+                None,
+            ),
+            Some(conversing_model(ModelAvailability::Available).default_agent_selection())
+        );
     }
 }

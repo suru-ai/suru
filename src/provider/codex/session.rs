@@ -164,6 +164,13 @@ impl ProviderRuntime for CodexRuntime {
         crate::provider::errand_unimplemented(&self.provider_id())
     }
 
+    // Which of Codex's Models is cheap, and at which effort, is settled
+    // alongside the one-shot mode above; until then its Errands run at whatever
+    // Model Codex already defaults to.
+    fn errand_selection(&self) -> Option<AgentSelection> {
+        None
+    }
+
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move { self.processes.shutdown().await })
     }
