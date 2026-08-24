@@ -16,12 +16,19 @@ use crate::support::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        CodexSettings, CopilotSettings, EffectiveSettings, FoldPosture, ProviderSettings,
-        ReasoningSummaryDetail, ReasoningVisibility, SettingMutation, SettingsSnapshot,
-        TranscriptSettings,
+        CodexSettings, CopilotSettings, EffectiveSettings, FoldPosture, ModelCatalog,
+        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
+        ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SettingMutation,
+        SettingsSnapshot, TranscriptSettings,
     },
-    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
+    tui::{
+        Application, ApplicationEvent, ApplicationTransition, CommandId, ModelListRequest,
+        SemanticCommandId,
+    },
 };
+
+/// The Spinner's first frame, which is what a row being read shows.
+const SPINNER: char = '⠋';
 
 /// A connected client holding the effective settings the server pushed, which
 /// is the only place the panel reads a value from.
@@ -105,6 +112,49 @@ fn open_panel(application: &mut Application) {
 fn open_providers_tab(application: &mut Application) {
     open_panel(application);
     press(application, KeyCode::Right, KeyModifiers::NONE);
+}
+
+/// The Providers tab, plus the catalog listing entering it asks for — which is
+/// how a test answers the read the panel has just begun.
+fn read_providers_tab(application: &mut Application) -> ModelListRequest {
+    open_panel(application);
+    let ApplicationTransition::ListModels(request) =
+        press(application, KeyCode::Right, KeyModifiers::NONE)
+    else {
+        panic!("entering the Providers tab reads every enabled Provider's Availability");
+    };
+    request
+}
+
+/// What a listing answers with: one entry per Provider named, carrying the
+/// status alone, because the status is all a Provider row reads.
+fn catalog(providers: &[(&str, ProviderCatalogStatus)]) -> ModelCatalog {
+    ModelCatalog {
+        providers: providers
+            .iter()
+            .map(|(provider, status)| ProviderModelCatalog {
+                provider: ProviderId::new(*provider),
+                display_name: (*provider).to_owned(),
+                models: Vec::new(),
+                status: status.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Answers a read with what it found, which is the only way anything about
+/// Availability reaches a row.
+fn deliver_catalog(
+    application: &mut Application,
+    request: ModelListRequest,
+    providers: &[(&str, ProviderCatalogStatus)],
+) {
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: catalog(providers),
+        })
+        .expect("receive what the Availability read found");
 }
 
 /// Walks the focus down to the Setting spelling `key`, which the panel names
@@ -415,6 +465,350 @@ fn space_on_a_provider_row_toggles_that_providers_enablement() {
         press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
         ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled { value: None }),
         "and undoing the choice is as easy as making it"
+    );
+}
+
+/// Availability is a fact about the environment that Suru re-reads when the
+/// reader turns to a surface presenting the Providers themselves, so arriving
+/// on the tab asks again — every time, however the reader got there — and
+/// leaving asks nothing.
+#[test]
+fn entering_the_providers_tab_reads_availability_every_time() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+
+    open_panel(&mut application);
+    assert!(
+        matches!(
+            press(&mut application, KeyCode::Right, KeyModifiers::NONE),
+            ApplicationTransition::ListModels(_)
+        ),
+        "arriving on the Providers tab reads the Providers"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Left, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "leaving it reads nothing"
+    );
+    assert!(
+        matches!(
+            press(&mut application, KeyCode::Right, KeyModifiers::NONE),
+            ApplicationTransition::ListModels(_)
+        ),
+        "and coming back reads again rather than trusting what it heard before"
+    );
+
+    press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+    open_panel(&mut application);
+    assert!(
+        matches!(
+            press(&mut application, KeyCode::Left, KeyModifiers::NONE),
+            ApplicationTransition::ListModels(_)
+        ),
+        "reaching the tab by wrapping the other way is the same arrival"
+    );
+}
+
+/// A Provider Suru cannot use names the condition on its row and spells it out
+/// in full where the reader is looking, because every way a Provider can be
+/// unavailable is something they fix outside Suru.
+#[test]
+fn an_unavailable_provider_names_its_reason_and_the_headline_carries_the_message() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let request = read_providers_tab(&mut application);
+
+    deliver_catalog(
+        &mut application,
+        request,
+        &[(
+            "codex",
+            ProviderCatalogStatus::Unavailable {
+                reason: ProviderUnavailability::NotInstalled,
+                message: "The codex CLI is not on PATH; install it and try again".to_owned(),
+            },
+        )],
+    );
+
+    let codex = row(&application, "Codex");
+    assert!(
+        codex.contains("not installed"),
+        "the row names the reason: {codex:?}"
+    );
+    let panel = rendered_application_rows(&application).join("\n");
+    assert!(
+        panel.contains("install it and try again"),
+        "and the headline carries the whole message while that row is selected: {panel}"
+    );
+}
+
+/// The row says only what the reader can act on: a read that failed is worth a
+/// word, and a catalog that answered — however long ago — is worth none.
+#[test]
+fn a_failed_read_says_error_while_a_serving_catalog_says_nothing() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let request = read_providers_tab(&mut application);
+
+    deliver_catalog(
+        &mut application,
+        request,
+        &[
+            (
+                "codex",
+                ProviderCatalogStatus::Failed {
+                    message: "the codex CLI answered with no Models at all".to_owned(),
+                },
+            ),
+            ("copilot", ProviderCatalogStatus::Fresh),
+            (
+                "claude",
+                ProviderCatalogStatus::Stale {
+                    message: "the last refresh timed out".to_owned(),
+                },
+            ),
+        ],
+    );
+
+    let codex = row(&application, "Codex");
+    assert!(
+        codex.contains("error"),
+        "the Provider whose read failed says so: {codex:?}"
+    );
+    let panel = rendered_application_rows(&application).join("\n");
+    assert!(
+        panel.contains("answered with no Models"),
+        "with the whole message in the headline: {panel}"
+    );
+    let copilot = row(&application, "Copilot");
+    assert!(
+        copilot.contains("Copilot [default]"),
+        "a fresh catalog leaves nothing between the Provider and its provenance: {copilot:?}"
+    );
+    let claude = row(&application, "Claude");
+    assert!(
+        claude.contains("Claude [default]"),
+        "and so does a stale one that is still serving what it last read: {claude:?}"
+    );
+}
+
+/// Reading a Provider's Availability is live work, so it shows a Spinner while
+/// it runs and nothing once the answer is in.
+#[test]
+fn a_provider_shows_a_spinner_while_its_availability_is_being_read() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let request = read_providers_tab(&mut application);
+
+    let reading = rendered_application_rows(&application);
+    for provider in ["Codex", "Copilot", "Claude"] {
+        assert!(
+            reading[row_index(&reading, provider)].contains(SPINNER),
+            "every enabled Provider is being read: {reading:?}"
+        );
+    }
+
+    deliver_catalog(
+        &mut application,
+        request,
+        &[
+            ("codex", ProviderCatalogStatus::Fresh),
+            ("copilot", ProviderCatalogStatus::Fresh),
+            ("claude", ProviderCatalogStatus::Fresh),
+        ],
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains(SPINNER),
+        "and the Spinner goes the moment the read settles"
+    );
+}
+
+/// A Provider the reader turned off is one Suru leaves entirely alone, so its
+/// row reports the choice and nothing Suru would have had to look for.
+#[test]
+fn a_disabled_provider_is_never_read_and_makes_no_availability_claim() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(
+        workspace.path(),
+        without_codex(),
+        &["provider.codex.enabled"],
+    );
+    let request = read_providers_tab(&mut application);
+
+    let codex = row(&application, "Codex");
+    assert!(
+        codex.contains("disabled") && !codex.contains(SPINNER),
+        "no read runs on its behalf, so nothing on its row is live: {codex:?}"
+    );
+
+    deliver_catalog(
+        &mut application,
+        request,
+        &[(
+            "codex",
+            ProviderCatalogStatus::Unavailable {
+                reason: ProviderUnavailability::NotSignedIn,
+                message: "the codex CLI is not signed in".to_owned(),
+            },
+        )],
+    );
+    let codex = row(&application, "Codex");
+    assert!(
+        !codex.contains("not signed in") && !codex.contains("error"),
+        "and its row claims nothing about a Provider Suru has not consulted: {codex:?}"
+    );
+    let panel = rendered_application_rows(&application).join("\n");
+    assert!(
+        !panel.contains("not signed in"),
+        "the headline says nothing of it either: {panel}"
+    );
+}
+
+/// The listing is the one thing asked of every Provider at once, so a listing
+/// that never came back is every asked-about Provider's failed read.
+#[test]
+fn a_listing_that_never_came_back_leaves_every_asked_about_provider_in_error() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(
+        workspace.path(),
+        without_codex(),
+        &["provider.codex.enabled"],
+    );
+    let request = read_providers_tab(&mut application);
+
+    application
+        .handle_event(ApplicationEvent::ModelListingFailed {
+            request,
+            error: "the Suru server closed the connection mid-listing".to_owned(),
+        })
+        .expect("hear that the read never came back");
+
+    for provider in ["Copilot", "Claude"] {
+        let row = row(&application, provider);
+        assert!(
+            row.contains("error") && !row.contains(SPINNER),
+            "the Provider asked about has its answer, such as it is: {row:?}"
+        );
+    }
+    let codex = row(&application, "Codex");
+    assert!(
+        !codex.contains("error"),
+        "and the one nothing was asked about is untouched by the failure: {codex:?}"
+    );
+    let disabled_headline = rendered_application_rows(&application).join("\n");
+    assert!(
+        !disabled_headline.contains("closed the connection"),
+        "nor does the headline speak for it while its row is the focused one: {disabled_headline}"
+    );
+
+    // Down from the disabled Provider onto one the read did ask about.
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    let panel = rendered_application_rows(&application).join("\n");
+    assert!(
+        panel.contains("closed the connection"),
+        "the headline says what went wrong for the row the reader is on: {panel}"
+    );
+}
+
+/// A read is a question this arrival asked, so only its own answer settles it:
+/// a reader who stepped away and back has asked again, and the answer they left
+/// behind must not stand in for the one they are waiting on.
+#[test]
+fn an_answer_to_a_superseded_read_settles_nothing() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let abandoned = read_providers_tab(&mut application);
+
+    press(&mut application, KeyCode::Left, KeyModifiers::NONE);
+    let ApplicationTransition::ListModels(awaited) =
+        press(&mut application, KeyCode::Right, KeyModifiers::NONE)
+    else {
+        panic!("coming back asks again");
+    };
+
+    deliver_catalog(
+        &mut application,
+        abandoned,
+        &[("codex", ProviderCatalogStatus::Fresh)],
+    );
+    assert!(
+        row(&application, "Codex").contains(SPINNER),
+        "the read in force is still out, whatever the abandoned one came back with"
+    );
+
+    deliver_catalog(
+        &mut application,
+        awaited,
+        &[("codex", ProviderCatalogStatus::Fresh)],
+    );
+    assert!(
+        !row(&application, "Codex").contains(SPINNER),
+        "and its own answer is what settles it"
+    );
+}
+
+/// A read that comes back saying nothing about a Provider has still come back:
+/// the row reports that rather than waiting on an answer already given.
+#[test]
+fn a_provider_the_answer_passes_over_stops_waiting_and_says_so() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let request = read_providers_tab(&mut application);
+
+    deliver_catalog(
+        &mut application,
+        request,
+        &[("codex", ProviderCatalogStatus::Fresh)],
+    );
+    let claude = row(&application, "Claude");
+    assert!(
+        claude.contains("error") && !claude.contains(SPINNER),
+        "a Provider the answer never named is answered badly, not still being read: {claude:?}"
+    );
+}
+
+/// Turning a Provider off takes back everything Suru had found out about it:
+/// the row goes quiet, and so must the headline above it, which is the other
+/// place a Provider speaks.
+#[test]
+fn turning_a_provider_off_after_a_read_silences_its_row_and_the_headline() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let request = read_providers_tab(&mut application);
+    deliver_catalog(
+        &mut application,
+        request,
+        &[(
+            "codex",
+            ProviderCatalogStatus::Unavailable {
+                reason: ProviderUnavailability::NotSignedIn,
+                message: "the codex CLI is not signed in".to_owned(),
+            },
+        )],
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("not signed in"),
+        "the Provider has something to say while it is on"
+    );
+
+    deliver_snapshot(
+        &mut application,
+        without_codex(),
+        &["provider.codex.enabled"],
+    );
+    let panel = rendered_application_rows(&application).join("\n");
+    assert!(
+        !panel.contains("not signed in"),
+        "and nothing at all once it is one Suru leaves entirely alone: {panel}"
+    );
+    let codex = row(&application, "Codex");
+    assert!(
+        codex.contains("disabled"),
+        "which is all the row reports: {codex:?}"
     );
 }
 
@@ -861,7 +1255,20 @@ fn resetting_a_setting_unpins_it_whether_or_not_the_panel_thinks_it_is_pinned() 
 fn an_edit_the_server_refuses_says_so_and_leaves_the_row_where_it_was() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
-    open_providers_tab(&mut application);
+    let request = read_providers_tab(&mut application);
+    // The row the refusal is about is also one with something of its own to
+    // say, so the complaint has to outrank it.
+    deliver_catalog(
+        &mut application,
+        request,
+        &[(
+            "codex",
+            ProviderCatalogStatus::Unavailable {
+                reason: ProviderUnavailability::NotInstalled,
+                message: "the codex CLI is not on PATH".to_owned(),
+            },
+        )],
+    );
     press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE);
 
     application

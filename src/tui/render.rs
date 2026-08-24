@@ -27,7 +27,7 @@ use super::{
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
     session_picker::SessionPickerRow,
-    settings_panel::{RowExpansion, RowValue},
+    settings_panel::{RowAvailability, RowExpansion, RowValue},
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
         PromptFooterSlotContext, PromptStatusSlotContext, RenderSlots, RenderedSlot,
@@ -377,19 +377,23 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
         lines.push(Line::from(spans));
     }
     if content_height >= 2 {
-        // What the focused Setting does, or why the last edit of it never
-        // reached the Config Document — a failed edit is the more urgent of
-        // the two, so it takes the line.
+        // What the focused Setting does, what its Provider has to say for
+        // itself, or why the last edit never reached the Config Document — a
+        // failed edit is the most urgent of the three, so it takes the line,
+        // and a Provider's own condition outranks the description of a Setting
+        // the reader can read off the row anyway.
         let (headline, style) = match (
             state.settings_panel.error(),
+            state.settings_panel.selected_message(state.settings()),
             state.settings_panel.selected_descriptor(),
         ) {
-            (Some(error), _) => (error.to_owned(), theme.feedback.error),
-            (None, Some(descriptor)) => (
+            (Some(error), _, _) => (error.to_owned(), theme.feedback.error),
+            (None, Some(message), _) => (message.to_owned(), theme.text.subdued),
+            (None, None, Some(descriptor)) => (
                 format!("{} · {}", descriptor.key, descriptor.description),
                 theme.text.subdued,
             ),
-            (None, None) => (String::new(), theme.text.subdued),
+            (None, None, None) => (String::new(), theme.text.subdued),
         };
         lines.push(Line::styled(
             truncate_to_width(&headline, content_width),
@@ -426,9 +430,23 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
             RowValue::ProviderEnabled => String::new(),
             RowValue::ProviderDisabled => " · disabled".to_owned(),
         };
+        // What Suru has found out about the Provider, which is a word at most:
+        // a Spinner while the read runs, the condition's name once it lands,
+        // and nothing at all from a Provider still serving its catalog.
+        let availability = match row.availability {
+            RowAvailability::Quiet => String::new(),
+            RowAvailability::Reading => {
+                format!(" · {}", spinner::frame(state.spinner_frame))
+            }
+            RowAvailability::Unavailable(reason) => format!(" · {}", reason.label()),
+            RowAvailability::Failed => " · error".to_owned(),
+        };
         lines.push(Line::styled(
             truncate_to_width(
-                &format!("{marker}{expansion}{}{value} [{origin}]", row.label),
+                &format!(
+                    "{marker}{expansion}{}{value}{availability} [{origin}]",
+                    row.label
+                ),
                 content_width,
             ),
             match (row.selected, row.value) {

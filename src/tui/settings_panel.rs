@@ -18,12 +18,31 @@
 //! ordinary rows the reader expands the Provider to see. The expansion is view
 //! state and nothing more — the panel forgets it on close — so a Provider whose
 //! Settings the reader is not looking at costs the listing one line.
+//!
+//! The Providers tab is a surface presenting the Providers themselves, so
+//! arriving on it re-reads their Availability through the same Model catalog
+//! listing the picker asks for. What that read finds is the panel's own to
+//! keep, alongside the rest of its ephemeral state: a Provider row reads it,
+//! and each arrival asks again rather than trusting the last answer. Enablement
+//! decides who is asked — a Provider the reader turned off is never consulted,
+//! so its row reports the choice and never a condition Suru did not look for.
 
 use crate::{
-    protocol::{EffectiveSettings, ProviderId, SettingMutation},
+    protocol::{
+        EffectiveSettings, ModelCatalog, ProviderCatalogStatus, ProviderId, ProviderUnavailability,
+        SettingMutation,
+    },
     provider::built_in_providers,
     settings::{SCHEMA, SettingDescriptor, SettingGroup, provider_enablement, provider_settings},
 };
+
+use super::ModelListRequest;
+
+/// What a row reports about a Provider the read in force asked about and the
+/// answer passed over. Nothing came back for it, which is Suru's problem to
+/// report rather than a condition of the Provider — and reporting it is what
+/// ends the read, because a row may not wait for an answer already given.
+const UNANSWERED_PROVIDER: &str = "the Model catalog answered for no such Provider";
 
 /// Stands in for a value the effective settings hold but the schema does not
 /// name, so a row says what it knows rather than claiming a wrong value.
@@ -83,6 +102,15 @@ pub(super) struct SettingsPanel {
     /// selection: an opening panel expands nothing, so the reader always meets
     /// the same short list of Providers.
     expanded: Vec<&'static ProviderId>,
+    /// What the Availability read in force found, one entry per Provider it
+    /// asked about — which is every enabled Provider and no other. A Provider
+    /// with no entry here is one nothing has been read about, and its row says
+    /// as much by saying nothing.
+    availability: Vec<ProviderReading>,
+    /// The catalog listing those readings are waiting on. Answers to any other
+    /// listing are somebody else's: a reader who left the tab and came back has
+    /// asked again, and the older answer must not settle the newer question.
+    awaited_listing: Option<ModelListRequest>,
     /// Why the last edit never reached the Config Document. Cleared by the
     /// next edit, so a stale complaint never outlives the attempt that earned
     /// it.
@@ -105,6 +133,47 @@ pub(super) struct SettingRow {
     pub(super) pinned: bool,
     pub(super) selected: bool,
     pub(super) expansion: RowExpansion,
+    pub(super) availability: RowAvailability,
+}
+
+/// What one Provider's Availability read has come to, held beside the message
+/// the reader gets in full when the row is theirs to act on.
+#[derive(Clone, Debug)]
+struct ProviderReading {
+    provider: ProviderId,
+    availability: RowAvailability,
+    /// What the Provider or the read itself said, whole. `None` where there is
+    /// nothing to say beyond the row.
+    message: Option<String>,
+}
+
+/// What arriving on a tab asks of Suru. Availability is a fact about the
+/// environment rather than a choice, so the surface presenting the Providers
+/// re-reads it on arrival and every other arrival asks nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub(super) enum AvailabilityRead {
+    /// The panel is now waiting on a catalog listing, which its caller owes it.
+    Begun,
+    /// Nothing was asked, so nothing is owed.
+    None,
+}
+
+/// What a Provider row says about Availability. Every state but the quiet one
+/// asks something of the reader, which is why the quiet one is what a Provider
+/// still serving its catalog gets: Suru reports a condition, not a heartbeat.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RowAvailability {
+    /// Nothing to report: a catalog that answered, a Provider nothing has been
+    /// read about, and every row that is not a Provider's.
+    Quiet,
+    /// Being read right now, which is live work and so wears a Spinner.
+    Reading,
+    /// Unusable until the reader fixes this outside Suru.
+    Unavailable(ProviderUnavailability),
+    /// The read itself failed, which is Suru's problem to report rather than a
+    /// condition of the Provider.
+    Failed,
 }
 
 /// Where a row sits in the one nesting the panel has: a Provider that reveals
@@ -194,12 +263,94 @@ impl SettingsPanel {
         self.move_selection(1);
     }
 
-    pub(super) fn select_previous_tab(&mut self) {
-        self.move_tab(-1);
+    pub(super) fn select_previous_tab(&mut self, settings: &EffectiveSettings) -> AvailabilityRead {
+        self.move_tab(-1, settings)
     }
 
-    pub(super) fn select_next_tab(&mut self) {
-        self.move_tab(1);
+    pub(super) fn select_next_tab(&mut self, settings: &EffectiveSettings) -> AvailabilityRead {
+        self.move_tab(1, settings)
+    }
+
+    /// Notes the listing the read in force is waiting on, which is the one
+    /// answer that may settle it.
+    pub(super) fn await_listing(&mut self, request: ModelListRequest) {
+        self.awaited_listing = Some(request);
+    }
+
+    /// Takes what the awaited listing found, for the Providers this panel asked
+    /// about and no others: an answer naming a Provider nothing was read about
+    /// — one the reader has turned off — changes nothing here, because a row
+    /// may not claim what Suru never looked for. A Provider the answer passes
+    /// over has still been answered, badly, and says so rather than waiting on.
+    pub(super) fn adopt_catalog(&mut self, request: &ModelListRequest, catalog: &ModelCatalog) {
+        if self.awaited_listing.as_ref() != Some(request) {
+            return;
+        }
+        for reading in &mut self.availability {
+            let Some(found) = catalog
+                .providers
+                .iter()
+                .find(|listed| listed.provider == reading.provider)
+            else {
+                reading.availability = RowAvailability::Failed;
+                reading.message = Some(UNANSWERED_PROVIDER.to_owned());
+                continue;
+            };
+            let (availability, message) = match &found.status {
+                // A refresh the server armed is this read still running, so
+                // the row keeps its Spinner until the settled answer lands.
+                ProviderCatalogStatus::Refreshing => (RowAvailability::Reading, None),
+                ProviderCatalogStatus::Unavailable { reason, message } => {
+                    (RowAvailability::Unavailable(*reason), Some(message.clone()))
+                }
+                ProviderCatalogStatus::Failed { message } => {
+                    (RowAvailability::Failed, Some(message.clone()))
+                }
+                // A catalog still serving what it last read asks nothing of
+                // the reader, whether or not the newest refresh went through.
+                ProviderCatalogStatus::Fresh
+                | ProviderCatalogStatus::Stale { .. }
+                | ProviderCatalogStatus::Disabled => (RowAvailability::Quiet, None),
+            };
+            reading.availability = availability;
+            reading.message = message;
+        }
+    }
+
+    /// Takes the reason the awaited listing never came back. It was the one
+    /// thing asked of every Provider at once, so its failure is every
+    /// asked-about Provider's failure.
+    pub(super) fn report_read_failure(&mut self, request: &ModelListRequest, error: &str) {
+        if self.awaited_listing.as_ref() != Some(request) {
+            return;
+        }
+        for reading in &mut self.availability {
+            reading.availability = RowAvailability::Failed;
+            reading.message = Some(error.to_owned());
+        }
+    }
+
+    /// Whether a read is still out on the tab showing it, which is what keeps
+    /// the Spinner animating. A reader who has walked away from the Providers
+    /// is watching nothing spin, whatever is still in flight for them.
+    pub(super) fn is_reading(&self, settings: &EffectiveSettings) -> bool {
+        self.open
+            && self.tab == SettingsTab::Providers
+            && built_in_providers().iter().any(|provider| {
+                self.reading(&provider.id, settings)
+                    .is_some_and(|reading| reading.availability == RowAvailability::Reading)
+            })
+    }
+
+    /// What the focused Provider's Availability says in full, which the
+    /// headline carries because a row has room only for the condition's name.
+    pub(super) fn selected_message(&self, settings: &EffectiveSettings) -> Option<&str> {
+        if !self.open {
+            return None;
+        }
+        let entries = self.entries();
+        let provider = entries.get(self.selected_row(entries.len()))?.provider?;
+        self.reading(provider, settings)?.message.as_deref()
     }
 
     /// The tab bar: every tab, always, with the one being shown marked as such.
@@ -233,26 +384,38 @@ impl SettingsPanel {
         entries
             .into_iter()
             .enumerate()
-            .map(|(index, entry)| SettingRow {
-                label: entry.label,
-                value: match entry.provider {
-                    Some(provider) if settings.provider_enabled(provider) => {
-                        RowValue::ProviderEnabled
-                    }
-                    Some(_) => RowValue::ProviderDisabled,
+            .map(|(index, entry)| {
+                let (value, availability) = match entry.provider {
+                    Some(provider) if settings.provider_enabled(provider) => (
+                        RowValue::ProviderEnabled,
+                        self.reading(provider, settings)
+                            .map_or(RowAvailability::Quiet, |reading| reading.availability),
+                    ),
+                    // A Provider the reader turned off is one Suru leaves
+                    // entirely alone, so its row reports that choice and never
+                    // a condition nothing looked for.
+                    Some(_) => (RowValue::ProviderDisabled, RowAvailability::Quiet),
                     // A Setting holding a value the schema does not name is a
                     // schema that fell behind its own types, not a reason to
                     // refuse the reader the rest of the panel.
-                    None => RowValue::Choice(
-                        entry
-                            .descriptor
-                            .effective(settings)
-                            .map_or(UNNAMED_VALUE, |choice| choice.value),
+                    None => (
+                        RowValue::Choice(
+                            entry
+                                .descriptor
+                                .effective(settings)
+                                .map_or(UNNAMED_VALUE, |choice| choice.value),
+                        ),
+                        RowAvailability::Quiet,
                     ),
-                },
-                pinned: pinned.iter().any(|key| key == entry.descriptor.key),
-                selected: index == selected,
-                expansion: entry.expansion,
+                };
+                SettingRow {
+                    label: entry.label,
+                    value,
+                    pinned: pinned.iter().any(|key| key == entry.descriptor.key),
+                    selected: index == selected,
+                    expansion: entry.expansion,
+                    availability,
+                }
             })
             .collect()
     }
@@ -382,12 +545,58 @@ impl SettingsPanel {
     }
 
     /// Walks the tab bar, wrapping at either end so neither is a dead end. The
-    /// tab arrived at is where the reader left it, not its top row.
-    fn move_tab(&mut self, distance: isize) {
+    /// tab arrived at is where the reader left it, not its top row. Landing on
+    /// the tab that presents the Providers themselves re-reads their
+    /// Availability, which is what that arrival means — and which is why a
+    /// closed panel walks nowhere: a command invoked from somewhere the panel
+    /// is not must not send Suru off to consult the Providers.
+    fn move_tab(&mut self, distance: isize, settings: &EffectiveSettings) -> AvailabilityRead {
+        if !self.open {
+            return AvailabilityRead::None;
+        }
         self.error = None;
         let position = (self.tab.position() as isize + distance)
             .rem_euclid(SettingsTab::ALL.len() as isize) as usize;
         self.tab = SettingsTab::ALL[position];
+        if self.tab != SettingsTab::Providers {
+            return AvailabilityRead::None;
+        }
+        self.begin_availability_read(settings);
+        AvailabilityRead::Begun
+    }
+
+    /// Puts every Provider that is about to be asked about back to waiting.
+    /// Only the ones the reader has left on: a disabled Provider is one Suru
+    /// leaves entirely alone, so nothing is asked on its behalf and its row has
+    /// nothing to wait for.
+    fn begin_availability_read(&mut self, settings: &EffectiveSettings) {
+        self.availability = built_in_providers()
+            .iter()
+            .filter(|provider| settings.provider_enabled(&provider.id))
+            .map(|provider| ProviderReading {
+                provider: provider.id.clone(),
+                availability: RowAvailability::Reading,
+                message: None,
+            })
+            .collect();
+    }
+
+    /// What the read in force found about one Provider, and nothing at all
+    /// about one the reader has turned off since. Enablement decides who is
+    /// asked, so it decides who may be reported on — and it decides here once,
+    /// so a row and the headline above it can never disagree about whether a
+    /// Provider has anything to say.
+    fn reading(
+        &self,
+        provider: &ProviderId,
+        settings: &EffectiveSettings,
+    ) -> Option<&ProviderReading> {
+        if !settings.provider_enabled(provider) {
+            return None;
+        }
+        self.availability
+            .iter()
+            .find(|reading| &reading.provider == provider)
     }
 }
 

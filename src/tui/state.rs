@@ -38,7 +38,7 @@ use super::{
     notice::{LandingNotice, Notice},
     render::render_with_slots,
     session_picker::SessionPicker,
-    settings_panel::SettingsPanel,
+    settings_panel::{AvailabilityRead, SettingsPanel},
     slots::RenderSlots,
     transcript::{
         FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups,
@@ -1822,6 +1822,7 @@ impl Application {
     ) -> ApplicationTransition {
         let accepted = self.state.model_picker.is_active_request(request);
         let current = self.state.agent_selection().cloned();
+        self.state.settings_panel.adopt_catalog(request, &catalog);
         self.state
             .model_picker
             .load(request, catalog, current.as_ref());
@@ -1840,6 +1841,9 @@ impl Application {
         error: String,
     ) -> ApplicationTransition {
         let accepted = self.state.model_picker.is_active_request(request);
+        self.state
+            .settings_panel
+            .report_read_failure(request, &error);
         self.state.model_picker.fail(request, error);
         if accepted {
             self.reconcile_model_options(CatalogListing::Complete);
@@ -2075,12 +2079,18 @@ impl Application {
                 None
             }
             SemanticCommandId::SettingsTabPrevious => {
-                self.state.settings_panel.select_previous_tab();
-                None
+                let read = self
+                    .state
+                    .settings_panel
+                    .select_previous_tab(&self.state.settings);
+                return self.answer_availability_read(read);
             }
             SemanticCommandId::SettingsTabNext => {
-                self.state.settings_panel.select_next_tab();
-                None
+                let read = self
+                    .state
+                    .settings_panel
+                    .select_next_tab(&self.state.settings);
+                return self.answer_availability_read(read);
             }
             SemanticCommandId::SettingsExpansionToggle => {
                 self.state.settings_panel.toggle_expansion();
@@ -2100,6 +2110,21 @@ impl Application {
             ApplicationTransition::Continue,
             ApplicationTransition::MutateSetting,
         )
+    }
+
+    /// Sends out the catalog listing an Availability read the panel has begun
+    /// is waiting on. The request is minted through the Model picker, so the
+    /// one listing answers every surface that reads the catalog rather than
+    /// each of them asking the Providers separately.
+    fn answer_availability_read(&mut self, read: AvailabilityRead) -> ApplicationTransition {
+        match read {
+            AvailabilityRead::Begun => {
+                let request = self.state.model_picker.begin_refresh();
+                self.state.settings_panel.await_listing(request.clone());
+                ApplicationTransition::ListModels(request)
+            }
+            AvailabilityRead::None => ApplicationTransition::Continue,
+        }
     }
 
     /// Handles the Model Options commands routed here; any other semantic
@@ -2337,14 +2362,17 @@ impl Application {
     /// Whether anything on screen is animating a Spinner, so the run loop
     /// ticks only while one shows and an idle TUI schedules zero wakeups.
     pub(super) fn wants_spinner(&self) -> bool {
-        self.state.session.as_ref().is_some_and(|session| {
-            let snapshot = session.snapshot();
-            snapshot.session.status == SessionStatus::Active
-                || snapshot
-                    .activities
-                    .iter()
-                    .any(|activity| activity.status() == Some(ActivityStatus::Active))
-        })
+        // A Provider's Availability being read is live work like any other, and
+        // the row showing it animates only while the tick is armed.
+        self.state.settings_panel.is_reading(&self.state.settings)
+            || self.state.session.as_ref().is_some_and(|session| {
+                let snapshot = session.snapshot();
+                snapshot.session.status == SessionStatus::Active
+                    || snapshot
+                        .activities
+                        .iter()
+                        .any(|activity| activity.status() == Some(ActivityStatus::Active))
+            })
     }
 
     /// Advances the Spinner one frame. Called from the run loop's tick, which
