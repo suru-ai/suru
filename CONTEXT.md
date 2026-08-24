@@ -16,6 +16,14 @@ _Avoid_: Model setting, model choice
 The external product through which an agent operates, such as Codex or Copilot. A Provider identifies that product rather than its underlying model vendor.
 _Avoid_: Backend
 
+**Provider Availability**:
+Whether a Provider can be used at all right now, as Suru finds it: the external product installed, signed in to, and at a version Suru speaks. Availability is a fact about the environment rather than a choice, so every way a Provider can be unavailable names a condition the user fixes outside Suru, and Suru re-reads it only when the user asks for a Provider's Models again. An unavailable Provider keeps its place wherever Providers are listed, with its reason on show, and none of its Models may be selected. Distinct from Provider Enablement, which is the user's own choice rather than something Suru discovers.
+_Avoid_: Health, readiness, status
+
+**Provider Enablement**:
+Whether the user wants Suru to offer a Provider at all, carried as a Setting and enabled unless they say otherwise. A disabled Provider is one Suru leaves entirely alone: never asked for its Models, never checked for Availability, never asked to begin a Session — so it costs nothing and reports nothing. It is not offered where a user chooses an Agent, and a Session already bound to it cannot begin another Turn until it is enabled again, though work already under way is left to finish: Enablement governs what Suru does next rather than what it is doing. The user may disable every Provider, which leaves them nothing to select and is theirs to undo. Distinct from Provider Availability, which Suru discovers and the user fixes outside Suru; Enablement is the user's own choice and takes effect as soon as they make it.
+_Avoid_: Provider toggle, active, installed
+
 **Model**:
 The language model selected for an Agent through its Provider.
 _Avoid_: Engine
