@@ -10,8 +10,8 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
     protocol::{
         CreateSessionRequest, InitialPrompt, Message, MessageRole, ModelCatalog, PromptId,
-        ProviderId, ProviderModelCatalog, SessionId, SessionSnapshot, TurnId, TurnStatus,
-        Workspace,
+        ProviderId, ProviderModelCatalog, SessionId, SessionSnapshot, TitleErrand, TurnId,
+        TurnStatus, Workspace,
     },
     provider::CopilotRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -20,7 +20,7 @@ use tokio::time::{Duration, timeout};
 
 use crate::{
     scripted_binary_support::{captured_methods, captured_requests, write_executable},
-    server_support::receive_initial_state,
+    server_support::{config_root_pinning, receive_initial_state},
 };
 
 /// The catalog the picker — and the Agent Selection a test names — draws on.
@@ -215,13 +215,38 @@ pub fn switch_model_arm() -> String {
 
 /// A `session.send` arm that accepts the Prompt and then plays `timeline` — `event` lines, and
 /// whatever else the test wants the CLI to do while the Turn runs.
+///
+/// The Session the timeline plays against is the one the Prompt was addressed to rather than the
+/// one created most recently, because a server running an Errand alongside a Turn holds two Copilot
+/// Sessions at once and each one's events belong to it alone.
 pub fn send_arm(timeline: &str) -> String {
     format!(
         r#"    *'"method":"session.send"'*)
+      sid=$(printf '%s' "$body" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
       reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"messageId":"fixture-message"}}}}'
 {timeline}      ;;
 "#
     )
+}
+
+/// A `session.destroy` arm acknowledging that the client is done with the Session, which is what
+/// the SDK sends when a Session is disconnected.
+pub fn destroy_session_arm() -> String {
+    r#"    *'"method":"session.destroy"'*)
+      reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"success":true}}'
+      ;;
+"#
+    .to_owned()
+}
+
+/// A `session.delete` arm acknowledging that everything the CLI filed under the Session is gone,
+/// which is what a real CLI answers once it has stopped listing it.
+pub fn delete_session_arm() -> String {
+    r#"    *'"method":"session.delete"'*)
+      reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"success":true}}'
+      ;;
+"#
+    .to_owned()
 }
 
 /// A `session.abort` arm that acknowledges the whole-loop abort and then plays `timeline` — the
@@ -666,4 +691,12 @@ pub async fn session_where(
     })
     .await
     .unwrap_or_else(|_| panic!("{what}"))
+}
+
+/// A config root turning Title derivation off, for a test whose subject is the Turn rather than the
+/// Errand Suru runs beside it. Both land on the same Copilot CLI, so a Session that named an Agent
+/// Selection — which is what makes it a Session worth deriving a Title for — would otherwise have
+/// the Errand's own Copilot Session interleaving with its own.
+pub fn titling_turned_off() -> tempfile::TempDir {
+    config_root_pinning(&TitleErrand::Off)
 }

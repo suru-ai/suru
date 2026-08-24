@@ -15,6 +15,7 @@ use suru::{
 };
 use tokio::time::{Duration, timeout};
 
+#[allow(dead_code)]
 mod support;
 
 use support::{

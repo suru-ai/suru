@@ -10,7 +10,9 @@
 //! [`shared harness`](super::harness::SharedHarness) that Model discovery and Sessions alike demand.
 //! [`session`] opens one Copilot Session on that process and runs its Turns, [`projection`] turns
 //! the Session's event timeline into the Provider events the rest of Suru consumes, and [`tools`]
-//! decides what one Tool execution reads as once it gets there.
+//! decides what one Tool execution reads as once it gets there. [`errand`] runs Suru's own
+//! Errands on the same process, through a Copilot Session it opens and discards, because Copilot's
+//! harness offers no one-shot mode to run them without one.
 //!
 //! Three conditions leave Copilot unusable until the user fixes them outside Suru, and each reaches
 //! a Model discovery as its own typed reason rather than as a failure: a CLI that is not installed,
@@ -21,6 +23,7 @@
 //! catalog refresh re-running all three checks is the whole of its part in the recovery.
 
 mod catalog;
+mod errand;
 mod projection;
 mod runtime;
 mod session;

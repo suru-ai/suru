@@ -7,7 +7,7 @@ use crate::support::{
     COPILOT_MODELS, ScriptedCopilot, agent_messages, connect, connect_arm, conversation_fixture,
     create_session_arm, modelless_current_model_arm, models_arm, permission_decision_arm,
     resumable_conversation_fixture, send_arm, settled_session, settled_session_on, signed_in_arm,
-    switch_model_arm,
+    switch_model_arm, titling_turned_off,
 };
 use serde_json::Value;
 use suru::{
@@ -139,8 +139,11 @@ async fn a_turn_selected_under_another_model_switches_copilot_onto_it_first() {
     let copilot = conversation_fixture(STREAMED_MESSAGE);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let titling = titling_turned_off();
     let server = server::spawn_with_provider(
-        ServerConfig::new(state_dir.path(), "copilot-model-switch").expect("configure server"),
+        ServerConfig::new(state_dir.path(), "copilot-model-switch")
+            .expect("configure server")
+            .with_config_dir(titling.path()),
         Arc::new(CopilotRuntime::new(copilot.executable())),
     )
     .await
@@ -203,8 +206,11 @@ async fn a_session_whose_cli_reports_no_active_model_runs_under_the_selected_one
     ));
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let titling = titling_turned_off();
     let server = server::spawn_with_provider(
-        ServerConfig::new(state_dir.path(), "copilot-modelless-startup").expect("configure server"),
+        ServerConfig::new(state_dir.path(), "copilot-modelless-startup")
+            .expect("configure server")
+            .with_config_dir(titling.path()),
         Arc::new(CopilotRuntime::new(copilot.executable())),
     )
     .await

@@ -2,10 +2,9 @@
 
 use crate::{
     provider_support::ControlledProvider,
+    server_support::{catalog_changes_through_title, config_root_pinning, open_catalog_stream},
     support::{hosted_model, hosted_selection},
 };
-use eventsource_stream::Eventsource;
-use futures_util::StreamExt;
 use serde_json::json;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
@@ -13,9 +12,8 @@ use suru::{
         AgentId, AgentIdentity, AgentSelection, CreateSessionRequest, InitialPrompt,
         ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
         ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
-        ModelOptionSelection, ModelOptionValue, PromptId, ProviderId, RuntimeDescriptor,
-        SESSION_CATALOG_UPDATED_EVENT, SessionCatalogChange, SessionCatalogUpdate, SessionDeleted,
-        SessionId, SessionListItem, SessionTitleChanged, TitleErrand, Workspace,
+        ModelOptionSelection, ModelOptionValue, PromptId, ProviderId, SessionCatalogChange,
+        SessionDeleted, SessionId, SessionListItem, SessionTitleChanged, TitleErrand, Workspace,
     },
     provider::ProviderEvent,
     server::{self, ServerConfig, ServerTimings},
@@ -806,19 +804,6 @@ async fn a_derived_title_outlives_a_restart_and_is_never_derived_again() {
     restarted.shutdown().await.expect("shut down server");
 }
 
-/// A config root holding one Config Document that pins `session.title.errand`
-/// to `errand`, which is how the Setting reaches a spawned server.
-fn config_root_pinning(errand: &TitleErrand) -> tempfile::TempDir {
-    let config_dir = tempfile::tempdir().expect("create isolated config directory");
-    let document = serde_json::json!({ "session": { "title": { "errand": errand } } });
-    std::fs::write(
-        config_dir.path().join("suru.jsonc"),
-        serde_json::to_string_pretty(&document).expect("serialize the Config Document"),
-    )
-    .expect("write Config Document");
-    config_dir
-}
-
 /// Runs a Session's first Turn through to completion, which is every chance a
 /// derivation would have had to reach the Provider. What follows can then say
 /// no Errand was asked for without waiting out a deadline.
@@ -1037,50 +1022,4 @@ async fn a_pinned_model_that_has_gone_falls_back_to_its_providers_default_model(
     );
 
     server.shutdown().await.expect("shut down server");
-}
-
-/// The raw catalog stream, so a test can count what fired on it rather than
-/// only what a client made of it.
-async fn open_catalog_stream(
-    descriptor: &RuntimeDescriptor,
-) -> impl futures_util::Stream<Item = SessionCatalogUpdate> + Unpin {
-    let response = reqwest::Client::new()
-        .get(format!("{}/v1/session-events", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("open the Session catalog stream")
-        .error_for_status()
-        .expect("the catalog stream authenticates");
-    Box::pin(
-        response
-            .bytes_stream()
-            .eventsource()
-            .filter_map(|event| async move {
-                let event = event.expect("the catalog stream stays open");
-                (event.event == SESSION_CATALOG_UPDATED_EVENT).then(|| {
-                    serde_json::from_str::<SessionCatalogUpdate>(&event.data)
-                        .expect("decode a catalog update")
-                })
-            }),
-    )
-}
-
-/// Every catalog change up to and including the derived Title.
-async fn catalog_changes_through_title(
-    catalog: &mut (impl futures_util::Stream<Item = SessionCatalogUpdate> + Unpin),
-) -> Vec<SessionCatalogChange> {
-    timeout(Duration::from_secs(2), async {
-        let mut changes = Vec::new();
-        while let Some(update) = catalog.next().await {
-            let done = matches!(update.change, SessionCatalogChange::TitleChanged { .. });
-            changes.push(update.change);
-            if done {
-                return changes;
-            }
-        }
-        changes
-    })
-    .await
-    .expect("the derived Title reaches the catalog stream")
 }

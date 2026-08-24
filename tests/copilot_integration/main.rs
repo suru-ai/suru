@@ -19,6 +19,7 @@ mod provider_support;
 
 mod activity;
 mod availability;
+mod errands;
 mod interruption;
 mod models;
 mod resume;

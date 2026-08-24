@@ -3,6 +3,10 @@
 //! Each module below covers one area of the protocol; `support` holds the fixtures
 //! shared between them.
 
+#[path = "../support/mod.rs"]
+#[allow(dead_code)]
+mod server_support;
+
 #[path = "../support/failing_provider.rs"]
 mod failing_provider_support;
 

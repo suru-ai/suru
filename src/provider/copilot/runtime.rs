@@ -2,19 +2,25 @@
 
 use std::ffi::{OsStr, OsString};
 
+use serde_json::Value;
 use tokio::time::Duration;
 
 use super::{
-    COPILOT_HARNESS_NAME, COPILOT_PROVIDER_ID, COPILOT_SERVER_ARGS,
+    COPILOT_HARNESS_NAME, COPILOT_PROVIDER_ID, COPILOT_SERVER_ARGS, REASONING_EFFORT_OPTION_ID,
     catalog::model_descriptors,
     copilot_error_context,
+    errand::run_copilot_errand,
     session::{INTERRUPT_REQUEST_TIMEOUT, start_copilot_session},
     transport::CopilotConnector,
 };
 use crate::{
-    protocol::{AgentSelection, ModelDescriptor, ProviderId},
+    protocol::{
+        AgentSelection, ModelDescriptor, ModelId, ModelOptionChoiceId, ModelOptionId,
+        ModelOptionSelection, ModelOptionValue, ProviderId,
+    },
     provider::{
-        ProviderFuture, ProviderRuntime, ProviderSessionConnection, ProviderSessionRequest,
+        ProviderErrand, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
+        ProviderSessionRequest,
         harness::{HarnessSpec, SharedHarness},
         resolve_executable,
     },
@@ -22,6 +28,16 @@ use crate::{
 
 const COPILOT_PATH_ENV: &str = "SURU_COPILOT_PATH";
 const COPILOT_EXECUTABLE_NAME: &str = "copilot";
+
+/// The Model Copilot declares its own Errands run at: the cheapest Model in the class Copilot's own
+/// picker calls lightweight.
+const ERRAND_MODEL_ID: &str = "gpt-5.6-luna";
+
+/// The reasoning effort it declares them at, named in Copilot's own wire vocabulary: the one that
+/// spends no thinking budget at all, because a Model asked to write six words should not be paid to
+/// reason about them. Not every Copilot Model offers it, which is one more reason the Model and the
+/// effort are declared together.
+const ERRAND_REASONING_EFFORT: &str = "none";
 
 /// Drives every Copilot Session and Model discovery through one supervised Copilot CLI server
 /// process, launched on the first demand and relaunched fresh after a crash.
@@ -103,20 +119,37 @@ impl ProviderRuntime for CopilotRuntime {
         })
     }
 
-    // Copilot fulfils Errands through the SDK, which is its own piece of work;
-    // until that lands it declares that it runs none.
-    fn run_errand(
-        &self,
-        _errand: crate::provider::ProviderErrand,
-    ) -> ProviderFuture<'_, serde_json::Value> {
-        crate::provider::errand_unimplemented(&self.provider_id())
+    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, Value> {
+        Box::pin(async move {
+            // The same shared process every Session and discovery runs on, launched here too if
+            // this is the first demand since the server started or since a crash.
+            let handle = self.harness.demand().await?;
+            run_copilot_errand(handle, errand).await
+        })
     }
 
-    // Which of Copilot's Models is cheap, and at which effort, is settled
-    // alongside the SDK work above; until then its Errands run at whatever
-    // Model Copilot already defaults to.
+    /// The Agent Selection Copilot's own Errands run at.
+    ///
+    /// Copilot names no cheap Model of its own — its catalog marks a Model's price band and picker
+    /// category but never says which one Copilot itself would use for a chore — so the choice is
+    /// made here, and made as a whole Selection rather than a Model identifier, because Copilot
+    /// relays reasoning efforts in its own publication order under its own wire names and nothing in
+    /// that order says which is the least.
+    ///
+    /// Both halves are a declaration rather than a resolution. A Model withdrawn from the catalog,
+    /// or one that stops offering this effort, gives way to Copilot's own default Model rather than
+    /// failing the Errand.
     fn errand_selection(&self) -> Option<AgentSelection> {
-        None
+        Some(AgentSelection {
+            provider: ProviderId::new(COPILOT_PROVIDER_ID),
+            model: ModelId::new(ERRAND_MODEL_ID),
+            options: vec![ModelOptionSelection {
+                id: ModelOptionId::new(REASONING_EFFORT_OPTION_ID),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new(ERRAND_REASONING_EFFORT),
+                },
+            }],
+        })
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {

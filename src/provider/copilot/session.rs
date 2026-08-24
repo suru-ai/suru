@@ -170,7 +170,7 @@ fn known_session_id(
 
 /// Runs `work` against the CLI, giving up the moment the shared harness process hosting it dies:
 /// once the process is gone nothing is left to answer, so its exit is the answer.
-async fn until_crash<T>(
+pub(super) async fn until_crash<T>(
     handle: &SharedHarnessHandle<CopilotConnection>,
     context: &str,
     work: impl Future<Output = Result<T, github_copilot_sdk::Error>>,
@@ -310,8 +310,12 @@ impl CopilotSession {
     }
 }
 
-/// The Model Options an Agent Selection carries, in the shape Copilot's Model switch takes them.
-fn lower_selection_options(selection: &AgentSelection) -> Result<SetModelOptions, ProviderError> {
+/// The Model Options an Agent Selection carries, in the shape Copilot takes them — which is the
+/// same shape whether they are put in force by switching a running Session onto them or by opening
+/// a Session under them, as an Errand does.
+pub(super) fn lower_selection_options(
+    selection: &AgentSelection,
+) -> Result<SetModelOptions, ProviderError> {
     let mut lowered = SetModelOptions::default();
     for option in &selection.options {
         let ModelOptionValue::Select { choice } = &option.value else {

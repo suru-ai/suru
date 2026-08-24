@@ -36,6 +36,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
+#[allow(dead_code)]
 mod support;
 
 use support::{

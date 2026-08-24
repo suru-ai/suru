@@ -406,15 +406,6 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     }
 }
 
-/// The answer a built-in runtime gives while it has yet to implement the Errand
-/// capability against its own harness. It fails rather than answering nothing,
-/// so whatever asked for the Errand records why in the Log and falls back,
-/// instead of waiting on a reply that is never coming.
-pub(crate) fn errand_unimplemented(provider: &ProviderId) -> ProviderFuture<'static, Value> {
-    let message = format!("Provider `{provider}` does not run Errands yet");
-    Box::pin(async move { Err(ProviderError::new(message)) })
-}
-
 pub(crate) fn validate_models(models: &[ModelDescriptor]) -> Result<(), ProviderError> {
     let mut model_ids = std::collections::HashSet::new();
     for model in models {
