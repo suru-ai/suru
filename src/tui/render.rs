@@ -99,14 +99,16 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     if state.session_picker.is_open() && !state.reconnect_overlay_visible {
         render_session_picker(frame, state, &theme);
     }
-    if state.model_picker.is_open() && !state.reconnect_overlay_visible {
-        render_model_picker(frame, state, &theme);
-    }
     if state.model_options.is_open() && !state.reconnect_overlay_visible {
         render_model_options(frame, state, &theme);
     }
     if state.settings_panel.is_open() && !state.reconnect_overlay_visible {
         render_settings_panel(frame, state, &theme);
+    }
+    // Last of the overlays, because a settings panel row opens it: the picker
+    // is what the reader is answering, so it is drawn over whatever asked.
+    if state.model_picker.is_open() && !state.reconnect_overlay_visible {
+        render_model_picker(frame, state, &theme);
     }
     if state.reconnect_overlay_visible {
         render_reconnect_overlay(frame, &theme);
@@ -445,10 +447,16 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
     let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
     // Read before the window narrows the rows, and read off the focused row:
     // Enter acts on that row alone, so that row decides whether the key is
-    // worth teaching.
-    let expands = rows
-        .iter()
-        .any(|row| row.selected && row.expansion.expands());
+    // worth teaching and which of the two things it does it would do.
+    let enter_hint = rows.iter().find(|row| row.selected).map_or("", |row| {
+        if row.chooses {
+            "Enter choose · "
+        } else if row.expansion.expands() {
+            "Enter expand · "
+        } else {
+            ""
+        }
+    });
     // The rows begin under whatever has been drawn above them, and the window
     // decides which of the tab's rows those are — so this frame is the only
     // thing that can say what a pointer over them landed on.
@@ -505,11 +513,10 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
     }
     if footer_rows > 0 && lines.len() < content_height {
         // Enter is taught only where it does something, so a reader focused on
-        // a row that does not expand is never offered a dead key.
-        let expand = if expands { "Enter expand · " } else { "" };
+        // a row that opens onto nothing is never offered a dead key.
         lines.push(Line::styled(
             truncate_to_width(
-                &format!("{expand}Left/Right tabs · Space change · Ctrl+D reset · Esc close"),
+                &format!("{enter_hint}Left/Right tabs · Space change · Ctrl+D reset · Esc close"),
                 content_width,
             ),
             theme.text.subdued,

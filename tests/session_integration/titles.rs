@@ -15,7 +15,7 @@ use suru::{
         ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
         ModelOptionSelection, ModelOptionValue, PromptId, ProviderId, RuntimeDescriptor,
         SESSION_CATALOG_UPDATED_EVENT, SessionCatalogChange, SessionCatalogUpdate, SessionDeleted,
-        SessionId, SessionListItem, SessionTitleChanged, Workspace,
+        SessionId, SessionListItem, SessionTitleChanged, TitleErrand, Workspace,
     },
     provider::ProviderEvent,
     server::{self, ServerConfig, ServerTimings},
@@ -336,20 +336,7 @@ async fn a_provider_with_no_model_to_run_an_errand_at_is_asked_for_none() {
         .await
         .expect("create Session");
 
-    // The Session's first Turn runs its full course, which is every chance a
-    // derivation would have had to reach the Provider.
-    let mut session = timeout(Duration::from_secs(1), provider.next_start())
-        .await
-        .expect("the first Turn starts a Provider Session")
-        .succeed(AgentIdentity {
-            agent: AgentId::new("controlled-agent"),
-            selection: hosted_selection(PROVIDER, MODEL),
-        });
-    timeout(Duration::from_secs(1), session.next_turn())
-        .await
-        .expect("the first Turn reaches the Provider")
-        .succeed();
-    session.emit(ProviderEvent::TurnCompleted);
+    work_the_first_turn(&mut provider).await;
 
     assert!(
         provider.try_next_errand().is_none(),
@@ -588,20 +575,7 @@ async fn a_session_with_no_agent_selection_asks_for_no_errand_at_all() {
         .expect("create Session");
     assert_eq!(created.session.agent_selection, None);
 
-    // The Session's first Turn runs its full course, which is every chance a
-    // derivation would have had to reach the Provider.
-    let mut session = timeout(Duration::from_secs(1), provider.next_start())
-        .await
-        .expect("the first Turn starts a Provider Session")
-        .succeed(AgentIdentity {
-            agent: AgentId::new("controlled-agent"),
-            selection: hosted_selection(PROVIDER, MODEL),
-        });
-    timeout(Duration::from_secs(1), session.next_turn())
-        .await
-        .expect("the first Turn reaches the Provider")
-        .succeed();
-    session.emit(ProviderEvent::TurnCompleted);
+    work_the_first_turn(&mut provider).await;
 
     assert!(
         provider.try_next_errand().is_none(),
@@ -830,6 +804,239 @@ async fn a_derived_title_outlives_a_restart_and_is_never_derived_again() {
     );
 
     restarted.shutdown().await.expect("shut down server");
+}
+
+/// A config root holding one Config Document that pins `session.title.errand`
+/// to `errand`, which is how the Setting reaches a spawned server.
+fn config_root_pinning(errand: &TitleErrand) -> tempfile::TempDir {
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let document = serde_json::json!({ "session": { "title": { "errand": errand } } });
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        serde_json::to_string_pretty(&document).expect("serialize the Config Document"),
+    )
+    .expect("write Config Document");
+    config_dir
+}
+
+/// Runs a Session's first Turn through to completion, which is every chance a
+/// derivation would have had to reach the Provider. What follows can then say
+/// no Errand was asked for without waiting out a deadline.
+async fn work_the_first_turn(provider: &mut ControlledProvider) {
+    let mut session = timeout(Duration::from_secs(1), provider.next_start())
+        .await
+        .expect("the first Turn starts a Provider Session")
+        .succeed(AgentIdentity {
+            agent: AgentId::new("controlled-agent"),
+            selection: hosted_selection(PROVIDER, MODEL),
+        });
+    timeout(Duration::from_secs(1), session.next_turn())
+        .await
+        .expect("the first Turn reaches the Provider")
+        .succeed();
+    session.emit(ProviderEvent::TurnCompleted);
+}
+
+#[tokio::test]
+async fn title_derivation_turned_off_asks_for_no_errand_at_all() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config_dir = config_root_pinning(&TitleErrand::Off);
+    let (runtime, mut provider) = titling_provider();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "title-off-test")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let client = connected_client(state_dir.path(), "title-off-test").await;
+
+    let created = client
+        .create_session(create_request(workspace.path(), "Explain the seam"))
+        .await
+        .expect("create Session");
+
+    work_the_first_turn(&mut provider).await;
+
+    assert!(
+        provider.try_next_errand().is_none(),
+        "a user who turned titling off is charged for no Provider call on Suru's behalf"
+    );
+    assert_eq!(
+        listed_title(&client, created.session.id).await,
+        ("Explain the seam".to_owned(), None),
+        "the Prompt-derived Title stands"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_pinned_selection_titles_a_session_whatever_that_session_converses_at() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    // The Session converses at the Provider's default Model; the pin names the
+    // other one, so the Model the Errand runs at can only have come from it.
+    let pinned = AgentSelection {
+        provider: ProviderId::new(PROVIDER),
+        model: ModelId::new(ERRAND_MODEL),
+        options: Vec::new(),
+    };
+    let config_dir = config_root_pinning(&TitleErrand::Pinned(pinned));
+    let (runtime, mut provider) = errand_titling_provider();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "title-pinned-test")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = connected_client(state_dir.path(), "title-pinned-test").await;
+
+    let created = client
+        .create_session(create_request(workspace.path(), "Explain the seam"))
+        .await
+        .expect("create Session");
+
+    let errand = timeout(Duration::from_secs(1), provider.next_errand())
+        .await
+        .expect("an Errand reaches the Provider");
+    assert_eq!(
+        errand.selection(),
+        &AgentSelection {
+            provider: ProviderId::new(PROVIDER),
+            model: ModelId::new(ERRAND_MODEL),
+            // The pin names a Model and leaves its Options alone, so the
+            // Model's own defaults fill them in like any other declaration.
+            options: vec![ModelOptionSelection {
+                id: ModelOptionId::new(EFFORT_OPTION),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("thorough"),
+                },
+            }],
+        },
+        "the pinned Provider and Model derive the Title, not the Session's own"
+    );
+    errand.succeed(json!({ "title": "Explain the Provider seam", "emoji": "\u{1F9F5}" }));
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("the derived Title reaches the client"),
+        Some(ManagedEvent::SessionTitleChanged(SessionTitleChanged {
+            session_id: created.session.id,
+            title: "Explain the Provider seam".to_owned(),
+            emoji: Some("\u{1F9F5}".to_owned()),
+        }))
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_pinned_selection_titles_a_session_that_has_selected_no_provider() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    // A Provider serving one Model and defaulting to none, so a Session created
+    // without a Selection acquires none — and the pin is the only thing in the
+    // running server naming a Model an Errand could run at.
+    let mut only_model = hosted_model(PROVIDER, ERRAND_MODEL);
+    only_model.is_default = false;
+    let pinned = AgentSelection {
+        provider: ProviderId::new(PROVIDER),
+        model: ModelId::new(ERRAND_MODEL),
+        options: Vec::new(),
+    };
+    let config_dir = config_root_pinning(&TitleErrand::Pinned(pinned.clone()));
+    let (runtime, mut provider) =
+        ControlledProvider::with_provider(ProviderId::new(PROVIDER), vec![only_model]);
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "title-pinned-unselected-test")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let client = connected_client(state_dir.path(), "title-pinned-unselected-test").await;
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Explain the seam".to_owned(),
+            },
+        })
+        .await
+        .expect("create Session");
+    assert_eq!(created.session.agent_selection, None);
+
+    let errand = timeout(Duration::from_secs(1), provider.next_errand())
+        .await
+        .expect("an Errand reaches the Provider");
+    assert_eq!(
+        errand.selection(),
+        &pinned,
+        "a pin is the user choosing a Provider up front, so a Session that chose none is still titled"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_pinned_model_that_has_gone_falls_back_to_its_providers_default_model() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config_dir = config_root_pinning(&TitleErrand::Pinned(AgentSelection {
+        provider: ProviderId::new(PROVIDER),
+        model: ModelId::new(ERRAND_MODEL),
+        options: Vec::new(),
+    }));
+    let (runtime, mut provider) = errand_titling_provider();
+    let catalog = std::sync::Arc::clone(&runtime);
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "title-pinned-withdrawal-test")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let client = connected_client(state_dir.path(), "title-pinned-withdrawal-test").await;
+
+    client
+        .create_session(create_request(workspace.path(), "Explain the seam"))
+        .await
+        .expect("create Session");
+    timeout(Duration::from_secs(1), provider.next_errand())
+        .await
+        .expect("an Errand reaches the Provider")
+        .succeed(json!({ "title": "Explain the Provider seam", "emoji": "\u{1F9F5}" }));
+
+    catalog.withdraw_model(&ModelId::new(ERRAND_MODEL));
+    client.refresh_models().await.expect("refresh the catalog");
+
+    client
+        .create_session(create_request(workspace.path(), "Ship the picker"))
+        .await
+        .expect("create the second Session");
+    let errand = timeout(Duration::from_secs(1), provider.next_errand())
+        .await
+        .expect("a second Errand reaches the Provider");
+    assert_eq!(
+        errand.selection(),
+        &hosted_selection(PROVIDER, MODEL),
+        "a pin naming a Model that has gone falls back rather than costing the Errand its answer"
+    );
+
+    server.shutdown().await.expect("shut down server");
 }
 
 /// The raw catalog stream, so a test can count what fired on it rather than

@@ -2,12 +2,17 @@
 //!
 //! A Session is titled with the verbatim text of its first Prompt, which is a
 //! real Title rather than a placeholder but rarely a good one. The moment that
-//! Prompt is admitted, Suru asks the Session's own Provider — through an Errand
-//! — for a short line naming the subject and the outcome, with an Emoji to
-//! stand beside it, and replaces the Title with what comes back. The Provider
-//! is the Session's; the Model is that Provider's declared Errand Selection,
-//! resolved when the Errand runs, so titling is paid for at the rate that
-//! Provider keeps for its own work rather than at the rate of conversing.
+//! Prompt is admitted, Suru asks a Provider — through an Errand — for a short
+//! line naming the subject and the outcome, with an Emoji to stand beside it,
+//! and replaces the Title with what comes back.
+//!
+//! Which Provider is the `session.title.errand` Setting's answer, read when the
+//! derivation begins. Left alone it is the Session's own, at that Provider's
+//! declared Errand Selection resolved when the Errand runs, so titling is paid
+//! for at the rate that Provider keeps for its own work rather than at the rate
+//! of conversing. Turned off, no Errand is asked for at all. Pinned to an Agent
+//! Selection, that Provider and Model derive every Session's Title whatever the
+//! Session itself uses — including a Session using nothing.
 //!
 //! Everything here is best-effort by construction. The derivation runs in the
 //! background alongside the real first Turn and never blocks or gates it; it is
@@ -18,11 +23,14 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::watch;
 
 use crate::{
     errands::ErrandRunner,
     model_catalog::ModelCatalogService,
-    protocol::{ProviderId, SessionCatalogChange, SessionId},
+    protocol::{
+        AgentSelection, ProviderId, SessionCatalogChange, SessionId, SettingsSnapshot, TitleErrand,
+    },
     provider::ProviderErrand,
 };
 
@@ -91,6 +99,10 @@ pub(crate) struct TitleDerivation {
     /// against — every time one runs, rather than once when the server started.
     models: ModelCatalogService,
     sessions: SessionStore,
+    /// The effective Settings in force, read when a derivation begins. A
+    /// Setting the user changes governs the Sessions they start next rather
+    /// than reaching back into a derivation already under way.
+    settings: watch::Receiver<SettingsSnapshot>,
 }
 
 impl TitleDerivation {
@@ -98,11 +110,13 @@ impl TitleDerivation {
         errands: ErrandRunner,
         models: ModelCatalogService,
         sessions: SessionStore,
+        settings: watch::Receiver<SettingsSnapshot>,
     ) -> Self {
         Self {
             errands,
             models,
             sessions,
+            settings,
         }
     }
 
@@ -112,15 +126,17 @@ impl TitleDerivation {
     /// cancel it, because the Prompt was still written and still deserves a
     /// Title.
     ///
-    /// A Session that has selected no Provider is skipped, permanently: Suru
-    /// will not pick a Provider the user did not choose, and deferring the
-    /// attempt would give derivation a second trigger point and pending state
-    /// to carry.
+    /// Following the Session, a Session that has selected no Provider is
+    /// skipped, permanently: Suru will not pick a Provider the user did not
+    /// choose, and deferring the attempt would give derivation a second trigger
+    /// point and pending state to carry. A pinned Selection is the user
+    /// choosing one up front, so it titles that Session like any other.
     ///
-    /// The Session's own Provider is all its Agent Selection decides here. The
-    /// Model is the Provider's own business — its declared Errand Selection,
-    /// resolved when the Errand runs — because the Model a user converses with
-    /// is not the one that should be paid to write six words.
+    /// Where the Session's own Provider runs the Errand, its Agent Selection
+    /// decides the Provider and nothing else. The Model is the Provider's own
+    /// business — its declared Errand Selection, resolved when the Errand runs
+    /// — because the Model a user converses with is not the one that should be
+    /// paid to write six words.
     pub(crate) fn derive(
         &self,
         session_id: SessionId,
@@ -128,11 +144,7 @@ impl TitleDerivation {
         provider: Option<ProviderId>,
         prompt: &str,
     ) {
-        let Some(provider) = provider else {
-            tracing::debug!(
-                %session_id,
-                "no Title Errand: the Session has selected no Provider"
-            );
+        let Some(errand_at) = self.errand_at(session_id, provider) else {
             return;
         };
         // The Title as it stands right now is the one this derivation is
@@ -145,7 +157,11 @@ impl TitleDerivation {
         let models = self.models.clone();
         let sessions = self.sessions.clone();
         tokio::spawn(async move {
-            let Some(selection) = models.resolved_errand_selection(&provider).await else {
+            let (provider, pinned) = match &errand_at {
+                ErrandAt::Provider(provider) => (provider, None),
+                ErrandAt::Selection(selection) => (&selection.provider, Some(selection)),
+            };
+            let Some(selection) = models.resolved_errand_selection(provider, pinned).await else {
                 tracing::info!(
                     %session_id,
                     "no Title Errand: `{provider}` offers no Model to run one at"
@@ -180,6 +196,38 @@ impl TitleDerivation {
             }
         });
     }
+
+    /// Where this Session's Title Errand goes, as the Setting in force decides,
+    /// and `None` where it goes nowhere. Read before anything is spawned, so a
+    /// Setting turning derivation off costs no task and no Provider call.
+    fn errand_at(&self, session_id: SessionId, provider: Option<ProviderId>) -> Option<ErrandAt> {
+        match &self.settings.borrow().settings.session.title.errand {
+            TitleErrand::Off => {
+                tracing::debug!(%session_id, "no Title Errand: Title derivation is turned off");
+                None
+            }
+            TitleErrand::Pinned(selection) => Some(ErrandAt::Selection(selection.clone())),
+            TitleErrand::FollowSession => match provider {
+                Some(provider) => Some(ErrandAt::Provider(provider)),
+                None => {
+                    tracing::debug!(
+                        %session_id,
+                        "no Title Errand: the Session has selected no Provider"
+                    );
+                    None
+                }
+            },
+        }
+    }
+}
+
+/// What one derivation was told to run its Errand at: a Provider whose own
+/// declaration decides the Model, or a whole Selection the user pinned. Both
+/// are resolved against the live catalog by the same rules when the Errand
+/// runs; the difference is only whose choice is being resolved.
+enum ErrandAt {
+    Provider(ProviderId),
+    Selection(AgentSelection),
 }
 
 impl SessionStore {

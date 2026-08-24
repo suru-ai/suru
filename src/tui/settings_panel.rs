@@ -43,7 +43,10 @@ use crate::{
         SettingMutation,
     },
     provider::built_in_providers,
-    settings::{SCHEMA, SettingDescriptor, SettingGroup, provider_enablement, provider_settings},
+    settings::{
+        SCHEMA, SettingChoiceSurface, SettingDescriptor, SettingGroup, provider_enablement,
+        provider_settings,
+    },
 };
 
 use super::ModelListRequest;
@@ -231,6 +234,10 @@ pub(super) struct SettingRow {
     pub(super) pinned: bool,
     pub(super) selected: bool,
     pub(super) expansion: RowExpansion,
+    /// Whether opening this row leads to a surface where its value is chosen,
+    /// which is the other thing Enter does and so the other thing a footer has
+    /// to teach.
+    pub(super) chooses: bool,
     pub(super) availability: RowAvailability,
 }
 
@@ -317,6 +324,14 @@ pub(super) enum RowValue {
     ProviderDisabled,
 }
 
+/// What the focused row stands for, which is what opening it acts on: the
+/// further Settings a Provider holds, or the surface a Setting's value is
+/// chosen at. A row standing for neither yields none of these and is left alone.
+enum RowOpening {
+    Provider(&'static ProviderId),
+    Surface(SettingChoiceSurface),
+}
+
 /// One row of a tab before a snapshot values it: what it is called, the Setting
 /// an edit of it acts on, and whether it stands for a Provider rather than for
 /// a value to read.
@@ -325,6 +340,18 @@ struct PanelEntry {
     descriptor: &'static SettingDescriptor,
     provider: Option<&'static ProviderId>,
     expansion: RowExpansion,
+}
+
+impl PanelEntry {
+    /// Where this row's value is chosen, for a row that leads to such a
+    /// surface at all. A Provider's row stands for its Enablement, which is
+    /// cycled rather than chosen, so it leads nowhere however the Setting
+    /// behind it is declared.
+    fn choice_surface(&self) -> Option<SettingChoiceSurface> {
+        self.provider
+            .is_none()
+            .then(|| self.descriptor.chosen_at())?
+    }
 }
 
 impl SettingsPanel {
@@ -567,38 +594,54 @@ impl SettingsPanel {
                     pinned: pinned.iter().any(|key| key == entry.descriptor.key),
                     selected: index == selected,
                     expansion: entry.expansion,
+                    chooses: entry.choice_surface().is_some(),
                     availability,
                 }
             })
             .collect()
     }
 
-    /// Reveals the focused Provider's further Settings beneath it, or hides
-    /// them again. Enter carries no other meaning in the panel, so a row with
-    /// nothing to reveal — a Setting, or a Provider configured by nothing
-    /// else — is left exactly as it was rather than given a second behavior.
-    /// Like an edit, this reaches a Provider only through the focused row, so a
-    /// command arriving while the panel is closed expands nothing.
-    pub(super) fn toggle_expansion(&mut self) {
+    /// Opens the focused row onto whatever it stands for. That is one meaning
+    /// rather than two: a Provider stands for the further Settings it holds, so
+    /// opening it reveals them and opening it again hides them; a Setting whose
+    /// value is chosen rather than cycled stands for the surface that chooses
+    /// it, so opening the row answers with that surface for the caller to show.
+    /// A row standing for neither is left exactly as it was.
+    ///
+    /// Like an edit, this reaches a row only through the focus, so a command
+    /// arriving while the panel is closed opens nothing.
+    pub(super) fn open_row(&mut self) -> Option<SettingChoiceSurface> {
         if !self.open {
-            return;
+            return None;
         }
         let entries = self.entries();
-        let expandable = entries
-            .get(self.selected_row(entries.len()))
-            .filter(|entry| entry.expansion.expands())
-            .and_then(|entry| entry.provider);
-        let Some(provider) = expandable else {
-            return;
-        };
+        let entry = entries.get(self.selected_row(entries.len()))?;
+        let opening = match entry.provider {
+            // A Provider stands for the further Settings it holds, and one
+            // holding none stands for nothing to open.
+            Some(provider) => entry
+                .expansion
+                .expands()
+                .then_some(provider)
+                .map(RowOpening::Provider),
+            // A Setting's row stands for the surface its value is chosen at,
+            // where its value is one a reader chooses rather than cycles.
+            None => entry.choice_surface().map(RowOpening::Surface),
+        }?;
         // Cleared only once the key has something to do, so a row Enter passes
         // over does not quietly take away the complaint the reader is reading.
         self.error = None;
-        match self.expanded.iter().position(|open| *open == provider) {
-            Some(index) => {
-                self.expanded.remove(index);
+        match opening {
+            RowOpening::Surface(surface) => Some(surface),
+            RowOpening::Provider(provider) => {
+                match self.expanded.iter().position(|open| *open == provider) {
+                    Some(index) => {
+                        self.expanded.remove(index);
+                    }
+                    None => self.expanded.push(provider),
+                }
+                None
             }
-            None => self.expanded.push(provider),
         }
     }
 
@@ -612,7 +655,7 @@ impl SettingsPanel {
     pub(super) fn cycle(&mut self, settings: &EffectiveSettings) -> Option<SettingMutation> {
         self.error = None;
         let descriptor = self.selected_descriptor()?;
-        Some(descriptor.next_choice(settings)?.pin)
+        Some(descriptor.next_choice(settings)?.pin.clone())
     }
 
     /// Takes the focused Setting's pin out of the Config Document. The reset
@@ -622,7 +665,7 @@ impl SettingsPanel {
     /// unset of something never pinned leaves the document untouched anyway.
     pub(super) fn reset(&mut self) -> Option<SettingMutation> {
         self.error = None;
-        Some(self.selected_descriptor()?.reset)
+        Some(self.selected_descriptor()?.reset.clone())
     }
 
     /// The rows of the tab being shown. General is the schema filtered to its

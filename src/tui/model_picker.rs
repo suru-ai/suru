@@ -3,10 +3,24 @@
 use crate::protocol::{
     AgentSelection, ModelAvailability, ModelCatalog, ModelDescriptor, ModelId, ModelOptionKind,
     ModelOptionRole, ModelOptionValue, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
-    ProviderUnavailability,
+    ProviderUnavailability, SettingMutation,
 };
 
 use super::ModelListRequest;
+
+/// What the Model a reader picks here is for. The picker is one list of Models
+/// however it was opened; where its answer goes is the opener's question, asked
+/// when the picker opens rather than guessed at when it closes.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) enum ModelPickerPurpose {
+    /// The Agent this Session — or the Landing — will converse with.
+    #[default]
+    AgentSelection,
+    /// One Setting holding an Agent Selection, pinned through the mutation the
+    /// Setting itself supplied. The picker knows nothing about which Setting:
+    /// it carries the pin and hands the choice to it.
+    Setting(fn(AgentSelection) -> SettingMutation),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ModelKey {
@@ -50,6 +64,13 @@ pub(super) struct ModelPicker {
     open: bool,
     request_sequence: u64,
     active_request: Option<ModelListRequest>,
+    /// What the Model chosen here is for, which the opener decides.
+    purpose: ModelPickerPurpose,
+    /// The Selection this picker was opened onto, kept because the Selection a
+    /// caller passes in later is the Session's own — and a picker opened to
+    /// choose a Setting's value must not be dragged onto the Model the reader
+    /// happens to be conversing at when the catalog lands.
+    opened_on: Option<AgentSelection>,
     provider_scope: Option<ProviderId>,
     query: String,
     cached_providers: Vec<ProviderModels>,
@@ -133,9 +154,12 @@ impl ModelPicker {
         &mut self,
         current: Option<&AgentSelection>,
         provider_scope: Option<ProviderId>,
+        purpose: ModelPickerPurpose,
     ) -> ModelListRequest {
         self.open = true;
         self.query.clear();
+        self.purpose = purpose;
+        self.opened_on = current.cloned();
         self.provider_scope = provider_scope;
         self.providers.clone_from(&self.cached_providers);
         self.cursor_moved = false;
@@ -147,8 +171,30 @@ impl ModelPicker {
     pub(super) fn close(&mut self) {
         self.open = false;
         self.query.clear();
+        self.purpose = ModelPickerPurpose::default();
+        self.opened_on = None;
         self.selected = None;
         self.cursor_moved = false;
+    }
+
+    pub(super) fn purpose(&self) -> ModelPickerPurpose {
+        self.purpose
+    }
+
+    /// The Selection this picker reads as the one in force — which row it
+    /// focuses, and which row it marks as the reader's current choice.
+    ///
+    /// A picker choosing the Agent takes the Session's own Selection, which is
+    /// what its callers hand in. A picker choosing a Setting's value takes the
+    /// Selection that Setting was holding when the row opened it instead: the
+    /// Session's Model is not what this picker is asking about, and letting it
+    /// in would move the focus off the reader's pin the moment a catalog
+    /// listing came back.
+    fn selection_in_force(&self, current: Option<&AgentSelection>) -> Option<AgentSelection> {
+        match self.purpose {
+            ModelPickerPurpose::AgentSelection => current.cloned(),
+            ModelPickerPurpose::Setting(_) => self.opened_on.clone(),
+        }
     }
 
     pub(super) fn is_open(&self) -> bool {
@@ -181,7 +227,8 @@ impl ModelPicker {
     pub(super) fn refocus(&mut self, current: Option<&AgentSelection>) {
         if self.open {
             self.cursor_moved = false;
-            self.focus(current, false);
+            let in_force = self.selection_in_force(current);
+            self.focus(in_force.as_ref(), false);
         }
     }
 
@@ -216,7 +263,8 @@ impl ModelPicker {
                 },
             });
         }
-        self.focus(current, self.cursor_moved);
+        let in_force = self.selection_in_force(current);
+        self.focus(in_force.as_ref(), self.cursor_moved);
     }
 
     pub(super) fn finish(&mut self, request: &ModelListRequest) {
@@ -305,7 +353,7 @@ impl ModelPicker {
         capacity: usize,
         current: Option<&AgentSelection>,
     ) -> impl Iterator<Item = ModelPickerRow<'_>> {
-        let rows = self.rows(current);
+        let rows = self.rows(self.selection_in_force(current).as_ref());
         let selected = rows
             .iter()
             .position(|row| match row {

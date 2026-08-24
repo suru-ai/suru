@@ -113,9 +113,11 @@ pub(super) fn command_for_model_options_event(event: InputEvent) -> Option<Comma
 /// The settings panel edits one Setting at a time and has no search line, so
 /// its keys are Up and Down between the rows of a tab, Left and Right between
 /// the tabs themselves, the Space that cycles the focused value, the Enter that
-/// expands a Provider onto its further Settings, and the reset that takes a pin
-/// out. Enter means expansion and nothing else, so it never edits a value.
-/// Nothing else reaches the composer while the panel is open.
+/// opens the focused row onto whatever it stands for — a Provider's further
+/// Settings, or the surface a value too rich to cycle is chosen at — and the
+/// reset that takes a pin out. Enter opens and never edits: what it opens onto
+/// is where a value the reader chooses is settled. Nothing else reaches the
+/// composer while the panel is open.
 ///
 /// The reader may also point at the panel, which the frame's own geometry
 /// resolves. A left press is the whole of it: the pointer asks for a tab or a
@@ -146,7 +148,7 @@ pub(super) fn command_for_settings_panel_event(event: InputEvent) -> Option<Comm
         }
         (KeyCode::Left, KeyModifiers::NONE) => SemanticCommandId::SettingsTabPrevious,
         (KeyCode::Right, KeyModifiers::NONE) => SemanticCommandId::SettingsTabNext,
-        (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::SettingsExpansionToggle,
+        (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::SettingsRowOpen,
         (KeyCode::Char(' '), KeyModifiers::NONE) => SemanticCommandId::SettingsValueCycle,
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => SemanticCommandId::SettingsReset,
         (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::SettingsClose,

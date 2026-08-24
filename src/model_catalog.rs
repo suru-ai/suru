@@ -130,6 +130,12 @@ impl ModelCatalogService {
     /// it has neither, which is the point at which whoever asked for the Errand
     /// gives up on it rather than guessing at a Model.
     ///
+    /// `pinned` is a Selection the caller insists on — a Setting pinning one
+    /// for every Errand of its purpose — which stands in for the Provider's own
+    /// declaration and is then resolved by exactly the same rules. A user who
+    /// pins a Model has said which Model to prefer, not that the Errand should
+    /// fail once that Model goes.
+    ///
     /// This resolves afresh on every Errand rather than once at startup,
     /// because a Provider's catalog changes underneath a running server and a
     /// Model that has gone should cost one Errand its cheapness rather than
@@ -137,12 +143,13 @@ impl ModelCatalogService {
     pub(crate) async fn resolved_errand_selection(
         &self,
         provider: &ProviderId,
+        pinned: Option<&AgentSelection>,
     ) -> Option<AgentSelection> {
         let catalog = self
             .providers
             .iter()
             .find(|catalog| &catalog.provider == provider)?;
-        catalog.resolved_errand_selection().await
+        catalog.resolved_errand_selection(pinned).await
     }
 
     pub(crate) fn normalize_selection(
@@ -231,9 +238,15 @@ impl ProviderCatalog {
     /// therefore either resolves a Selection and is refused by name, or — never
     /// having been discovered — offers no Model, which is what a Provider that
     /// is off does.
-    async fn resolved_errand_selection(&self) -> Option<AgentSelection> {
+    async fn resolved_errand_selection(
+        &self,
+        pinned: Option<&AgentSelection>,
+    ) -> Option<AgentSelection> {
         self.discover_once().await;
-        let declared = self.runtime.errand_selection();
+        // A Selection the user pinned stands in front of the Provider's own
+        // declaration outright rather than beside it: the Provider declares
+        // what it would choose, and the user has said otherwise.
+        let declared = pinned.cloned().or_else(|| self.runtime.errand_selection());
         let state = self
             .state
             .lock()

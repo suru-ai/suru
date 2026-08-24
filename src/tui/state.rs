@@ -21,6 +21,7 @@ use crate::{
         SettingsSnapshot, ShutdownReason, TurnId, TurnStatus, UpdateAgentSelectionRequest,
         Workspace,
     },
+    settings::SettingChoiceSurface,
     theme::Theme,
 };
 
@@ -34,7 +35,7 @@ use super::{
         command_for_settings_panel_event, command_for_terminal_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
-    model_picker::{ModelPicker, ModelPickerAction},
+    model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
     notice::{LandingNotice, Notice},
     render::render_with_slots,
     session_picker::SessionPicker,
@@ -1639,6 +1640,7 @@ impl Application {
     }
 
     fn choose_model(&mut self) -> Result<ApplicationTransition> {
+        let purpose = self.state.model_picker.purpose();
         match self.state.model_picker.choose() {
             Some(ModelPickerAction::Retry) => Ok(self.state.model_picker.begin_retry().map_or(
                 ApplicationTransition::Continue,
@@ -1646,6 +1648,20 @@ impl Application {
             )),
             Some(ModelPickerAction::Select(model)) => {
                 self.state.model_picker.close();
+                // A Model chosen for a Setting pins the Provider and Model the
+                // reader picked and nothing else, and no Options editor opens
+                // over it. The picker asked them for a Model, so the pin claims
+                // a Model: the Options are filled in from whatever that Model
+                // defaults to wherever the Selection is resolved, which keeps
+                // the pin following a Model that changes its own defaults
+                // rather than freezing today's.
+                if let ModelPickerPurpose::Setting(pin) = purpose {
+                    return Ok(ApplicationTransition::MutateSetting(pin(AgentSelection {
+                        provider: model.provider,
+                        model: model.id,
+                        options: Vec::new(),
+                    })));
+                }
                 if model.options.is_empty() {
                     return self.apply_agent_selection(model.default_agent_selection());
                 }
@@ -1988,10 +2004,11 @@ impl Application {
                     .session
                     .as_ref()
                     .and_then(|_| current.as_ref().map(|selection| selection.provider.clone()));
-                let request = self
-                    .state
-                    .model_picker
-                    .open(current.as_ref(), provider_scope);
+                let request = self.state.model_picker.open(
+                    current.as_ref(),
+                    provider_scope,
+                    ModelPickerPurpose::AgentSelection,
+                );
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::ListModels(request))
             }
@@ -2009,7 +2026,7 @@ impl Application {
             | SemanticCommandId::SettingsNext
             | SemanticCommandId::SettingsTabPrevious
             | SemanticCommandId::SettingsTabNext
-            | SemanticCommandId::SettingsExpansionToggle
+            | SemanticCommandId::SettingsRowOpen
             | SemanticCommandId::SettingsValueCycle
             | SemanticCommandId::SettingsReset
             | SemanticCommandId::SettingsClose) => Ok(self.handle_settings_panel_command(command)),
@@ -2111,8 +2128,21 @@ impl Application {
                     .select_next_tab(&self.state.settings);
                 return self.answer_availability_read(read);
             }
-            SemanticCommandId::SettingsExpansionToggle => {
-                self.state.settings_panel.toggle_expansion();
+            SemanticCommandId::SettingsRowOpen => {
+                // A row opening onto a choosing surface leaves the panel where
+                // it is and shows that surface over it, so the reader lands
+                // back on the same row once they have chosen.
+                if let Some(SettingChoiceSurface::AgentSelection { current, pin }) =
+                    self.state.settings_panel.open_row()
+                {
+                    let pinned = current(&self.state.settings);
+                    let request = self.state.model_picker.open(
+                        pinned.as_ref(),
+                        None,
+                        ModelPickerPurpose::Setting(pin),
+                    );
+                    return ApplicationTransition::ListModels(request);
+                }
                 None
             }
             SemanticCommandId::SettingsValueCycle => {
@@ -2340,14 +2370,20 @@ impl Application {
     /// Translates a terminal event through the active input mode. `None` means
     /// the event changes nothing, so callers can skip redrawing.
     pub fn command_for_terminal_input(&self, event: InputEvent) -> Option<CommandId> {
+        // The Model picker is tested first because it is the one surface that
+        // can now open over another: a settings panel row opens it, so while it
+        // is up it is the newer surface, drawn over the panel, and every key
+        // belongs to it until the reader is done choosing. The order among the
+        // rest is unchanged and carries no meaning — no two of them are ever
+        // open at once.
+        if self.state.model_picker.is_open() {
+            return command_for_model_picker_event(event);
+        }
         if self.state.settings_panel.is_open() {
             return command_for_settings_panel_event(event);
         }
         if self.state.model_options.is_open() {
             return command_for_model_options_event(event);
-        }
-        if self.state.model_picker.is_open() {
-            return command_for_model_picker_event(event);
         }
         if self.state.session_picker.is_open() {
             return command_for_session_picker_event(event);

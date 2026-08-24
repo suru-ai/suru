@@ -12,16 +12,20 @@ use ratatui::{
 };
 
 use crate::support::{
-    connected_application, rendered_application_buffer, rendered_application_rows,
-    rendered_application_rows_at, text_position, type_terminal_text,
+    connected_application, model_descriptor, rendered_application_buffer,
+    rendered_application_rows, rendered_application_rows_at, selected_session_snapshot,
+    text_position, type_terminal_text,
 };
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        CodexSettings, CopilotSettings, EffectiveSettings, FoldPosture, ModelCatalog,
+        AgentSelection, CodexSettings, CopilotSettings, EffectiveSettings, FoldPosture,
+        ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId,
+        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
-        ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SettingMutation,
-        SettingsSnapshot, TranscriptSettings,
+        ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionId,
+        SessionSettings, SettingMutation, SettingsSnapshot, TitleErrand, TitleSettings,
+        TranscriptSettings,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, ModelListRequest,
@@ -1367,11 +1371,12 @@ fn space_cycles_a_setting_forward_and_wraps_past_the_last_value() {
     );
 }
 
-/// Enter means expand and collapse and nothing else, so on a row that is not a
-/// Provider — a General Setting, or a Setting revealed inside an expansion —
-/// it changes neither the shape of the panel nor any value.
+/// Enter opens a row onto what it stands for and never edits, so on a row
+/// standing for nothing to open — a General Setting cycled through words, or a
+/// Setting revealed inside an expansion — it changes neither the shape of the
+/// panel nor any value.
 #[test]
-fn enter_is_a_no_op_on_every_row_that_is_not_a_provider() {
+fn enter_never_edits_a_value_and_opens_nothing_on_a_row_that_stands_for_nothing() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
@@ -1673,5 +1678,276 @@ fn the_open_panel_takes_the_keys_the_composer_would_otherwise_get() {
             .expect("close a panel that is already closed"),
         ApplicationTransition::Continue,
         "closing a closed panel changes nothing"
+    );
+}
+
+/// Effective settings whose only departure from the built-in defaults is which
+/// Agent Selection derives a Session's Title.
+fn deriving_titles_with(errand: TitleErrand) -> EffectiveSettings {
+    EffectiveSettings {
+        session: SessionSettings {
+            title: TitleSettings { errand },
+        },
+        ..EffectiveSettings::default()
+    }
+}
+
+/// The Agent Selection a reader would pin, and the Model the picker offers to
+/// pin it with.
+fn pinned_selection() -> AgentSelection {
+    AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-5-mini"),
+        options: Vec::new(),
+    }
+}
+
+/// Two Models, so a test can tell the one the picker focuses from the one it
+/// would have focused on its own: the second is the Provider's default.
+fn two_model_catalog() -> ModelCatalog {
+    // The cheap Model carries a Model Option, which is what makes the pin's own
+    // Options worth asserting: a Model with none could not tell "the Model the
+    // reader chose" from "that Model with today's defaults baked in".
+    let mut cheap = model_descriptor(
+        "codex",
+        "gpt-5-mini",
+        "GPT-5 Mini",
+        false,
+        ModelAvailability::Available,
+    );
+    cheap.options = vec![ModelOptionDescriptor {
+        id: ModelOptionId::new("reasoning_effort"),
+        label: "Reasoning".to_owned(),
+        description: None,
+        role: ModelOptionRole::ReasoningEffort,
+        kind: ModelOptionKind::Select {
+            choices: vec![ModelOptionChoice {
+                id: ModelOptionChoiceId::new("low"),
+                label: "Low".to_owned(),
+                description: None,
+                availability: ModelAvailability::Available,
+            }],
+            default: ModelOptionChoiceId::new("low"),
+        },
+    }];
+    ModelCatalog {
+        providers: vec![ProviderModelCatalog {
+            provider: ProviderId::new("codex"),
+            display_name: "Codex".to_owned(),
+            models: vec![
+                cheap,
+                model_descriptor(
+                    "codex",
+                    "gpt-5",
+                    "GPT-5",
+                    true,
+                    ModelAvailability::Available,
+                ),
+            ],
+            status: ProviderCatalogStatus::Fresh,
+        }],
+    }
+}
+
+/// The Model row the picker has focused, which is the row it marks.
+fn focused_model(application: &Application) -> String {
+    let rows = rendered_application_rows(application);
+    rows.iter()
+        .find(|row| row.contains('›'))
+        .unwrap_or_else(|| panic!("the Model picker focused nothing: {rows:?}"))
+        .trim()
+        .to_owned()
+}
+
+/// Title derivation is the first Setting the panel cannot present as a ring of
+/// words: two of its values are words, and the third is an Agent Selection the
+/// reader chooses at the Model picker rather than types.
+#[test]
+fn the_title_derivation_row_cycles_its_named_values_and_spells_a_pinned_selection() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "session.title.errand");
+
+    assert!(
+        row(&application, "Title derivation").contains("· session"),
+        "the built-in default follows the Session's own Provider: {:?}",
+        row(&application, "Title derivation")
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Enter choose · "),
+        "the focused row teaches the key that opens the surface its value is chosen at"
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::SessionTitleErrand {
+            value: Some(TitleErrand::Off),
+        }),
+        "Space walks the values the schema does name"
+    );
+
+    deliver_snapshot(
+        &mut application,
+        deriving_titles_with(TitleErrand::Pinned(pinned_selection())),
+        &["session.title.errand"],
+    );
+    let pinned_row = row(&application, "Title derivation");
+    assert!(
+        pinned_row.contains("codex · gpt-5-mini") && pinned_row.contains("[pinned]"),
+        "a value the schema never named is spelled by the Setting itself: {pinned_row:?}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::SessionTitleErrand {
+            value: Some(TitleErrand::FollowSession),
+        }),
+        "and cycling off it returns to the first value that has a word"
+    );
+}
+
+#[test]
+fn opening_the_title_derivation_row_pins_the_model_chosen_at_the_picker() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "session.title.errand");
+
+    let ApplicationTransition::ListModels(request) =
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE)
+    else {
+        panic!("opening the row opens the Model picker onto a fresh catalog listing");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: two_model_catalog(),
+        })
+        .expect("receive the catalog the picker asked for");
+    let showing = rendered_application_rows(&application).join("\n");
+    assert!(
+        showing.contains("GPT-5 Mini") && !showing.contains("Title derivation"),
+        "the picker is drawn over the panel that opened it, and answers the keys: {showing}"
+    );
+    assert!(
+        focused_model(&application).contains("· gpt-5 ·"),
+        "a Setting holding no Selection yet opens the picker where it would open anyway: {:?}",
+        focused_model(&application)
+    );
+
+    // Off the Provider's default and onto the cheap Model, which is the whole
+    // point of pinning one for Title derivation.
+    press(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::SessionTitleErrand {
+            value: Some(TitleErrand::Pinned(pinned_selection())),
+        }),
+        "the Model the reader chose is pinned as this Setting's value, not as the Agent, \
+         and the pin claims the Model alone rather than freezing today's Model Options"
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("GPT-5 Mini"),
+        "and the picker closes, leaving the reader back on the row they opened"
+    );
+
+    // The server answers the edit, and reopening the row lands on the choice
+    // the reader made rather than back on the Provider's default.
+    deliver_snapshot(
+        &mut application,
+        deriving_titles_with(TitleErrand::Pinned(pinned_selection())),
+        &["session.title.errand"],
+    );
+    let ApplicationTransition::ListModels(reopened) =
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE)
+    else {
+        panic!("reopening the row reads the catalog again");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request: reopened,
+            catalog: two_model_catalog(),
+        })
+        .expect("receive the catalog the reopened picker asked for");
+    assert!(
+        focused_model(&application).contains("gpt-5-mini"),
+        "the picker opens on the Model this Setting already holds: {:?}",
+        focused_model(&application)
+    );
+}
+
+/// The Session's own Model is not what this picker is asking about. The
+/// listing the row's picker asks for lands after it opens, and every other
+/// picker in Suru focuses the Session's Selection when one does — so this is
+/// the frame where a Setting's pin is easiest to lose.
+#[test]
+fn a_catalog_landing_leaves_the_pinned_model_focused_rather_than_the_sessions() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(
+        workspace.path(),
+        deriving_titles_with(TitleErrand::Pinned(pinned_selection())),
+        &["session.title.errand"],
+    );
+    // A Session conversing at the Provider's default Model, which is the Model
+    // this picker must not be dragged onto.
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            selected_session_snapshot(
+                SessionId::new(),
+                workspace.path(),
+                AgentSelection {
+                    provider: ProviderId::new("codex"),
+                    model: ModelId::new("gpt-5"),
+                    options: Vec::new(),
+                },
+            ),
+        ))
+        .expect("attach a Session conversing at another Model");
+    open_panel(&mut application);
+    focus_setting(&mut application, "session.title.errand");
+
+    let ApplicationTransition::ListModels(request) =
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE)
+    else {
+        panic!("opening the row opens the Model picker");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: two_model_catalog(),
+        })
+        .expect("receive the catalog the picker asked for");
+
+    assert!(
+        focused_model(&application).contains("gpt-5-mini"),
+        "the catalog landing moved the focus onto the Session's Model rather than the pin: {:?}",
+        focused_model(&application)
+    );
+}
+
+/// Cancelling is the other way out of the picker, and it must leave the panel
+/// exactly as the reader left it rather than closing it along with the picker.
+#[test]
+fn cancelling_the_picker_leaves_the_settings_panel_where_it_was() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "session.title.errand");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+
+    press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+
+    assert!(
+        has_row(&application, "Title derivation"),
+        "Esc closes the picker alone"
+    );
+    assert_eq!(
+        focused_key(&application),
+        "session.title.errand",
+        "and the panel is still focused on the row that opened it"
     );
 }

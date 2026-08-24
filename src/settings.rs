@@ -30,9 +30,9 @@ use jsonc_parser::{
 use serde_json::Value;
 
 use crate::protocol::{
-    EffectiveSettings, FoldPosture, ProviderId, ReasoningSummaryDetail, ReasoningVisibility,
-    SettingMutation, SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity,
-    SettingsSnapshot,
+    AgentSelection, EffectiveSettings, FoldPosture, ProviderId, ReasoningSummaryDetail,
+    ReasoningVisibility, SettingMutation, SettingScope, SettingsDiagnostic,
+    SettingsDiagnosticSeverity, SettingsSnapshot, TitleErrand,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -44,6 +44,10 @@ pub const FALLBACK_CONFIG_FILE: &str = "suru.json";
 // mutations that edit it can never drift apart.
 const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
 const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
+// Keyed per purpose rather than Errand-wide, so a compaction Errand arriving
+// later gets its own key and turning Titles off can never silently disable
+// work that has nothing to do with them.
+const SESSION_TITLE_ERRAND: &str = "session.title.errand";
 const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
 const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary";
 const PROVIDER_COPILOT_ENABLED: &str = "provider.copilot.enabled";
@@ -111,6 +115,29 @@ pub enum SettingValues {
         /// confession that it cannot say. Total, because the Setting can spell
         /// anything its own typed field is able to hold.
         spell: fn(&EffectiveSettings) -> String,
+        /// Where a reader chooses one of those unnamed values, for a Setting
+        /// whose unnamed values are theirs to pick. `None` where they are not:
+        /// a Setting holding something Suru worked out for itself offers the
+        /// reader the named values and nothing more.
+        chosen_at: Option<SettingChoiceSurface>,
+    },
+}
+
+/// The surface a reader chooses an Open Setting's unnamed value at, and the pin
+/// that puts what they chose in force. The surface is one Suru already has, so
+/// a Setting holding a value too rich to cycle through costs no second place to
+/// choose that kind of value.
+#[derive(Clone, Copy)]
+pub enum SettingChoiceSurface {
+    /// The Model picker, which is where every Agent Selection in Suru is
+    /// chosen.
+    AgentSelection {
+        /// The Selection in force, where the Setting is holding one, so the
+        /// picker opens on the Model the reader already chose rather than at
+        /// the top of the list.
+        current: fn(&EffectiveSettings) -> Option<AgentSelection>,
+        /// What the Selection they choose becomes.
+        pin: fn(AgentSelection) -> SettingMutation,
     },
 }
 
@@ -122,6 +149,14 @@ impl SettingValues {
         match *self {
             Self::Fixed(choices) => choices,
             Self::Open { named, .. } => named,
+        }
+    }
+
+    /// Where this Setting's unnamed values are chosen, if anywhere.
+    fn chosen_at(&self) -> Option<SettingChoiceSurface> {
+        match *self {
+            Self::Fixed(_) => None,
+            Self::Open { chosen_at, .. } => chosen_at,
         }
     }
 }
@@ -198,6 +233,12 @@ impl SettingDescriptor {
         named.get(index)
     }
 
+    /// The surface this Setting's unnamed values are chosen at, which is what a
+    /// row acts on when a reader opens it.
+    pub fn chosen_at(&self) -> Option<SettingChoiceSurface> {
+        self.values.chosen_at()
+    }
+
     fn effective_index(&self, settings: &EffectiveSettings) -> Option<usize> {
         self.values
             .named()
@@ -232,24 +273,27 @@ impl SettingDescriptor {
 /// Whether a pin would leave the Setting exactly where the effective settings
 /// already have it.
 fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings) -> bool {
-    match *mutation {
+    match mutation {
         SettingMutation::TranscriptDefaultFoldPosture { value } => {
-            value == Some(settings.transcript.default_fold_posture)
+            *value == Some(settings.transcript.default_fold_posture)
         }
         SettingMutation::TranscriptReasoningVisibility { value } => {
-            value == Some(settings.transcript.reasoning_visibility)
+            *value == Some(settings.transcript.reasoning_visibility)
+        }
+        SettingMutation::SessionTitleErrand { value } => {
+            value.as_ref() == Some(&settings.session.title.errand)
         }
         SettingMutation::ProviderCodexEnabled { value } => {
-            value == Some(settings.provider.codex.enabled)
+            *value == Some(settings.provider.codex.enabled)
         }
         SettingMutation::ProviderCodexReasoningSummary { value } => {
-            value == Some(settings.provider.codex.reasoning_summary)
+            *value == Some(settings.provider.codex.reasoning_summary)
         }
         SettingMutation::ProviderCopilotEnabled { value } => {
-            value == Some(settings.provider.copilot.enabled)
+            *value == Some(settings.provider.copilot.enabled)
         }
         SettingMutation::ProviderClaudeEnabled { value } => {
-            value == Some(settings.provider.claude.enabled)
+            *value == Some(settings.provider.claude.enabled)
         }
     }
 }
@@ -311,6 +355,63 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |visibility| {
                 settings.transcript.reasoning_visibility = visibility;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: SESSION_TITLE_ERRAND,
+        label: "Title derivation",
+        description: "Which Agent Selection derives a Session's Title, if any",
+        group: SettingGroup::General,
+        scope: SettingScope::Server,
+        values: SettingValues::Open {
+            named: &[
+                SettingChoice {
+                    value: "session",
+                    pin: SettingMutation::SessionTitleErrand {
+                        value: Some(TitleErrand::FollowSession),
+                    },
+                },
+                SettingChoice {
+                    value: "off",
+                    pin: SettingMutation::SessionTitleErrand {
+                        value: Some(TitleErrand::Off),
+                    },
+                },
+            ],
+            accepts: "an Agent Selection",
+            spell: |settings| {
+                let errand = &settings.session.title.errand;
+                match errand {
+                    // The pin's own Model, not the one an Errand would resolve
+                    // to: a row reports the choice the reader made, and what a
+                    // live catalog makes of it is the Errand's business.
+                    TitleErrand::Pinned(selection) => {
+                        format!("{} · {}", selection.provider, selection.model)
+                    }
+                    // Every other value spells itself the way a reader would
+                    // have typed it, read off the one place those words are
+                    // written down rather than repeated here.
+                    TitleErrand::FollowSession | TitleErrand::Off => errand
+                        .named()
+                        .expect("every value but a pinned Selection has a word")
+                        .to_owned(),
+                }
+            },
+            chosen_at: Some(SettingChoiceSurface::AgentSelection {
+                current: |settings| match &settings.session.title.errand {
+                    TitleErrand::Pinned(selection) => Some(selection.clone()),
+                    TitleErrand::FollowSession | TitleErrand::Off => None,
+                },
+                pin: |selection| SettingMutation::SessionTitleErrand {
+                    value: Some(TitleErrand::Pinned(selection)),
+                },
+            }),
+        },
+        reset: SettingMutation::SessionTitleErrand { value: None },
+        apply: |settings, value| {
+            apply_value(value, |errand| {
+                settings.session.title.errand = errand;
             })
         },
     },
@@ -582,6 +683,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::TranscriptReasoningVisibility { value } => {
             (TRANSCRIPT_REASONING_VISIBILITY, pinned(value))
         }
+        SettingMutation::SessionTitleErrand { value } => (SESSION_TITLE_ERRAND, pinned(value)),
         SettingMutation::ProviderCodexEnabled { value } => (PROVIDER_CODEX_ENABLED, pinned(value)),
         SettingMutation::ProviderCodexReasoningSummary { value } => {
             (PROVIDER_CODEX_REASONING_SUMMARY, pinned(value))
@@ -970,6 +1072,9 @@ mod tests {
             FoldPosture::Folded => "folded".to_owned(),
             FoldPosture::Expanded => "expanded".to_owned(),
         },
+        // A posture Suru worked out is nothing a reader picks, which is the
+        // half of the Open shape the shipped Setting does not cover.
+        chosen_at: None,
     });
 
     /// The same Setting written the only way the schema could write one before
@@ -1088,6 +1193,9 @@ mod tests {
             vec![
                 "one of \"folded\" or \"expanded\"".to_owned(),
                 "one of \"hidden\" or \"shown\"".to_owned(),
+                // A Setting the schema can only partly enumerate names what it
+                // can and describes the rest, in the same breath.
+                "one of \"session\", \"off\", or an Agent Selection".to_owned(),
                 // A boolean Setting is diagnosed as accepting `true` or
                 // `false`, unquoted, because that is what the reader must type.
                 "one of true or false".to_owned(),
@@ -1158,6 +1266,64 @@ mod tests {
             None
         );
         assert_eq!(FIXED_STAND_IN.spelling(&settings), None);
+    }
+
+    /// The Setting the Open shape was added for holds an Agent Selection the
+    /// reader picks, which is the half of that shape the stand-in above cannot
+    /// cover: the value has no word to cycle onto, so the Setting names the
+    /// surface it is chosen at and the pin that choice becomes.
+    #[test]
+    fn a_pinned_agent_selection_reads_back_as_the_selection_the_reader_chose() {
+        let descriptor = SCHEMA
+            .iter()
+            .find(|descriptor| descriptor.key == SESSION_TITLE_ERRAND)
+            .expect("the Title derivation Setting is defined");
+        let chosen = AgentSelection {
+            provider: crate::protocol::ProviderId::new("codex"),
+            model: crate::protocol::ModelId::new("gpt-5-mini"),
+            options: Vec::new(),
+        };
+        let Some(SettingChoiceSurface::AgentSelection { current, pin }) = descriptor.chosen_at()
+        else {
+            panic!("an Agent Selection is chosen at the Model picker");
+        };
+
+        let mut settings = EffectiveSettings::default();
+        assert_eq!(
+            current(&settings),
+            None,
+            "a Setting holding one of its named values opens the picker on nothing in particular"
+        );
+        assert!((descriptor.apply)(
+            &mut settings,
+            &pinned_value(&pin(chosen.clone()))
+        ));
+
+        assert_eq!(
+            settings.session.title.errand,
+            TitleErrand::Pinned(chosen.clone()),
+            "the pin puts the reader's own Selection in force"
+        );
+        assert_eq!(
+            current(&settings),
+            Some(chosen.clone()),
+            "and reopening the picker lands on the Model they chose"
+        );
+        assert_eq!(
+            descriptor.effective(&settings).map(|choice| choice.value),
+            None,
+            "a pinned Selection is none of the values the schema names"
+        );
+        assert_eq!(
+            descriptor.spelling(&settings).as_deref(),
+            Some("codex · gpt-5-mini"),
+            "so the Setting spells it for whatever is drawing it"
+        );
+        assert_eq!(
+            descriptor.next_choice(&settings).map(|choice| choice.value),
+            Some("session"),
+            "and cycling off it returns to the first value the schema names"
+        );
     }
 
     /// Half of the guard that a Provider cannot ship without a working

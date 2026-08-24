@@ -8,8 +8,9 @@ use std::path::Path;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        FoldPosture, ReasoningSummaryDetail, ReasoningVisibility, SettingMutation,
-        SettingsDiagnosticSeverity, SettingsSnapshot,
+        AgentSelection, FoldPosture, ModelId, ProviderId, ReasoningSummaryDetail,
+        ReasoningVisibility, SettingMutation, SettingsDiagnosticSeverity, SettingsSnapshot,
+        TitleErrand,
     },
     server::{self, ServerConfig},
 };
@@ -943,6 +944,155 @@ async fn turning_a_provider_off_in_one_client_reaches_every_other() {
 
     drop(editor);
     drop(onlooker);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// The Agent Selection a reader pins for Title derivation, which is the value
+/// no fixed choice list could have named.
+fn pinned_title_selection() -> AgentSelection {
+    AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-5-mini"),
+        options: Vec::new(),
+    }
+}
+
+/// Title derivation is the first Setting whose values the schema cannot
+/// enumerate, so these hold the line on a value richer than a word: pinned from
+/// a document, pinned by an edit, and diagnosed by naming the values that do
+/// have words alongside a description of the one that does not.
+#[tokio::test]
+async fn a_pinned_title_errand_selection_round_trips_through_a_config_document() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            // Every Title written by the cheap Model, whatever the Session uses.
+            "session": {
+                "title": {
+                    "errand": {
+                        "provider": "codex",
+                        "model": "gpt-5-mini",
+                        "options": [],
+                    },
+                },
+            },
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-title-pin")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (client, opening) = attach(state_dir.path(), "settings-title-pin").await;
+    assert_eq!(
+        opening.settings.session.title.errand,
+        TitleErrand::Pinned(pinned_title_selection())
+    );
+    assert_eq!(opening.pinned, ["session.title.errand"]);
+    assert_eq!(opening.diagnostics, []);
+
+    let off = client
+        .mutate_setting(SettingMutation::SessionTitleErrand {
+            value: Some(TitleErrand::Off),
+        })
+        .await
+        .expect("turn Title derivation off");
+    assert_eq!(off.settings.session.title.errand, TitleErrand::Off);
+    let document = config_document(config_dir.path());
+    assert!(
+        document.contains("\"errand\": \"off\""),
+        "a named value is pinned as the one word a reader would type: {document:?}"
+    );
+
+    let repinned = client
+        .mutate_setting(SettingMutation::SessionTitleErrand {
+            value: Some(TitleErrand::Pinned(pinned_title_selection())),
+        })
+        .await
+        .expect("pin an Agent Selection again");
+    assert_eq!(
+        repinned.settings.session.title.errand,
+        TitleErrand::Pinned(pinned_title_selection()),
+        "an Agent Selection survives the round trip through the document"
+    );
+
+    let reset = client
+        .mutate_setting(SettingMutation::SessionTitleErrand { value: None })
+        .await
+        .expect("remove the pin");
+    assert_eq!(
+        reset.settings.session.title.errand,
+        TitleErrand::FollowSession,
+        "the built-in default follows the Session's own Provider"
+    );
+    assert_eq!(reset.pinned, [] as [String; 0]);
+    let emptied = config_document(config_dir.path());
+    assert!(
+        !emptied.contains("session") && !emptied.contains("title"),
+        "the pin takes the objects that existed only to hold it with it: {emptied:?}"
+    );
+    assert!(
+        emptied.contains("// Every Title written by the cheap Model"),
+        "the author's comment about the removed pin is theirs to delete: {emptied:?}"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_mistyped_title_errand_is_ignored_alone_and_says_what_it_accepts() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            "session": { "title": { "errand": "sometimes" } },
+            "transcript": { "reasoningVisibility": "shown" }
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-title-mistyped")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let snapshot = attach(state_dir.path(), "settings-title-mistyped").await.1;
+    assert_eq!(
+        snapshot.settings.session.title.errand,
+        TitleErrand::FollowSession,
+        "the mistyped Setting keeps its built-in default"
+    );
+    assert_eq!(
+        snapshot.settings.transcript.reasoning_visibility,
+        ReasoningVisibility::Shown,
+        "one mistake does not void the rest of the document"
+    );
+    assert_eq!(snapshot.pinned, ["transcript.reasoningVisibility"]);
+
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one diagnostic, got {:?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.severity, SettingsDiagnosticSeverity::Warning);
+    assert_eq!(diagnostic.file, config_dir.path().join("suru.jsonc"));
+    assert_eq!(diagnostic.key.as_deref(), Some("session.title.errand"));
+    assert!(
+        diagnostic
+            .message
+            .contains("one of \"session\", \"off\", or an Agent Selection"),
+        "a Setting the schema cannot enumerate names what it can and describes the rest: {:?}",
+        diagnostic.message
+    );
+
     server.shutdown().await.expect("shut down server");
 }
 

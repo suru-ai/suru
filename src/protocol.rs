@@ -486,6 +486,96 @@ pub struct TranscriptSettings {
     pub reasoning_visibility: ReasoningVisibility,
 }
 
+/// Which Agent Selection derives a Session's Title, which is also whether Suru
+/// derives one at all.
+///
+/// One Setting rather than two, because two would admit a state that
+/// contradicts itself — titling turned off while a Model stands pinned for it —
+/// and would give the settings panel two rows for one intent.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum TitleErrand {
+    /// The built-in default: each Session's Title is derived by the Provider
+    /// that Session already uses, at that Provider's Errand Selection. A
+    /// Session that has selected no Provider is left alone, because Suru will
+    /// not pick one the user did not choose.
+    #[default]
+    FollowSession,
+    /// Suru derives no Titles and makes no Provider call on its own behalf.
+    Off,
+    /// Every Session's Title is derived by this Provider and Model, whatever
+    /// the Session itself uses — including a Session that uses nothing. The
+    /// Selection is resolved against the live Model catalog like any other
+    /// Errand Selection, so a Model that has gone gives way to that Provider's
+    /// default rather than failing the Errand.
+    Pinned(AgentSelection),
+}
+
+impl TitleErrand {
+    /// The word a Config Document spells this value with, and `None` for the
+    /// one value no word can spell. This is the only place those words are
+    /// written down: serializing reads them off here, deserializing matches
+    /// against them, and anything drawing the Setting spells a named value the
+    /// way a reader would have typed it.
+    pub fn named(&self) -> Option<&'static str> {
+        match self {
+            Self::FollowSession => Some("session"),
+            Self::Off => Some("off"),
+            Self::Pinned(_) => None,
+        }
+    }
+}
+
+/// How a Config Document spells a [`TitleErrand`]: one of the two words for the
+/// values the schema names, or the Agent Selection itself for the one it
+/// cannot. The Selection is written plainly rather than under a tag, because a
+/// Config Document is written by hand and an Agent Selection is already an
+/// object no word could be mistaken for.
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum TitleErrandDocument {
+    Named(String),
+    Pinned(AgentSelection),
+}
+
+impl Serialize for TitleErrand {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match (self.named(), self) {
+            (Some(word), _) => TitleErrandDocument::Named(word.to_owned()),
+            (None, Self::Pinned(selection)) => TitleErrandDocument::Pinned(selection.clone()),
+            (None, _) => unreachable!("every value but a pinned Selection has a word"),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TitleErrand {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match TitleErrandDocument::deserialize(deserializer)? {
+            TitleErrandDocument::Named(word) => [Self::FollowSession, Self::Off]
+                .into_iter()
+                .find(|value| value.named() == Some(word.as_str()))
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!("{word:?} is not a way of deriving a Title"))
+                }),
+            TitleErrandDocument::Pinned(selection) => Ok(Self::Pinned(selection)),
+        }
+    }
+}
+
+/// How Suru derives a Session's Title, which is the whole of what a Session is
+/// configured by today.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TitleSettings {
+    pub errand: TitleErrand,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSettings {
+    pub title: TitleSettings,
+}
+
 /// Whether the user wants Suru to offer a Provider at all. Every Provider
 /// carries one, and each spells its own built-in default by hand rather than
 /// deriving it, because a derived `bool` is `false` and a Provider is on unless
@@ -540,10 +630,11 @@ pub struct ProviderSettings {
 
 /// The effective value of every defined Setting: what a Config Document
 /// pinned where it did, the built-in default everywhere else.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectiveSettings {
     pub transcript: TranscriptSettings,
+    pub session: SessionSettings,
     pub provider: ProviderSettings,
 }
 
@@ -573,7 +664,7 @@ impl EffectiveSettings {
 /// path nor pin a value the Setting cannot hold. A `value` pins that value even
 /// when it equals the built-in default, so a deliberate choice survives a later
 /// change of that default; `null` removes the pin and lets the default resume.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "setting", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SettingMutation {
     TranscriptDefaultFoldPosture {
@@ -581,6 +672,9 @@ pub enum SettingMutation {
     },
     TranscriptReasoningVisibility {
         value: Option<ReasoningVisibility>,
+    },
+    SessionTitleErrand {
+        value: Option<TitleErrand>,
     },
     ProviderCodexEnabled {
         value: Option<bool>,

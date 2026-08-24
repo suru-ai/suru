@@ -476,6 +476,7 @@ pub async fn spawn_with_providers_and_timings(
             .with_timeout(timings.errand_timeout),
         model_catalog.clone(),
         sessions.clone(),
+        settings.subscribe(),
     );
     let state = AppState {
         descriptor: Arc::new(descriptor.clone()),
