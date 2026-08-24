@@ -116,7 +116,21 @@ pub(super) fn command_for_model_options_event(event: InputEvent) -> Option<Comma
 /// expands a Provider onto its further Settings, and the reset that takes a pin
 /// out. Enter means expansion and nothing else, so it never edits a value.
 /// Nothing else reaches the composer while the panel is open.
+///
+/// The reader may also point at the panel, which the frame's own geometry
+/// resolves. A left press is the whole of it: the pointer asks for a tab or a
+/// row, and no click carries a key's meaning.
 pub(super) fn command_for_settings_panel_event(event: InputEvent) -> Option<CommandId> {
+    if let InputEvent::Mouse(mouse) = &event {
+        // A press, not a release, so the panel answers the click the reader
+        // just made rather than trailing a drag that ends elsewhere.
+        return matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)).then_some(
+            CommandId::FocusSettingsPanelAt {
+                column: mouse.column,
+                screen_row: mouse.row,
+            },
+        );
+    }
     let InputEvent::Key(key) = event else {
         return None;
     };

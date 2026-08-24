@@ -3,15 +3,17 @@
 
 use std::path::Path;
 
-use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{
     buffer::Buffer,
     style::{Color, Modifier},
 };
 
 use crate::support::{
-    connected_application, rendered_application_buffer, rendered_application_rows, text_position,
-    type_terminal_text,
+    connected_application, rendered_application_buffer, rendered_application_rows,
+    rendered_application_rows_at, text_position, type_terminal_text,
 };
 use suru::{
     managed_client::ManagedEvent,
@@ -101,6 +103,36 @@ fn press(
     application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(code, modifiers)))
         .expect("handle a settings panel key")
+}
+
+/// A left click on one cell of the panel, which is the only mouse event it
+/// answers. The press rather than the release, so the panel answers the click
+/// the reader has just made.
+fn click(application: &mut Application, column: u16, row: u16) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("handle a settings panel click")
+}
+
+/// Clicks the label the tab bar draws for `title`, which is where a reader
+/// points to switch tabs.
+fn click_tab(application: &mut Application, title: &str) -> ApplicationTransition {
+    let buffer = rendered_application_buffer(application, 80, 15);
+    let (column, row) = text_position(&buffer, title);
+    click(application, column, row)
+}
+
+/// Clicks the row the panel draws for `label`, on the label itself.
+fn click_row(application: &mut Application, label: &str) -> ApplicationTransition {
+    let rows = rendered_application_rows(application);
+    let row = row_index(&rows, label) as u16;
+    let column = label_column(application, label) as u16;
+    click(application, column, row)
 }
 
 fn open_panel(application: &mut Application) {
@@ -221,9 +253,13 @@ fn is_row_for(row: &str, label: &str) -> bool {
 /// Which column a row's name starts at, which is what says a revealed Setting
 /// is drawn indented beneath the Provider it configures.
 fn label_column(application: &Application, label: &str) -> usize {
-    let rows = rendered_application_rows(application);
-    let index = row_index(&rows, label);
-    let row = &rows[index];
+    label_column_in(&rendered_application_rows(application), label)
+}
+
+/// The same column, read off a frame already in hand, so a test that rendered
+/// at a size of its own points at what that frame drew.
+fn label_column_in(rows: &[String], label: &str) -> usize {
+    let row = &rows[row_index(rows, label)];
     let start = row
         .find(label)
         .expect("the row found by its label contains it");
@@ -334,6 +370,179 @@ fn the_tab_bar_names_both_tabs_and_left_and_right_switch_between_them_with_wrap(
         active,
         "Left before the first tab wraps to the last"
     );
+}
+
+/// The tab bar is a surface the reader can point at, and pointing at a label
+/// is the same arrival as walking onto it: the tab that presents the Providers
+/// re-reads their Availability however the reader got there — the reader
+/// already on it included, because clicking that label is the natural way to
+/// ask Suru to look again after signing in outside it.
+#[test]
+fn clicking_a_tab_label_switches_to_that_tab() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+
+    assert!(
+        matches!(
+            click_tab(&mut application, "Providers"),
+            ApplicationTransition::ListModels(_)
+        ),
+        "clicking the Providers tab arrives on it and reads the Providers"
+    );
+    assert!(
+        has_row(&application, "Codex"),
+        "and the panel lists that tab's rows"
+    );
+    let switched = rendered_application_buffer(&application, 80, 15);
+    assert_ne!(
+        styling(&switched, "Providers"),
+        styling(&switched, "General"),
+        "with the tab bar drawing the clicked tab as the active one"
+    );
+
+    assert!(
+        matches!(
+            click_tab(&mut application, "Providers"),
+            ApplicationTransition::ListModels(_)
+        ),
+        "clicking the tab already showing asks the Providers again"
+    );
+
+    assert_eq!(
+        click_tab(&mut application, "General"),
+        ApplicationTransition::Continue,
+        "clicking back to General reads nothing"
+    );
+    assert!(
+        has_row(&application, "Default Fold posture"),
+        "and lists the Settings that configure no Provider"
+    );
+}
+
+/// A click moves the focus and does nothing else: the row the reader pointed
+/// at becomes the one an edit would act on, and the value it carries is left
+/// exactly where it was.
+#[test]
+fn clicking_a_row_selects_it_without_changing_a_value() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    assert_eq!(
+        focused_key(&application),
+        "transcript.defaultFoldPosture",
+        "the panel opens focused on its top row"
+    );
+
+    assert_eq!(
+        click_row(&mut application, "Reasoning visibility"),
+        ApplicationTransition::Continue,
+        "a click selects, so nothing goes out to the Config Document"
+    );
+    assert_eq!(
+        focused_key(&application),
+        "transcript.reasoningVisibility",
+        "the row the reader pointed at is the one an edit would now act on"
+    );
+    assert!(
+        row(&application, "Reasoning visibility").contains("hidden [default]"),
+        "and it is worth exactly what it was worth before the click"
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::TranscriptReasoningVisibility {
+            value: Some(ReasoningVisibility::Shown),
+        }),
+        "and Space still edits the focused Setting, wherever the focus came from"
+    );
+}
+
+/// Every edit runs through the focused row, so a click on a Provider must not
+/// be one: it may not turn the Provider off, and it may not stand in for the
+/// Enter that reveals what the Provider carries.
+#[test]
+fn clicking_a_provider_row_neither_toggles_it_nor_expands_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_providers_tab(&mut application);
+
+    assert_eq!(
+        click_row(&mut application, "Copilot"),
+        ApplicationTransition::Continue,
+        "no click ever edits a Setting"
+    );
+    assert_eq!(
+        focused_key(&application),
+        "provider.copilot.enabled",
+        "the Provider row takes the focus like any other"
+    );
+    let copilot = row(&application, "Copilot");
+    assert!(
+        !copilot.contains("disabled"),
+        "and the Provider is left exactly as it was: {copilot:?}"
+    );
+
+    // Back onto the Provider that carries further Settings, which is the one a
+    // click could otherwise have opened.
+    assert_eq!(
+        click_row(&mut application, "Codex"),
+        ApplicationTransition::Continue,
+        "clicking an expandable Provider edits nothing either"
+    );
+    assert_eq!(
+        focused_key(&application),
+        "provider.codex.enabled",
+        "it takes the focus"
+    );
+    assert!(
+        !has_row(&application, "Reasoning summary"),
+        "and stays collapsed, because expanding is Enter's and never the pointer's"
+    );
+}
+
+/// The panel answers a click on a tab label and on a row, and on nothing else:
+/// the headline, the footer, the tab bar's empty end, the border, and the
+/// screen outside the box are all surfaces the reader may click through.
+#[test]
+fn a_click_on_anything_but_a_tab_or_a_row_changes_nothing() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+
+    let buffer = rendered_application_buffer(&application, 80, 15);
+    let (tabs_column, tabs_row) = text_position(&buffer, "Providers");
+    let (headline_column, headline_row) = text_position(&buffer, "transcript.defaultFoldPosture");
+    let (footer_column, footer_row) = text_position(&buffer, "Esc close");
+    let (general_column, general_row) = text_position(&buffer, "General");
+    let listed_row = row_index(
+        &rendered_application_rows(&application),
+        "Reasoning visibility",
+    );
+    let before = rendered_application_rows(&application);
+
+    for (column, row) in [
+        // Past the end of the last tab label, which is tab bar and nothing more.
+        (tabs_column + "Providers".len() as u16 + 1, tabs_row),
+        (headline_column, headline_row),
+        (footer_column, footer_row),
+        // The box's own left border, beside the tab bar and beside a row.
+        (general_column - 1, general_row),
+        (general_column - 1, listed_row as u16),
+        // And the screen the overlay is drawn over.
+        (0, 0),
+    ] {
+        assert_eq!(
+            click(&mut application, column, row),
+            ApplicationTransition::Continue,
+            "a click at ({column}, {row}) asked something of Suru"
+        );
+        assert_eq!(
+            rendered_application_rows(&application),
+            before,
+            "a click at ({column}, {row}) changed the panel"
+        );
+    }
 }
 
 #[test]
@@ -1317,6 +1526,126 @@ fn an_edit_command_invoked_while_the_panel_is_closed_touches_no_setting() {
             "{command:?} edited a Setting with no panel open"
         );
     }
+}
+
+/// A Setting revealed inside an expansion is an ordinary row, so the pointer
+/// reaches it as it reaches any other — and no more than any other: the value
+/// stays where it was until the reader edits it from the keyboard.
+#[test]
+fn clicking_a_revealed_setting_focuses_it_like_any_other_row() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_providers_tab(&mut application);
+    focus_setting(&mut application, "provider.codex.enabled");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+
+    assert_eq!(
+        click_row(&mut application, "Reasoning summary"),
+        ApplicationTransition::Continue,
+        "a revealed Setting is selected by a click, not edited by one"
+    );
+    assert_eq!(
+        focused_key(&application),
+        "provider.codex.reasoningSummary",
+        "the revealed row the reader pointed at is the focused one"
+    );
+    assert!(
+        row(&application, "Reasoning summary").contains("auto [default]"),
+        "and it is worth exactly what it was worth before the click"
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexReasoningSummary {
+            value: Some(ReasoningSummaryDetail::Concise),
+        }),
+        "Space edits the row the click focused, the edit gate intact"
+    );
+}
+
+/// A box too short for its tab holds a window onto the rows rather than all of
+/// them, so the row under the pointer is the one that window drew there and not
+/// the tab's row of the same number.
+#[test]
+fn a_click_lands_on_the_row_the_window_drew_there() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_providers_tab(&mut application);
+    focus_setting(&mut application, "provider.claude.enabled");
+
+    // Short enough that the box has room for the last rows of the tab alone.
+    let cramped = rendered_application_rows_at(&application, 80, 9);
+    assert!(
+        !cramped.iter().any(|row| is_row_for(row, "Codex")),
+        "the window has scrolled past the tab's first row: {cramped:?}"
+    );
+
+    click(
+        &mut application,
+        label_column_in(&cramped, "Copilot") as u16,
+        row_index(&cramped, "Copilot") as u16,
+    );
+    assert_eq!(
+        focused_key(&application),
+        "provider.copilot.enabled",
+        "the click landed on the row drawn there rather than on the tab's first"
+    );
+}
+
+/// A pointer lands on what is on screen, so a frame that drew no panel leaves
+/// nothing to land on: a terminal too small for the panel answers a click with
+/// nothing rather than with where the panel last stood.
+#[test]
+fn a_click_at_a_terminal_too_small_to_draw_the_panel_changes_nothing() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    let rows = rendered_application_rows(&application);
+    let listed_row = row_index(&rows, "Reasoning visibility") as u16;
+    let column = label_column(&application, "Reasoning visibility") as u16;
+
+    let cramped = rendered_application_rows_at(&application, 20, 4);
+    assert!(
+        !cramped.join("\n").contains("Reasoning visibility"),
+        "the terminal is too small to draw the panel at all: {cramped:?}"
+    );
+
+    assert_eq!(
+        click(&mut application, column, listed_row),
+        ApplicationTransition::Continue,
+        "a click asked something of a panel this frame never drew"
+    );
+    assert_eq!(
+        focused_key(&application),
+        "transcript.defaultFoldPosture",
+        "the focus is where the reader left it, not where the panel used to be"
+    );
+}
+
+/// The pointer reaches the panel as a command like any other, so the command
+/// can arrive while the panel is closed. It must move no focus the reader
+/// cannot see and send Suru off to consult no Provider.
+#[test]
+fn a_pointer_command_invoked_while_the_panel_is_closed_changes_nothing() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let before = rendered_application_rows(&application);
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::FocusSettingsPanelAt {
+                column: 4,
+                screen_row: 6,
+            }))
+            .expect("point at a panel that is not open"),
+        ApplicationTransition::Continue,
+        "a click with no panel open asked something of Suru"
+    );
+    assert_eq!(
+        rendered_application_rows(&application),
+        before,
+        "and changed what is on screen"
+    );
 }
 
 #[test]

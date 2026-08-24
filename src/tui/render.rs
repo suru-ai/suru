@@ -27,7 +27,9 @@ use super::{
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
     session_picker::SessionPickerRow,
-    settings_panel::{RowAvailability, RowExpansion, RowValue},
+    settings_panel::{
+        PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, TabBar, TabSpan,
+    },
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
         PromptFooterSlotContext, PromptStatusSlotContext, RenderSlots, RenderedSlot,
@@ -78,6 +80,10 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
 
 pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlots) {
     let theme = Theme::system();
+    // The settings panel is pointable, and only a frame that drew it can say
+    // where. Every frame starts by giving up what the last one recorded, so the
+    // geometry a click resolves against is always the one on screen.
+    state.settings_panel.forget_layout();
     if terminal_is_too_small(frame.area()) {
         render_terminal_too_small(frame, &theme);
         return;
@@ -335,10 +341,19 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     );
 }
 
+/// What the tab bar puts between two labels, which the hit test steps over as
+/// the drawing does.
+const SETTINGS_TAB_GAP: &str = "  ";
+
 /// The settings panel: the tab bar, the rows of the tab being shown, what each
 /// is worth right now, and whether that value is the reader's own pin or the
 /// built-in default. Rows come straight from the latest effective-settings
 /// snapshot, so an edit moves a row only once the server has answered for it.
+///
+/// Drawing is also what tells the panel where it ended up, because the box's
+/// height, the tab labels' columns, and the window of rows that fit are all
+/// decided here. A pointer is resolved against that record, so the reader can
+/// only ever click something this frame actually drew.
 fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     let rows = state
         .settings_panel
@@ -354,6 +369,17 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
     );
     let content_width = usize::from(area.width.saturating_sub(2));
     let content_height = usize::from(area.height.saturating_sub(2));
+    let content_left = area.x.saturating_add(1);
+    let content_top = area.y.saturating_add(1);
+    // Inside the border on both sides, so the box's own frame and the screen it
+    // covers are surfaces a click passes through.
+    let content_columns = content_left
+        ..area
+            .x
+            .saturating_add(area.width)
+            .saturating_sub(1)
+            .max(content_left);
+    let mut tab_bar = None;
     let mut lines = Vec::with_capacity(content_height);
     // Both tabs, always, so the reader can see what the panel holds without
     // visiting it; the active one is drawn as the accent. A box too short for
@@ -361,10 +387,20 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
     // says nothing about the Settings the reader came for.
     if content_height >= 4 {
         let mut spans = Vec::new();
+        let mut labels = Vec::new();
+        let mut column = content_left;
         for tab in state.settings_panel.tabs() {
             if !spans.is_empty() {
-                spans.push(Span::raw("  "));
+                spans.push(Span::raw(SETTINGS_TAB_GAP));
+                column = column
+                    .saturating_add(u16::try_from(SETTINGS_TAB_GAP.width()).unwrap_or(u16::MAX));
             }
+            let width = u16::try_from(tab.title.width()).unwrap_or(u16::MAX);
+            labels.push(TabSpan {
+                tab: tab.tab,
+                columns: column..column.saturating_add(width),
+            });
+            column = column.saturating_add(width);
             spans.push(Span::styled(
                 tab.title,
                 if tab.active {
@@ -374,6 +410,10 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
                 },
             ));
         }
+        tab_bar = Some(TabBar {
+            row: content_top,
+            labels,
+        });
         lines.push(Line::from(spans));
     }
     if content_height >= 2 {
@@ -409,7 +449,14 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
     let expands = rows
         .iter()
         .any(|row| row.selected && row.expansion.expands());
+    // The rows begin under whatever has been drawn above them, and the window
+    // decides which of the tab's rows those are — so this frame is the only
+    // thing that can say what a pointer over them landed on.
+    let rows_top = content_top.saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+    let first_row = window_start(selected, capacity);
+    let mut drawn_rows: u16 = 0;
     for row in visible_window(rows, selected, capacity) {
+        drawn_rows = drawn_rows.saturating_add(1);
         let marker = if row.selected { "› " } else { "  " };
         // The affordance says what Enter would do to this row and, on a tab of
         // Providers, holds its column even for the Provider Enter passes over,
@@ -468,6 +515,15 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
             theme.text.subdued,
         ));
     }
+    state.settings_panel.record_layout(PanelLayout::new(
+        content_columns,
+        tab_bar,
+        (drawn_rows > 0).then_some(RowWindow {
+            top: rows_top,
+            first: first_row,
+            count: drawn_rows,
+        }),
+    ));
     render_overlay_box(frame, area, lines, " Settings ", theme);
 }
 
@@ -615,8 +671,16 @@ fn model_option_choice_line(
 /// rows to fill it, ending on the focused one, so a selection moving past the
 /// bottom scrolls the list rather than leaving the frame.
 fn visible_window<T>(rows: Vec<T>, selected: usize, capacity: usize) -> impl Iterator<Item = T> {
-    let start = selected.saturating_add(1).saturating_sub(capacity);
-    rows.into_iter().skip(start).take(capacity)
+    rows.into_iter()
+        .skip(window_start(selected, capacity))
+        .take(capacity)
+}
+
+/// The first row a window of `capacity` rows shows while `selected` has to be
+/// in it, which a surface a reader can point at needs as well as the drawing
+/// does: it is what says which row the pointer landed on.
+fn window_start(selected: usize, capacity: usize) -> usize {
+    selected.saturating_add(1).saturating_sub(capacity)
 }
 
 fn render_overlay_box(

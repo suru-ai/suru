@@ -26,6 +26,16 @@
 //! and each arrival asks again rather than trusting the last answer. Enablement
 //! decides who is asked — a Provider the reader turned off is never consulted,
 //! so its row reports the choice and never a condition Suru did not look for.
+//!
+//! The reader may also point at the panel. Drawing is the only thing that knows
+//! how tall the box came out and which rows the window put on screen, so the
+//! frame leaves its geometry here and a click resolves against that, the way a
+//! click in the transcript resolves against the viewport it drew. What a
+//! pointer can reach stops there: a tab label shows that tab and a row takes
+//! the focus, because every edit runs through the focused Setting and pointing
+//! at a row is not asking for one.
+
+use std::{cell::RefCell, ops::Range};
 
 use crate::{
     protocol::{
@@ -115,13 +125,100 @@ pub(super) struct SettingsPanel {
     /// next edit, so a stale complaint never outlives the attempt that earned
     /// it.
     error: Option<String>,
+    /// Where the frame in force drew the tab bar and the rows, which is what a
+    /// pointer resolves against. Rendering leaves it here, so it is held behind
+    /// a cell rather than taken by an edit.
+    layout: RefCell<PanelLayout>,
 }
 
 /// One tab as the tab bar draws it.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SettingsTabLabel {
+    pub(super) tab: SettingsTab,
     pub(super) title: &'static str,
     pub(super) active: bool,
+}
+
+/// Where a frame drew the panel's two pointable surfaces. Everything here is
+/// terminal geometry the drawing decided, which is why drawing is what records
+/// it; a panel nothing has drawn yet answers no click, because a layout that
+/// claimed a geometry it had not drawn would move the focus somewhere the
+/// reader never pointed.
+#[derive(Clone, Debug, Default)]
+pub(super) struct PanelLayout {
+    /// The columns inside the box's border, so a click on the border or on the
+    /// screen the overlay covers lands on nothing.
+    columns: Range<u16>,
+    /// The tab bar, where the box had the room to draw one.
+    tabs: Option<TabBar>,
+    /// The rows, where any were drawn at all.
+    rows: Option<RowWindow>,
+}
+
+/// The tab bar as one frame drew it: the row it went on, and the columns each
+/// label fills.
+#[derive(Clone, Debug)]
+pub(super) struct TabBar {
+    pub(super) row: u16,
+    pub(super) labels: Vec<TabSpan>,
+}
+
+/// One tab label as the bar drew it: the tab it names and the columns it fills.
+#[derive(Clone, Debug)]
+pub(super) struct TabSpan {
+    pub(super) tab: SettingsTab,
+    pub(super) columns: Range<u16>,
+}
+
+/// The rows as one frame drew them: where they began, which row of the tab the
+/// first of them was, and how many followed. A tab is longer than the box has
+/// room for, so a pointer means nothing without knowing which of its rows the
+/// window put on screen.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RowWindow {
+    pub(super) top: u16,
+    pub(super) first: usize,
+    pub(super) count: u16,
+}
+
+/// What the pointer landed on, which is a tab to show or a row to focus and
+/// never anything a reader has to undo.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PanelHit {
+    Tab(SettingsTab),
+    Row(usize),
+}
+
+impl PanelLayout {
+    /// The geometry one frame drew, out of the parts the drawing decided: what
+    /// a valid layout is stays here rather than with whoever assembled it.
+    pub(super) fn new(columns: Range<u16>, tabs: Option<TabBar>, rows: Option<RowWindow>) -> Self {
+        Self {
+            columns,
+            tabs,
+            rows,
+        }
+    }
+
+    fn hit(&self, column: u16, row: u16) -> Option<PanelHit> {
+        if !self.columns.contains(&column) {
+            return None;
+        }
+        if let Some(bar) = &self.tabs
+            && bar.row == row
+            && let Some(span) = bar
+                .labels
+                .iter()
+                .find(|span| span.columns.contains(&column))
+        {
+            return Some(PanelHit::Tab(span.tab));
+        }
+        let window = self.rows?;
+        let offset = row.checked_sub(window.top)?;
+        (offset < window.count)
+            .then(|| window.first.saturating_add(usize::from(offset)))
+            .map(PanelHit::Row)
+    }
 }
 
 /// One row as the panel presents it: what it is called, what it is worth, and
@@ -271,6 +368,58 @@ impl SettingsPanel {
         self.move_tab(1, settings)
     }
 
+    /// Takes the geometry the frame just drew, which is the only account of the
+    /// panel a pointer can be resolved against.
+    pub(super) fn record_layout(&self, layout: PanelLayout) {
+        self.layout.replace(layout);
+    }
+
+    /// Gives up the geometry a frame recorded. A frame that draws no panel —
+    /// because none is open, or because the terminal came out too small for one
+    /// — leaves nothing to point at, so a click cannot land on where the panel
+    /// used to be.
+    pub(super) fn forget_layout(&self) {
+        self.record_layout(PanelLayout::default());
+    }
+
+    /// Moves the panel to whatever the reader pointed at: a tab label shows
+    /// that tab, a row takes the focus, and a click on anything else — the
+    /// headline, the footer, the border, the screen the box is drawn over —
+    /// changes nothing. A click never edits a Setting and never expands a
+    /// Provider: the focused row is the one surface an edit runs through, so
+    /// pointing at a row asks for the focus and never for the value.
+    ///
+    /// Like every other way into the panel, this does nothing at all while the
+    /// panel is closed, so a click resolved somewhere the panel is not can
+    /// neither move a focus the reader cannot see nor send Suru off to consult
+    /// the Providers.
+    ///
+    /// The pointer mints no semantic command of its own, because it introduces
+    /// no behavior: showing a tab and focusing a row are what the tab and row
+    /// keys already do, and a plugin reaches both through those. It only says
+    /// which one, by position — and a position is this frame's to know rather
+    /// than something a command could name, which is why the hit test ends
+    /// here rather than in a subject a command could carry.
+    pub(super) fn focus_at(
+        &mut self,
+        column: u16,
+        row: u16,
+        settings: &EffectiveSettings,
+    ) -> AvailabilityRead {
+        if !self.open {
+            return AvailabilityRead::None;
+        }
+        let hit = self.layout.borrow().hit(column, row);
+        match hit {
+            Some(PanelHit::Tab(tab)) => self.show_tab(tab, settings),
+            Some(PanelHit::Row(row)) => {
+                self.focus_row(row);
+                AvailabilityRead::None
+            }
+            None => AvailabilityRead::None,
+        }
+    }
+
     /// Notes the listing the read in force is waiting on, which is the one
     /// answer that may settle it.
     pub(super) fn await_listing(&mut self, request: ModelListRequest) {
@@ -358,6 +507,7 @@ impl SettingsPanel {
         SettingsTab::ALL
             .iter()
             .map(|tab| SettingsTabLabel {
+                tab: *tab,
                 title: tab.title(),
                 active: *tab == self.tab,
             })
@@ -545,24 +695,40 @@ impl SettingsPanel {
     }
 
     /// Walks the tab bar, wrapping at either end so neither is a dead end. The
-    /// tab arrived at is where the reader left it, not its top row. Landing on
-    /// the tab that presents the Providers themselves re-reads their
-    /// Availability, which is what that arrival means — and which is why a
-    /// closed panel walks nowhere: a command invoked from somewhere the panel
-    /// is not must not send Suru off to consult the Providers.
+    /// tab arrived at is where the reader left it, not its top row. A closed
+    /// panel walks nowhere: a command invoked from somewhere the panel is not
+    /// must not send Suru off to consult the Providers.
     fn move_tab(&mut self, distance: isize, settings: &EffectiveSettings) -> AvailabilityRead {
         if !self.open {
             return AvailabilityRead::None;
         }
-        self.error = None;
         let position = (self.tab.position() as isize + distance)
             .rem_euclid(SettingsTab::ALL.len() as isize) as usize;
-        self.tab = SettingsTab::ALL[position];
+        self.show_tab(SettingsTab::ALL[position], settings)
+    }
+
+    /// Shows one tab, however the reader asked for it. Asking for the tab that
+    /// presents the Providers themselves re-reads their Availability, which is
+    /// what turning to that surface means — including from the reader already
+    /// on it, because pointing at the Providers is asking Suru to consult them,
+    /// and that gesture is how a reader who has just signed in outside Suru
+    /// watches the row come good. Walking the bar never lands on the tab in
+    /// view, so only a pointer can ask this.
+    fn show_tab(&mut self, tab: SettingsTab, settings: &EffectiveSettings) -> AvailabilityRead {
+        self.error = None;
+        self.tab = tab;
         if self.tab != SettingsTab::Providers {
             return AvailabilityRead::None;
         }
         self.begin_availability_read(settings);
         AvailabilityRead::Begun
+    }
+
+    /// Focuses one row of the tab being shown, which is a move like Up and Down
+    /// and takes the standing complaint away as they do.
+    fn focus_row(&mut self, row: usize) {
+        self.error = None;
+        self.selected[self.tab.position()] = row;
     }
 
     /// Puts every Provider that is about to be asked about back to waiting.

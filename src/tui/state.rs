@@ -1208,7 +1208,9 @@ pub enum CommandId {
     ScrollTranscriptLinesUp,
     ScrollTranscriptLinesDown,
     FollowLatest,
-    ToggleTranscriptDisclosureAt { screen_row: u16 },
+    ToggleTranscriptDisclosureAt {
+        screen_row: u16,
+    },
     BeginLeader,
     OpenQueuedPrompts,
     SelectPreviousQueuedPrompt,
@@ -1239,6 +1241,12 @@ pub enum CommandId {
     PageNextModels,
     SelectModel,
     CloseModelPicker,
+    /// Where in the settings panel the reader pointed, which the panel resolves
+    /// against the geometry the frame in force drew.
+    FocusSettingsPanelAt {
+        column: u16,
+        screen_row: u16,
+    },
     InvokeSemantic(SemanticCommandId),
     InsertText(String),
     PasteText(String),
@@ -1426,6 +1434,13 @@ impl Application {
             | CommandId::PageNextModels
             | CommandId::SelectModel
             | CommandId::CloseModelPicker) => self.handle_model_picker_command(command),
+            CommandId::FocusSettingsPanelAt { column, screen_row } => {
+                let read =
+                    self.state
+                        .settings_panel
+                        .focus_at(column, screen_row, &self.state.settings);
+                Ok(self.answer_availability_read(read))
+            }
             command @ (CommandId::BeginLeader
             | CommandId::OpenQueuedPrompts
             | CommandId::SelectPreviousQueuedPrompt
