@@ -42,7 +42,10 @@ pub const FALLBACK_CONFIG_FILE: &str = "suru.json";
 // mutations that edit it can never drift apart.
 const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
 const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
+const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
 const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary";
+const PROVIDER_COPILOT_ENABLED: &str = "provider.copilot.enabled";
+const PROVIDER_CLAUDE_ENABLED: &str = "provider.claude.enabled";
 
 /// What a Config Document that does not exist yet is edited as.
 const EMPTY_DOCUMENT: &str = "{}\n";
@@ -63,17 +66,41 @@ pub struct SettingDescriptor {
     /// so the built-in default resumes.
     pub reset: SettingMutation,
     /// Writes a pinned JSON value into the typed field it governs, or reports
-    /// that the value is not one of the accepted ones.
-    apply: fn(&mut EffectiveSettings, &Value) -> bool,
+    /// that the value is not one of the accepted ones. Crate-visible so a test
+    /// elsewhere can put a Setting in force the way a Config Document would.
+    pub(crate) apply: fn(&mut EffectiveSettings, &Value) -> bool,
 }
 
 /// One value a Setting can hold, and the pin that puts it in force.
 pub struct SettingChoice {
     /// The value as a Config Document spells it, which is also what a client
     /// shows: what the reader sees and what they would type are the same word.
+    /// The spelling elides JSON's own quoting, so a string choice reads
+    /// `folded` rather than `"folded"` and a boolean one reads `true`.
     pub value: &'static str,
     /// The mutation that pins this value, even when it is the built-in default.
     pub pin: SettingMutation,
+}
+
+impl SettingChoice {
+    /// The JSON this choice's pin writes into a Config Document, which is what
+    /// the loader reads back.
+    fn pinned_value(&self) -> Value {
+        pin_for(&self.pin)
+            .1
+            .expect("a Setting's choice always pins a value")
+    }
+
+    /// The choice as a message naming it spells it: quoted when a Config
+    /// Document spells it as a JSON string, bare when the document spells it
+    /// as a literal such as `true`. Telling the reader what to type is the
+    /// whole job of the diagnostic this feeds, so the quoting is not cosmetic.
+    fn spelled(&self) -> String {
+        match self.pinned_value() {
+            Value::String(_) => format!("{:?}", self.value),
+            _ => self.value.to_owned(),
+        }
+    }
 }
 
 impl SettingDescriptor {
@@ -118,7 +145,7 @@ impl SettingDescriptor {
         let values = self
             .choices
             .iter()
-            .map(|choice| format!("{:?}", choice.value))
+            .map(SettingChoice::spelled)
             .collect::<Vec<_>>();
         match values.split_last() {
             None => "a value this Setting accepts".to_owned(),
@@ -139,8 +166,17 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::TranscriptReasoningVisibility { value } => {
             value == Some(settings.transcript.reasoning_visibility)
         }
+        SettingMutation::ProviderCodexEnabled { value } => {
+            value == Some(settings.provider.codex.enabled)
+        }
         SettingMutation::ProviderCodexReasoningSummary { value } => {
             value == Some(settings.provider.codex.reasoning_summary)
+        }
+        SettingMutation::ProviderCopilotEnabled { value } => {
+            value == Some(settings.provider.copilot.enabled)
+        }
+        SettingMutation::ProviderClaudeEnabled { value } => {
+            value == Some(settings.provider.claude.enabled)
         }
     }
 }
@@ -203,6 +239,31 @@ pub const SCHEMA: &[SettingDescriptor] = &[
             })
         },
     },
+    // Each Provider's Enablement is ordered immediately before that Provider's
+    // other Settings, so the flat panel still reads grouped without any
+    // grouping machinery.
+    SettingDescriptor {
+        key: PROVIDER_CODEX_ENABLED,
+        label: "Codex Provider",
+        description: "Whether Suru offers Codex, or leaves it entirely alone",
+        scope: SettingScope::Server,
+        choices: &[
+            SettingChoice {
+                value: "true",
+                pin: SettingMutation::ProviderCodexEnabled { value: Some(true) },
+            },
+            SettingChoice {
+                value: "false",
+                pin: SettingMutation::ProviderCodexEnabled { value: Some(false) },
+            },
+        ],
+        reset: SettingMutation::ProviderCodexEnabled { value: None },
+        apply: |settings, value| {
+            apply_value(value, |enabled| {
+                settings.provider.codex.enabled = enabled;
+            })
+        },
+    },
     SettingDescriptor {
         key: PROVIDER_CODEX_REASONING_SUMMARY,
         label: "Codex Reasoning summary",
@@ -238,6 +299,50 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |detail| {
                 settings.provider.codex.reasoning_summary = detail;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: PROVIDER_COPILOT_ENABLED,
+        label: "Copilot Provider",
+        description: "Whether Suru offers Copilot, or leaves it entirely alone",
+        scope: SettingScope::Server,
+        choices: &[
+            SettingChoice {
+                value: "true",
+                pin: SettingMutation::ProviderCopilotEnabled { value: Some(true) },
+            },
+            SettingChoice {
+                value: "false",
+                pin: SettingMutation::ProviderCopilotEnabled { value: Some(false) },
+            },
+        ],
+        reset: SettingMutation::ProviderCopilotEnabled { value: None },
+        apply: |settings, value| {
+            apply_value(value, |enabled| {
+                settings.provider.copilot.enabled = enabled;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: PROVIDER_CLAUDE_ENABLED,
+        label: "Claude Provider",
+        description: "Whether Suru offers Claude, or leaves it entirely alone",
+        scope: SettingScope::Server,
+        choices: &[
+            SettingChoice {
+                value: "true",
+                pin: SettingMutation::ProviderClaudeEnabled { value: Some(true) },
+            },
+            SettingChoice {
+                value: "false",
+                pin: SettingMutation::ProviderClaudeEnabled { value: Some(false) },
+            },
+        ],
+        reset: SettingMutation::ProviderClaudeEnabled { value: None },
+        apply: |settings, value| {
+            apply_value(value, |enabled| {
+                settings.provider.claude.enabled = enabled;
             })
         },
     },
@@ -368,8 +473,15 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::TranscriptReasoningVisibility { value } => {
             (TRANSCRIPT_REASONING_VISIBILITY, pinned(value))
         }
+        SettingMutation::ProviderCodexEnabled { value } => (PROVIDER_CODEX_ENABLED, pinned(value)),
         SettingMutation::ProviderCodexReasoningSummary { value } => {
             (PROVIDER_CODEX_REASONING_SUMMARY, pinned(value))
+        }
+        SettingMutation::ProviderCopilotEnabled { value } => {
+            (PROVIDER_COPILOT_ENABLED, pinned(value))
+        }
+        SettingMutation::ProviderClaudeEnabled { value } => {
+            (PROVIDER_CLAUDE_ENABLED, pinned(value))
         }
     }
 }
@@ -704,16 +816,21 @@ mod tests {
         serde_json::to_value(mutation).expect("Setting mutations always serialize")["value"].clone()
     }
 
+    /// A choice is shown as the Config Document spells it, with JSON's own
+    /// quoting elided: a string choice is its contents, and any other JSON
+    /// value — a boolean above all — is its literal spelling.
     #[test]
     fn every_choice_is_spelled_the_way_the_config_document_spells_it() {
         for descriptor in SCHEMA {
             for choice in descriptor.choices {
+                let spelled = match pinned_value(&choice.pin) {
+                    Value::String(text) => text,
+                    other => other.to_string(),
+                };
                 assert_eq!(
-                    pinned_value(&choice.pin),
-                    Value::String(choice.value.to_owned()),
+                    spelled, choice.value,
                     "{} offers {:?} but pins something else",
-                    descriptor.key,
-                    choice.value
+                    descriptor.key, choice.value
                 );
             }
         }
@@ -800,7 +917,12 @@ mod tests {
             vec![
                 "one of \"folded\" or \"expanded\"".to_owned(),
                 "one of \"hidden\" or \"shown\"".to_owned(),
+                // A boolean Setting is diagnosed as accepting `true` or
+                // `false`, unquoted, because that is what the reader must type.
+                "one of true or false".to_owned(),
                 "one of \"auto\", \"concise\", \"detailed\", or \"none\"".to_owned(),
+                "one of true or false".to_owned(),
+                "one of true or false".to_owned(),
             ]
         );
     }

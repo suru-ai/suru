@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use futures_util::stream;
 use suru::protocol::{AgentIdentity, ModelDescriptor, ProviderId, ProviderUnavailability};
@@ -21,6 +24,13 @@ pub struct ControlledProviderRuntime {
     /// in for a Provider the user has yet to install or sign in to. Shared so a
     /// test can fix it the way a user would and refresh.
     unavailable: Arc<Mutex<Option<ProviderUnavailability>>>,
+    /// How many times Suru has asked this Provider for its Models. Every other
+    /// assertion can only establish that a Provider is not selectable; this is
+    /// what lets a test see that a Provider was never consulted at all.
+    /// Session startup proves its own negative — a start request that never
+    /// arrives on the double's channel is directly observable — so discovery is
+    /// the one demand that needs counting.
+    discoveries: Arc<AtomicUsize>,
     starts: mpsc::UnboundedSender<StartRequest>,
 }
 
@@ -76,6 +86,7 @@ impl ControlledProvider {
                 provider,
                 models,
                 unavailable: Arc::new(Mutex::new(None)),
+                discoveries: Arc::new(AtomicUsize::new(0)),
                 starts: starts_tx,
             }),
             Self { starts: starts_rx },
@@ -88,6 +99,13 @@ impl ControlledProvider {
             .await
             .expect("Provider runtime remains connected")
     }
+
+    /// The Session startup already asked for, without waiting for one. A test
+    /// that must show a Provider was *never* asked to begin a Session reads the
+    /// absence here rather than waiting out a timeout.
+    pub fn try_next_start(&mut self) -> Option<StartRequest> {
+        self.starts.try_recv().ok()
+    }
 }
 
 impl ControlledProviderRuntime {
@@ -98,6 +116,11 @@ impl ControlledProviderRuntime {
             .unavailable
             .lock()
             .expect("controlled Provider availability lock is not poisoned") = reason;
+    }
+
+    /// How many times Suru has asked this Provider for its Models.
+    pub fn model_discoveries(&self) -> usize {
+        self.discoveries.load(Ordering::SeqCst)
     }
 }
 
@@ -242,6 +265,7 @@ impl ProviderRuntime for ControlledProviderRuntime {
     }
 
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
+        self.discoveries.fetch_add(1, Ordering::SeqCst);
         let models = self.models.clone();
         let unavailable = *self
             .unavailable

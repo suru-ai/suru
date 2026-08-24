@@ -1123,6 +1123,105 @@ fn model_picker_shows_an_unavailable_provider_with_its_reason_and_refuses_select
     );
 }
 
+/// A disabled Provider is the opposite of an unavailable one here: it draws no
+/// row at all rather than keeping its place with a retry row, because Suru
+/// never consulted it and decluttering the list is half of what the Setting is
+/// for.
+#[test]
+fn model_picker_draws_no_row_at_all_for_a_provider_the_user_turned_off() {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request: request.clone(),
+            catalog: ModelCatalog {
+                providers: vec![
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("codex"),
+                        models: Vec::new(),
+                        status: ProviderCatalogStatus::Disabled,
+                    },
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("copilot"),
+                        models: Vec::new(),
+                        status: ProviderCatalogStatus::Unavailable {
+                            reason: ProviderUnavailability::NotInstalled,
+                            message: "could not launch the Copilot CLI".to_owned(),
+                        },
+                    },
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("other"),
+                        models: vec![model_descriptor(
+                            "other",
+                            "other-default",
+                            "Other Default",
+                            true,
+                            ModelAvailability::Available,
+                        )],
+                        status: ProviderCatalogStatus::Fresh,
+                    },
+                ],
+            },
+        })
+        .expect("load a catalog holding a disabled Provider");
+
+    let screen = rendered_application_rows(&application).join("\n");
+    assert!(
+        !screen.contains("codex"),
+        "a disabled Provider leaves the list outright, got {screen}"
+    );
+    assert!(
+        screen.contains("Retry copilot: not installed"),
+        "an unavailable Provider still keeps its place with its retry row, got {screen}"
+    );
+    assert!(
+        screen.contains("Other Default"),
+        "the Providers the user kept are unaffected, got {screen}"
+    );
+
+    // The user turns it back on; its Models arrive with the next listing and
+    // become selectable without anything else happening.
+    application
+        .handle_event(ApplicationEvent::ModelsRefreshed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    models: vec![model_descriptor(
+                        "codex",
+                        "gpt-fixture",
+                        "GPT Fixture",
+                        true,
+                        ModelAvailability::Available,
+                    )],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("merge the re-enabled Provider");
+    let rows = rendered_application_rows(&application);
+    assert!(
+        rows.join("\n").contains("Provider codex"),
+        "the Provider returns to the list the moment it is enabled, got {}",
+        rows.join("\n")
+    );
+    assert!(
+        !rows
+            .iter()
+            .find(|row| row.contains("GPT Fixture"))
+            .expect("the re-enabled Provider brings its Models")
+            .contains("unavailable"),
+        "its Models are selectable again"
+    );
+}
+
 #[test]
 fn model_picker_keeps_an_unavailable_provider_with_no_models_in_the_list() {
     let mut application = Application::default();

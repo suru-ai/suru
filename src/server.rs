@@ -313,6 +313,16 @@ struct AppState {
     timings: ServerTimings,
 }
 
+impl AppState {
+    /// Whether Suru may put this Provider forward on the user's behalf: it is
+    /// one this server hosts, and one the user has left enabled. The one
+    /// predicate every site that chooses a Provider for the user consults.
+    fn is_selectable_provider(&self, provider: &ProviderId) -> bool {
+        self.hosted_providers.contains(provider)
+            && self.settings.borrow().settings.provider_enabled(provider)
+    }
+}
+
 pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
     spawn_with_providers(config, built_in_runtimes()).await
 }
@@ -444,12 +454,13 @@ pub async fn spawn_with_providers_and_timings(
     let sessions = SessionStore::new(persisted_sessions, storage.clone());
     let landing_agent_selection =
         LandingAgentSelectionStore::new(persisted_landing_agent_selection, storage);
-    let model_catalog = ModelCatalogService::new(runtimes.iter().cloned());
+    let model_catalog = ModelCatalogService::new(runtimes.iter().cloned(), settings.subscribe());
     let providers = ProviderOrchestrator::new(
         runtimes.clone(),
         sessions.clone(),
         provider_shutdown_rx,
         provider_updates,
+        settings.subscribe(),
     );
     let state = AppState {
         descriptor: Arc::new(descriptor.clone()),
@@ -829,13 +840,14 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             Err(response) => return *response,
         };
     } else {
-        // A persisted Landing selection can predate this server's hosted set,
-        // so an unhosted one yields to the built-in default rather than
-        // opening a Session on a Provider this server cannot run.
+        // A persisted Landing selection can predate this server's hosted set or
+        // the user's own choice of Providers, so one naming a Provider this
+        // server does not host — or one the user has since turned off — yields
+        // to the built-in default rather than stranding them on it.
         request.agent_selection = state
             .landing_agent_selection
             .current()
-            .filter(|selection| state.hosted_providers.contains(&selection.provider))
+            .filter(|selection| state.is_selectable_provider(&selection.provider))
             .or_else(|| state.model_catalog.default_selection());
     }
 
@@ -1466,6 +1478,7 @@ mod tests {
     use futures_util::{StreamExt, pin_mut};
 
     use super::*;
+    use crate::protocol::EffectiveSettings;
 
     #[tokio::test]
     async fn lifecycle_streams_receive_shutdown_intent_independently() {
@@ -1518,5 +1531,36 @@ mod tests {
             .expect("lifecycle stream is infallible");
         assert!(first.next().await.is_none());
         assert!(second.next().await.is_none());
+    }
+
+    /// A Provider added to the built-in set without an `enabled` Setting would
+    /// be one the user cannot turn off, and would read as enabled forever
+    /// through the fallback [`EffectiveSettings::provider_enabled`] keeps for
+    /// Providers the schema does not name. This is the guard that walks a
+    /// developer to the schema entry, the mutation, and the settings field.
+    #[test]
+    fn every_built_in_provider_can_be_turned_off_by_its_own_setting() {
+        for runtime in built_in_runtimes() {
+            let provider = runtime.provider_id();
+            let key = format!("provider.{provider}.enabled");
+            let descriptor = crate::settings::SCHEMA
+                .iter()
+                .find(|descriptor| descriptor.key == key)
+                .unwrap_or_else(|| panic!("Provider `{provider}` has no {key} Setting"));
+
+            let mut settings = EffectiveSettings::default();
+            assert!(
+                settings.provider_enabled(&provider),
+                "Provider `{provider}` must be enabled unless the user says otherwise"
+            );
+            assert!(
+                (descriptor.apply)(&mut settings, &serde_json::Value::Bool(false)),
+                "{key} must accept a JSON boolean"
+            );
+            assert!(
+                !settings.provider_enabled(&provider),
+                "{key} does not reach the gate that reads Provider `{provider}`'s Enablement"
+            );
+        }
     }
 }

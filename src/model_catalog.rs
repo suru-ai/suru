@@ -6,7 +6,7 @@ use tokio::sync::watch;
 use crate::{
     protocol::{
         AgentSelection, ModelCatalog, ModelDescriptor, ProviderCatalogStatus, ProviderId,
-        ProviderModelCatalog, ProviderUnavailability,
+        ProviderModelCatalog, ProviderUnavailability, SettingsSnapshot,
     },
     provider::{ProviderError, ProviderRuntime, validate_models},
 };
@@ -22,6 +22,10 @@ struct ProviderCatalog {
     provider: ProviderId,
     state: Arc<Mutex<CatalogState>>,
     generation: watch::Sender<u64>,
+    /// The effective Settings in force, read whenever this catalog is about to
+    /// consult its Provider. A Provider the user turned off is never asked for
+    /// its Models, so no process starts on its behalf.
+    settings: watch::Receiver<SettingsSnapshot>,
 }
 
 #[derive(Default)]
@@ -40,8 +44,11 @@ struct CatalogFailure {
 }
 
 impl ModelCatalogService {
-    pub(crate) fn new(runtimes: impl IntoIterator<Item = Arc<dyn ProviderRuntime>>) -> Self {
-        Self {
+    pub(crate) fn new(
+        runtimes: impl IntoIterator<Item = Arc<dyn ProviderRuntime>>,
+        settings: watch::Receiver<SettingsSnapshot>,
+    ) -> Self {
+        let service = Self {
             providers: Arc::new(
                 runtimes
                     .into_iter()
@@ -50,10 +57,41 @@ impl ModelCatalogService {
                         runtime,
                         state: Arc::new(Mutex::new(CatalogState::default())),
                         generation: watch::channel(0).0,
+                        settings: settings.clone(),
                     })
                     .collect(),
             ),
-        }
+        };
+        service.refresh_providers_as_they_are_enabled(settings);
+        service
+    }
+
+    /// Discovers a Provider's Models the moment the user turns it back on, so
+    /// enabling it and using it are one step. A Provider disabled at startup
+    /// was never consulted and has no cache to fall back on, so without this it
+    /// would come back as a Provider with no Models until something asked
+    /// again.
+    fn refresh_providers_as_they_are_enabled(
+        &self,
+        mut settings: watch::Receiver<SettingsSnapshot>,
+    ) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut was_enabled = service
+                .providers
+                .iter()
+                .map(ProviderCatalog::is_enabled)
+                .collect::<Vec<_>>();
+            while settings.changed().await.is_ok() {
+                for (catalog, was_enabled) in service.providers.iter().zip(was_enabled.iter_mut()) {
+                    let is_enabled = catalog.is_enabled();
+                    if is_enabled && !*was_enabled {
+                        catalog.begin_refresh();
+                    }
+                    *was_enabled = is_enabled;
+                }
+            }
+        });
     }
 
     pub(crate) async fn list(&self) -> ModelCatalog {
@@ -69,10 +107,10 @@ impl ModelCatalogService {
     }
 
     /// The Agent Selection a fresh Landing starts from: hosted Providers are
-    /// consulted in their fixed built-in order, and the first available one
+    /// consulted in their fixed built-in order, and the first selectable one
     /// whose cached catalog carries a default Model supplies it. A Provider the
-    /// user cannot use yet is passed over, so a first Prompt never lands on a
-    /// Provider that cannot work.
+    /// user cannot use yet — or has turned off — is passed over, so a first
+    /// Prompt never lands on a Provider that will not work.
     pub(crate) fn default_selection(&self) -> Option<AgentSelection> {
         self.providers
             .iter()
@@ -109,9 +147,33 @@ impl ModelCatalogService {
 }
 
 impl ProviderCatalog {
+    /// Whether the user has left this Provider on. Everything that would
+    /// consult the runtime asks here first.
+    fn is_enabled(&self) -> bool {
+        self.settings
+            .borrow()
+            .settings
+            .provider_enabled(&self.provider)
+    }
+
+    /// What a Provider the user turned off reports: no Models, because none
+    /// were asked for. Whatever it discovered before a disable stays cached, so
+    /// a disable/enable round-trip costs nothing — it is simply not on offer
+    /// while the Provider is off.
+    fn disabled(&self) -> ProviderModelCatalog {
+        ProviderModelCatalog {
+            provider: self.provider.clone(),
+            models: Vec::new(),
+            status: ProviderCatalogStatus::Disabled,
+        }
+    }
+
     /// The selection this Provider's cached default Model makes, or nothing
-    /// while the Provider cannot be used.
+    /// while the Provider cannot be used or the user has turned it off.
     fn default_selection(&self) -> Option<AgentSelection> {
+        if !self.is_enabled() {
+            return None;
+        }
         let state = self
             .state
             .lock()
@@ -128,6 +190,9 @@ impl ProviderCatalog {
     }
 
     async fn list(&self) -> ProviderModelCatalog {
+        if !self.is_enabled() {
+            return self.disabled();
+        }
         {
             let mut state = self
                 .state
@@ -143,6 +208,9 @@ impl ProviderCatalog {
     }
 
     async fn refresh(&self) -> ProviderModelCatalog {
+        if !self.is_enabled() {
+            return self.disabled();
+        }
         let mut generation = self.generation.subscribe();
         self.begin_refresh();
         loop {
@@ -340,9 +408,11 @@ mod tests {
     /// caller reads the status.
     #[tokio::test(flavor = "multi_thread")]
     async fn refresh_reports_the_settled_status_despite_concurrent_list_rearming() {
-        let service = ModelCatalogService::new([
-            Arc::new(FailingAfterFirstRuntime::new()) as Arc<dyn ProviderRuntime>
-        ]);
+        let (settings, settings_rx) = watch::channel(SettingsSnapshot::default());
+        let service = ModelCatalogService::new(
+            [Arc::new(FailingAfterFirstRuntime::new()) as Arc<dyn ProviderRuntime>],
+            settings_rx,
+        );
         assert_eq!(
             service.refresh().await.providers[0].status,
             ProviderCatalogStatus::Fresh
@@ -377,5 +447,6 @@ mod tests {
         for hammer in hammers {
             hammer.await.expect("hammer task completes");
         }
+        drop(settings);
     }
 }

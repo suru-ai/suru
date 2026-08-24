@@ -719,6 +719,233 @@ async fn an_unauthenticated_mutation_never_reaches_the_config_document() {
     server.shutdown().await.expect("shut down server");
 }
 
+/// Provider Enablement is the first boolean Setting, so these hold the line on
+/// a JSON boolean being first-class: pinned, reset, and diagnosed as `true` or
+/// `false` rather than as quoted strings.
+#[tokio::test]
+async fn a_provider_pinned_off_round_trips_and_the_rest_default_to_enabled() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            // I only ever work with Codex.
+            "provider": {
+                "copilot": { "enabled": false },
+            },
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-provider-off")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let snapshot = attach(state_dir.path(), "settings-provider-off").await.1;
+    assert!(!snapshot.settings.provider.copilot.enabled);
+    assert!(
+        snapshot.settings.provider.codex.enabled && snapshot.settings.provider.claude.enabled,
+        "a Provider with no pin is enabled, so a fresh install works without finding the Setting"
+    );
+    assert_eq!(snapshot.pinned, ["provider.copilot.enabled"]);
+    assert_eq!(snapshot.diagnostics, []);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn turning_a_provider_off_and_resetting_it_leaves_the_rest_of_the_document_alone() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(config_dir.path().join("suru.jsonc"), HAND_WRITTEN)
+        .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-provider-toggle")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    let (client, _) = attach(state_dir.path(), "settings-provider-toggle").await;
+
+    let disabled = client
+        .mutate_setting(SettingMutation::ProviderClaudeEnabled { value: Some(false) })
+        .await
+        .expect("turn the Provider off");
+    assert!(!disabled.settings.provider.claude.enabled);
+    assert!(
+        disabled
+            .pinned
+            .contains(&"provider.claude.enabled".to_owned())
+    );
+    let document = config_document(config_dir.path());
+    assert!(
+        document.contains("\"enabled\": false"),
+        "the pin is a real JSON boolean rather than a quoted string: {document:?}"
+    );
+    assert!(
+        document.contains("\"reasoningSummary\":    \"detailed\""),
+        "the untouched Setting keeps its spacing: {document:?}"
+    );
+    assert!(
+        document.contains("// I read my Sessions folded."),
+        "the author's comments survive: {document:?}"
+    );
+
+    let reset = client
+        .mutate_setting(SettingMutation::ProviderClaudeEnabled { value: None })
+        .await
+        .expect("undo the choice");
+    assert!(
+        reset.settings.provider.claude.enabled,
+        "removing the pin lets the built-in default resume"
+    );
+    assert_eq!(
+        config_document(config_dir.path()),
+        HAND_WRITTEN,
+        "the round trip leaves the document byte for byte as its author wrote it"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn pinning_a_provider_on_explicitly_still_writes_it() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-provider-on")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    let (client, _) = attach(state_dir.path(), "settings-provider-on").await;
+
+    let pinned = client
+        .mutate_setting(SettingMutation::ProviderCodexEnabled { value: Some(true) })
+        .await
+        .expect("pin the built-in default");
+
+    assert!(pinned.settings.provider.codex.enabled);
+    assert_eq!(
+        pinned.pinned,
+        ["provider.codex.enabled"],
+        "a deliberate choice is pinned even when it equals the default"
+    );
+    assert_eq!(
+        config_document(config_dir.path()),
+        "{\n  \"provider\": {\n    \"codex\": {\n      \"enabled\": true\n    }\n  }\n}\n"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_mistyped_enablement_is_diagnosed_with_unquoted_booleans_and_ignored_alone() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            "provider": {
+                "codex": { "enabled": "no" },
+                "copilot": { "enabled": false },
+                "gemini": { "enabled": false }
+            }
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-provider-mistyped")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let snapshot = attach(state_dir.path(), "settings-provider-mistyped")
+        .await
+        .1;
+    assert!(
+        snapshot.settings.provider.codex.enabled,
+        "the mistyped Setting keeps its built-in default"
+    );
+    assert!(
+        !snapshot.settings.provider.copilot.enabled,
+        "one mistake does not void the rest of the document"
+    );
+    assert_eq!(snapshot.pinned, ["provider.copilot.enabled"]);
+
+    let diagnostics: Vec<_> = snapshot
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            assert_eq!(diagnostic.severity, SettingsDiagnosticSeverity::Warning);
+            (
+                diagnostic.key.as_deref().expect("a per-key diagnostic"),
+                diagnostic.message.as_str(),
+            )
+        })
+        .collect();
+    let [(codex_key, codex_message), (gemini_key, _)] = diagnostics.as_slice() else {
+        panic!("expected two diagnostics, got {diagnostics:?}");
+    };
+    assert_eq!(*codex_key, "provider.codex.enabled");
+    assert!(
+        codex_message.contains("one of true or false"),
+        "the message tells the reader what to actually type, got {codex_message:?}"
+    );
+    assert!(
+        !codex_message.contains("\"true\""),
+        "a boolean is not spelled as a quoted string, got {codex_message:?}"
+    );
+    assert_eq!(
+        *gemini_key, "provider.gemini",
+        "a Provider that does not exist is visible rather than silent"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn turning_a_provider_off_in_one_client_reaches_every_other() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-provider-broadcast")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    let (mut editor, _) = attach(state_dir.path(), "settings-provider-broadcast").await;
+    let (mut onlooker, _) = attach(state_dir.path(), "settings-provider-broadcast").await;
+
+    let answered = editor
+        .mutate_setting(SettingMutation::ProviderCopilotEnabled { value: Some(false) })
+        .await
+        .expect("turn the Provider off");
+
+    for client in [&mut editor, &mut onlooker] {
+        let pushed = next_snapshot(client).await;
+        assert_eq!(
+            pushed, answered,
+            "every view agrees on which Providers exist"
+        );
+        assert!(!pushed.settings.provider.copilot.enabled);
+    }
+
+    drop(editor);
+    drop(onlooker);
+    server.shutdown().await.expect("shut down server");
+}
+
 #[tokio::test]
 async fn a_reset_on_a_fresh_install_leaves_the_config_root_empty() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");

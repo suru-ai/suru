@@ -434,9 +434,11 @@ impl ModelPicker {
             .providers
             .iter()
             .filter(|provider| {
-                self.provider_scope
-                    .as_ref()
-                    .is_none_or(|scope| *scope == provider.provider)
+                !is_disabled(&provider.status)
+                    && self
+                        .provider_scope
+                        .as_ref()
+                        .is_none_or(|scope| *scope == provider.provider)
             })
             .flat_map(|provider| &provider.models)
             .find(|model| model.is_default && model_matches(&self.query, model))
@@ -448,10 +450,11 @@ impl ModelPicker {
         let current = current.map(ModelKey::from_selection);
         let mut rows = Vec::new();
         for provider in &self.providers {
-            if self
-                .provider_scope
-                .as_ref()
-                .is_some_and(|scope| *scope != provider.provider)
+            if is_disabled(&provider.status)
+                || self
+                    .provider_scope
+                    .as_ref()
+                    .is_some_and(|scope| *scope != provider.provider)
             {
                 continue;
             }
@@ -523,10 +526,11 @@ impl ModelPicker {
     fn selectable(&self) -> Vec<PickerSelection> {
         let mut selectable = Vec::new();
         for provider in &self.providers {
-            if self
-                .provider_scope
-                .as_ref()
-                .is_some_and(|scope| *scope != provider.provider)
+            if is_disabled(&provider.status)
+                || self
+                    .provider_scope
+                    .as_ref()
+                    .is_some_and(|scope| *scope != provider.provider)
             {
                 continue;
             }
@@ -549,7 +553,7 @@ impl ModelPicker {
 /// Model nothing may select is no basis for the options editor's implicit
 /// choice either.
 fn default_model(provider: &ProviderModels) -> Option<&ModelDescriptor> {
-    if is_unavailable(&provider.status) {
+    if is_unavailable(&provider.status) || is_disabled(&provider.status) {
         return None;
     }
     provider.models.iter().find(|model| model.is_default)
@@ -562,9 +566,11 @@ fn normalize_catalog(mut catalog: Vec<ProviderModelCatalog>) -> Vec<ProviderMode
 
 fn normalize_provider(mut catalog: ProviderModelCatalog) -> ProviderModels {
     sort_models(&mut catalog.models);
-    if is_unavailable(&catalog.status) {
-        // No Model of a Provider the user cannot use can start a Session, so
-        // the whole Provider renders — and refuses selection — as unavailable.
+    if is_unavailable(&catalog.status) || is_disabled(&catalog.status) {
+        // No Model of a Provider the user cannot use — or has turned off — can
+        // start a Session, so the whole Provider renders, and refuses
+        // selection, as unavailable. A disabled Provider draws no row at all,
+        // but its Models are cached for the options editor to read.
         for model in &mut catalog.models {
             model.availability = ModelAvailability::Unavailable;
         }
@@ -620,7 +626,11 @@ fn provider_condition(status: &ProviderCatalogStatus) -> Option<ProviderConditio
                 message,
             })
         }
-        ProviderCatalogStatus::Fresh | ProviderCatalogStatus::Refreshing => None,
+        // A Provider the user turned off puts nothing in the list — not even a
+        // reason, because Suru never looked for one.
+        ProviderCatalogStatus::Fresh
+        | ProviderCatalogStatus::Refreshing
+        | ProviderCatalogStatus::Disabled => None,
     }
 }
 
@@ -629,6 +639,14 @@ fn is_unavailable(status: &ProviderCatalogStatus) -> bool {
         provider_condition(status),
         Some(ProviderCondition::Unavailable { .. })
     )
+}
+
+/// A Provider the user turned off leaves the list outright, rather than keeping
+/// its place the way an unavailable one does: decluttering is half of what the
+/// Setting is for, and a row reporting a Provider Suru never consulted would
+/// replace one message with another.
+fn is_disabled(status: &ProviderCatalogStatus) -> bool {
+    matches!(status, ProviderCatalogStatus::Disabled)
 }
 
 fn option_is_default(kind: &ModelOptionKind, value: &ModelOptionValue) -> bool {

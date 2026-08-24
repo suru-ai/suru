@@ -4,12 +4,14 @@ use std::path::Path;
 
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 
-use crate::support::{connected_application, rendered_application_rows, type_terminal_text};
+use crate::support::{
+    connected_application, rendered_application_rows, rendered_row, type_terminal_text,
+};
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        EffectiveSettings, FoldPosture, ReasoningSummaryDetail, SettingMutation, SettingsSnapshot,
-        TranscriptSettings,
+        CodexSettings, CopilotSettings, EffectiveSettings, FoldPosture, ProviderSettings,
+        ReasoningSummaryDetail, SettingMutation, SettingsSnapshot, TranscriptSettings,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
@@ -180,6 +182,7 @@ fn a_setting_cycles_through_every_value_it_offers_in_both_directions() {
     // than trusting a count of rows the schema is free to grow.
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
     assert!(
         rendered_application_rows(&application)
             .join("\n")
@@ -200,6 +203,113 @@ fn a_setting_cycles_through_every_value_it_offers_in_both_directions() {
             value: Some(ReasoningSummaryDetail::None),
         }),
         "stepping back from the first value wraps to the last"
+    );
+}
+
+/// Provider Enablement is the first boolean Setting, and each Provider gets its
+/// own row, ordered beside that Provider's other Settings so the flat list still
+/// reads grouped.
+#[test]
+fn every_provider_has_its_own_enabled_row_showing_true_or_false() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(
+        workspace.path(),
+        EffectiveSettings {
+            provider: ProviderSettings {
+                copilot: CopilotSettings { enabled: false },
+                ..ProviderSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &["provider.copilot.enabled"],
+    );
+    open_panel(&mut application);
+
+    let copilot = row(&application, "Copilot Provider");
+    assert!(
+        copilot.contains("false") && copilot.contains("[pinned]"),
+        "the Provider the reader turned off shows the value they would type: {copilot:?}"
+    );
+    for label in ["Codex Provider", "Claude Provider"] {
+        let enabled = row(&application, label);
+        assert!(
+            enabled.contains("true") && enabled.contains("[default]"),
+            "a Provider nothing pins is on by default: {enabled:?}"
+        );
+    }
+    assert!(
+        row(&application, "Codex Reasoning summary").contains("auto"),
+        "a disabled Provider's other Settings stay visible and editable"
+    );
+
+    let rows = rendered_application_rows(&application);
+    assert!(
+        rendered_row(&rows, "Codex Provider") < rendered_row(&rows, "Codex Reasoning summary"),
+        "a Provider's Enablement sits immediately before that Provider's other Settings: {rows:?}"
+    );
+    assert!(
+        rendered_row(&rows, "Codex Reasoning summary") < rendered_row(&rows, "Copilot Provider"),
+        "each Provider's rows stay together: {rows:?}"
+    );
+}
+
+#[test]
+fn a_providers_enabled_row_names_its_key_and_cycles_between_true_and_false() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    // Onto the first Provider's Enablement, past the two Transcript Settings.
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+
+    let headline = rendered_application_rows(&application).join("\n");
+    assert!(
+        headline.contains("provider.codex.enabled"),
+        "the focused Setting names the key a Config Document would spell: {headline}"
+    );
+    assert!(
+        headline.contains("Whether Suru offers Codex"),
+        "and its description, so true and false are unambiguous in context: {headline}"
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Right, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
+            value: Some(false),
+        }),
+        "stepping on from the enabled default turns the Provider off"
+    );
+    application
+        .handle_event(ApplicationEvent::SettingMutated(snapshot(
+            EffectiveSettings {
+                provider: ProviderSettings {
+                    codex: CodexSettings {
+                        enabled: false,
+                        ..CodexSettings::default()
+                    },
+                    ..ProviderSettings::default()
+                },
+                ..EffectiveSettings::default()
+            },
+            &["provider.codex.enabled"],
+        )))
+        .expect("receive the settings the edit left in force");
+    assert!(
+        row(&application, "Codex Provider").contains("false [pinned]"),
+        "the row follows the refreshed snapshot the edit produced"
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Right, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
+            value: Some(true),
+        }),
+        "a boolean Setting cycles back to the other value"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled { value: None }),
+        "undoing the choice is as easy as making it"
     );
 }
 

@@ -320,6 +320,22 @@ pub enum ProviderCatalogStatus {
         reason: ProviderUnavailability,
         message: String,
     },
+    /// The user turned this Provider off, so Suru never consulted it: it lists
+    /// no Models because none were asked for, and it reports no condition
+    /// because none was looked for.
+    ///
+    /// Deliberately a sibling of `Unavailable` rather than a fourth
+    /// [`ProviderUnavailability`] reason. That enum's contract is a condition
+    /// the user fixes *outside* Suru and which the next catalog refresh
+    /// re-evaluates; Enablement is neither — it is a Setting the user changes
+    /// inside Suru and it takes effect on the next settings snapshot. Folding
+    /// it in would make that enum's own documentation false and would wire
+    /// recovery through a refresh Enablement does not need.
+    ///
+    /// Like `Unavailable`, it outranks every other status — a refresh
+    /// notionally in flight included — because nothing about a Provider Suru
+    /// never consulted may be offered.
+    Disabled,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -465,16 +481,56 @@ pub struct TranscriptSettings {
     pub reasoning_visibility: ReasoningVisibility,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+/// Whether the user wants Suru to offer a Provider at all. Every Provider
+/// carries one, and each spells its own built-in default by hand rather than
+/// deriving it, because a derived `bool` is `false` and a Provider is on unless
+/// the user says otherwise.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodexSettings {
+    pub enabled: bool,
     pub reasoning_summary: ReasoningSummaryDetail,
+}
+
+impl Default for CodexSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reasoning_summary: ReasoningSummaryDetail::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CopilotSettings {
+    pub enabled: bool,
+}
+
+impl Default for CopilotSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeSettings {
+    pub enabled: bool,
+}
+
+impl Default for ClaudeSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderSettings {
     pub codex: CodexSettings,
+    pub copilot: CopilotSettings,
+    pub claude: ClaudeSettings,
 }
 
 /// The effective value of every defined Setting: what a Config Document
@@ -484,6 +540,26 @@ pub struct ProviderSettings {
 pub struct EffectiveSettings {
     pub transcript: TranscriptSettings,
     pub provider: ProviderSettings,
+}
+
+impl EffectiveSettings {
+    /// Whether the user has left `provider` on. This is the one predicate every
+    /// site consults before asking a Provider for anything, and the only place
+    /// a Provider id is read back off the settings tree.
+    ///
+    /// A Provider this build hosts but the schema names no `enabled` Setting
+    /// for reads as enabled: it has nothing the user could have turned off. A
+    /// server-side test asserts every built-in Provider does have one, so that
+    /// fallback catches a test double rather than a shipped Provider that
+    /// silently lost its Setting.
+    pub fn provider_enabled(&self, provider: &ProviderId) -> bool {
+        match provider.as_str() {
+            "codex" => self.provider.codex.enabled,
+            "copilot" => self.provider.copilot.enabled,
+            "claude" => self.provider.claude.enabled,
+            _ => true,
+        }
+    }
 }
 
 /// A typed change to exactly one Setting: the whole surface through which a
@@ -501,8 +577,17 @@ pub enum SettingMutation {
     TranscriptReasoningVisibility {
         value: Option<ReasoningVisibility>,
     },
+    ProviderCodexEnabled {
+        value: Option<bool>,
+    },
     ProviderCodexReasoningSummary {
         value: Option<ReasoningSummaryDetail>,
+    },
+    ProviderCopilotEnabled {
+        value: Option<bool>,
+    },
+    ProviderClaudeEnabled {
+        value: Option<bool>,
     },
 }
 

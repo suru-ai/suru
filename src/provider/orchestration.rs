@@ -21,7 +21,8 @@ use super::{
 use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AgentIdentity, Message, MessageId, MessageRole,
-    MessageStatus, PromptId, ProviderId, SessionChange, SessionId, TurnId, TurnStatus,
+    MessageStatus, PromptId, ProviderId, SessionChange, SessionId, SettingsSnapshot, TurnId,
+    TurnStatus,
 };
 use crate::sessions::{
     DeliveredTurn, DeliveredTurnStatus, InterruptTurnError, ProviderTurnOutcome, SessionStore,
@@ -64,6 +65,10 @@ pub(crate) struct ProviderOrchestrator {
     shutdown: watch::Receiver<bool>,
     updates: ProviderUpdateGate,
     shutdown_complete: watch::Sender<bool>,
+    /// The effective Settings in force, read whenever a Prompt is about to
+    /// reach a Provider. A Provider the user turned off is never asked to begin
+    /// a Session, so no process starts on its behalf.
+    settings: watch::Receiver<SettingsSnapshot>,
 }
 
 struct ProviderActors {
@@ -231,6 +236,7 @@ impl ProviderOrchestrator {
         sessions: SessionStore,
         shutdown: watch::Receiver<bool>,
         updates: ProviderUpdateGate,
+        settings: watch::Receiver<SettingsSnapshot>,
     ) -> Self {
         assert!(
             !runtimes.is_empty(),
@@ -247,6 +253,7 @@ impl ProviderOrchestrator {
             shutdown,
             updates,
             shutdown_complete,
+            settings,
         }
     }
 
@@ -265,13 +272,64 @@ impl ProviderOrchestrator {
         }
     }
 
+    fn is_enabled(&self, provider: &ProviderId) -> bool {
+        self.settings.borrow().settings.provider_enabled(provider)
+    }
+
+    /// Settles a Prompt's Turn as failed before it ever reaches a Provider, and
+    /// answers the caller with why nothing was scheduled.
+    fn fail_prompt(
+        &self,
+        session_id: SessionId,
+        prompt_id: PromptId,
+        message: String,
+    ) -> anyhow::Error {
+        let reported = message.clone();
+        let _ = self.updates.apply(|| {
+            self.sessions.deliver_prompt(
+                session_id,
+                prompt_id,
+                None,
+                DeliveredTurnStatus::Failed { message },
+            )
+        });
+        anyhow::anyhow!(reported)
+    }
+
+    /// Why the Session's Provider cannot take another Turn, when the user has
+    /// turned it off. Enablement is the one condition that has to reach a
+    /// Session already running on its Provider, so it is asked separately from
+    /// [`Self::resolve_runtime`], which only answers where a new actor would
+    /// run. The fix is inside Suru rather than outside it, so the message names
+    /// the Setting rather than reading like an unavailability reason.
+    fn disabled_provider_failure(&self, session_id: SessionId) -> Option<String> {
+        let provider = self.sessions.provider(session_id)?;
+        if self.is_enabled(&provider) {
+            return None;
+        }
+        Some(format!(
+            "Provider `{provider}` is disabled: turn `provider.{provider}.enabled` \
+             back on in Settings to use it again."
+        ))
+    }
+
     /// The Session's Provider runtime under this server's hosted set. A Session
     /// keeps the Provider it was selected with (ADR-0005); one that has no
-    /// Agent Selection yet takes the first hosted runtime, the built-in
-    /// default order's head.
+    /// Agent Selection yet takes the first *enabled* runtime of the built-in
+    /// default order, so Enablement governs that order rather than merely
+    /// filtering what it produced.
     fn resolve_runtime(&self, session_id: SessionId) -> Result<Arc<dyn ProviderRuntime>, String> {
         let Some(provider) = self.sessions.provider(session_id) else {
-            return Ok(self.runtimes[0].clone());
+            return self
+                .runtimes
+                .iter()
+                .find(|runtime| self.is_enabled(&runtime.provider_id()))
+                .cloned()
+                .ok_or_else(|| {
+                    "Provider startup failed: every Provider is disabled. \
+                     Turn one back on in Settings to start a Turn."
+                        .to_owned()
+                });
         };
         self.runtimes
             .iter()
@@ -284,19 +342,27 @@ impl ProviderOrchestrator {
             })
     }
 
-    /// Returns the Session's actor, resolving the Session's runtime only when
-    /// no actor is running yet: an existing actor already owns the Session's
-    /// Provider conversation and keeps it (ADR-0005). When a new actor is
-    /// needed and the Session's Provider is not hosted here — a Session
-    /// stored under a Provider this server no longer hosts — the Prompt's
-    /// Turn settles as failed legibly rather than running on the wrong
-    /// Provider.
+    /// Returns the Session's actor, or settles the Prompt's Turn as failed when
+    /// its Provider cannot take it: a Session the user has turned its Provider
+    /// off for, or one stored under a Provider this server no longer hosts.
+    /// Either failure leaves a record in the Transcript, which a silently
+    /// rejected Prompt would not.
+    ///
+    /// Enablement is asked before the actor is looked up, because an existing
+    /// actor is exactly the case a disable has to reach: the Turn it is running
+    /// is left to Settle, and this — the next Prompt — is what fails. Every
+    /// other condition is about where a *new* actor would run, so an actor that
+    /// survives the Enablement check keeps the Provider conversation it already
+    /// owns (ADR-0005).
     fn actor_commands_or_fail_prompt(
         &self,
         session_id: SessionId,
         workspace: PathBuf,
         prompt_id: PromptId,
     ) -> Result<mpsc::UnboundedSender<ProviderCommand>> {
+        if let Some(message) = self.disabled_provider_failure(session_id) {
+            return Err(self.fail_prompt(session_id, prompt_id, message));
+        }
         if let Some(commands) = self
             .actors
             .lock()
@@ -309,19 +375,7 @@ impl ProviderOrchestrator {
         }
         let runtime = match self.resolve_runtime(session_id) {
             Ok(runtime) => runtime,
-            Err(message) => {
-                let _ = self.updates.apply(|| {
-                    self.sessions.deliver_prompt(
-                        session_id,
-                        prompt_id,
-                        None,
-                        DeliveredTurnStatus::Failed { message },
-                    )
-                });
-                return Err(anyhow::anyhow!(
-                    "Session's Provider is not hosted by this server"
-                ));
-            }
+            Err(message) => return Err(self.fail_prompt(session_id, prompt_id, message)),
         };
         self.get_or_spawn_actor_commands(session_id, workspace, runtime)
     }
