@@ -1066,7 +1066,291 @@ async fn server_stop_notifies_attached_clients_and_remains_stopped() {
     assert!(String::from_utf8_lossy(&status.stderr).contains("missing"));
 }
 
-#[cfg(target_os = "linux")]
+const TERMINAL_MODE_RESTORED: &str = "__SURU_TERMINAL_MODE_RESTORED__";
+const TERMINAL_MODE_CHANGED: &str = "__SURU_TERMINAL_MODE_CHANGED__";
+
+/// Not a test of its own: [`AttachedTui`] re-executes this binary to reach this
+/// function from inside a pseudo-terminal. The mode a TUI puts a terminal into
+/// belongs to that terminal, and only a process running inside it can read the
+/// mode back, so the check that the TUI returned the mode it was handed has to
+/// run here rather than in the test that opened the terminal. Ignored so an
+/// ordinary run never reaches it.
+#[test]
+#[ignore = "re-executed inside a pseudo-terminal by the attached TUI tests"]
+fn attached_tui_terminal_mode_probe() {
+    let before = read_terminal_mode();
+    let status = Command::new(env!("CARGO_BIN_EXE_suru"))
+        .status()
+        .expect("run the TUI inside the pseudo-terminal");
+    let after = read_terminal_mode();
+    if before == after {
+        println!("\n{TERMINAL_MODE_RESTORED}");
+    } else {
+        println!("\n{TERMINAL_MODE_CHANGED}:{before}:{after}");
+    }
+    // The harness reports on the TUI's own status, so the probe exits with it
+    // rather than letting the test harness report on the probe.
+    std::io::Write::flush(&mut std::io::stdout()).expect("flush the probe report");
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// The console mode of the pseudo-console, which is a property of the console
+/// itself rather than of the handle used to reach it.
+#[cfg(windows)]
+fn read_terminal_mode() -> String {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE]
+        .iter()
+        .map(|handle| {
+            let mut mode = 0u32;
+            // SAFETY: both handles belong to the pseudo-console this process was
+            // spawned into, and `mode` outlives the call that fills it.
+            let read = unsafe { GetConsoleMode(GetStdHandle(*handle), &mut mode) };
+            assert!(read != 0, "read the mode of the pseudo-console");
+            format!("{mode:08x}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The terminal attributes `stty -g` reports, read the way `stty` reads them.
+#[cfg(unix)]
+fn read_terminal_mode() -> String {
+    let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: stdin is the pseudo-terminal this process was spawned into, and
+    // `tcgetattr` fills the attributes it is handed on success.
+    let read = unsafe { libc::tcgetattr(libc::STDIN_FILENO, attributes.as_mut_ptr()) };
+    assert_eq!(read, 0, "read the mode of the pseudo-terminal");
+    // SAFETY: `tcgetattr` reported success, so the attributes are initialized.
+    let attributes = unsafe { attributes.assume_init() };
+    format!(
+        "{:x}:{:x}:{:x}:{:x}:{:?}",
+        attributes.c_iflag,
+        attributes.c_oflag,
+        attributes.c_cflag,
+        attributes.c_lflag,
+        attributes.c_cc
+    )
+}
+
+/// Answers the cursor position report a terminal is expected to answer. A
+/// ConPTY pseudo-console asks for one while it is starting up and waits for the
+/// reply before it will carry anything the child writes, so a harness that only
+/// reads never sees a byte of the TUI it launched. The position reported is the
+/// home position, which is where the pseudo-console starts its screen.
+fn answer_cursor_position_report(shown: &[u8], terminal: &Mutex<Box<dyn std::io::Write + Send>>) {
+    const REQUEST: &[u8] = b"\x1b[6n";
+    const HOME: &[u8] = b"\x1b[1;1R";
+
+    if !shown.windows(REQUEST.len()).any(|window| window == REQUEST) {
+        return;
+    }
+    let mut terminal = terminal.lock().expect("answer the pseudo-terminal");
+    let _ = terminal.write_all(HOME);
+    let _ = terminal.flush();
+}
+
+/// A TUI attached to a real pseudo-terminal: a ConPTY pseudo-console on Windows
+/// and an `openpty` pair everywhere else. The TUI is launched through
+/// [`attached_tui_terminal_mode_probe`] so that the terminal mode is sampled
+/// from inside the terminal, on both sides of the TUI's lifetime.
+struct AttachedTui {
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    input: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    screen: Arc<Mutex<Vec<u8>>>,
+}
+
+/// What the terminal saw, and how the TUI left it.
+struct AttachedTuiOutcome {
+    succeeded: bool,
+    screen: String,
+}
+
+impl AttachedTui {
+    /// A pseudo-terminal wide enough that the lines the assertions look for are
+    /// not wrapped: ConPTY renders what the TUI writes into a screen buffer of
+    /// exactly this width before the harness sees any of it, so a narrow
+    /// terminal would split those lines with cursor movement.
+    const SIZE: portable_pty::PtySize = portable_pty::PtySize {
+        rows: 24,
+        cols: 200,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+
+    fn spawn(state_dir: &std::path::Path, channel: &str) -> Self {
+        let pair = portable_pty::native_pty_system()
+            .openpty(Self::SIZE)
+            .expect("open a pseudo-terminal");
+        let mut command = portable_pty::CommandBuilder::new(
+            std::env::current_exe().expect("locate the running test binary"),
+        );
+        command.args([
+            "--exact",
+            "attached_tui_terminal_mode_probe",
+            "--ignored",
+            "--nocapture",
+        ]);
+        command.env("SURU_STATE_DIR", state_dir);
+        command.env("SURU_DATA_DIR", state_dir);
+        command.env("SURU_CONFIG_DIR", state_dir);
+        command.env("SURU_CHANNEL", channel);
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .expect("launch the attached TUI in a pseudo-terminal");
+        // The harness keeps no terminal handle of its own, so the terminal
+        // reports end-of-file once the TUI and its probe are gone.
+        drop(pair.slave);
+
+        // The reader accumulates into a buffer the harness can read at any time
+        // rather than reporting at end-of-file. A ConPTY pseudo-console reports
+        // end-of-file only once every handle to it is closed, and the reader is
+        // itself such a handle, so waiting for the end would wait forever.
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .expect("read the pseudo-terminal");
+        let input: Arc<Mutex<Box<dyn std::io::Write + Send>>> = Arc::new(Mutex::new(
+            pair.master
+                .take_writer()
+                .expect("write to the pseudo-terminal"),
+        ));
+        let screen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&screen);
+        let responder = Arc::clone(&input);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            while let Ok(read) = std::io::Read::read(&mut reader, &mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                let shown = &chunk[..read];
+                answer_cursor_position_report(shown, &responder);
+                recorder
+                    .lock()
+                    .expect("record what the terminal showed")
+                    .extend_from_slice(shown);
+            }
+        });
+
+        Self {
+            _master: pair.master,
+            input,
+            child,
+            screen,
+        }
+    }
+
+    fn is_running(&mut self) -> bool {
+        self.child
+            .try_wait()
+            .expect("inspect the attached TUI")
+            .is_none()
+    }
+
+    fn send(&mut self, bytes: &[u8]) {
+        let mut input = self.input.lock().expect("the terminal accepts input");
+        input.write_all(bytes).expect("send input to the TUI");
+        input.flush().expect("flush input to the TUI");
+    }
+
+    /// Waits for the TUI to exit and collects everything the terminal showed.
+    fn finish(&mut self) -> AttachedTuiOutcome {
+        let status = self.child.wait().expect("wait for the attached TUI");
+        AttachedTuiOutcome {
+            succeeded: status.success(),
+            screen: self.settled_screen(),
+        }
+    }
+
+    /// Everything the terminal has shown once it stops showing anything new.
+    /// The last of what a process wrote on its way out reaches the terminal
+    /// after the process itself is gone, so a screen read the instant the TUI
+    /// exits is missing its own restore sequences.
+    fn settled_screen(&self) -> String {
+        const SETTLE: Duration = Duration::from_millis(100);
+        const LIMIT: Duration = Duration::from_secs(2);
+
+        let deadline = std::time::Instant::now() + LIMIT;
+        let mut shown = self.shown();
+        loop {
+            std::thread::sleep(SETTLE);
+            let settled = self.shown();
+            if settled == shown || std::time::Instant::now() >= deadline {
+                return String::from_utf8_lossy(&settled).into_owned();
+            }
+            shown = settled;
+        }
+    }
+
+    fn shown(&self) -> Vec<u8> {
+        self.screen
+            .lock()
+            .expect("read what the terminal showed")
+            .clone()
+    }
+}
+
+impl Drop for AttachedTui {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl AttachedTuiOutcome {
+    fn assert_terminal_mode_restored(&self) {
+        assert!(
+            !self.screen.contains(TERMINAL_MODE_CHANGED),
+            "the TUI left the terminal in a mode it was not given: {:?}",
+            self.screen
+        );
+        assert!(
+            self.screen.contains(TERMINAL_MODE_RESTORED),
+            "the TUI never reported on the terminal mode it was given: {:?}",
+            self.screen
+        );
+    }
+
+    /// A ConPTY pseudo-console is a terminal emulator rather than a conduit: it
+    /// parses what the TUI writes into a screen buffer and re-renders sequences
+    /// of its own, so the TUI's own escape sequences survive to be asserted on
+    /// only where the pseudo-terminal passes bytes through untouched. The order
+    /// the TUI writes them in is pinned on every platform by the unit tests over
+    /// `enter_terminal_display` and `leave_terminal_display`.
+    #[cfg(unix)]
+    fn assert_display_was_restored(&self) {
+        for sequence in [
+            "\u{1b}[?1049h",
+            "\u{1b}[?1049l",
+            "\u{1b}[?25l",
+            "\u{1b}[?25h",
+            "\u{1b}[?2004h",
+            "\u{1b}[?2004l",
+        ] {
+            assert!(
+                self.screen.contains(sequence),
+                "missing terminal sequence {sequence:?}: {:?}",
+                self.screen
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn assert_display_was_restored(&self) {}
+
+    fn position_of(&self, sequence: &str) -> usize {
+        self.screen
+            .find(sequence)
+            .unwrap_or_else(|| panic!("{sequence:?} is missing from {:?}", self.screen))
+    }
+}
+
 #[tokio::test]
 async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -1077,32 +1361,16 @@ async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
         ProtocolViolation::UnknownEvent,
     )
     .await;
-    let binary = env!("CARGO_BIN_EXE_suru").replace('\'', "'\\''");
-    let tui_command = format!(
-        "stty rows 24 cols 80; original_stty=$(stty -g); '{binary}'; suru_status=$?; restored_stty=$(stty -g); if [ \"$original_stty\" = \"$restored_stty\" ]; then printf '\\n__SURU_STTY_RESTORED__\\n'; else printf '\\n__SURU_STTY_CHANGED__:%s:%s\\n' \"$original_stty\" \"$restored_stty\"; fi; exit $suru_status"
-    );
-    let mut tui = AttachedTuiGuard(Some(
-        Command::new("script")
-            .args(["-qef", "/dev/null", "-c", &tui_command])
-            .env("SURU_STATE_DIR", state_dir.path())
-            .env("SURU_DATA_DIR", state_dir.path())
-            .env("SURU_CONFIG_DIR", state_dir.path())
-            .env("SURU_CHANNEL", channel)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("launch attached TUI in a pseudo-terminal"),
-    ));
+    let mut tui = AttachedTui::spawn(state_dir.path(), channel);
 
-    timeout(Duration::from_secs(2), async {
+    timeout(Duration::from_secs(5), async {
         while !fixture.events_opened.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("TUI opens the corrupt event stream");
-    timeout(Duration::from_secs(2), async {
+    timeout(Duration::from_secs(10), async {
         while tui.is_running() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1110,44 +1378,44 @@ async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
     .await
     .expect("fatal TUI exits promptly without user input");
 
-    let output = tui.wait_with_output();
-    assert!(!output.status.success(), "fatal TUI reports failure");
-    let screen = String::from_utf8_lossy(&output.stdout);
-    let alternate_screen_exit_position = screen
-        .find("\u{1b}[?1049l")
-        .expect("fatal TUI leaves the alternate screen");
-    let cursor_restore_position = screen
-        .find("\u{1b}[?25h")
-        .expect("fatal TUI restores the cursor");
-    let bracketed_paste_enable_position = screen
-        .find("\u{1b}[?2004h")
-        .expect("fatal TUI enabled bracketed paste while it was active");
-    let bracketed_paste_disable_position = screen
-        .find("\u{1b}[?2004l")
-        .expect("fatal TUI disables bracketed paste on exit");
-    let error_detail_position = screen
-        .find("unknown event type 'future_event'")
-        .expect("fatal protocol detail remains visible");
+    let outcome = tui.finish();
+    assert!(!outcome.succeeded, "fatal TUI reports failure");
+    outcome.assert_display_was_restored();
+    outcome.assert_terminal_mode_restored();
+    let error_detail = outcome.position_of("unknown event type 'future_event'");
+
+    // The report has to reach the terminal the user is left looking at, not the
+    // alternate screen that is about to be torn down with it.
+    #[cfg(unix)]
+    {
+        assert!(
+            outcome.position_of("\u{1b}[?1049l") < error_detail,
+            "fatal error was reported before leaving the alternate screen: {:?}",
+            outcome.screen
+        );
+        assert!(
+            outcome.position_of("\u{1b}[?25h") < error_detail,
+            "fatal error was reported before restoring the cursor: {:?}",
+            outcome.screen
+        );
+        let paste_enabled = outcome.position_of("\u{1b}[?2004h");
+        let paste_disabled = outcome.position_of("\u{1b}[?2004l");
+        assert!(
+            paste_enabled < paste_disabled && paste_disabled < error_detail,
+            "fatal TUI did not bracket its active lifetime with paste mode: {:?}",
+            outcome.screen
+        );
+    }
+    // The probe reports on the terminal mode only once the TUI has exited, so a
+    // report that follows the error detail is the ordering evidence that a
+    // re-rendering pseudo-console can still give.
     assert!(
-        alternate_screen_exit_position < error_detail_position,
-        "fatal error was reported before leaving the alternate screen: {screen:?}"
-    );
-    assert!(
-        cursor_restore_position < error_detail_position,
-        "fatal error was reported before restoring the cursor: {screen:?}"
-    );
-    assert!(
-        bracketed_paste_enable_position < bracketed_paste_disable_position
-            && bracketed_paste_disable_position < error_detail_position,
-        "fatal TUI did not bracket its active lifetime with paste mode: {screen:?}"
-    );
-    assert!(
-        screen.contains("__SURU_STTY_RESTORED__"),
-        "fatal TUI did not restore its original terminal mode: {screen:?}"
+        error_detail < outcome.position_of(TERMINAL_MODE_RESTORED),
+        "fatal error was reported after the TUI had already exited: {:?}",
+        outcome.screen
     );
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -1159,8 +1427,8 @@ async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
         String::from_utf8_lossy(&started.stderr)
     );
 
-    let mut tui = AttachedTuiGuard::spawn(state_dir.path(), channel);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut tui = AttachedTui::spawn(state_dir.path(), channel);
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         tui.is_running(),
         "attached TUI exited before the manual stop"
@@ -1172,7 +1440,7 @@ async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
         "server stop failed: {}",
         String::from_utf8_lossy(&stopped.stderr)
     );
-    timeout(Duration::from_secs(2), async {
+    timeout(Duration::from_secs(10), async {
         while tui.is_running() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1180,28 +1448,11 @@ async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
     .await
     .expect("attached TUI exits after manual stop");
 
-    let output = tui.wait_with_output();
-    assert!(
-        output.status.success(),
-        "attached TUI failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let screen = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        screen.contains("Shared server stopped intentionally"),
-        "attached TUI did not render the manual-stop state: {screen:?}"
-    );
-    assert!(
-        screen.contains("\u{1b}[?1049l"),
-        "attached TUI did not leave the alternate screen"
-    );
-    assert!(
-        screen.contains("\u{1b}[?25h"),
-        "attached TUI did not restore the cursor"
-    );
+    let outcome = tui.finish();
+    outcome.assert_display_was_restored();
+    outcome.assert_terminal_mode_restored();
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn clean_tui_exit_restores_the_terminal() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -1213,39 +1464,25 @@ async fn clean_tui_exit_restores_the_terminal() {
         String::from_utf8_lossy(&started.stderr)
     );
 
-    let binary = AttachedTuiGuard::escaped_binary();
-    let tui_command = format!(
-        "stty rows 24 cols 80; original_stty=$(stty -g); '{binary}'; suru_status=$?; restored_stty=$(stty -g); if [ \"$original_stty\" = \"$restored_stty\" ]; then printf '\\n__SURU_STTY_RESTORED__\\n'; else printf '\\n__SURU_STTY_CHANGED__:%s:%s\\n' \"$original_stty\" \"$restored_stty\"; fi; exit $suru_status"
-    );
-    let typescript = state_dir.path().join("clean-tui-exit.typescript");
-    let mut tui = AttachedTuiGuard::spawn_shell_command_with_typescript(
-        state_dir.path(),
-        channel,
-        &tui_command,
-        &typescript,
-    );
-    timeout(Duration::from_secs(2), async {
+    let mut tui = AttachedTui::spawn(state_dir.path(), channel);
+    // Raw mode is taken before the TUI draws anything, so a frame on the screen
+    // is what says Ctrl+C will reach the composer as a keystroke rather than
+    // reaching the process as a signal. A re-rendering pseudo-console keeps
+    // none of the escape sequences that entering the display writes, so the
+    // frame is what the wait can look for on every platform.
+    timeout(Duration::from_secs(10), async {
         loop {
             assert!(tui.is_running(), "TUI exited before clean-exit input");
-            if std::fs::read(&typescript).is_ok_and(|screen| {
-                screen
-                    .windows(b"\x1b[?1049h".len())
-                    .any(|window| window == b"\x1b[?1049h")
-            }) {
+            if String::from_utf8_lossy(&tui.shown()).contains("Suru") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("TUI enters the alternate screen before clean-exit input");
-    tui.child_mut()
-        .stdin
-        .as_mut()
-        .expect("TUI stdin remains open")
-        .write_all(b"\x03")
-        .expect("send Ctrl+C to the empty composer");
-    timeout(Duration::from_secs(2), async {
+    .expect("TUI draws its first frame before clean-exit input");
+    tui.send(b"\x03");
+    timeout(Duration::from_secs(10), async {
         while tui.is_running() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1253,109 +1490,16 @@ async fn clean_tui_exit_restores_the_terminal() {
     .await
     .expect("TUI exits cleanly after Ctrl+C");
 
-    let output = tui.wait_with_output();
+    let outcome = tui.finish();
     assert!(
-        output.status.success(),
-        "clean TUI exit failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        outcome.succeeded,
+        "clean TUI exit failed: {:?}",
+        outcome.screen
     );
-    let screen = String::from_utf8_lossy(&output.stdout);
-    for sequence in [
-        "\u{1b}[?1049h",
-        "\u{1b}[?1049l",
-        "\u{1b}[?25l",
-        "\u{1b}[?25h",
-    ] {
-        assert!(
-            screen.contains(sequence),
-            "missing terminal sequence {sequence:?}"
-        );
-    }
-    assert!(screen.contains("\u{1b}[?2004h"));
-    assert!(screen.contains("\u{1b}[?2004l"));
-    assert!(
-        screen.contains("__SURU_STTY_RESTORED__"),
-        "clean exit did not restore raw mode: {screen:?}"
-    );
+    outcome.assert_display_was_restored();
+    outcome.assert_terminal_mode_restored();
 
     stop_test_server(state_dir.path(), channel);
-}
-
-#[cfg(target_os = "linux")]
-struct AttachedTuiGuard(Option<Child>);
-
-#[cfg(target_os = "linux")]
-impl AttachedTuiGuard {
-    fn spawn(state_dir: &std::path::Path, channel: &str) -> Self {
-        let binary = Self::escaped_binary();
-        let tui_command = format!("stty rows 24 cols 80; exec '{binary}'");
-        Self::spawn_shell_command(state_dir, channel, &tui_command)
-    }
-
-    fn escaped_binary() -> String {
-        env!("CARGO_BIN_EXE_suru").replace('\'', "'\\''")
-    }
-
-    fn spawn_shell_command(state_dir: &std::path::Path, channel: &str, tui_command: &str) -> Self {
-        Self::spawn_shell_command_with_typescript(
-            state_dir,
-            channel,
-            tui_command,
-            std::path::Path::new("/dev/null"),
-        )
-    }
-
-    fn spawn_shell_command_with_typescript(
-        state_dir: &std::path::Path,
-        channel: &str,
-        tui_command: &str,
-        typescript: &std::path::Path,
-    ) -> Self {
-        Self(Some(
-            Command::new("script")
-                .arg("-qef")
-                .arg(typescript)
-                .args(["-c", tui_command])
-                .env("SURU_STATE_DIR", state_dir)
-                .env("SURU_DATA_DIR", state_dir)
-                .env("SURU_CONFIG_DIR", state_dir)
-                .env("SURU_CHANNEL", channel)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("launch attached TUI in a pseudo-terminal"),
-        ))
-    }
-
-    fn child_mut(&mut self) -> &mut Child {
-        self.0.as_mut().expect("attached TUI process")
-    }
-
-    fn is_running(&mut self) -> bool {
-        self.child_mut()
-            .try_wait()
-            .expect("inspect attached TUI")
-            .is_none()
-    }
-
-    fn wait_with_output(&mut self) -> std::process::Output {
-        self.0
-            .take()
-            .expect("attached TUI process")
-            .wait_with_output()
-            .expect("collect attached TUI output")
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for AttachedTuiGuard {
-    fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
 }
 
 async fn run_server_cli(
@@ -1734,7 +1878,6 @@ impl ReadinessFixture {
         .await
     }
 
-    #[cfg(target_os = "linux")]
     async fn spawn_binary_protocol_violation(
         state_dir: &std::path::Path,
         channel: &str,

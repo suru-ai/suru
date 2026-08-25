@@ -1238,45 +1238,93 @@ fn ignore_unsupported(result: std::io::Result<()>) -> std::io::Result<()> {
     }
 }
 
-fn enable_terminal_features(output: &mut impl std::io::Write) -> std::io::Result<()> {
-    ignore_unsupported(execute!(output, EnableBracketedPaste))?;
+/// The seam every terminal-mode change is written through. Production routes
+/// each command through crossterm's `execute!`, which decides per command
+/// whether the terminal is driven by an ANSI sequence or by the Windows console
+/// API; tests substitute a sink that records the ANSI rendering, so the order of
+/// the sequence can be asserted identically on every platform. `execute!`
+/// against an in-memory buffer cannot serve that purpose: crossterm picks its
+/// path from a process-global probe of the attached console rather than from the
+/// writer it is handed, so the same call records the sequence on a developer's
+/// terminal and records nothing on a machine with no VT-capable console.
+trait TerminalSink {
+    fn apply(&mut self, command: impl crossterm::Command) -> std::io::Result<()>;
+}
+
+struct TerminalOutput<W: std::io::Write>(W);
+
+impl<W: std::io::Write> TerminalSink for TerminalOutput<W> {
+    fn apply(&mut self, command: impl crossterm::Command) -> std::io::Result<()> {
+        execute!(self.0, command)
+    }
+}
+
+fn enable_terminal_features(output: &mut impl TerminalSink) -> std::io::Result<()> {
+    ignore_unsupported(output.apply(EnableBracketedPaste))?;
     // Mouse reporting is the one feature with no graceful degradation: a TUI
     // that cannot read clicks or the wheel is worth refusing to start.
-    execute!(output, EnableMouseButtonReporting)?;
-    ignore_unsupported(execute!(output, PushModifiedKeyReporting))
+    output.apply(EnableMouseButtonReporting)?;
+    ignore_unsupported(output.apply(PushModifiedKeyReporting))
 }
 
 /// Every restore is attempted even after one of them fails: leaving the terminal
 /// in mouse capture is worse than a restore whose error nobody could act on. The
 /// first failure is the one reported.
-fn disable_terminal_features(output: &mut impl std::io::Write) -> std::io::Result<()> {
-    let modified_keys = ignore_unsupported(execute!(output, PopModifiedKeyReporting));
-    let mouse = execute!(output, DisableMouseButtonReporting);
-    let paste = ignore_unsupported(execute!(output, DisableBracketedPaste));
+fn disable_terminal_features(output: &mut impl TerminalSink) -> std::io::Result<()> {
+    let modified_keys = ignore_unsupported(output.apply(PopModifiedKeyReporting));
+    let mouse = output.apply(DisableMouseButtonReporting);
+    let paste = ignore_unsupported(output.apply(DisableBracketedPaste));
     modified_keys.and(mouse).and(paste)
+}
+
+/// Gives the terminal back the screen it was showing and the cursor it was
+/// showing it with. Both are attempted for the same reason the features above
+/// are: a terminal left on the alternate screen is worse than a failed restore.
+fn leave_terminal_screen(output: &mut impl TerminalSink) -> std::io::Result<()> {
+    let screen = output.apply(LeaveAlternateScreen);
+    let cursor = output.apply(Show);
+    screen.and(cursor)
+}
+
+/// Takes the screen and then the input features, undoing whatever already
+/// succeeded when a later step fails so a refusal to start never strands the
+/// terminal half-configured.
+fn enter_terminal_display(output: &mut impl TerminalSink) -> std::io::Result<()> {
+    if let Err(error) = output
+        .apply(EnterAlternateScreen)
+        .and_then(|()| output.apply(Hide))
+    {
+        let _ = leave_terminal_screen(output);
+        return Err(error);
+    }
+    if let Err(error) = enable_terminal_features(output) {
+        let _ = disable_terminal_features(output);
+        let _ = leave_terminal_screen(output);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Restores in the exact reverse of [`enter_terminal_display`], so a terminal
+/// that ignored one of the features on the way in sees the matching restore.
+fn leave_terminal_display(output: &mut impl TerminalSink) -> std::io::Result<()> {
+    let features = disable_terminal_features(output);
+    let screen = leave_terminal_screen(output);
+    features.and(screen)
 }
 
 impl TerminalSession {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        let mut output = stdout();
-        if let Err(error) = execute!(output, EnterAlternateScreen, Hide) {
-            let _ = execute!(output, LeaveAlternateScreen, Show);
+        let mut output = TerminalOutput(stdout());
+        if let Err(error) = enter_terminal_display(&mut output) {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
-        if let Err(error) = enable_terminal_features(&mut output) {
-            let _ = disable_terminal_features(&mut output);
-            let _ = execute!(output, LeaveAlternateScreen, Show);
-            let _ = disable_raw_mode();
-            return Err(error.into());
-        }
-        match Terminal::new(CrosstermBackend::new(output)) {
+        match Terminal::new(CrosstermBackend::new(output.0)) {
             Ok(terminal) => Ok(Self { terminal }),
             Err(error) => {
-                let mut output = stdout();
-                let _ = disable_terminal_features(&mut output);
-                let _ = execute!(output, LeaveAlternateScreen, Show);
+                let _ = leave_terminal_display(&mut TerminalOutput(stdout()));
                 let _ = disable_raw_mode();
                 Err(error.into())
             }
@@ -1286,11 +1334,9 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        if let Err(error) = disable_terminal_features(self.terminal.backend_mut()) {
-            tracing::warn!("could not disable terminal features: {error}");
-        }
-        if let Err(error) = execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show) {
-            tracing::warn!("could not leave the alternate screen: {error}");
+        if let Err(error) = leave_terminal_display(&mut TerminalOutput(self.terminal.backend_mut()))
+        {
+            tracing::warn!("could not restore the terminal: {error}");
         }
         if let Err(error) = disable_raw_mode() {
             tracing::warn!("could not disable raw mode: {error}");
@@ -1304,9 +1350,113 @@ mod tests {
 
     use super::{
         DisableMouseButtonReporting, EnableMouseButtonReporting, PopModifiedKeyReporting,
-        PushModifiedKeyReporting, ignore_unsupported,
+        PushModifiedKeyReporting, TerminalSink, enter_terminal_display, ignore_unsupported,
+        leave_terminal_display,
     };
 
+    /// Records what an ANSI terminal would receive. Going through `write_ansi`
+    /// rather than `execute!` keeps the recording independent of the console the
+    /// test process happens to be attached to, so the sequence is the same on
+    /// Windows, macOS, and Linux.
+    struct AnsiTranscript(String);
+
+    impl TerminalSink for AnsiTranscript {
+        fn apply(&mut self, command: impl Command) -> std::io::Result<()> {
+            command
+                .write_ansi(&mut self.0)
+                .map_err(std::io::Error::other)
+        }
+    }
+
+    impl AnsiTranscript {
+        fn record(sequence: impl Fn(&mut Self) -> std::io::Result<()>) -> String {
+            let mut transcript = Self(String::new());
+            sequence(&mut transcript).expect("an ANSI transcript never fails to record");
+            transcript.0
+        }
+
+        /// Positions the escape sequences within the transcript, in the order
+        /// they were asked for, so a caller can assert that order is ascending.
+        fn positions(transcript: &str, sequences: &[&str]) -> Vec<usize> {
+            sequences
+                .iter()
+                .map(|sequence| {
+                    transcript.find(sequence).unwrap_or_else(|| {
+                        panic!("{sequence:?} is missing from the transcript {transcript:?}")
+                    })
+                })
+                .collect()
+        }
+    }
+
+    /// The screen has to be taken before the input features are turned on: a
+    /// terminal that starts reporting mouse and paste input while the shell is
+    /// still on screen delivers that input to whatever is running there.
+    #[test]
+    fn entering_the_display_takes_the_screen_before_arming_the_input_features() {
+        let transcript = AnsiTranscript::record(enter_terminal_display);
+        let positions = AnsiTranscript::positions(
+            &transcript,
+            &[
+                "\x1b[?1049h", // alternate screen
+                "\x1b[?25l",   // cursor hidden
+                "\x1b[?2004h", // bracketed paste
+                "\x1b[?1000h", // mouse button reporting
+                "\x1b[>1u",    // modified key reporting
+            ],
+        );
+        assert!(
+            positions.is_sorted(),
+            "the display was entered out of order: {transcript:?}"
+        );
+    }
+
+    /// The exact reverse of entering. Restoring the features only after the
+    /// screen is given back would leave them armed over the shell for as long as
+    /// the restore takes, which is the same window entering avoids.
+    #[test]
+    fn leaving_the_display_restores_in_the_reverse_of_the_order_it_took() {
+        let transcript = AnsiTranscript::record(leave_terminal_display);
+        let positions = AnsiTranscript::positions(
+            &transcript,
+            &[
+                "\x1b[<1u",    // modified key reporting
+                "\x1b[?1000l", // mouse button reporting
+                "\x1b[?2004l", // bracketed paste
+                "\x1b[?1049l", // alternate screen
+                "\x1b[?25h",   // cursor shown
+            ],
+        );
+        assert!(
+            positions.is_sorted(),
+            "the display was restored out of order: {transcript:?}"
+        );
+    }
+
+    /// Anything the TUI turns on has to be turned off again, or it outlives the
+    /// process in the terminal that hosted it.
+    #[test]
+    fn every_feature_entering_the_display_turns_on_is_turned_off_again() {
+        let entered = AnsiTranscript::record(enter_terminal_display);
+        let left = AnsiTranscript::record(leave_terminal_display);
+        for (enabled, disabled) in [
+            ("\x1b[?1049h", "\x1b[?1049l"),
+            ("\x1b[?25l", "\x1b[?25h"),
+            ("\x1b[?2004h", "\x1b[?2004l"),
+            ("\x1b[?1000h", "\x1b[?1000l"),
+            ("\x1b[?1006h", "\x1b[?1006l"),
+            ("\x1b[>1u", "\x1b[<1u"),
+        ] {
+            assert!(
+                entered.contains(enabled),
+                "{enabled:?} is missing from {entered:?}"
+            );
+            assert!(
+                left.contains(disabled),
+                "{enabled:?} was turned on but {disabled:?} never turned it off: {left:?}"
+            );
+        }
+    }
     /// Pins the sequence an ANSI terminal receives. Windows takes the console
     /// API for mouse reporting instead, which the sibling tests cover.
     #[test]

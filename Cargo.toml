@@ -37,6 +37,7 @@ github-copilot-sdk = { version = "1.0.12-preview.0", default-features = false }
 # The Copilot fixtures answer the SDK's own protocol handshake, so they read the version it speaks
 # from the crate rather than pinning a literal that silently rots on an upgrade.
 github-copilot-sdk = { version = "1.0.12-preview.0", default-features = false }
+portable-pty = "0.9.0"
 sysinfo = "0.37.2"
 # The Claude fixtures verify the spawn-time session identifier is a well-formed UUID.
 uuid = "1.18.1"
