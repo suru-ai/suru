@@ -1734,6 +1734,7 @@ impl ReadinessFixture {
         .await
     }
 
+    #[cfg(target_os = "linux")]
     async fn spawn_binary_protocol_violation(
         state_dir: &std::path::Path,
         channel: &str,
