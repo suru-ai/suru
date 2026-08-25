@@ -1194,9 +1194,28 @@ async fn clean_tui_exit_restores_the_terminal() {
     let tui_command = format!(
         "stty rows 24 cols 80; original_stty=$(stty -g); '{binary}'; suru_status=$?; restored_stty=$(stty -g); if [ \"$original_stty\" = \"$restored_stty\" ]; then printf '\\n__SURU_STTY_RESTORED__\\n'; else printf '\\n__SURU_STTY_CHANGED__:%s:%s\\n' \"$original_stty\" \"$restored_stty\"; fi; exit $suru_status"
     );
-    let mut tui = AttachedTuiGuard::spawn_shell_command(state_dir.path(), channel, &tui_command);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(tui.is_running(), "TUI exited before clean-exit input");
+    let typescript = state_dir.path().join("clean-tui-exit.typescript");
+    let mut tui = AttachedTuiGuard::spawn_shell_command_with_typescript(
+        state_dir.path(),
+        channel,
+        &tui_command,
+        &typescript,
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            assert!(tui.is_running(), "TUI exited before clean-exit input");
+            if std::fs::read(&typescript).is_ok_and(|screen| {
+                screen
+                    .windows(b"\x1b[?1049h".len())
+                    .any(|window| window == b"\x1b[?1049h")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("TUI enters the alternate screen before clean-exit input");
     tui.child_mut()
         .stdin
         .as_mut()
@@ -1255,9 +1274,25 @@ impl AttachedTuiGuard {
     }
 
     fn spawn_shell_command(state_dir: &std::path::Path, channel: &str, tui_command: &str) -> Self {
+        Self::spawn_shell_command_with_typescript(
+            state_dir,
+            channel,
+            tui_command,
+            std::path::Path::new("/dev/null"),
+        )
+    }
+
+    fn spawn_shell_command_with_typescript(
+        state_dir: &std::path::Path,
+        channel: &str,
+        tui_command: &str,
+        typescript: &std::path::Path,
+    ) -> Self {
         Self(Some(
             Command::new("script")
-                .args(["-qef", "/dev/null", "-c", tui_command])
+                .arg("-qef")
+                .arg(typescript)
+                .args(["-c", tui_command])
                 .env("SURU_STATE_DIR", state_dir)
                 .env("SURU_DATA_DIR", state_dir)
                 .env("SURU_CONFIG_DIR", state_dir)
