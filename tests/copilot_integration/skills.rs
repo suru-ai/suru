@@ -727,6 +727,10 @@ async fn a_failed_native_skill_invocation_fails_without_sending_literal_marker_t
     }));
     assert_eq!(failed.messages[0].content, "$review this");
     assert_eq!(failed.messages[0].skill_invocations, [invocation]);
+    let serialized = serde_json::to_string(&failed).expect("serialize failed Session data");
+    assert!(!serialized.contains("native-review"));
+    assert!(!serialized.contains("/private/copilot"));
+    assert!(!serialized.contains("private-plugin"));
     assert!(
         copilot
             .requests()

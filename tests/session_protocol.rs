@@ -1071,10 +1071,11 @@ fn session_delta_status_and_error_contracts_use_stable_provider_neutral_shapes()
         serde_json::to_value([
             PromptStatus::Pending,
             PromptStatus::Delivered,
+            PromptStatus::Failed,
             PromptStatus::Cancelled,
         ])
         .expect("encode Prompt statuses"),
-        json!(["pending", "delivered", "cancelled"])
+        json!(["pending", "delivered", "failed", "cancelled"])
     );
     assert_eq!(
         serde_json::to_value([

@@ -21,14 +21,15 @@ use super::{
 use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AgentIdentity, Message, MessageId, MessageRole,
-    MessageStatus, PromptId, ProviderId, SessionChange, SessionId, SettingsSnapshot, TurnId,
-    TurnStatus,
+    MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
+    SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery, TurnId, TurnStatus,
 };
 use crate::sessions::{
-    DeliveredTurn, DeliveredTurnStatus, InterruptTurnError, ProviderTurnOutcome, SessionStore,
-    TrailingCommandOutput, command_output_changes, message_content_changes,
-    reasoning_content_changes,
+    DeliveredTurn, DeliveredTurnStatus, InterruptTurnError, ProviderTurnOutcome,
+    QueuedPromptDisposition, SessionStore, TrailingCommandOutput, command_output_changes,
+    earliest_pending_prompt, message_content_changes, reasoning_content_changes,
 };
+use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 
 /// The most characters of Provider-sent output Suru stores for one command; the
 /// truncation marker Suru appends past the cap is its own and is not charged
@@ -69,6 +70,7 @@ pub(crate) struct ProviderOrchestrator {
     /// reach a Provider. A Provider the user turned off is never asked to begin
     /// a Session, so no process starts on its behalf.
     settings: watch::Receiver<SettingsSnapshot>,
+    skill_catalog: SkillCatalogService,
 }
 
 struct ProviderActors {
@@ -161,6 +163,15 @@ struct ConnectedProviderSession {
     events: ProviderEventStream,
 }
 
+struct ProviderSessionContext {
+    runtime: Arc<dyn ProviderRuntime>,
+    sessions: SessionStore,
+    skill_catalog: SkillCatalogService,
+    session_id: SessionId,
+    workspace: PathBuf,
+    updates: ProviderUpdateGate,
+}
+
 struct ActiveProviderTurn {
     turn_id: TurnId,
     streaming_message: Option<ActiveProviderMessage>,
@@ -237,6 +248,7 @@ impl ProviderOrchestrator {
         shutdown: watch::Receiver<bool>,
         updates: ProviderUpdateGate,
         settings: watch::Receiver<SettingsSnapshot>,
+        skill_catalog: SkillCatalogService,
     ) -> Self {
         assert!(
             !runtimes.is_empty(),
@@ -254,6 +266,7 @@ impl ProviderOrchestrator {
             updates,
             shutdown_complete,
             settings,
+            skill_catalog,
         }
     }
 
@@ -404,16 +417,19 @@ impl ProviderOrchestrator {
         let sessions = self.sessions.clone();
         let (session_shutdown, session_shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(run_provider_session(
-            runtime,
-            sessions,
-            session_id,
-            workspace,
+            ProviderSessionContext {
+                runtime,
+                sessions,
+                skill_catalog: self.skill_catalog.clone(),
+                session_id,
+                workspace,
+                updates: self.updates.clone(),
+            },
             commands_rx,
             ProviderShutdown {
                 server: self.shutdown.clone(),
                 session: session_shutdown_rx,
             },
-            self.updates.clone(),
         ));
         actors.entries.insert(
             session_id,
@@ -590,16 +606,21 @@ impl ProviderOrchestrator {
 }
 
 async fn run_provider_session(
-    runtime: Arc<dyn ProviderRuntime>,
-    sessions: SessionStore,
-    session_id: SessionId,
-    workspace: PathBuf,
+    context: ProviderSessionContext,
     mut commands: mpsc::UnboundedReceiver<ProviderCommand>,
     mut shutdown: ProviderShutdown,
-    updates: ProviderUpdateGate,
 ) {
+    let ProviderSessionContext {
+        runtime,
+        sessions,
+        skill_catalog,
+        session_id,
+        workspace,
+        updates,
+    } = context;
     let mut provider: Option<ConnectedProviderSession> = None;
     let mut active: Option<ActiveProviderTurn> = None;
+    let mut deferred_prompt_id = None;
     let provider_id = runtime.provider_id();
 
     'actor: loop {
@@ -607,7 +628,9 @@ async fn run_provider_session(
             break;
         }
         if active.is_none() {
-            let input = if let Some(connected) = provider.as_mut() {
+            let input = if let Some(prompt_id) = deferred_prompt_id.take() {
+                ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
+            } else if let Some(connected) = provider.as_mut() {
                 tokio::select! {
                     biased;
                     _ = shutdown.wait() => break,
@@ -663,6 +686,7 @@ async fn run_provider_session(
                         }) else {
                             break;
                         };
+                        defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                         continue;
                     }
                 };
@@ -685,6 +709,7 @@ async fn run_provider_session(
                         )
                     });
                     let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
+                    defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                     continue;
                 }
                 let selection = identity.selection.clone();
@@ -706,6 +731,7 @@ async fn run_provider_session(
                         )
                     });
                     let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
+                    defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                     continue;
                 }
                 provider = Some(ConnectedProviderSession {
@@ -720,6 +746,38 @@ async fn run_provider_session(
                 .expect("Provider connection exists before Prompt delivery")
                 .identity
                 .clone();
+            let prompt = sessions.snapshot(session_id).and_then(|snapshot| {
+                snapshot
+                    .prompts
+                    .into_iter()
+                    .find(|prompt| prompt.id == prompt_id && prompt.status == PromptStatus::Pending)
+            });
+            let Some(prompt) = prompt else {
+                continue;
+            };
+            let delivery = skill_prompt_delivery(&prompt);
+            if let Err(message) = revalidate_prompt_skills(
+                &skill_catalog,
+                &sessions,
+                session_id,
+                &provider_id,
+                &workspace,
+                &prompt,
+                delivery,
+            )
+            .await
+            {
+                let _ = updates.apply(|| {
+                    sessions.deliver_prompt(
+                        session_id,
+                        prompt_id,
+                        Some(identity.agent.clone()),
+                        DeliveredTurnStatus::Failed { message },
+                    )
+                });
+                defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
+                continue;
+            }
             let Some(delivered) = updates.apply(|| {
                 sessions.deliver_prompt(
                     session_id,
@@ -748,9 +806,13 @@ async fn run_provider_session(
             };
             if let Err(error) = started {
                 let session_lost = error.is_session_lost();
+                let selection_rejected = error.is_selection_rejected();
                 project_turn_start_failure(&sessions, &updates, session_id, turn_id, &error);
                 if session_lost {
                     provider = None;
+                }
+                if !selection_rejected {
+                    defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                 }
                 continue;
             }
@@ -798,6 +860,22 @@ async fn run_provider_session(
                     Ok(Some(prompt)) => prompt,
                     Ok(None) | Err(_) => continue,
                 };
+                if let Err(message) = revalidate_prompt_skills(
+                    &skill_catalog,
+                    &sessions,
+                    session_id,
+                    &provider_id,
+                    &workspace,
+                    &prompt,
+                    SkillPromptDelivery::Steer,
+                )
+                .await
+                {
+                    let _ = updates.apply(|| {
+                        sessions.fail_skill_steer(session_id, current.turn_id, prompt.id, message)
+                    });
+                    continue;
+                }
                 let steered = tokio::select! {
                     biased;
                     _ = shutdown.wait() => break 'actor,
@@ -816,12 +894,22 @@ async fn run_provider_session(
                     }
                     Err(error) => {
                         let _ = updates.apply(|| {
-                            sessions.report_steer_failure(
-                                session_id,
-                                current.turn_id,
-                                prompt.id,
-                                failure_message("Provider steering failed", &error),
-                            )
+                            let message = failure_message("Provider steering failed", &error);
+                            if prompt.skill_invocations.is_empty() {
+                                sessions.report_steer_failure(
+                                    session_id,
+                                    current.turn_id,
+                                    prompt.id,
+                                    message,
+                                )
+                            } else {
+                                sessions.fail_skill_steer(
+                                    session_id,
+                                    current.turn_id,
+                                    prompt.id,
+                                    message,
+                                )
+                            }
                         });
                     }
                 }
@@ -876,6 +964,7 @@ async fn run_provider_session(
                         fail_active_turn(&sessions, &updates, session_id, current, message.clone());
                         active = None;
                         provider = None;
+                        defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                         let _ = response.send(Err(InterruptTurnError::ProviderFailure(message)));
                     }
                 }
@@ -886,13 +975,33 @@ async fn run_provider_session(
                 };
                 match event {
                     Some(Ok(event)) => {
+                        let selection_rejected =
+                            matches!(event, ProviderEvent::AgentSelectionRejected { .. });
                         let identity = provider
                             .as_ref()
                             .expect("Provider connection exists while its Turn is active")
                             .identity
                             .clone();
+                        let queued_prompt_disposition = if provider_event_settles_turn(&event) {
+                            queued_prompt_disposition(
+                                &skill_catalog,
+                                &sessions,
+                                session_id,
+                                &provider_id,
+                                &workspace,
+                            )
+                            .await
+                        } else {
+                            QueuedPromptDisposition::LeavePending
+                        };
                         if let ProviderEventProjection::Terminal(next_turn) = project_provider_event(
-                            &sessions, &updates, session_id, current, &identity, event,
+                            &sessions,
+                            &updates,
+                            session_id,
+                            current,
+                            &identity,
+                            event,
+                            queued_prompt_disposition,
                         ) {
                             active = None;
                             if let Some(delivered) = next_turn {
@@ -904,11 +1013,19 @@ async fn run_provider_session(
                                 };
                                 if let Err(error) = started {
                                     let session_lost = error.is_session_lost();
+                                    let selection_rejected = error.is_selection_rejected();
                                     project_turn_start_failure(
                                         &sessions, &updates, session_id, turn_id, &error,
                                     );
                                     if session_lost {
                                         provider = None;
+                                    }
+                                    if !selection_rejected {
+                                        defer_next_queued_prompt(
+                                            &mut deferred_prompt_id,
+                                            &sessions,
+                                            session_id,
+                                        );
                                     }
                                 } else {
                                     active = Some(ActiveProviderTurn {
@@ -920,6 +1037,12 @@ async fn run_provider_session(
                                         reasoning_activities: HashMap::new(),
                                     });
                                 }
+                            } else if !selection_rejected {
+                                defer_next_queued_prompt(
+                                    &mut deferred_prompt_id,
+                                    &sessions,
+                                    session_id,
+                                );
                             }
                         }
                     }
@@ -933,6 +1056,7 @@ async fn run_provider_session(
                         );
                         active = None;
                         provider = None;
+                        defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                     }
                     None => {
                         fail_active_turn(
@@ -945,6 +1069,7 @@ async fn run_provider_session(
                         );
                         active = None;
                         provider = None;
+                        defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                     }
                 }
             }
@@ -1030,6 +1155,114 @@ fn project_turn_start_failure(
     });
 }
 
+fn skill_prompt_delivery(prompt: &Prompt) -> SkillPromptDelivery {
+    if prompt.admission_order == PromptOrder::INITIAL {
+        SkillPromptDelivery::Initial
+    } else {
+        match prompt.delivery {
+            PromptDelivery::Queue => SkillPromptDelivery::Queue,
+            PromptDelivery::Steer => SkillPromptDelivery::Steer,
+        }
+    }
+}
+
+fn provider_event_settles_turn(event: &ProviderEvent) -> bool {
+    matches!(
+        event,
+        ProviderEvent::TurnCompleted
+            | ProviderEvent::TurnInterrupted
+            | ProviderEvent::TurnFailed { .. }
+    )
+}
+
+fn next_queued_prompt(sessions: &SessionStore, session_id: SessionId) -> Option<Prompt> {
+    sessions.snapshot(session_id).and_then(|snapshot| {
+        earliest_pending_prompt(&snapshot.prompts, PromptDelivery::Queue).cloned()
+    })
+}
+
+fn defer_next_queued_prompt(
+    deferred_prompt_id: &mut Option<PromptId>,
+    sessions: &SessionStore,
+    session_id: SessionId,
+) {
+    *deferred_prompt_id = next_queued_prompt(sessions, session_id).map(|prompt| prompt.id);
+}
+
+async fn queued_prompt_disposition(
+    skill_catalog: &SkillCatalogService,
+    sessions: &SessionStore,
+    session_id: SessionId,
+    provider: &ProviderId,
+    workspace: &std::path::Path,
+) -> QueuedPromptDisposition {
+    let Some(prompt) = next_queued_prompt(sessions, session_id) else {
+        return QueuedPromptDisposition::LeavePending;
+    };
+    match revalidate_prompt_skills(
+        skill_catalog,
+        sessions,
+        session_id,
+        provider,
+        workspace,
+        &prompt,
+        SkillPromptDelivery::Queue,
+    )
+    .await
+    {
+        Ok(()) => QueuedPromptDisposition::Deliver {
+            prompt_id: prompt.id,
+        },
+        Err(message) => QueuedPromptDisposition::Fail {
+            prompt_id: prompt.id,
+            message,
+        },
+    }
+}
+
+async fn revalidate_prompt_skills(
+    skill_catalog: &SkillCatalogService,
+    sessions: &SessionStore,
+    session_id: SessionId,
+    provider: &ProviderId,
+    workspace: &std::path::Path,
+    prompt: &Prompt,
+    delivery: SkillPromptDelivery,
+) -> Result<(), String> {
+    if prompt.skill_invocations.is_empty() {
+        return Ok(());
+    }
+    if sessions.provider(session_id).as_ref() != Some(provider) {
+        return Err(
+            "Skill Invocation delivery failed: the Session Provider changed before delivery"
+                .to_owned(),
+        );
+    }
+    let prompt = crate::protocol::InitialPrompt {
+        id: prompt.id,
+        text: prompt.text.clone(),
+        skill_invocations: prompt.skill_invocations.clone(),
+    };
+    skill_catalog
+        .validate_prompt(provider.clone(), workspace, &prompt, delivery)
+        .await
+        .map_err(skill_delivery_failure_message)
+}
+
+fn skill_delivery_failure_message(error: SkillCatalogError) -> String {
+    let cause = match error {
+        SkillCatalogError::InvalidWorkspace => {
+            "the Session Workspace is no longer valid".to_owned()
+        }
+        SkillCatalogError::ProviderNotHosted(provider) => {
+            format!("Provider `{provider}` is no longer hosted")
+        }
+        SkillCatalogError::InvalidCatalog(message)
+        | SkillCatalogError::InvalidInvocation(message) => message,
+    };
+    format!("Skill Invocation delivery failed: {cause}")
+}
+
 fn project_provider_event(
     sessions: &SessionStore,
     updates: &ProviderUpdateGate,
@@ -1037,6 +1270,7 @@ fn project_provider_event(
     active: &mut ActiveProviderTurn,
     next_agent: &AgentIdentity,
     event: ProviderEvent,
+    queued_prompt_disposition: QueuedPromptDisposition,
 ) -> ProviderEventProjection {
     let Some(projected) = updates.apply(|| {
         let projection = match event {
@@ -1429,6 +1663,7 @@ fn project_provider_event(
                             active.turn_id,
                             next_agent.agent.clone(),
                             ProviderTurnOutcome::Completed,
+                            queued_prompt_disposition,
                         )
                         .map(ProviderEventProjection::Terminal)
                 }
@@ -1441,6 +1676,7 @@ fn project_provider_event(
                         active.turn_id,
                         next_agent.agent.clone(),
                         ProviderTurnOutcome::Interrupted { trailing_output },
+                        queued_prompt_disposition,
                     )
                     .map(ProviderEventProjection::Terminal)
             }
@@ -1466,6 +1702,7 @@ fn project_provider_event(
                             trailing_output,
                             message: normalize_provider_text(&message),
                         },
+                        queued_prompt_disposition,
                     )
                     .map(ProviderEventProjection::Terminal)
             }
@@ -1541,6 +1778,7 @@ fn finish_invalid_provider_event(
                 trailing_output,
                 message,
             },
+            QueuedPromptDisposition::LeavePending,
         )
         .ok()
         .flatten();

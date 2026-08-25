@@ -473,6 +473,7 @@ pub async fn spawn_with_providers_and_timings(
         provider_shutdown_rx.clone(),
         provider_updates,
         settings.subscribe(),
+        skill_catalog.clone(),
     );
     // Errands are abandoned on the same signal that stops Provider work, so a
     // shutting-down server never waits on one and never resumes one.

@@ -82,8 +82,13 @@ pub struct ControlledProviderSession {
     turns: mpsc::UnboundedReceiver<TurnStart>,
     steers: mpsc::UnboundedReceiver<TurnSteer>,
     interruptions: mpsc::UnboundedReceiver<TurnInterrupt>,
-    events: mpsc::UnboundedSender<Result<ProviderEvent, ProviderError>>,
+    events: mpsc::UnboundedSender<ControlledProviderEvent>,
 }
+
+type ControlledProviderEvent = (
+    Result<ProviderEvent, ProviderError>,
+    Option<oneshot::Sender<()>>,
+);
 
 pub struct PromptOperation {
     input: ProviderTurnInput,
@@ -328,9 +333,14 @@ impl StartRequest {
         let (turns_tx, turns_rx) = mpsc::unbounded_channel();
         let (steers_tx, steers_rx) = mpsc::unbounded_channel();
         let (interruptions_tx, interruptions_rx) = mpsc::unbounded_channel();
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ControlledProviderEvent>();
         let events: ProviderEventStream = Box::pin(stream::unfold(events_rx, |mut events| async {
-            events.recv().await.map(|event| (event, events))
+            events.recv().await.map(|(event, observed)| {
+                if let Some(observed) = observed {
+                    let _ = observed.send(());
+                }
+                (event, events)
+            })
         }));
         self.response
             .send(Ok(ProviderSessionConnection::new(
@@ -391,8 +401,17 @@ impl ControlledProviderSession {
 
     pub fn emit(&self, event: ProviderEvent) {
         self.events
-            .send(Ok(event))
+            .send((Ok(event), None))
             .expect("Provider event stream remains connected");
+    }
+
+    pub async fn emit_and_wait_until_observed(&self, event: ProviderEvent) {
+        let (observed, wait) = oneshot::channel();
+        self.events
+            .send((Ok(event), Some(observed)))
+            .expect("Provider event stream remains connected");
+        wait.await
+            .expect("Provider actor observes the controlled event");
     }
 }
 

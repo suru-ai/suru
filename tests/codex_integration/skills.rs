@@ -370,6 +370,9 @@ async fn codex_delivers_ordered_distinct_skills_with_visible_skill_only_transcri
         delivered.messages[0].skill_invocations,
         delivered.prompts[0].skill_invocations
     );
+    let serialized = serde_json::to_string(&delivered).expect("serialize client Session data");
+    assert!(!serialized.contains("SKILL.md"));
+    assert!(!serialized.contains("/private/codex"));
 
     drop(client);
     server.shutdown().await.expect("shut down server");
@@ -647,6 +650,9 @@ async fn codex_does_not_retry_rejected_structured_skills_as_plain_text() {
     .await;
     assert_eq!(failed.messages[0].content, visible_prompt);
     assert_eq!(failed.messages[0].skill_invocations, invocations);
+    let serialized = serde_json::to_string(&failed).expect("serialize failed Session data");
+    assert!(!serialized.contains("SKILL.md"));
+    assert!(!serialized.contains("/private/codex"));
 
     let starts = fixture
         .requests()

@@ -70,6 +70,16 @@ pub(crate) enum DeliveredTurnStatus {
     Failed { message: String },
 }
 
+pub(crate) fn earliest_pending_prompt<'a>(
+    prompts: impl IntoIterator<Item = &'a Prompt>,
+    delivery: PromptDelivery,
+) -> Option<&'a Prompt> {
+    prompts
+        .into_iter()
+        .filter(|prompt| prompt.status == PromptStatus::Pending && prompt.delivery == delivery)
+        .min_by_key(|prompt| prompt.admission_order)
+}
+
 /// The Session a Prompt belongs to, alongside everything a retry of the request
 /// that introduced it must match to be recognized as the same Prompt rather
 /// than a conflicting one.
@@ -481,6 +491,70 @@ impl SessionStore {
                     text: message,
                 },
             }],
+            updated_at,
+        )?;
+        record.steer_targets.remove(&prompt_id);
+        Ok(Some(update))
+    }
+
+    /// Records a Skill-bearing steer that failed before or at native delivery.
+    /// Unlike an ordinary transient steer failure, this Prompt cannot be
+    /// retried under weaker plain-text semantics: its durable Message and safe
+    /// bindings remain beside the visible Error, while its terminal status
+    /// keeps the continuation boundary from later claiming it was delivered.
+    pub(crate) fn fail_skill_steer(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        prompt_id: PromptId,
+        message: String,
+    ) -> anyhow::Result<Option<SessionUpdate>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let prompt = {
+            let record = state
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+            let Some(prompt) = record.pending_steer(turn_id, prompt_id)? else {
+                return Ok(None);
+            };
+            prompt.clone()
+        };
+        let updated_at = state.next_timestamp();
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
+        let update = record.commit(
+            &self.storage,
+            session_id,
+            vec![
+                SessionChange::PromptStatusChanged {
+                    prompt_id,
+                    status: PromptStatus::Failed,
+                },
+                SessionChange::MessageAdded {
+                    message: Message {
+                        id: MessageId::new(),
+                        turn_id,
+                        role: MessageRole::User,
+                        status: MessageStatus::Completed,
+                        content: prompt.text,
+                        skill_invocations: prompt.skill_invocations,
+                        truncated: false,
+                    },
+                },
+                SessionChange::ActivityAdded {
+                    activity: Activity::Error {
+                        id: ActivityId::new(),
+                        turn_id,
+                        text: message,
+                    },
+                },
+            ],
             updated_at,
         )?;
         record.steer_targets.remove(&prompt_id);

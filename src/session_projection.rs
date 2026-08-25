@@ -70,7 +70,10 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update referenced an unknown Prompt");
                 };
                 if prompt.status != PromptStatus::Pending
-                    || !matches!(status, PromptStatus::Delivered | PromptStatus::Cancelled)
+                    || !matches!(
+                        status,
+                        PromptStatus::Delivered | PromptStatus::Failed | PromptStatus::Cancelled
+                    )
                 {
                     bail!("Session update contained an invalid Prompt status transition");
                 }

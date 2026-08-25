@@ -15,7 +15,10 @@ use super::{
     SessionStore,
     output::command_output_changes,
     projection::active_turn_id,
-    prompts::{DeliveredTurn, append_steer_delivery_changes, prepare_prompt_delivery},
+    prompts::{
+        DeliveredTurn, append_steer_delivery_changes, earliest_pending_prompt,
+        prepare_prompt_delivery,
+    },
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +38,22 @@ pub(crate) enum ProviderTurnOutcome {
     Interrupted {
         trailing_output: TrailingCommandOutput,
     },
+}
+
+/// The authoritative decision made for the next queued Prompt immediately
+/// before the settle commit would deliver it. Keeping the decision explicit
+/// lets the Provider actor perform asynchronous Skill Catalog validation while
+/// the Session store still settles the old Turn and either starts or fails the
+/// queued Turn atomically for every attached client.
+pub(crate) enum QueuedPromptDisposition {
+    Deliver {
+        prompt_id: crate::protocol::PromptId,
+    },
+    Fail {
+        prompt_id: crate::protocol::PromptId,
+        message: String,
+    },
+    LeavePending,
 }
 
 /// The unterminated line each in-flight command's normalizer held back when its
@@ -89,6 +108,7 @@ impl SessionStore {
         turn_id: TurnId,
         agent_id: AgentId,
         outcome: ProviderTurnOutcome,
+        queued_prompt_disposition: QueuedPromptDisposition,
     ) -> anyhow::Result<Option<DeliveredTurn>> {
         let mut state = self
             .state
@@ -141,16 +161,8 @@ impl SessionStore {
                 .cloned()
                 .collect::<Vec<_>>();
             pending_steers.sort_unstable_by_key(|prompt| prompt.admission_order);
-            let next_queued_prompt = record
-                .snapshot
-                .prompts
-                .iter()
-                .filter(|prompt| {
-                    prompt.status == PromptStatus::Pending
-                        && prompt.delivery == PromptDelivery::Queue
-                })
-                .min_by_key(|prompt| prompt.admission_order)
-                .cloned();
+            let next_queued_prompt =
+                earliest_pending_prompt(&record.snapshot.prompts, PromptDelivery::Queue).cloned();
             let next_agent = record
                 .snapshot
                 .session
@@ -188,12 +200,32 @@ impl SessionStore {
             settled_at: None,
         });
 
-        let next_turn = next_queued_prompt.map(|prompt| {
-            let (delivered, delivery_changes) =
-                prepare_prompt_delivery(prompt, next_agent, TurnStatus::Active);
-            changes.extend(delivery_changes);
-            delivered
-        });
+        let next_turn = match (next_queued_prompt, queued_prompt_disposition) {
+            (Some(prompt), QueuedPromptDisposition::Deliver { prompt_id })
+                if prompt.id == prompt_id =>
+            {
+                let (delivered, delivery_changes) =
+                    prepare_prompt_delivery(prompt, next_agent, TurnStatus::Active);
+                changes.extend(delivery_changes);
+                Some(delivered)
+            }
+            (Some(prompt), QueuedPromptDisposition::Fail { prompt_id, message })
+                if prompt.id == prompt_id =>
+            {
+                let (delivered, delivery_changes) =
+                    prepare_prompt_delivery(prompt, next_agent, TurnStatus::Failed);
+                changes.extend(delivery_changes);
+                changes.push(SessionChange::ActivityAdded {
+                    activity: Activity::Error {
+                        id: ActivityId::new(),
+                        turn_id: delivered.turn_id,
+                        text: message,
+                    },
+                });
+                None
+            }
+            (None, _) | (Some(_), _) => None,
+        };
 
         let updated_at = state.next_timestamp();
         let record = state

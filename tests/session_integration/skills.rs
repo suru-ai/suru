@@ -11,10 +11,11 @@ use serde_json::json;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        AgentId, AgentIdentity, CreateSessionRequest, InitialPrompt, PromptId, ProviderId,
-        SessionError, SessionErrorCode, SessionRevision, SettingMutation, SkillCatalog,
-        SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor,
-        SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, Workspace,
+        Activity, AdmitPromptRequest, AgentId, AgentIdentity, CreateSessionRequest, InitialPrompt,
+        PromptDelivery, PromptId, PromptStatus, ProviderId, SessionError, SessionErrorCode,
+        SessionRevision, SessionStatus, SettingMutation, SkillCatalog, SkillCatalogCapabilities,
+        SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillInvocation,
+        SkillMarkerSpan, SkillPromptDelivery, TurnStatus, Workspace,
     },
     server::{self, ServerConfig},
 };
@@ -48,6 +49,661 @@ async fn list_skills_until(
     })
     .await
     .expect("Skill Catalog reaches expected state")
+}
+
+async fn next_fresh_catalog(client: &mut ManagedClient) -> SkillCatalog {
+    loop {
+        let catalog = next_skill_catalog(client).await;
+        if matches!(catalog.status, SkillCatalogStatus::Fresh { .. }) {
+            return catalog;
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_provider_revalidates_queued_skills_before_native_delivery() {
+    for provider_name in ["codex", "copilot", "claude"] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let workspace = tempfile::tempdir().expect("create Workspace");
+        let canonical_workspace =
+            std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+        let provider_id = ProviderId::new(provider_name);
+        let model_id = format!("{provider_name}-model");
+        let (runtime, mut provider) = ControlledProvider::with_provider(
+            provider_id.clone(),
+            vec![hosted_model(provider_name, &model_id)],
+        );
+        let original = SkillDescriptor {
+            id: SkillId::new(format!("{provider_name}-original-review")),
+            name: "review".to_owned(),
+            description: "Review the current change".to_owned(),
+            scope: Some("Workspace".to_owned()),
+        };
+        let catalog = |skill: SkillDescriptor| SkillCatalog {
+            provider: provider_id.clone(),
+            workspace: Workspace {
+                path: canonical_workspace.clone(),
+            },
+            skills: vec![skill],
+            capabilities: SkillCatalogCapabilities {
+                max_distinct_invocations: Some(if provider_name == "copilot" { 1 } else { 6 }),
+                supported_deliveries: vec![SkillPromptDelivery::Queue],
+            },
+            status: SkillCatalogStatus::Fresh { warning: None },
+        };
+        runtime.offer_skills(catalog(original.clone()));
+        let channel = format!("{provider_name}-queued-skill-revalidation");
+        let server = server::spawn_with_provider(
+            ServerConfig::new(state_dir.path(), &channel).expect("configure server"),
+            Arc::new((*runtime).clone()),
+        )
+        .await
+        .expect("spawn server");
+        let mut first = ManagedClient::connect(
+            ManagedClientConfig::new(state_dir.path(), &channel).expect("configure first client"),
+        )
+        .await
+        .expect("connect first client");
+        let mut second = ManagedClient::connect(
+            ManagedClientConfig::new(state_dir.path(), &channel).expect("configure second client"),
+        )
+        .await
+        .expect("connect second client");
+        crate::support::receive_managed_client_initial_state(&mut first).await;
+        crate::support::receive_managed_client_initial_state(&mut second).await;
+        let catalog_request = SkillCatalogRequest {
+            provider: provider_id.clone(),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+        };
+        let loading = first
+            .list_skills(catalog_request)
+            .await
+            .expect("prefetch Skill Catalog");
+        assert!(matches!(loading.status, SkillCatalogStatus::Loading));
+        assert_eq!(
+            next_fresh_catalog(&mut first).await.skills.as_slice(),
+            std::slice::from_ref(&original)
+        );
+        assert_eq!(
+            next_fresh_catalog(&mut second).await.skills.as_slice(),
+            std::slice::from_ref(&original)
+        );
+
+        let created = first
+            .create_session(CreateSessionRequest {
+                agent_selection: Some(hosted_selection(provider_name, &model_id)),
+                workspace: Workspace {
+                    path: workspace.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Hold the active Turn".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+            })
+            .await
+            .expect("create active Session");
+        let start = provider.next_start().await;
+        let mut provider_session = start.succeed(AgentIdentity {
+            agent: AgentId::new(format!("{provider_name}-agent")),
+            selection: hosted_selection(provider_name, &model_id),
+        });
+        provider_session.next_turn().await.succeed();
+
+        let invocation = SkillInvocation {
+            skill_id: original.id.clone(),
+            name: original.name.clone(),
+            scope: original.scope.clone(),
+            marker: SkillMarkerSpan { start: 6, end: 13 },
+        };
+        let queued = first
+            .admit_prompt(
+                created.session.id,
+                AdmitPromptRequest {
+                    prompt: InitialPrompt {
+                        id: PromptId::new(),
+                        text: "Queue $review safely".to_owned(),
+                        skill_invocations: vec![invocation.clone()],
+                    },
+                    delivery: PromptDelivery::Queue,
+                },
+            )
+            .await
+            .expect("admit queued Skill Prompt");
+        assert_eq!(queued.status, PromptStatus::Pending);
+
+        let replacement = SkillDescriptor {
+            id: SkillId::new(format!("{provider_name}-replacement-review")),
+            ..original.clone()
+        };
+        runtime.offer_skills(catalog(replacement.clone()));
+        runtime.invalidate_skill_catalog();
+        assert_eq!(
+            next_fresh_catalog(&mut first).await.skills.as_slice(),
+            std::slice::from_ref(&replacement)
+        );
+        assert_eq!(next_fresh_catalog(&mut second).await.skills, [replacement]);
+
+        provider_session.emit(suru::provider::ProviderEvent::TurnCompleted);
+        let failed = timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = first
+                    .read_session(created.session.id)
+                    .await
+                    .expect("read Session while queued Prompt fails");
+                if snapshot.turns.len() == 2 && snapshot.turns[1].status == TurnStatus::Failed {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{provider_name} rejects the stale queued binding"));
+        let also_failed = second
+            .read_session(created.session.id)
+            .await
+            .expect("second client reads authoritative failure");
+        assert_eq!(also_failed, failed);
+        drop(first);
+        let mut reconnected = ManagedClient::connect(
+            ManagedClientConfig::new(state_dir.path(), &channel)
+                .expect("configure reconnected client"),
+        )
+        .await
+        .expect("reconnect client");
+        crate::support::receive_managed_client_initial_state(&mut reconnected).await;
+        assert_eq!(
+            reconnected
+                .read_session(created.session.id)
+                .await
+                .expect("reconnected client reads stored failure"),
+            failed
+        );
+        assert_eq!(failed.session.status, SessionStatus::Idle);
+        assert_eq!(failed.prompts[1].status, PromptStatus::Delivered);
+        let message = failed
+            .messages
+            .iter()
+            .find(|message| message.content == "Queue $review safely")
+            .expect("failed queued Prompt retains its Message");
+        assert_eq!(message.skill_invocations, [invocation]);
+        assert!(failed.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Error { turn_id, text, .. }
+                if *turn_id == failed.turns[1].id
+                    && text.contains("Skill Invocation delivery failed")
+        )));
+        assert!(
+            timeout(Duration::from_millis(20), provider_session.next_turn())
+                .await
+                .is_err(),
+            "{provider_name} receives no native call for the stale queued Prompt"
+        );
+
+        let serialized = serde_json::to_string(&failed).expect("serialize failed Session");
+        assert!(!serialized.contains("SKILL.md"));
+        assert!(!serialized.contains("native-review"));
+
+        drop(provider_session);
+        drop(second);
+        drop(reconnected);
+        server.shutdown().await.expect("shut down server");
+    }
+}
+
+#[tokio::test]
+async fn every_provider_revalidates_initial_skills_after_session_startup() {
+    for provider_name in ["codex", "copilot", "claude"] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let workspace = tempfile::tempdir().expect("create Workspace");
+        let canonical_workspace =
+            std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+        let provider_id = ProviderId::new(provider_name);
+        let model_id = format!("{provider_name}-model");
+        let (runtime, mut provider) = ControlledProvider::with_provider(
+            provider_id.clone(),
+            vec![hosted_model(provider_name, &model_id)],
+        );
+        let original = SkillDescriptor {
+            id: SkillId::new(format!("{provider_name}-initial-review")),
+            name: "review".to_owned(),
+            description: "Review the current change".to_owned(),
+            scope: Some("Workspace".to_owned()),
+        };
+        let catalog = |skill: SkillDescriptor| SkillCatalog {
+            provider: provider_id.clone(),
+            workspace: Workspace {
+                path: canonical_workspace.clone(),
+            },
+            skills: vec![skill],
+            capabilities: SkillCatalogCapabilities {
+                max_distinct_invocations: None,
+                supported_deliveries: vec![SkillPromptDelivery::Initial],
+            },
+            status: SkillCatalogStatus::Fresh { warning: None },
+        };
+        runtime.offer_skills(catalog(original.clone()));
+        let channel = format!("{provider_name}-initial-skill-revalidation");
+        let server = server::spawn_with_provider(
+            ServerConfig::new(state_dir.path(), &channel).expect("configure server"),
+            Arc::new((*runtime).clone()),
+        )
+        .await
+        .expect("spawn server");
+        let mut client = ManagedClient::connect(
+            ManagedClientConfig::new(state_dir.path(), &channel).expect("configure client"),
+        )
+        .await
+        .expect("connect client");
+        crate::support::receive_managed_client_initial_state(&mut client).await;
+        let loading = client
+            .list_skills(SkillCatalogRequest {
+                provider: provider_id.clone(),
+                workspace: Workspace {
+                    path: workspace.path().to_owned(),
+                },
+            })
+            .await
+            .expect("prefetch Skill Catalog");
+        assert!(matches!(loading.status, SkillCatalogStatus::Loading));
+        assert_eq!(
+            next_fresh_catalog(&mut client).await.skills.as_slice(),
+            std::slice::from_ref(&original)
+        );
+
+        let invocation = SkillInvocation {
+            skill_id: original.id.clone(),
+            name: original.name.clone(),
+            scope: original.scope.clone(),
+            marker: SkillMarkerSpan { start: 0, end: 7 },
+        };
+        let created = client
+            .create_session(CreateSessionRequest {
+                agent_selection: Some(hosted_selection(provider_name, &model_id)),
+                workspace: Workspace {
+                    path: workspace.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "$review before startup".to_owned(),
+                    skill_invocations: vec![invocation.clone()],
+                },
+            })
+            .await
+            .expect("admit initial Skill Prompt");
+        let start = provider.next_start().await;
+
+        runtime.offer_skills(catalog(SkillDescriptor {
+            id: SkillId::new(format!("{provider_name}-replacement-review")),
+            ..original
+        }));
+        runtime.invalidate_skill_catalog();
+        let _ = next_fresh_catalog(&mut client).await;
+
+        let mut provider_session = start.succeed(AgentIdentity {
+            agent: AgentId::new(format!("{provider_name}-agent")),
+            selection: hosted_selection(provider_name, &model_id),
+        });
+        let failed = timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = client
+                    .read_session(created.session.id)
+                    .await
+                    .expect("read initial delivery failure");
+                if snapshot
+                    .turns
+                    .first()
+                    .is_some_and(|turn| turn.status == TurnStatus::Failed)
+                {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{provider_name} rejects stale initial binding"));
+        assert_eq!(failed.messages[0].content, "$review before startup");
+        assert_eq!(failed.messages[0].skill_invocations, [invocation]);
+        assert!(
+            timeout(Duration::from_millis(20), provider_session.next_turn())
+                .await
+                .is_err(),
+            "{provider_name} receives no initial native Prompt"
+        );
+
+        drop(provider_session);
+        drop(client);
+        server.shutdown().await.expect("shut down server");
+    }
+}
+
+#[tokio::test]
+async fn steer_capable_providers_revalidate_skills_before_native_delivery() {
+    for provider_name in ["codex", "copilot"] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let workspace = tempfile::tempdir().expect("create Workspace");
+        let canonical_workspace =
+            std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+        let provider_id = ProviderId::new(provider_name);
+        let model_id = format!("{provider_name}-model");
+        let (runtime, mut provider) = ControlledProvider::with_provider(
+            provider_id.clone(),
+            vec![hosted_model(provider_name, &model_id)],
+        );
+        let original = SkillDescriptor {
+            id: SkillId::new(format!("{provider_name}-steer-review")),
+            name: "review".to_owned(),
+            description: "Review the current change".to_owned(),
+            scope: Some("Workspace".to_owned()),
+        };
+        let catalog = |skill: SkillDescriptor| SkillCatalog {
+            provider: provider_id.clone(),
+            workspace: Workspace {
+                path: canonical_workspace.clone(),
+            },
+            skills: vec![skill],
+            capabilities: SkillCatalogCapabilities {
+                max_distinct_invocations: Some(if provider_name == "copilot" { 1 } else { 6 }),
+                supported_deliveries: vec![SkillPromptDelivery::Steer],
+            },
+            status: SkillCatalogStatus::Fresh { warning: None },
+        };
+        runtime.offer_skills(catalog(original.clone()));
+        let channel = format!("{provider_name}-steer-skill-revalidation");
+        let server = server::spawn_with_provider(
+            ServerConfig::new(state_dir.path(), &channel).expect("configure server"),
+            Arc::new((*runtime).clone()),
+        )
+        .await
+        .expect("spawn server");
+        let mut client = ManagedClient::connect(
+            ManagedClientConfig::new(state_dir.path(), &channel).expect("configure client"),
+        )
+        .await
+        .expect("connect client");
+        crate::support::receive_managed_client_initial_state(&mut client).await;
+        let loading = client
+            .list_skills(SkillCatalogRequest {
+                provider: provider_id.clone(),
+                workspace: Workspace {
+                    path: workspace.path().to_owned(),
+                },
+            })
+            .await
+            .expect("prefetch Skill Catalog");
+        assert!(matches!(loading.status, SkillCatalogStatus::Loading));
+        assert_eq!(
+            next_fresh_catalog(&mut client).await.skills.as_slice(),
+            std::slice::from_ref(&original)
+        );
+
+        let created = client
+            .create_session(CreateSessionRequest {
+                agent_selection: Some(hosted_selection(provider_name, &model_id)),
+                workspace: Workspace {
+                    path: workspace.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Hold native start".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+            })
+            .await
+            .expect("create Session");
+        let start = provider.next_start().await;
+        let mut provider_session = start.succeed(AgentIdentity {
+            agent: AgentId::new(format!("{provider_name}-agent")),
+            selection: hosted_selection(provider_name, &model_id),
+        });
+        let initial_turn = provider_session.next_turn().await;
+
+        let invocation = SkillInvocation {
+            skill_id: original.id.clone(),
+            name: original.name.clone(),
+            scope: original.scope.clone(),
+            marker: SkillMarkerSpan { start: 6, end: 13 },
+        };
+        let steer = client
+            .admit_prompt(
+                created.session.id,
+                AdmitPromptRequest {
+                    prompt: InitialPrompt {
+                        id: PromptId::new(),
+                        text: "Steer $review safely".to_owned(),
+                        skill_invocations: vec![invocation.clone()],
+                    },
+                    delivery: PromptDelivery::Steer,
+                },
+            )
+            .await
+            .expect("admit Skill steer while native start is held");
+        assert_eq!(steer.status, PromptStatus::Pending);
+
+        runtime.offer_skills(catalog(SkillDescriptor {
+            id: SkillId::new(format!("{provider_name}-replacement-review")),
+            ..original
+        }));
+        runtime.invalidate_skill_catalog();
+        let _ = next_fresh_catalog(&mut client).await;
+        initial_turn.succeed();
+
+        let failed = timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = client
+                    .read_session(created.session.id)
+                    .await
+                    .expect("read steer validation failure");
+                if snapshot.activities.iter().any(|activity| {
+                    matches!(
+                        activity,
+                        Activity::Error { text, .. }
+                            if text.contains("Skill Invocation delivery failed")
+                    )
+                }) {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{provider_name} rejects stale steer binding"));
+        let retained = failed
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == steer.id)
+            .expect("failed steer retains the Prompt record");
+        assert_eq!(
+            serde_json::to_value(retained.status).expect("serialize failed Prompt status"),
+            serde_json::json!("failed")
+        );
+        assert_eq!(retained.skill_invocations, [invocation]);
+        let message = failed
+            .messages
+            .iter()
+            .find(|message| message.content == "Steer $review safely")
+            .expect("failed steer retains its Message");
+        assert_eq!(message.skill_invocations, retained.skill_invocations);
+        assert!(
+            timeout(Duration::from_millis(20), provider_session.next_steer())
+                .await
+                .is_err(),
+            "{provider_name} receives no native steer call"
+        );
+
+        provider_session.emit(suru::provider::ProviderEvent::TurnCompleted);
+        drop(provider_session);
+        drop(client);
+        server.shutdown().await.expect("shut down server");
+    }
+}
+
+#[tokio::test]
+async fn queued_validation_outcome_is_bound_to_the_prompt_that_was_checked() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let canonical_workspace =
+        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+    let (runtime, mut provider) = ControlledProvider::with_provider(
+        ProviderId::new("codex"),
+        vec![hosted_model("codex", "codex-model")],
+    );
+    let original = SkillDescriptor {
+        id: SkillId::new("original-racy-review"),
+        name: "review".to_owned(),
+        description: "Review the current change".to_owned(),
+        scope: Some("Workspace".to_owned()),
+    };
+    let catalog = |skill: SkillDescriptor| SkillCatalog {
+        provider: ProviderId::new("codex"),
+        workspace: Workspace {
+            path: canonical_workspace.clone(),
+        },
+        skills: vec![skill],
+        capabilities: SkillCatalogCapabilities {
+            max_distinct_invocations: None,
+            supported_deliveries: vec![SkillPromptDelivery::Queue],
+        },
+        status: SkillCatalogStatus::Fresh { warning: None },
+    };
+    runtime.offer_skills(catalog(original.clone()));
+    let channel = "queued-skill-cancellation-race";
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        Arc::new((*runtime).clone()),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    crate::support::receive_managed_client_initial_state(&mut client).await;
+    assert!(matches!(
+        client
+            .list_skills(SkillCatalogRequest {
+                provider: ProviderId::new("codex"),
+                workspace: Workspace {
+                    path: workspace.path().to_owned(),
+                },
+            })
+            .await
+            .expect("prefetch Skill Catalog")
+            .status,
+        SkillCatalogStatus::Loading
+    ));
+    let _ = next_fresh_catalog(&mut client).await;
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(hosted_selection("codex", "codex-model")),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Hold the active Turn".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create active Session");
+    let start = provider.next_start().await;
+    let mut provider_session = start.succeed(AgentIdentity {
+        agent: AgentId::new("codex-agent"),
+        selection: hosted_selection("codex", "codex-model"),
+    });
+    provider_session.next_turn().await.succeed();
+
+    let stale = client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "$review stale work".to_owned(),
+                    skill_invocations: vec![SkillInvocation {
+                        skill_id: original.id.clone(),
+                        name: original.name.clone(),
+                        scope: original.scope.clone(),
+                        marker: SkillMarkerSpan { start: 0, end: 7 },
+                    }],
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("queue binding that will become stale");
+    let following = client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Run the following plain Prompt".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("queue plain Prompt behind stale binding");
+
+    runtime.offer_skills(catalog(SkillDescriptor {
+        id: SkillId::new("replacement-racy-review"),
+        ..original
+    }));
+    let release_refresh = runtime.block_next_skill_discovery();
+    runtime.invalidate_skill_catalog();
+    assert!(matches!(
+        next_skill_catalog(&mut client).await.status,
+        SkillCatalogStatus::Refreshing
+    ));
+    provider_session
+        .emit_and_wait_until_observed(suru::provider::ProviderEvent::TurnCompleted)
+        .await;
+    let cancelled = client
+        .cancel_prompt(created.session.id, stale.id)
+        .await
+        .expect("cancel the Prompt whose validation is in flight");
+    assert_eq!(cancelled.status, PromptStatus::Cancelled);
+    release_refresh.send(()).expect("release catalog refresh");
+
+    let next_turn = timeout(Duration::from_secs(1), provider_session.next_turn())
+        .await
+        .expect("the next Prompt is revalidated after the queue changes");
+    assert_eq!(next_turn.prompt(), following.text);
+    assert!(next_turn.skill_invocations().is_empty());
+    next_turn.succeed();
+    let snapshot = client
+        .read_session(created.session.id)
+        .await
+        .expect("read queue after cancellation race");
+    assert_eq!(
+        snapshot
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == stale.id)
+            .expect("cancelled Prompt remains stored")
+            .status,
+        PromptStatus::Cancelled
+    );
+    assert_eq!(
+        snapshot
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == following.id)
+            .expect("following Prompt remains stored")
+            .status,
+        PromptStatus::Delivered
+    );
+
+    drop(provider_session);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
 }
 
 #[tokio::test]

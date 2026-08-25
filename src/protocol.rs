@@ -895,6 +895,7 @@ pub enum SessionStatus {
 pub enum PromptStatus {
     Pending,
     Delivered,
+    Failed,
     Cancelled,
 }
 

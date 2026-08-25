@@ -9,8 +9,8 @@ use crate::{
 };
 use serde_json::Value;
 use suru::protocol::{
-    AdmitPromptRequest, CreateSessionRequest, InitialPrompt, MessageRole, PromptDelivery, PromptId,
-    PromptStatus, ProviderId, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor,
+    Activity, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, MessageRole, PromptDelivery,
+    PromptId, PromptStatus, ProviderId, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor,
     SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, TurnStatus, Workspace,
 };
 
@@ -341,6 +341,77 @@ async fn claude_delivers_ordered_distinct_skills_for_initial_and_queued_prompts(
     drop(client);
     server.shutdown().await.expect("shut down server");
     claude.wait_for_exits(3).await;
+}
+
+#[tokio::test]
+async fn claude_reports_native_skill_rejection_without_plain_text_retry() {
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}",
+        skill_catalog_arms(),
+        user_turn_arm(
+            r#"      emit '{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":1,"num_turns":1,"errors":["fixture rejected native Skill invocation"],"session_id":"prov-session"}'
+"#,
+        )
+    ));
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (server, mut client) =
+        hosting(&claude, "claude-native-skill-rejection", state_dir.path()).await;
+    let catalog = fresh_catalog(&mut client, workspace.path()).await;
+    let review = catalog
+        .skills
+        .iter()
+        .find(|skill| skill.name == "review")
+        .expect("review Skill is offered");
+    let invocation = invocation(review, 0, 7);
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "$review".to_owned(),
+                skill_invocations: vec![invocation.clone()],
+            },
+        })
+        .await
+        .expect("admit Claude Skill Prompt");
+    let failed = settled_session(&client, created.session.id, 0).await;
+
+    assert_eq!(failed.turns[0].status, TurnStatus::Failed);
+    assert_eq!(failed.messages[0].content, "$review");
+    assert_eq!(failed.messages[0].skill_invocations, [invocation]);
+    assert!(failed.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Error { text, .. }
+            if text.contains("fixture rejected native Skill invocation")
+    )));
+    let serialized = serde_json::to_string(&failed).expect("serialize failed Session data");
+    assert!(!serialized.contains("argumentHint"));
+    assert!(!serialized.contains("reload_skills"));
+    let native_prompts = claude
+        .requests()
+        .into_iter()
+        .filter(|request| request.get("type").and_then(Value::as_str) == Some("user"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        native_prompts.len(),
+        1,
+        "Claude never retries as plain text"
+    );
+    assert_eq!(
+        native_prompts[0]
+            .pointer("/message/content/0/text")
+            .and_then(Value::as_str),
+        Some("/review")
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    claude.wait_for_exits(2).await;
 }
 
 #[tokio::test]

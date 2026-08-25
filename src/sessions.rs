@@ -34,10 +34,12 @@ pub(crate) use output::{
 };
 pub(crate) use prompts::{
     AdmitPromptError, CreateSessionError, DeliveredTurn, DeliveredTurnStatus,
-    PromptAdmissionDisposition, PromptMutationError,
+    PromptAdmissionDisposition, PromptMutationError, earliest_pending_prompt,
 };
 pub(crate) use selection::AgentSelectionMutationError;
-pub(crate) use settlement::{InterruptTurnError, ProviderTurnOutcome, TrailingCommandOutput};
+pub(crate) use settlement::{
+    InterruptTurnError, ProviderTurnOutcome, QueuedPromptDisposition, TrailingCommandOutput,
+};
 pub(crate) use title::TitleDerivation;
 
 use prompts::{PromptOrigin, PromptOwner};
