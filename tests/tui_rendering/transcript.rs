@@ -65,6 +65,51 @@ fn text_cell<'a>(buffer: &'a Buffer, needle: &str) -> &'a Cell {
         .expect("rendered text position is inside the buffer")
 }
 
+#[test]
+fn wrapped_transcript_lines_keep_source_and_list_indentation() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
+    let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
+    snapshot
+        .messages
+        .iter_mut()
+        .find(|message| message.role == MessageRole::Agent)
+        .expect("fixture contains an Agent Message")
+        .content = concat!(
+        "```text\n",
+        "    indented-start alpha beta gamma delta epsilon zeta eta source-continuation\n",
+        "```\n\n",
+        "- bullet-start alpha beta gamma delta epsilon zeta eta bullet-continuation"
+    )
+    .to_owned();
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach Session with wrapping Markdown");
+
+    let buffer = rendered_application_buffer(&application, 50, 24);
+    let rows = buffer_rows(&buffer);
+    let continuation_column = |needle: &str| {
+        rows.iter()
+            .find(|row| row.contains(needle))
+            .and_then(|row| row.chars().position(|character| !character.is_whitespace()))
+            .unwrap_or_else(|| panic!("rendered frame contains {needle:?}")) as u16
+    };
+    assert_eq!(
+        continuation_column("source-continuation"),
+        text_position(&buffer, "indented-start").0,
+        "a wrapped source line keeps its leading whitespace:\n{}",
+        rows.join("\n")
+    );
+    assert_eq!(
+        continuation_column("bullet-continuation"),
+        text_position(&buffer, "bullet-start").0,
+        "a wrapped list item uses a hanging indent beneath its text:\n{}",
+        rows.join("\n")
+    );
+}
+
 async fn apply_next_session_event(
     application: &mut Application,
     subscription: &mut SessionSubscription,

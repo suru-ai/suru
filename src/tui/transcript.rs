@@ -28,7 +28,7 @@
 
 use std::{
     cell::{Ref, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
 };
 
@@ -37,6 +37,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
@@ -1723,7 +1724,7 @@ fn reuse_or_render(
         if rendered_anchor.is_some_and(|anchor| anchor.marker_source_line == Some(index)) {
             marker_line = Some(measured.len());
         }
-        split_oversized_line(line, width, &mut measured);
+        layout_line(line, width, &mut measured);
         if rendered_anchor.is_some_and(|anchor| index + 1 == anchor.header_source_lines) {
             header_lines = measured.len();
         }
@@ -2440,7 +2441,7 @@ fn fold_output_to_tail(
 ) -> (Vec<Line<'static>>, bool) {
     let rows_per_line = lines
         .iter()
-        .map(|line| wrapped_line_count(line, width).max(1))
+        .map(|line| laid_out_line_count(line, width).max(1))
         .collect::<Vec<_>>();
     if rows_per_line.iter().sum::<usize>() <= tail_rows {
         return (lines, false);
@@ -3074,6 +3075,275 @@ fn wrapped_line_count(line: &Line<'static>, width: u16) -> usize {
         .line_count(width)
 }
 
+#[derive(Clone, Debug)]
+struct StyledSymbol {
+    symbol: String,
+    style: Style,
+}
+
+impl StyledSymbol {
+    fn width(&self) -> usize {
+        self.symbol.width()
+    }
+
+    fn is_whitespace(&self) -> bool {
+        self.symbol == "\u{200b}"
+            || (self.symbol != "\u{00a0}" && self.symbol.chars().all(char::is_whitespace))
+    }
+}
+
+fn styled_symbols(line: &Line<'static>) -> Vec<StyledSymbol> {
+    line.spans
+        .iter()
+        .flat_map(|span| {
+            UnicodeSegmentation::graphemes(span.content.as_ref(), true).map(|symbol| StyledSymbol {
+                symbol: symbol.to_owned(),
+                style: span.style,
+            })
+        })
+        .collect()
+}
+
+/// The whitespace repeated before every wrapped continuation of a projected
+/// line. Ordinary leading whitespace repeats verbatim. Markdown structural
+/// markers become same-width spaces as well, giving list items and quotes a
+/// hanging indent beneath the text rather than beneath the marker.
+fn continuation_prefix(symbols: &[StyledSymbol], width: u16) -> Vec<StyledSymbol> {
+    let leading_end = symbols
+        .iter()
+        .position(|symbol| !symbol.is_whitespace())
+        .unwrap_or(symbols.len());
+    let mut prefix_end = leading_end;
+    while let Some(marker_end) = markdown_marker_end(symbols, prefix_end) {
+        prefix_end = marker_end;
+    }
+    if prefix_end == 0 || width <= 1 {
+        return Vec::new();
+    }
+
+    let maximum = usize::from(width.saturating_sub(1));
+    let mut used = 0;
+    let mut prefix = Vec::new();
+    for symbol in &symbols[..prefix_end] {
+        let symbol_width = symbol.width();
+        if used + symbol_width > maximum {
+            break;
+        }
+        used += symbol_width;
+        prefix.push(StyledSymbol {
+            symbol: if symbol.is_whitespace() {
+                symbol.symbol.clone()
+            } else {
+                " ".repeat(symbol_width)
+            },
+            style: symbol.style,
+        });
+    }
+    prefix
+}
+
+fn markdown_marker_end(symbols: &[StyledSymbol], start: usize) -> Option<usize> {
+    let symbol = |index: usize| symbols.get(index).map(|symbol| symbol.symbol.as_str());
+    if matches!(symbol(start), Some("•" | "│"))
+        && symbols
+            .get(start + 1)
+            .is_some_and(StyledSymbol::is_whitespace)
+    {
+        return Some(start + 2);
+    }
+    if symbol(start) == Some("[")
+        && matches!(symbol(start + 1), Some(" " | "x" | "X"))
+        && symbol(start + 2) == Some("]")
+        && symbols
+            .get(start + 3)
+            .is_some_and(StyledSymbol::is_whitespace)
+    {
+        return Some(start + 4);
+    }
+
+    let digits_end = symbols[start..]
+        .iter()
+        .take_while(|symbol| {
+            symbol.symbol.len() == 1
+                && symbol
+                    .symbol
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_digit())
+        })
+        .count()
+        + start;
+    (digits_end > start
+        && symbol(digits_end) == Some(".")
+        && symbols
+            .get(digits_end + 1)
+            .is_some_and(StyledSymbol::is_whitespace))
+    .then_some(digits_end + 2)
+}
+
+fn symbols_to_line(
+    symbols: Vec<StyledSymbol>,
+    style: Style,
+    alignment: Option<ratatui::layout::Alignment>,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for symbol in symbols {
+        if let Some(span) = spans.last_mut()
+            && span.style == symbol.style
+        {
+            span.content.to_mut().push_str(&symbol.symbol);
+        } else {
+            spans.push(Span::styled(symbol.symbol, symbol.style));
+        }
+    }
+    Line {
+        style,
+        alignment,
+        spans,
+    }
+}
+
+/// Ratatui's word-wrapper with one deliberate extension: once the first row
+/// fills, every later row starts with `prefix`. Keeping the wrapper here makes
+/// cached row counts, viewport slicing, and the final rendered rows agree.
+fn wrap_with_continuation_indent(
+    line: Line<'static>,
+    width: u16,
+    prefix: &[StyledSymbol],
+) -> Vec<Line<'static>> {
+    let Line {
+        style,
+        alignment,
+        spans: _,
+    } = &line;
+    let (style, alignment) = (*style, *alignment);
+    let symbols = styled_symbols(&line);
+    let prefix_width = prefix.iter().map(StyledSymbol::width).sum::<usize>();
+    let maximum = usize::from(width);
+    let mut wrapped = Vec::new();
+    let mut pending_line = Vec::new();
+    let mut pending_word = Vec::new();
+    let mut pending_whitespace = VecDeque::new();
+    let mut line_width = 0usize;
+    let mut word_width = 0usize;
+    let mut whitespace_width = 0usize;
+    let mut non_whitespace_previous = false;
+
+    for symbol in symbols {
+        let is_whitespace = symbol.is_whitespace();
+        let symbol_width = symbol.width();
+        if symbol_width > maximum {
+            continue;
+        }
+
+        let word_found = non_whitespace_previous && is_whitespace;
+        let current_prefix_symbols = if wrapped.is_empty() { 0 } else { prefix.len() };
+        let untrimmed_overflow = pending_line.len() == current_prefix_symbols
+            && word_width + whitespace_width + line_width + symbol_width > maximum;
+        if word_found || untrimmed_overflow {
+            pending_line.extend(pending_whitespace.drain(..));
+            line_width += whitespace_width;
+            pending_line.append(&mut pending_word);
+            line_width += word_width;
+            whitespace_width = 0;
+            word_width = 0;
+        }
+
+        let line_full = line_width >= maximum;
+        let pending_word_overflow =
+            symbol_width > 0 && line_width + whitespace_width + word_width >= maximum;
+        if line_full || pending_word_overflow {
+            let mut remaining_width = maximum.saturating_sub(line_width);
+            wrapped.push(symbols_to_line(
+                std::mem::take(&mut pending_line),
+                style,
+                alignment,
+            ));
+            pending_line.extend(prefix.iter().cloned());
+            line_width = prefix_width;
+
+            while let Some(whitespace) = pending_whitespace.front() {
+                let whitespace_symbol_width = whitespace.width();
+                if whitespace_symbol_width > remaining_width {
+                    break;
+                }
+                whitespace_width -= whitespace_symbol_width;
+                remaining_width -= whitespace_symbol_width;
+                pending_whitespace.pop_front();
+            }
+            if is_whitespace && pending_whitespace.is_empty() {
+                continue;
+            }
+        }
+
+        if is_whitespace {
+            whitespace_width += symbol_width;
+            pending_whitespace.push_back(symbol);
+        } else {
+            word_width += symbol_width;
+            pending_word.push(symbol);
+        }
+        non_whitespace_previous = !is_whitespace;
+    }
+
+    if pending_line.is_empty() && pending_word.is_empty() && !pending_whitespace.is_empty() {
+        wrapped.push(Line {
+            style,
+            alignment,
+            spans: Vec::new(),
+        });
+    }
+    pending_line.extend(pending_whitespace);
+    pending_line.append(&mut pending_word);
+    if !pending_line.is_empty() && (wrapped.is_empty() || pending_line.len() != prefix.len()) {
+        wrapped.push(symbols_to_line(pending_line, style, alignment));
+    }
+    if wrapped.is_empty() {
+        wrapped.push(Line {
+            style,
+            alignment,
+            spans: Vec::new(),
+        });
+    }
+    wrapped
+}
+
+/// Lays out a projected source line. Lines with a continuation indent become
+/// physical cached rows, because Ratatui's final generic wrapper cannot express
+/// hanging indents. Zero-indent lines keep the bounded source-line path.
+fn layout_line(line: Line<'static>, width: u16, output: &mut Vec<(Line<'static>, usize)>) {
+    let rows = wrapped_line_count(&line, width);
+    if rows <= 1 {
+        output.push((line, rows));
+        return;
+    }
+    let symbols = styled_symbols(&line);
+    let prefix = continuation_prefix(&symbols, width);
+    if prefix.is_empty() {
+        split_oversized_line(line, width, output);
+        return;
+    }
+    output.extend(
+        wrap_with_continuation_indent(line, width, &prefix)
+            .into_iter()
+            .map(|line| (line, 1)),
+    );
+}
+
+fn laid_out_line_count(line: &Line<'static>, width: u16) -> usize {
+    let rows = wrapped_line_count(line, width);
+    if rows <= 1 {
+        return rows;
+    }
+    let symbols = styled_symbols(line);
+    let prefix = continuation_prefix(&symbols, width);
+    if prefix.is_empty() {
+        rows
+    } else {
+        wrap_with_continuation_indent(line.clone(), width, &prefix).len()
+    }
+}
+
 /// Splits `line` into pieces each wrapping to at most
 /// [`MAX_TRANSCRIPT_SOURCE_LINE_ROWS`] rows, pushing every piece with its
 /// measured row count so layout does not have to measure again.
@@ -3251,8 +3521,8 @@ mod tests {
     use super::{
         CappedStream, FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, TranscriptCache,
         TranscriptDisclosure, TranscriptFolds, TranscriptGroups, TranscriptTurnFolds,
-        TranscriptView, UnitKey, UnitStart, render_activity, render_message, split_oversized_line,
-        wrapped_line_count,
+        TranscriptView, UnitKey, UnitStart, layout_line, render_activity, render_message,
+        split_oversized_line, wrapped_line_count,
     };
 
     fn rendered_text(line: &Line<'static>) -> String {
@@ -3314,6 +3584,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn hanging_indent_does_not_add_prefix_only_rows_to_a_long_word() {
+        let mut laid_out = Vec::new();
+        layout_line(
+            Line::from(format!("      line 4 {}", "x".repeat(200))),
+            56,
+            &mut laid_out,
+        );
+
+        assert_eq!(
+            laid_out.len(),
+            5,
+            "the first row has 56 columns and continuations have 50"
+        );
+        assert!(laid_out.iter().all(|(line, rows)| {
+            *rows == 1 && line.width() <= 56 && !rendered_text(line).trim().is_empty()
+        }));
     }
 
     #[test]

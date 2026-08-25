@@ -29,6 +29,7 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "=0.2.0"
+unicode-segmentation = "1.13.3"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 jsonc-parser = { version = "0.33.1", features = ["cst", "serde"] }
 github-copilot-sdk = { version = "1.0.12-preview.0", default-features = false }
