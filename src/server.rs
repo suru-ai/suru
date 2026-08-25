@@ -1446,16 +1446,43 @@ fn write_descriptor(path: &Path, descriptor: &RuntimeDescriptor) -> Result<()> {
         .as_file()
         .sync_all()
         .context("flush runtime descriptor")?;
-    let published = temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .context("publish runtime descriptor atomically")?;
+    let published = persist_descriptor(temporary, path)?;
     protect_current_user_file(path)?;
     published
         .sync_all()
         .context("flush published runtime descriptor")?;
     sync_runtime_directory(runtime_dir)?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn persist_descriptor(temporary: tempfile::NamedTempFile, path: &Path) -> Result<File> {
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .context("publish runtime descriptor atomically")
+}
+
+#[cfg(windows)]
+fn persist_descriptor(temporary: tempfile::NamedTempFile, path: &Path) -> Result<File> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, SetFileAttributesW};
+
+    let temporary_path = temporary.path();
+    let temporary_path_utf16 = temporary_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // NamedTempFile marks the file temporary; a persistent descriptor must be flushed normally.
+    // SAFETY: temporary_path_utf16 is NUL-terminated and remains alive for the call.
+    if unsafe { SetFileAttributesW(temporary_path_utf16.as_ptr(), FILE_ATTRIBUTE_NORMAL) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("finalize temporary runtime descriptor");
+    }
+    fs::rename(temporary_path, path).context("publish runtime descriptor atomically")?;
+    Ok(temporary.into_file())
 }
 
 #[cfg(unix)]

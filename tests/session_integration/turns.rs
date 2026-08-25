@@ -203,7 +203,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
     let start = timeout(Duration::from_secs(1), provider.next_start())
         .await
         .expect("Provider startup begins asynchronously");
-    assert_eq!(start.workspace(), workspace.path());
+    assert_eq!(start.workspace(), created.session.workspace.path);
     let identity = AgentIdentity {
         agent: AgentId::new("codex"),
         selection: AgentSelection {
