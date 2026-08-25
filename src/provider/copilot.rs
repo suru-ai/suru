@@ -28,6 +28,7 @@ mod event_drain;
 mod projection;
 mod runtime;
 mod session;
+mod skills;
 mod tools;
 mod transport;
 

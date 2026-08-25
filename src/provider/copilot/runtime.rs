@@ -3,7 +3,7 @@
 use std::ffi::{OsStr, OsString};
 
 use serde_json::Value;
-use tokio::time::Duration;
+use tokio::{sync::watch, time::Duration};
 
 use super::{
     COPILOT_HARNESS_NAME, COPILOT_PROVIDER_ID, COPILOT_SERVER_ARGS, REASONING_EFFORT_OPTION_ID,
@@ -11,12 +11,13 @@ use super::{
     copilot_error_context,
     errand::run_copilot_errand,
     session::{INTERRUPT_REQUEST_TIMEOUT, start_copilot_session},
+    skills::CopilotSkills,
     transport::CopilotConnector,
 };
 use crate::{
     protocol::{
         AgentSelection, ModelDescriptor, ModelId, ModelOptionChoiceId, ModelOptionId,
-        ModelOptionSelection, ModelOptionValue, ProviderId,
+        ModelOptionSelection, ModelOptionValue, ProviderId, ProviderUnavailability, SkillCatalog,
     },
     provider::{
         ProviderErrand, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
@@ -43,6 +44,7 @@ const ERRAND_REASONING_EFFORT: &str = "none";
 /// process, launched on the first demand and relaunched fresh after a crash.
 pub struct CopilotRuntime {
     harness: SharedHarness<CopilotConnector>,
+    skills: CopilotSkills,
     interrupt_request_timeout: Duration,
 }
 
@@ -56,6 +58,7 @@ impl CopilotRuntime {
         };
         Self {
             harness: SharedHarness::new(spec, CopilotConnector::new()),
+            skills: CopilotSkills::default(),
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
         }
     }
@@ -107,6 +110,27 @@ impl ProviderRuntime for CopilotRuntime {
         })
     }
 
+    fn skill_catalog(&self, workspace: &std::path::Path) -> ProviderFuture<'_, SkillCatalog> {
+        let workspace = workspace.to_owned();
+        Box::pin(async move {
+            let handle = match self.harness.demand().await {
+                Ok(handle) => handle,
+                Err(error)
+                    if error.unavailability()
+                        == Some(ProviderUnavailability::IncompatibleVersion) =>
+                {
+                    return Ok(CopilotSkills::incompatible_catalog(&workspace));
+                }
+                Err(error) => return Err(error),
+            };
+            self.skills.discover(&handle, &workspace).await
+        })
+    }
+
+    fn subscribe_skill_catalog_invalidations(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.skills.subscribe_invalidations())
+    }
+
     fn start_session(
         &self,
         request: ProviderSessionRequest,
@@ -115,7 +139,13 @@ impl ProviderRuntime for CopilotRuntime {
             // Launches the shared process if this is the first demand, or the first since a crash,
             // which is how the Prompt after a harness crash recovers without a restart.
             let handle = self.harness.demand().await?;
-            start_copilot_session(handle, request, self.interrupt_request_timeout).await
+            start_copilot_session(
+                handle,
+                request,
+                self.skills.clone(),
+                self.interrupt_request_timeout,
+            )
+            .await
         })
     }
 

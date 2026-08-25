@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 
 use super::{
     COPILOT_FAILURE_FALLBACK, copilot_error, event_drain::EventDrainCheckpoint,
-    tools::command_text, transport::CopilotConnection,
+    skills::CopilotSkills, tools::command_text, transport::CopilotConnection,
 };
 use crate::provider::{
     ProviderActivityId, ProviderCommandStatus, ProviderError, ProviderEvent, ProviderEventStream,
@@ -133,6 +133,7 @@ pub(super) fn provider_events(
     harness: Arc<SharedHarnessHandle<CopilotConnection>>,
     drain: EventDrainCheckpoint,
     correlation: Arc<StdMutex<CopilotCorrelation>>,
+    skills: CopilotSkills,
 ) -> ProviderEventStream {
     // The SDK drops the oldest events on a subscriber that falls behind, and a dropped delta is
     // Transcript content Suru cannot get back, so the timeline is drained as fast as it arrives
@@ -149,6 +150,7 @@ pub(super) fn provider_events(
             harness,
             drain,
             correlation,
+            skills,
             pending: VecDeque::new(),
             ended: false,
         },
@@ -189,6 +191,7 @@ struct CopilotEvents {
     harness: Arc<SharedHarnessHandle<CopilotConnection>>,
     drain: EventDrainCheckpoint,
     correlation: Arc<StdMutex<CopilotCorrelation>>,
+    skills: CopilotSkills,
     pending: VecDeque<Result<ProviderEvent, ProviderError>>,
     ended: bool,
 }
@@ -239,6 +242,12 @@ async fn next_provider_event(
 }
 
 fn queue_projected(events: &mut CopilotEvents, event: SessionEvent) {
+    if matches!(
+        event.parsed_type(),
+        SessionEventType::CommandsChanged | SessionEventType::SessionSkillsLoaded
+    ) {
+        events.skills.native_catalog_changed();
+    }
     let projected = {
         let mut correlation = events
             .correlation

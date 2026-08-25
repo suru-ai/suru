@@ -16,6 +16,7 @@
 
 use std::{
     future::Future,
+    path::PathBuf,
     sync::{Arc, Mutex as StdMutex},
 };
 
@@ -33,6 +34,7 @@ use super::{
     catalog::{model_descriptors, tier_id},
     copilot_error, copilot_error_context,
     projection::{CopilotCorrelation, provider_events},
+    skills::CopilotSkills,
     transport::CopilotConnection,
 };
 use crate::{
@@ -74,9 +76,11 @@ const RESUME_CONTEXT: &str = "Copilot Session resume failed";
 pub(super) async fn start_copilot_session(
     handle: SharedHarnessHandle<CopilotConnection>,
     request: ProviderSessionRequest,
+    skills: CopilotSkills,
     interrupt_request_timeout: Duration,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let handle = Arc::new(handle);
+    let workspace = request.workspace.clone();
     let (context, copilot_session_id, native) = match known_session_id(request.resume_state)? {
         // A restored Suru Session keeps the identifier its Copilot Session was created under,
         // because that is what Copilot filed the work under. A resume that fails is not an
@@ -88,6 +92,8 @@ pub(super) async fn start_copilot_session(
                 .with_client_name(COPILOT_CLIENT_NAME)
                 .with_working_directory(request.workspace)
                 .with_streaming(true)
+                .with_enable_config_discovery(true)
+                .with_enable_skills(true)
                 .approve_all_permissions();
             let native = until_crash(
                 &handle,
@@ -106,6 +112,8 @@ pub(super) async fn start_copilot_session(
                 .with_client_name(COPILOT_CLIENT_NAME)
                 .with_working_directory(request.workspace)
                 .with_streaming(true)
+                .with_enable_config_discovery(true)
+                .with_enable_skills(true)
                 .approve_all_permissions();
             let native = until_crash(
                 &handle,
@@ -139,12 +147,15 @@ pub(super) async fn start_copilot_session(
         handle.clone(),
         event_drain,
         correlation.clone(),
+        skills.clone(),
     );
     let session = Arc::new(CopilotSession {
         native,
         handle,
         correlation,
         selection: StdMutex::new(in_force),
+        skills,
+        workspace,
         interrupt_request_timeout,
     });
     Ok(ProviderSessionConnection::new(
@@ -269,6 +280,8 @@ struct CopilotSession {
     /// The Agent Selection in force on the Copilot Session — nothing until the CLI has resolved a
     /// Model — which the next Turn switches away from when it was selected under a different one.
     selection: StdMutex<Option<AgentSelection>>,
+    skills: CopilotSkills,
+    workspace: PathBuf,
     /// How long an interrupt waits for Copilot to acknowledge it before giving up.
     interrupt_request_timeout: Duration,
 }
@@ -364,17 +377,26 @@ pub(super) fn lower_selection_options(
 impl ProviderSession for CopilotSession {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
-            input.prompt.reject_unlowered_skill_invocations("Copilot")?;
             self.correlation
                 .lock()
                 .expect("Copilot correlation lock is not poisoned")
                 .begin_turn()?;
             let started = async {
                 self.apply_selection(&input.selection).await?;
+                let prompt = self
+                    .skills
+                    .expand(
+                        &self.handle,
+                        &self.workspace,
+                        &self.native,
+                        crate::protocol::SkillPromptDelivery::Initial,
+                        input.prompt,
+                    )
+                    .await?;
                 until_crash(
                     &self.handle,
                     "Copilot Turn startup failed",
-                    self.native.send(input.prompt.text.as_str()),
+                    self.native.send(prompt.as_str()),
                 )
                 .await
                 .map(|_message_id| ())
@@ -392,8 +414,17 @@ impl ProviderSession for CopilotSession {
 
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
-            input.prompt.reject_unlowered_skill_invocations("Copilot")?;
             self.require_running_turn("steer")?;
+            let prompt = self
+                .skills
+                .expand(
+                    &self.handle,
+                    &self.workspace,
+                    &self.native,
+                    crate::protocol::SkillPromptDelivery::Steer,
+                    input.prompt,
+                )
+                .await?;
             // Immediate delivery injects the Prompt into the loop already running, where Copilot's
             // default would hold it back and run it as a Turn of its own once this one stopped.
             //
@@ -406,9 +437,8 @@ impl ProviderSession for CopilotSession {
             until_crash(
                 &self.handle,
                 "Copilot Turn steering failed",
-                self.native.send(
-                    MessageOptions::new(input.prompt.text).with_mode(DeliveryMode::Immediate),
-                ),
+                self.native
+                    .send(MessageOptions::new(prompt).with_mode(DeliveryMode::Immediate)),
             )
             .await
             .map(|_message_id| ())
