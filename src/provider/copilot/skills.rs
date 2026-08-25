@@ -313,7 +313,9 @@ impl CopilotSkills {
             )
             .await?;
             return match result {
-                SlashCommandInvocationResult::AgentPrompt(expanded) => Ok(expanded.prompt),
+                SlashCommandInvocationResult::AgentPrompt(expanded) => {
+                    Ok(prevent_redundant_skill_invocation(expanded.prompt))
+                }
                 _ => Err(copilot_error(
                     "Copilot Skill Invocation did not return an agent Prompt",
                 )),
@@ -358,6 +360,45 @@ impl CopilotSkills {
         }
         Ok(native.command_name)
     }
+}
+
+/// Rewords Copilot's explicit-Skill preamble so the model follows the Skill content already
+/// embedded below it instead of trying to load the same Skill again through the model-facing
+/// `skill` Tool. That second route deliberately excludes Skills marked `disable-model-invocation`,
+/// making an otherwise successful user invocation look like it failed.
+///
+/// The native command response is an experimental surface, so an unfamiliar shape passes through
+/// untouched rather than risking damage to a future expansion format.
+fn prevent_redundant_skill_invocation(expanded: String) -> String {
+    const PREFIX: &str = "The user explicitly invoked the \"";
+    const SUFFIX: &str = "\" skill. Follow its instructions now.";
+    const REPLACEMENT: &str = "The following skill has already been loaded. Follow its supplied instructions directly; do not invoke the `skill` tool again.";
+
+    let separator = if expanded.contains("\r\n\r\n") {
+        "\r\n\r\n"
+    } else {
+        "\n\n"
+    };
+    let Some(paragraph_end) = expanded.find(separator) else {
+        return expanded;
+    };
+    let introduction = &expanded[..paragraph_end];
+    let context = &expanded[paragraph_end + separator.len()..];
+    let Some(skill_name) = introduction
+        .strip_prefix(PREFIX)
+        .and_then(|introduction| introduction.strip_suffix(SUFFIX))
+    else {
+        return expanded;
+    };
+    if !skill_name.starts_with('/')
+        || skill_name.len() == 1
+        || skill_name.chars().any(char::is_whitespace)
+        || !context.starts_with("<skill-context")
+    {
+        return expanded;
+    }
+
+    format!("{REPLACEMENT}{separator}{context}")
 }
 
 fn safe_scope(source: SkillSource) -> &'static str {
@@ -552,6 +593,44 @@ mod tests {
                 .expect("Copilot Skill store lock is not poisoned")
                 .workspaces
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn explicit_skill_expansion_tells_the_model_not_to_reload_the_skill() {
+        let context = concat!(
+            "<skill-context name=\"ask-matt\">\n",
+            "# Ask Matt\n\n",
+            "Use the right flow.\n",
+            "</skill-context>",
+        );
+        for separator in ["\n\n", "\r\n\r\n"] {
+            let expanded = format!(
+                "The user explicitly invoked the \"/ask-matt\" skill. Follow its instructions now.{separator}{context}"
+            );
+
+            assert_eq!(
+                prevent_redundant_skill_invocation(expanded),
+                format!(
+                    "The following skill has already been loaded. Follow its supplied instructions directly; do not invoke the `skill` tool again.{separator}{context}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn unfamiliar_skill_expansion_is_not_rewritten() {
+        let expanded = concat!(
+            "Follow the selected skill.\n\n",
+            "<skill-context name=\"review\">\n",
+            "Review carefully.\n",
+            "</skill-context>",
+        )
+        .to_owned();
+
+        assert_eq!(
+            prevent_redundant_skill_invocation(expanded.clone()),
+            expanded
         );
     }
 }
