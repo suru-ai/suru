@@ -4,6 +4,7 @@
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
+use ratatui::layout::Position;
 
 use super::{
     commands::{
@@ -21,7 +22,7 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
             // just made rather than trailing a drag that ends elsewhere.
             MouseEventKind::Down(MouseButton::Left) => {
                 Some(CommandId::ToggleTranscriptDisclosureAt {
-                    screen_row: mouse.row,
+                    position: Position::new(mouse.column, mouse.row),
                 })
             }
             _ => None,

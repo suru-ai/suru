@@ -627,7 +627,11 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
     let user_accent_column = text_position(&completed, "Explain the stream")
         .0
         .saturating_sub(2);
-    let user_block_right_edge = completed.area.width.saturating_sub(3);
+    let normally_padded_width = completed.area.width.saturating_sub(4);
+    let session_content_width = normally_padded_width.min(80);
+    let user_block_right_edge = 2_u16
+        .saturating_add(normally_padded_width.saturating_sub(session_content_width) / 2)
+        .saturating_add(session_content_width.saturating_sub(1));
     assert!(user_row < error_row && error_row < status_row && status_row < agent_row);
     assert_eq!(
         code_after_blank_row,

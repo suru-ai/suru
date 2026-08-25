@@ -9,8 +9,8 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
         AgentSelection, FoldPosture, ModelId, ProviderId, ReasoningSummaryDetail,
-        ReasoningVisibility, SettingMutation, SettingsDiagnosticSeverity, SettingsSnapshot,
-        TitleErrand,
+        ReasoningVisibility, SessionContentWidth, SettingMutation, SettingsDiagnosticSeverity,
+        SettingsSnapshot, TitleErrand,
     },
     server::{self, ServerConfig},
 };
@@ -131,6 +131,150 @@ async fn showing_reasoning_pins_from_a_document_and_resets_to_the_hidden_default
 
     drop(client);
     server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn fill_session_content_width_loads_from_a_config_document() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{ "session": { "contentWidth": "fill" } }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-content-fill")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let snapshot = attach(state_dir.path(), "settings-content-fill").await.1;
+    assert_eq!(
+        snapshot.settings.session.content_width,
+        SessionContentWidth::Fill
+    );
+    assert_eq!(snapshot.pinned, ["session.contentWidth"]);
+    assert_eq!(snapshot.diagnostics, []);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn minimum_session_content_width_loads_from_a_config_document() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{ "session": { "contentWidth": 50 } }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-content-minimum")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let snapshot = attach(state_dir.path(), "settings-content-minimum").await.1;
+    assert_eq!(
+        snapshot.settings.session.content_width,
+        SessionContentWidth::Maximum(50)
+    );
+    assert_eq!(snapshot.pinned, ["session.contentWidth"]);
+    assert_eq!(snapshot.diagnostics, []);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn session_content_width_has_no_product_level_maximum() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{ "session": { "contentWidth": 1000000 } }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-content-unbounded")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let snapshot = attach(state_dir.path(), "settings-content-unbounded")
+        .await
+        .1;
+    assert_eq!(
+        snapshot.settings.session.content_width,
+        SessionContentWidth::Maximum(1_000_000)
+    );
+    assert_eq!(snapshot.pinned, ["session.contentWidth"]);
+    assert_eq!(snapshot.diagnostics, []);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn invalid_session_content_width_pins_are_ignored_individually_with_diagnostics() {
+    for (case, invalid) in [
+        ("fraction", "49.5"),
+        ("boolean", "true"),
+        ("word", r#""wide""#),
+        ("below-minimum", "49"),
+    ] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let config_dir = tempfile::tempdir().expect("create isolated config directory");
+        std::fs::write(
+            config_dir.path().join("suru.jsonc"),
+            format!(
+                r#"{{
+                    "session": {{ "contentWidth": {invalid} }},
+                    "transcript": {{ "reasoningVisibility": "shown" }}
+                }}"#
+            ),
+        )
+        .expect("write Config Document");
+        let channel = format!("settings-content-invalid-{case}");
+        let server = server::spawn(
+            ServerConfig::new(state_dir.path(), &channel)
+                .expect("configure server")
+                .with_config_dir(config_dir.path()),
+        )
+        .await
+        .expect("spawn server");
+
+        let snapshot = attach(state_dir.path(), &channel).await.1;
+        assert_eq!(
+            snapshot.settings.session.content_width,
+            SessionContentWidth::Maximum(80),
+            "{case} keeps the built-in fallback"
+        );
+        assert_eq!(
+            snapshot.settings.transcript.reasoning_visibility,
+            ReasoningVisibility::Shown,
+            "{case} ignores only the invalid pin"
+        );
+        assert_eq!(snapshot.pinned, ["transcript.reasoningVisibility"]);
+        let [diagnostic] = snapshot.diagnostics.as_slice() else {
+            panic!(
+                "{case} should produce one diagnostic: {:?}",
+                snapshot.diagnostics
+            );
+        };
+        assert_eq!(diagnostic.severity, SettingsDiagnosticSeverity::Warning);
+        assert_eq!(diagnostic.key.as_deref(), Some("session.contentWidth"));
+        assert_eq!(
+            diagnostic.message,
+            "ignored because its value is not one of \"fill\" or an integer of at least 50"
+        );
+
+        server.shutdown().await.expect("shut down server");
+    }
 }
 
 #[tokio::test]
@@ -313,6 +457,11 @@ async fn without_a_config_root_every_setting_is_its_built_in_default() {
         snapshot.settings.provider.codex.reasoning_summary,
         ReasoningSummaryDetail::Auto
     );
+    assert_eq!(
+        snapshot.settings.session.content_width,
+        SessionContentWidth::Maximum(80),
+        "the Session Content Column defaults to an 80-column maximum"
+    );
     assert_eq!(snapshot.pinned, [] as [String; 0]);
     assert_eq!(snapshot.diagnostics, []);
 
@@ -360,8 +509,96 @@ async fn a_flat_dotted_spelling_is_not_a_second_way_to_pin() {
 /// of it alone except the value they target.
 const HAND_WRITTEN: &str = "{\n\t// Codex should say as much about its thinking as it likes.\n\t\"provider\": {\n\t\t\"codex\": { \"reasoningSummary\":    \"detailed\" }\n\t},\n\n\t// I read my Sessions folded.\n\t\"transcript\": { \"defaultFoldPosture\": \"folded\" },\n}\n";
 
+const CONTENT_WIDTH_DOCUMENT: &str = concat!(
+    "{\n",
+    "\t// Keep this hand-written configuration exactly as authored.\n",
+    "\t\"transcript\": { \"reasoningVisibility\": \"shown\" },\n",
+    "\t\"session\": { \"contentWidth\": \"fill\" },\n",
+    "}\n",
+);
+
 fn config_document(config_dir: &Path) -> String {
     std::fs::read_to_string(config_dir.join("suru.jsonc")).expect("read the Config Document")
+}
+
+#[tokio::test]
+async fn session_content_width_mutations_preserve_bytes_broadcast_and_reset() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(config_dir.path().join("suru.jsonc"), CONTENT_WIDTH_DOCUMENT)
+        .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-content-mutation")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    let (mut editor, opening) = attach(state_dir.path(), "settings-content-mutation").await;
+    let (mut onlooker, _) = attach(state_dir.path(), "settings-content-mutation").await;
+    assert_eq!(
+        opening.settings.session.content_width,
+        SessionContentWidth::Fill
+    );
+
+    let maximum = editor
+        .mutate_setting(SettingMutation::SessionContentWidth {
+            value: Some(SessionContentWidth::Maximum(80)),
+        })
+        .await
+        .expect("pin the built-in maximum explicitly");
+    assert_eq!(
+        maximum.settings.session.content_width,
+        SessionContentWidth::Maximum(80)
+    );
+    assert_eq!(
+        maximum.pinned,
+        ["session.contentWidth", "transcript.reasoningVisibility"]
+    );
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, maximum);
+    }
+    assert_eq!(
+        config_document(config_dir.path()),
+        CONTENT_WIDTH_DOCUMENT.replace("\"fill\"", "80"),
+        "the typed maximum changes only its target bytes"
+    );
+
+    let fill = editor
+        .mutate_setting(SettingMutation::SessionContentWidth {
+            value: Some(SessionContentWidth::Fill),
+        })
+        .await
+        .expect("pin fill through a typed mutation");
+    assert_eq!(
+        fill.settings.session.content_width,
+        SessionContentWidth::Fill
+    );
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, fill);
+    }
+
+    let reset = editor
+        .mutate_setting(SettingMutation::SessionContentWidth { value: None })
+        .await
+        .expect("reset the Setting");
+    assert_eq!(
+        reset.settings.session.content_width,
+        SessionContentWidth::Maximum(80)
+    );
+    assert_eq!(reset.pinned, ["transcript.reasoningVisibility"]);
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, reset);
+    }
+    assert!(
+        config_document(config_dir.path())
+            .contains("\t\"transcript\": { \"reasoningVisibility\": \"shown\" },"),
+        "reset leaves the unrelated hand-written Setting bytes alone"
+    );
+
+    drop(editor);
+    drop(onlooker);
+    server.shutdown().await.expect("shut down server");
 }
 
 #[tokio::test]

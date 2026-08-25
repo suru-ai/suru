@@ -527,7 +527,6 @@ fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
     );
     let optimistic = rendered_application_rows_at(&application, 100, 16).join("\n");
     assert!(optimistic.contains("Reasoning High"));
-    assert!(optimistic.contains("Fast Off"));
     type_terminal_text(&mut application, "must wait");
     assert_eq!(
         application

@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use crate::protocol::{
     AgentSelection, EffectiveSettings, FoldPosture, ProviderId, ReasoningSummaryDetail,
-    ReasoningVisibility, SettingMutation, SettingScope, SettingsDiagnostic,
+    ReasoningVisibility, SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
     SettingsDiagnosticSeverity, SettingsSnapshot, TitleErrand,
 };
 
@@ -44,6 +44,7 @@ pub const FALLBACK_CONFIG_FILE: &str = "suru.json";
 // mutations that edit it can never drift apart.
 const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
 const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
+const SESSION_CONTENT_WIDTH: &str = "session.contentWidth";
 // Keyed per purpose rather than Errand-wide, so a compaction Errand arriving
 // later gets its own key and turning Titles off can never silently disable
 // work that has nothing to do with them.
@@ -280,6 +281,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::TranscriptReasoningVisibility { value } => {
             *value == Some(settings.transcript.reasoning_visibility)
         }
+        SettingMutation::SessionContentWidth { value } => {
+            *value == Some(settings.session.content_width)
+        }
         SettingMutation::SessionTitleErrand { value } => {
             value.as_ref() == Some(&settings.session.title.errand)
         }
@@ -355,6 +359,35 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |visibility| {
                 settings.transcript.reasoning_visibility = visibility;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: SESSION_CONTENT_WIDTH,
+        label: "Session content width",
+        description: "Whether the Session Content Column fills the terminal or has a maximum",
+        group: SettingGroup::General,
+        scope: SettingScope::Client,
+        values: SettingValues::Open {
+            named: &[SettingChoice {
+                value: "fill",
+                pin: SettingMutation::SessionContentWidth {
+                    value: Some(SessionContentWidth::Fill),
+                },
+            }],
+            accepts: "an integer of at least 50",
+            spell: |settings| match settings.session.content_width {
+                SessionContentWidth::Fill => "fill".to_owned(),
+                SessionContentWidth::Maximum(maximum) => {
+                    format!("max {maximum} columns")
+                }
+            },
+            chosen_at: None,
+        },
+        reset: SettingMutation::SessionContentWidth { value: None },
+        apply: |settings, value| {
+            apply_value(value, |content_width| {
+                settings.session.content_width = content_width;
             })
         },
     },
@@ -683,6 +716,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::TranscriptReasoningVisibility { value } => {
             (TRANSCRIPT_REASONING_VISIBILITY, pinned(value))
         }
+        SettingMutation::SessionContentWidth { value } => (SESSION_CONTENT_WIDTH, pinned(value)),
         SettingMutation::SessionTitleErrand { value } => (SESSION_TITLE_ERRAND, pinned(value)),
         SettingMutation::ProviderCodexEnabled { value } => (PROVIDER_CODEX_ENABLED, pinned(value)),
         SettingMutation::ProviderCodexReasoningSummary { value } => {
@@ -1193,6 +1227,7 @@ mod tests {
             vec![
                 "one of \"folded\" or \"expanded\"".to_owned(),
                 "one of \"hidden\" or \"shown\"".to_owned(),
+                "one of \"fill\" or an integer of at least 50".to_owned(),
                 // A Setting the schema can only partly enumerate names what it
                 // can and describes the rest, in the same breath.
                 "one of \"session\", \"off\", or an Agent Selection".to_owned(),

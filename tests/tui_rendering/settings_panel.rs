@@ -23,8 +23,8 @@ use suru::{
         ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId,
         ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
-        ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionId,
-        SessionSettings, SettingMutation, SettingsSnapshot, TitleErrand, TitleSettings,
+        ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
+        SessionId, SessionSettings, SettingMutation, SettingsSnapshot, TitleErrand, TitleSettings,
         TranscriptSettings,
     },
     tui::{
@@ -86,6 +86,16 @@ fn without_codex() -> EffectiveSettings {
                 ..CodexSettings::default()
             },
             ..ProviderSettings::default()
+        },
+        ..EffectiveSettings::default()
+    }
+}
+
+fn with_content_width(content_width: SessionContentWidth) -> EffectiveSettings {
+    EffectiveSettings {
+        session: SessionSettings {
+            content_width,
+            ..SessionSettings::default()
         },
         ..EffectiveSettings::default()
     }
@@ -1343,6 +1353,41 @@ fn choosing_a_value_pins_it_and_the_row_follows_the_refreshed_snapshot() {
     );
 }
 
+#[test]
+fn session_content_width_row_spells_maxima_and_space_selects_fill() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "session.contentWidth");
+
+    assert!(
+        row(&application, "Session content width").contains("max 80 columns [default]"),
+        "the built-in maximum is visible as a default"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::SessionContentWidth {
+            value: Some(SessionContentWidth::Fill),
+        }),
+        "Space selects the Setting's named fill choice"
+    );
+
+    deliver_snapshot(
+        &mut application,
+        with_content_width(SessionContentWidth::Maximum(132)),
+        &["session.contentWidth"],
+    );
+    assert!(
+        row(&application, "Session content width").contains("max 132 columns [pinned]"),
+        "an arbitrary maximum is spelled distinctly from its provenance"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
+        ApplicationTransition::MutateSetting(SettingMutation::SessionContentWidth { value: None }),
+        "the existing reset action removes the width pin"
+    );
+}
+
 /// Space is the one change key, and it only ever steps forward: a Setting
 /// holding its last value wraps to the first rather than stopping.
 #[test]
@@ -1687,6 +1732,7 @@ fn deriving_titles_with(errand: TitleErrand) -> EffectiveSettings {
     EffectiveSettings {
         session: SessionSettings {
             title: TitleSettings { errand },
+            ..SessionSettings::default()
         },
         ..EffectiveSettings::default()
     }

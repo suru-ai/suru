@@ -15,8 +15,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     managed_client::SessionProjection,
     protocol::{
-        ModelAvailability, ModelDescriptor, ServerIdentity, SessionSnapshot, SessionStatus,
-        SessionTimestamp,
+        ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth, SessionSnapshot,
+        SessionStatus, SessionTimestamp,
     },
     theme::Theme,
 };
@@ -917,10 +917,7 @@ fn render_command_autocomplete(
     composer_area: Rect,
     theme: &Theme,
 ) {
-    let available_width = frame
-        .area()
-        .width
-        .saturating_sub(horizontal_padding(frame.area().width).saturating_mul(2));
+    let available_width = composer_area.width;
     let width = available_width.clamp(1, 72);
     let room_above = composer_area.y.saturating_sub(frame.area().y);
     let bordered = room_above >= 3;
@@ -931,10 +928,9 @@ fn render_command_autocomplete(
         row_count.min(room_above.max(1))
     };
     let row_capacity = height.saturating_sub(if bordered { 2 } else { 0 });
-    let x = frame
-        .area()
+    let x = composer_area
         .x
-        .saturating_add(frame.area().width.saturating_sub(width) / 2);
+        .saturating_add(composer_area.width.saturating_sub(width) / 2);
     let y = composer_area.y.saturating_sub(height).max(frame.area().y);
     let area = Rect::new(x, y, width, height);
     let content_width = width.saturating_sub(if bordered { 2 } else { 0 });
@@ -1103,21 +1099,28 @@ fn render_session(
         .as_ref()
         .expect("Session renderer requires a Session")
         .snapshot();
-    let detail = ResponsiveDetail::for_width(frame.area().width);
     let padding = horizontal_padding(frame.area().width);
+    let normally_padded = horizontally_inset(frame.area(), padding);
+    let content_column =
+        session_content_column(normally_padded, state.settings().session.content_width);
+    let content_width = content_column.width;
+    let content_detail = ResponsiveDetail::for_width(content_width);
+    let header_detail = ResponsiveDetail::for_width(normally_padded.width);
     let show_header = frame.area().height >= SESSION_HEADER_MINIMUM_HEIGHT;
     let session_id = snapshot.session.id;
     let key = ComposerKey::Session(session_id);
     let composer_text = state.composers.text(key);
     let composer_cursor = state.composers.cursor(key);
-    let content_width = frame.area().width.saturating_sub(padding.saturating_mul(2));
     let desired_composer_height = composer_block_height(
         frame.area().height,
         content_width,
         composer_text,
         composer_cursor,
     );
-    let composer_top = slots.session_composer_top(&SessionComposerTopSlotContext { session_id });
+    let composer_top = slots.session_composer_top(&SessionComposerTopSlotContext {
+        session_id,
+        width: content_width,
+    });
     let status = match snapshot.session.status {
         SessionStatus::Idle => "idle".to_owned(),
         SessionStatus::Active => {
@@ -1146,10 +1149,14 @@ fn render_session(
             ),
             theme.feedback.error,
         )
-    } else if snapshot.session.status == SessionStatus::Active && !detail.shows_secondary() {
+    } else if snapshot.session.status == SessionStatus::Active && !content_detail.shows_secondary()
+    {
         (String::new(), activity_style)
     } else {
-        (agent_selection_context(state, detail), activity_style)
+        (
+            agent_selection_context(state, content_detail),
+            activity_style,
+        )
     };
     let footer = slots.prompt_footer(
         &PromptFooterSlotContext {
@@ -1301,17 +1308,17 @@ fn render_session(
             state,
             snapshot,
             horizontally_inset(header_area, padding),
-            detail,
+            header_detail,
             theme,
         );
     }
 
-    let transcript_area = horizontally_inset(transcript_area, padding);
-    let pending_area = horizontally_inset(pending_area, padding);
-    let latest_area = horizontally_inset(latest_area, padding);
-    let composer_top_area = horizontally_inset(composer_top_area, padding);
-    let composer_area = horizontally_inset(composer_area, padding);
-    let footer_area = horizontally_inset(status_area, padding);
+    let transcript_area = in_column(transcript_area, content_column);
+    let pending_area = in_column(pending_area, content_column);
+    let latest_area = in_column(latest_area, content_column);
+    let composer_top_area = in_column(composer_top_area, content_column);
+    let composer_area = in_column(composer_area, content_column);
+    let footer_area = in_column(status_area, content_column);
     let mut window = transcript_view.window(scroll_position, usize::from(transcript_area.height));
     spinner::overlay_frame(
         &mut window.lines,
@@ -1334,6 +1341,8 @@ fn render_session(
         unit_starts: transcript_view.unit_starts().to_vec(),
         content_top: transcript_area.y.saturating_add(border_rows),
         content_rows: transcript_area.height.saturating_sub(border_rows),
+        content_left: transcript_area.x,
+        content_width: transcript_area.width,
     }));
     let transcript_widget = Paragraph::new(Text::from(window.lines)).wrap(Wrap { trim: false });
     let transcript_widget = if has_top_border {
@@ -1347,7 +1356,14 @@ fn render_session(
     };
     frame.render_widget(transcript_widget.scroll((local_scroll, 0)), transcript_area);
     if pending_height > 0 {
-        render_pending_prompts(frame, pending_area, state, &queued_prompts, detail, theme);
+        render_pending_prompts(
+            frame,
+            pending_area,
+            state,
+            &queued_prompts,
+            content_detail,
+            theme,
+        );
     }
     if away_from_bottom {
         frame.render_widget(
@@ -1366,7 +1382,7 @@ fn render_session(
         composer_text,
         composer_cursor,
         state.composer_border_style(theme),
-        detail,
+        content_detail,
         theme,
     );
     render_slot(frame, footer_area, footer, theme);
@@ -1702,6 +1718,25 @@ fn horizontally_inset(area: Rect, padding: u16) -> Rect {
     )
 }
 
+fn session_content_column(available: Rect, configured: SessionContentWidth) -> Rect {
+    let width = match configured {
+        SessionContentWidth::Fill => available.width,
+        SessionContentWidth::Maximum(maximum) => u64::from(available.width).min(maximum) as u16,
+    };
+    Rect::new(
+        available
+            .x
+            .saturating_add(available.width.saturating_sub(width) / 2),
+        available.y,
+        width,
+        available.height,
+    )
+}
+
+fn in_column(area: Rect, column: Rect) -> Rect {
+    Rect::new(column.x, area.y, column.width, area.height)
+}
+
 fn render_slot(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1834,9 +1869,10 @@ mod tests {
         state::{Application, ApplicationEvent},
     };
     use crate::{
-        managed_client::SessionEvent,
+        managed_client::{ManagedEvent, SessionEvent},
         protocol::{
-            ModelAvailability, Session, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
+            EffectiveSettings, ModelAvailability, Session, SessionContentWidth, SessionId,
+            SessionRevision, SessionSettings, SessionSnapshot, SessionStatus, SettingsSnapshot,
             Workspace,
         },
     };
@@ -2010,5 +2046,54 @@ mod tests {
             Color::LightMagenta
         );
         assert_ne!(text_cell(&buffer, "idle").fg, Color::LightMagenta);
+    }
+
+    #[test]
+    fn session_extension_contexts_receive_the_effective_column_width() {
+        let session_id = SessionId::new();
+        let mut application = Application {
+            slots: RenderSlots::testing_session_column_widths(),
+            ..Application::default()
+        };
+        application
+            .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+                SettingsSnapshot {
+                    settings: EffectiveSettings {
+                        session: SessionSettings {
+                            content_width: SessionContentWidth::Maximum(60),
+                            ..SessionSettings::default()
+                        },
+                        ..EffectiveSettings::default()
+                    },
+                    pinned: vec!["session.contentWidth".to_owned()],
+                    diagnostics: Vec::new(),
+                },
+            )))
+            .expect("receive Session content width");
+        application
+            .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+                SessionSnapshot {
+                    session: Session {
+                        id: session_id,
+                        workspace: Workspace {
+                            path: PathBuf::from("/workspace"),
+                        },
+                        agent_selection: None,
+                        agent_selection_availability: ModelAvailability::Available,
+                        status: SessionStatus::Idle,
+                    },
+                    revision: SessionRevision::INITIAL,
+                    prompts: Vec::new(),
+                    turns: Vec::new(),
+                    messages: Vec::new(),
+                    activities: Vec::new(),
+                    transcript: Vec::new(),
+                },
+            )))
+            .expect("hydrate test Application");
+
+        let screen = rendered_rows(&application).join("\n");
+        assert!(screen.contains("composer extension width 60"));
+        assert!(screen.contains("footer extension width 60"));
     }
 }

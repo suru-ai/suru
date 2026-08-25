@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{Event as InputEvent, KeyEventKind, MouseEventKind};
-use ratatui::{Frame, style::Style};
+use ratatui::{Frame, layout::Position, style::Style};
 
 use crate::{
     managed_client::{ManagedEvent, RecoveryStatus, SessionEvent, SessionProjection},
@@ -148,17 +148,24 @@ pub(super) struct TranscriptViewport {
     pub(super) message_starts: Vec<MessageStart>,
     pub(super) unit_starts: Vec<UnitStart>,
     /// Terminal row the first projected transcript row was drawn on, with the
-    /// count of rows below it, so a pointer position maps back to a transcript
-    /// row without re-deriving the frame's layout.
+    /// count of rows below it and the horizontal Session Content Column, so a
+    /// pointer position maps back to a transcript row without re-deriving the
+    /// frame's layout and clicks in centered gutters reach nothing.
     pub(super) content_top: u16,
     pub(super) content_rows: u16,
+    pub(super) content_left: u16,
+    pub(super) content_width: u16,
 }
 
 impl TranscriptViewport {
     /// The transcript row drawn at `screen_row`, or `None` when that terminal
     /// row belongs to another part of the frame.
-    fn transcript_row(&self, screen_row: u16) -> Option<usize> {
-        let offset = screen_row.checked_sub(self.content_top)?;
+    fn transcript_row(&self, position: Position) -> Option<usize> {
+        let column = position.x.checked_sub(self.content_left)?;
+        if column >= self.content_width {
+            return None;
+        }
+        let offset = position.y.checked_sub(self.content_top)?;
         (offset < self.content_rows)
             .then(|| self.scroll_position.saturating_add(usize::from(offset)))
     }
@@ -166,8 +173,8 @@ impl TranscriptViewport {
     /// The projected unit drawn at `screen_row`, with the transcript row the
     /// pointer landed on. Units are recorded in row order, so this is a binary
     /// search rather than a scan of the transcript.
-    fn unit_at(&self, screen_row: u16) -> Option<(UnitStart, usize)> {
-        let row = self.transcript_row(screen_row)?;
+    fn unit_at(&self, position: Position) -> Option<(UnitStart, usize)> {
+        let row = self.transcript_row(position)?;
         let index = self
             .unit_starts
             .partition_point(|start| start.row <= row)
@@ -764,13 +771,13 @@ impl TuiState {
     /// A Turn Fold's marker is not toggled here: the pointer resolves to the
     /// Turn it stands for and the caller invokes that Turn's semantic command,
     /// so a click, a keybinding, and a future plugin all reach one behavior.
-    fn toggle_disclosure_at(&mut self, screen_row: u16) -> Option<SemanticInvocation> {
+    fn toggle_disclosure_at(&mut self, position: Position) -> Option<SemanticInvocation> {
         let interaction = self.current_interaction()?;
         let (start, row) = interaction
             .viewport
             .borrow()
             .as_ref()
-            .and_then(|viewport| viewport.unit_at(screen_row))?;
+            .and_then(|viewport| viewport.unit_at(position))?;
         match start.key {
             UnitKey::Activity(activity_id) => {
                 let mut folds = interaction.folds.borrow_mut();
@@ -1214,7 +1221,7 @@ pub enum CommandId {
     ScrollTranscriptLinesDown,
     FollowLatest,
     ToggleTranscriptDisclosureAt {
-        screen_row: u16,
+        position: Position,
     },
     BeginLeader,
     OpenQueuedPrompts,
@@ -1538,8 +1545,8 @@ impl Application {
                     .navigate_transcript_lines(TranscriptDirection::Down);
             }
             CommandId::FollowLatest => self.state.follow_latest(),
-            CommandId::ToggleTranscriptDisclosureAt { screen_row } => {
-                if let Some(invocation) = self.state.toggle_disclosure_at(screen_row) {
+            CommandId::ToggleTranscriptDisclosureAt { position } => {
+                if let Some(invocation) = self.state.toggle_disclosure_at(position) {
                     return self.invoke_semantic(invocation);
                 }
             }

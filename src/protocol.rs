@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SESSION_CATALOG_SNAPSHOT_EVENT: &str = "session_catalog_snapshot";
@@ -562,8 +562,56 @@ impl<'de> Deserialize<'de> for TitleErrand {
     }
 }
 
-/// How Suru derives a Session's Title, which is the whole of what a Session is
-/// configured by today.
+/// The reader's chosen width for the Session Content Column. `Fill` uses all
+/// normally padded terminal columns; `Maximum` centers a column capped at the
+/// given width. A maximum is always at least 50 columns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionContentWidth {
+    Fill,
+    Maximum(u64),
+}
+
+impl Default for SessionContentWidth {
+    fn default() -> Self {
+        Self::Maximum(80)
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum SessionContentWidthDocument {
+    Named(String),
+    Maximum(u64),
+}
+
+impl Serialize for SessionContentWidth {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Fill => SessionContentWidthDocument::Named("fill".to_owned()),
+            Self::Maximum(maximum) => SessionContentWidthDocument::Maximum(*maximum),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionContentWidth {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match SessionContentWidthDocument::deserialize(deserializer)? {
+            SessionContentWidthDocument::Named(word) if word == "fill" => Ok(Self::Fill),
+            SessionContentWidthDocument::Named(word) => Err(serde::de::Error::custom(format!(
+                "{word:?} is not a Session Content Column width"
+            ))),
+            SessionContentWidthDocument::Maximum(maximum) if maximum >= 50 => {
+                Ok(Self::Maximum(maximum))
+            }
+            SessionContentWidthDocument::Maximum(maximum) => Err(serde::de::Error::custom(
+                format!("{maximum} is below the 50-column minimum"),
+            )),
+        }
+    }
+}
+
+/// How Suru derives a Session's Title.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TitleSettings {
@@ -573,6 +621,7 @@ pub struct TitleSettings {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSettings {
+    pub content_width: SessionContentWidth,
     pub title: TitleSettings,
 }
 
@@ -672,6 +721,9 @@ pub enum SettingMutation {
     },
     TranscriptReasoningVisibility {
         value: Option<ReasoningVisibility>,
+    },
+    SessionContentWidth {
+        value: Option<SessionContentWidth>,
     },
     SessionTitleErrand {
         value: Option<TitleErrand>,

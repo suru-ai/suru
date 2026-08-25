@@ -49,6 +49,7 @@ pub(super) struct LandingFooterSlotContext {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SessionComposerTopSlotContext {
     pub(super) session_id: SessionId,
+    pub(super) width: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -223,7 +224,7 @@ impl RenderSlots {
         &self,
         context: &SessionComposerTopSlotContext,
     ) -> RenderedSlot<Line<'static>> {
-        let _ = context.session_id;
+        let _ = (context.session_id, context.width);
         self.session_composer_top.compose(context, Vec::new())
     }
 
@@ -553,6 +554,27 @@ impl RenderSlots {
                 }
             }
         }
+        slots
+    }
+
+    pub(super) fn testing_session_column_widths() -> Self {
+        let mut slots = Self::builtins();
+        slots
+            .session_composer_top
+            .contribute(Placement::Append, |context| {
+                Ok(vec![Line::raw(format!(
+                    "composer extension width {}",
+                    context.width
+                ))])
+            });
+        slots
+            .prompt_footer
+            .contribute(Placement::Append, |context| {
+                Ok(vec![Line::raw(format!(
+                    "footer extension width {}",
+                    context.width
+                ))])
+            });
         slots
     }
 }
