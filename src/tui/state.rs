@@ -31,8 +31,9 @@ use super::{
     keymap::{
         command_for_autocomplete_event, command_for_interrupt_confirmation_event,
         command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
-        command_for_queued_prompt_event, command_for_session_picker_event,
-        command_for_settings_panel_event, command_for_terminal_event,
+        command_for_numeric_editor_event, command_for_queued_prompt_event,
+        command_for_session_picker_event, command_for_settings_panel_event,
+        command_for_terminal_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
@@ -2002,6 +2003,20 @@ impl Application {
         {
             return Ok(ApplicationTransition::Continue);
         }
+        // The Model picker is the one overlay that can sit above the settings
+        // panel. Semantic invocations obey the same ownership as terminal
+        // input: an editor hidden beneath that newer overlay accepts nothing.
+        if self.state.model_picker.is_open()
+            && matches!(
+                command,
+                SemanticCommandId::SettingsNumericInsert(_)
+                    | SemanticCommandId::SettingsNumericDeleteBackward
+                    | SemanticCommandId::SettingsNumericApply
+                    | SemanticCommandId::SettingsNumericCancel
+            )
+        {
+            return Ok(ApplicationTransition::Continue);
+        }
         match command {
             SemanticCommandId::ApplicationExit => Ok(ApplicationTransition::Exit),
             SemanticCommandId::ModelList => {
@@ -2036,7 +2051,13 @@ impl Application {
             | SemanticCommandId::SettingsRowOpen
             | SemanticCommandId::SettingsValueCycle
             | SemanticCommandId::SettingsReset
-            | SemanticCommandId::SettingsClose) => Ok(self.handle_settings_panel_command(command)),
+            | SemanticCommandId::SettingsClose
+            | SemanticCommandId::SettingsNumericInsert(_)
+            | SemanticCommandId::SettingsNumericDeleteBackward
+            | SemanticCommandId::SettingsNumericApply
+            | SemanticCommandId::SettingsNumericCancel) => {
+                Ok(self.handle_settings_panel_command(command))
+            }
             SemanticCommandId::SessionList => {
                 let request = self.state.session_picker.open();
                 self.state.command_mode = CommandMode::Composer;
@@ -2139,16 +2160,23 @@ impl Application {
                 // A row opening onto a choosing surface leaves the panel where
                 // it is and shows that surface over it, so the reader lands
                 // back on the same row once they have chosen.
-                if let Some(SettingChoiceSurface::AgentSelection { current, pin }) =
-                    self.state.settings_panel.open_row()
-                {
-                    let pinned = current(&self.state.settings);
-                    let request = self.state.model_picker.open(
-                        pinned.as_ref(),
-                        None,
-                        ModelPickerPurpose::Setting(pin),
-                    );
-                    return ApplicationTransition::ListModels(request);
+                if let Some(surface) = self.state.settings_panel.open_row() {
+                    match surface {
+                        SettingChoiceSurface::AgentSelection { current, pin } => {
+                            let pinned = current(&self.state.settings);
+                            let request = self.state.model_picker.open(
+                                pinned.as_ref(),
+                                None,
+                                ModelPickerPurpose::Setting(pin),
+                            );
+                            return ApplicationTransition::ListModels(request);
+                        }
+                        SettingChoiceSurface::Numeric(choice) => {
+                            self.state
+                                .settings_panel
+                                .open_numeric_editor(choice, &self.state.settings);
+                        }
+                    }
                 }
                 None
             }
@@ -2158,6 +2186,21 @@ impl Application {
             SemanticCommandId::SettingsReset => self.state.settings_panel.reset(),
             SemanticCommandId::SettingsClose => {
                 self.state.settings_panel.close();
+                None
+            }
+            SemanticCommandId::SettingsNumericInsert(digit) => {
+                self.state.settings_panel.insert_numeric_digit(digit);
+                None
+            }
+            SemanticCommandId::SettingsNumericDeleteBackward => {
+                self.state.settings_panel.delete_numeric_backward();
+                None
+            }
+            SemanticCommandId::SettingsNumericApply => {
+                self.state.settings_panel.apply_numeric_edit()
+            }
+            SemanticCommandId::SettingsNumericCancel => {
+                self.state.settings_panel.cancel_numeric_edit();
                 None
             }
             _ => None,
@@ -2385,6 +2428,9 @@ impl Application {
         // open at once.
         if self.state.model_picker.is_open() {
             return command_for_model_picker_event(event);
+        }
+        if self.state.settings_panel.numeric_editor_is_open() {
+            return command_for_numeric_editor_event(event);
         }
         if self.state.settings_panel.is_open() {
             return command_for_settings_panel_event(event);

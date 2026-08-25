@@ -104,6 +104,9 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     }
     if state.settings_panel.is_open() && !state.reconnect_overlay_visible {
         render_settings_panel(frame, state, &theme);
+        if state.settings_panel.numeric_editor().is_some() {
+            render_numeric_editor(frame, state, &theme);
+        }
     }
     // Last of the overlays, because a settings panel row opens it: the picker
     // is what the reader is answering, so it is drawn over whatever asked.
@@ -121,6 +124,25 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     {
         frame.set_cursor_position(composer.cursor);
     }
+}
+
+fn render_numeric_editor(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+    let editor = state
+        .settings_panel
+        .numeric_editor()
+        .expect("the numeric editor is open when it is rendered");
+    let area = centered_rect(
+        frame.area(),
+        frame.area().width.saturating_sub(4).min(44),
+        frame.area().height.saturating_sub(2).min(6),
+    );
+    let lines = vec![
+        Line::styled(editor.label, theme.text.subdued),
+        Line::styled(format!("› {}", editor.input), theme.form_field.text),
+        Line::styled(editor.error.unwrap_or(""), theme.feedback.error),
+        Line::styled("Enter apply · Esc cancel", theme.text.subdued),
+    ];
+    render_overlay_box(frame, area, lines, " Number ", theme);
 }
 
 fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {

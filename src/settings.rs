@@ -140,7 +140,83 @@ pub enum SettingChoiceSurface {
         /// What the Selection they choose becomes.
         pin: fn(AgentSelection) -> SettingMutation,
     },
+    /// A numeric editor whose complete behavior is declared by the Setting.
+    /// The panel only hosts the editor; it never needs to know which typed
+    /// field the number belongs to or how that Setting spells it.
+    Numeric(NumericSettingChoice),
 }
+
+/// Everything a reusable numeric editor needs to edit one Setting. Callers
+/// receive the seed text and either a complete typed mutation or the concise
+/// validation explanation; the numeric value and its Setting-specific
+/// conversion stay behind this interface.
+#[derive(Clone, Copy, Debug)]
+pub struct NumericSettingChoice {
+    label: &'static str,
+    seed: fn(&EffectiveSettings) -> u64,
+    validate: fn(&str) -> Result<u64, &'static str>,
+    spell: fn(u64) -> String,
+    pin: fn(u64) -> SettingMutation,
+}
+
+impl NumericSettingChoice {
+    pub const fn new(
+        label: &'static str,
+        seed: fn(&EffectiveSettings) -> u64,
+        validate: fn(&str) -> Result<u64, &'static str>,
+        spell: fn(u64) -> String,
+        pin: fn(u64) -> SettingMutation,
+    ) -> Self {
+        Self {
+            label,
+            seed,
+            validate,
+            spell,
+            pin,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.label
+    }
+
+    pub fn seed(self, settings: &EffectiveSettings) -> String {
+        (self.seed)(settings).to_string()
+    }
+
+    pub fn accept(self, input: &str) -> Result<SettingMutation, &'static str> {
+        (self.validate)(input).map(self.pin)
+    }
+
+    pub fn spell(self, value: u64) -> String {
+        (self.spell)(value)
+    }
+}
+
+fn spell_session_content_width(maximum: u64) -> String {
+    format!("max {maximum} columns")
+}
+
+fn validate_session_content_width(value: &str) -> Result<u64, &'static str> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|maximum| *maximum >= 50)
+        .ok_or("minimum: 50")
+}
+
+const SESSION_CONTENT_WIDTH_NUMERIC: NumericSettingChoice = NumericSettingChoice::new(
+    "Maximum columns",
+    |settings| match settings.session.content_width {
+        SessionContentWidth::Fill => 80,
+        SessionContentWidth::Maximum(maximum) => maximum,
+    },
+    validate_session_content_width,
+    spell_session_content_width,
+    |maximum| SettingMutation::SessionContentWidth {
+        value: Some(SessionContentWidth::Maximum(maximum)),
+    },
+);
 
 impl SettingValues {
     /// The values the schema names, which is everything a Fixed Setting accepts
@@ -379,10 +455,10 @@ pub const SCHEMA: &[SettingDescriptor] = &[
             spell: |settings| match settings.session.content_width {
                 SessionContentWidth::Fill => "fill".to_owned(),
                 SessionContentWidth::Maximum(maximum) => {
-                    format!("max {maximum} columns")
+                    SESSION_CONTENT_WIDTH_NUMERIC.spell(maximum)
                 }
             },
-            chosen_at: None,
+            chosen_at: Some(SettingChoiceSurface::Numeric(SESSION_CONTENT_WIDTH_NUMERIC)),
         },
         reset: SettingMutation::SessionContentWidth { value: None },
         apply: |settings, value| {

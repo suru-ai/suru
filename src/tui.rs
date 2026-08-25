@@ -16,7 +16,7 @@ mod spinner;
 mod state;
 mod transcript;
 
-pub use commands::SemanticCommandId;
+pub use commands::{NumericDigit, SemanticCommandId};
 pub use event_loop::run;
 pub use keymap::command_for_terminal_event;
 pub use render::render;

@@ -29,7 +29,7 @@ use suru::{
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, ModelListRequest,
-        SemanticCommandId,
+        NumericDigit, SemanticCommandId,
     },
 };
 
@@ -1385,6 +1385,271 @@ fn session_content_width_row_spells_maxima_and_space_selects_fill() {
         press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
         ApplicationTransition::MutateSetting(SettingMutation::SessionContentWidth { value: None }),
         "the existing reset action removes the width pin"
+    );
+}
+
+#[test]
+fn session_content_width_opens_a_numeric_editor_prefilled_from_the_active_maximum() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(
+        workspace.path(),
+        with_content_width(SessionContentWidth::Maximum(132)),
+        &["session.contentWidth"],
+    );
+    open_panel(&mut application);
+    focus_setting(&mut application, "session.contentWidth");
+
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "opening an editor is local presentation state"
+    );
+    let rendered = rendered_application_rows(&application).join("\n");
+    assert!(
+        rendered.contains("Maximum columns") && rendered.contains("132"),
+        "the numeric editor opens over the panel with the active maximum prefilled: {rendered}"
+    );
+}
+
+#[test]
+fn a_valid_numeric_edit_emits_a_typed_mutation_and_waits_for_the_refreshed_snapshot() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(
+        workspace.path(),
+        with_content_width(SessionContentWidth::Maximum(132)),
+        &["session.contentWidth"],
+    );
+    open_panel(&mut application);
+    focus_setting(&mut application, "session.contentWidth");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Char('2'), KeyModifiers::NONE);
+    press(&mut application, KeyCode::Char('0'), KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::SessionContentWidth {
+            value: Some(SessionContentWidth::Maximum(120)),
+        }),
+        "Enter applies the edited number through the Setting's typed mutation"
+    );
+    assert!(
+        row(&application, "Session content width").contains("max 132 columns [pinned]"),
+        "the row waits for the refreshed settings snapshot"
+    );
+
+    deliver_snapshot(
+        &mut application,
+        with_content_width(SessionContentWidth::Maximum(120)),
+        &["session.contentWidth"],
+    );
+    assert!(
+        row(&application, "Session content width").contains("max 120 columns [pinned]"),
+        "the refreshed snapshot moves the row to the accepted maximum"
+    );
+}
+
+#[test]
+fn invalid_numeric_input_stays_open_with_the_settings_validation_explanation() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "session.contentWidth");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "incomplete input produces no mutation"
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("minimum: 50"),
+        "incomplete input keeps the editor open with its concise explanation"
+    );
+
+    press(&mut application, KeyCode::Char('4'), KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "a number below the minimum produces no mutation"
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("minimum: 50"),
+        "a number below the minimum remains editable with the same explanation"
+    );
+}
+
+#[test]
+fn fill_has_no_hidden_maximum_and_cancel_discards_the_numeric_edit() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(
+        workspace.path(),
+        with_content_width(SessionContentWidth::Maximum(132)),
+        &["session.contentWidth"],
+    );
+    open_panel(&mut application);
+    focus_setting(&mut application, "session.contentWidth");
+
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::SessionContentWidth {
+            value: Some(SessionContentWidth::Fill),
+        })
+    );
+    deliver_snapshot(
+        &mut application,
+        with_content_width(SessionContentWidth::Fill),
+        &["session.contentWidth"],
+    );
+
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    let opened = rendered_application_rows(&application).join("\n");
+    assert!(
+        opened.contains("Maximum columns") && opened.contains("80"),
+        "Fill opens from the Setting's useful default rather than hidden state: {opened}"
+    );
+    press(&mut application, KeyCode::Char('9'), KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Esc, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "cancelling produces no mutation"
+    );
+    assert!(
+        row(&application, "Session content width").contains("fill [pinned]"),
+        "cancelling returns to the unchanged panel"
+    );
+
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    let reopened = rendered_application_rows(&application).join("\n");
+    assert!(
+        reopened.contains("Maximum columns") && reopened.contains("80"),
+        "reopening from Fill forgets the cancelled number: {reopened}"
+    );
+}
+
+#[test]
+fn numeric_editor_commands_can_be_invoked_semantically() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "session.contentWidth");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+
+    for command in [
+        SemanticCommandId::SettingsNumericDeleteBackward,
+        SemanticCommandId::SettingsNumericDeleteBackward,
+        SemanticCommandId::SettingsNumericInsert(NumericDigit::Five),
+        SemanticCommandId::SettingsNumericInsert(NumericDigit::Zero),
+    ] {
+        assert_eq!(
+            application
+                .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                    command,
+                )))
+                .expect("invoke a numeric editor command"),
+            ApplicationTransition::Continue
+        );
+    }
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SettingsNumericApply,
+            )))
+            .expect("apply a numeric edit semantically"),
+        ApplicationTransition::MutateSetting(SettingMutation::SessionContentWidth {
+            value: Some(SessionContentWidth::Maximum(50)),
+        }),
+        "plugins and future pointer behavior reach the same typed mutation as the keyboard"
+    );
+}
+
+#[test]
+fn closing_the_settings_panel_also_closes_its_numeric_editor() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "session.contentWidth");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SettingsClose,
+        )))
+        .expect("close the settings panel through its semantic command");
+    let closed = rendered_application_rows(&application).join("\n");
+    assert!(
+        !closed.contains("Maximum columns") && !closed.contains(" Settings "),
+        "closing the owner leaves no invisible numeric editor behind: {closed}"
+    );
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SettingsNumericInsert(NumericDigit::Nine),
+            )))
+            .expect("invoke stale editor input after the panel closed"),
+        ApplicationTransition::Continue,
+        "input aimed at the closed editor changes nothing"
+    );
+}
+
+#[test]
+fn a_numeric_editor_hidden_by_a_newer_overlay_accepts_no_input() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "session.contentWidth");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+
+    assert!(
+        matches!(
+            application
+                .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                    SemanticCommandId::ModelList,
+                )))
+                .expect("open the Model picker over the numeric editor"),
+            ApplicationTransition::ListModels(_)
+        ),
+        "the newer overlay opens"
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SettingsNumericInsert(NumericDigit::Nine),
+        )))
+        .expect("aim numeric input at the hidden editor");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::CloseModelPicker))
+        .expect("close the newer overlay");
+
+    for command in [
+        SemanticCommandId::SettingsNumericDeleteBackward,
+        SemanticCommandId::SettingsNumericDeleteBackward,
+        SemanticCommandId::SettingsNumericInsert(NumericDigit::Five),
+        SemanticCommandId::SettingsNumericInsert(NumericDigit::Zero),
+    ] {
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                command,
+            )))
+            .expect("edit the visible numeric editor");
+    }
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SettingsNumericApply,
+            )))
+            .expect("apply after the newer overlay closes"),
+        ApplicationTransition::MutateSetting(SettingMutation::SessionContentWidth {
+            value: Some(SessionContentWidth::Maximum(50)),
+        }),
+        "the editor did not accept input while another overlay hid it"
     );
 }
 

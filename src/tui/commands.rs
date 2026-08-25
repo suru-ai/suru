@@ -29,10 +29,79 @@ pub enum SemanticCommandId {
     SettingsValueCycle,
     SettingsReset,
     SettingsClose,
+    SettingsNumericInsert(NumericDigit),
+    SettingsNumericDeleteBackward,
+    SettingsNumericApply,
+    SettingsNumericCancel,
     TranscriptFoldsToggle,
     TranscriptGroupsToggle,
     TranscriptTurnToggle,
     TranscriptTurnsToggle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum NumericDigit {
+    Zero,
+    One,
+    Two,
+    Three,
+    Four,
+    Five,
+    Six,
+    Seven,
+    Eight,
+    Nine,
+}
+
+impl NumericDigit {
+    const ALL: [Self; 10] = [
+        Self::Zero,
+        Self::One,
+        Self::Two,
+        Self::Three,
+        Self::Four,
+        Self::Five,
+        Self::Six,
+        Self::Seven,
+        Self::Eight,
+        Self::Nine,
+    ];
+    const CHARACTERS: [char; 10] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+    const COMMAND_IDS: [&'static str; 10] = [
+        "settings.numeric.insert.0",
+        "settings.numeric.insert.1",
+        "settings.numeric.insert.2",
+        "settings.numeric.insert.3",
+        "settings.numeric.insert.4",
+        "settings.numeric.insert.5",
+        "settings.numeric.insert.6",
+        "settings.numeric.insert.7",
+        "settings.numeric.insert.8",
+        "settings.numeric.insert.9",
+    ];
+    const TITLES: [&'static str; 10] = [
+        "Insert 0", "Insert 1", "Insert 2", "Insert 3", "Insert 4", "Insert 5", "Insert 6",
+        "Insert 7", "Insert 8", "Insert 9",
+    ];
+
+    pub(super) fn from_char(character: char) -> Option<Self> {
+        Self::CHARACTERS
+            .iter()
+            .position(|candidate| *candidate == character)
+            .map(|index| Self::ALL[index])
+    }
+
+    pub const fn as_char(self) -> char {
+        Self::CHARACTERS[self as usize]
+    }
+
+    const fn command_id(self) -> &'static str {
+        Self::COMMAND_IDS[self as usize]
+    }
+
+    const fn title(self) -> &'static str {
+        Self::TITLES[self as usize]
+    }
 }
 
 /// What a semantic command acts on. Most act on the view as a whole; one that
@@ -96,6 +165,10 @@ impl SemanticCommandId {
             Self::SettingsValueCycle => "settings.value.cycle",
             Self::SettingsReset => "settings.reset",
             Self::SettingsClose => "settings.close",
+            Self::SettingsNumericInsert(digit) => digit.command_id(),
+            Self::SettingsNumericDeleteBackward => "settings.numeric.delete-backward",
+            Self::SettingsNumericApply => "settings.numeric.apply",
+            Self::SettingsNumericCancel => "settings.numeric.cancel",
             Self::TranscriptFoldsToggle => "transcript.folds.toggle",
             Self::TranscriptGroupsToggle => "transcript.groups.toggle",
             Self::TranscriptTurnToggle => "transcript.turn.fold.toggle",
@@ -130,6 +203,38 @@ pub(super) struct SemanticKeybinding {
 }
 
 const LEADER_PREFIX: (KeyCode, KeyModifiers) = (KeyCode::Char('x'), KeyModifiers::CONTROL);
+
+const fn numeric_insert_descriptor(
+    id: SemanticCommandId,
+    title: &'static str,
+) -> SemanticCommandDescriptor {
+    SemanticCommandDescriptor {
+        id,
+        title,
+        description: "Insert one digit in the open numeric Setting editor",
+        slash: None,
+        keybinding: None,
+    }
+}
+
+const fn numeric_insert_descriptors() -> [SemanticCommandDescriptor; 10] {
+    let mut descriptors = [numeric_insert_descriptor(
+        SemanticCommandId::SettingsNumericInsert(NumericDigit::Zero),
+        NumericDigit::Zero.title(),
+    ); 10];
+    let mut index = 0;
+    while index < NumericDigit::ALL.len() {
+        let digit = NumericDigit::ALL[index];
+        descriptors[index] = numeric_insert_descriptor(
+            SemanticCommandId::SettingsNumericInsert(digit),
+            digit.title(),
+        );
+        index += 1;
+    }
+    descriptors
+}
+
+const NUMERIC_INSERT_COMMANDS: [SemanticCommandDescriptor; 10] = numeric_insert_descriptors();
 
 const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
@@ -373,11 +478,33 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: None,
         keybinding: None,
     },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SettingsNumericDeleteBackward,
+        title: "Delete Numeric Digit",
+        description: "Delete the last digit in the open numeric Setting editor",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SettingsNumericApply,
+        title: "Apply Numeric Setting",
+        description: "Validate and apply the open numeric Setting editor",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SettingsNumericCancel,
+        title: "Cancel Numeric Setting",
+        description: "Discard the open numeric Setting editor",
+        slash: None,
+        keybinding: None,
+    },
 ];
 
 pub(super) fn descriptor(id: SemanticCommandId) -> &'static SemanticCommandDescriptor {
     SEMANTIC_COMMANDS
         .iter()
+        .chain(NUMERIC_INSERT_COMMANDS.iter())
         .find(|command| command.id == id)
         .expect("every semantic command ID has one descriptor")
 }

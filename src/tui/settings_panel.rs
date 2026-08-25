@@ -44,12 +44,12 @@ use crate::{
     },
     provider::built_in_providers,
     settings::{
-        SCHEMA, SettingChoiceSurface, SettingDescriptor, SettingGroup, provider_enablement,
-        provider_settings,
+        NumericSettingChoice, SCHEMA, SettingChoiceSurface, SettingDescriptor, SettingGroup,
+        provider_enablement, provider_settings,
     },
 };
 
-use super::ModelListRequest;
+use super::{ModelListRequest, commands::NumericDigit};
 
 /// What a row reports about a Provider the read in force asked about and the
 /// answer passed over. Nothing came back for it, which is Suru's problem to
@@ -133,6 +133,21 @@ pub(super) struct SettingsPanel {
     /// pointer resolves against. Rendering leaves it here, so it is held behind
     /// a cell rather than taken by an edit.
     layout: RefCell<PanelLayout>,
+    numeric_editor: Option<NumericEditor>,
+}
+
+#[derive(Clone, Debug)]
+struct NumericEditor {
+    choice: NumericSettingChoice,
+    input: String,
+    error: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct NumericEditorView<'a> {
+    pub(super) label: &'static str,
+    pub(super) input: &'a str,
+    pub(super) error: Option<&'static str>,
 }
 
 /// One tab as the tab bar draws it.
@@ -374,6 +389,65 @@ impl SettingsPanel {
 
     pub(super) fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    pub(super) fn open_numeric_editor(
+        &mut self,
+        choice: NumericSettingChoice,
+        settings: &EffectiveSettings,
+    ) {
+        self.numeric_editor = Some(NumericEditor {
+            choice,
+            input: choice.seed(settings),
+            error: None,
+        });
+    }
+
+    pub(super) fn numeric_editor(&self) -> Option<NumericEditorView<'_>> {
+        self.numeric_editor
+            .as_ref()
+            .map(|editor| NumericEditorView {
+                label: editor.choice.label(),
+                input: &editor.input,
+                error: editor.error,
+            })
+    }
+
+    pub(super) fn numeric_editor_is_open(&self) -> bool {
+        self.numeric_editor.is_some()
+    }
+
+    pub(super) fn insert_numeric_digit(&mut self, digit: NumericDigit) {
+        let Some(editor) = &mut self.numeric_editor else {
+            return;
+        };
+        editor.input.push(digit.as_char());
+        editor.error = None;
+    }
+
+    pub(super) fn delete_numeric_backward(&mut self) {
+        if let Some(editor) = &mut self.numeric_editor {
+            editor.input.pop();
+            editor.error = None;
+        }
+    }
+
+    pub(super) fn apply_numeric_edit(&mut self) -> Option<SettingMutation> {
+        let editor = self.numeric_editor.as_mut()?;
+        match editor.choice.accept(&editor.input) {
+            Ok(mutation) => {
+                self.numeric_editor = None;
+                Some(mutation)
+            }
+            Err(error) => {
+                editor.error = Some(error);
+                None
+            }
+        }
+    }
+
+    pub(super) fn cancel_numeric_edit(&mut self) {
+        self.numeric_editor = None;
     }
 
     /// Takes the reason an edit never landed, so the reader learns the Config

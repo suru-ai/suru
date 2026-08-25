@@ -8,7 +8,8 @@ use ratatui::layout::Position;
 
 use super::{
     commands::{
-        SemanticCommandId, command_for_direct_semantic_key, command_for_leader_key, descriptor,
+        NumericDigit, SemanticCommandId, command_for_direct_semantic_key, command_for_leader_key,
+        descriptor,
     },
     state::CommandId,
 };
@@ -156,6 +157,30 @@ pub(super) fn command_for_settings_panel_event(event: InputEvent) -> Option<Comm
         _ => return None,
     };
     Some(CommandId::InvokeSemantic(semantic))
+}
+
+/// Numeric editor input is semantic at the first seam: the terminal only
+/// translates keys, while the same commands remain available to future
+/// pointers and plugins without reproducing editor behavior.
+pub(super) fn command_for_numeric_editor_event(event: InputEvent) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let command = match (key.code, key.modifiers) {
+        (KeyCode::Char(character), KeyModifiers::NONE) => {
+            SemanticCommandId::SettingsNumericInsert(NumericDigit::from_char(character)?)
+        }
+        (KeyCode::Backspace, KeyModifiers::NONE) => {
+            SemanticCommandId::SettingsNumericDeleteBackward
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::SettingsNumericApply,
+        (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::SettingsNumericCancel,
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(command))
 }
 
 struct PickerCommandBindings {
