@@ -40,7 +40,8 @@ use super::{
     claude_error, claude_error_context,
     projection::provider_events,
     runtime::usable_claude_models,
-    transport::{ClaudeConnection, ConversationSink, StreamJsonTransport},
+    skills::ClaudeSkills,
+    transport::{ClaudeConnection, ClaudeSettingSources, ConversationSink, StreamJsonTransport},
     turn_in_flight::TurnInFlight,
     wire::{ControlRequest, UserMessageEnvelope},
 };
@@ -104,6 +105,7 @@ pub(super) async fn start_claude_session(
     request: ProviderSessionRequest,
     processes: ProcessRegistry,
     availability: ClaudeAvailability,
+    skills: ClaudeSkills,
     timings: ClaudeTimings,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     // Read before anything is launched: Resume State Suru cannot read fails the startup outright
@@ -145,6 +147,7 @@ pub(super) async fn start_claude_session(
             next_spawn,
         }),
         turn,
+        skills,
         interrupt_request_timeout: timings.interrupt_request,
         shutdown_started: AtomicBool::new(false),
     });
@@ -213,6 +216,7 @@ struct ClaudeSession {
     child: Mutex<ChildSlot>,
     /// What the Session and the projection of its conversation agree on about the Turn in flight.
     turn: Arc<TurnInFlight>,
+    skills: ClaudeSkills,
     interrupt_request_timeout: Duration,
     shutdown_started: AtomicBool,
 }
@@ -280,7 +284,7 @@ impl ProviderSession for ClaudeSession {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             const CONTEXT: &str = "Claude Turn startup failed";
-            input.prompt.reject_unlowered_skill_invocations("Claude")?;
+            let prompt = self.skills.lower(&self.workspace, input.prompt)?;
             let mut slot = self.child.lock().await;
             if self.shutdown_started.load(Ordering::Acquire) {
                 return Err(claude_error("Claude Session is shutting down"));
@@ -315,6 +319,7 @@ impl ProviderSession for ClaudeSession {
                     Some(self.workspace.clone()),
                     Some(self.conversation.clone()),
                     self.processes.clone(),
+                    ClaudeSettingSources::PersonalAndProject,
                 )
                 .await
                 .map_err(|error| claude_error_context(launch_context, error))?;
@@ -334,7 +339,7 @@ impl ProviderSession for ClaudeSession {
             self.turn.begin_turn();
             child
                 .transport
-                .send(&UserMessageEnvelope::text(&input.prompt.text))
+                .send(&UserMessageEnvelope::text(&prompt))
                 .await
                 .map_err(|error| {
                     // The Prompt never reached the CLI, so the Turn it would have begun is not
@@ -348,7 +353,11 @@ impl ProviderSession for ClaudeSession {
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             const CONTEXT: &str = "Claude Turn steering failed";
-            input.prompt.reject_unlowered_skill_invocations("Claude")?;
+            if !input.prompt.skill_invocations.is_empty() {
+                return Err(claude_error(
+                    "Claude does not support Skill Invocations for Steer Prompts; queue this Prompt instead",
+                ));
+            }
             // A steer is another user message on the running loop's stdin, and nothing about one
             // says which Turn it joins: delivered to a Session running no Turn, the CLI would
             // answer it as a Turn of its own that Suru never began. A Turn only ever runs on a
@@ -472,7 +481,7 @@ mod tests {
         use tokio::{sync::Mutex, time::Duration};
 
         use super::{
-            super::{ChildSlot, ClaudeSession, ProviderSessionSpawn, TurnInFlight},
+            super::{ChildSlot, ClaudeSession, ClaudeSkills, ProviderSessionSpawn, TurnInFlight},
             selection,
         };
         use crate::provider::{
@@ -505,6 +514,7 @@ mod tests {
                     next_spawn: ProviderSessionSpawn::Mint,
                 }),
                 turn: TurnInFlight::new(),
+                skills: ClaudeSkills::default(),
                 interrupt_request_timeout: Duration::from_millis(200),
                 shutdown_started: AtomicBool::new(false),
             })

@@ -16,11 +16,12 @@ use super::{
     claude_error, claude_error_context,
     errand::run_claude_errand,
     session::{ClaudeTimings, start_claude_session},
-    transport::{ClaudeConnection, StreamJsonTransport},
+    skills::ClaudeSkills,
+    transport::{ClaudeConnection, ClaudeSettingSources, StreamJsonTransport},
     wire::{ControlRequest, NativeModelList},
 };
 use crate::{
-    protocol::{AgentSelection, ModelDescriptor, ProviderId},
+    protocol::{AgentSelection, ModelDescriptor, ProviderId, SkillCatalog},
     provider::{
         ProviderErrand, ProviderError, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
         ProviderSessionRequest, harness::ProcessRegistry, resolve_executable,
@@ -42,6 +43,7 @@ pub struct ClaudeRuntime {
     availability: ClaudeAvailability,
     control_request_timeout: Duration,
     interrupt_request_timeout: Duration,
+    skills: ClaudeSkills,
 }
 
 impl ClaudeRuntime {
@@ -52,6 +54,7 @@ impl ClaudeRuntime {
             availability: ClaudeAvailability::new(),
             control_request_timeout: CONTROL_REQUEST_TIMEOUT,
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
+            skills: ClaudeSkills::default(),
         }
     }
 
@@ -116,6 +119,27 @@ impl ProviderRuntime for ClaudeRuntime {
         })
     }
 
+    fn skill_catalog(&self, workspace: &std::path::Path) -> ProviderFuture<'_, SkillCatalog> {
+        let executable = self.executable.clone();
+        let processes = self.processes.clone();
+        let skills = self.skills.clone();
+        let workspace = workspace.to_owned();
+        let request_timeout = self.control_request_timeout;
+        Box::pin(async move {
+            skills
+                .discover(executable, processes, workspace, request_timeout)
+                .await
+        })
+    }
+
+    fn skill_delivery_rejection_guidance(
+        &self,
+        delivery: crate::protocol::SkillPromptDelivery,
+    ) -> Option<&'static str> {
+        (delivery == crate::protocol::SkillPromptDelivery::Steer)
+            .then_some("queue this Prompt instead")
+    }
+
     fn start_session(
         &self,
         request: ProviderSessionRequest,
@@ -127,8 +151,17 @@ impl ProviderRuntime for ClaudeRuntime {
             control_request: self.control_request_timeout,
             interrupt_request: self.interrupt_request_timeout,
         };
+        let skills = self.skills.clone();
         Box::pin(async move {
-            start_claude_session(executable, request, processes, availability, timings).await
+            start_claude_session(
+                executable,
+                request,
+                processes,
+                availability,
+                skills,
+                timings,
+            )
+            .await
         })
     }
 
@@ -176,8 +209,15 @@ async fn discover_claude_models(
     processes: ProcessRegistry,
     request_timeout: Duration,
 ) -> Result<Vec<ModelDescriptor>, ProviderError> {
-    let ClaudeConnection { transport, process } =
-        StreamJsonTransport::launch(&executable, std::iter::empty(), None, None, processes).await?;
+    let ClaudeConnection { transport, process } = StreamJsonTransport::launch(
+        &executable,
+        std::iter::empty(),
+        None,
+        None,
+        processes,
+        ClaudeSettingSources::Isolated,
+    )
+    .await?;
     let result = transport
         .control_request(&ControlRequest::ListModels, request_timeout)
         .await

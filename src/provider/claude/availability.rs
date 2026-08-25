@@ -29,7 +29,7 @@ use tokio::time::{Duration, Instant};
 
 use super::{
     claude_error, claude_error_context,
-    transport::{ClaudeConnection, StreamJsonTransport},
+    transport::{ClaudeConnection, ClaudeSettingSources, StreamJsonTransport},
     wire::{ControlRequest, NativeAccount, NativeBinaryVersion, NativeInitialize},
 };
 use crate::{
@@ -121,6 +121,7 @@ async fn probe(
         None,
         None,
         processes,
+        ClaudeSettingSources::Isolated,
     )
     .await?;
     let verdict = ask_for_a_verdict(&transport, request_timeout).await;

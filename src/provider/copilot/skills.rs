@@ -301,7 +301,7 @@ impl CopilotSkills {
             }
             let invocation = &prompt.skill_invocations[0];
             let command_name = self.resolve_command(workspace, &invocation.skill_id, delivery)?;
-            let input = remove_markers(prompt.text, &invocation.marker_spans)?;
+            let input = prompt.without_skill_markers("Copilot")?;
             let result = until_crash(
                 handle,
                 "Copilot Skill Invocation failed",
@@ -358,31 +358,6 @@ impl CopilotSkills {
         }
         Ok(native.command_name)
     }
-}
-
-fn remove_markers(
-    mut text: String,
-    marker_spans: &[crate::protocol::SkillMarkerSpan],
-) -> Result<String, ProviderError> {
-    let mut spans = marker_spans.to_vec();
-    spans.sort_by_key(|span| std::cmp::Reverse((span.start, span.end)));
-    let mut next_start = text.len();
-    for span in spans {
-        let start = span.start as usize;
-        let end = span.end as usize;
-        if start >= end
-            || end > next_start
-            || !text.is_char_boundary(start)
-            || !text.is_char_boundary(end)
-        {
-            return Err(copilot_error(
-                "Copilot Skill Invocation contains an invalid marker range",
-            ));
-        }
-        text.replace_range(start..end, "");
-        next_start = start;
-    }
-    Ok(text)
 }
 
 fn safe_scope(source: SkillSource) -> &'static str {

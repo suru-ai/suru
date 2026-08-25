@@ -43,18 +43,32 @@ use crate::provider::{
 /// control response, and the failure that ends the connection when the process is lost.
 pub(super) type ConversationSink = mpsc::UnboundedSender<Result<Value, ProviderError>>;
 
-/// The arguments that put the CLI in stream-json mode: newline-delimited JSON both ways, with the
-/// user's filesystem settings left unloaded so a Suru-launched process runs no hooks and starts no
-/// MCP servers.
-const CLAUDE_STREAM_JSON_ARGS: [&str; 8] = [
+/// Which native filesystem settings a Claude process is allowed to load. User Sessions and Skill
+/// discovery deliberately use Claude's personal and project sources (ADR 0013); probes and Model
+/// discovery stay isolated from them.
+#[derive(Clone, Copy)]
+pub(super) enum ClaudeSettingSources {
+    Isolated,
+    PersonalAndProject,
+}
+
+impl ClaudeSettingSources {
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Isolated => "",
+            Self::PersonalAndProject => "user,project",
+        }
+    }
+}
+
+/// The arguments that put the CLI in stream-json mode: newline-delimited JSON both ways.
+const CLAUDE_STREAM_JSON_ARGS: [&str; 6] = [
     "--print",
     "--input-format",
     "stream-json",
     "--output-format",
     "stream-json",
     "--verbose",
-    "--setting-sources",
-    "",
 ];
 
 /// Why a control request produced no answer.
@@ -117,12 +131,17 @@ impl StreamJsonTransport {
         cwd: Option<PathBuf>,
         conversation: Option<ConversationSink>,
         processes: ProcessRegistry,
+        setting_sources: ClaudeSettingSources,
     ) -> Result<ClaudeConnection, ProviderError> {
         let spec = HarnessSpec {
             executable: executable.to_owned(),
             args: CLAUDE_STREAM_JSON_ARGS
                 .iter()
                 .map(OsString::from)
+                .chain([
+                    OsString::from("--setting-sources"),
+                    OsString::from(setting_sources.argument()),
+                ])
                 .chain(args)
                 .collect(),
             name: super::CLAUDE_HARNESS_NAME.to_owned(),

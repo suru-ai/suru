@@ -11,16 +11,15 @@
 //! An Errand is not a Turn, and the launch says so in every flag it carries. It disables the
 //! built-in Tools outright and starts no MCP servers, so a call made to name a Session cannot read
 //! a file, run a command, or change the Workspace; and it persists no conversation, so nothing it
-//! touches can be resumed — by Suru, by the user's own CLI, or by anything else. What it
-//! deliberately does *not* carry is permission bypass: with no Tools there is nothing to permit,
-//! and an Errand that skips permissions would be a call the user never asked for running with more
-//! authority than the work they did ask for.
+//! touches can be resumed — by Suru, by the user's own CLI, or by anything else. It also leaves the
+//! user's personal and project settings unloaded: an Errand is Suru's own work, not an ordinary
+//! user Session (ADR 0013). What it deliberately does *not* carry is permission bypass: with no
+//! Tools there is nothing to permit, and an Errand that skips permissions would be a call the user
+//! never asked for running with more authority than the work they did ask for.
 //!
 //! What the launch does take from the Session is its Workspace, as the working directory, so a
-//! project's own agent instructions inform how its Sessions are titled. That is why the launch
-//! leaves the CLI's own settings sources loaded, unlike every other process Suru launches: on
-//! 2.1.237 the flag that unloads them takes the Workspace's agent instruction files with it, and
-//! those files informing the answer is the point of running in the Workspace at all.
+//! Workspace still scopes whatever repository content the toolless Prompt itself carries, without
+//! giving Suru's own call the hooks, MCP servers, plugins, and overrides configured for user work.
 
 use std::ffi::OsString;
 
@@ -44,10 +43,7 @@ const ERRAND_FAILED: &str = "Claude Errand failed";
 /// `--output-format json` is what makes the whole exchange one object on stdout rather than a
 /// stream to project.
 ///
-/// `--setting-sources` is pointedly absent, unlike on the stream-json launches: unloading the CLI's
-/// settings sources also unloads the Workspace's agent instruction files, which an Errand is run in
-/// the Workspace to consult.
-const CLAUDE_PRINT_MODE_ARGS: [&str; 7] = [
+const CLAUDE_PRINT_MODE_ARGS: [&str; 9] = [
     "--print",
     "--output-format",
     "json",
@@ -55,6 +51,8 @@ const CLAUDE_PRINT_MODE_ARGS: [&str; 7] = [
     "",
     "--strict-mcp-config",
     "--no-session-persistence",
+    "--setting-sources",
+    "",
 ];
 
 /// Runs one Errand as a single print-mode invocation and answers with the JSON the CLI shaped to
@@ -167,14 +165,16 @@ mod tests {
         );
     }
 
-    /// Held separately from the flags above because it is the one place the Errand launch carries
-    /// *more* than a stream-json one: on 2.1.237 unloading the CLI's settings sources also unloads
-    /// the Workspace's agent instruction files, and an Errand runs in the Workspace to read them.
+    /// Errands are Suru-owned, toolless work and therefore load no personal or project settings.
     #[test]
-    fn print_mode_leaves_the_workspaces_own_instructions_loaded() {
+    fn print_mode_isolated_from_personal_and_project_settings() {
+        let setting_sources = CLAUDE_PRINT_MODE_ARGS
+            .iter()
+            .position(|argument| *argument == "--setting-sources")
+            .expect("print mode says which setting sources it loads");
         assert!(
-            !CLAUDE_PRINT_MODE_ARGS.contains(&"--setting-sources"),
-            "an Errand reads the Workspace it runs in: {CLAUDE_PRINT_MODE_ARGS:?}"
+            CLAUDE_PRINT_MODE_ARGS.get(setting_sources + 1) == Some(&""),
+            "an Errand loads no personal or project settings: {CLAUDE_PRINT_MODE_ARGS:?}"
         );
     }
 

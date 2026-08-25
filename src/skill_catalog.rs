@@ -180,8 +180,13 @@ impl SkillCatalogService {
             .supported_deliveries
             .contains(&delivery)
         {
+            let guidance = self
+                .runtime(&catalog.provider)?
+                .skill_delivery_rejection_guidance(delivery)
+                .map(|guidance| format!("; {guidance}"))
+                .unwrap_or_default();
             return Err(SkillCatalogError::InvalidInvocation(format!(
-                "the Provider does not support Skill Invocations for {delivery:?} Prompts"
+                "the Provider does not support Skill Invocations for {delivery:?} Prompts{guidance}"
             )));
         }
 

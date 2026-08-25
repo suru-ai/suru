@@ -197,9 +197,8 @@ async fn a_session_on_claude_is_titled_by_a_print_mode_errand() {
         errand.arguments
     );
     assert!(
-        !errand.carries("--setting-sources"),
-        "an Errand reads the Workspace's own agent instructions, which unloading the CLI's \
-         settings sources would take with them: {:?}",
+        errand.carries("--setting-sources") && errand.value("--setting-sources").is_empty(),
+        "an Errand remains isolated from Claude's personal and project setting sources: {:?}",
         errand.arguments
     );
     assert_eq!(

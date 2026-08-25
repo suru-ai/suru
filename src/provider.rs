@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use crate::protocol::{
     AgentIdentity, AgentSelection, EffectiveSettings, FileChange, ModelDescriptor, ModelOptionKind,
     ModelOptionRole, ProviderId, ProviderUnavailability, SkillCatalog, SkillCatalogCapabilities,
-    SkillCatalogStatus, SkillId, SkillInvocation, SkillMarkerSpan, Workspace,
+    SkillCatalogStatus, SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, Workspace,
 };
 
 mod claude;
@@ -282,19 +282,35 @@ impl ProviderPrompt {
         }
     }
 
-    /// Keeps a Provider adapter from silently treating a typed Skill Invocation
-    /// as ordinary text before that adapter has implemented native lowering.
-    /// Adapters remove this guard when their Skill delivery lands.
-    pub(crate) fn reject_unlowered_skill_invocations(
-        &self,
+    pub(crate) fn without_skill_markers(
+        self,
         provider_name: &str,
-    ) -> Result<(), ProviderError> {
-        if self.skill_invocations.is_empty() {
-            return Ok(());
+    ) -> Result<String, ProviderError> {
+        let mut spans = self
+            .skill_invocations
+            .into_iter()
+            .flat_map(|invocation| invocation.marker_spans)
+            .collect::<Vec<_>>();
+        spans.sort_by_key(|span| std::cmp::Reverse((span.start, span.end)));
+
+        let mut text = self.text;
+        let mut next_start = text.len();
+        for span in spans {
+            let start = span.start as usize;
+            let end = span.end as usize;
+            if start >= end
+                || end > next_start
+                || !text.is_char_boundary(start)
+                || !text.is_char_boundary(end)
+            {
+                return Err(ProviderError::new(format!(
+                    "{provider_name} Skill Invocation contains an invalid marker range"
+                )));
+            }
+            text.replace_range(start..end, "");
+            next_start = start;
         }
-        Err(ProviderError::new(format!(
-            "{provider_name} Skill Invocation delivery is not implemented"
-        )))
+        Ok(text)
     }
 }
 
@@ -442,6 +458,16 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     /// Codex override this to request their native force-refresh operation.
     fn refresh_skill_catalog(&self, workspace: &Path) -> ProviderFuture<'_, SkillCatalog> {
         self.skill_catalog(workspace)
+    }
+
+    /// Adds Provider-specific recovery guidance when a Skill delivery mode is unavailable.
+    /// Capability enforcement stays generic; only the adapter knows whether another delivery is
+    /// a meaningful alternative for its native invocation mechanism.
+    fn skill_delivery_rejection_guidance(
+        &self,
+        _delivery: SkillPromptDelivery,
+    ) -> Option<&'static str> {
+        None
     }
 
     /// Reports Provider-native Skill changes as invalidations. The generation

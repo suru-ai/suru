@@ -23,6 +23,7 @@ mod errands;
 mod interruption;
 mod models;
 mod resume;
+mod skills;
 mod steering;
 mod support;
 mod turns;

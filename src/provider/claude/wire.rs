@@ -39,6 +39,9 @@ pub(super) enum ControlRequest {
     /// run the conversation under, the account it holds credentials for among it. The probe sends
     /// it bare — no hooks, no SDK MCP servers, no agents — because all it reads is the account.
     Initialize,
+    /// Refreshes and returns only enabled, user-invocable native Skills. Unlike the broader
+    /// `initialize.commands` list, this excludes built-in and other non-Skill slash commands.
+    ReloadSkills,
     /// Stops the running loop. The CLI answers with an interrupt receipt and ends the Turn with a
     /// terminal result of its own.
     Interrupt {
@@ -63,6 +66,7 @@ impl ControlRequest {
             Self::ListModels => "list_models",
             Self::GetBinaryVersion => "get_binary_version",
             Self::Initialize => "initialize",
+            Self::ReloadSkills => "reload_skills",
             Self::Interrupt { .. } => "interrupt",
             Self::StopTask { .. } => "stop_task",
         }
@@ -273,6 +277,22 @@ pub(super) struct NativeBinaryVersion {
 pub(super) struct NativeInitialize {
     #[serde(default)]
     pub(super) account: NativeAccount,
+}
+
+/// What `reload_skills` answers with: the user-invocable Skills Claude resolved from its native
+/// configuration, after applying scopes, overrides, plugins, and visibility rules.
+#[derive(Deserialize)]
+pub(super) struct NativeSkillList {
+    pub(super) skills: Vec<NativeSkill>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct NativeSkill {
+    pub(super) name: String,
+    pub(super) description: String,
+    #[serde(default)]
+    pub(super) argument_hint: String,
 }
 
 /// The account the CLI reports at the init handshake. Every field is optional on the wire and each

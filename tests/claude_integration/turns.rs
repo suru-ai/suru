@@ -108,7 +108,7 @@ async fn a_prompt_streams_a_claude_message_into_the_transcript_and_settles_the_t
 
     let arguments = claude.arguments();
     assert_eq!(
-        arguments[..8],
+        arguments[..9],
         [
             "--print",
             "--input-format",
@@ -117,10 +117,10 @@ async fn a_prompt_streams_a_claude_message_into_the_transcript_and_settles_the_t
             "stream-json",
             "--verbose",
             "--setting-sources",
-            // The empty settings-sources value is invisible to the fixture's argv capture.
+            "user,project",
             "--include-partial-messages",
         ],
-        "the Session child runs in stream-json mode with partial messages enabled"
+        "the Session child loads Claude's personal and project settings with partial messages enabled"
     );
     assert!(
         arguments.contains(&"--dangerously-skip-permissions".to_owned()),

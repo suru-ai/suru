@@ -31,6 +31,7 @@ mod errand;
 mod projection;
 mod runtime;
 mod session;
+mod skills;
 mod thinking;
 mod transport;
 mod turn_in_flight;
