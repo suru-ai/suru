@@ -69,7 +69,7 @@ pub fn built_in_providers() -> &'static [BuiltInProvider] {
 
 /// A Provider-authored message is user-visible once it surfaces as a Provider failure, so it is
 /// capped.
-const MAX_REMOTE_ERROR_CHARS: usize = 384;
+const MAX_REMOTE_ERROR_CHARS: usize = 1_024;
 
 /// Collapses a Provider-authored message onto a single bounded line fit for a Provider failure.
 pub(crate) fn concise_remote_message(message: &str, fallback: &str) -> String {
@@ -521,13 +521,35 @@ pub(crate) async fn wait_for_shutdown(signal: &mut watch::Receiver<bool>) {
 mod tests {
     use std::{ffi::OsString, sync::Mutex};
 
-    use super::{built_in_providers, built_in_runtimes, resolve_executable};
+    use super::{
+        MAX_REMOTE_ERROR_CHARS, built_in_providers, built_in_runtimes, concise_remote_message,
+        resolve_executable,
+    };
     use crate::{protocol::EffectiveSettings, settings::provider_enablement};
 
     /// Every Provider's binary resolution shares this scope, so they share its lock.
     static ENVIRONMENT: Mutex<()> = Mutex::new(());
 
     const FIXTURE_PATH_ENV: &str = "SURU_FIXTURE_PROVIDER_PATH";
+
+    #[test]
+    fn a_remote_error_keeps_actionable_detail_past_the_old_cap() {
+        let message = format!("{} invalid_json_schema", "x".repeat(500));
+
+        assert!(
+            concise_remote_message(&message, "provider failed").ends_with("invalid_json_schema"),
+            "the Provider's actionable suffix survives its diagnostic preamble"
+        );
+    }
+
+    #[test]
+    fn an_overlong_remote_error_stays_bounded_and_marked() {
+        let concise =
+            concise_remote_message(&"x".repeat(MAX_REMOTE_ERROR_CHARS + 1), "provider failed");
+
+        assert_eq!(concise.chars().count(), MAX_REMOTE_ERROR_CHARS + 1);
+        assert!(concise.ends_with('\u{2026}'));
+    }
 
     /// The other guard a Provider must clear before shipping: client surfaces
     /// print whatever name the runtime declares, so a Provider with a blank

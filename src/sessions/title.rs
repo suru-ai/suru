@@ -79,9 +79,12 @@ const QUOTE_PAIRS: [(char, char); 6] = [
 /// than one retrofitting it onto a Title it had no say in — and because two
 /// calls would cost twice as much to answer the same question.
 ///
-/// Extra properties are tolerated rather than rejected: a Model that volunteers
-/// a field Suru did not ask for has still answered the question, and throwing a
-/// good Title away over it costs the user more than ignoring it does. A reply
+/// Suru's own validation tolerates extra properties: a Model that volunteers a
+/// field Suru did not ask for has still answered the question, and throwing a
+/// good Title away over it costs the user more than ignoring it does. The
+/// requested schema still rejects them because Codex sends output schemas in
+/// strict mode, where every object must do so. Providers that cannot enforce the
+/// schema may return them anyway, and Suru will keep ignoring them. A reply
 /// missing the Title is what does not deserialize, and it is discarded whole.
 #[derive(Debug, Deserialize)]
 struct DerivedTitleReply {
@@ -321,6 +324,7 @@ fn reply_schema() -> Value {
             },
         },
         "required": ["title", "emoji"],
+        "additionalProperties": false,
     })
 }
 
@@ -455,6 +459,11 @@ mod tests {
                 emoji: Some("\u{1F680}".to_owned()),
             })
         );
+    }
+
+    #[test]
+    fn a_title_errand_schema_rejects_unasked_properties() {
+        assert_eq!(reply_schema()["additionalProperties"], json!(false));
     }
 
     /// The guard is exercised here rather than at the server seam because

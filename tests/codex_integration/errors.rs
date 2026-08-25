@@ -400,7 +400,7 @@ async fn assert_provider_failure(
     );
     assert!(!text.contains('\n'));
     assert!(
-        text.chars().count() <= 512,
+        text.chars().count() <= 1_152,
         "Provider failure Activity should remain concise: {text:?}"
     );
 

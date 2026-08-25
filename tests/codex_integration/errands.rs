@@ -257,7 +257,9 @@ async fn codex_derives_a_title_through_its_own_one_shot_mode() {
     );
     let schema = codex.errand_schema();
     assert!(
-        schema["properties"]["title"].is_object() && schema["properties"]["emoji"].is_object(),
+        schema["properties"]["title"].is_object()
+            && schema["properties"]["emoji"].is_object()
+            && schema["additionalProperties"] == false,
         "the schema Suru asked for is handed to Codex natively: {schema}"
     );
 
