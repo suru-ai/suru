@@ -2806,6 +2806,64 @@ fn an_active_command_shows_a_live_tail_and_settles_into_its_folded_row() {
 }
 
 #[test]
+fn a_saturated_live_command_tail_keeps_its_height_as_the_latest_line_wraps() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let output = format!("{}\n{}", "Z".repeat(80), "Z".repeat(80));
+    let (mut snapshot, activity_id) =
+        command_activity_session(workspace.path(), ActivityStatus::Active, &output, false);
+    let session_id = snapshot.session.id;
+    let revision = snapshot.revision;
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with wrapping streaming output");
+
+    let live_tail_height = |application: &Application| {
+        rendered_application_rows_at(application, 60, 24)
+            .iter()
+            .filter(|row| row.contains('Z') || row.contains("… +"))
+            .count()
+    };
+    let before = live_tail_height(&application);
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![SessionChange::CommandOutputAppended {
+                    activity_id,
+                    content: "\nZ".to_owned(),
+                }],
+            },
+        )))
+        .expect("append one short source line");
+    let with_short_line = live_tail_height(&application);
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 2),
+                changes: vec![SessionChange::CommandOutputAppended {
+                    activity_id,
+                    content: "Z".repeat(79),
+                }],
+            },
+        )))
+        .expect("wrap the newest source line");
+    let after_wrap = live_tail_height(&application);
+
+    assert_eq!(
+        [before, with_short_line, after_wrap],
+        [4; 3],
+        "the marker plus a saturated three-row live tail keeps one height"
+    );
+}
+
+#[test]
 fn interrupting_a_turn_lands_the_watched_command_in_its_peek() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let (mut snapshot, activity_id) = command_activity_session(

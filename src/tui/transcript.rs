@@ -2479,6 +2479,14 @@ fn fold_output_to_tail(
         tail_used += rows_per_line[tail_start - 1];
         tail_start -= 1;
     }
+    let remaining_rows = tail_rows.saturating_sub(tail_used);
+    let boundary_tail = if remaining_rows > 0 && tail_start > 0 {
+        let mut rows = laid_out_line_rows(lines[tail_start - 1].clone(), width);
+        let keep_from = rows.len().saturating_sub(remaining_rows);
+        rows.split_off(keep_from)
+    } else {
+        Vec::new()
+    };
     let hidden = tail_start;
     let tail = lines.split_off(tail_start);
     lines.clear();
@@ -2488,6 +2496,7 @@ fn fold_output_to_tail(
         COMMAND_DETAIL_INDENT,
         theme,
     ));
+    lines.extend(boundary_tail);
     lines.extend(tail);
     (lines, true)
 }
@@ -3424,17 +3433,21 @@ fn layout_line(line: Line<'static>, width: u16, output: &mut Vec<(Line<'static>,
 }
 
 fn laid_out_line_count(line: &Line<'static>, width: u16) -> usize {
-    let rows = wrapped_line_count(line, width);
+    laid_out_line_rows(line.clone(), width).len()
+}
+
+/// Resolves one projected source line to the physical rows layout will draw.
+/// Tail clamping uses these rows when its boundary cuts through a wrapped
+/// source line, so the visible tail can fill its budget without retaining the
+/// whole source line that crossed it.
+fn laid_out_line_rows(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let rows = wrapped_line_count(&line, width);
     if rows <= 1 {
-        return rows;
+        return vec![line];
     }
-    let symbols = styled_symbols(line);
+    let symbols = styled_symbols(&line);
     let prefix = continuation_prefix(&symbols, width);
-    if prefix.is_empty() {
-        rows
-    } else {
-        wrap_with_continuation_indent(line.clone(), width, &prefix).len()
-    }
+    wrap_with_continuation_indent(line, width, &prefix)
 }
 
 /// Splits `line` into pieces each wrapping to at most
