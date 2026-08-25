@@ -1484,35 +1484,50 @@ mod tests {
         }
     }
 
+    /// An absolute directory on the platform under test. Absoluteness is
+    /// platform-defined — a POSIX `/home/user` is relative to Windows — and
+    /// [`resolve_config_root`] turns on exactly that judgement, so the
+    /// fixtures have to be rooted the way the running platform roots paths.
+    #[cfg(windows)]
+    const OVERRIDE_DIR: &str = r"C:\tmp\override";
+    #[cfg(windows)]
+    const XDG_CONFIG_HOME: &str = r"C:\Users\user\.xdg";
+    #[cfg(windows)]
+    const HOME_DIR: &str = r"C:\Users\user";
+
+    #[cfg(not(windows))]
+    const OVERRIDE_DIR: &str = "/tmp/override";
+    #[cfg(not(windows))]
+    const XDG_CONFIG_HOME: &str = "/home/user/.xdg";
+    #[cfg(not(windows))]
+    const HOME_DIR: &str = "/home/user";
+
     #[test]
     fn suru_config_dir_overrides_every_other_config_root() {
         let root = resolve_config_root(
-            Some(OsStr::new("/tmp/override")),
-            Some(OsStr::new("/home/user/.xdg")),
-            Some(Path::new("/home/user")),
+            Some(OsStr::new(OVERRIDE_DIR)),
+            Some(OsStr::new(XDG_CONFIG_HOME)),
+            Some(Path::new(HOME_DIR)),
         );
-        assert_eq!(root, Some(PathBuf::from("/tmp/override")));
+        assert_eq!(root, Some(PathBuf::from(OVERRIDE_DIR)));
     }
 
     #[test]
     fn xdg_config_home_hosts_the_suru_directory() {
         let root = resolve_config_root(
             None,
-            Some(OsStr::new("/home/user/.xdg")),
-            Some(Path::new("/home/user")),
+            Some(OsStr::new(XDG_CONFIG_HOME)),
+            Some(Path::new(HOME_DIR)),
         );
-        assert_eq!(root, Some(PathBuf::from("/home/user/.xdg/suru")));
+        assert_eq!(root, Some(Path::new(XDG_CONFIG_HOME).join("suru")));
     }
 
     #[test]
     fn relative_or_empty_xdg_config_home_falls_back_to_the_home_config_directory() {
         for invalid in ["relative/config", ""] {
-            let root = resolve_config_root(
-                None,
-                Some(OsStr::new(invalid)),
-                Some(Path::new("/home/user")),
-            );
-            assert_eq!(root, Some(PathBuf::from("/home/user/.config/suru")));
+            let root =
+                resolve_config_root(None, Some(OsStr::new(invalid)), Some(Path::new(HOME_DIR)));
+            assert_eq!(root, Some(Path::new(HOME_DIR).join(".config").join("suru")));
         }
     }
 
