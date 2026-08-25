@@ -1160,6 +1160,18 @@ impl crossterm::Command for EnableMouseButtonReporting {
     fn execute_winapi(&self) -> std::io::Result<()> {
         crossterm::event::EnableMouseCapture.execute_winapi()
     }
+
+    /// A Windows console hands mouse input to the program as console records
+    /// rather than as the ANSI replies this sequence asks for, and it only does
+    /// so once quick-edit selection is off — otherwise the console keeps the
+    /// clicks for its own text selection. Nothing written to the output stream
+    /// turns quick-edit off, so Windows always takes the console API path. That
+    /// path has no dial for motion tracking, so the motion records it delivers
+    /// are dropped later, when `command_for_terminal_event` maps the event.
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        false
+    }
 }
 
 struct DisableMouseButtonReporting;
@@ -1173,8 +1185,19 @@ impl crossterm::Command for DisableMouseButtonReporting {
     fn execute_winapi(&self) -> std::io::Result<()> {
         crossterm::event::DisableMouseCapture.execute_winapi()
     }
+
+    /// Restores the console mode [`EnableMouseButtonReporting`] replaced, so it
+    /// has to take the same console API path.
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        false
+    }
 }
 
+/// Asks for modified-key disambiguation, the first level of the kitty keyboard
+/// protocol. crossterm's own `PushKeyboardEnhancementFlags` reports the escape
+/// sequence as unsupported on Windows and fails outright there, so this writes
+/// the sequence itself; terminals that do not implement the protocol ignore it.
 struct PushModifiedKeyReporting;
 
 impl crossterm::Command for PushModifiedKeyReporting {
@@ -1204,15 +1227,33 @@ impl crossterm::Command for PopModifiedKeyReporting {
     }
 }
 
-fn enable_terminal_features(output: &mut impl std::io::Write) -> std::io::Result<()> {
-    execute!(output, EnableBracketedPaste, EnableMouseButtonReporting)?;
-    let _ = execute!(output, PushModifiedKeyReporting);
-    Ok(())
+/// Terminal features are progressive: a terminal that does not implement one
+/// ignores its escape sequence, and the legacy Windows console API answers
+/// `Unsupported` for the features it has no equivalent of. Neither is a reason
+/// to refuse to draw the TUI, while a terminal that has gone away still is.
+fn ignore_unsupported(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+        result => result,
+    }
 }
 
+fn enable_terminal_features(output: &mut impl std::io::Write) -> std::io::Result<()> {
+    ignore_unsupported(execute!(output, EnableBracketedPaste))?;
+    // Mouse reporting is the one feature with no graceful degradation: a TUI
+    // that cannot read clicks or the wheel is worth refusing to start.
+    execute!(output, EnableMouseButtonReporting)?;
+    ignore_unsupported(execute!(output, PushModifiedKeyReporting))
+}
+
+/// Every restore is attempted even after one of them fails: leaving the terminal
+/// in mouse capture is worse than a restore whose error nobody could act on. The
+/// first failure is the one reported.
 fn disable_terminal_features(output: &mut impl std::io::Write) -> std::io::Result<()> {
-    let _ = execute!(output, PopModifiedKeyReporting);
-    execute!(output, DisableMouseButtonReporting, DisableBracketedPaste)
+    let modified_keys = ignore_unsupported(execute!(output, PopModifiedKeyReporting));
+    let mouse = execute!(output, DisableMouseButtonReporting);
+    let paste = ignore_unsupported(execute!(output, DisableBracketedPaste));
+    modified_keys.and(mouse).and(paste)
 }
 
 impl TerminalSession {
@@ -1263,9 +1304,11 @@ mod tests {
 
     use super::{
         DisableMouseButtonReporting, EnableMouseButtonReporting, PopModifiedKeyReporting,
-        PushModifiedKeyReporting,
+        PushModifiedKeyReporting, ignore_unsupported,
     };
 
+    /// Pins the sequence an ANSI terminal receives. Windows takes the console
+    /// API for mouse reporting instead, which the sibling tests cover.
     #[test]
     fn terminal_input_capabilities_enable_mouse_and_modified_key_reporting() {
         let mut enabled = String::new();
@@ -1298,6 +1341,55 @@ mod tests {
         assert!(
             disabled.contains("\x1b[<1u"),
             "modified key reporting was not restored"
+        );
+    }
+
+    #[test]
+    fn a_feature_the_terminal_cannot_support_is_not_fatal() {
+        let unsupported =
+            std::io::Error::new(std::io::ErrorKind::Unsupported, "no keyboard enhancement");
+        ignore_unsupported(Err(unsupported)).expect("an unsupported feature is not an error");
+    }
+
+    #[test]
+    fn a_failure_other_than_an_unsupported_feature_still_propagates() {
+        let broken = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the terminal went away");
+        let error = ignore_unsupported(Err(broken)).expect_err("a broken terminal is fatal");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// Windows reports mouse input as console records rather than the ANSI
+    /// replies the escape sequence asks for, so the escape sequence alone leaves
+    /// the TUI blind to clicks.
+    #[cfg(windows)]
+    #[test]
+    fn mouse_reporting_uses_the_windows_console_api() {
+        assert!(
+            !EnableMouseButtonReporting.is_ansi_code_supported(),
+            "enabling mouse reporting bypassed the Windows console API"
+        );
+        assert!(
+            !DisableMouseButtonReporting.is_ansi_code_supported(),
+            "disabling mouse reporting bypassed the Windows console API"
+        );
+    }
+
+    /// crossterm forces its own `PushKeyboardEnhancementFlags` onto the Windows
+    /// console API, where the flags have no equivalent and the call can only
+    /// fail. Modified-key reporting has to keep asking the terminal instead.
+    #[cfg(windows)]
+    #[test]
+    fn modified_key_reporting_follows_the_terminals_own_ansi_support() {
+        let ansi = crossterm::ansi_support::supports_ansi();
+        assert_eq!(
+            PushModifiedKeyReporting.is_ansi_code_supported(),
+            ansi,
+            "enabling modified key reporting ignored the terminal's ANSI support"
+        );
+        assert_eq!(
+            PopModifiedKeyReporting.is_ansi_code_supported(),
+            ansi,
+            "restoring modified key reporting ignored the terminal's ANSI support"
         );
     }
 }
