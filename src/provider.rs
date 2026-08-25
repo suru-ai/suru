@@ -4,7 +4,7 @@ use std::{
     error::Error,
     fmt,
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, OnceLock},
 };
@@ -15,7 +15,8 @@ use tokio::sync::watch;
 
 use crate::protocol::{
     AgentIdentity, AgentSelection, EffectiveSettings, FileChange, ModelDescriptor, ModelOptionKind,
-    ModelOptionRole, ProviderId, ProviderUnavailability,
+    ModelOptionRole, ProviderId, ProviderUnavailability, SkillCatalog, SkillCatalogCapabilities,
+    SkillCatalogStatus, SkillId, SkillInvocation, SkillMarkerSpan, Workspace,
 };
 
 mod claude;
@@ -247,14 +248,74 @@ impl ProviderResumeState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderPrompt {
+    pub text: String,
+    pub skill_invocations: Vec<ProviderSkillInvocation>,
+}
+
+impl ProviderPrompt {
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            skill_invocations: Vec::new(),
+        }
+    }
+
+    pub(crate) fn from_user_prompt(text: String, skill_invocations: Vec<SkillInvocation>) -> Self {
+        let mut ordered = Vec::<ProviderSkillInvocation>::new();
+        for invocation in skill_invocations {
+            if let Some(existing) = ordered
+                .iter_mut()
+                .find(|existing| existing.skill_id == invocation.skill_id)
+            {
+                existing.marker_spans.push(invocation.marker);
+            } else {
+                ordered.push(ProviderSkillInvocation {
+                    skill_id: invocation.skill_id,
+                    marker_spans: vec![invocation.marker],
+                });
+            }
+        }
+        Self {
+            text,
+            skill_invocations: ordered,
+        }
+    }
+
+    /// Keeps a Provider adapter from silently treating a typed Skill Invocation
+    /// as ordinary text before that adapter has implemented native lowering.
+    /// Adapters remove this guard when their Skill delivery lands.
+    pub(crate) fn reject_unlowered_skill_invocations(
+        &self,
+        provider_name: &str,
+    ) -> Result<(), ProviderError> {
+        if self.skill_invocations.is_empty() {
+            return Ok(());
+        }
+        Err(ProviderError::new(format!(
+            "{provider_name} Skill Invocation delivery is not implemented"
+        )))
+    }
+}
+
+/// One distinct Provider-neutral Skill Invocation, in first-appearance order,
+/// with every marker that selected it retained for Provider-specific lowering.
+/// Native paths and command names remain inside the Provider adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderSkillInvocation {
+    pub skill_id: SkillId,
+    pub marker_spans: Vec<SkillMarkerSpan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderTurnInput {
-    pub prompt: String,
+    pub prompt: ProviderPrompt,
     pub selection: AgentSelection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderSteerInput {
-    pub prompt: String,
+    pub prompt: ProviderPrompt,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -351,6 +412,30 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     fn display_name(&self) -> &str;
 
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>>;
+
+    /// Offers the effective user-invocable Skill Catalog for exactly one
+    /// Workspace. Discovery and native identifiers remain inside the Provider;
+    /// the generic boundary returns only opaque identities and safe metadata.
+    /// Providers may inherit the unavailable catalog while their adapter has no
+    /// Skill implementation, which keeps ordinary Prompt behavior independent
+    /// of Skill discovery.
+    fn skill_catalog(&self, workspace: &Path) -> ProviderFuture<'_, SkillCatalog> {
+        let catalog = SkillCatalog {
+            provider: self.provider_id(),
+            workspace: Workspace {
+                path: workspace.to_owned(),
+            },
+            skills: Vec::new(),
+            capabilities: SkillCatalogCapabilities {
+                max_distinct_invocations: None,
+                supported_deliveries: Vec::new(),
+            },
+            status: SkillCatalogStatus::Unavailable {
+                message: "Skill discovery is not implemented for this Provider".to_owned(),
+            },
+        };
+        Box::pin(async move { Ok(catalog) })
+    }
 
     fn start_session(
         &self,

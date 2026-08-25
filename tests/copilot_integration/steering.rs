@@ -57,6 +57,7 @@ async fn a_steer_prompt_joins_the_running_turn_rather_than_beginning_another() {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Answer in French instead".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -148,6 +149,7 @@ async fn a_refused_steer_leaves_its_prompt_pending_and_says_what_went_wrong() {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Change course".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },

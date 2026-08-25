@@ -286,7 +286,11 @@ impl ComposerState {
         self.cursor = 0;
         self.history_position = None;
         self.history_scratch = None;
-        InitialPrompt { id, text }
+        InitialPrompt {
+            id,
+            text,
+            skill_invocations: Vec::new(),
+        }
     }
 
     fn admission_failed(&mut self, prompt: &InitialPrompt) {

@@ -131,6 +131,7 @@ fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionReq
         prompt: InitialPrompt {
             id: PromptId::new(),
             text: prompt.to_owned(),
+            skill_invocations: Vec::new(),
         },
     }
 }
@@ -498,6 +499,7 @@ async fn an_errand_leaves_a_restart_nothing_of_its_own_to_resume() {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Carry on".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },

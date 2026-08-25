@@ -10,8 +10,8 @@ use suru::protocol::{
 };
 use suru::provider::{
     ProviderErrand, ProviderError, ProviderEvent, ProviderEventStream, ProviderFuture,
-    ProviderRuntime, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
-    ProviderSteerInput, ProviderTurnInput,
+    ProviderPrompt, ProviderRuntime, ProviderSession, ProviderSessionConnection,
+    ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -334,7 +334,11 @@ impl ControlledProviderSession {
 
 impl PromptOperation {
     pub fn prompt(&self) -> &str {
-        &self.input.prompt
+        &self.input.prompt.text
+    }
+
+    pub fn skill_invocations(&self) -> &[suru::provider::ProviderSkillInvocation] {
+        &self.input.prompt.skill_invocations
     }
 
     pub fn selection(&self) -> &suru::protocol::AgentSelection {
@@ -362,7 +366,11 @@ impl PromptOperation {
 
 impl TurnSteer {
     pub fn prompt(&self) -> &str {
-        &self.input.prompt
+        &self.input.prompt.text
+    }
+
+    pub fn skill_invocations(&self) -> &[suru::provider::ProviderSkillInvocation] {
+        &self.input.prompt.skill_invocations
     }
 
     pub fn succeed(self) {
@@ -500,7 +508,7 @@ async fn run_errand_through_a_session(
     let (_identity, _resume_state, session, mut events) = connection.into_parts();
     session
         .start_turn(ProviderTurnInput {
-            prompt: errand.prompt,
+            prompt: ProviderPrompt::plain(errand.prompt),
             selection: errand.selection,
         })
         .await?;

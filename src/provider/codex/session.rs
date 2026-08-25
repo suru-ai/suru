@@ -400,6 +400,7 @@ struct CodexSession {
 impl ProviderSession for CodexSession {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
+            input.prompt.reject_unlowered_skill_invocations("Codex")?;
             {
                 let mut correlation = self
                     .correlation
@@ -421,7 +422,7 @@ impl ProviderSession for CodexSession {
             );
             let task = tokio::spawn(start_native_turn(
                 self.thread_id.clone(),
-                input.prompt,
+                input.prompt.text,
                 input.selection,
                 summary,
                 self.transport.clone(),
@@ -435,6 +436,7 @@ impl ProviderSession for CodexSession {
 
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
+            input.prompt.reject_unlowered_skill_invocations("Codex")?;
             let turn_id = self
                 .correlation
                 .lock()
@@ -449,7 +451,7 @@ impl ProviderSession for CodexSession {
                         thread_id: &self.thread_id,
                         input: [TextInput {
                             kind: "text",
-                            text: &input.prompt,
+                            text: &input.prompt.text,
                         }],
                         expected_turn_id: &turn_id,
                     },

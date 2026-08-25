@@ -14,9 +14,10 @@ use suru::{
         CreateSessionRequest, InitialPrompt, Message, MessageId, MessageRole, MessageStatus,
         ModelId, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
         SESSION_UPDATED_EVENT, SessionChange, SessionError, SessionErrorCode, SessionRevision,
-        SessionSnapshot, SessionStatus, SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
+        SessionSnapshot, SessionStatus, SessionUpdate, SkillId, SkillInvocation, SkillMarkerSpan,
+        Turn, TurnId, TurnStatus, Workspace,
     },
-    provider::ProviderEvent,
+    provider::{ProviderEvent, ProviderSkillInvocation},
     server::{self, AgentOutput, ServerConfig},
 };
 use tokio::time::{Duration, timeout};
@@ -47,6 +48,7 @@ async fn authenticated_creation_returns_pending_before_async_provider_failure() 
             prompt: InitialPrompt {
                 id: prompt_id,
                 text: "Explain this workspace".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -123,6 +125,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
         prompt: InitialPrompt {
             id: prompt_id,
             text: "Explain this workspace".to_owned(),
+            skill_invocations: Vec::new(),
         },
     };
 
@@ -165,6 +168,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
             prompt: InitialPrompt {
                 id: prompt_id,
                 text: "Different content".to_owned(),
+                skill_invocations: Vec::new(),
             },
         },
         CreateSessionRequest {
@@ -239,6 +243,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Initial Prompt".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -275,10 +280,17 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         .expect("decode Session snapshot event");
 
     let prompt_id = PromptId::new();
+    let invocation = SkillInvocation {
+        skill_id: SkillId::new("safe-smaller-interface-id"),
+        name: "smaller-interface".to_owned(),
+        scope: Some("Workspace".to_owned()),
+        marker: SkillMarkerSpan { start: 0, end: 18 },
+    };
     let command = AdmitPromptRequest {
         prompt: InitialPrompt {
             id: prompt_id,
-            text: "Use the smaller interface".to_owned(),
+            text: "$smaller-interface use it".to_owned(),
+            skill_invocations: vec![invocation.clone()],
         },
         delivery: PromptDelivery::Steer,
     };
@@ -331,7 +343,9 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         .expect("delivered steer creates a Turn");
     assert!(failure.changes.iter().any(|change| {
         matches!(change, SessionChange::MessageAdded { message }
-            if message.turn_id == turn_id && message.content == command.prompt.text)
+            if message.turn_id == turn_id
+                && message.content == command.prompt.text
+                && message.skill_invocations == vec![invocation.clone()])
     }));
 
     let exact_retry = client
@@ -351,6 +365,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         .expect("decode retried Prompt");
     assert_eq!(retried.id, admitted.id);
     assert_eq!(retried.text, admitted.text);
+    assert_eq!(retried.skill_invocations, vec![invocation.clone()]);
     assert_eq!(retried.delivery, admitted.delivery);
     assert_eq!(retried.status, PromptStatus::Delivered);
     assert!(
@@ -370,6 +385,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
             prompt: InitialPrompt {
                 id: prompt_id,
                 text: "Conflicting content".to_owned(),
+                skill_invocations: Vec::new(),
             },
             delivery: PromptDelivery::Steer,
         })
@@ -409,6 +425,31 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         SessionErrorCode::PromptConflict
     );
 
+    let conflicting_invocation = client
+        .post(format!(
+            "{}/v1/sessions/{}/prompts",
+            descriptor.base_url, created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&AdmitPromptRequest {
+            prompt: InitialPrompt {
+                id: prompt_id,
+                text: command.prompt.text.clone(),
+                skill_invocations: vec![SkillInvocation {
+                    skill_id: SkillId::new("different-safe-id"),
+                    ..invocation
+                }],
+            },
+            delivery: PromptDelivery::Steer,
+        })
+        .send()
+        .await
+        .expect("reuse Prompt identity with conflicting Skill binding");
+    assert_eq!(
+        conflicting_invocation.status(),
+        reqwest::StatusCode::CONFLICT
+    );
+
     drop(events);
     server.shutdown().await.expect("shut down server");
 }
@@ -439,6 +480,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Initial Prompt".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -465,6 +507,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                         delivery: PromptDelivery::Steer,
                         admission_order: PromptOrder(2),
                         status: PromptStatus::Delivered,
+                        skill_invocations: Vec::new(),
                     },
                 },
                 SessionChange::TurnAdded {
@@ -485,6 +528,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                         status: MessageStatus::Completed,
                         content: "Long-running work".to_owned(),
                         truncated: false,
+                        skill_invocations: Vec::new(),
                     },
                 },
             ],
@@ -513,6 +557,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                             delivery: PromptDelivery::Steer,
                             admission_order: PromptOrder(3),
                             status: PromptStatus::Delivered,
+                            skill_invocations: Vec::new(),
                         },
                     },
                     SessionChange::TurnAdded {
@@ -548,6 +593,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Run this later".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -561,6 +607,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Run this after the first queue".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -574,6 +621,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Change direction now".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -703,6 +751,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Long-running work".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -732,6 +781,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Promote this Prompt".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -745,19 +795,27 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Cancel this Prompt".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
         )
         .await
         .expect("admit Prompt to cancel");
+    let queued_invocation = SkillInvocation {
+        skill_id: SkillId::new("safe-review-after-interrupt-id"),
+        name: "review".to_owned(),
+        scope: Some("Workspace".to_owned()),
+        marker: SkillMarkerSpan { start: 0, end: 7 },
+    };
     let after_interrupt = first
         .admit_prompt(
             session_id,
             AdmitPromptRequest {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
-                    text: "Run after interruption".to_owned(),
+                    text: "$review after interruption".to_owned(),
+                    skill_invocations: vec![queued_invocation.clone()],
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -867,7 +925,9 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
         message.turn_id == active_turn_id && message.content == "Promote this Prompt"
     }));
     assert!(current.messages.iter().any(|message| {
-        message.turn_id == current.turns[1].id && message.content == "Run after interruption"
+        message.turn_id == current.turns[1].id
+            && message.content == "$review after interruption"
+            && message.skill_invocations == vec![queued_invocation.clone()]
     }));
 
     assert!(
@@ -916,7 +976,14 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
     );
 
     let queued_start = provider_session.next_turn().await;
-    assert_eq!(queued_start.prompt(), "Run after interruption");
+    assert_eq!(queued_start.prompt(), "$review after interruption");
+    assert_eq!(
+        queued_start.skill_invocations(),
+        &[ProviderSkillInvocation {
+            skill_id: queued_invocation.skill_id,
+            marker_spans: vec![queued_invocation.marker],
+        }]
+    );
     queued_start.succeed();
     provider_session.emit(ProviderEvent::TurnCompleted);
     timeout(Duration::from_secs(1), async {
@@ -964,6 +1031,7 @@ async fn consecutive_prompt_admissions_and_failures_do_not_collapse_revisions() 
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Initial Prompt".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -1015,6 +1083,7 @@ async fn consecutive_prompt_admissions_and_failures_do_not_collapse_revisions() 
                     prompt: InitialPrompt {
                         id: prompt_id,
                         text: format!("Consecutive steer {}", index + 1),
+                        skill_invocations: Vec::new(),
                     },
                     delivery: PromptDelivery::Steer,
                 })
@@ -1075,6 +1144,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Explain this workspace".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -1093,6 +1163,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: " \n\t ".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -1119,6 +1190,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Explain this workspace".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()

@@ -120,6 +120,7 @@ impl AgentOutputSink {
                     role: MessageRole::Agent,
                     status: MessageStatus::Streaming,
                     content: String::new(),
+                    skill_invocations: Vec::new(),
                     truncated: false,
                 },
             },

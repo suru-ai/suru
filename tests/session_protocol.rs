@@ -9,13 +9,96 @@ use suru::protocol::{
     ModelOptionRole, ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId,
     PromptOrder, PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode,
     SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-    SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest,
-    Workspace,
+    SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillDescriptor,
+    SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, TranscriptItem, Turn, TurnId,
+    TurnStatus, UpdateAgentSelectionRequest, Workspace,
 };
 use uuid::Uuid;
 
 fn fixture_id(value: &str) -> Uuid {
     Uuid::parse_str(value).expect("parse fixture identity")
+}
+
+#[test]
+fn workspace_skill_catalog_round_trips_only_safe_provider_neutral_metadata() {
+    let catalog = SkillCatalog {
+        provider: ProviderId::new("codex"),
+        workspace: Workspace {
+            path: PathBuf::from("/work/suru"),
+        },
+        skills: vec![SkillDescriptor {
+            id: SkillId::new("01J-safe-opaque-id"),
+            name: "code-review".to_owned(),
+            description: "Review a change against its specification.".to_owned(),
+            scope: Some("Workspace".to_owned()),
+        }],
+        capabilities: SkillCatalogCapabilities {
+            max_distinct_invocations: Some(3),
+            supported_deliveries: vec![
+                SkillPromptDelivery::Initial,
+                SkillPromptDelivery::Queue,
+                SkillPromptDelivery::Steer,
+            ],
+        },
+        status: SkillCatalogStatus::Fresh { warning: None },
+    };
+    let expected = json!({
+        "provider": "codex",
+        "workspace": { "path": "/work/suru" },
+        "skills": [{
+            "id": "01J-safe-opaque-id",
+            "name": "code-review",
+            "description": "Review a change against its specification.",
+            "scope": "Workspace"
+        }],
+        "capabilities": {
+            "max_distinct_invocations": 3,
+            "supported_deliveries": ["initial", "queue", "steer"]
+        },
+        "status": { "state": "fresh", "warning": null }
+    });
+
+    assert_eq!(
+        serde_json::to_value(&catalog).expect("encode Skill Catalog"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<SkillCatalog>(expected).expect("decode Skill Catalog"),
+        catalog
+    );
+}
+
+#[test]
+fn safe_skill_invocations_round_trip_beside_the_original_prompt_text() {
+    let prompt = InitialPrompt {
+        id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
+        text: "$code-review check this".to_owned(),
+        skill_invocations: vec![SkillInvocation {
+            skill_id: SkillId::new("01J-safe-opaque-id"),
+            name: "code-review".to_owned(),
+            scope: Some("Workspace".to_owned()),
+            marker: SkillMarkerSpan { start: 0, end: 12 },
+        }],
+    };
+    let encoded = serde_json::to_value(&prompt).expect("encode Skill-bearing Prompt");
+
+    assert_eq!(
+        encoded,
+        json!({
+            "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
+            "text": "$code-review check this",
+            "skill_invocations": [{
+                "skill_id": "01J-safe-opaque-id",
+                "name": "code-review",
+                "scope": "Workspace",
+                "marker": { "start": 0, "end": 12 }
+            }]
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<InitialPrompt>(encoded).expect("decode Skill-bearing Prompt"),
+        prompt
+    );
 }
 
 #[test]
@@ -156,6 +239,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         prompts: vec![Prompt {
             id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
             text: "Explain this workspace".to_owned(),
+            skill_invocations: Vec::new(),
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder(1),
             status: PromptStatus::Delivered,
@@ -186,6 +270,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             role: MessageRole::User,
             status: MessageStatus::Completed,
             content: "Explain this workspace".to_owned(),
+            skill_invocations: Vec::new(),
             truncated: false,
         }],
         activities: vec![Activity::Error {
@@ -225,6 +310,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         "prompts": [{
             "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
             "text": "Explain this workspace",
+            "skill_invocations": [],
             "delivery": "steer",
             "admission_order": 1,
             "status": "delivered"
@@ -253,6 +339,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             "role": "user",
             "status": "completed",
             "content": "Explain this workspace",
+            "skill_invocations": [],
             "truncated": false
         }],
         "activities": [{
@@ -299,6 +386,7 @@ fn agent_message_streaming_uses_one_stable_provider_neutral_identity() {
                     role: MessageRole::Agent,
                     status: MessageStatus::Streaming,
                     content: String::new(),
+                    skill_invocations: Vec::new(),
                     truncated: false,
                 },
             }],
@@ -334,6 +422,7 @@ fn agent_message_streaming_uses_one_stable_provider_neutral_identity() {
                     "role": "agent",
                     "status": "streaming",
                     "content": "",
+                    "skill_invocations": [],
                     "truncated": false
                 }
             }]
@@ -787,6 +876,7 @@ fn initial_session_command_round_trips_through_json() {
         prompt: InitialPrompt {
             id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
             text: "Explain this workspace".to_owned(),
+            skill_invocations: Vec::new(),
         },
     };
     let expected = json!({
@@ -794,7 +884,8 @@ fn initial_session_command_round_trips_through_json() {
         "workspace": { "path": "/work/suru" },
         "prompt": {
             "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
-            "text": "Explain this workspace"
+            "text": "Explain this workspace",
+            "skill_invocations": []
         }
     });
 
@@ -859,13 +950,15 @@ fn prompt_admission_command_round_trips_with_its_client_generated_identity() {
         prompt: InitialPrompt {
             id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
             text: "Steer the current Session".to_owned(),
+            skill_invocations: Vec::new(),
         },
         delivery: PromptDelivery::Queue,
     };
     let expected = json!({
         "prompt": {
             "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
-            "text": "Steer the current Session"
+            "text": "Steer the current Session",
+            "skill_invocations": []
         },
         "delivery": "queue"
     });

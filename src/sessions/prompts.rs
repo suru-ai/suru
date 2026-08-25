@@ -14,7 +14,7 @@ use crate::protocol::{
     CreateSessionRequest, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
     Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, Session, SessionCatalogChange,
     SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary,
-    SessionUpdate, Turn, TurnId, TurnStatus, Workspace,
+    SessionUpdate, SkillInvocation, Turn, TurnId, TurnStatus, Workspace,
 };
 
 use super::{
@@ -76,6 +76,7 @@ pub(crate) enum DeliveredTurnStatus {
 pub(super) struct PromptOwner {
     pub(super) session_id: SessionId,
     pub(super) text: String,
+    pub(super) skill_invocations: Vec<SkillInvocation>,
     pub(super) agent_selection: Option<AgentSelection>,
     pub(super) origin: PromptOrigin,
 }
@@ -157,6 +158,7 @@ impl SessionStore {
         let prompt = Prompt {
             id: request.prompt.id,
             text: request.prompt.text.clone(),
+            skill_invocations: request.prompt.skill_invocations.clone(),
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
@@ -195,6 +197,7 @@ impl SessionStore {
             PromptOwner {
                 session_id,
                 text: request.prompt.text,
+                skill_invocations: request.prompt.skill_invocations,
                 agent_selection: request.agent_selection,
                 origin: PromptOrigin::SessionCreation {
                     requested_workspace: request.workspace.path,
@@ -285,6 +288,7 @@ impl SessionStore {
         let prompt = Prompt {
             id: request.prompt.id,
             text: request.prompt.text.clone(),
+            skill_invocations: request.prompt.skill_invocations.clone(),
             delivery: request.delivery,
             admission_order,
             status: PromptStatus::Pending,
@@ -308,6 +312,7 @@ impl SessionStore {
             PromptOwner {
                 session_id,
                 text: request.prompt.text,
+                skill_invocations: request.prompt.skill_invocations,
                 agent_selection: None,
                 origin: PromptOrigin::Admission(request.delivery),
             },
@@ -535,6 +540,7 @@ impl SessionStore {
                         role: MessageRole::User,
                         status: MessageStatus::Completed,
                         content: prompt.text.clone(),
+                        skill_invocations: prompt.skill_invocations.clone(),
                         truncated: false,
                     },
                 },
@@ -712,6 +718,7 @@ pub(super) fn append_steer_delivery_changes(
                 role: MessageRole::User,
                 status: MessageStatus::Completed,
                 content: prompt.text.clone(),
+                skill_invocations: prompt.skill_invocations.clone(),
                 truncated: false,
             },
         },
@@ -748,6 +755,7 @@ pub(super) fn prepare_prompt_delivery(
                 role: MessageRole::User,
                 status: MessageStatus::Completed,
                 content: prompt.text.clone(),
+                skill_invocations: prompt.skill_invocations.clone(),
                 truncated: false,
             },
         },
@@ -774,6 +782,7 @@ fn snapshot_for_owner(state: &SessionStoreState, owner: &PromptOwner) -> Session
 impl PromptOwner {
     fn matches_requested_creation(&self, request: &CreateSessionRequest) -> bool {
         self.text == request.prompt.text
+            && self.skill_invocations == request.prompt.skill_invocations
             && self.agent_selection == request.agent_selection
             && matches!(
                 &self.origin,
@@ -785,7 +794,10 @@ impl PromptOwner {
     }
 
     fn canonical_creation_workspace(&self, request: &CreateSessionRequest) -> Option<PathBuf> {
-        if self.text != request.prompt.text || self.agent_selection != request.agent_selection {
+        if self.text != request.prompt.text
+            || self.skill_invocations != request.prompt.skill_invocations
+            || self.agent_selection != request.agent_selection
+        {
             return None;
         }
         match &self.origin {
@@ -805,6 +817,7 @@ impl PromptOwner {
     fn matches_admission(&self, session_id: SessionId, request: &AdmitPromptRequest) -> bool {
         self.session_id == session_id
             && self.text == request.prompt.text
+            && self.skill_invocations == request.prompt.skill_invocations
             && matches!(&self.origin, PromptOrigin::Admission(delivery) if *delivery == request.delivery)
     }
 }

@@ -60,6 +60,7 @@ async fn a_steer_prompt_joins_the_running_turn_rather_than_beginning_another() {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Answer in French instead".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },

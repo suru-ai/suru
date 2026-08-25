@@ -761,6 +761,7 @@ impl LiveTurn {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: prompt.to_owned(),
+                    skill_invocations: Vec::new(),
                 },
             })
             .await

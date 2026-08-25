@@ -17,8 +17,8 @@ use crate::{
         Message, MessageId, MessageRole, MessageStatus, ModelId, ModelOptionChoiceId,
         ModelOptionId, ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId,
         PromptOrder, PromptStatus, ProviderId, Session, SessionId, SessionRevision, SessionSummary,
-        SessionTimestamp, TranscriptItem, Turn, TurnId, TurnStatus, UnreadableSessionSummary,
-        Workspace,
+        SessionTimestamp, SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus,
+        UnreadableSessionSummary, Workspace,
     },
     provider::ProviderResumeState,
 };
@@ -344,6 +344,7 @@ impl PromptRow {
                 "Prompt payload",
                 &StoredPromptPayload {
                     text: prompt.text,
+                    skill_invocations: prompt.skill_invocations,
                     delivery: prompt.delivery,
                     status: prompt.status,
                 },
@@ -357,6 +358,7 @@ impl PromptRow {
         Ok(Prompt {
             id: parse_id(&self.id, "Prompt ID", PromptId::from_uuid)?,
             text: payload.text,
+            skill_invocations: payload.skill_invocations,
             delivery: payload.delivery,
             admission_order: PromptOrder(i64_to_u64(
                 &session_id,
@@ -428,6 +430,7 @@ impl MessageRow {
                     role: message.role,
                     status: message.status,
                     content: message.content,
+                    skill_invocations: message.skill_invocations,
                     truncated: message.truncated,
                 },
             )?,
@@ -444,6 +447,7 @@ impl MessageRow {
                 role: payload.role,
                 status: payload.status,
                 content: payload.content,
+                skill_invocations: payload.skill_invocations,
                 truncated: payload.truncated,
             },
             self.transcript_order,
@@ -627,6 +631,8 @@ impl From<StoredModelOptionValue> for ModelOptionValue {
 #[derive(Deserialize, Serialize)]
 struct StoredPromptPayload {
     text: String,
+    #[serde(default)]
+    skill_invocations: Vec<SkillInvocation>,
     delivery: PromptDelivery,
     status: PromptStatus,
 }
@@ -648,6 +654,8 @@ struct StoredMessagePayload {
     role: MessageRole,
     status: MessageStatus,
     content: String,
+    #[serde(default)]
+    skill_invocations: Vec<SkillInvocation>,
     truncated: bool,
 }
 

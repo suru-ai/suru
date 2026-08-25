@@ -15,8 +15,8 @@ use tokio::{
 
 use super::{
     ProviderCommandStatus, ProviderError, ProviderEvent, ProviderEventStream,
-    ProviderFileChangeStatus, ProviderRuntime, ProviderSession, ProviderSessionRequest,
-    ProviderSteerInput, ProviderTurnInput,
+    ProviderFileChangeStatus, ProviderPrompt, ProviderRuntime, ProviderSession,
+    ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
 };
 use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
@@ -802,7 +802,10 @@ async fn run_provider_session(
                     biased;
                     _ = shutdown.wait() => break 'actor,
                     steered = provider_session.steer_turn(ProviderSteerInput {
-                        prompt: prompt.text.clone(),
+                        prompt: ProviderPrompt::from_user_prompt(
+                            prompt.text.clone(),
+                            prompt.skill_invocations.clone(),
+                        ),
                     }) => steered,
                 };
                 match steered {
@@ -995,7 +998,10 @@ fn provider_turn_start(delivered: DeliveredTurn) -> (TurnId, ProviderTurnInput) 
     (
         turn_id,
         ProviderTurnInput {
-            prompt: delivered.prompt.text,
+            prompt: ProviderPrompt::from_user_prompt(
+                delivered.prompt.text,
+                delivered.prompt.skill_invocations,
+            ),
             selection,
         },
     )
@@ -1065,6 +1071,7 @@ fn project_provider_event(
                                     role: MessageRole::Agent,
                                     status: MessageStatus::Streaming,
                                     content: String::new(),
+                                    skill_invocations: Vec::new(),
                                     truncated: false,
                                 },
                             },

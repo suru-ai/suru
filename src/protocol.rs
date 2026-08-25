@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SESSION_CATALOG_SNAPSHOT_EVENT: &str = "session_catalog_snapshot";
@@ -81,6 +81,7 @@ named_identity!(ProviderId);
 named_identity!(ModelId);
 named_identity!(ModelOptionId);
 named_identity!(ModelOptionChoiceId);
+named_identity!(SkillId);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -398,6 +399,89 @@ pub struct SessionTimestamp(pub u64);
 #[serde(deny_unknown_fields)]
 pub struct Workspace {
     pub path: PathBuf,
+}
+
+/// Safe presentation metadata for one user-invocable Skill. The Provider keeps
+/// every native path, command name, and configuration detail behind its own
+/// runtime boundary; clients receive only this opaque identity and the words
+/// they need to choose and distinguish the Skill.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillDescriptor {
+    pub id: SkillId,
+    pub name: String,
+    pub description: String,
+    pub scope: Option<String>,
+}
+
+/// A delivery context in which a Provider can honor Skill Invocations. Initial
+/// is distinct from Steer even though an initial Prompt currently enters the
+/// Session store with steer delivery: Providers such as Claude support one and
+/// not the other.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillPromptDelivery {
+    Initial,
+    Queue,
+    Steer,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillCatalogCapabilities {
+    /// The maximum number of distinct Skills one Prompt may invoke. None means
+    /// the Provider declares no Suru-enforced limit.
+    pub max_distinct_invocations: Option<u32>,
+    pub supported_deliveries: Vec<SkillPromptDelivery>,
+}
+
+/// Whether the entries in a Skill Catalog are current invocation authority.
+/// Skill discovery is deliberately independent of Provider Availability: a
+/// failed or stale Skill Catalog never prevents an ordinary Prompt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SkillCatalogStatus {
+    Loading,
+    Fresh { warning: Option<String> },
+    Refreshing,
+    Stale { message: String },
+    Unavailable { message: String },
+}
+
+/// The effective user-invocable Skills offered by one Provider in exactly one
+/// Workspace. Including both identities in the value makes crossing Provider
+/// or Workspace contexts visible at every caller boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillCatalog {
+    pub provider: ProviderId,
+    pub workspace: Workspace,
+    pub skills: Vec<SkillDescriptor>,
+    pub capabilities: SkillCatalogCapabilities,
+    pub status: SkillCatalogStatus,
+}
+
+/// The byte range occupied by one recognized `$skill-name` marker in the
+/// original UTF-8 Prompt. The end is exclusive, matching Rust string ranges.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillMarkerSpan {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// A safe binding between visible Prompt text and one Provider-owned Skill.
+/// It deliberately carries no Provider-native identifier. Repeated markers
+/// remain separate records so historical presentation preserves every marker;
+/// Provider lowering may later deduplicate identities in first-appearance
+/// order.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillInvocation {
+    pub skill_id: SkillId,
+    pub name: String,
+    pub scope: Option<String>,
+    pub marker: SkillMarkerSpan,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1069,6 +1153,7 @@ pub struct SessionCatalogUpdate {
 pub struct Prompt {
     pub id: PromptId,
     pub text: String,
+    pub skill_invocations: Vec<SkillInvocation>,
     pub delivery: PromptDelivery,
     pub admission_order: PromptOrder,
     pub status: PromptStatus,
@@ -1097,6 +1182,9 @@ pub struct Message {
     pub role: MessageRole,
     pub status: MessageStatus,
     pub content: String,
+    /// Safe invocation records captured with a user Message. Agent Messages
+    /// always carry an empty list.
+    pub skill_invocations: Vec<SkillInvocation>,
     /// Whether Suru's cap cut the stored content short of what the Provider
     /// sent, so a client can say so without reading it out of `content`.
     pub truncated: bool,
@@ -1226,6 +1314,7 @@ pub enum SessionChange {
 pub struct InitialPrompt {
     pub id: PromptId,
     pub text: String,
+    pub skill_invocations: Vec<SkillInvocation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

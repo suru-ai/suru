@@ -81,6 +81,7 @@ async fn scripted_codex_interrupt_acknowledges_before_trailing_output_and_termin
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Keep working until interrupted".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -243,6 +244,7 @@ async fn assert_interruption_failure(script: &str, channel: &str, expected_error
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Interrupt this work".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await

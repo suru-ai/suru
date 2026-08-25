@@ -13,7 +13,8 @@ use suru::{
         Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelectionOperationId,
         CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId, SessionError,
         SessionErrorCode, SessionId, SessionListItem, SessionRevision, SessionSnapshot,
-        SessionStatus, SessionSummary, TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        SessionStatus, SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan, TurnStatus,
+        UpdateAgentSelectionRequest, Workspace,
     },
     provider::{ProviderActivityId, ProviderCommandStatus, ProviderEvent},
     server::{self, ServerConfig},
@@ -31,6 +32,87 @@ fn readable_session_summaries(items: Vec<SessionListItem>) -> Vec<SessionSummary
             }
         })
         .collect()
+}
+
+#[tokio::test]
+async fn safe_skill_invocations_are_readable_after_a_server_restart() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "skill-history-restart-test")
+        .expect("configure original server")
+        .with_data_dir(data_dir.path());
+    let invocation = SkillInvocation {
+        skill_id: SkillId::new("safe-review-id"),
+        name: "review".to_owned(),
+        scope: Some("Workspace".to_owned()),
+        marker: SkillMarkerSpan { start: 0, end: 7 },
+    };
+    let original = spawn_with_failing_provider(config.clone())
+        .await
+        .expect("spawn original server");
+    let created = reqwest::Client::new()
+        .post(format!("{}/v1/sessions", original.descriptor().base_url))
+        .bearer_auth(&original.descriptor().token)
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "$review persisted work".to_owned(),
+                skill_invocations: vec![invocation.clone()],
+            },
+        })
+        .send()
+        .await
+        .expect("create Skill-bearing Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+    let before_restart = read_session_at_least_revision(
+        &reqwest::Client::new(),
+        original.descriptor(),
+        created.session.id,
+        SessionRevision(2),
+    )
+    .await;
+    original.shutdown().await.expect("stop original server");
+
+    let replacement = spawn_with_failing_provider(config)
+        .await
+        .expect("spawn replacement server");
+    let restored = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{}",
+            replacement.descriptor().base_url,
+            created.session.id
+        ))
+        .bearer_auth(&replacement.descriptor().token)
+        .send()
+        .await
+        .expect("read restored Session")
+        .error_for_status()
+        .expect("restored Session is readable")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode restored Session");
+
+    assert_eq!(restored, before_restart);
+    assert_eq!(
+        restored.prompts[0].skill_invocations,
+        vec![invocation.clone()]
+    );
+    assert_eq!(restored.messages[0].content, "$review persisted work");
+    assert_eq!(restored.messages[0].skill_invocations, vec![invocation]);
+
+    replacement
+        .shutdown()
+        .await
+        .expect("shut down replacement server");
 }
 
 #[tokio::test]
@@ -55,6 +137,7 @@ async fn authenticated_clients_can_read_a_session_by_id() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Explain this workspace".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -139,6 +222,7 @@ async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace
         prompt: InitialPrompt {
             id: PromptId::new(),
             text: text.to_owned(),
+            skill_invocations: Vec::new(),
         },
     };
     let first = client
@@ -251,6 +335,7 @@ async fn session_metadata_remains_listed_after_a_server_restart() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "  Durable Session  ".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -352,6 +437,7 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Persist this whole Turn".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -566,6 +652,7 @@ async fn persisted_session_without_resume_state_starts_a_fresh_provider_conversa
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Persist without Provider Resume State".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -608,6 +695,7 @@ async fn persisted_session_without_resume_state_starts_a_fresh_provider_conversa
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Continue without Provider Resume State".to_owned(),
+                skill_invocations: Vec::new(),
             },
             delivery: PromptDelivery::Steer,
         })
@@ -666,6 +754,7 @@ async fn an_undecodable_stored_session_does_not_block_startup_and_remains_listed
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Keep this damaged Session visible".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -780,6 +869,7 @@ async fn turn_timing_survives_a_restart_and_a_session_stored_before_it_stays_rea
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Persist when this Turn worked".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()

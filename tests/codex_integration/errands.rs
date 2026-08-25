@@ -139,6 +139,7 @@ async fn create_session(client: &ManagedClient, workspace: &std::path::Path) -> 
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: FIRST_PROMPT.to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await

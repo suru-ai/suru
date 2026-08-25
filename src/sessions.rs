@@ -132,6 +132,7 @@ impl SessionStore {
                     PromptOwner {
                         session_id: snapshot.session.id,
                         text: prompt.text.clone(),
+                        skill_invocations: prompt.skill_invocations.clone(),
                         agent_selection: None,
                         origin: PromptOrigin::Admission(prompt.delivery),
                     },

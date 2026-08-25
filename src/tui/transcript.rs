@@ -3730,6 +3730,7 @@ mod tests {
             role: MessageRole::Agent,
             status: MessageStatus::Completed,
             content: "```\nfenced code\n".to_owned(),
+            skill_invocations: Vec::new(),
             truncated: true,
         };
         let theme = Theme::system();
@@ -3808,6 +3809,7 @@ mod tests {
             role: MessageRole::Agent,
             status: MessageStatus::Completed,
             content: format!("prose\n\n{}\n", CappedStream::Message.truncation_marker()),
+            skill_invocations: Vec::new(),
             truncated: false,
         };
         let theme = Theme::system();
@@ -3879,6 +3881,7 @@ mod tests {
             role: MessageRole::User,
             status: MessageStatus::Completed,
             content: content.to_owned(),
+            skill_invocations: Vec::new(),
             truncated: false,
         }
     }

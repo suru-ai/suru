@@ -14,9 +14,10 @@ use suru::{
         ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
         ModelOptionSelection, ModelOptionValue, PromptDelivery, PromptId, PromptStatus,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, SessionChange, SessionRevision,
-        SessionSnapshot, TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        SessionSnapshot, SkillId, SkillInvocation, SkillMarkerSpan, TurnStatus,
+        UpdateAgentSelectionRequest, Workspace,
     },
-    provider::ProviderEvent,
+    provider::{ProviderEvent, ProviderSkillInvocation},
     server::{self, ServerConfig},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
@@ -51,6 +52,7 @@ async fn agent_selection_changes_do_not_rewrite_an_active_turn_identity() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Keep this Turn on its effective Agent".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -148,7 +150,8 @@ async fn session_creation_makes_the_landing_agent_selection_authoritative() {
             "workspace": { "path": workspace.path() },
             "prompt": {
                 "id": PromptId::new(),
-                "text": "Begin with my landing selection"
+                "text": "Begin with my landing selection",
+                "skill_invocations": []
             },
             "agent_selection": selection,
         }))
@@ -193,6 +196,7 @@ async fn confirmed_landing_agent_selection_defaults_new_sessions_after_a_restart
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Use the existing default".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -259,6 +263,7 @@ async fn confirmed_landing_agent_selection_defaults_new_sessions_after_a_restart
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Reuse my remembered selection".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -316,6 +321,7 @@ async fn agent_selection_commands_are_idempotent_and_converge_across_clients() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Wait for a selected Turn".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -524,6 +530,7 @@ async fn rapid_reasoning_cycles_serialize_coalesce_and_converge_across_clients()
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Cycle Reasoning Effort rapidly".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -738,6 +745,7 @@ async fn concurrent_clients_converge_in_server_acceptance_order() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Wait while clients select concurrently".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -849,6 +857,7 @@ async fn turn_boundaries_capture_the_latest_selection_while_steers_keep_the_acti
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Begin on A".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -884,6 +893,7 @@ async fn turn_boundaries_capture_the_latest_selection_while_steers_keep_the_acti
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Steer the A Turn".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -900,6 +910,7 @@ async fn turn_boundaries_capture_the_latest_selection_while_steers_keep_the_acti
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Queue a new Turn".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -987,6 +998,7 @@ async fn provider_effective_selection_reconciles_the_active_turn_with_visible_ac
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Use the selected Model".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -1105,6 +1117,12 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
         options: Vec::new(),
     };
     let original_prompt_id = PromptId::new();
+    let invocation = SkillInvocation {
+        skill_id: SkillId::new("safe-retry-id"),
+        name: "retry".to_owned(),
+        scope: Some("Workspace".to_owned()),
+        marker: SkillMarkerSpan { start: 0, end: 6 },
+    };
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: Some(selection.clone()),
@@ -1113,7 +1131,8 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
             },
             prompt: InitialPrompt {
                 id: original_prompt_id,
-                text: "Retry me deliberately".to_owned(),
+                text: "$retry deliberately".to_owned(),
+                skill_invocations: vec![invocation.clone()],
             },
         })
         .await
@@ -1124,6 +1143,11 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
     });
     let turn = provider_session.next_turn().await;
     assert_eq!(turn.selection(), &selection);
+    let provider_invocation = ProviderSkillInvocation {
+        skill_id: invocation.skill_id.clone(),
+        marker_spans: vec![invocation.marker],
+    };
+    assert_eq!(turn.skill_invocations(), &[provider_invocation.clone()]);
     turn.reject_selection("selected Model is unavailable");
 
     let failed = timeout(Duration::from_secs(1), async {
@@ -1161,7 +1185,11 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
     assert_eq!(failed.prompts[0].id, original_prompt_id);
     assert_eq!(failed.prompts[0].status, PromptStatus::Delivered);
     assert_ne!(failed.prompts[1].id, original_prompt_id);
-    assert_eq!(failed.prompts[1].text, "Retry me deliberately");
+    assert_eq!(failed.prompts[1].text, "$retry deliberately");
+    assert_eq!(
+        failed.prompts[1].skill_invocations,
+        vec![invocation.clone()]
+    );
     assert_eq!(failed.prompts[1].status, PromptStatus::Pending);
     assert_eq!(failed.messages.len(), 1, "failed Turn history is retained");
 
@@ -1180,7 +1208,8 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
     let repeated = timeout(Duration::from_secs(1), provider_session.next_turn())
         .await
         .expect("first use of the operation schedules the restored Prompt");
-    assert_eq!(repeated.prompt(), "Retry me deliberately");
+    assert_eq!(repeated.prompt(), "$retry deliberately");
+    assert_eq!(repeated.skill_invocations(), &[provider_invocation.clone()]);
     repeated.reject_selection("selected Model remains unavailable");
 
     let failed_again = timeout(Duration::from_secs(1), async {
@@ -1201,6 +1230,10 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
     .await
     .expect("repeated selection rejection is projected");
     assert_eq!(failed_again.turns[1].prompt_id, first_retry_prompt_id);
+    assert_eq!(
+        failed_again.prompts[2].skill_invocations,
+        vec![invocation.clone()]
+    );
     let retry_prompt_id = failed_again.prompts[2].id;
 
     client
@@ -1238,7 +1271,8 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
     let retry = timeout(Duration::from_secs(1), provider_session.next_turn())
         .await
         .expect("restored Prompt is scheduled after Agent Selection recovery");
-    assert_eq!(retry.prompt(), "Retry me deliberately");
+    assert_eq!(retry.prompt(), "$retry deliberately");
+    assert_eq!(retry.skill_invocations(), &[provider_invocation]);
     assert_eq!(retry.selection(), &retry_selection);
     retry.succeed();
 

@@ -68,6 +68,7 @@ async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_clie
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Explain this workspace".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -146,6 +147,7 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Attach to this Session".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -227,6 +229,7 @@ async fn managed_clients_observe_durable_session_deletion() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Delete this Session and its Transcript".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -340,6 +343,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "First Session".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -360,6 +364,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Second Session".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -394,6 +399,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
                         delivery: PromptDelivery::Steer,
                         admission_order: PromptOrder(2),
                         status: PromptStatus::Delivered,
+                        skill_invocations: Vec::new(),
                     },
                 },
                 SessionChange::TurnAdded {
@@ -413,6 +419,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
                         role: MessageRole::User,
                         status: MessageStatus::Completed,
                         content: "Keep working while detached".to_owned(),
+                        skill_invocations: Vec::new(),
                         truncated: false,
                     },
                 },
@@ -490,6 +497,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Shared Session".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -503,6 +511,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Isolated Session".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -577,6 +586,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
                         delivery: PromptDelivery::Steer,
                         admission_order: PromptOrder(2),
                         status: PromptStatus::Delivered,
+                        skill_invocations: Vec::new(),
                     },
                 },
                 SessionChange::TurnAdded {
@@ -596,6 +606,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
                         role: MessageRole::User,
                         status: MessageStatus::Completed,
                         content: "Observe this change".to_owned(),
+                        skill_invocations: Vec::new(),
                         truncated: false,
                     },
                 },
@@ -846,6 +857,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Delivered,
+            skill_invocations: Vec::new(),
         }],
         turns: vec![Turn {
             id: turn_id,
@@ -861,6 +873,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             role: MessageRole::User,
             status: MessageStatus::Completed,
             content: "Explain this workspace".to_owned(),
+            skill_invocations: Vec::new(),
             truncated: false,
         }],
         activities: vec![Activity::Error {

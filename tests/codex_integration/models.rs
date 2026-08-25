@@ -246,6 +246,7 @@ async fn codex_model_catalog_is_paginated_normalized_and_kept_across_refresh_fai
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Reject incomplete advertised options".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -261,6 +262,7 @@ async fn codex_model_catalog_is_paginated_normalized_and_kept_across_refresh_fai
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Materialize every advertised default".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -384,6 +386,7 @@ async fn selected_model_is_lowered_to_codex_and_effective_model_is_projected_bac
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Use the requested native Model".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -494,6 +497,7 @@ async fn codex_materializes_thread_options_and_handles_native_omission_and_clear
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Use every effective default".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -614,6 +618,7 @@ async fn codex_adapter_distinguishes_explicit_option_defaults_from_native_omissi
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Apply explicit defaults".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -647,6 +652,7 @@ async fn codex_adapter_distinguishes_explicit_option_defaults_from_native_omissi
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Leave options omitted".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -717,6 +723,7 @@ async fn codex_lowers_every_advertised_effort_and_tier_combination_independently
                     prompt: InitialPrompt {
                         id: PromptId::new(),
                         text: format!("Use {effort} with {service_tier}"),
+                        skill_invocations: Vec::new(),
                     },
                 })
                 .await
@@ -790,6 +797,7 @@ async fn codex_model_rejection_never_falls_back_and_restores_the_prompt() {
             prompt: InitialPrompt {
                 id: prompt_id,
                 text: "Do not silently fall back".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -886,6 +894,7 @@ async fn codex_option_rejection_never_falls_back_and_restores_the_prompt() {
             prompt: InitialPrompt {
                 id: prompt_id,
                 text: "Do not silently replace the selected speed".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -974,6 +983,7 @@ async fn generic_codex_turn_rejection_does_not_mark_the_model_unavailable() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Fail for a reason unrelated to Model selection".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await

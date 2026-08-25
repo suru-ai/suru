@@ -225,6 +225,7 @@ async fn an_interrupted_turn_takes_its_steer_with_it_and_keeps_nothing_that_land
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Answer in French instead".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -257,6 +258,7 @@ async fn an_interrupted_turn_takes_its_steer_with_it_and_keeps_nothing_that_land
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Start over".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },

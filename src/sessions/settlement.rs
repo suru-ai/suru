@@ -387,6 +387,7 @@ mod tests {
             role: MessageRole::Agent,
             status: MessageStatus::Streaming,
             content: String::new(),
+            skill_invocations: Vec::new(),
             truncated: false,
         };
         let snapshot = settling_snapshot(
@@ -525,6 +526,7 @@ mod tests {
             role: MessageRole::Agent,
             status: MessageStatus::Completed,
             content: "done".to_owned(),
+            skill_invocations: Vec::new(),
             truncated: false,
         };
         let user = Message {
@@ -533,6 +535,7 @@ mod tests {
             role: MessageRole::User,
             status: MessageStatus::Completed,
             content: "report progress".to_owned(),
+            skill_invocations: Vec::new(),
             truncated: false,
         };
         let snapshot = settling_snapshot(

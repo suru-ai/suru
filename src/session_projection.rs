@@ -499,6 +499,7 @@ mod tests {
             prompts: vec![Prompt {
                 id: prompt_id,
                 text: "Work on this".to_owned(),
+                skill_invocations: Vec::new(),
                 delivery: PromptDelivery::Steer,
                 admission_order: PromptOrder::INITIAL,
                 status: PromptStatus::Pending,

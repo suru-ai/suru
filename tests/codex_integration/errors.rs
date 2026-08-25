@@ -173,6 +173,7 @@ async fn unknown_server_request_gets_method_not_found_without_corrupting_respons
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Keep routing the Codex Turn".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -356,6 +357,7 @@ async fn assert_provider_failure(
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Surface the Provider failure".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await

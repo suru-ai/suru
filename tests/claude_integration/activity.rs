@@ -144,6 +144,7 @@ async fn worked_session(name: &'static str, timeline: &str, text: &str) -> Sessi
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: text.to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await

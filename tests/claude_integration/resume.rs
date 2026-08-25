@@ -78,6 +78,7 @@ impl DurableSession {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Open a durable Claude conversation".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
             })
             .await
@@ -155,6 +156,7 @@ impl DurableSession {
                     prompt: InitialPrompt {
                         id: PromptId::new(),
                         text: prompt.to_owned(),
+                        skill_invocations: Vec::new(),
                     },
                     delivery: PromptDelivery::Steer,
                 },

@@ -494,6 +494,7 @@ mod tests {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Explain the seam".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
             })
             .expect("create Session");

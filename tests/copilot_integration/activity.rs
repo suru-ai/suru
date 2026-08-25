@@ -61,6 +61,7 @@ async fn worked_session(
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: text.to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await

@@ -364,6 +364,7 @@ pub(super) fn lower_selection_options(
 impl ProviderSession for CopilotSession {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
+            input.prompt.reject_unlowered_skill_invocations("Copilot")?;
             self.correlation
                 .lock()
                 .expect("Copilot correlation lock is not poisoned")
@@ -373,7 +374,7 @@ impl ProviderSession for CopilotSession {
                 until_crash(
                     &self.handle,
                     "Copilot Turn startup failed",
-                    self.native.send(input.prompt.as_str()),
+                    self.native.send(input.prompt.text.as_str()),
                 )
                 .await
                 .map(|_message_id| ())
@@ -391,6 +392,7 @@ impl ProviderSession for CopilotSession {
 
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
+            input.prompt.reject_unlowered_skill_invocations("Copilot")?;
             self.require_running_turn("steer")?;
             // Immediate delivery injects the Prompt into the loop already running, where Copilot's
             // default would hold it back and run it as a Turn of its own once this one stopped.
@@ -404,8 +406,9 @@ impl ProviderSession for CopilotSession {
             until_crash(
                 &self.handle,
                 "Copilot Turn steering failed",
-                self.native
-                    .send(MessageOptions::new(input.prompt).with_mode(DeliveryMode::Immediate)),
+                self.native.send(
+                    MessageOptions::new(input.prompt.text).with_mode(DeliveryMode::Immediate),
+                ),
             )
             .await
             .map(|_message_id| ())

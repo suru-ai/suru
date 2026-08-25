@@ -39,6 +39,7 @@ async fn authenticated_session_stream_starts_with_a_complete_revisioned_snapshot
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Explain this workspace".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -137,6 +138,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Explain the stream".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -177,6 +179,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
                         delivery: PromptDelivery::Steer,
                         admission_order: PromptOrder(2),
                         status: PromptStatus::Delivered,
+                        skill_invocations: Vec::new(),
                     },
                 },
                 SessionChange::TurnAdded {
@@ -196,6 +199,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
                         role: MessageRole::User,
                         status: MessageStatus::Completed,
                         content: "Continue with an active Agent".to_owned(),
+                        skill_invocations: Vec::new(),
                         truncated: false,
                     },
                 },
@@ -312,6 +316,7 @@ async fn active_session_stream_does_not_delay_graceful_server_shutdown() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Explain this workspace".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()

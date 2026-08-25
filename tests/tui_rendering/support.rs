@@ -187,6 +187,7 @@ pub fn enter_active_session(
         delivery: PromptDelivery::Steer,
         admission_order: PromptOrder(2),
         status: PromptStatus::Delivered,
+        skill_invocations: Vec::new(),
     });
     snapshot.turns.push(Turn {
         id: turn_id,
@@ -203,6 +204,7 @@ pub fn enter_active_session(
         status: MessageStatus::Completed,
         content: "Long-running work".to_owned(),
         truncated: false,
+        skill_invocations: Vec::new(),
     });
     snapshot
         .transcript
@@ -315,6 +317,7 @@ pub fn navigable_session_snapshot(
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder(section as u64),
             status: PromptStatus::Delivered,
+            skill_invocations: Vec::new(),
         });
         snapshot.turns.push(Turn {
             id: turn_id,
@@ -332,6 +335,7 @@ pub fn navigable_session_snapshot(
                 status: MessageStatus::Completed,
                 content: format!("Prompt section {section}"),
                 truncated: false,
+                skill_invocations: Vec::new(),
             },
             Message {
                 id: agent_message_id,
@@ -342,6 +346,7 @@ pub fn navigable_session_snapshot(
                     "## Agent section {section}\n\nA multiline Markdown response for section {section}."
                 ),
                 truncated: false,
+                skill_invocations: Vec::new(),
             },
         ]);
         snapshot.transcript.extend([
@@ -373,6 +378,7 @@ impl FailedTurnFixture {
                 delivery: PromptDelivery::Steer,
                 admission_order,
                 status: PromptStatus::Delivered,
+                skill_invocations: Vec::new(),
             },
             turn: Turn {
                 id: turn_id,
@@ -389,6 +395,7 @@ impl FailedTurnFixture {
                 status: MessageStatus::Completed,
                 content: text.to_owned(),
                 truncated: false,
+                skill_invocations: Vec::new(),
             },
             activity: Activity::Error {
                 id: ActivityId::new(),

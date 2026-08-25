@@ -296,6 +296,7 @@ impl SessionStore {
         let restored = Prompt {
             id: PromptId::new(),
             text: prompt.text,
+            skill_invocations: prompt.skill_invocations,
             delivery: PromptDelivery::Queue,
             admission_order,
             status: PromptStatus::Pending,
@@ -337,6 +338,7 @@ impl SessionStore {
             PromptOwner {
                 session_id,
                 text: restored.text,
+                skill_invocations: restored.skill_invocations,
                 agent_selection: None,
                 origin: PromptOrigin::Admission(restored.delivery),
             },

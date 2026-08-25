@@ -123,6 +123,7 @@ async fn installed_codex_launches_runs_one_text_turn_and_shuts_down() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Reply with a short confirmation that the smoke test completed.".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -418,6 +419,7 @@ impl RecoveryFixture {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: initial_prompt.to_owned(),
+                    skill_invocations: Vec::new(),
                 },
             })
             .await
@@ -476,6 +478,7 @@ impl RecoveryFixture {
                     prompt: InitialPrompt {
                         id: PromptId::new(),
                         text: prompt.to_owned(),
+                        skill_invocations: Vec::new(),
                     },
                     delivery: PromptDelivery::Steer,
                 },

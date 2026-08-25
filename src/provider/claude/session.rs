@@ -280,6 +280,7 @@ impl ProviderSession for ClaudeSession {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             const CONTEXT: &str = "Claude Turn startup failed";
+            input.prompt.reject_unlowered_skill_invocations("Claude")?;
             let mut slot = self.child.lock().await;
             if self.shutdown_started.load(Ordering::Acquire) {
                 return Err(claude_error("Claude Session is shutting down"));
@@ -333,7 +334,7 @@ impl ProviderSession for ClaudeSession {
             self.turn.begin_turn();
             child
                 .transport
-                .send(&UserMessageEnvelope::text(&input.prompt))
+                .send(&UserMessageEnvelope::text(&input.prompt.text))
                 .await
                 .map_err(|error| {
                     // The Prompt never reached the CLI, so the Turn it would have begun is not
@@ -347,6 +348,7 @@ impl ProviderSession for ClaudeSession {
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             const CONTEXT: &str = "Claude Turn steering failed";
+            input.prompt.reject_unlowered_skill_invocations("Claude")?;
             // A steer is another user message on the running loop's stdin, and nothing about one
             // says which Turn it joins: delivered to a Session running no Turn, the CLI would
             // answer it as a Turn of its own that Suru never began. A Turn only ever runs on a
@@ -360,7 +362,7 @@ impl ProviderSession for ClaudeSession {
             }
             child
                 .transport
-                .send(&UserMessageEnvelope::text(&input.prompt))
+                .send(&UserMessageEnvelope::text(&input.prompt.text))
                 .await
                 .map_err(|error| {
                     self.turn.withdraw_prompt();
@@ -514,7 +516,7 @@ mod tests {
             let session = scripted_session(&directory);
             let error = session
                 .steer_turn(ProviderSteerInput {
-                    prompt: "Answer in French instead".to_owned(),
+                    prompt: crate::provider::ProviderPrompt::plain("Answer in French instead"),
                 })
                 .await
                 .expect_err("a Session with no Turn running has none to steer");
@@ -525,14 +527,14 @@ mod tests {
 
             session
                 .start_turn(ProviderTurnInput {
-                    prompt: "Say hello".to_owned(),
+                    prompt: crate::provider::ProviderPrompt::plain("Say hello"),
                     selection: selection(Vec::new()),
                 })
                 .await
                 .expect("the first Turn spawns the child");
             session
                 .steer_turn(ProviderSteerInput {
-                    prompt: "Answer in French instead".to_owned(),
+                    prompt: crate::provider::ProviderPrompt::plain("Answer in French instead"),
                 })
                 .await
                 .expect("the running Turn takes the steer");
@@ -571,7 +573,7 @@ mod tests {
             let session = scripted_session(&directory);
             session
                 .start_turn(ProviderTurnInput {
-                    prompt: "Say hello".to_owned(),
+                    prompt: crate::provider::ProviderPrompt::plain("Say hello"),
                     selection: selection(Vec::new()),
                 })
                 .await
@@ -584,7 +586,7 @@ mod tests {
             assert!(session.shutdown_started.load(Ordering::Acquire));
             let error = session
                 .start_turn(ProviderTurnInput {
-                    prompt: "Too late".to_owned(),
+                    prompt: crate::provider::ProviderPrompt::plain("Too late"),
                     selection: selection(Vec::new()),
                 })
                 .await

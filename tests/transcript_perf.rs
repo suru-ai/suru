@@ -66,6 +66,7 @@ fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder(section as u64),
             status: PromptStatus::Delivered,
+            skill_invocations: Vec::new(),
         });
         snapshot.turns.push(Turn {
             id: turn_id,
@@ -82,6 +83,7 @@ fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
                 role: MessageRole::User,
                 status: MessageStatus::Completed,
                 content: format!("User question for section {section} with a bit of extra text"),
+                skill_invocations: Vec::new(),
                 truncated: false,
             },
             Message {
@@ -90,6 +92,7 @@ fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
                 role: MessageRole::Agent,
                 status: MessageStatus::Completed,
                 content: agent_markdown(section),
+                skill_invocations: Vec::new(),
                 truncated: false,
             },
         ]);

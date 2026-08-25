@@ -14,15 +14,122 @@ use suru::{
         Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection,
         CreateSessionRequest, FileChange, InitialPrompt, MessageRole, MessageStatus, ModelId,
         PromptDelivery, PromptId, PromptStatus, ProviderId, SessionChange, SessionError,
-        SessionErrorCode, SessionRevision, SessionSnapshot, SessionStatus, TranscriptItem,
-        TurnStatus, Workspace,
+        SessionErrorCode, SessionRevision, SessionSnapshot, SessionStatus, SkillId,
+        SkillInvocation, SkillMarkerSpan, TranscriptItem, TurnStatus, Workspace,
     },
     provider::{
         ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderFileChangeStatus,
+        ProviderSkillInvocation,
     },
     server::{self, ServerConfig},
 };
 use tokio::time::{Duration, timeout};
+
+#[tokio::test]
+async fn provider_session_receives_safe_skill_invocations_and_history_keeps_them() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "skill-prompt-provider-test")
+            .expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "skill-prompt-provider-test")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_managed_client_initial_state(&mut client).await;
+    let invocation = SkillInvocation {
+        skill_id: SkillId::new("safe-review-id"),
+        name: "review".to_owned(),
+        scope: Some("Workspace".to_owned()),
+        marker: SkillMarkerSpan { start: 0, end: 7 },
+    };
+    let second_invocation = SkillInvocation {
+        skill_id: SkillId::new("safe-explain-id"),
+        name: "explain".to_owned(),
+        scope: Some("Workspace".to_owned()),
+        marker: SkillMarkerSpan { start: 8, end: 16 },
+    };
+    let repeated_invocation = SkillInvocation {
+        marker: SkillMarkerSpan { start: 17, end: 24 },
+        ..invocation.clone()
+    };
+    let historical_invocations = vec![
+        invocation.clone(),
+        second_invocation.clone(),
+        repeated_invocation,
+    ];
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "$review $explain $review this change".to_owned(),
+                skill_invocations: historical_invocations.clone(),
+            },
+        })
+        .await
+        .expect("create Skill-bearing Session");
+    let start = provider.next_start().await;
+    let mut provider_session = start.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-skill", "high", "fast"),
+    });
+    let turn = provider_session.next_turn().await;
+
+    assert_eq!(turn.prompt(), "$review $explain $review this change");
+    assert_eq!(turn.skill_invocations().len(), 2);
+    assert_eq!(turn.skill_invocations()[0].skill_id, invocation.skill_id);
+    assert_eq!(
+        turn.skill_invocations()[0].marker_spans,
+        vec![
+            SkillMarkerSpan { start: 0, end: 7 },
+            SkillMarkerSpan { start: 17, end: 24 },
+        ]
+    );
+    assert_eq!(
+        turn.skill_invocations()[1].skill_id,
+        second_invocation.skill_id
+    );
+    assert_eq!(
+        turn.skill_invocations()[1].marker_spans,
+        vec![SkillMarkerSpan { start: 8, end: 16 }]
+    );
+
+    turn.succeed();
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    let settled = read_session_at_least_revision(
+        &reqwest::Client::new(),
+        server.descriptor(),
+        created.session.id,
+        SessionRevision(4),
+    )
+    .await;
+    assert_eq!(
+        settled.prompts[0].skill_invocations,
+        historical_invocations.clone()
+    );
+    assert_eq!(
+        settled.messages[0].content,
+        "$review $explain $review this change"
+    );
+    assert_eq!(
+        settled.messages[0].skill_invocations,
+        historical_invocations
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
 
 #[tokio::test]
 async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_multiple_clients() {
@@ -60,6 +167,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
             prompt: InitialPrompt {
                 id: prompt_id,
                 text: "Explain the provider seam".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -315,6 +423,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
                 prompt: InitialPrompt {
                     id: failing_prompt_id,
                     text: "Fail while a command is active".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -427,6 +536,7 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Normalize provider output".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -664,6 +774,7 @@ async fn reasoning_streams_into_a_titled_transcript_activity_that_settles_with_a
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Explain the Transcript".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -793,6 +904,7 @@ async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Report progress".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -913,6 +1025,7 @@ async fn stopping_a_provider_actor_settles_the_command_it_left_in_flight() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Report progress".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -1042,6 +1155,7 @@ async fn interrupting_a_turn_without_a_provider_actor_settles_its_in_flight_comm
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Report progress".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .send()
@@ -1195,6 +1309,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Begin through the Provider seam".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -1207,6 +1322,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
                 prompt: InitialPrompt {
                     id: preactive_prompt_id,
                     text: "Remain pending across Provider startup".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -1235,13 +1351,20 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
         .expect("Session snapshot is valid");
 
     let accepted_prompt_id = PromptId::new();
+    let steer_invocation = SkillInvocation {
+        skill_id: SkillId::new("safe-steer-review-id"),
+        name: "review".to_owned(),
+        scope: Some("Workspace".to_owned()),
+        marker: SkillMarkerSpan { start: 0, end: 7 },
+    };
     client
         .admit_prompt(
             created.session.id,
             AdmitPromptRequest {
                 prompt: InitialPrompt {
                     id: accepted_prompt_id,
-                    text: "Accept this steer".to_owned(),
+                    text: "$review this steer".to_owned(),
+                    skill_invocations: vec![steer_invocation.clone()],
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -1250,7 +1373,14 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
         .expect("admit accepted steer");
     next_session_update(&mut feed).await;
     let accepted = provider_session.next_steer().await;
-    assert_eq!(accepted.prompt(), "Accept this steer");
+    assert_eq!(accepted.prompt(), "$review this steer");
+    assert_eq!(
+        accepted.skill_invocations(),
+        &[ProviderSkillInvocation {
+            skill_id: steer_invocation.skill_id.clone(),
+            marker_spans: vec![steer_invocation.marker],
+        }]
+    );
     assert_eq!(
         client
             .read_session(created.session.id)
@@ -1274,6 +1404,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
                 prompt: InitialPrompt {
                     id: rejected_prompt_id,
                     text: "Reject this steer".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -1294,6 +1425,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
                 prompt: InitialPrompt {
                     id: following_prompt_id,
                     text: "Accept the steer after rejection".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -1352,7 +1484,10 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
         snapshot
             .messages
             .iter()
-            .filter(|message| message.content == "Accept this steer")
+            .filter(|message| {
+                message.content == "$review this steer"
+                    && message.skill_invocations == vec![steer_invocation.clone()]
+            })
             .count(),
         1
     );
@@ -1402,6 +1537,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
             prompt: InitialPrompt {
                 id: initial_prompt_id,
                 text: "Fail during startup".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -1450,6 +1586,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
                 prompt: InitialPrompt {
                     id: execution_prompt_id,
                     text: "Fail while starting the Turn".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -1512,6 +1649,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
                 prompt: InitialPrompt {
                     id: recovery_prompt_id,
                     text: "Succeed after both failures".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -1584,6 +1722,7 @@ async fn turn_timing_spans_the_delivery_commit_and_every_settle_path() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "Complete this Turn".to_owned(),
+                skill_invocations: Vec::new(),
             },
         })
         .await
@@ -1627,6 +1766,7 @@ async fn turn_timing_spans_the_delivery_commit_and_every_settle_path() {
                         prompt: InitialPrompt {
                             id: PromptId::new(),
                             text: prompt_text.to_owned(),
+                            skill_invocations: Vec::new(),
                         },
                         delivery: PromptDelivery::Steer,
                     },

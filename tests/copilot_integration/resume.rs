@@ -73,6 +73,7 @@ impl RestartedSession {
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "Establish durable Copilot context".to_owned(),
+                    skill_invocations: Vec::new(),
                 },
             })
             .await
@@ -117,6 +118,7 @@ impl RestartedSession {
                     prompt: InitialPrompt {
                         id: PromptId::new(),
                         text: prompt.to_owned(),
+                        skill_invocations: Vec::new(),
                     },
                     delivery: PromptDelivery::Steer,
                 },
