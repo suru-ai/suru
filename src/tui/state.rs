@@ -66,6 +66,16 @@ impl SessionListScope {
         }
     }
 
+    /// Widens this scope to every Workspace, or narrows it back to the one
+    /// the client runs in — the flip a reader makes when a listing scoped to
+    /// where they stand is too narrow, or too wide, for what they are after.
+    pub(super) fn toggled(&self, current_workspace: &Path) -> Self {
+        match self {
+            Self::CurrentWorkspace(_) => Self::AllWorkspaces,
+            Self::AllWorkspaces => Self::CurrentWorkspace(current_workspace.to_owned()),
+        }
+    }
+
     pub(super) fn label(&self) -> &'static str {
         match self {
             Self::CurrentWorkspace(_) => "Current Workspace",

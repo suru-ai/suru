@@ -1,23 +1,20 @@
 //! Session switcher state and title matching.
 
-use std::{cmp::Reverse, path::Path};
+use std::path::Path;
 
 use crate::protocol::{SessionId, SessionListItem, SessionStatus, SessionTimestamp};
 
-use super::{SessionListRequest, SessionListScope};
+use super::{SessionListRequest, SessionListScope, session_listing::SessionListing};
 
 #[derive(Clone, Debug)]
 pub(super) struct SessionPicker {
     open: bool,
-    current_workspace: std::path::PathBuf,
-    scope: SessionListScope,
-    request_sequence: u64,
-    pending_request: Option<SessionListRequest>,
+    /// The Sessions on offer, and the conversation with the server that keeps
+    /// them true. The picker holds only what it does with them: the query it
+    /// filters by and the row the reader is on.
+    listing: SessionListing,
     query: String,
-    sessions: Vec<SessionListItem>,
     selected: Option<SessionId>,
-    loading: bool,
-    error: Option<String>,
     attaching: Option<SessionId>,
     confirming_delete: Option<SessionId>,
     deleting: Option<SessionId>,
@@ -44,15 +41,9 @@ impl SessionPicker {
     pub(super) fn new(current_workspace: std::path::PathBuf) -> Self {
         Self {
             open: false,
-            scope: SessionListScope::CurrentWorkspace(current_workspace.clone()),
-            current_workspace,
-            request_sequence: 0,
-            pending_request: None,
+            listing: SessionListing::new(current_workspace),
             query: String::new(),
-            sessions: Vec::new(),
             selected: None,
-            loading: false,
-            error: None,
             attaching: None,
             confirming_delete: None,
             deleting: None,
@@ -62,21 +53,15 @@ impl SessionPicker {
     pub(super) fn open(&mut self) -> SessionListRequest {
         self.open = true;
         self.query.clear();
-        self.error = None;
+        self.listing.clear_error();
         self.begin_listing()
     }
 
     pub(super) fn close(&mut self) {
         self.open = false;
         self.query.clear();
-        self.sessions.clear();
-        self.selected = None;
-        self.loading = false;
-        self.error = None;
-        self.attaching = None;
-        self.confirming_delete = None;
-        self.deleting = None;
-        self.pending_request = None;
+        self.listing.clear();
+        self.forget_selection();
     }
 
     pub(super) fn is_open(&self) -> bool {
@@ -84,7 +69,7 @@ impl SessionPicker {
     }
 
     pub(super) fn is_loading(&self) -> bool {
-        self.loading
+        self.listing.is_loading()
     }
 
     pub(super) fn query(&self) -> &str {
@@ -92,61 +77,43 @@ impl SessionPicker {
     }
 
     pub(super) fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+        self.listing.error()
     }
 
     pub(super) fn scope(&self) -> &SessionListScope {
-        &self.scope
+        self.listing.scope()
     }
 
     pub(super) fn load(
         &mut self,
         request: &SessionListRequest,
-        mut sessions: Vec<SessionListItem>,
+        sessions: Vec<SessionListItem>,
         current: Option<SessionId>,
     ) {
-        if !self.accepts(request) {
+        if !self.listing.load(request, sessions) {
             return;
         }
-        sessions.sort_unstable_by_key(|summary| Reverse(summary.updated_at()));
-        self.sessions = sessions;
-        self.loading = false;
         self.attaching = None;
         self.confirming_delete = None;
-        self.pending_request = None;
         self.selected = current
             .filter(|current| self.visible_ids().contains(current))
             .or_else(|| self.visible_ids().first().copied());
     }
 
-    /// Takes a Session's newly derived Title and Emoji into a listing already
-    /// drawn, so a Title landing while the picker is open moves the row it is
-    /// on rather than waiting for the reader to reopen the picker.
     pub(super) fn retitle(&mut self, session_id: SessionId, title: String, emoji: Option<String>) {
-        for session in &mut self.sessions {
-            if let SessionListItem::Readable(summary) = session
-                && summary.session.id == session_id
-            {
-                summary.title = title;
-                summary.emoji = emoji;
-                return;
-            }
-        }
+        self.listing.retitle(session_id, title, emoji);
     }
 
     pub(super) fn fail_listing(&mut self, request: &SessionListRequest, error: String) {
-        if !self.accepts(request) {
+        if !self.listing.fail(request, error) {
             return;
         }
-        self.loading = false;
-        self.error = Some(error);
         self.attaching = None;
         self.confirming_delete = None;
-        self.pending_request = None;
     }
 
     pub(super) fn fail_attachment(&mut self, error: String) -> SessionListRequest {
-        self.error = Some(error);
+        self.listing.report_error(error);
         self.begin_listing()
     }
 
@@ -163,15 +130,8 @@ impl SessionPicker {
     }
 
     pub(super) fn toggle_scope(&mut self) -> SessionListRequest {
-        self.confirming_delete = None;
-        self.scope = match &self.scope {
-            SessionListScope::CurrentWorkspace(_) => SessionListScope::AllWorkspaces,
-            SessionListScope::AllWorkspaces => {
-                SessionListScope::CurrentWorkspace(self.current_workspace.clone())
-            }
-        };
-        self.error = None;
-        self.begin_listing()
+        self.forget_selection();
+        self.listing.toggle_scope()
     }
 
     pub(super) fn select_previous(&mut self) {
@@ -193,12 +153,13 @@ impl SessionPicker {
     pub(super) fn begin_attachment(&mut self) -> Option<SessionId> {
         self.confirming_delete = None;
         let selected = self.selected?;
-        self.sessions
+        self.listing
+            .sessions()
             .iter()
             .find(|summary| summary.id() == selected)?
             .readable()?;
         self.attaching = Some(selected);
-        self.error = None;
+        self.listing.clear_error();
         Some(selected)
     }
 
@@ -221,7 +182,7 @@ impl SessionPicker {
         let selected = self.selected?;
         if self.confirming_delete != Some(selected) {
             self.confirming_delete = Some(selected);
-            self.error = None;
+            self.listing.clear_error();
             return None;
         }
         self.confirming_delete = None;
@@ -230,49 +191,13 @@ impl SessionPicker {
     }
 
     pub(super) fn remove(&mut self, session_id: SessionId) {
-        let selected = self.selected == Some(session_id);
-        self.sessions.retain(|summary| summary.id() != session_id);
-        if self.confirming_delete == Some(session_id) {
-            self.confirming_delete = None;
-        }
-        if self.attaching == Some(session_id) {
-            self.attaching = None;
-        }
-        if self.deleting == Some(session_id) {
-            self.deleting = None;
-        }
-        if selected {
-            self.select_first_visible();
-        }
+        self.listing.remove(session_id);
+        self.forget_absent();
     }
 
     pub(super) fn retain_catalog(&mut self, session_ids: &[SessionId]) {
-        self.sessions
-            .retain(|summary| session_ids.contains(&summary.id()));
-        if self
-            .selected
-            .is_some_and(|selected| !session_ids.contains(&selected))
-        {
-            self.select_first_visible();
-        }
-        if self
-            .confirming_delete
-            .is_some_and(|session_id| !session_ids.contains(&session_id))
-        {
-            self.confirming_delete = None;
-        }
-        if self
-            .attaching
-            .is_some_and(|session_id| !session_ids.contains(&session_id))
-        {
-            self.attaching = None;
-        }
-        if self
-            .deleting
-            .is_some_and(|session_id| !session_ids.contains(&session_id))
-        {
-            self.deleting = None;
-        }
+        self.listing.retain(session_ids);
+        self.forget_absent();
     }
 
     pub(super) fn fail_deletion(&mut self, session_id: SessionId, error: String) {
@@ -280,7 +205,7 @@ impl SessionPicker {
             return;
         }
         self.deleting = None;
-        self.error = Some(error);
+        self.listing.report_error(error);
     }
 
     pub(super) fn attaching_to(&self, session_id: SessionId) -> bool {
@@ -288,7 +213,9 @@ impl SessionPicker {
     }
 
     fn rows(&self, current: Option<SessionId>) -> impl Iterator<Item = SessionPickerRow<'_>> {
-        self.sessions
+        let all_workspaces = matches!(self.listing.scope(), SessionListScope::AllWorkspaces);
+        self.listing
+            .sessions()
             .iter()
             .filter(|summary| fuzzy_title_matches(&self.query, summary.title()))
             .map(move |summary| {
@@ -302,7 +229,7 @@ impl SessionPicker {
                         .is_some_and(|summary| summary.session.status == SessionStatus::Active),
                     unreadable: readable.is_none(),
                     updated_at: summary.updated_at(),
-                    workspace: matches!(self.scope, SessionListScope::AllWorkspaces)
+                    workspace: all_workspaces
                         .then(|| {
                             summary
                                 .workspace()
@@ -346,28 +273,46 @@ impl SessionPicker {
     }
 
     fn visible_ids(&self) -> Vec<SessionId> {
-        self.sessions
+        self.listing
+            .sessions()
             .iter()
             .filter(|summary| fuzzy_title_matches(&self.query, summary.title()))
             .map(SessionListItem::id)
             .collect()
     }
 
+    /// Asks the listing again and puts the picker back where a fresh listing
+    /// leaves it: nothing selected, nothing in flight.
     fn begin_listing(&mut self) -> SessionListRequest {
-        self.request_sequence = self.request_sequence.wrapping_add(1);
-        let request = SessionListRequest::new(self.request_sequence, self.scope.clone());
-        self.pending_request = Some(request.clone());
-        self.sessions.clear();
+        self.forget_selection();
+        self.listing.refresh()
+    }
+
+    fn forget_selection(&mut self) {
         self.selected = None;
-        self.loading = true;
         self.attaching = None;
         self.confirming_delete = None;
         self.deleting = None;
-        request
     }
 
-    fn accepts(&self, request: &SessionListRequest) -> bool {
-        self.open && self.pending_request.as_ref() == Some(request)
+    /// Drops what the picker was pointing at once the Sessions behind it have
+    /// left the listing, so no row is confirmed, attached, or deleted twice.
+    fn forget_absent(&mut self) {
+        for session_id in [
+            &mut self.confirming_delete,
+            &mut self.attaching,
+            &mut self.deleting,
+        ] {
+            if session_id.is_some_and(|session_id| !self.listing.contains(session_id)) {
+                *session_id = None;
+            }
+        }
+        if self
+            .selected
+            .is_some_and(|selected| !self.listing.contains(selected))
+        {
+            self.select_first_visible();
+        }
     }
 }
 

@@ -10,6 +10,7 @@ mod model_options;
 mod model_picker;
 mod notice;
 mod render;
+mod session_listing;
 mod session_picker;
 mod settings_panel;
 mod slots;
