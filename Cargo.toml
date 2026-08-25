@@ -15,6 +15,7 @@ diesel_migrations = "2"
 eventsource-stream = "0.2.3"
 fs2 = "0.4.3"
 futures-util = "0.3.31"
+libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 pulldown-cmark = "0.13.4"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "stream"] }
 ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
