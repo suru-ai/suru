@@ -114,8 +114,12 @@ impl CodexSkills {
             },
             skills,
             capabilities: SkillCatalogCapabilities {
-                max_distinct_invocations: Some(1),
-                supported_deliveries: vec![SkillPromptDelivery::Initial],
+                max_distinct_invocations: None,
+                supported_deliveries: vec![
+                    SkillPromptDelivery::Initial,
+                    SkillPromptDelivery::Queue,
+                    SkillPromptDelivery::Steer,
+                ],
             },
             status: SkillCatalogStatus::Fresh { warning },
         })

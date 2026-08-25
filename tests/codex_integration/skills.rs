@@ -10,19 +10,21 @@ use serde_json::{Value, json};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        CreateSessionRequest, InitialPrompt, PromptId, SkillCatalogStatus, SkillInvocation,
-        SkillMarkerSpan, Workspace,
+        Activity, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery,
+        PromptId, PromptStatus, SessionSnapshot, SessionStatus, SkillCatalogStatus,
+        SkillDescriptor, SkillInvocation, SkillMarkerSpan, Workspace,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
 };
+use tokio::time::{Duration, timeout};
 
 const SKILL_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
     *'"method":"skills/list"'*)
-      printf '%s\n' '{"id":2,"result":{"data":[{"cwd":$SKILL_WORKSPACE,"skills":[{"name":"review","description":"Review the current change","path":"/private/codex/skills/review/SKILL.md","scope":"repo","enabled":true},{"name":"disabled","description":"Not offered","path":"/private/codex/skills/disabled/SKILL.md","scope":"user","enabled":false}],"errors":[]}]}}'
+      printf '%s\n' '{"id":2,"result":{"data":[{"cwd":$SKILL_WORKSPACE,"skills":[{"name":"review","description":"Review the current change","path":"/private/codex/skills/review/SKILL.md","scope":"repo","enabled":true},{"name":"explain","description":"Explain the current change","path":"/private/codex/skills/explain/SKILL.md","scope":"user","enabled":true},{"name":"disabled","description":"Not offered","path":"/private/codex/skills/disabled/SKILL.md","scope":"user","enabled":false}],"errors":[]}]}}'
       ;;
     *'"method":"thread/start"'*)
       printf '%s\n' '{"id":2,"result":{"thread":{"id":"skill-thread"},"model":"gpt-fixture"}}'
@@ -56,6 +58,95 @@ const CHANGING_SKILL_CODEX: &str = r#"
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"skill-change-thread","turn":{"id":"skill-change-turn","status":"completed","items":[]}}}'
       ;;
 "#;
+
+const SKILL_OPERATION_CODEX: &str = r#"#!/bin/sh
+turn_index=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"skills/list"'*)
+      printf '%s\n' '{"id":2,"result":{"data":[{"cwd":$SKILL_WORKSPACE,"skills":[{"name":"review","description":"Review the current change","path":"/private/codex/skills/review/SKILL.md","scope":"repo","enabled":true},{"name":"explain","description":"Explain the current change","path":"/private/codex/skills/explain/SKILL.md","scope":"user","enabled":true}],"errors":[]}]}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"skill-operation-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+__TURN_START_ACTION__
+      ;;
+    *'"method":"turn/steer"'*)
+__STEER_ACTION__
+      ;;
+  esac
+done
+wait
+"#;
+
+const DELIVER_SKILL_TURNS: &str = r#"      turn_index=$((turn_index + 1))
+      if [ "$turn_index" -eq 1 ]; then
+        printf '%s\n' '{"id":3,"result":{"turn":{"id":"skill-operation-turn-1"}}}'
+        (
+          while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
+            sleep 0.01
+          done
+          printf '%s\n' '{"method":"turn/completed","params":{"threadId":"skill-operation-thread","turn":{"id":"skill-operation-turn-1","status":"completed","items":[]}}}'
+        ) &
+      else
+        printf '%s\n' '{"id":5,"result":{"turn":{"id":"skill-operation-turn-2"}}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"skill-operation-thread","turn":{"id":"skill-operation-turn-2","status":"completed","items":[]}}}'
+      fi"#;
+
+const ACCEPT_SKILL_STEER: &str =
+    r#"      printf '%s\n' '{"id":4,"result":{"turnId":"skill-operation-turn-1"}}'"#;
+
+const REJECT_SKILL_TURN: &str = r#"      printf '%s\n' '{"id":3,"error":{"code":-32600,"message":"fixture rejected structured Skill input"}}'"#;
+
+const UNEXPECTED_SKILL_STEER: &str = "      exit 65";
+
+fn skill_operation_script(
+    workspace: &std::path::Path,
+    turn_start_action: &str,
+    steer_action: &str,
+) -> String {
+    let workspace_json = serde_json::to_string(workspace).expect("encode Workspace");
+    SKILL_OPERATION_CODEX
+        .replace("$SKILL_WORKSPACE", &workspace_json)
+        .replace("__TURN_START_ACTION__", turn_start_action)
+        .replace("__STEER_ACTION__", steer_action)
+}
+
+fn invocation(skill: &SkillDescriptor, start: u32, end: u32) -> SkillInvocation {
+    SkillInvocation {
+        skill_id: skill.id.clone(),
+        name: skill.name.clone(),
+        scope: skill.scope.clone(),
+        marker: SkillMarkerSpan { start, end },
+    }
+}
+
+async fn wait_for_snapshot(
+    client: &ManagedClient,
+    session_id: suru::protocol::SessionId,
+    description: &str,
+    predicate: impl Fn(&SessionSnapshot) -> bool,
+) -> SessionSnapshot {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = client
+                .read_session(session_id)
+                .await
+                .expect("read Codex Skill Session");
+            if predicate(&snapshot) {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{description}"))
+}
 
 #[tokio::test]
 async fn codex_skill_changes_force_refresh_server_authority() {
@@ -142,7 +233,7 @@ async fn codex_skill_changes_force_refresh_server_authority() {
 }
 
 #[tokio::test]
-async fn codex_discovers_enabled_skills_and_receives_structured_input_with_visible_text() {
+async fn codex_delivers_ordered_distinct_skills_with_visible_skill_only_transcript() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let canonical_workspace =
@@ -178,20 +269,56 @@ async fn codex_discovers_enabled_skills_and_receives_structured_input_with_visib
         catalog.status,
         SkillCatalogStatus::Fresh { warning: None }
     ));
-    assert_eq!(catalog.skills.len(), 1, "disabled Skills stay native-only");
-    let skill = catalog.skills[0].clone();
-    assert_eq!(skill.name, "review");
-    assert_eq!(skill.scope.as_deref(), Some("Workspace"));
-    assert_eq!(catalog.capabilities.max_distinct_invocations, Some(1));
+    assert_eq!(catalog.skills.len(), 2, "disabled Skills stay native-only");
+    let review = catalog
+        .skills
+        .iter()
+        .find(|skill| skill.name == "review")
+        .expect("review Skill is offered")
+        .clone();
+    let explain = catalog
+        .skills
+        .iter()
+        .find(|skill| skill.name == "explain")
+        .expect("explain Skill is offered")
+        .clone();
+    assert_eq!(review.scope.as_deref(), Some("Workspace"));
+    assert_eq!(explain.scope.as_deref(), Some("User"));
+    assert_eq!(catalog.capabilities.max_distinct_invocations, None);
     assert_eq!(
         catalog.capabilities.supported_deliveries,
-        [suru::protocol::SkillPromptDelivery::Initial]
+        [
+            suru::protocol::SkillPromptDelivery::Initial,
+            suru::protocol::SkillPromptDelivery::Queue,
+            suru::protocol::SkillPromptDelivery::Steer,
+        ]
     );
     let serialized = serde_json::to_string(&catalog).expect("serialize safe Skill Catalog");
     assert!(!serialized.contains("SKILL.md"));
     assert!(!serialized.contains("/private/codex"));
 
-    client
+    let visible_prompt = "$review\n$explain $review";
+    let invocations = vec![
+        SkillInvocation {
+            skill_id: review.id.clone(),
+            name: review.name.clone(),
+            scope: review.scope.clone(),
+            marker: SkillMarkerSpan { start: 0, end: 7 },
+        },
+        SkillInvocation {
+            skill_id: explain.id.clone(),
+            name: explain.name.clone(),
+            scope: explain.scope.clone(),
+            marker: SkillMarkerSpan { start: 8, end: 16 },
+        },
+        SkillInvocation {
+            skill_id: review.id,
+            name: review.name,
+            scope: review.scope,
+            marker: SkillMarkerSpan { start: 17, end: 24 },
+        },
+    ];
+    let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
             workspace: Workspace {
@@ -199,13 +326,8 @@ async fn codex_discovers_enabled_skills_and_receives_structured_input_with_visib
             },
             prompt: InitialPrompt {
                 id: PromptId::new(),
-                text: "$review improve this".to_owned(),
-                skill_invocations: vec![SkillInvocation {
-                    skill_id: skill.id,
-                    name: skill.name,
-                    scope: skill.scope,
-                    marker: SkillMarkerSpan { start: 0, end: 7 },
-                }],
+                text: visible_prompt.to_owned(),
+                skill_invocations: invocations.clone(),
             },
         })
         .await
@@ -220,7 +342,322 @@ async fn codex_discovers_enabled_skills_and_receives_structured_input_with_visib
     assert_eq!(
         started["params"]["input"],
         json!([
-            { "type": "text", "text": "$review improve this" },
+            { "type": "text", "text": visible_prompt },
+            {
+                "type": "skill",
+                "name": "review",
+                "path": "/private/codex/skills/review/SKILL.md"
+            },
+            {
+                "type": "skill",
+                "name": "explain",
+                "path": "/private/codex/skills/explain/SKILL.md"
+            }
+        ])
+    );
+
+    let delivered = wait_for_snapshot(
+        &client,
+        created.session.id,
+        "Codex Skill Prompt reaches the Transcript",
+        |snapshot| !snapshot.messages.is_empty(),
+    )
+    .await;
+    assert_eq!(delivered.prompts[0].text, visible_prompt);
+    assert_eq!(delivered.prompts[0].skill_invocations, invocations);
+    assert_eq!(delivered.messages[0].content, visible_prompt);
+    assert_eq!(
+        delivered.messages[0].skill_invocations,
+        delivered.prompts[0].skill_invocations
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn codex_preserves_skill_bindings_through_queue_and_steer_delivery() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let canonical_workspace =
+        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+    let fixture = ScriptedCodex::new(&skill_operation_script(
+        &canonical_workspace,
+        DELIVER_SKILL_TURNS,
+        ACCEPT_SKILL_STEER,
+    ));
+    let channel = "codex-skill-queue-steer-test";
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+
+    let loading = client
+        .list_skills(suru::protocol::SkillCatalogRequest {
+            provider: suru::protocol::ProviderId::new("codex"),
+            workspace: Workspace {
+                path: canonical_workspace,
+            },
+        })
+        .await
+        .expect("list Codex Skills");
+    assert!(matches!(loading.status, SkillCatalogStatus::Loading));
+    let catalog = next_skill_catalog(&mut client).await;
+    let review = catalog
+        .skills
+        .iter()
+        .find(|skill| skill.name == "review")
+        .expect("review Skill is offered");
+    let explain = catalog
+        .skills
+        .iter()
+        .find(|skill| skill.name == "explain")
+        .expect("explain Skill is offered");
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Hold the active Turn".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create active Codex Session");
+    fixture.wait_for_method_count("turn/start", 1).await;
+    wait_for_snapshot(
+        &client,
+        created.session.id,
+        "initial Codex Turn becomes active",
+        |snapshot| snapshot.session.status == SessionStatus::Active,
+    )
+    .await;
+
+    let queued_text = "$explain\n$review $explain";
+    let queued_invocations = vec![
+        invocation(explain, 0, 8),
+        invocation(review, 9, 16),
+        invocation(explain, 17, 25),
+    ];
+    let queued = client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: queued_text.to_owned(),
+                    skill_invocations: queued_invocations.clone(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("admit queued Codex Skill Prompt");
+    assert_eq!(queued.status, PromptStatus::Pending);
+
+    let steer_text = "$review\n$explain $review";
+    let steer_invocations = vec![
+        invocation(review, 0, 7),
+        invocation(explain, 8, 16),
+        invocation(review, 17, 24),
+    ];
+    let steer = client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: steer_text.to_owned(),
+                    skill_invocations: steer_invocations.clone(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit Codex Skill steer");
+    fixture.wait_for_method("turn/steer").await;
+    let steered = wait_for_snapshot(
+        &client,
+        created.session.id,
+        "Codex Skill steer reaches the Transcript",
+        |snapshot| {
+            snapshot
+                .prompts
+                .iter()
+                .find(|prompt| prompt.id == steer.id)
+                .is_some_and(|prompt| prompt.status == PromptStatus::Delivered)
+        },
+    )
+    .await;
+    let steer_message = steered
+        .messages
+        .iter()
+        .find(|message| message.content == steer_text)
+        .expect("delivered steer has a visible Message");
+    assert_eq!(steer_message.skill_invocations, steer_invocations);
+
+    let steer_request = fixture
+        .requests()
+        .into_iter()
+        .find(|request| request["method"] == "turn/steer")
+        .expect("Codex receives the steer");
+    assert_eq!(
+        steer_request["params"]["input"],
+        json!([
+            { "type": "text", "text": steer_text },
+            {
+                "type": "skill",
+                "name": "review",
+                "path": "/private/codex/skills/review/SKILL.md"
+            },
+            {
+                "type": "skill",
+                "name": "explain",
+                "path": "/private/codex/skills/explain/SKILL.md"
+            }
+        ])
+    );
+
+    fixture.release();
+    fixture.wait_for_method_count("turn/start", 2).await;
+    let completed = wait_for_snapshot(
+        &client,
+        created.session.id,
+        "queued Codex Skill Turn settles",
+        |snapshot| snapshot.session.status == SessionStatus::Idle && snapshot.turns.len() == 2,
+    )
+    .await;
+    let queued_message = completed
+        .messages
+        .iter()
+        .find(|message| message.content == queued_text)
+        .expect("queued Prompt has a visible Message");
+    assert_eq!(queued_message.skill_invocations, queued_invocations);
+
+    let queued_start = fixture
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "turn/start")
+        .nth(1)
+        .expect("Codex receives the queued Turn");
+    assert_eq!(
+        queued_start["params"]["input"],
+        json!([
+            { "type": "text", "text": queued_text },
+            {
+                "type": "skill",
+                "name": "explain",
+                "path": "/private/codex/skills/explain/SKILL.md"
+            },
+            {
+                "type": "skill",
+                "name": "review",
+                "path": "/private/codex/skills/review/SKILL.md"
+            }
+        ])
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn codex_does_not_retry_rejected_structured_skills_as_plain_text() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let canonical_workspace =
+        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+    let fixture = ScriptedCodex::new(&skill_operation_script(
+        &canonical_workspace,
+        REJECT_SKILL_TURN,
+        UNEXPECTED_SKILL_STEER,
+    ));
+    let channel = "codex-skill-rejection-test";
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+
+    let loading = client
+        .list_skills(suru::protocol::SkillCatalogRequest {
+            provider: suru::protocol::ProviderId::new("codex"),
+            workspace: Workspace {
+                path: canonical_workspace,
+            },
+        })
+        .await
+        .expect("list Codex Skills");
+    assert!(matches!(loading.status, SkillCatalogStatus::Loading));
+    let catalog = next_skill_catalog(&mut client).await;
+    let review = catalog
+        .skills
+        .iter()
+        .find(|skill| skill.name == "review")
+        .expect("review Skill is offered");
+    let visible_prompt = "$review";
+    let invocations = vec![invocation(review, 0, 7)];
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: visible_prompt.to_owned(),
+                skill_invocations: invocations.clone(),
+            },
+        })
+        .await
+        .expect("create rejected Codex Skill Session");
+    fixture.wait_for_method("turn/start").await;
+    let failed = wait_for_snapshot(
+        &client,
+        created.session.id,
+        "structured Skill rejection fails the Turn",
+        |snapshot| {
+            snapshot.session.status == SessionStatus::Idle
+                && snapshot.activities.iter().any(|activity| {
+                    matches!(activity, Activity::Error { text, .. }
+                        if text.contains("fixture rejected structured Skill input"))
+                })
+        },
+    )
+    .await;
+    assert_eq!(failed.messages[0].content, visible_prompt);
+    assert_eq!(failed.messages[0].skill_invocations, invocations);
+
+    let starts = fixture
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "turn/start")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 1, "Codex receives no text-only retry");
+    assert_eq!(
+        starts[0]["params"]["input"],
+        json!([
+            { "type": "text", "text": visible_prompt },
             {
                 "type": "skill",
                 "name": "review",
