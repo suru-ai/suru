@@ -13,7 +13,7 @@ The Provider, Model, and Model Option configuration a Session will use when its 
 _Avoid_: Model setting, model choice
 
 **Provider**:
-The external product through which an agent operates, such as Codex or Copilot. A Provider identifies that product rather than its underlying model vendor.
+The external product through which an agent operates, such as Codex, Copilot, or Claude. A Provider identifies that product rather than its underlying model vendor.
 _Avoid_: Backend
 
 **Provider Availability**:
@@ -33,7 +33,7 @@ A Provider-advertised, Model-specific configuration dimension such as reasoning 
 _Avoid_: Variant, trait, model setting
 
 **Session**:
-A workspace for conversation between a user and an agent. A Session is independently addressable, may be viewed from multiple clients, and may exist before an agent is selected.
+A workspace for conversation between a user and an agent. A Session is independently addressable, may be viewed from multiple clients, and may exist before an agent is selected. Its first Turn binds it to that Agent's Provider; later Agent Selections may change the Model and Model Options, but not the Provider.
 _Avoid_: Chat, thread, conversation
 
 **Title**:
@@ -83,6 +83,18 @@ _Avoid_: Message, notification
 **Tool**:
 A provider-operated capability that performs work for an agent. User-visible Tool execution is represented as Activity.
 _Avoid_: Function, action
+
+**Skill**:
+A Provider-offered body of task-specific guidance that an Agent may use and a user may explicitly select for a Prompt. Suru identifies an offered Skill to clients by an opaque identity and safe presentation metadata, leaving its native path or command inside the Provider. Distinct from a Tool, which performs work; a Skill guides how work is approached.
+_Avoid_: Command, prompt template
+
+**Skill Invocation**:
+A user's explicit selection of a Skill for one Prompt, written as `$skill-name` in that Prompt and carried as a typed binding beside the original text. It remains bound to that Provider's Skill even when Providers differ in how they receive it; an unbound `$token` is ordinary text.
+_Avoid_: Skill mention, skill command
+
+**Skill Catalog**:
+The current set of Skills a Provider offers a user in one Workspace, together with the Provider's effective Skill Invocation limits and Prompt delivery support. Before a Session's first Turn it follows the Agent Selection; afterwards it follows the Session's fixed Provider. It contains only user-invocable Skills and may change when the Provider's environment changes.
+_Avoid_: Skill list, command catalog
 
 **Reasoning**:
 The account a Provider gives of an agent's thinking during a Turn, carried as Activity because it reports progress rather than the prose the agent authored for the user. A Reasoning block may carry a **title** — a short heading the Provider leads it with, kept beside the content as a typed property so a client can head a Fold with it instead of reading it out of the prose. Each heading the Provider leads a section with begins a new Reasoning block, so a block never carries more than one title. A block that settles with no title and no content stays stored, but a Transcript shows nothing for it. A Transcript hides the kind outright unless a reader asks for it, which is a Setting rather than view state: every block stays stored and keeps arriving either way, and while they are hidden a Transcript shows nothing for any of them — so hidden blocks, like empty ones, neither join nor end the run around them and leave no gap. Distinct from the Reasoning Effort Model Option, which tunes how much of it a Model does, and from the Setting deciding how much summary detail a Turn asks a Provider for, which is what arrives rather than what is shown. Suru's own name for the concept is Reasoning everywhere except the words a Transcript shows a reader, which deliberately say _Thinking_ while a block runs and _Thought_ once it settles.

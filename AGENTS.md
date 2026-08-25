@@ -5,9 +5,8 @@ You have access to the following codebases under ./references/ you should use fo
 - copilot-sdk - GitHub Copilot SDK. Use for building the Copilot integrations
 
 ## Development Notes
-- To start we will only support the Codex and Copilot providers, but additional providers may be added at a later date.
-- Build all functionality supporting both providers to avoid building interfaces that are not generic enough to
-support others down the line.
+- Suru supports the Codex, Copilot, and Claude Providers; additional Providers may be added later.
+- Build Provider functionality across all three through generic interfaces that can support future Providers.
 - This application is very early in development. Freely make breaking changes if they result in better code.
 - Do not account for backwards compatibility with previous versions.
 - Build using interfaces designed for an eventual plugin architecture based on that of OpenCode.
