@@ -9,9 +9,9 @@ use suru::protocol::{
     ModelOptionRole, ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId,
     PromptOrder, PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode,
     SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-    SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillDescriptor,
-    SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, TranscriptItem, Turn, TurnId,
-    TurnStatus, UpdateAgentSelectionRequest, Workspace,
+    SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus,
+    SkillDescriptor, SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery,
+    TranscriptItem, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
 };
 use uuid::Uuid;
 
@@ -65,6 +65,28 @@ fn workspace_skill_catalog_round_trips_only_safe_provider_neutral_metadata() {
     assert_eq!(
         serde_json::from_value::<SkillCatalog>(expected).expect("decode Skill Catalog"),
         catalog
+    );
+}
+
+#[test]
+fn skill_catalog_request_round_trips_provider_and_workspace_context() {
+    let request = SkillCatalogRequest {
+        provider: ProviderId::new("codex"),
+        workspace: Workspace {
+            path: PathBuf::from("workspace"),
+        },
+    };
+    let encoded = json!({
+        "provider": "codex",
+        "workspace": { "path": "workspace" }
+    });
+    assert_eq!(
+        serde_json::to_value(&request).expect("encode request"),
+        encoded
+    );
+    assert_eq!(
+        serde_json::from_value::<SkillCatalogRequest>(encoded).expect("decode request"),
+        request
     );
 }
 

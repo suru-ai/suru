@@ -11,6 +11,7 @@ pub mod server;
 mod session_projection;
 mod sessions;
 pub mod settings;
+mod skill_catalog;
 mod storage;
 mod theme;
 pub mod tui;

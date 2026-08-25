@@ -45,7 +45,7 @@ use crate::{
     protocol::{
         Activity, ActivityId, FileChange, FoldPosture, InitialPrompt, Message, MessageId,
         MessageRole, PromptId, ReasoningVisibility, SessionId, SessionRevision, SessionSnapshot,
-        TranscriptItem, Turn, TurnId, TurnStatus,
+        SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus,
     },
     theme::Theme,
 };
@@ -853,7 +853,7 @@ impl RenderUnit<'_> {
             }
             Self::TurnFold(marker) => Some(render_turn_fold(lines, *marker, theme)),
             Self::Provisional(prompt) => {
-                push_user_message(lines, &prompt.text, theme, width);
+                push_user_message(lines, &prompt.text, &prompt.skill_invocations, theme, width);
                 None
             }
         }
@@ -1789,6 +1789,13 @@ fn message_fingerprint(message: &Message) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     message.content.len().hash(&mut hasher);
     message.truncated.hash(&mut hasher);
+    for invocation in &message.skill_invocations {
+        invocation.skill_id.as_str().hash(&mut hasher);
+        invocation.name.hash(&mut hasher);
+        invocation.scope.hash(&mut hasher);
+        invocation.marker.start.hash(&mut hasher);
+        invocation.marker.end.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -1955,7 +1962,13 @@ fn sanitize_content(text: &str) -> std::borrow::Cow<'_, str> {
 
 fn render_message(lines: &mut Vec<Line<'static>>, message: &Message, theme: &Theme, width: u16) {
     match message.role {
-        MessageRole::User => push_user_message(lines, &message.content, theme, width),
+        MessageRole::User => push_user_message(
+            lines,
+            &message.content,
+            &message.skill_invocations,
+            theme,
+            width,
+        ),
         MessageRole::Agent => push_agent_message(lines, &message.content, message.truncated, theme),
     }
 }
@@ -2738,45 +2751,98 @@ fn humanized_duration(duration_ms: u64) -> String {
 fn push_user_message(
     lines: &mut Vec<Line<'static>>,
     content: &str,
+    skill_invocations: &[SkillInvocation],
     theme: &Theme,
     available_width: u16,
 ) {
     let content = sanitize_content(content);
     let surface = theme.surface.elevated.patch(theme.text.primary);
     let accent = theme.surface.elevated.patch(theme.accent.primary);
+    let skill_ranges = matches!(&content, std::borrow::Cow::Borrowed(_))
+        .then(|| recognized_skill_ranges(&content, skill_invocations))
+        .unwrap_or_default();
     let available_width = usize::from(available_width);
     let content_width = available_width.saturating_sub(2).max(1);
-    for content_line in wrapped_content_lines(&content, content_width) {
-        let padding = available_width.saturating_sub(2 + content_line.width());
-        lines.push(Line::from(vec![
-            Span::styled("┃ ", accent),
-            Span::styled(content_line, surface),
-            Span::styled(" ".repeat(padding), surface),
-        ]));
+    let mut source_offset = 0;
+    for source_line in content.split('\n') {
+        if source_line.is_empty() {
+            push_user_message_row(lines, Vec::new(), 0, available_width, surface, accent);
+            source_offset += 1;
+            continue;
+        }
+        let mut segments = Vec::<(Style, String)>::new();
+        let mut line_width = 0;
+        for (offset, character) in source_line.char_indices() {
+            let character_width = character.width().unwrap_or(1);
+            if line_width > 0 && line_width + character_width > content_width {
+                push_user_message_row(
+                    lines,
+                    std::mem::take(&mut segments),
+                    line_width,
+                    available_width,
+                    surface,
+                    accent,
+                );
+                line_width = 0;
+            }
+            let byte = source_offset + offset;
+            let style = if skill_ranges.iter().any(|range| range.contains(&byte)) {
+                accent
+            } else {
+                surface
+            };
+            match segments.last_mut() {
+                Some((last_style, text)) if *last_style == style => text.push(character),
+                _ => segments.push((style, character.to_string())),
+            }
+            line_width += character_width;
+        }
+        push_user_message_row(
+            lines,
+            segments,
+            line_width,
+            available_width,
+            surface,
+            accent,
+        );
+        source_offset += source_line.len() + 1;
     }
 }
 
-fn wrapped_content_lines(content: &str, width: usize) -> Vec<String> {
-    let mut wrapped = Vec::new();
-    for source_line in content.split('\n') {
-        if source_line.is_empty() {
-            wrapped.push(String::new());
-            continue;
-        }
-        let mut line = String::new();
-        let mut line_width = 0;
-        for character in source_line.chars() {
-            let character_width = character.width().unwrap_or(1);
-            if line_width > 0 && line_width + character_width > width {
-                wrapped.push(std::mem::take(&mut line));
-                line_width = 0;
-            }
-            line.push(character);
-            line_width += character_width;
-        }
-        wrapped.push(line);
-    }
-    wrapped
+fn recognized_skill_ranges(
+    content: &str,
+    skill_invocations: &[SkillInvocation],
+) -> Vec<std::ops::Range<usize>> {
+    skill_invocations
+        .iter()
+        .filter_map(|invocation| {
+            let range = invocation.marker.start as usize..invocation.marker.end as usize;
+            let marker = content.get(range.clone())?;
+            marker
+                .eq_ignore_ascii_case(&format!("${}", invocation.name))
+                .then_some(range)
+        })
+        .collect()
+}
+
+fn push_user_message_row(
+    lines: &mut Vec<Line<'static>>,
+    segments: Vec<(Style, String)>,
+    content_width: usize,
+    available_width: usize,
+    surface: Style,
+    accent: Style,
+) {
+    let padding = available_width.saturating_sub(2 + content_width);
+    let mut spans = Vec::with_capacity(segments.len() + 2);
+    spans.push(Span::styled("┃ ", accent));
+    spans.extend(
+        segments
+            .into_iter()
+            .map(|(style, text)| Span::styled(text, style)),
+    );
+    spans.push(Span::styled(" ".repeat(padding), surface));
+    lines.push(Line::from(spans));
 }
 
 fn push_agent_message(

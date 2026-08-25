@@ -759,9 +759,9 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
     let session_id = created.session.id;
     let start = provider.next_start().await;
     let mut provider_session = start.succeed(AgentIdentity {
-        agent: AgentId::new("codex"),
+        agent: AgentId::new("controlled"),
         selection: AgentSelection {
-            provider: ProviderId::new("codex"),
+            provider: ProviderId::new("controlled"),
             model: ModelId::new("test-model"),
             options: Vec::new(),
         },

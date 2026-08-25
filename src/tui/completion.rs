@@ -2,8 +2,11 @@
 
 use std::ops::Range;
 
+use crate::protocol::{SkillCatalog, SkillDescriptor};
+
 use super::commands::{
-    SemanticCommandDescriptor, SemanticCommandId, command_matches, descriptor, slash_trigger,
+    AUTOCOMPLETE_LIMIT, SemanticCommandDescriptor, SemanticCommandId, command_matches, descriptor,
+    fuzzy_score, slash_trigger,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,12 +28,14 @@ impl CompletionTrigger {
 enum CompletionKind {
     Commands,
     Insertion,
+    Skills,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CompletionCandidate {
     Command(SemanticCommandId),
     Insert(String),
+    Skill(SkillDescriptor),
 }
 
 /// The trigger, typed candidates, and selection belonging to one active
@@ -76,8 +81,24 @@ impl CompletionMode {
         }
     }
 
+    fn skills(trigger: CompletionTrigger, matches: Vec<SkillDescriptor>, selected: usize) -> Self {
+        Self {
+            kind: CompletionKind::Skills,
+            trigger,
+            candidates: matches
+                .into_iter()
+                .map(CompletionCandidate::Skill)
+                .collect(),
+            selected,
+        }
+    }
+
     fn is_commands_for(&self, trigger: &CompletionTrigger) -> bool {
         self.kind == CompletionKind::Commands && self.trigger == *trigger
+    }
+
+    fn is_skills_for(&self, trigger: &CompletionTrigger) -> bool {
+        self.kind == CompletionKind::Skills && self.trigger == *trigger
     }
 
     fn select_previous(&mut self) {
@@ -104,6 +125,10 @@ impl CompletionMode {
                 replacement: self.trigger.replacement.clone(),
                 canonical: canonical.clone(),
             }),
+            CompletionCandidate::Skill(skill) => Some(CompletionConfirmation::InsertSkill {
+                replacement: self.trigger.replacement.clone(),
+                skill: skill.clone(),
+            }),
         }
     }
 
@@ -111,6 +136,7 @@ impl CompletionMode {
         match self.kind {
             CompletionKind::Commands => " Commands ",
             CompletionKind::Insertion => " Completion ",
+            CompletionKind::Skills => " Skills ",
         }
     }
 
@@ -124,6 +150,7 @@ impl CompletionMode {
                         CompletionRow::Command(descriptor(*command))
                     }
                     CompletionCandidate::Insert(canonical) => CompletionRow::Insertion(canonical),
+                    CompletionCandidate::Skill(skill) => CompletionRow::Skill(skill),
                 };
                 (index == self.selected, row)
             })
@@ -138,12 +165,17 @@ pub(super) enum CompletionConfirmation {
         replacement: Range<usize>,
         canonical: String,
     },
+    InsertSkill {
+        replacement: Range<usize>,
+        skill: SkillDescriptor,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum CompletionRow<'a> {
     Command(&'static SemanticCommandDescriptor),
     Insertion(&'a str),
+    Skill(&'a SkillDescriptor),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -153,9 +185,26 @@ pub(super) struct ComposerCompletion {
 }
 
 impl ComposerCompletion {
-    pub(super) fn sync(&mut self, text: &str, cursor: usize) {
+    pub(super) fn sync(&mut self, text: &str, cursor: usize, catalog: Option<&SkillCatalog>) {
         if self.dismissed_text.as_deref() != Some(text) {
             self.dismissed_text = None;
+        }
+        if let Some((query, replacement)) = skill_trigger(text, cursor) {
+            if self.dismissed_text.as_deref() == Some(text) {
+                self.hide();
+                return;
+            }
+            let trigger = CompletionTrigger::new(query, replacement);
+            let selected = self
+                .mode
+                .as_ref()
+                .filter(|mode| mode.is_skills_for(&trigger))
+                .map_or(0, |mode| mode.selected);
+            let matches =
+                catalog.map_or_else(Vec::new, |catalog| skill_matches(&trigger.query, catalog));
+            let selected = selected.min(matches.len().saturating_sub(1));
+            self.mode = Some(CompletionMode::skills(trigger, matches, selected));
+            return;
         }
         let Some((query, replacement)) = slash_trigger(text, cursor) else {
             self.hide();
@@ -232,4 +281,61 @@ impl ComposerCompletion {
     fn hide(&mut self) {
         self.mode = None;
     }
+}
+
+fn skill_trigger(text: &str, cursor: usize) -> Option<(&str, Range<usize>)> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let start = text[..cursor]
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            character
+                .is_whitespace()
+                .then_some(index + character.len_utf8())
+        })
+        .unwrap_or(0);
+    let token = &text[start..cursor];
+    let query = token.strip_prefix('$')?;
+    if query.starts_with(['$', '{', '('])
+        || query
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+        || query.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some((query, start..cursor))
+}
+
+fn skill_matches(query: &str, catalog: &SkillCatalog) -> Vec<SkillDescriptor> {
+    let mut matches = catalog
+        .skills
+        .iter()
+        .filter_map(|skill| {
+            let score = fuzzy_score(query, &skill.name)
+                .into_iter()
+                .chain(fuzzy_score(query, &skill.description).map(|score| score + 1_000))
+                .min()?;
+            Some((
+                score,
+                skill.name.to_ascii_lowercase(),
+                skill.id.as_str(),
+                skill,
+            ))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_unstable_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(right.2))
+    });
+    matches
+        .into_iter()
+        .take(AUTOCOMPLETE_LIMIT)
+        .map(|(_, _, _, skill)| skill.clone())
+        .collect()
 }

@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::protocol::TurnId;
 
-const AUTOCOMPLETE_LIMIT: usize = 10;
+pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SemanticCommandId {
@@ -566,7 +566,7 @@ pub(super) fn command_matches(query: &str) -> Vec<SemanticCommandId> {
         .collect()
 }
 
-fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
+pub(super) fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
     if query.is_empty() {
         return Some(0);
     }

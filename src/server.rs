@@ -30,13 +30,14 @@ use crate::build_identity;
 use crate::errands::{DEFAULT_ERRAND_TIMEOUT, ErrandRunner};
 use crate::model_catalog::ModelCatalogService;
 use crate::protocol::{
-    Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, LifecycleState, Message,
-    MessageId, MessageRole, MessageStatus, PROTOCOL_VERSION, ProviderId, RuntimeDescriptor,
-    SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
-    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT, ServerIdentity,
-    ServerShutdown, SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode,
-    SessionId, SessionRevision, SessionUpdate, SettingMutation, SettingsSnapshot, ShutdownReason,
-    TurnId, UpdateAgentSelectionRequest,
+    Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, InitialPrompt,
+    LifecycleState, Message, MessageId, MessageRole, MessageStatus, PROTOCOL_VERSION, ProviderId,
+    RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT,
+    SESSION_CATALOG_UPDATED_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
+    SETTINGS_SNAPSHOT_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision, SessionChange,
+    SessionError, SessionErrorCode, SessionId, SessionRevision, SessionUpdate, SettingMutation,
+    SettingsSnapshot, ShutdownReason, SkillCatalogRequest, SkillPromptDelivery, TurnId,
+    UpdateAgentSelectionRequest,
 };
 use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
@@ -48,6 +49,7 @@ use crate::sessions::{
     SessionCatalogFeed, SessionFeed, SessionStore, StoreOutcome, TitleDerivation,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
+use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::storage::{StorageRepository, StorageSink, StorageWriter};
 
 pub type ServerConfig = RuntimeConfig;
@@ -311,6 +313,7 @@ struct AppState {
     /// beside the first Turn rather than in front of it.
     title_derivation: TitleDerivation,
     model_catalog: ModelCatalogService,
+    skill_catalog: SkillCatalogService,
     landing_agent_selection: LandingAgentSelectionStore,
     /// The loaded effective-settings view. A watch channel so every attached
     /// lifecycle stream re-pushes the snapshot when a mutation (or a future
@@ -462,14 +465,15 @@ pub async fn spawn_with_providers_and_timings(
     let landing_agent_selection =
         LandingAgentSelectionStore::new(persisted_landing_agent_selection, storage);
     let model_catalog = ModelCatalogService::new(runtimes.iter().cloned(), settings.subscribe());
+    let runtimes = Arc::new(runtimes);
+    let skill_catalog = SkillCatalogService::new(runtimes.clone(), settings.subscribe());
     let providers = ProviderOrchestrator::new(
-        runtimes.clone(),
+        runtimes.as_ref().clone(),
         sessions.clone(),
         provider_shutdown_rx.clone(),
         provider_updates,
         settings.subscribe(),
     );
-    let runtimes = Arc::new(runtimes);
     // Errands are abandoned on the same signal that stops Provider work, so a
     // shutting-down server never waits on one and never resumes one.
     let title_derivation = TitleDerivation::new(
@@ -485,6 +489,7 @@ pub async fn spawn_with_providers_and_timings(
         providers: providers.clone(),
         title_derivation,
         model_catalog,
+        skill_catalog,
         landing_agent_selection,
         settings: Arc::new(settings),
         config_documents,
@@ -500,6 +505,7 @@ pub async fn spawn_with_providers_and_timings(
         .route("/v1/settings", post(mutate_setting))
         .route("/v1/models", get(list_models))
         .route("/v1/models/refresh", post(refresh_models))
+        .route("/v1/skills", post(list_skills))
         .route(
             "/v1/landing-agent-selection",
             put(confirm_landing_agent_selection),
@@ -603,6 +609,23 @@ async fn refresh_models(State(state): State<AppState>, headers: HeaderMap) -> Re
         return StatusCode::UNAUTHORIZED.into_response();
     }
     Json(state.model_catalog.refresh().await).into_response()
+}
+
+async fn list_skills(State(state): State<AppState>, request: Request) -> Response {
+    let request = match decode_session_command::<SkillCatalogRequest>(
+        &state,
+        request,
+        "Skill Catalog listing",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state.skill_catalog.list(request).await {
+        Ok(catalog) => Json(catalog).into_response(),
+        Err(error) => skill_catalog_error_response(error),
+    }
 }
 
 async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -869,6 +892,23 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             .or_else(|| state.model_catalog.default_selection());
     }
 
+    let provider = request
+        .agent_selection
+        .as_ref()
+        .map(|selection| selection.provider.clone())
+        .or_else(|| state.hosted_providers.first().cloned());
+    if let Err(response) = validate_new_prompt_skills(
+        &state,
+        provider,
+        &request.workspace.path,
+        &request.prompt,
+        SkillPromptDelivery::Initial,
+    )
+    .await
+    {
+        return response;
+    }
+
     match state.sessions.create(request) {
         Ok(StoreOutcome::Created(snapshot)) => {
             if let Some(selection) = snapshot.session.agent_selection.clone() {
@@ -1017,6 +1057,39 @@ async fn admit_prompt(
             Err(response) => return response,
         };
 
+    if !request.prompt.skill_invocations.is_empty()
+        && !state.sessions.knows_prompt(request.prompt.id)
+    {
+        let Some(snapshot) = state.sessions.snapshot(session_id) else {
+            return session_error_response(
+                StatusCode::NOT_FOUND,
+                SessionErrorCode::SessionNotFound,
+                "Session does not exist on this server instance",
+            );
+        };
+        let provider = snapshot
+            .session
+            .agent_selection
+            .as_ref()
+            .map(|selection| selection.provider.clone())
+            .or_else(|| state.hosted_providers.first().cloned());
+        let delivery = match request.delivery {
+            crate::protocol::PromptDelivery::Queue => SkillPromptDelivery::Queue,
+            crate::protocol::PromptDelivery::Steer => SkillPromptDelivery::Steer,
+        };
+        if let Err(response) = validate_new_prompt_skills(
+            &state,
+            provider,
+            &snapshot.session.workspace.path,
+            &request.prompt,
+            delivery,
+        )
+        .await
+        {
+            return response;
+        }
+    }
+
     match state.sessions.admit(session_id, request) {
         Ok(StoreOutcome::Created(admission)) => {
             match admission.disposition {
@@ -1047,6 +1120,59 @@ async fn admit_prompt(
         ),
         Err(AdmitPromptError::PromptConflict) => prompt_conflict_response(),
     }
+}
+
+async fn validate_new_prompt_skills(
+    state: &AppState,
+    provider: Option<ProviderId>,
+    workspace: &Path,
+    prompt: &InitialPrompt,
+    delivery: SkillPromptDelivery,
+) -> std::result::Result<(), Response> {
+    if prompt.skill_invocations.is_empty() || state.sessions.knows_prompt(prompt.id) {
+        return Ok(());
+    }
+    let provider = provider.ok_or_else(|| {
+        skill_catalog_error_response(SkillCatalogError::InvalidInvocation(
+            "No Provider is selected for this Skill Invocation".to_owned(),
+        ))
+    })?;
+    state
+        .skill_catalog
+        .validate_prompt(provider, workspace, prompt, delivery)
+        .await
+        .map_err(skill_catalog_error_response)
+}
+
+fn skill_catalog_error_response(error: SkillCatalogError) -> Response {
+    let (status, code, message) = match error {
+        SkillCatalogError::InvalidWorkspace => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::InvalidWorkspace,
+            "Workspace must be an existing local directory".to_owned(),
+        ),
+        SkillCatalogError::ProviderNotHosted(provider) => (
+            StatusCode::CONFLICT,
+            SessionErrorCode::AgentSelectionProviderConflict,
+            format!("Provider `{provider}` is not hosted by this server"),
+        ),
+        SkillCatalogError::Discovery => (
+            StatusCode::BAD_GATEWAY,
+            SessionErrorCode::InvalidSkillInvocation,
+            "The Provider could not list Skills for this Workspace".to_owned(),
+        ),
+        SkillCatalogError::InvalidCatalog(message) => (
+            StatusCode::BAD_GATEWAY,
+            SessionErrorCode::InvalidSkillInvocation,
+            message,
+        ),
+        SkillCatalogError::InvalidInvocation(message) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::InvalidSkillInvocation,
+            message,
+        ),
+    };
+    session_error_response(status, code, message)
 }
 
 async fn promote_prompt(

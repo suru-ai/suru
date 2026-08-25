@@ -23,24 +23,24 @@ use super::{
     DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
     codex_error, codex_error_context,
     projection::{NativeCorrelation, provider_events},
+    skills::CodexSkills,
     transport::{CodexConnection, JsonRpcTransport},
     wire::{
-        ModelListParams, NativeField, NativeModelList, TextInput, ThreadConnectionResult,
-        ThreadResumeParams, ThreadStartParams, TurnInterruptParams, TurnStartParams,
-        TurnStartResult, TurnSteerParams, TurnSteerResult, lower_reasoning_summary,
-        lower_turn_options,
+        ModelListParams, NativeField, NativeModelList, ThreadConnectionResult, ThreadResumeParams,
+        ThreadStartParams, TurnInterruptParams, TurnStartParams, TurnStartResult, TurnSteerParams,
+        TurnSteerResult, lower_reasoning_summary, lower_turn_options,
     },
 };
 use crate::{
     protocol::{
         AgentId, AgentIdentity, AgentSelection, EffectiveSettings, ModelDescriptor, ModelId,
         ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue, ProviderId,
-        ReasoningSummaryDetail,
+        ReasoningSummaryDetail, SkillCatalog,
     },
     provider::{
-        ProviderErrand, ProviderError, ProviderFuture, ProviderResumeState, ProviderRuntime,
-        ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
-        ProviderTurnInput,
+        ProviderErrand, ProviderError, ProviderFuture, ProviderPrompt, ProviderResumeState,
+        ProviderRuntime, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
+        ProviderSteerInput, ProviderTurnInput,
         harness::{ProcessGuard, ProcessRegistry},
         resolve_executable,
     },
@@ -63,6 +63,7 @@ pub struct CodexRuntime {
     /// this runtime started so the value each Turn sends is the one in force
     /// when it starts rather than the one its Session opened with.
     reasoning_summary: Arc<StdMutex<ReasoningSummaryDetail>>,
+    skills: CodexSkills,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -88,6 +89,7 @@ impl CodexRuntime {
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
             shutdown_interrupt_timeout: SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT,
             reasoning_summary: Arc::new(StdMutex::new(ReasoningSummaryDetail::default())),
+            skills: CodexSkills::default(),
         }
     }
 
@@ -140,6 +142,14 @@ impl ProviderRuntime for CodexRuntime {
         Box::pin(async move { discover_codex_models(executable, processes).await })
     }
 
+    fn skill_catalog(&self, workspace: &std::path::Path) -> ProviderFuture<'_, SkillCatalog> {
+        let executable = self.executable.clone();
+        let processes = self.processes.clone();
+        let skills = self.skills.clone();
+        let workspace = workspace.to_owned();
+        Box::pin(async move { skills.discover(&executable, processes, &workspace).await })
+    }
+
     fn start_session(
         &self,
         request: ProviderSessionRequest,
@@ -152,6 +162,8 @@ impl ProviderRuntime for CodexRuntime {
                 shutdown_interrupt: self.shutdown_interrupt_timeout,
             },
             reasoning_summary: self.reasoning_summary.clone(),
+            skills: self.skills.clone(),
+            workspace: request.workspace.clone(),
         };
         Box::pin(async move { start_codex_session(executable, request, processes, context).await })
     }
@@ -247,6 +259,8 @@ struct SessionTimeouts {
 struct SessionContext {
     timeouts: SessionTimeouts,
     reasoning_summary: Arc<StdMutex<ReasoningSummaryDetail>>,
+    skills: CodexSkills,
+    workspace: std::path::PathBuf,
 }
 
 async fn start_codex_session(
@@ -400,7 +414,6 @@ struct CodexSession {
 impl ProviderSession for CodexSession {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
-            input.prompt.reject_unlowered_skill_invocations("Codex")?;
             {
                 let mut correlation = self
                     .correlation
@@ -422,9 +435,11 @@ impl ProviderSession for CodexSession {
             );
             let task = tokio::spawn(start_native_turn(
                 self.thread_id.clone(),
-                input.prompt.text,
+                input.prompt,
                 input.selection,
                 summary,
+                self.context.skills.clone(),
+                self.context.workspace.clone(),
                 self.transport.clone(),
                 self.correlation.clone(),
                 self.turn_start_changed.clone(),
@@ -436,7 +451,10 @@ impl ProviderSession for CodexSession {
 
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
-            input.prompt.reject_unlowered_skill_invocations("Codex")?;
+            let native_input = self
+                .context
+                .skills
+                .lower(&self.context.workspace, input.prompt)?;
             let turn_id = self
                 .correlation
                 .lock()
@@ -449,10 +467,7 @@ impl ProviderSession for CodexSession {
                     "turn/steer",
                     &TurnSteerParams {
                         thread_id: &self.thread_id,
-                        input: [TextInput {
-                            kind: "text",
-                            text: &input.prompt.text,
-                        }],
+                        input: &native_input,
                         expected_turn_id: &turn_id,
                     },
                 )
@@ -540,24 +555,24 @@ impl ProviderSession for CodexSession {
 
 async fn start_native_turn(
     thread_id: String,
-    prompt: String,
+    prompt: ProviderPrompt,
     selection: AgentSelection,
     summary: &'static str,
+    skills: CodexSkills,
+    workspace: std::path::PathBuf,
     transport: JsonRpcTransport,
     correlation: Arc<StdMutex<NativeCorrelation>>,
     turn_start_changed: Arc<Notify>,
 ) -> Result<(), ProviderError> {
     let started = async {
         let options = lower_turn_options(&selection)?;
+        let native_input = skills.lower(&workspace, prompt)?;
         let result = transport
             .request(
                 "turn/start",
                 &TurnStartParams {
                     thread_id: &thread_id,
-                    input: [TextInput {
-                        kind: "text",
-                        text: &prompt,
-                    }],
+                    input: &native_input,
                     model: selection.model.as_str(),
                     summary,
                     effort: options.effort,

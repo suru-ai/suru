@@ -1331,9 +1331,9 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
         .expect("admit Prompt before the initial Turn becomes active");
     let start = provider.next_start().await;
     let identity = AgentIdentity {
-        agent: AgentId::new("codex"),
+        agent: AgentId::new("controlled"),
         selection: AgentSelection {
-            provider: ProviderId::new("codex"),
+            provider: ProviderId::new("controlled"),
             model: ModelId::new("controlled-model"),
             options: Vec::new(),
         },

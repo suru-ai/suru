@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SESSION_CATALOG_SNAPSHOT_EVENT: &str = "session_catalog_snapshot";
@@ -459,6 +459,16 @@ pub struct SkillCatalog {
     pub skills: Vec<SkillDescriptor>,
     pub capabilities: SkillCatalogCapabilities,
     pub status: SkillCatalogStatus,
+}
+
+/// The client context whose current Skill Catalog it wants. The server
+/// canonicalizes the Workspace before consulting the Provider, so spelling
+/// variants of one directory cannot create separate authority domains.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillCatalogRequest {
+    pub provider: ProviderId,
+    pub workspace: Workspace,
 }
 
 /// The byte range occupied by one recognized `$skill-name` marker in the
@@ -1354,6 +1364,7 @@ pub enum SessionErrorCode {
     TurnInterruptionFailed,
     AgentSelectionOperationConflict,
     AgentSelectionProviderConflict,
+    InvalidSkillInvocation,
     ConfigRootUnavailable,
     ConfigDocumentNotEditable,
     ConfigDocumentWriteFailed,

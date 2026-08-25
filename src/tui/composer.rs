@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use crate::protocol::{InitialPrompt, PromptId, SessionId};
+use crate::protocol::{
+    InitialPrompt, PromptId, SessionId, SkillDescriptor, SkillInvocation, SkillMarkerSpan,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum ComposerKey {
@@ -24,12 +26,14 @@ struct ComposerState {
     history_position: Option<usize>,
     history_scratch: Option<String>,
     retry: Option<RetryPrompt>,
+    skill_invocations: Vec<SkillInvocation>,
 }
 
 #[derive(Clone, Debug)]
 struct RetryPrompt {
     id: PromptId,
     text: String,
+    skill_invocations: Vec<SkillInvocation>,
 }
 
 impl ComposerMemory {
@@ -55,6 +59,15 @@ impl ComposerMemory {
 
     pub(super) fn replace(&mut self, key: ComposerKey, range: Range<usize>, text: &str) -> bool {
         self.composer_mut(key).replace(range, text)
+    }
+
+    pub(super) fn insert_skill(
+        &mut self,
+        key: ComposerKey,
+        range: Range<usize>,
+        skill: &SkillDescriptor,
+    ) -> bool {
+        self.composer_mut(key).insert_skill(range, skill)
     }
 
     pub(super) fn delete_backward(&mut self, key: ComposerKey) {
@@ -160,6 +173,7 @@ impl ComposerMemory {
 impl ComposerState {
     fn insert(&mut self, text: &str) {
         self.leave_history_navigation();
+        self.rebase_invocations(self.cursor..self.cursor, text.len());
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
         self.invalidate_retry_after_edit();
@@ -174,10 +188,32 @@ impl ComposerState {
             return false;
         }
         self.leave_history_navigation();
+        self.rebase_invocations(range.clone(), replacement.len());
         let cursor = range.start + replacement.len();
         self.text.replace_range(range, replacement);
         self.cursor = cursor;
         self.invalidate_retry_after_edit();
+        true
+    }
+
+    fn insert_skill(&mut self, range: Range<usize>, skill: &SkillDescriptor) -> bool {
+        let marker = format!("${}", skill.name);
+        let replacement = format!("{marker} ");
+        let start = range.start;
+        if !self.replace(range, &replacement) {
+            return false;
+        }
+        self.skill_invocations.push(SkillInvocation {
+            skill_id: skill.id.clone(),
+            name: skill.name.clone(),
+            scope: skill.scope.clone(),
+            marker: SkillMarkerSpan {
+                start: start as u32,
+                end: (start + marker.len()) as u32,
+            },
+        });
+        self.skill_invocations
+            .sort_by_key(|invocation| invocation.marker.start);
         true
     }
 
@@ -190,6 +226,7 @@ impl ComposerState {
             .char_indices()
             .next_back()
             .map_or(0, |(index, _)| index);
+        self.rebase_invocations(previous..self.cursor, 0);
         self.text.replace_range(previous..self.cursor, "");
         self.cursor = previous;
         self.invalidate_retry_after_edit();
@@ -204,6 +241,7 @@ impl ComposerState {
             .char_indices()
             .nth(1)
             .map_or(self.text.len(), |(offset, _)| self.cursor + offset);
+        self.rebase_invocations(self.cursor..next, 0);
         self.text.replace_range(self.cursor..next, "");
         self.invalidate_retry_after_edit();
     }
@@ -245,6 +283,7 @@ impl ComposerState {
         );
         self.history_position = Some(position);
         self.text.clone_from(&self.history[position]);
+        self.skill_invocations.clear();
         self.cursor = self.text.len();
     }
 
@@ -260,9 +299,11 @@ impl ComposerState {
             let next = position + 1;
             self.history_position = Some(next);
             self.text.clone_from(&self.history[next]);
+            self.skill_invocations.clear();
         } else {
             self.history_position = None;
             self.text = self.history_scratch.take().unwrap_or_default();
+            self.skill_invocations.clear();
         }
         self.cursor = self.text.len();
     }
@@ -273,6 +314,7 @@ impl ComposerState {
         self.history_position = None;
         self.history_scratch = None;
         self.retry = None;
+        self.skill_invocations.clear();
     }
 
     fn begin_submission(&mut self) -> InitialPrompt {
@@ -280,8 +322,9 @@ impl ComposerState {
         let id = self
             .retry
             .as_ref()
-            .filter(|retry| retry.text == text)
+            .filter(|retry| retry.text == text && retry.skill_invocations == self.skill_invocations)
             .map_or_else(PromptId::new, |retry| retry.id);
+        let skill_invocations = std::mem::take(&mut self.skill_invocations);
         self.text.clear();
         self.cursor = 0;
         self.history_position = None;
@@ -289,7 +332,7 @@ impl ComposerState {
         InitialPrompt {
             id,
             text,
-            skill_invocations: Vec::new(),
+            skill_invocations,
         }
     }
 
@@ -298,12 +341,14 @@ impl ComposerState {
             self.push_history(self.text.clone());
         }
         self.text.clone_from(&prompt.text);
+        self.skill_invocations.clone_from(&prompt.skill_invocations);
         self.cursor = self.text.len();
         self.history_position = None;
         self.history_scratch = None;
         self.retry = Some(RetryPrompt {
             id: prompt.id,
             text: prompt.text.clone(),
+            skill_invocations: prompt.skill_invocations.clone(),
         });
     }
 
@@ -326,6 +371,7 @@ impl ComposerState {
             .is_some_and(|retry| retry.id == prompt.id && self.text == retry.text);
         if restored_was_current {
             self.text.clear();
+            self.skill_invocations.clear();
             self.cursor = 0;
             self.history_position = None;
             self.history_scratch = None;
@@ -385,11 +431,9 @@ impl ComposerState {
     }
 
     fn invalidate_retry_after_edit(&mut self) {
-        if self
-            .retry
-            .as_ref()
-            .is_some_and(|retry| retry.text != self.text)
-        {
+        if self.retry.as_ref().is_some_and(|retry| {
+            retry.text != self.text || retry.skill_invocations != self.skill_invocations
+        }) {
             self.retry = None;
         }
     }
@@ -398,6 +442,32 @@ impl ComposerState {
         if !text.is_empty() && self.history.last() != Some(&text) {
             self.history.push(text);
         }
+    }
+
+    fn rebase_invocations(&mut self, edited: Range<usize>, replacement_len: usize) {
+        let removed_len = edited.end.saturating_sub(edited.start);
+        let delta = replacement_len as isize - removed_len as isize;
+        self.skill_invocations.retain_mut(|invocation| {
+            let start = invocation.marker.start as usize;
+            let end = invocation.marker.end as usize;
+            if edited.end <= start {
+                invocation.marker.start = shift(start, delta) as u32;
+                invocation.marker.end = shift(end, delta) as u32;
+                true
+            } else if edited.start >= end {
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+fn shift(value: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        value.saturating_add(delta as usize)
+    } else {
+        value.saturating_sub(delta.unsigned_abs())
     }
 }
 

@@ -10,6 +10,7 @@
 mod errand;
 mod projection;
 mod session;
+mod skills;
 mod transport;
 mod wire;
 

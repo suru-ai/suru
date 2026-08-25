@@ -265,13 +265,61 @@ pub(super) struct NativeThread {
     pub(super) id: String,
 }
 
+// Skill discovery.
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SkillsListParams<'a> {
+    pub(super) cwds: [&'a std::path::Path; 1],
+    pub(super) force_reload: bool,
+}
+
+#[derive(Deserialize)]
+pub(super) struct NativeSkillsList {
+    pub(super) data: Vec<NativeSkillsListEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct NativeSkillsListEntry {
+    pub(super) cwd: PathBuf,
+    pub(super) skills: Vec<NativeSkillMetadata>,
+    #[serde(default)]
+    pub(super) errors: Vec<NativeSkillError>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct NativeSkillMetadata {
+    pub(super) name: String,
+    pub(super) description: String,
+    pub(super) path: PathBuf,
+    pub(super) scope: NativeSkillScope,
+    pub(super) enabled: bool,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum NativeSkillScope {
+    User,
+    Repo,
+    System,
+    Admin,
+}
+
+#[derive(Deserialize)]
+pub(super) struct NativeSkillError {
+    #[serde(rename = "message")]
+    pub(super) _message: String,
+}
+
 // Turn lifecycle.
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct TurnStartParams<'a> {
     pub(super) thread_id: &'a str,
-    pub(super) input: [TextInput<'a>; 1],
+    pub(super) input: &'a [UserInput],
     pub(super) model: &'a str,
     /// How much detail Codex should summarize its Reasoning in. A Turn that
     /// omits it inherits the Model's own default, which is why Suru always
@@ -290,7 +338,7 @@ pub(super) struct TurnStartParams<'a> {
 #[serde(rename_all = "camelCase")]
 pub(super) struct TurnSteerParams<'a> {
     pub(super) thread_id: &'a str,
-    pub(super) input: [TextInput<'a>; 1],
+    pub(super) input: &'a [UserInput],
     pub(super) expected_turn_id: &'a str,
 }
 
@@ -301,11 +349,11 @@ pub(super) struct TurnInterruptParams<'a> {
     pub(super) turn_id: &'a str,
 }
 
-#[derive(Serialize)]
-pub(super) struct TextInput<'a> {
-    #[serde(rename = "type")]
-    pub(super) kind: &'static str,
-    pub(super) text: &'a str,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub(super) enum UserInput {
+    Text { text: String },
+    Skill { name: String, path: PathBuf },
 }
 
 #[derive(Deserialize)]

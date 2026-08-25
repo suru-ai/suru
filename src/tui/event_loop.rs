@@ -19,7 +19,7 @@ use crate::{
     protocol::{
         AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
         ModelCatalog, PromptId, SessionId, SessionListItem, SessionSnapshot, SettingMutation,
-        SettingsSnapshot, TurnId, UpdateAgentSelectionRequest,
+        SettingsSnapshot, SkillCatalog, SkillCatalogRequest, TurnId, UpdateAgentSelectionRequest,
     },
 };
 use anyhow::{Result, anyhow};
@@ -65,6 +65,7 @@ struct SessionTasks {
     attaching: Option<tokio::task::JoinHandle<()>>,
     listing_sessions: Option<(SessionListRequest, tokio::task::JoinHandle<()>)>,
     listing_models: Option<(ModelListRequest, tokio::task::JoinHandle<()>)>,
+    listing_skills: Option<(SkillCatalogRequest, tokio::task::JoinHandle<()>)>,
 }
 
 impl SessionTasks {
@@ -83,6 +84,12 @@ impl SessionTasks {
 
     fn abort_subscribing(&mut self) {
         if let Some((_, task)) = self.subscribing.take() {
+            task.abort();
+        }
+    }
+
+    fn reset_skill_listing(&mut self) {
+        if let Some((_, task)) = self.listing_skills.take() {
             task.abort();
         }
     }
@@ -192,6 +199,25 @@ impl SessionTasks {
             spawn_model_listing(commands, request, results)
         });
     }
+
+    fn list_skills_if_needed(
+        &mut self,
+        commands: SessionCommandClient,
+        request: SkillCatalogRequest,
+        results: &UnboundedSender<SkillCatalogResult>,
+    ) {
+        if self
+            .listing_skills
+            .as_ref()
+            .is_some_and(|(active, _)| active == &request)
+        {
+            return;
+        }
+        let results = results.clone();
+        replace_listing(&mut self.listing_skills, request, |request| {
+            spawn_skill_listing(commands, request, results)
+        });
+    }
 }
 
 /// The channels the run loop's spawned tasks report their results back on.
@@ -200,6 +226,7 @@ struct TaskChannels {
     subscriptions: UnboundedSender<ConnectedSessionSubscription>,
     pickers: UnboundedSender<SessionPickerResult>,
     models: UnboundedSender<ModelPickerResult>,
+    skills: UnboundedSender<SkillCatalogResult>,
 }
 
 /// The run loop's mutable world: the Application it feeds, the client it sends
@@ -228,6 +255,7 @@ async fn run_loop(
     let (subscriptions, mut subscription_rx) = tokio::sync::mpsc::unbounded_channel();
     let (pickers, mut picker_rx) = tokio::sync::mpsc::unbounded_channel();
     let (models, mut model_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (skills, mut skill_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut run = RunLoop {
         client,
         application: Application::new(workspace),
@@ -237,6 +265,7 @@ async fn run_loop(
             subscriptions,
             pickers,
             models,
+            skills,
         },
         reconnect_grace: None,
         spinner_tick: None,
@@ -245,6 +274,7 @@ async fn run_loop(
     let mut input = EventStream::new();
 
     loop {
+        run.sync_skill_catalog();
         run.sync_spinner_tick();
         if run.needs_redraw {
             terminal.draw(|frame| run.application.render(frame))?;
@@ -265,6 +295,7 @@ async fn run_loop(
             connected = subscription_rx.recv() => run.receive_subscription(connected)?,
             submission = submission_rx.recv() => run.receive_submission(submission)?,
             model = model_rx.recv() => run.receive_model_listing(model)?,
+            skill = skill_rx.recv() => run.receive_skill_listing(skill)?,
             picker = picker_rx.recv() => run.receive_session_picker(picker)?,
             input_event = input.next() => match input_event {
                 Some(Ok(event)) => run.handle_input_event(event)?,
@@ -319,6 +350,20 @@ fn leave_run_loop(
 }
 
 impl RunLoop {
+    fn sync_skill_catalog(&mut self) {
+        let Some(request) = self.application.skill_catalog_request() else {
+            return;
+        };
+        if self.application.has_skill_catalog_for(&request) {
+            return;
+        }
+        self.tasks.list_skills_if_needed(
+            self.client.session_commands(),
+            request,
+            &self.channels.skills,
+        );
+    }
+
     fn handle_input_event(&mut self, event: InputEvent) -> Result<ControlFlow<Exit>> {
         if matches!(event, InputEvent::Resize(..)) {
             self.needs_redraw = true;
@@ -452,6 +497,9 @@ impl RunLoop {
     fn receive_managed_event(&mut self, event: Option<ManagedEvent>) -> Result<ControlFlow<Exit>> {
         self.needs_redraw = true;
         let event = event.ok_or_else(|| anyhow!("managed client stopped unexpectedly"))?;
+        if matches!(&event, ManagedEvent::Connecting) {
+            self.tasks.reset_skill_listing();
+        }
         let was_recovering = self.application.is_recovering();
         let transition = self
             .application
@@ -704,6 +752,26 @@ impl RunLoop {
         Ok(ControlFlow::Continue(()))
     }
 
+    fn receive_skill_listing(
+        &mut self,
+        result: Option<SkillCatalogResult>,
+    ) -> Result<ControlFlow<Exit>> {
+        self.needs_redraw = true;
+        let result =
+            result.ok_or_else(|| anyhow!("Skill Catalog task channel stopped unexpectedly"))?;
+        match result {
+            SkillCatalogResult::Listed { request, catalog } => {
+                self.application
+                    .handle_event(ApplicationEvent::SkillsListed { request, catalog })?;
+            }
+            SkillCatalogResult::Failed { request, error } => {
+                self.application
+                    .handle_event(ApplicationEvent::SkillListingFailed { request, error })?;
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
     fn receive_session_picker(
         &mut self,
         result: Option<SessionPickerResult>,
@@ -829,6 +897,34 @@ enum ModelPickerResult {
         request: ModelListRequest,
         error: String,
     },
+}
+
+enum SkillCatalogResult {
+    Listed {
+        request: SkillCatalogRequest,
+        catalog: SkillCatalog,
+    },
+    Failed {
+        request: SkillCatalogRequest,
+        error: String,
+    },
+}
+
+fn spawn_skill_listing(
+    commands: SessionCommandClient,
+    request: SkillCatalogRequest,
+    results: UnboundedSender<SkillCatalogResult>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = match commands.list_skills(request.clone()).await {
+            Ok(catalog) => SkillCatalogResult::Listed { request, catalog },
+            Err(error) => SkillCatalogResult::Failed {
+                request,
+                error: error.to_string(),
+            },
+        };
+        let _ = results.send(result);
+    })
 }
 
 fn spawn_model_listing(

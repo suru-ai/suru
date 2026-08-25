@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use suru::{
-    protocol::{AgentSelection, ModelDescriptor, ProviderId},
+    protocol::{
+        AgentSelection, ModelDescriptor, ProviderId, SkillCatalog, SkillCatalogCapabilities,
+        SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery, Workspace,
+    },
     provider::{
         ProviderErrand, ProviderError, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
         ProviderSessionRequest,
@@ -22,6 +25,38 @@ impl ProviderRuntime for FailingProviderRuntime {
 
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
         Box::pin(async { Err(ProviderError::new("Model discovery is unavailable.")) })
+    }
+
+    fn skill_catalog(&self, workspace: &std::path::Path) -> ProviderFuture<'_, SkillCatalog> {
+        let skills = [
+            ("safe-review-id", "review"),
+            ("safe-smaller-interface-id", "smaller-interface"),
+        ]
+        .into_iter()
+        .map(|(id, name)| SkillDescriptor {
+            id: SkillId::new(id),
+            name: name.to_owned(),
+            description: format!("Test Skill {name}"),
+            scope: Some("Workspace".to_owned()),
+        })
+        .collect();
+        let catalog = SkillCatalog {
+            provider: self.provider_id(),
+            workspace: Workspace {
+                path: workspace.to_owned(),
+            },
+            skills,
+            capabilities: SkillCatalogCapabilities {
+                max_distinct_invocations: None,
+                supported_deliveries: vec![
+                    SkillPromptDelivery::Initial,
+                    SkillPromptDelivery::Queue,
+                    SkillPromptDelivery::Steer,
+                ],
+            },
+            status: SkillCatalogStatus::Fresh { warning: None },
+        };
+        Box::pin(async move { Ok(catalog) })
     }
 
     fn start_session(

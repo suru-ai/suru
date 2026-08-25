@@ -18,8 +18,8 @@ use crate::{
         CreateSessionRequest, EffectiveSettings, FoldPosture, InitialPrompt, MessageId,
         ModelCatalog, PromptDelivery, PromptId, PromptStatus, ServerIdentity, SessionChange,
         SessionId, SessionListItem, SessionSnapshot, SessionStatus, SettingMutation,
-        SettingsSnapshot, ShutdownReason, TurnId, TurnStatus, UpdateAgentSelectionRequest,
-        Workspace,
+        SettingsSnapshot, ShutdownReason, SkillCatalog, SkillCatalogRequest, TurnId, TurnStatus,
+        UpdateAgentSelectionRequest, Workspace,
     },
     settings::SettingChoiceSurface,
     theme::Theme,
@@ -246,6 +246,7 @@ pub struct TuiState {
     pending_steers: Vec<PendingSteer>,
     pub(super) command_mode: CommandMode,
     pub(super) composer_completion: ComposerCompletion,
+    skill_catalog: Option<(SkillCatalogRequest, SkillCatalog)>,
     pending_model_options: bool,
     pub(super) model_options: ModelOptions,
     pub(super) model_picker: ModelPicker,
@@ -339,6 +340,7 @@ impl TuiState {
             pending_steers: Vec::new(),
             command_mode: CommandMode::Composer,
             composer_completion: ComposerCompletion::default(),
+            skill_catalog: None,
             pending_model_options: false,
             model_options: ModelOptions::default(),
             model_picker: ModelPicker::default(),
@@ -349,8 +351,45 @@ impl TuiState {
 
     fn sync_composer_completion(&mut self) {
         let key = self.composer_key();
-        self.composer_completion
-            .sync(self.composers.text(key), self.composers.cursor(key));
+        let catalog = self.current_skill_catalog().cloned();
+        self.composer_completion.sync(
+            self.composers.text(key),
+            self.composers.cursor(key),
+            catalog.as_ref(),
+        );
+    }
+
+    fn current_skill_catalog(&self) -> Option<&SkillCatalog> {
+        let request = self.skill_catalog_request()?;
+        self.skill_catalog
+            .as_ref()
+            .filter(|(loaded, _)| *loaded == request)
+            .map(|(_, catalog)| catalog)
+            .filter(|catalog| {
+                matches!(
+                    catalog.status,
+                    crate::protocol::SkillCatalogStatus::Fresh { .. }
+                )
+            })
+    }
+
+    fn skill_catalog_request(&self) -> Option<SkillCatalogRequest> {
+        let selection = self.agent_selection()?;
+        let workspace = self.session.as_ref().map_or_else(
+            || self.workspace.clone(),
+            |session| session.snapshot().session.workspace.path.clone(),
+        );
+        Some(SkillCatalogRequest {
+            provider: selection.provider.clone(),
+            workspace: Workspace { path: workspace },
+        })
+    }
+
+    fn load_skill_catalog(&mut self, request: SkillCatalogRequest, catalog: SkillCatalog) {
+        if self.skill_catalog_request().as_ref() == Some(&request) {
+            self.skill_catalog = Some((request, catalog));
+            self.sync_composer_completion();
+        }
     }
 
     fn edit_composer(&mut self, edit: impl FnOnce(&mut ComposerMemory, ComposerKey)) {
@@ -377,6 +416,7 @@ impl TuiState {
     pub fn apply(&mut self, event: ManagedEvent) {
         match event {
             ManagedEvent::Connecting => {
+                self.skill_catalog = None;
                 self.identity = None;
                 self.recovery = None;
                 self.reconnect_overlay_visible = false;
@@ -1183,6 +1223,14 @@ pub enum ApplicationEvent {
         request: ModelListRequest,
         error: String,
     },
+    SkillsListed {
+        request: SkillCatalogRequest,
+        catalog: SkillCatalog,
+    },
+    SkillListingFailed {
+        request: SkillCatalogRequest,
+        error: String,
+    },
     LandingAgentSelectionConfirmed(AgentSelection),
     LandingAgentSelectionConfirmationFailed(String),
     AgentSelectionUpdated {
@@ -1376,6 +1424,17 @@ impl Application {
             }
             ApplicationEvent::ModelListingFailed { request, error } => {
                 Ok(self.fail_model_catalog(&request, error))
+            }
+            ApplicationEvent::SkillsListed { request, catalog } => {
+                self.state.load_skill_catalog(request, catalog);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SkillListingFailed { request, error: _ } => {
+                if self.state.skill_catalog_request().as_ref() == Some(&request) {
+                    self.state.skill_catalog = None;
+                    self.state.sync_composer_completion();
+                }
+                Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::LandingAgentSelectionConfirmed(selection) => {
                 Ok(self.confirm_landing_agent_selection(selection))
@@ -1607,6 +1666,12 @@ impl Application {
                 let inserted = format!("{canonical} ");
                 self.state.edit_composer(|composers, key| {
                     composers.replace(key, replacement, &inserted);
+                });
+                Ok(ApplicationTransition::Continue)
+            }
+            CompletionConfirmation::InsertSkill { replacement, skill } => {
+                self.state.edit_composer(|composers, key| {
+                    composers.insert_skill(key, replacement, &skill);
                 });
                 Ok(ApplicationTransition::Continue)
             }
@@ -2481,6 +2546,17 @@ impl Application {
             .session
             .as_ref()
             .map(SessionProjection::session_id)
+    }
+
+    pub(super) fn skill_catalog_request(&self) -> Option<SkillCatalogRequest> {
+        self.state.skill_catalog_request()
+    }
+
+    pub(super) fn has_skill_catalog_for(&self, request: &SkillCatalogRequest) -> bool {
+        self.state
+            .skill_catalog
+            .as_ref()
+            .is_some_and(|(loaded, _)| loaded == request)
     }
 
     pub(super) fn is_recovering(&self) -> bool {

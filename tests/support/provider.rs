@@ -7,6 +7,8 @@ use futures_util::{StreamExt, stream};
 use serde_json::Value;
 use suru::protocol::{
     AgentIdentity, AgentSelection, ModelDescriptor, ModelId, ProviderId, ProviderUnavailability,
+    SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillDescriptor, SkillId,
+    SkillPromptDelivery, Workspace,
 };
 use suru::provider::{
     ProviderErrand, ProviderError, ProviderEvent, ProviderEventStream, ProviderFuture,
@@ -44,6 +46,9 @@ pub struct ControlledProviderRuntime {
     /// arrives on the double's channel is directly observable — so discovery is
     /// the one demand that needs counting.
     discoveries: Arc<AtomicUsize>,
+    skill_discoveries: Arc<AtomicUsize>,
+    skill_catalog: Arc<Mutex<Option<SkillCatalog>>>,
+    skill_catalog_error: Arc<Mutex<Option<String>>>,
     starts: mpsc::UnboundedSender<StartRequest>,
     errands: mpsc::UnboundedSender<ErrandRequest>,
     /// Where a session-shaped Errand's startup goes. It is kept apart from
@@ -121,6 +126,9 @@ impl ControlledProvider {
                 errand_selection: Arc::new(Mutex::new(None)),
                 unavailable: Arc::new(Mutex::new(None)),
                 discoveries: Arc::new(AtomicUsize::new(0)),
+                skill_discoveries: Arc::new(AtomicUsize::new(0)),
+                skill_catalog: Arc::new(Mutex::new(None)),
+                skill_catalog_error: Arc::new(Mutex::new(None)),
                 starts: starts_tx,
                 errands: errands_tx,
                 errand_starts: errand_starts_tx,
@@ -174,6 +182,24 @@ impl ControlledProvider {
 }
 
 impl ControlledProviderRuntime {
+    pub fn offer_skills(&self, catalog: SkillCatalog) {
+        *self
+            .skill_catalog
+            .lock()
+            .expect("controlled Provider Skill Catalog lock is not poisoned") = Some(catalog);
+    }
+
+    pub fn fail_skill_discovery(&self, message: impl Into<String>) {
+        *self
+            .skill_catalog_error
+            .lock()
+            .expect("controlled Provider Skill error lock is not poisoned") = Some(message.into());
+    }
+
+    pub fn skill_discoveries(&self) -> usize {
+        self.skill_discoveries.load(Ordering::SeqCst)
+    }
+
     /// Makes Model discovery report `reason`, or — with `None` — serve the
     /// catalog again, as a user fixing the condition outside Suru would.
     pub fn set_unavailable(&self, reason: Option<ProviderUnavailability>) {
@@ -428,6 +454,28 @@ impl ProviderRuntime for ControlledProviderRuntime {
         })
     }
 
+    fn skill_catalog(&self, workspace: &std::path::Path) -> ProviderFuture<'_, SkillCatalog> {
+        self.skill_discoveries.fetch_add(1, Ordering::SeqCst);
+        let catalog = self
+            .skill_catalog
+            .lock()
+            .expect("controlled Provider Skill Catalog lock is not poisoned")
+            .clone();
+        let error = self
+            .skill_catalog_error
+            .lock()
+            .expect("controlled Provider Skill error lock is not poisoned")
+            .clone();
+        let provider = self.provider.clone();
+        let workspace = workspace.to_owned();
+        Box::pin(async move {
+            if let Some(error) = error {
+                return Err(ProviderError::new(error));
+            }
+            Ok(catalog.unwrap_or_else(|| fixture_skill_catalog(provider, workspace)))
+        })
+    }
+
     fn start_session(
         &self,
         request: ProviderSessionRequest,
@@ -468,6 +516,39 @@ impl ProviderRuntime for ControlledProviderRuntime {
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async { Ok(()) })
+    }
+}
+
+pub fn fixture_skill_catalog(provider: ProviderId, workspace: std::path::PathBuf) -> SkillCatalog {
+    let skills = [
+        ("safe-review-id", "review"),
+        ("safe-explain-id", "explain"),
+        ("safe-steer-review-id", "review"),
+        ("safe-retry-id", "retry"),
+        ("safe-review-after-interrupt-id", "review"),
+        ("safe-smaller-interface-id", "smaller-interface"),
+    ]
+    .into_iter()
+    .map(|(id, name)| SkillDescriptor {
+        id: SkillId::new(id),
+        name: name.to_owned(),
+        description: format!("Test Skill {name}"),
+        scope: Some("Workspace".to_owned()),
+    })
+    .collect();
+    SkillCatalog {
+        provider,
+        workspace: Workspace { path: workspace },
+        skills,
+        capabilities: SkillCatalogCapabilities {
+            max_distinct_invocations: None,
+            supported_deliveries: vec![
+                SkillPromptDelivery::Initial,
+                SkillPromptDelivery::Queue,
+                SkillPromptDelivery::Steer,
+            ],
+        },
+        status: SkillCatalogStatus::Fresh { warning: None },
     }
 }
 

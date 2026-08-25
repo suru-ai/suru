@@ -978,6 +978,16 @@ fn render_composer_completion(
                 CompletionRow::Insertion(canonical) => {
                     truncate_to_width(canonical, usize::from(content_width))
                 }
+                CompletionRow::Skill(skill) => {
+                    let scope = skill
+                        .scope
+                        .as_deref()
+                        .map_or(String::new(), |scope| format!(" · {scope}"));
+                    truncate_to_width(
+                        &format!("${}  {}{}", skill.name, skill.description, scope),
+                        usize::from(content_width),
+                    )
+                }
             };
             Line::styled(
                 content,

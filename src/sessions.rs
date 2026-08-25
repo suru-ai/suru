@@ -212,6 +212,14 @@ impl SessionStore {
             .map(|record| record.snapshot.clone())
     }
 
+    pub(crate) fn knows_prompt(&self, prompt_id: PromptId) -> bool {
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .prompts
+            .contains_key(&prompt_id)
+    }
+
     pub(crate) fn workspace(&self, session_id: SessionId) -> Option<PathBuf> {
         self.state
             .lock()

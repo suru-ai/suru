@@ -7,8 +7,9 @@ use crate::{
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
-use ratatui::{Terminal, backend::TestBackend};
+use ratatui::{Terminal, backend::TestBackend, style::Color};
 use suru::{
+    managed_client::SessionEvent,
     protocol::{
         Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelectionOperationId,
         CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId, SessionError,
@@ -108,6 +109,33 @@ async fn safe_skill_invocations_are_readable_after_a_server_restart() {
     );
     assert_eq!(restored.messages[0].content, "$review persisted work");
     assert_eq!(restored.messages[0].skill_invocations, vec![invocation]);
+
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(restored)))
+        .expect("hydrate restored Skill-bearing Session");
+    let mut terminal = Terminal::new(TestBackend::new(80, 15)).expect("create test terminal");
+    terminal
+        .draw(|frame| application.render(frame))
+        .expect("render restored Transcript");
+    let cells = terminal.backend().buffer().content();
+    let marker = cells
+        .windows(7)
+        .find(|window| window.iter().map(|cell| cell.symbol()).collect::<String>() == "$review")
+        .expect("restored recognized marker is visible");
+    assert!(
+        marker.iter().all(|cell| cell.fg == Color::Cyan),
+        "stored binding accents its marker without consulting the current catalog"
+    );
+    let transcript = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(80)
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(transcript.contains("$review persisted work"));
 
     replacement
         .shutdown()

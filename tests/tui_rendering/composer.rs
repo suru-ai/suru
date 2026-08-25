@@ -8,12 +8,19 @@ use crate::support::{
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
 use suru::{
-    managed_client::SessionEvent,
-    protocol::{PromptId, SessionId},
+    managed_client::{ManagedEvent, SessionEvent},
+    protocol::{
+        AgentSelection, ModelId, PromptId, ProviderId, SessionId, SkillCatalog,
+        SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor,
+        SkillId, SkillPromptDelivery, Workspace,
+    },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, command_for_terminal_event,
     },
 };
+use uuid::Uuid;
+
+use crate::support::ready_health;
 
 #[test]
 fn composer_cursor_tracks_empty_unicode_and_multiline_input() {
@@ -56,6 +63,86 @@ fn composer_cursor_tracks_empty_unicode_and_multiline_input() {
         Position::new(first.0 + 3, first.1),
         "the emoji occupies two terminal cells"
     );
+}
+
+#[test]
+fn skill_completion_replaces_only_the_query_binds_it_and_keeps_the_prompt_open() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let selection = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-fixture"),
+        options: Vec::new(),
+    };
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(Uuid::new_v4(), 42).with_landing_agent_selection(Some(selection)),
+        )))
+        .expect("connect application");
+    let request = SkillCatalogRequest {
+        provider: ProviderId::new("codex"),
+        workspace: Workspace {
+            path: workspace.path().to_owned(),
+        },
+    };
+    let skill = SkillDescriptor {
+        id: SkillId::new("opaque-review-id"),
+        name: "review".to_owned(),
+        description: "Review the current change".to_owned(),
+        scope: Some("Workspace".to_owned()),
+    };
+    application
+        .handle_event(ApplicationEvent::SkillsListed {
+            request: request.clone(),
+            catalog: SkillCatalog {
+                provider: request.provider.clone(),
+                workspace: request.workspace.clone(),
+                skills: vec![skill.clone()],
+                capabilities: SkillCatalogCapabilities {
+                    max_distinct_invocations: None,
+                    supported_deliveries: vec![SkillPromptDelivery::Initial],
+                },
+                status: SkillCatalogStatus::Fresh { warning: None },
+            },
+        })
+        .expect("load Skill Catalog");
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Please $rev".to_owned(),
+        )))
+        .expect("type a Skill query");
+    let completion = rendered_application_rows(&application).join("\n");
+    assert!(completion.contains(" Skills "));
+    assert!(completion.contains("$review"));
+    assert!(!completion.contains(" Commands "));
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(
+                CommandId::ConfirmSelectedCompletion,
+            ))
+            .expect("confirm Skill completion"),
+        ApplicationTransition::Continue,
+        "Skill confirmation edits without submitting"
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "improve this".to_owned(),
+        )))
+        .expect("finish the Prompt");
+    let ApplicationTransition::CreateSession(created) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit Prompt")
+    else {
+        panic!("Skill Prompt should create a Session");
+    };
+    assert_eq!(created.prompt.text, "Please $review improve this");
+    assert_eq!(created.prompt.skill_invocations.len(), 1);
+    assert_eq!(created.prompt.skill_invocations[0].skill_id, skill.id);
+    assert_eq!(created.prompt.skill_invocations[0].name, "review");
+    assert_eq!(created.prompt.skill_invocations[0].marker.start, 7);
+    assert_eq!(created.prompt.skill_invocations[0].marker.end, 14);
 }
 
 #[test]

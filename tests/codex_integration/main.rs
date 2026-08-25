@@ -19,6 +19,7 @@ mod interruption;
 mod models;
 mod process;
 mod shutdown;
+mod skills;
 mod steering;
 mod support;
 mod turns;
