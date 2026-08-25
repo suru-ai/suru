@@ -467,17 +467,17 @@ impl ProviderSession for CodexSession {
                     .lock()
                     .expect("Codex Reasoning summary Setting lock is not poisoned"),
             );
-            let task = tokio::spawn(start_native_turn(
-                self.thread_id.clone(),
-                input.prompt,
-                input.selection,
+            let task = tokio::spawn(start_native_turn(NativeTurnStartRequest {
+                thread_id: self.thread_id.clone(),
+                prompt: input.prompt,
+                selection: input.selection,
                 summary,
-                self.context.skills.clone(),
-                self.context.workspace.clone(),
-                self.transport.clone(),
-                self.correlation.clone(),
-                self.turn_start_changed.clone(),
-            ));
+                skills: self.context.skills.clone(),
+                workspace: self.context.workspace.clone(),
+                transport: self.transport.clone(),
+                correlation: self.correlation.clone(),
+                turn_start_changed: self.turn_start_changed.clone(),
+            }));
             task.await
                 .map_err(|error| codex_error(format!("Codex Turn startup task failed: {error}")))?
         })
@@ -587,7 +587,7 @@ impl ProviderSession for CodexSession {
     }
 }
 
-async fn start_native_turn(
+struct NativeTurnStartRequest {
     thread_id: String,
     prompt: ProviderPrompt,
     selection: AgentSelection,
@@ -597,7 +597,20 @@ async fn start_native_turn(
     transport: JsonRpcTransport,
     correlation: Arc<StdMutex<NativeCorrelation>>,
     turn_start_changed: Arc<Notify>,
-) -> Result<(), ProviderError> {
+}
+
+async fn start_native_turn(request: NativeTurnStartRequest) -> Result<(), ProviderError> {
+    let NativeTurnStartRequest {
+        thread_id,
+        prompt,
+        selection,
+        summary,
+        skills,
+        workspace,
+        transport,
+        correlation,
+        turn_start_changed,
+    } = request;
     let started = async {
         let options = lower_turn_options(&selection)?;
         let native_input = skills.lower(&workspace, prompt)?;

@@ -460,10 +460,8 @@ impl ComposerState {
                 invocation.marker.start = shift(start, delta) as u32;
                 invocation.marker.end = shift(end, delta) as u32;
                 true
-            } else if edited.start >= end {
-                true
             } else {
-                false
+                edited.start >= end
             }
         });
     }

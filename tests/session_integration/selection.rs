@@ -1147,7 +1147,10 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
         skill_id: invocation.skill_id.clone(),
         marker_spans: vec![invocation.marker],
     };
-    assert_eq!(turn.skill_invocations(), &[provider_invocation.clone()]);
+    assert_eq!(
+        turn.skill_invocations(),
+        std::slice::from_ref(&provider_invocation)
+    );
     turn.reject_selection("selected Model is unavailable");
 
     let failed = timeout(Duration::from_secs(1), async {
@@ -1209,7 +1212,10 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
         .await
         .expect("first use of the operation schedules the restored Prompt");
     assert_eq!(repeated.prompt(), "$retry deliberately");
-    assert_eq!(repeated.skill_invocations(), &[provider_invocation.clone()]);
+    assert_eq!(
+        repeated.skill_invocations(),
+        std::slice::from_ref(&provider_invocation)
+    );
     repeated.reject_selection("selected Model remains unavailable");
 
     let failed_again = timeout(Duration::from_secs(1), async {
