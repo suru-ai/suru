@@ -57,8 +57,8 @@ A unit of work that begins when a Prompt is delivered while a Session is idle an
 _Avoid_: Request, exchange
 
 **Settle**:
-The transition of a Turn or Activity into a terminal state — completed, failed, or interrupted — after which it accepts no further Provider output.
-_Avoid_: Finish, close, resolve
+The transition of a Turn or Activity into a terminal state — completed, failed, or interrupted — after which it accepts no further Provider output. A Session Settles in its own, reversible sense: set aside as done for now, by the user's say-so or on its own after long enough idle, and active again the moment it is prompted or the user unsettles it. Wherever Sessions are listed by liveness, the settled ones stand apart from the active ones.
+_Avoid_: Finish, close, resolve; archive (for a settled Session)
 
 **Prompt**:
 User input submitted for delivery to an agent. A delivered Prompt becomes either the user Message that begins a Turn or a later user Message that steers its active Turn.
@@ -111,6 +111,10 @@ _Avoid_: History, log, conversation
 **Session Content Column**:
 The main working column of an open Session: its Transcript, queued Prompts, latest-position affordance, composer extensions, composer, and composer footer. The Session header and the Landing sit outside it.
 _Avoid_: Conversation column, transcript column
+
+**Sidebar**:
+The collapsible column a client shows beside its main view, listing Sessions with the active apart from the settled, searched by Title, and scoped to one Workspace or all of them. Whether it begins shown, and how wide its scope begins, are Settings; showing or hiding it afterwards is the reader's own view state, and a terminal too narrow for both it and the main view keeps the main view.
+_Avoid_: Panel, drawer, session list, nav
 
 **Truncation**:
 The condition of a Message, command Activity, or Reasoning Activity whose stored content Suru's cap cut short of everything the Provider sent. Truncation is carried as a typed property beside the content rather than as text within it, so a client reads it as data and draws its own **truncation marker**: the line a Transcript shows in place of what the cap dropped.
