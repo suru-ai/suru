@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::protocol::{
     RuntimeDescriptor, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
     SKILL_CATALOG_UPDATED_EVENT, SessionCatalogChange, SessionCatalogRevision,
-    SessionCatalogSnapshot, SessionCatalogUpdate, SessionDeleted, SessionId, SessionTitleChanged,
-    SkillCatalog,
+    SessionCatalogSnapshot, SessionCatalogUpdate, SessionDeleted, SessionId,
+    SessionSettlementChanged, SessionTitleChanged, SkillCatalog,
 };
 
 use super::ManagedEvent;
@@ -149,6 +149,20 @@ fn apply_update(
                     session_id,
                     title,
                     emoji,
+                },
+            )))
+        }
+        SessionCatalogChange::SettlementChanged {
+            session_id,
+            settled_at,
+        } => {
+            if !known.contains(&session_id) {
+                bail!("Session catalog settled an unknown Session");
+            }
+            Ok(Some(ManagedEvent::SessionSettlementChanged(
+                SessionSettlementChanged {
+                    session_id,
+                    settled_at,
                 },
             )))
         }

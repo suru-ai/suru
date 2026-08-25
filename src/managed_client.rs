@@ -17,9 +17,10 @@ use crate::{
     protocol::{
         AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, LifecycleState,
         ModelCatalog, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
-        SessionDeleted, SessionError, SessionId, SessionListItem, SessionSnapshot,
-        SessionTitleChanged, SettingMutation, SettingsSnapshot, ShutdownReason, SkillCatalog,
-        SkillCatalogRequest, Turn, TurnId, UpdateAgentSelectionRequest,
+        SessionDeleted, SessionError, SessionId, SessionListItem, SessionSettlementChanged,
+        SessionSnapshot, SessionSummary, SessionTitleChanged, SettingMutation, SettingsSnapshot,
+        SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest, Turn, TurnId,
+        UpdateAgentSelectionRequest,
     },
 };
 
@@ -156,6 +157,10 @@ pub enum ManagedEvent {
     /// the server holds, open or not, because the picker lists Sessions this
     /// client has never opened.
     SessionTitleChanged(SessionTitleChanged),
+    /// A Session was set aside as done for now, or brought back. It arrives on
+    /// the same terms as a Title change, and for the same reason: every client
+    /// lists the Session, and only some have it open.
+    SessionSettlementChanged(SessionSettlementChanged),
     SessionCatalogReconciled(SessionCatalogSnapshot),
     Fatal(String),
 }
@@ -307,6 +312,16 @@ impl ManagedClient {
 
     pub async fn delete_session(&self, session_id: SessionId) -> Result<()> {
         self.session_commands().delete_session(session_id).await
+    }
+
+    pub async fn settle_session(
+        &self,
+        session_id: SessionId,
+        settled: bool,
+    ) -> Result<SessionSummary> {
+        self.session_commands()
+            .settle_session(session_id, settled)
+            .await
     }
 
     pub async fn list_sessions(&self, workspace: Option<&Path>) -> Result<Vec<SessionListItem>> {
@@ -562,6 +577,22 @@ impl SessionCommandClient {
             .await
             .context("send Session deletion")?;
         decode_empty_api_response(response, "Session deletion").await
+    }
+
+    /// Sets a Session aside as done for now, or brings it back. Which of the
+    /// two is stated rather than toggled, so a client acting on a listing that
+    /// has moved on cannot flip a Session it meant to leave alone.
+    pub(crate) async fn settle_session(
+        &self,
+        session_id: SessionId,
+        settled: bool,
+    ) -> Result<SessionSummary> {
+        self.post_session_command(
+            &format!("/v1/sessions/{session_id}/settlement"),
+            &SettleSessionRequest { settled },
+            "Session settlement",
+        )
+        .await
     }
 
     pub(crate) async fn list_sessions(

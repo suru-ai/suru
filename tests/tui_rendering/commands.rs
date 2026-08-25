@@ -40,6 +40,54 @@ fn slash_autocomplete_invokes_new_session_from_a_description_match() {
 }
 
 #[test]
+fn slash_settle_sets_the_open_session_aside() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path());
+    let (session_id, _, _) = enter_active_session(&mut application, workspace.path());
+
+    type_terminal_text(&mut application, "/settle");
+
+    let autocomplete = rendered_application_rows(&application).join("\n");
+    assert!(autocomplete.contains("/settle"));
+    assert!(autocomplete.contains("done for now"));
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("invoke the settle command"),
+        ApplicationTransition::SettleSession(session_id)
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("/settle"),
+        "invoking the command closes the autocomplete it was chosen from"
+    );
+}
+
+/// On the Landing there is no Session to set aside, so the command names none
+/// and the view stays where it is.
+#[test]
+fn slash_settle_on_the_landing_sets_nothing_aside() {
+    let mut application = Application::default();
+
+    type_terminal_text(&mut application, "/settle");
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("invoke the settle command with no Session open"),
+        ApplicationTransition::Continue
+    );
+}
+
+#[test]
 fn insert_completion_replaces_its_range_and_keeps_the_composer_open() {
     let mut application = Application::default();
     type_terminal_text(&mut application, "Ask $revlater");

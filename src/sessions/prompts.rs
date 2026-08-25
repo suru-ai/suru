@@ -199,6 +199,9 @@ impl SessionStore {
             // only once an Errand has derived one, and a Session that never
             // gets one draws just as cleanly.
             emoji: None,
+            // And it begins active: a Session created by a Prompt is work
+            // beginning, which is the opposite of work set aside.
+            settled_at: None,
             created_at: timestamp,
             updated_at: timestamp,
         };
@@ -303,6 +306,10 @@ impl SessionStore {
             admission_order,
             status: PromptStatus::Pending,
         };
+        // Work has arrived for this Session, so it is no longer set aside. The
+        // marker goes before the commit, so the summary that commit persists is
+        // the active one and the announcement follows the Prompt it belongs to.
+        let reactivation = record.reactivate(session_id);
         record
             .commit(
                 &self.storage,
@@ -327,6 +334,9 @@ impl SessionStore {
                 origin: PromptOrigin::Admission(request.delivery),
             },
         );
+        if let Some(change) = reactivation {
+            state.publish_catalog_change(change);
+        }
         Ok(StoreOutcome::Created(PromptAdmission {
             prompt,
             disposition,

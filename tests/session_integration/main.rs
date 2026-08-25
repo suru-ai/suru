@@ -18,6 +18,7 @@ mod multi_provider;
 mod prompts;
 mod provider_enablement;
 mod selection;
+mod settlement;
 mod skills;
 mod storage;
 mod streams;

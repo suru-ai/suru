@@ -20,6 +20,7 @@ pub enum SemanticCommandId {
     SessionList,
     SessionDelete,
     SessionNew,
+    SessionSettle,
     SettingsOpen,
     SettingsPrevious,
     SettingsNext,
@@ -156,6 +157,7 @@ impl SemanticCommandId {
             Self::SessionList => "session.list",
             Self::SessionDelete => "session.delete",
             Self::SessionNew => "session.new",
+            Self::SessionSettle => "session.settle",
             Self::SettingsOpen => "settings.open",
             Self::SettingsPrevious => "settings.previous",
             Self::SettingsNext => "settings.next",
@@ -406,6 +408,16 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             modifiers: KeyModifiers::NONE,
             label: "Ctrl+X N",
         }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SessionSettle,
+        title: "Settle Session",
+        description: "Set the open Session aside as done for now",
+        slash: Some(SlashCommand {
+            name: "settle",
+            aliases: &[],
+        }),
+        keybinding: None,
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsOpen,

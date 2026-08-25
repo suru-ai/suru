@@ -4,7 +4,7 @@
 
 use std::{cmp::Reverse, path::PathBuf};
 
-use crate::protocol::{SessionId, SessionListItem};
+use crate::protocol::{SessionId, SessionListItem, SessionSummary, SessionTimestamp};
 
 use super::{SessionListRequest, SessionListScope};
 
@@ -111,15 +111,29 @@ impl SessionListing {
     /// drawn, so a Title landing while a surface shows it moves the row it is
     /// on rather than waiting for the reader to ask for the listing again.
     pub(super) fn retitle(&mut self, session_id: SessionId, title: String, emoji: Option<String>) {
-        for session in &mut self.sessions {
-            if let SessionListItem::Readable(summary) = session
-                && summary.session.id == session_id
-            {
-                summary.title = title;
-                summary.emoji = emoji;
-                return;
-            }
+        if let Some(summary) = self.readable_mut(session_id) {
+            summary.title = title;
+            summary.emoji = emoji;
         }
+    }
+
+    /// Records a Session the server reports set aside as done for now, or
+    /// brought back. The order this listing keeps is by when a Session was last
+    /// updated, which settling does not touch, so nothing moves.
+    pub(super) fn settle(&mut self, session_id: SessionId, settled_at: Option<SessionTimestamp>) {
+        if let Some(summary) = self.readable_mut(session_id) {
+            summary.settled_at = settled_at;
+        }
+    }
+
+    /// The listed summary a catalog change names, for the changes that revise
+    /// one Session in place. A Session Suru could not read carries no summary
+    /// to revise, so it is passed over rather than reported missing.
+    fn readable_mut(&mut self, session_id: SessionId) -> Option<&mut SessionSummary> {
+        self.sessions.iter_mut().find_map(|session| match session {
+            SessionListItem::Readable(summary) if summary.session.id == session_id => Some(summary),
+            _ => None,
+        })
     }
 
     /// Drops a Session the server reports deleted.
@@ -273,6 +287,28 @@ mod tests {
     }
 
     #[test]
+    fn a_settle_lands_on_the_session_it_names_without_moving_the_order() {
+        let workspace = tempfile::tempdir().expect("create Workspace");
+        let mut listing = SessionListing::new(workspace.path().to_owned());
+        let request = listing.refresh();
+        listing.load(&request, vec![summary("Newer", 2), summary("Set aside", 1)]);
+        let session_id = listing.sessions()[1].id();
+
+        listing.settle(session_id, Some(SessionTimestamp(9)));
+
+        assert_eq!(titles(&listing), vec!["Newer", "Set aside"]);
+        assert_eq!(
+            listing.sessions()[1].settled_at(),
+            Some(SessionTimestamp(9))
+        );
+        assert_eq!(listing.sessions()[0].settled_at(), None);
+
+        listing.settle(session_id, None);
+
+        assert_eq!(listing.sessions()[1].settled_at(), None);
+    }
+
+    #[test]
     fn a_deleted_session_leaves_the_listing() {
         let workspace = tempfile::tempdir().expect("create Workspace");
         let mut listing = SessionListing::new(workspace.path().to_owned());
@@ -362,6 +398,7 @@ mod tests {
             },
             title: title.to_owned(),
             emoji: None,
+            settled_at: None,
             created_at: SessionTimestamp(1),
             updated_at: SessionTimestamp(updated_at),
         })

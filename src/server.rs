@@ -36,8 +36,9 @@ use crate::protocol::{
     SESSION_CATALOG_UPDATED_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
     SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, ServerIdentity, ServerShutdown,
     SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode, SessionId,
-    SessionRevision, SessionUpdate, SettingMutation, SettingsSnapshot, ShutdownReason,
-    SkillCatalog, SkillCatalogRequest, SkillPromptDelivery, TurnId, UpdateAgentSelectionRequest,
+    SessionRevision, SessionUpdate, SettingMutation, SettingsSnapshot, SettleSessionRequest,
+    ShutdownReason, SkillCatalog, SkillCatalogRequest, SkillPromptDelivery, TurnId,
+    UpdateAgentSelectionRequest,
 };
 use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
@@ -46,7 +47,8 @@ use crate::runtime::protect_current_user_file;
 use crate::sessions::{
     AdmitPromptError, AgentSelectionMutationError, CreateSessionError, DeleteSessionError,
     InterruptTurnError, ListSessionsError, PromptAdmissionDisposition, PromptMutationError,
-    SessionCatalogFeed, SessionFeed, SessionStore, StoreOutcome, TitleDerivation,
+    SessionCatalogFeed, SessionFeed, SessionStore, SettleSessionError, StoreOutcome,
+    TitleDerivation,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
@@ -521,6 +523,7 @@ pub async fn spawn_with_providers_and_timings(
             "/v1/sessions/{session_id}/agent-selection",
             post(update_agent_selection),
         )
+        .route("/v1/sessions/{session_id}/settlement", post(settle_session))
         .route("/v1/sessions/{session_id}/prompts", post(admit_prompt))
         .route(
             "/v1/sessions/{session_id}/prompts/{prompt_id}/promote",
@@ -1420,6 +1423,31 @@ async fn delete_session(
             "Session does not exist on this server instance",
         ),
         Err(DeleteSessionError::Storage(_)) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Sets a Session aside as done for now, or brings it back. The intent is the
+/// request's to state rather than the server's to infer, so a client acting on
+/// a stale listing cannot flip a Session it meant to leave alone.
+async fn settle_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    request: Request,
+) -> Response {
+    let settlement =
+        match decode_session_command::<SettleSessionRequest>(&state, request, "Session settlement")
+            .await
+        {
+            Ok(settlement) => settlement,
+            Err(response) => return response,
+        };
+    match state.sessions.settle(session_id, settlement.settled) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(SettleSessionError::SessionNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
     }
 }
 

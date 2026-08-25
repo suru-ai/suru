@@ -15,8 +15,9 @@ use suru::{
         ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus, SessionEvent,
     },
     protocol::{
-        Activity, AgentSelection, ModelId, PromptId, ProviderId, ServerShutdown, SessionId,
-        SessionStatus, ShutdownReason, TurnStatus,
+        Activity, AgentSelection, CreateSessionRequest, InitialPrompt, ModelId, PromptId,
+        ProviderId, ServerShutdown, SessionId, SessionStatus, ShutdownReason, TurnStatus,
+        Workspace,
     },
     server::ServerConfig,
     tui::{
@@ -625,4 +626,85 @@ fn ended_session_subscription_requests_a_fresh_snapshot_for_reconciliation() {
             .expect("handle ended Session subscription"),
         ApplicationTransition::SubscribeSession(session_id)
     );
+}
+
+/// `/settle` end to end: the slash command a reader types in an open Session
+/// reaches a real server, and the Session it names comes back set aside.
+///
+/// The command is followed from the keystroke to what the server holds, which
+/// is the only place the two halves meet — the transition names the Session,
+/// and the server is what decides it is settled.
+#[tokio::test]
+async fn headless_slash_settle_sets_the_open_session_aside_on_a_real_server() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), "headless-settle-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "headless-settle-test")
+            .expect("configure managed client"),
+    )
+    .await
+    .expect("connect managed client");
+    let mut application = Application::new(workspace.path());
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Explain this workspace".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session through managed client");
+    let session_id = created.session.id;
+    application
+        .handle_event(ApplicationEvent::SessionCreated(created))
+        .expect("open the created Session");
+
+    type_terminal_text(&mut application, "/settle");
+    let ApplicationTransition::SettleSession(named) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("invoke the settle command")
+    else {
+        panic!("/settle in an open Session should ask for that Session to be set aside");
+    };
+    assert_eq!(
+        named, session_id,
+        "the command names the Session the reader is in"
+    );
+
+    let settled = client
+        .settle_session(named, true)
+        .await
+        .expect("the server accepts the Session the command named");
+    assert!(
+        settled.settled_at.is_some(),
+        "the Session the command named comes back set aside"
+    );
+    assert_eq!(
+        client
+            .list_sessions(None)
+            .await
+            .expect("list Sessions")
+            .into_iter()
+            .find(|item| item.id() == session_id)
+            .expect("the Session remains listed")
+            .settled_at(),
+        settled.settled_at,
+        "every listing of that Session now carries the marker"
+    );
+
+    server.shutdown().await.expect("stop server");
 }

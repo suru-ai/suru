@@ -26,6 +26,7 @@ mod output;
 mod projection;
 mod prompts;
 mod selection;
+mod settled;
 mod settlement;
 mod title;
 
@@ -37,6 +38,7 @@ pub(crate) use prompts::{
     PromptAdmissionDisposition, PromptMutationError, earliest_pending_prompt,
 };
 pub(crate) use selection::AgentSelectionMutationError;
+pub(crate) use settled::SettleSessionError;
 pub(crate) use settlement::{
     InterruptTurnError, ProviderTurnOutcome, QueuedPromptDisposition, TrailingCommandOutput,
 };
@@ -105,9 +107,19 @@ impl SessionStore {
             readable: persisted_sessions,
             unreadable,
         } = restored;
+        // Every stored moment the store itself minted, so the clock resumes
+        // past all of them. A Settle is minted without a commit, so it can
+        // stand later than any `updated_at` and would otherwise be the one
+        // moment a restored clock could hand out twice.
         let last_timestamp = persisted_sessions
             .iter()
-            .map(|persisted| persisted.summary.updated_at)
+            .flat_map(|persisted| {
+                [
+                    Some(persisted.summary.updated_at),
+                    persisted.summary.settled_at,
+                ]
+            })
+            .flatten()
             .chain(unreadable.iter().map(|summary| summary.updated_at))
             .max();
         let mut sessions = HashMap::new();

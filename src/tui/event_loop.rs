@@ -448,6 +448,9 @@ impl RunLoop {
             ApplicationTransition::DeleteSession(session_id) => {
                 self.spawn_operation(SessionOperation::DeleteSession { session_id });
             }
+            ApplicationTransition::SettleSession(session_id) => {
+                self.spawn_operation(SessionOperation::SettleSession { session_id });
+            }
             ApplicationTransition::SubscribeSession(_) => {
                 unreachable!("terminal input cannot end a Session subscription")
             }
@@ -543,6 +546,7 @@ impl RunLoop {
             ApplicationTransition::CreateSession(_)
             | ApplicationTransition::DetachSession
             | ApplicationTransition::DeleteSession(_)
+            | ApplicationTransition::SettleSession(_)
             | ApplicationTransition::AdmitPrompt { .. }
             | ApplicationTransition::PromotePrompt { .. }
             | ApplicationTransition::CancelPrompt { .. }
@@ -1126,6 +1130,9 @@ enum SessionOperation {
     DeleteSession {
         session_id: SessionId,
     },
+    SettleSession {
+        session_id: SessionId,
+    },
     PromotePrompt {
         session_id: SessionId,
         prompt_id: PromptId,
@@ -1150,6 +1157,12 @@ impl SessionOperation {
                     error: error.to_string(),
                 },
             },
+            // Nothing but the failure needs reporting: the summary the server
+            // answers with reaches every client on the catalog stream, this one
+            // included.
+            Self::SettleSession { session_id } => {
+                operation_result(commands.settle_session(session_id, true).await.map(|_| ()))
+            }
             Self::PromotePrompt {
                 session_id,
                 prompt_id,

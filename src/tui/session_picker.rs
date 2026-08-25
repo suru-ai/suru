@@ -104,6 +104,10 @@ impl SessionPicker {
         self.listing.retitle(session_id, title, emoji);
     }
 
+    pub(super) fn settle(&mut self, session_id: SessionId, settled_at: Option<SessionTimestamp>) {
+        self.listing.settle(session_id, settled_at);
+    }
+
     pub(super) fn fail_listing(&mut self, request: &SessionListRequest, error: String) {
         if !self.listing.fail(request, error) {
             return;

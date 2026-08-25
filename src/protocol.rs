@@ -1065,6 +1065,13 @@ pub struct SessionSummary {
     /// predates the feature.
     #[serde(default)]
     pub emoji: Option<String>,
+    /// When the user set this Session aside as done for now, and `None` while
+    /// it is active. The marker and the moment are one field because a Session
+    /// is settled exactly when there is a moment it was settled at — and a
+    /// reader ordering the Sessions that were set aside needs that moment as
+    /// much as the fact of it.
+    #[serde(default)]
+    pub settled_at: Option<SessionTimestamp>,
     pub created_at: SessionTimestamp,
     pub updated_at: SessionTimestamp,
 }
@@ -1110,6 +1117,17 @@ impl SessionListItem {
         match self {
             Self::Readable(summary) => summary.updated_at,
             Self::Unreadable(summary) => summary.updated_at,
+        }
+    }
+
+    /// When this Session was set aside as done for now, and `None` while it is
+    /// active. A Session Suru could not read is never settled, because settling
+    /// is a judgement about work a reader can still return to and prompting is
+    /// what returns to it — neither of which an unreadable Session offers.
+    pub const fn settled_at(&self) -> Option<SessionTimestamp> {
+        match self {
+            Self::Readable(summary) => summary.settled_at,
+            Self::Unreadable(_) => None,
         }
     }
 
@@ -1162,6 +1180,13 @@ pub enum SessionCatalogChange {
         session_id: SessionId,
         title: String,
         emoji: Option<String>,
+    },
+    /// A Session was set aside as done for now, or brought back. It rides the
+    /// catalog stream for the same reason a Title does: every client lists the
+    /// Session, and only some have it open.
+    SettlementChanged {
+        session_id: SessionId,
+        settled_at: Option<SessionTimestamp>,
     },
 }
 
@@ -1354,6 +1379,15 @@ pub struct CreateSessionRequest {
 pub struct AdmitPromptRequest {
     pub prompt: InitialPrompt,
     pub delivery: PromptDelivery,
+}
+
+/// Whether a Session is being set aside as done for now, or brought back. The
+/// intent is carried rather than a toggle so a client that has been looking at
+/// a stale listing cannot flip a Session it meant to leave alone.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettleSessionRequest {
+    pub settled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1563,6 +1597,15 @@ pub struct ServerShutdown {
 #[serde(deny_unknown_fields)]
 pub struct SessionDeleted {
     pub session_id: SessionId,
+}
+
+/// A Session set aside as done for now, or brought back, carried to a client
+/// that may be listing that Session without having it open.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSettlementChanged {
+    pub session_id: SessionId,
+    pub settled_at: Option<SessionTimestamp>,
 }
 
 /// A Session's Title — and the Emoji beside it — as a derivation left them,

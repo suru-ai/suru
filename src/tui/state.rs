@@ -524,6 +524,10 @@ impl TuiState {
                 self.session_picker
                     .retitle(retitled.session_id, retitled.title, retitled.emoji);
             }
+            ManagedEvent::SessionSettlementChanged(settled) => {
+                self.session_picker
+                    .settle(settled.session_id, settled.settled_at);
+            }
             ManagedEvent::SessionCatalogReconciled(snapshot) => {
                 self.session_picker.retain_catalog(&snapshot.session_ids);
                 if let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id)
@@ -1363,6 +1367,8 @@ pub enum ApplicationTransition {
     SessionEnded,
     DetachSession,
     DeleteSession(SessionId),
+    /// The open Session, set aside as done for now.
+    SettleSession(SessionId),
     CreateSession(CreateSessionRequest),
     AdmitPrompt {
         session_id: SessionId,
@@ -2221,6 +2227,20 @@ impl Application {
                     self.state.toggle_turn_fold(turn_id);
                 }
                 Ok(ApplicationTransition::Continue)
+            }
+            // The command acts on the Session the reader is in, so on the
+            // Landing there is nothing to set aside and the view stays put.
+            SemanticCommandId::SessionSettle => {
+                self.state.command_mode = CommandMode::Composer;
+                Ok(self
+                    .state
+                    .session
+                    .as_ref()
+                    .map(SessionProjection::session_id)
+                    .map_or(
+                        ApplicationTransition::Continue,
+                        ApplicationTransition::SettleSession,
+                    ))
             }
             SemanticCommandId::SessionDelete => {
                 Ok(self.state.session_picker.begin_deletion().map_or(
