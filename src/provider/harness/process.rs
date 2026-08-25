@@ -549,7 +549,7 @@ fn spawn_harness_child(command: &mut Command) -> std::io::Result<(Child, Process
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
             SetInformationJobObject, TerminateJobObject,
         },
-        Threading::CREATE_SUSPENDED,
+        Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED},
     };
 
     #[link(name = "ntdll")]
@@ -577,7 +577,10 @@ fn spawn_harness_child(command: &mut Command) -> std::io::Result<(Child, Process
         return Err(std::io::Error::last_os_error());
     }
 
-    command.creation_flags(CREATE_SUSPENDED);
+    // `CREATE_NO_WINDOW` keeps the console-subsystem app-server from allocating a console of its
+    // own. Suru's server runs detached and so has no console to inherit, which would otherwise
+    // make Windows pop a terminal window for every launched app-server.
+    command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
     let mut child = command.spawn()?;
     let process_handle = child
         .raw_handle()
