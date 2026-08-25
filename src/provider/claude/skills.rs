@@ -12,7 +12,7 @@ use tokio::time::Duration;
 use super::{
     CLAUDE_PROVIDER_ID, claude_error, claude_error_context,
     transport::{ClaudeConnection, ClaudeSettingSources, StreamJsonTransport},
-    wire::{ControlRequest, NativeSkill, NativeSkillList},
+    wire::{ControlRequest, NativeInitialize, NativeSkill, NativeSkillList},
 };
 use crate::{
     protocol::{
@@ -63,23 +63,30 @@ impl ClaudeSkills {
         .await
         .map_err(|error| claude_error_context(DISCOVERY_CONTEXT, error))?;
 
-        // Complete Claude's ordinary native initialization before asking for the dedicated Skill
-        // projection. The broader initialize response also carries built-in slash commands and is
-        // intentionally not itself treated as a Skill Catalog.
+        // Claude's dedicated Skill projection contains what the model can invoke. Initialization's
+        // broader command projection also carries Skills reserved for explicit user invocation,
+        // mixed with built-in slash commands. Both are needed for Suru's user-facing catalog.
         let listed = async {
-            transport
+            let initialized = transport
                 .control_request(&ControlRequest::Initialize, request_timeout)
                 .await
                 .map_err(|failure| claude_error_context(DISCOVERY_CONTEXT, failure.into_error()))?;
+            let initialized: NativeInitialize =
+                serde_json::from_value(initialized).map_err(|error| {
+                    claude_error(format!(
+                        "Claude Code CLI returned an invalid initialize response: {error}"
+                    ))
+                })?;
             let listed = transport
                 .control_request(&ControlRequest::ReloadSkills, request_timeout)
                 .await
                 .map_err(|failure| claude_error_context(DISCOVERY_CONTEXT, failure.into_error()))?;
-            serde_json::from_value(listed).map_err(|error| {
+            let listed: NativeSkillList = serde_json::from_value(listed).map_err(|error| {
                 claude_error(format!(
                     "Claude Code CLI returned an invalid reload_skills response: {error}"
                 ))
-            })
+            })?;
+            Ok::<_, ProviderError>((initialized, listed))
         }
         .await;
         transport.close().await;
@@ -90,7 +97,7 @@ impl ClaudeSkills {
 
         // Prefer the discovery error when there is one: stopping the child is cleanup, not the
         // operation the user asked for. Either way, the short-lived process is gone first.
-        let listed: NativeSkillList = listed?;
+        let (initialized, listed) = listed?;
         stopped?;
         let mut by_name = HashMap::<String, (NativeSkill, SafeMetadata)>::new();
         let mut invalid_entries = 0usize;
@@ -106,6 +113,25 @@ impl ClaudeSkills {
             // Claude returns native sources in precedence order. A later entry with the same
             // canonical name is the effective override the slash invocation resolves.
             by_name.insert(skill.name.to_ascii_lowercase(), (skill, metadata));
+        }
+        for skill in initialized.commands {
+            let key = skill.name.to_ascii_lowercase();
+            if by_name.contains_key(&key) {
+                continue;
+            }
+            let Some(metadata) = scoped_metadata(&skill.description) else {
+                // Initialization also contains built-in and other non-Skill slash commands. Native
+                // Skills carry source metadata in their descriptions; unscoped commands do not.
+                continue;
+            };
+            if skill.name.is_empty()
+                || skill.name.chars().any(char::is_whitespace)
+                || metadata.description.trim().is_empty()
+            {
+                invalid_entries += 1;
+                continue;
+            }
+            by_name.insert(key, (skill, metadata));
         }
 
         let mut native = HashMap::new();
@@ -214,6 +240,13 @@ struct SafeMetadata {
 }
 
 fn safe_metadata(description: &str) -> SafeMetadata {
+    scoped_metadata(description).unwrap_or_else(|| SafeMetadata {
+        description: description.to_owned(),
+        scope: "Built-in".to_owned(),
+    })
+}
+
+fn scoped_metadata(description: &str) -> Option<SafeMetadata> {
     for (suffix, scope) in [
         (" (project)", "Workspace"),
         (" (project, gitignored)", "Workspace"),
@@ -221,25 +254,22 @@ fn safe_metadata(description: &str) -> SafeMetadata {
         (" (plugin)", "Plugin"),
     ] {
         if let Some(description) = description.strip_suffix(suffix) {
-            return SafeMetadata {
+            return Some(SafeMetadata {
                 description: description.to_owned(),
                 scope: scope.to_owned(),
-            };
+            });
         }
     }
     if let Some((plugin, description)) = description
         .strip_prefix('(')
         .and_then(|rest| rest.split_once(") "))
     {
-        return SafeMetadata {
+        return Some(SafeMetadata {
             description: description.to_owned(),
             scope: format!("Plugin · {plugin}"),
-        };
+        });
     }
-    SafeMetadata {
-        description: description.to_owned(),
-        scope: "Built-in".to_owned(),
-    }
+    None
 }
 
 fn opaque_skill_id(workspace: &Path, skill: &NativeSkill, scope: &str) -> SkillId {

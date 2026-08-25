@@ -15,15 +15,23 @@ use suru::protocol::{
 };
 
 fn skill_catalog_arms() -> String {
-    skill_catalog_arms_with(
+    skill_catalog_arms_with_commands(
         r#"[{"name":"review","description":"Shadowed review (user)","argumentHint":""},{"name":"review","description":"Review the current change (project)","argumentHint":""},{"name":"explain","description":"Explain the current change (user)","argumentHint":"<topic>"},{"name":"charts","description":"(data-tools@official) Draw a chart","argumentHint":""},{"name":"invalid name","description":"Not invocable (project)","argumentHint":""}]"#,
+        r#"[{"name":"help","description":"Built-in help","argumentHint":""},{"name":"hidden","description":"A non-Skill command","argumentHint":""},{"name":"implement","description":"Implement a piece of work (user)","argumentHint":""}]"#,
     )
 }
 
 fn skill_catalog_arms_with(skills: &str) -> String {
+    skill_catalog_arms_with_commands(
+        skills,
+        r#"[{"name":"help","description":"Built-in help","argumentHint":""},{"name":"hidden","description":"A non-Skill command","argumentHint":""}]"#,
+    )
+}
+
+fn skill_catalog_arms_with_commands(skills: &str, commands: &str) -> String {
     format!(
         r#"{}    *'"subtype":"initialize"'*)
-      printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"commands":[{{"name":"help","description":"Built-in help","argumentHint":""}},{{"name":"hidden","description":"A non-Skill command","argumentHint":""}}],"agents":[],"output_style":"default","account":{{"email":"fixture@example.com","apiProvider":"firstParty"}}}}}}}}'
+      printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"commands":__COMMANDS__,"agents":[],"output_style":"default","account":{{"email":"fixture@example.com","apiProvider":"firstParty"}}}}}}}}'
       ;;
 {}    *'"subtype":"reload_skills"'*)
       printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"skills":__SKILLS__}}}}}}'
@@ -32,6 +40,7 @@ fn skill_catalog_arms_with(skills: &str) -> String {
         version_arm(CLAUDE_VERSION_FLOOR),
         list_models_arm(CLAUDE_MODELS),
     )
+    .replace("__COMMANDS__", commands)
     .replace("__SKILLS__", skills)
 }
 
@@ -105,9 +114,10 @@ async fn claude_discovers_native_skills_in_configured_short_lived_processes() {
                 Some("Plugin · data-tools@official")
             ),
             ("explain", "Explain the current change", Some("User")),
+            ("implement", "Implement a piece of work", Some("User")),
             ("review", "Review the current change", Some("Workspace")),
         ],
-        "only the CLI's native Skill listing reaches the Catalog, with safe scope metadata"
+        "user-only and model-visible native Skills reach the Catalog, with safe scope metadata"
     );
     assert!(
         catalog.skills.iter().all(

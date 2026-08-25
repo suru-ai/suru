@@ -270,17 +270,21 @@ pub(super) struct NativeBinaryVersion {
     pub(super) version: String,
 }
 
-/// What `initialize` answers with, decoded as far as the availability probe reads: the account the
-/// CLI would make requests under. A CLI holding no credentials answers with an account naming
-/// none rather than by omitting it, but an absent account decodes as one naming none all the same.
+/// What `initialize` answers with, decoded as far as Suru reads it: the account the CLI would make
+/// requests under and the slash commands a user can invoke. A CLI holding no credentials answers
+/// with an account naming none rather than by omitting it, but an absent account decodes as one
+/// naming none all the same.
 #[derive(Deserialize)]
 pub(super) struct NativeInitialize {
     #[serde(default)]
     pub(super) account: NativeAccount,
+    #[serde(default)]
+    pub(super) commands: Vec<NativeSkill>,
 }
 
-/// What `reload_skills` answers with: the user-invocable Skills Claude resolved from its native
-/// configuration, after applying scopes, overrides, plugins, and visibility rules.
+/// What `reload_skills` answers with: the model-visible Skills Claude resolved from its native
+/// configuration, after applying scopes, overrides, plugins, and visibility rules. Skills reserved
+/// for explicit user invocation remain available through `initialize.commands` instead.
 #[derive(Deserialize)]
 pub(super) struct NativeSkillList {
     pub(super) skills: Vec<NativeSkill>,
