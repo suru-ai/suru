@@ -122,6 +122,10 @@ pub(super) async fn start_copilot_session(
         Some(selection) => selection.clone(),
         None => default_selection(&handle, context).await?,
     };
+    let subscription = native.subscribe();
+    let event_drain = handle
+        .connection()
+        .event_checkpoint(copilot_session_id.as_str());
     let resume_state = ProviderResumeState::new(
         serde_json::to_value(CopilotResumeState {
             session_id: copilot_session_id,
@@ -130,7 +134,12 @@ pub(super) async fn start_copilot_session(
     );
 
     let correlation = Arc::new(StdMutex::new(CopilotCorrelation::new()));
-    let events = provider_events(native.subscribe(), handle.clone(), correlation.clone());
+    let events = provider_events(
+        subscription,
+        handle.clone(),
+        event_drain,
+        correlation.clone(),
+    );
     let session = Arc::new(CopilotSession {
         native,
         handle,

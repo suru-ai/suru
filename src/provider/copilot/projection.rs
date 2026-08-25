@@ -38,7 +38,8 @@ use github_copilot_sdk::{
 use tokio::sync::mpsc;
 
 use super::{
-    COPILOT_FAILURE_FALLBACK, copilot_error, tools::command_text, transport::CopilotConnection,
+    COPILOT_FAILURE_FALLBACK, copilot_error, event_drain::EventDrainCheckpoint,
+    tools::command_text, transport::CopilotConnection,
 };
 use crate::provider::{
     ProviderActivityId, ProviderCommandStatus, ProviderError, ProviderEvent, ProviderEventStream,
@@ -130,17 +131,23 @@ impl CopilotCorrelation {
 pub(super) fn provider_events(
     subscription: EventSubscription,
     harness: Arc<SharedHarnessHandle<CopilotConnection>>,
+    drain: EventDrainCheckpoint,
     correlation: Arc<StdMutex<CopilotCorrelation>>,
 ) -> ProviderEventStream {
     // The SDK drops the oldest events on a subscriber that falls behind, and a dropped delta is
     // Transcript content Suru cannot get back, so the timeline is drained as fast as it arrives
     // and queued here rather than at the pace the Session's consumer reads.
     let (events_tx, events_rx) = mpsc::unbounded_channel();
-    tokio::spawn(drain_session_timeline(subscription, events_tx));
+    tokio::spawn(drain_session_timeline(
+        subscription,
+        events_tx,
+        drain.clone(),
+    ));
     Box::pin(stream::unfold(
         CopilotEvents {
             events: events_rx,
             harness,
+            drain,
             correlation,
             pending: VecDeque::new(),
             ended: false,
@@ -153,13 +160,16 @@ pub(super) fn provider_events(
 async fn drain_session_timeline(
     mut subscription: EventSubscription,
     events: mpsc::UnboundedSender<Result<SessionEvent, ProviderError>>,
+    drain: EventDrainCheckpoint,
 ) {
     loop {
         match subscription.recv().await {
             Ok(event) => {
+                let event_id = event.id.clone();
                 if events.send(Ok(event)).is_err() {
                     return;
                 }
+                drain.delivered(event_id);
             }
             Err(error) => {
                 if let RecvErrorKind::Lagged(lagged) = error.kind() {
@@ -177,6 +187,7 @@ async fn drain_session_timeline(
 struct CopilotEvents {
     events: mpsc::UnboundedReceiver<Result<SessionEvent, ProviderError>>,
     harness: Arc<SharedHarnessHandle<CopilotConnection>>,
+    drain: EventDrainCheckpoint,
     correlation: Arc<StdMutex<CopilotCorrelation>>,
     pending: VecDeque<Result<ProviderEvent, ProviderError>>,
     ended: bool,
@@ -198,8 +209,16 @@ async fn next_provider_event(
         let received = tokio::select! {
             biased;
             crashed = harness.crashed() => {
+                events.drain.wait_until_drained().await;
+                while let Ok(received) = events.events.try_recv() {
+                    match received {
+                        Ok(event) => queue_projected(&mut events, event),
+                        Err(error) => events.pending.push_back(Err(error)),
+                    }
+                }
+                events.pending.push_back(Err(crashed));
                 events.ended = true;
-                return Some((Err(crashed), events));
+                continue;
             }
             received = events.events.recv() => received,
         };
@@ -213,19 +232,23 @@ async fn next_provider_event(
                 return Some((Err(error), events));
             }
             Some(Ok(event)) => {
-                let projected = {
-                    let mut correlation = events
-                        .correlation
-                        .lock()
-                        .expect("Copilot correlation lock is not poisoned");
-                    project_session_event(&mut correlation, event)
-                };
-                match projected {
-                    Ok(projected) => events.pending.extend(projected.into_iter().map(Ok)),
-                    Err(error) => events.pending.push_back(Err(error)),
-                }
+                queue_projected(&mut events, event);
             }
         }
+    }
+}
+
+fn queue_projected(events: &mut CopilotEvents, event: SessionEvent) {
+    let projected = {
+        let mut correlation = events
+            .correlation
+            .lock()
+            .expect("Copilot correlation lock is not poisoned");
+        project_session_event(&mut correlation, event)
+    };
+    match projected {
+        Ok(projected) => events.pending.extend(projected.into_iter().map(Ok)),
+        Err(error) => events.pending.push_back(Err(error)),
     }
 }
 

@@ -20,12 +20,15 @@ use tokio::{
     process::ChildStdin,
 };
 
-use super::{concise_remote_message, copilot_error, copilot_error_context};
+use super::{
+    concise_remote_message, copilot_error, copilot_error_context,
+    event_drain::{CopilotEventDrain, EventDrainCheckpoint},
+};
 use crate::{
     protocol::ProviderUnavailability,
     provider::{
         ProviderError, ProviderFuture,
-        harness::{HarnessConnector, HarnessLink, ProcessStdio},
+        harness::{HarnessConnector, HarnessInvalidator, HarnessLink, ProcessStdio},
     },
 };
 
@@ -47,14 +50,22 @@ impl CopilotConnector {
 impl HarnessConnector for CopilotConnector {
     type Connection = CopilotConnection;
 
-    fn connect(&self, io: ProcessStdio) -> Result<CopilotConnection, ProviderError> {
+    fn connect(
+        &self,
+        io: ProcessStdio,
+        invalidator: HarnessInvalidator,
+    ) -> Result<CopilotConnection, ProviderError> {
         let stdin = HarnessStdin::new(io.stdin);
-        let client = Client::from_streams(io.stdout, stdin.clone(), self.cwd.clone())
+        let event_drain = CopilotEventDrain::new();
+        let stdout = event_drain.observe(io.stdout);
+        let client = Client::from_streams(stdout, stdin.clone(), self.cwd.clone())
             .map_err(|error| copilot_error(format!("could not drive the Copilot CLI: {error}")))?;
         Ok(CopilotConnection {
             client,
             stdin,
             ending: Arc::new(StdMutex::new(None)),
+            invalidator,
+            event_drain,
         })
     }
 
@@ -113,6 +124,8 @@ pub(super) struct CopilotConnection {
     client: Client,
     stdin: HarnessStdin,
     ending: Arc<StdMutex<Option<ConnectionEnd>>>,
+    invalidator: HarnessInvalidator,
+    event_drain: CopilotEventDrain,
 }
 
 /// Why this connection stopped serving requests, once it has.
@@ -184,9 +197,20 @@ impl CopilotConnection {
     /// The Provider failure to report for `error` under `context`.
     ///
     /// Once the process is gone every in-flight and later request fails with a transport-shaped SDK
-    /// error that says nothing about why. The supervisor already decided what the exit meant — and
-    /// whether it lost a Provider Session — so its account wins wherever it exists.
-    pub(super) fn failure(&self, context: &str, error: impl std::fmt::Display) -> ProviderError {
+    /// error that says nothing about why. The supervisor's account wins when it has arrived; when
+    /// the SDK observes the dead transport first, that typed signal invalidates this shared-harness
+    /// generation so a later demand cannot be granted the same connection.
+    pub(super) fn failure(&self, context: &str, error: github_copilot_sdk::Error) -> ProviderError {
+        if error.is_transport_failure() {
+            let lost = copilot_error(format!(
+                "{} connection was lost: {error}",
+                super::COPILOT_HARNESS_NAME
+            ))
+            .mark_session_lost();
+            if let ConnectionEnd::Terminated(lost) = self.record(ConnectionEnd::Terminated(lost)) {
+                self.invalidator.invalidate(lost);
+            }
+        }
         match self.end() {
             Some(ConnectionEnd::Terminated(exit)) => copilot_error_context(context, exit),
             Some(ConnectionEnd::Closed) => copilot_error(format!(
@@ -204,19 +228,26 @@ impl CopilotConnection {
             .clone()
     }
 
+    /// The on-wire position a Session begins observing from, used to drain its final events before
+    /// a process crash settles it.
+    pub(super) fn event_checkpoint(&self, session_id: &str) -> EventDrainCheckpoint {
+        self.event_drain.checkpoint(session_id)
+    }
+
     /// Records how the connection ended, keeping the first account: a process that exits on its own
     /// while a shutdown is already under way did not lose anything the shutdown was not taking.
-    fn record(&self, ending: ConnectionEnd) {
+    fn record(&self, ending: ConnectionEnd) -> ConnectionEnd {
         self.ending
             .lock()
             .expect("Copilot connection ending lock is not poisoned")
-            .get_or_insert(ending);
+            .get_or_insert(ending)
+            .clone()
     }
 }
 
 impl HarnessLink for CopilotConnection {
     fn close(&self) {
-        self.record(ConnectionEnd::Closed);
+        let _ = self.record(ConnectionEnd::Closed);
     }
 
     fn close_stdin(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
@@ -224,7 +255,7 @@ impl HarnessLink for CopilotConnection {
     }
 
     fn terminate(&self, error: ProviderError) {
-        self.record(ConnectionEnd::Terminated(error));
+        let _ = self.record(ConnectionEnd::Terminated(error));
     }
 }
 

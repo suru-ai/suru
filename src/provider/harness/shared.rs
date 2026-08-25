@@ -23,12 +23,32 @@ pub(crate) trait HarnessConnector: Send + Sync + 'static {
 
     /// Wraps the spawned process's stdio in the Provider's transport. Runs before the process is
     /// supervised, so it must not wait on the harness; the handshake belongs in `initialize`.
-    fn connect(&self, io: ProcessStdio) -> Result<Self::Connection, ProviderError>;
+    fn connect(
+        &self,
+        io: ProcessStdio,
+        invalidator: HarnessInvalidator,
+    ) -> Result<Self::Connection, ProviderError>;
 
     /// Completes the Provider's startup handshake over the now-supervised connection. Must fail
     /// once the connection's `HarnessLink` is terminated or closed — the launch holds every later
     /// demand behind it, so a handshake that outlives its process must not hang.
     fn initialize(&self, connection: &Self::Connection) -> ProviderFuture<'_, ()>;
+}
+
+/// Lets a transport reject the exact shared-harness generation it is connected through.
+///
+/// The process supervisor remains the authoritative account of process exit, but a transport can
+/// observe EOF or a broken pipe first. Publishing that loss here prevents a later demand from
+/// being granted a connection the transport already knows cannot serve it.
+#[derive(Clone)]
+pub(crate) struct HarnessInvalidator {
+    crash: watch::Sender<Option<ProviderError>>,
+}
+
+impl HarnessInvalidator {
+    pub(crate) fn invalidate(&self, error: ProviderError) {
+        publish_first(&self.crash, error);
+    }
 }
 
 /// A Provider runtime's one shared harness server process, launched lazily and supervised until
@@ -81,14 +101,14 @@ struct LiveHarness<T> {
     /// dropping it is what asks the process to stop.
     #[allow(dead_code)]
     guard: Arc<ProcessGuard>,
-    crash: watch::Receiver<Option<ProviderError>>,
+    crash: watch::Sender<Option<ProviderError>>,
 }
 
 impl<T: Clone> LiveHarness<T> {
     fn handle(&self) -> SharedHarnessHandle<T> {
         SharedHarnessHandle {
             connection: self.connection.clone(),
-            crash: self.crash.clone(),
+            crash: self.crash.subscribe(),
         }
     }
 }
@@ -137,16 +157,21 @@ impl<C: HarnessConnector> SharedHarness<C> {
 
     async fn launch(&self) -> Result<LiveHarness<C::Connection>, ProviderError> {
         let (process, stdio) = spawn_harness_process(&self.spec)?;
-        let connection = self.connector.connect(stdio)?;
+        let (crash, _) = watch::channel(None);
+        let connection = self.connector.connect(
+            stdio,
+            HarnessInvalidator {
+                crash: crash.clone(),
+            },
+        )?;
         let (guard, exit) =
             supervise_harness_process(process, self.processes.clone(), connection.clone()).await?;
         self.connector.initialize(&connection).await?;
-        let (crash_tx, crash_rx) = watch::channel(None);
-        tokio::spawn(fan_out_crash(exit, crash_tx, self.processes.clone()));
+        tokio::spawn(fan_out_crash(exit, crash.clone(), self.processes.clone()));
         Ok(LiveHarness {
             connection,
             guard,
-            crash: crash_rx,
+            crash,
         })
     }
 
@@ -177,7 +202,17 @@ async fn fan_out_crash(
         harness = %processes.name(),
         "shared harness process crashed; its hosted Sessions lose their active Turns"
     );
-    crash.send_replace(Some(error));
+    publish_first(&crash, error);
+}
+
+fn publish_first(crash: &watch::Sender<Option<ProviderError>>, error: ProviderError) {
+    crash.send_if_modified(|published| {
+        if published.is_some() {
+            return false;
+        }
+        *published = Some(error);
+        true
+    });
 }
 
 // The scripted fixtures are `sh` programs and the liveness probe is `libc::kill`, so these tests
@@ -197,7 +232,7 @@ mod tests {
         time::{Duration, timeout},
     };
 
-    use super::{HarnessConnector, SharedHarness};
+    use super::{HarnessConnector, HarnessInvalidator, SharedHarness};
     use crate::provider::{
         ProviderError, ProviderFuture,
         harness::{HarnessLink, HarnessSpec, ProcessStdio},
@@ -311,6 +346,7 @@ STUBBORN_TAIL
         stdout: Arc<StdMutex<Option<ChildStdout>>>,
         closed: Arc<AtomicBool>,
         terminated: Arc<StdMutex<Option<ProviderError>>>,
+        invalidator: Arc<StdMutex<Option<HarnessInvalidator>>>,
     }
 
     impl FixtureConnection {
@@ -322,6 +358,15 @@ STUBBORN_TAIL
                 .await
                 .expect("write to scripted harness");
             stdin.flush().await.expect("flush scripted harness stdin");
+        }
+
+        fn invalidate(&self, error: ProviderError) {
+            self.invalidator
+                .lock()
+                .expect("fixture invalidator lock is not poisoned")
+                .as_ref()
+                .expect("fixture connection has an invalidator")
+                .invalidate(error);
         }
     }
 
@@ -372,10 +417,15 @@ STUBBORN_TAIL
     impl HarnessConnector for Arc<FixtureConnector> {
         type Connection = FixtureConnection;
 
-        fn connect(&self, io: ProcessStdio) -> Result<FixtureConnection, ProviderError> {
+        fn connect(
+            &self,
+            io: ProcessStdio,
+            invalidator: HarnessInvalidator,
+        ) -> Result<FixtureConnection, ProviderError> {
             let connection = FixtureConnection {
                 stdin: Arc::new(TokioMutex::new(Some(io.stdin))),
                 stdout: Arc::new(StdMutex::new(Some(io.stdout))),
+                invalidator: Arc::new(StdMutex::new(Some(invalidator))),
                 ..FixtureConnection::default()
             };
             self.connections
@@ -494,6 +544,34 @@ STUBBORN_TAIL
             crashed_pid,
             "the relaunch is a fresh process"
         );
+
+        harness.shutdown().await.expect("shutdown tears down");
+    }
+
+    #[tokio::test]
+    async fn transport_invalidation_prevents_the_next_demand_reusing_the_lost_connection() {
+        let fixture = ScriptedHarness::new();
+        let connector = Arc::new(FixtureConnector::default());
+        let harness = SharedHarness::new(fixture.spec(), connector.clone());
+
+        let first = harness.demand().await.expect("first demand launches");
+        fixture.wait_for_attempts(1).await;
+        let lost_pid = fixture.pid();
+        connector
+            .latest_connection()
+            .invalidate(ProviderError::new("fixture transport was lost").mark_session_lost());
+
+        let failure = first.crashed().await;
+        assert!(
+            failure.is_session_lost(),
+            "transport invalidation reaches existing handles"
+        );
+        harness
+            .demand()
+            .await
+            .expect("the demand after transport loss relaunches");
+        fixture.wait_for_attempts(2).await;
+        assert_ne!(fixture.pid(), lost_pid, "the lost connection is not reused");
 
         harness.shutdown().await.expect("shutdown tears down");
     }
