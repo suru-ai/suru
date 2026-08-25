@@ -481,6 +481,18 @@ pub struct SkillMarkerSpan {
     pub end: u32,
 }
 
+pub(crate) fn skill_names_equal(left: &str, right: &str) -> bool {
+    left.chars()
+        .flat_map(char::to_lowercase)
+        .eq(right.chars().flat_map(char::to_lowercase))
+}
+
+pub(crate) fn skill_marker_matches(marker: &str, name: &str) -> bool {
+    marker
+        .strip_prefix('$')
+        .is_some_and(|visible| skill_names_equal(visible, name))
+}
+
 /// A safe binding between visible Prompt text and one Provider-owned Skill.
 /// It deliberately carries no Provider-native identifier. Repeated markers
 /// remain separate records so historical presentation preserves every marker;

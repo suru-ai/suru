@@ -431,7 +431,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
         ControlledProvider::with_provider(ProviderId::new("controlled"), vec![model]);
     let descriptor = SkillDescriptor {
         id: SkillId::new("opaque-review-id"),
-        name: "review".to_owned(),
+        name: "Über".to_owned(),
         description: "Review the current change".to_owned(),
         scope: Some("Workspace".to_owned()),
     };
@@ -491,7 +491,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
         skill_id: descriptor.id.clone(),
         name: descriptor.name.clone(),
         scope: descriptor.scope.clone(),
-        marker: SkillMarkerSpan { start: 0, end: 7 },
+        marker: SkillMarkerSpan { start: 0, end: 6 },
     };
     let prompt_id = PromptId::new();
     let created_response = client
@@ -504,7 +504,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
             },
             prompt: InitialPrompt {
                 id: prompt_id,
-                text: "$review".to_owned(),
+                text: "$über".to_owned(),
                 skill_invocations: vec![invocation.clone()],
             },
         })
@@ -523,7 +523,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
         selection,
     });
     let turn = provider_session.next_turn().await;
-    assert_eq!(turn.prompt(), "$review");
+    assert_eq!(turn.prompt(), "$über");
     assert_eq!(turn.skill_invocations().len(), 1);
     assert_eq!(turn.skill_invocations()[0].skill_id, descriptor.id);
     turn.succeed();
@@ -535,7 +535,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
         SessionRevision(2),
     )
     .await;
-    assert_eq!(delivered.messages[0].content, "$review");
+    assert_eq!(delivered.messages[0].content, "$über");
     assert_eq!(delivered.messages[0].skill_invocations, vec![invocation]);
 
     let rejected = client
@@ -546,12 +546,12 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
             workspace: Workspace { path: workspace },
             prompt: InitialPrompt {
                 id: PromptId::new(),
-                text: "$review".to_owned(),
+                text: "$über".to_owned(),
                 skill_invocations: vec![SkillInvocation {
                     skill_id: SkillId::new("forged-id"),
-                    name: "review".to_owned(),
+                    name: "Über".to_owned(),
                     scope: Some("Workspace".to_owned()),
-                    marker: SkillMarkerSpan { start: 0, end: 7 },
+                    marker: SkillMarkerSpan { start: 0, end: 6 },
                 }],
             },
         })

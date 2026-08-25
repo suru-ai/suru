@@ -45,7 +45,7 @@ use crate::{
     protocol::{
         Activity, ActivityId, FileChange, FoldPosture, InitialPrompt, Message, MessageId,
         MessageRole, PromptId, ReasoningVisibility, SessionId, SessionRevision, SessionSnapshot,
-        SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus,
+        SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus, skill_marker_matches,
     },
     theme::Theme,
 };
@@ -2818,9 +2818,7 @@ fn recognized_skill_ranges(
         .filter_map(|invocation| {
             let range = invocation.marker.start as usize..invocation.marker.end as usize;
             let marker = content.get(range.clone())?;
-            marker
-                .eq_ignore_ascii_case(&format!("${}", invocation.name))
-                .then_some(range)
+            skill_marker_matches(marker, &invocation.name).then_some(range)
         })
         .collect()
 }

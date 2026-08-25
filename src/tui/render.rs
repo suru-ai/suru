@@ -23,7 +23,7 @@ use crate::{
 
 use super::{
     completion::CompletionRow,
-    composer::ComposerKey,
+    composer::{ComposerKey, ComposerSkillMarkers},
     keymap::binding_label,
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
@@ -998,13 +998,19 @@ fn render_composer_completion(
                         usize::from(content_width),
                     )
                 }
+                CompletionRow::DisabledSkill(skill) => truncate_to_width(
+                    &format!("${}  {} · limit reached", skill.name, skill.description),
+                    usize::from(content_width),
+                ),
                 CompletionRow::Message(message) => {
                     truncate_to_width(message, usize::from(content_width))
                 }
             };
             Line::styled(
                 content,
-                if selected {
+                if matches!(row, CompletionRow::DisabledSkill(_)) {
+                    theme.action.disabled
+                } else if selected {
                     theme.selection.focused
                 } else {
                     theme.text.primary
@@ -1070,6 +1076,7 @@ fn render_landing(
     let key = ComposerKey::Landing;
     let composer_text = state.composers.text(key);
     let composer_cursor = state.composers.cursor(key);
+    let skill_markers = state.composers.skill_markers(key);
     let composer_height = composer_block_height(
         frame.area().height,
         72_u16.min(content.width),
@@ -1117,8 +1124,11 @@ fn render_landing(
     let cursor = render_composer(
         frame,
         composer_area,
-        composer_text,
-        composer_cursor,
+        ComposerContent {
+            text: composer_text,
+            cursor: composer_cursor,
+            skill_markers: &skill_markers,
+        },
         state.composer_border_style(theme),
         detail,
         theme,
@@ -1165,6 +1175,7 @@ fn render_session(
     let key = ComposerKey::Session(session_id);
     let composer_text = state.composers.text(key);
     let composer_cursor = state.composers.cursor(key);
+    let skill_markers = state.composers.skill_markers(key);
     let desired_composer_height = composer_block_height(
         frame.area().height,
         content_width,
@@ -1433,8 +1444,11 @@ fn render_session(
     let cursor = render_composer(
         frame,
         composer_area,
-        composer_text,
-        composer_cursor,
+        ComposerContent {
+            text: composer_text,
+            cursor: composer_cursor,
+            skill_markers: &skill_markers,
+        },
         state.composer_border_style(theme),
         content_detail,
         theme,
@@ -1528,15 +1542,25 @@ fn transcript_viewport_height(area: Rect) -> usize {
     })
 }
 
+struct ComposerContent<'a> {
+    text: &'a str,
+    cursor: usize,
+    skill_markers: &'a ComposerSkillMarkers,
+}
+
 fn render_composer(
     frame: &mut Frame<'_>,
     area: Rect,
-    text: &str,
-    cursor: usize,
+    content: ComposerContent<'_>,
     style: Style,
     detail: ResponsiveDetail,
     theme: &Theme,
 ) -> Position {
+    let ComposerContent {
+        text,
+        cursor,
+        skill_markers,
+    } = content;
     let submit = binding_label(&CommandId::SubmitSteer);
     let queue = binding_label(&CommandId::SubmitQueue);
     let newline = binding_label(&CommandId::InsertNewline);
@@ -1559,7 +1583,13 @@ fn render_composer(
             theme.form_field.placeholder,
         ))
     } else {
-        Paragraph::new(wrapped_composer_lines(text, content_width)).style(theme.form_field.text)
+        Paragraph::new(wrapped_composer_lines(
+            text,
+            content_width,
+            skill_markers,
+            theme,
+        ))
+        .style(theme.form_field.text)
     };
     frame.render_widget(paragraph.block(block).scroll((scroll, 0)), area);
     Position::new(
@@ -1709,27 +1739,59 @@ fn visual_text_end(text: &str, width: u16) -> (u16, u16) {
     (row, column)
 }
 
-fn wrapped_composer_lines(text: &str, width: u16) -> Text<'static> {
+fn wrapped_composer_lines(
+    text: &str,
+    width: u16,
+    skill_markers: &ComposerSkillMarkers,
+    theme: &Theme,
+) -> Text<'static> {
     let width = width.max(1);
     let mut lines = Vec::new();
-    let mut line = String::new();
+    let mut line = Vec::<(Style, String)>::new();
     let mut line_width = 0_u16;
-    for character in text.chars() {
+    for (offset, character) in text.char_indices() {
         if character == '\n' {
-            lines.push(Line::from(std::mem::take(&mut line)));
+            lines.push(styled_composer_line(std::mem::take(&mut line)));
             line_width = 0;
             continue;
         }
         let character_width = UnicodeWidthChar::width(character).unwrap_or(0) as u16;
         if line_width > 0 && line_width.saturating_add(character_width) > width {
-            lines.push(Line::from(std::mem::take(&mut line)));
+            lines.push(styled_composer_line(std::mem::take(&mut line)));
             line_width = 0;
         }
-        line.push(character);
+        let style = if skill_markers
+            .invalid
+            .iter()
+            .any(|range| range.contains(&offset))
+        {
+            theme.feedback.error
+        } else if skill_markers
+            .recognized
+            .iter()
+            .any(|range| range.contains(&offset))
+        {
+            theme.accent.primary
+        } else {
+            theme.form_field.text
+        };
+        match line.last_mut() {
+            Some((current, text)) if *current == style => text.push(character),
+            _ => line.push((style, character.to_string())),
+        }
         line_width = line_width.saturating_add(character_width);
     }
-    lines.push(Line::from(line));
+    lines.push(styled_composer_line(line));
     Text::from(lines)
+}
+
+fn styled_composer_line(segments: Vec<(Style, String)>) -> Line<'static> {
+    Line::from(
+        segments
+            .into_iter()
+            .map(|(style, text)| Span::styled(text, style))
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn terminal_is_too_small(area: Rect) -> bool {

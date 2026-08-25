@@ -13,6 +13,7 @@ use crate::{
     protocol::{
         InitialPrompt, ProviderId, SettingsSnapshot, SkillCatalog, SkillCatalogCapabilities,
         SkillCatalogRequest, SkillCatalogStatus, SkillId, SkillPromptDelivery, Workspace,
+        skill_marker_matches,
     },
     provider::ProviderRuntime,
 };
@@ -224,8 +225,7 @@ impl SkillCatalogService {
                     invocation.name
                 )));
             };
-            let expected = format!("${}", descriptor.name);
-            if !marker.eq_ignore_ascii_case(&expected) {
+            if !skill_marker_matches(marker, &descriptor.name) {
                 return Err(SkillCatalogError::InvalidInvocation(format!(
                     "Skill `{}` is not bound to its visible marker",
                     invocation.name

@@ -1,10 +1,11 @@
 //! Client-local multiline composer memory keyed by landing route or Session.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use crate::protocol::{
     InitialPrompt, PromptId, SessionId, SkillDescriptor, SkillInvocation, SkillMarkerSpan,
+    skill_marker_matches,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -26,7 +27,26 @@ struct ComposerState {
     history_position: Option<usize>,
     history_scratch: Option<String>,
     retry: Option<RetryPrompt>,
-    skill_invocations: Vec<SkillInvocation>,
+    skill_bindings: Vec<DraftSkillBinding>,
+    skill_issues: Vec<DraftSkillIssue>,
+}
+
+#[derive(Clone, Debug)]
+struct DraftSkillBinding {
+    invocation: SkillInvocation,
+    inferred: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DraftSkillIssue {
+    marker: Range<usize>,
+    message: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ComposerSkillMarkers {
+    pub(super) recognized: Vec<Range<usize>>,
+    pub(super) invalid: Vec<Range<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -49,10 +69,53 @@ impl ComposerMemory {
             .map_or(0, |composer| composer.cursor)
     }
 
-    pub(super) fn skill_invocations(&self, key: ComposerKey) -> &[SkillInvocation] {
+    pub(super) fn skill_issue(&self, key: ComposerKey) -> Option<&str> {
         self.composers
             .get(&key)
-            .map_or(&[], |composer| composer.skill_invocations.as_slice())
+            .and_then(|composer| composer.skill_issues.first())
+            .map(|issue| issue.message.as_str())
+    }
+
+    pub(super) fn skill_markers(&self, key: ComposerKey) -> ComposerSkillMarkers {
+        let Some(composer) = self.composers.get(&key) else {
+            return ComposerSkillMarkers::default();
+        };
+        let invalid = composer
+            .skill_issues
+            .iter()
+            .map(|issue| issue.marker.clone())
+            .collect::<Vec<_>>();
+        let recognized = composer
+            .skill_bindings
+            .iter()
+            .map(|binding| {
+                binding.invocation.marker.start as usize..binding.invocation.marker.end as usize
+            })
+            .filter(|range| !invalid.contains(range))
+            .collect();
+        ComposerSkillMarkers {
+            recognized,
+            invalid,
+        }
+    }
+
+    pub(super) fn valid_skill_ids(&self, key: ComposerKey) -> HashSet<crate::protocol::SkillId> {
+        let Some(composer) = self.composers.get(&key) else {
+            return HashSet::new();
+        };
+        composer
+            .skill_bindings
+            .iter()
+            .filter(|binding| {
+                let marker = binding.invocation.marker.start as usize
+                    ..binding.invocation.marker.end as usize;
+                !composer
+                    .skill_issues
+                    .iter()
+                    .any(|issue| issue.marker == marker)
+            })
+            .map(|binding| binding.invocation.skill_id.clone())
+            .collect()
     }
 
     pub(super) fn is_empty(&self, key: ComposerKey) -> bool {
@@ -74,6 +137,14 @@ impl ComposerMemory {
         skill: &SkillDescriptor,
     ) -> bool {
         self.composer_mut(key).insert_skill(range, skill)
+    }
+
+    pub(super) fn resolve_skills(
+        &mut self,
+        key: ComposerKey,
+        catalog: Option<&crate::protocol::SkillCatalog>,
+    ) {
+        self.composer_mut(key).resolve_skills(catalog);
     }
 
     pub(super) fn delete_backward(&mut self, key: ComposerKey) {
@@ -177,6 +248,113 @@ impl ComposerMemory {
 }
 
 impl ComposerState {
+    fn resolve_skills(&mut self, catalog: Option<&crate::protocol::SkillCatalog>) {
+        self.skill_issues.clear();
+        self.skill_bindings.retain(|binding| {
+            let invocation = &binding.invocation;
+            let range = invocation.marker.start as usize..invocation.marker.end as usize;
+            self.text
+                .get(range)
+                .is_some_and(|marker| skill_marker_matches(marker, &invocation.name))
+        });
+        let fresh_catalog = catalog.filter(|catalog| {
+            matches!(
+                catalog.status,
+                crate::protocol::SkillCatalogStatus::Fresh { .. }
+            )
+        });
+        let Some(catalog) = fresh_catalog else {
+            for binding in &mut self.skill_bindings {
+                binding.inferred = false;
+                let invocation = &binding.invocation;
+                self.skill_issues.push(DraftSkillIssue {
+                    marker: invocation.marker.start as usize..invocation.marker.end as usize,
+                    message: format!(
+                        "Skill `${}` is stale; edit or choose the Skill again before submitting",
+                        invocation.name
+                    ),
+                });
+            }
+            self.skill_issues.sort_by_key(|issue| issue.marker.start);
+            return;
+        };
+
+        for binding in &mut self.skill_bindings {
+            if binding.inferred && !skill_binding_is_current(&binding.invocation, catalog) {
+                binding.inferred = false;
+            }
+        }
+        self.skill_bindings.retain(|binding| !binding.inferred);
+        for binding in &self.skill_bindings {
+            let invocation = &binding.invocation;
+            if !skill_binding_is_current(invocation, catalog) {
+                self.skill_issues.push(DraftSkillIssue {
+                    marker: invocation.marker.start as usize..invocation.marker.end as usize,
+                    message: format!(
+                        "Skill `${}` is stale; edit or choose the Skill again before submitting",
+                        invocation.name
+                    ),
+                });
+            }
+        }
+        for (range, matches) in exact_skill_markers(&self.text, &catalog.skills) {
+            if self.skill_bindings.iter().any(|binding| {
+                let marker = binding.invocation.marker.start as usize
+                    ..binding.invocation.marker.end as usize;
+                marker.start < range.end && range.start < marker.end
+            }) {
+                continue;
+            }
+            if matches.len() != 1 {
+                let marker = self.text.get(range.clone()).unwrap_or("$Skill");
+                self.skill_issues.push(DraftSkillIssue {
+                    marker: range,
+                    message: format!(
+                        "There are multiple Skills named `{}`; choose a scoped result from autocomplete",
+                        marker.trim_start_matches('$')
+                    ),
+                });
+                continue;
+            }
+            let skill = matches[0];
+            self.skill_bindings.push(DraftSkillBinding {
+                invocation: SkillInvocation {
+                    skill_id: skill.id.clone(),
+                    name: skill.name.clone(),
+                    scope: skill.scope.clone(),
+                    marker: SkillMarkerSpan {
+                        start: range.start as u32,
+                        end: range.end as u32,
+                    },
+                },
+                inferred: true,
+            });
+        }
+        self.skill_bindings
+            .sort_by_key(|binding| binding.invocation.marker.start);
+        if let Some(limit) = catalog.capabilities.max_distinct_invocations {
+            let mut admitted = HashSet::new();
+            for binding in &self.skill_bindings {
+                let invocation = &binding.invocation;
+                if admitted.contains(&invocation.skill_id) {
+                    continue;
+                }
+                if admitted.len() < limit as usize {
+                    admitted.insert(invocation.skill_id.clone());
+                    continue;
+                }
+                self.skill_issues.push(DraftSkillIssue {
+                    marker: invocation.marker.start as usize..invocation.marker.end as usize,
+                    message: format!(
+                        "This Provider supports at most {limit} distinct Skill{} per Prompt",
+                        if limit == 1 { "" } else { "s" }
+                    ),
+                });
+            }
+        }
+        self.skill_issues.sort_by_key(|issue| issue.marker.start);
+    }
+
     fn insert(&mut self, text: &str) {
         self.leave_history_navigation();
         self.rebase_invocations(self.cursor..self.cursor, text.len());
@@ -209,17 +387,20 @@ impl ComposerState {
         if !self.replace(range, &replacement) {
             return false;
         }
-        self.skill_invocations.push(SkillInvocation {
-            skill_id: skill.id.clone(),
-            name: skill.name.clone(),
-            scope: skill.scope.clone(),
-            marker: SkillMarkerSpan {
-                start: start as u32,
-                end: (start + marker.len()) as u32,
+        self.skill_bindings.push(DraftSkillBinding {
+            invocation: SkillInvocation {
+                skill_id: skill.id.clone(),
+                name: skill.name.clone(),
+                scope: skill.scope.clone(),
+                marker: SkillMarkerSpan {
+                    start: start as u32,
+                    end: (start + marker.len()) as u32,
+                },
             },
+            inferred: false,
         });
-        self.skill_invocations
-            .sort_by_key(|invocation| invocation.marker.start);
+        self.skill_bindings
+            .sort_by_key(|binding| binding.invocation.marker.start);
         true
     }
 
@@ -289,7 +470,7 @@ impl ComposerState {
         );
         self.history_position = Some(position);
         self.text.clone_from(&self.history[position]);
-        self.skill_invocations.clear();
+        self.skill_bindings.clear();
         self.cursor = self.text.len();
     }
 
@@ -305,11 +486,11 @@ impl ComposerState {
             let next = position + 1;
             self.history_position = Some(next);
             self.text.clone_from(&self.history[next]);
-            self.skill_invocations.clear();
+            self.skill_bindings.clear();
         } else {
             self.history_position = None;
             self.text = self.history_scratch.take().unwrap_or_default();
-            self.skill_invocations.clear();
+            self.skill_bindings.clear();
         }
         self.cursor = self.text.len();
     }
@@ -320,7 +501,8 @@ impl ComposerState {
         self.history_position = None;
         self.history_scratch = None;
         self.retry = None;
-        self.skill_invocations.clear();
+        self.skill_bindings.clear();
+        self.skill_issues.clear();
     }
 
     fn begin_submission(&mut self) -> InitialPrompt {
@@ -328,9 +510,19 @@ impl ComposerState {
         let id = self
             .retry
             .as_ref()
-            .filter(|retry| retry.text == text && retry.skill_invocations == self.skill_invocations)
+            .filter(|retry| {
+                retry.text == text
+                    && retry.skill_invocations.iter().eq(self
+                        .skill_bindings
+                        .iter()
+                        .map(|binding| &binding.invocation))
+            })
             .map_or_else(PromptId::new, |retry| retry.id);
-        let skill_invocations = std::mem::take(&mut self.skill_invocations);
+        let skill_invocations = std::mem::take(&mut self.skill_bindings)
+            .into_iter()
+            .map(|binding| binding.invocation)
+            .collect();
+        self.skill_issues.clear();
         self.text.clear();
         self.cursor = 0;
         self.history_position = None;
@@ -347,7 +539,16 @@ impl ComposerState {
             self.push_history(self.text.clone());
         }
         self.text.clone_from(&prompt.text);
-        self.skill_invocations.clone_from(&prompt.skill_invocations);
+        self.skill_bindings = prompt
+            .skill_invocations
+            .iter()
+            .cloned()
+            .map(|invocation| DraftSkillBinding {
+                invocation,
+                inferred: false,
+            })
+            .collect();
+        self.skill_issues.clear();
         self.cursor = self.text.len();
         self.history_position = None;
         self.history_scratch = None;
@@ -377,7 +578,8 @@ impl ComposerState {
             .is_some_and(|retry| retry.id == prompt.id && self.text == retry.text);
         if restored_was_current {
             self.text.clear();
-            self.skill_invocations.clear();
+            self.skill_bindings.clear();
+            self.skill_issues.clear();
             self.cursor = 0;
             self.history_position = None;
             self.history_scratch = None;
@@ -438,7 +640,11 @@ impl ComposerState {
 
     fn invalidate_retry_after_edit(&mut self) {
         if self.retry.as_ref().is_some_and(|retry| {
-            retry.text != self.text || retry.skill_invocations != self.skill_invocations
+            retry.text != self.text
+                || retry.skill_invocations.iter().ne(self
+                    .skill_bindings
+                    .iter()
+                    .map(|binding| &binding.invocation))
         }) {
             self.retry = None;
         }
@@ -453,7 +659,8 @@ impl ComposerState {
     fn rebase_invocations(&mut self, edited: Range<usize>, replacement_len: usize) {
         let removed_len = edited.end.saturating_sub(edited.start);
         let delta = replacement_len as isize - removed_len as isize;
-        self.skill_invocations.retain_mut(|invocation| {
+        self.skill_bindings.retain_mut(|binding| {
+            let invocation = &mut binding.invocation;
             let start = invocation.marker.start as usize;
             let end = invocation.marker.end as usize;
             if edited.end <= start {
@@ -464,6 +671,104 @@ impl ComposerState {
                 edited.start >= end
             }
         });
+    }
+}
+
+fn skill_binding_is_current(
+    invocation: &SkillInvocation,
+    catalog: &crate::protocol::SkillCatalog,
+) -> bool {
+    catalog.skills.iter().any(|skill| {
+        skill.id == invocation.skill_id
+            && skill.name == invocation.name
+            && skill.scope == invocation.scope
+    })
+}
+
+fn exact_skill_markers<'a>(
+    text: &str,
+    skills: &'a [SkillDescriptor],
+) -> Vec<(Range<usize>, Vec<&'a SkillDescriptor>)> {
+    let mut markers = Vec::new();
+    for (start, character) in text.char_indices() {
+        if character != '$' || !skill_marker_start_is_valid(text, start) {
+            continue;
+        }
+        let marker_start = start + 1;
+        let mut matches = skills
+            .iter()
+            .filter_map(|skill| {
+                skill_match_end(text, marker_start, &skill.name).map(|end| (end, skill))
+            })
+            .collect::<Vec<_>>();
+        let Some(end) = matches.iter().map(|(end, _)| *end).max() else {
+            continue;
+        };
+        matches.retain(|(candidate_end, _)| *candidate_end == end);
+        markers.push((
+            start..end,
+            matches.into_iter().map(|(_, skill)| skill).collect(),
+        ));
+    }
+    markers
+}
+
+fn skill_match_end(text: &str, start: usize, canonical: &str) -> Option<usize> {
+    let tail = text.get(start..)?;
+    let canonical = canonical
+        .chars()
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let mut visible = String::new();
+    for (offset, character) in tail.char_indices() {
+        visible.extend(character.to_lowercase());
+        if visible.len() > canonical.len() {
+            return None;
+        }
+        if visible == canonical {
+            let end = start + offset + character.len_utf8();
+            return is_skill_marker_end(text, end).then_some(end);
+        }
+    }
+    None
+}
+
+pub(super) fn skill_marker_start_is_valid(text: &str, start: usize) -> bool {
+    let before_is_word = text[..start]
+        .chars()
+        .next_back()
+        .is_some_and(|character| character.is_alphanumeric() || character == '_');
+    if before_is_word {
+        return false;
+    }
+    let mut after = text[start + 1..].chars();
+    match after.next() {
+        Some(character) if matches!(character, '$' | '{' | '(') || character.is_ascii_digit() => {
+            false
+        }
+        Some('.')
+            if after
+                .next()
+                .is_some_and(|character| character.is_ascii_digit()) =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
+fn is_skill_marker_end(text: &str, end: usize) -> bool {
+    let mut trailing = text.get(end..).into_iter().flat_map(str::chars);
+    match trailing.next() {
+        None => true,
+        Some(character) if character.is_whitespace() => true,
+        Some('.') => trailing.next().is_none_or(|character| {
+            character.is_whitespace() || !(character.is_alphanumeric() || character == '_')
+        }),
+        Some(character) => matches!(
+            character,
+            ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"'
+        ),
     }
 }
 

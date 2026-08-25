@@ -3,10 +3,11 @@
 use crate::support::{
     buffer_rows, enter_session, failed_session_snapshot, rendered_application_buffer,
     rendered_application_cursor_at, rendered_application_rows, rendered_application_rows_at,
-    text_position,
+    text_position, type_terminal_text,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
+use ratatui::style::Color;
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
@@ -143,6 +144,661 @@ fn skill_completion_replaces_only_the_query_binds_it_and_keeps_the_prompt_open()
     assert_eq!(created.prompt.skill_invocations[0].name, "review");
     assert_eq!(created.prompt.skill_invocations[0].marker.start, 7);
     assert_eq!(created.prompt.skill_invocations[0].marker.end, 14);
+}
+
+#[test]
+fn exact_typed_and_pasted_skill_markers_bind_without_completion_and_keep_punctuation() {
+    let (_workspace, mut application) = application_with_skills(
+        vec![SkillDescriptor {
+            id: SkillId::new("opaque-review-id"),
+            name: "Review".to_owned(),
+            description: "Review the current change".to_owned(),
+            scope: Some("Workspace".to_owned()),
+        }],
+        None,
+    );
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Use $review,".to_owned(),
+        )))
+        .expect("type an exact marker");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::PasteText(
+            " then $REVIEW.\"".to_owned(),
+        )))
+        .expect("paste another exact marker");
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains(" Skills "),
+        "paste must not open Skill completion"
+    );
+
+    let ApplicationTransition::CreateSession(created) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit manually bound Skills")
+    else {
+        panic!("exact markers should produce a bound Prompt");
+    };
+    assert_eq!(created.prompt.text, "Use $review, then $REVIEW.\"");
+    assert_eq!(created.prompt.skill_invocations.len(), 2);
+    assert_eq!(created.prompt.skill_invocations[0].name, "Review");
+    assert_eq!(created.prompt.skill_invocations[0].marker.start, 4);
+    assert_eq!(created.prompt.skill_invocations[0].marker.end, 11);
+    assert_eq!(created.prompt.skill_invocations[1].name, "Review");
+    assert_eq!(created.prompt.skill_invocations[1].marker.start, 18);
+    assert_eq!(created.prompt.skill_invocations[1].marker.end, 25);
+}
+
+#[test]
+fn continued_typing_recomputes_manual_markers_before_final_resolution() {
+    let review = SkillDescriptor {
+        id: SkillId::new("review-id"),
+        name: "review".to_owned(),
+        description: "Review guidance".to_owned(),
+        scope: None,
+    };
+    let lint = SkillDescriptor {
+        id: SkillId::new("lint-id"),
+        name: "lint".to_owned(),
+        description: "General lint guidance".to_owned(),
+        scope: None,
+    };
+    let lint_rust = SkillDescriptor {
+        id: SkillId::new("lint-rust-id"),
+        name: "lint.rs".to_owned(),
+        description: "Rust lint guidance".to_owned(),
+        scope: None,
+    };
+
+    let (_workspace, mut unknown) = application_with_skills(vec![review], None);
+    type_terminal_text(&mut unknown, "$reviewer");
+    let ApplicationTransition::CreateSession(created) = unknown
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit a longer unknown token")
+    else {
+        panic!("longer unknown token remains an ordinary Prompt");
+    };
+    assert!(created.prompt.skill_invocations.is_empty());
+
+    let (_workspace, mut longest) = application_with_skills(vec![lint, lint_rust.clone()], None);
+    type_terminal_text(&mut longest, "$lint.rs,");
+    let ApplicationTransition::CreateSession(created) = longest
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the longest marker")
+    else {
+        panic!("longest marker creates a Skill-bearing Prompt");
+    };
+    assert_eq!(created.prompt.skill_invocations.len(), 1);
+    assert_eq!(created.prompt.skill_invocations[0].skill_id, lint_rust.id);
+    assert_eq!(created.prompt.skill_invocations[0].marker.start, 0);
+    assert_eq!(created.prompt.skill_invocations[0].marker.end, 8);
+
+    let unicode = SkillDescriptor {
+        id: SkillId::new("unicode-id"),
+        name: "Über".to_owned(),
+        description: "Unicode guidance".to_owned(),
+        scope: None,
+    };
+    let (_workspace, mut suffix_and_case) = application_with_skills(
+        vec![
+            SkillDescriptor {
+                id: SkillId::new("lint-id"),
+                name: "lint".to_owned(),
+                description: "General lint guidance".to_owned(),
+                scope: None,
+            },
+            unicode.clone(),
+        ],
+        None,
+    );
+    suffix_and_case
+        .handle_event(ApplicationEvent::Command(CommandId::PasteText(
+            "$lint.rs then $über".to_owned(),
+        )))
+        .expect("paste a suffix and Unicode case variant");
+    let ApplicationTransition::CreateSession(created) = suffix_and_case
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("resolve only the exact Unicode marker")
+    else {
+        panic!("Unicode marker creates a Skill-bearing Prompt");
+    };
+    assert_eq!(created.prompt.skill_invocations.len(), 1);
+    assert_eq!(created.prompt.skill_invocations[0].skill_id, unicode.id);
+    assert_eq!(created.prompt.skill_invocations[0].name, "Über");
+}
+
+#[test]
+fn skill_completion_follows_the_active_token_and_escape_dismisses_until_it_ends() {
+    let (_workspace, mut application) = application_with_skills(
+        vec![
+            SkillDescriptor {
+                id: SkillId::new("opaque-review-id"),
+                name: "review".to_owned(),
+                description: "Review the current change".to_owned(),
+                scope: None,
+            },
+            SkillDescriptor {
+                id: SkillId::new("price-shaped-id"),
+                name: ".99".to_owned(),
+                description: "A deliberately price-shaped fixture".to_owned(),
+                scope: None,
+            },
+        ],
+        None,
+    );
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "first line\n($rev".to_owned(),
+        )))
+        .expect("type a multiline Skill query after punctuation");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains(" Skills ")
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::DismissCompletion))
+        .expect("dismiss the active Skill token");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::PasteText(
+            "i".to_owned(),
+        )))
+        .expect("paste into the dismissed token");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "e".to_owned(),
+        )))
+        .expect("continue typing after the paste");
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains(" Skills "),
+        "Escape dismissal lasts for the active token"
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            " $rev".to_owned(),
+        )))
+        .expect("begin another Skill token");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains(" Skills "),
+        "a later token gets its own completion"
+    );
+
+    for literal in ["word$rev", "${review}", "$(review)", "$12.00", "$.99"] {
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::ClearOrExit))
+            .expect("clear the draft");
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+                literal.to_owned(),
+            )))
+            .expect("type literal dollar text");
+        assert!(
+            !rendered_application_rows(&application)
+                .join("\n")
+                .contains(" Skills "),
+            "{literal:?} is not a Skill query"
+        );
+    }
+}
+
+#[test]
+fn unicode_equivalent_skill_names_are_ambiguous() {
+    let (_workspace, mut application) = application_with_skills(
+        vec![
+            SkillDescriptor {
+                id: SkillId::new("composed-id"),
+                name: "İ".to_owned(),
+                description: "Composed spelling".to_owned(),
+                scope: None,
+            },
+            SkillDescriptor {
+                id: SkillId::new("decomposed-id"),
+                name: "i\u{307}".to_owned(),
+                description: "Decomposed spelling".to_owned(),
+                scope: None,
+            },
+        ],
+        None,
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::PasteText(
+            "$i\u{307}".to_owned(),
+        )))
+        .expect("paste a Unicode-equivalent marker");
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("reject the ambiguous marker"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("multiple Skills named")
+    );
+}
+
+#[test]
+fn longest_exact_marker_is_accented_while_ambiguous_input_is_rejected_in_place() {
+    let (_workspace, mut application) = application_with_skills(
+        vec![
+            SkillDescriptor {
+                id: SkillId::new("lint-short"),
+                name: "lint".to_owned(),
+                description: "Lint broadly".to_owned(),
+                scope: None,
+            },
+            SkillDescriptor {
+                id: SkillId::new("lint-rust"),
+                name: "lint.rs".to_owned(),
+                description: "Lint Rust".to_owned(),
+                scope: None,
+            },
+            SkillDescriptor {
+                id: SkillId::new("review-personal"),
+                name: "review".to_owned(),
+                description: "Personal review".to_owned(),
+                scope: Some("Personal".to_owned()),
+            },
+            SkillDescriptor {
+                id: SkillId::new("review-workspace"),
+                name: "Review".to_owned(),
+                description: "Workspace review".to_owned(),
+                scope: Some("Workspace".to_owned()),
+            },
+        ],
+        None,
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::PasteText(
+            "Run $lint.rs, then $review".to_owned(),
+        )))
+        .expect("paste exact and ambiguous markers");
+
+    let buffer = rendered_application_buffer(&application, 80, 15);
+    for (marker, color) in [("$lint.rs", Color::Cyan), ("$review", Color::Red)] {
+        let cells = buffer
+            .content()
+            .windows(marker.len())
+            .find(|window| window.iter().map(|cell| cell.symbol()).collect::<String>() == marker)
+            .unwrap_or_else(|| panic!("rendered composer contains {marker}"));
+        assert!(
+            cells.iter().all(|cell| cell.fg == color),
+            "{marker} uses its semantic marker treatment"
+        );
+    }
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("reject ambiguous Prompt"),
+        ApplicationTransition::Continue
+    );
+    let rejected = rendered_application_rows(&application).join("\n");
+    assert!(rejected.contains("Run $lint.rs, then $review"));
+    assert!(rejected.contains("multiple Skills named `review`"));
+}
+
+#[test]
+fn skill_bindings_follow_outside_edits_and_same_named_replacements_stay_stale() {
+    let review = SkillDescriptor {
+        id: SkillId::new("review-original"),
+        name: "review".to_owned(),
+        description: "Review the current change".to_owned(),
+        scope: None,
+    };
+    let (_workspace, mut edited) = application_with_skills(vec![review.clone()], None);
+    edited
+        .handle_event(ApplicationEvent::Command(CommandId::PasteText(
+            "Use $review now".to_owned(),
+        )))
+        .expect("paste a bound Prompt");
+    for _ in 0.."Use $review now".chars().count() {
+        edited
+            .handle_event(ApplicationEvent::Command(CommandId::MoveCursorLeft))
+            .expect("move before the marker");
+    }
+    edited
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            ">".to_owned(),
+        )))
+        .expect("edit wholly before the marker");
+    for _ in 0.."Use $review now".chars().count() {
+        edited
+            .handle_event(ApplicationEvent::Command(CommandId::MoveCursorRight))
+            .expect("move after the marker");
+    }
+    edited
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "!".to_owned(),
+        )))
+        .expect("edit wholly after the marker");
+    let ApplicationTransition::CreateSession(created) = edited
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit rebased binding")
+    else {
+        panic!("outside edits preserve a valid Skill Prompt");
+    };
+    assert_eq!(created.prompt.text, ">Use $review now!");
+    assert_eq!(created.prompt.skill_invocations.len(), 1);
+    assert_eq!(created.prompt.skill_invocations[0].marker.start, 5);
+    assert_eq!(created.prompt.skill_invocations[0].marker.end, 12);
+
+    let (workspace, mut stale) = application_with_skills(vec![review], None);
+    stale
+        .handle_event(ApplicationEvent::Command(CommandId::PasteText(
+            "$review keep this draft".to_owned(),
+        )))
+        .expect("paste a bound Prompt");
+    let request = SkillCatalogRequest {
+        provider: ProviderId::new("codex"),
+        workspace: Workspace {
+            path: workspace.path().to_owned(),
+        },
+    };
+    stale
+        .handle_event(ApplicationEvent::SkillsListed {
+            request: request.clone(),
+            catalog: SkillCatalog {
+                provider: request.provider,
+                workspace: request.workspace,
+                skills: vec![SkillDescriptor {
+                    id: SkillId::new("review-replacement"),
+                    name: "review".to_owned(),
+                    description: "Different instructions".to_owned(),
+                    scope: None,
+                }],
+                capabilities: SkillCatalogCapabilities {
+                    max_distinct_invocations: None,
+                    supported_deliveries: vec![SkillPromptDelivery::Initial],
+                },
+                status: SkillCatalogStatus::Fresh { warning: None },
+            },
+        })
+        .expect("replace the catalog identity");
+    let stale_buffer = rendered_application_buffer(&stale, 80, 15);
+    let marker = stale_buffer
+        .content()
+        .windows(7)
+        .find(|window| window.iter().map(|cell| cell.symbol()).collect::<String>() == "$review")
+        .expect("stale marker remains visible");
+    assert!(marker.iter().all(|cell| cell.fg == Color::Red));
+    assert_eq!(
+        stale
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("reject stale binding"),
+        ApplicationTransition::Continue
+    );
+    let rejected = rendered_application_rows(&stale).join("\n");
+    assert!(rejected.contains("$review keep this draft"));
+    assert!(rejected.contains("stale"));
+}
+
+#[test]
+fn provider_limit_disables_new_choices_and_rejects_manual_over_limit_input() {
+    let review = SkillDescriptor {
+        id: SkillId::new("review-id"),
+        name: "review".to_owned(),
+        description: "Audit".to_owned(),
+        scope: None,
+    };
+    let test = SkillDescriptor {
+        id: SkillId::new("test-id"),
+        name: "test".to_owned(),
+        description: "Test the change".to_owned(),
+        scope: None,
+    };
+    let (_workspace, mut application) = application_with_skills(vec![review, test], Some(1));
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::PasteText(
+            "$review ".to_owned(),
+        )))
+        .expect("paste the first distinct Skill");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "$tes".to_owned(),
+        )))
+        .expect("query another distinct Skill");
+    let limited = rendered_application_rows(&application).join("\n");
+    assert!(limited.contains("$test"));
+    assert!(limited.contains("limit reached"));
+    application
+        .handle_event(ApplicationEvent::Command(
+            CommandId::ConfirmSelectedCompletion,
+        ))
+        .expect("disabled choice cannot be selected");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "t".to_owned(),
+        )))
+        .expect("manual over-limit input remains editable");
+    let exact_limit = rendered_application_rows(&application).join("\n");
+    assert!(exact_limit.contains("$test"));
+    assert!(
+        exact_limit.contains("limit reached"),
+        "an exact manually bound over-limit choice remains disabled"
+    );
+    application
+        .handle_event(ApplicationEvent::Command(
+            CommandId::ConfirmSelectedCompletion,
+        ))
+        .expect("exact disabled choice still cannot be selected");
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("reject over-limit Prompt atomically"),
+        ApplicationTransition::Continue
+    );
+    let rejected = rendered_application_rows(&application).join("\n");
+    assert!(rejected.contains("$review $test"));
+    assert!(
+        rejected.contains("supports at most 1 distinct Skill"),
+        "{rejected}"
+    );
+}
+
+#[test]
+fn repeated_skill_markers_keep_first_appearance_order_in_the_prompt() {
+    let alpha = SkillDescriptor {
+        id: SkillId::new("alpha-id"),
+        name: "alpha".to_owned(),
+        description: "Alpha guidance".to_owned(),
+        scope: None,
+    };
+    let beta = SkillDescriptor {
+        id: SkillId::new("beta-id"),
+        name: "beta".to_owned(),
+        description: "Beta guidance".to_owned(),
+        scope: None,
+    };
+    let (_workspace, mut application) =
+        application_with_skills(vec![alpha.clone(), beta.clone()], None);
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::PasteText(
+            "$beta then $alpha and $beta".to_owned(),
+        )))
+        .expect("paste repeated Skills");
+    let ApplicationTransition::CreateSession(created) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit repeated Skills")
+    else {
+        panic!("valid repeated Skills create a Session");
+    };
+    assert_eq!(
+        created
+            .prompt
+            .skill_invocations
+            .iter()
+            .map(|invocation| invocation.skill_id.clone())
+            .collect::<Vec<_>>(),
+        vec![beta.id.clone(), alpha.id, beta.id]
+    );
+    assert_eq!(created.prompt.text.matches('$').count(), 3);
+}
+
+#[test]
+fn history_restoration_resolves_exact_skills_without_opening_completion() {
+    let review = SkillDescriptor {
+        id: SkillId::new("review-id"),
+        name: "review".to_owned(),
+        description: "Review guidance".to_owned(),
+        scope: None,
+    };
+    let (workspace, mut application) = application_with_skills(vec![review.clone()], None);
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::PasteText(
+            "$review".to_owned(),
+        )))
+        .expect("paste the first Prompt");
+    let ApplicationTransition::CreateSession(created) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the first Prompt")
+    else {
+        panic!("first Prompt creates a Session");
+    };
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        created.prompt.id,
+        &created.prompt.text,
+        workspace.path(),
+    );
+    snapshot.session.agent_selection = Some(AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-fixture"),
+        options: Vec::new(),
+    });
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(snapshot)))
+        .expect("enter the created Session");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::HistoryPrevious))
+        .expect("restore the prior Prompt");
+    let restored = rendered_application_rows(&application).join("\n");
+    assert!(restored.contains("$review"));
+    assert!(
+        !restored.contains(" Skills "),
+        "history restoration must not open completion"
+    );
+    let ApplicationTransition::AdmitPrompt { request, .. } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("resubmit restored Prompt")
+    else {
+        panic!("restored Prompt is admitted to the Session");
+    };
+    assert_eq!(request.prompt.skill_invocations.len(), 1);
+    assert_eq!(request.prompt.skill_invocations[0].skill_id, review.id);
+}
+
+#[test]
+fn intersecting_a_binding_invalidates_it_and_unknown_dollar_tokens_stay_literal() {
+    let review = SkillDescriptor {
+        id: SkillId::new("review-id"),
+        name: "review".to_owned(),
+        description: "Review guidance".to_owned(),
+        scope: None,
+    };
+    let (_workspace, mut application) = application_with_skills(vec![review], None);
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::PasteText(
+            "$unknown and $review".to_owned(),
+        )))
+        .expect("paste unknown and known markers");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::DeleteBackward))
+        .expect("edit inside the known marker");
+    let buffer = rendered_application_buffer(&application, 80, 15);
+    for literal in ["$unknown", "$revie"] {
+        let cells = buffer
+            .content()
+            .windows(literal.len())
+            .find(|window| window.iter().map(|cell| cell.symbol()).collect::<String>() == literal)
+            .unwrap_or_else(|| panic!("rendered composer contains {literal}"));
+        assert!(
+            cells.iter().all(|cell| cell.fg == Color::Reset),
+            "unknown and incomplete dollar text keeps normal styling"
+        );
+    }
+    let ApplicationTransition::CreateSession(created) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit literal dollar text")
+    else {
+        panic!("unknown and invalidated markers remain an ordinary Prompt");
+    };
+    assert_eq!(created.prompt.text, "$unknown and $revie");
+    assert!(created.prompt.skill_invocations.is_empty());
+}
+
+#[test]
+fn rejected_admission_restores_the_complete_skill_bearing_draft() {
+    let review = SkillDescriptor {
+        id: SkillId::new("review-id"),
+        name: "review".to_owned(),
+        description: "Review guidance".to_owned(),
+        scope: None,
+    };
+    let (workspace, mut application) = application_with_skills(vec![review.clone()], None);
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Initial Prompt".to_owned(),
+        )))
+        .expect("type the first Prompt");
+    let ApplicationTransition::CreateSession(initial) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the first Prompt")
+    else {
+        panic!("first Prompt creates a Session");
+    };
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        initial.prompt.id,
+        &initial.prompt.text,
+        workspace.path(),
+    );
+    snapshot.session.agent_selection = initial.agent_selection;
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(snapshot)))
+        .expect("enter the created Session");
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::PasteText(
+            "$review preserve every marker".to_owned(),
+        )))
+        .expect("paste a Skill-bearing Prompt");
+    let ApplicationTransition::AdmitPrompt { request, .. } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit Skill-bearing Prompt")
+    else {
+        panic!("Session Prompt begins admission");
+    };
+    application
+        .handle_event(ApplicationEvent::PromptAdmissionFailed {
+            prompt_id: request.prompt.id,
+            error: "catalog changed during admission".to_owned(),
+        })
+        .expect("reject admission atomically");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("$review preserve every marker")
+    );
+    let ApplicationTransition::AdmitPrompt { request: retry, .. } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("retry the restored Prompt")
+    else {
+        panic!("restored Prompt remains recoverable");
+    };
+    assert_eq!(retry.prompt.id, request.prompt.id);
+    assert_eq!(retry.prompt.text, request.prompt.text);
+    assert_eq!(retry.prompt.skill_invocations.len(), 1);
+    assert_eq!(retry.prompt.skill_invocations[0].skill_id, review.id);
 }
 
 #[test]
@@ -565,4 +1221,44 @@ fn prompt_block_height(rows: &[String]) -> usize {
         .find_map(|(index, row)| row.contains('└').then_some(index))
         .expect("Prompt block bottom border is rendered");
     bottom - top + 1
+}
+
+fn application_with_skills(
+    skills: Vec<SkillDescriptor>,
+    max_distinct_invocations: Option<u32>,
+) -> (tempfile::TempDir, Application) {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let selection = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-fixture"),
+        options: Vec::new(),
+    };
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(Uuid::new_v4(), 42).with_landing_agent_selection(Some(selection)),
+        )))
+        .expect("connect application");
+    let request = SkillCatalogRequest {
+        provider: ProviderId::new("codex"),
+        workspace: Workspace {
+            path: workspace.path().to_owned(),
+        },
+    };
+    application
+        .handle_event(ApplicationEvent::SkillsListed {
+            request: request.clone(),
+            catalog: SkillCatalog {
+                provider: request.provider,
+                workspace: request.workspace,
+                skills,
+                capabilities: SkillCatalogCapabilities {
+                    max_distinct_invocations,
+                    supported_deliveries: vec![SkillPromptDelivery::Initial],
+                },
+                status: SkillCatalogStatus::Fresh { warning: None },
+            },
+        })
+        .expect("load Skill Catalog");
+    (workspace, application)
 }

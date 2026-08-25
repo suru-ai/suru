@@ -1,13 +1,14 @@
 //! Typed composer completion modes and their shared interaction state.
 
-use std::ops::Range;
+use std::{collections::HashSet, ops::Range};
 
-use crate::protocol::{SkillCatalog, SkillCatalogStatus, SkillDescriptor};
+use crate::protocol::{SkillCatalog, SkillCatalogStatus, SkillDescriptor, SkillId};
 
 use super::commands::{
     AUTOCOMPLETE_LIMIT, SemanticCommandDescriptor, SemanticCommandId, command_matches, descriptor,
     fuzzy_score, slash_trigger,
 };
+use super::composer::skill_marker_start_is_valid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CompletionTrigger {
@@ -47,6 +48,7 @@ pub struct CompletionMode {
     candidates: Vec<CompletionCandidate>,
     selected: usize,
     presentations: Vec<SkillDescriptor>,
+    disabled: Vec<SkillDescriptor>,
     message: Option<String>,
 }
 
@@ -65,6 +67,7 @@ impl CompletionMode {
             candidates: vec![CompletionCandidate::Insert(canonical.into())],
             selected: 0,
             presentations: Vec::new(),
+            disabled: Vec::new(),
             message: None,
         }
     }
@@ -83,12 +86,18 @@ impl CompletionMode {
                 .collect(),
             selected,
             presentations: Vec::new(),
+            disabled: Vec::new(),
             message: None,
         }
     }
 
-    fn skills(trigger: CompletionTrigger, catalog: Option<&SkillCatalog>, selected: usize) -> Self {
-        let (matches, presentations, message) = match catalog.map(|catalog| &catalog.status) {
+    fn skills(
+        trigger: CompletionTrigger,
+        catalog: Option<&SkillCatalog>,
+        bound_skills: &HashSet<SkillId>,
+        selected: usize,
+    ) -> Self {
+        let (mut matches, presentations, message) = match catalog.map(|catalog| &catalog.status) {
             None | Some(SkillCatalogStatus::Loading) => {
                 (Vec::new(), Vec::new(), Some("Loading Skills…".to_owned()))
             }
@@ -113,6 +122,19 @@ impl CompletionMode {
                 Some(format!("Skills unavailable · {message}")),
             ),
         };
+        let mut disabled = Vec::new();
+        if let Some(limit) = catalog.and_then(|catalog| {
+            matches!(catalog.status, SkillCatalogStatus::Fresh { .. })
+                .then_some(catalog.capabilities.max_distinct_invocations)
+                .flatten()
+        }) && bound_skills.len() >= limit as usize
+        {
+            let (still_available, at_limit): (Vec<_>, Vec<_>) = matches
+                .into_iter()
+                .partition(|skill| bound_skills.contains(&skill.id));
+            matches = still_available;
+            disabled = at_limit;
+        }
         let selected = selected.min(matches.len().saturating_sub(1));
         Self {
             kind: CompletionKind::Skills,
@@ -123,6 +145,7 @@ impl CompletionMode {
                 .collect(),
             selected,
             presentations,
+            disabled,
             message,
         }
     }
@@ -191,6 +214,11 @@ impl CompletionMode {
             })
             .collect::<Vec<_>>();
         rows.extend(
+            self.disabled
+                .iter()
+                .map(|skill| (false, CompletionRow::DisabledSkill(skill))),
+        );
+        rows.extend(
             self.presentations
                 .iter()
                 .map(|skill| (false, CompletionRow::StaleSkill(skill))),
@@ -223,42 +251,54 @@ pub(super) enum CompletionRow<'a> {
     Insertion(&'a str),
     Skill(&'a SkillDescriptor),
     StaleSkill(&'a SkillDescriptor),
+    DisabledSkill(&'a SkillDescriptor),
     Message(&'a str),
 }
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ComposerCompletion {
     mode: Option<CompletionMode>,
-    dismissed_text: Option<String>,
+    dismissed: Option<(CompletionKind, usize)>,
 }
 
 impl ComposerCompletion {
-    pub(super) fn sync(&mut self, text: &str, cursor: usize, catalog: Option<&SkillCatalog>) {
-        if self.dismissed_text.as_deref() != Some(text) {
-            self.dismissed_text = None;
-        }
+    pub(super) fn sync(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        catalog: Option<&SkillCatalog>,
+        bound_skills: &HashSet<SkillId>,
+    ) {
         if let Some((query, replacement)) = skill_trigger(text, cursor) {
-            if self.dismissed_text.as_deref() == Some(text) {
+            if self.dismissed == Some((CompletionKind::Skills, replacement.start)) {
                 self.hide();
                 return;
             }
+            self.dismissed = None;
             let trigger = CompletionTrigger::new(query, replacement);
             let selected = self
                 .mode
                 .as_ref()
                 .filter(|mode| mode.is_skills_for(&trigger))
                 .map_or(0, |mode| mode.selected);
-            self.mode = Some(CompletionMode::skills(trigger, catalog, selected));
+            self.mode = Some(CompletionMode::skills(
+                trigger,
+                catalog,
+                bound_skills,
+                selected,
+            ));
             return;
         }
         let Some((query, replacement)) = slash_trigger(text, cursor) else {
+            self.dismissed = None;
             self.hide();
             return;
         };
-        if self.dismissed_text.as_deref() == Some(text) {
+        if self.dismissed == Some((CompletionKind::Commands, replacement.start)) {
             self.hide();
             return;
         }
+        self.dismissed = None;
         let trigger = CompletionTrigger::new(query, replacement);
         let selected = self
             .mode
@@ -271,12 +311,14 @@ impl ComposerCompletion {
     }
 
     pub(super) fn activate(&mut self, mode: CompletionMode) {
-        self.dismissed_text = None;
+        self.dismissed = None;
         self.mode = Some(mode);
     }
 
-    pub(super) fn dismiss_for_text(&mut self, text: &str) {
-        self.dismissed_text = Some(text.to_owned());
+    pub(super) fn dismiss_active(&mut self) {
+        if let Some(mode) = &self.mode {
+            self.dismissed = Some((mode.kind, mode.trigger.replacement.start));
+        }
         self.hide();
     }
 
@@ -338,7 +380,7 @@ fn skill_trigger(text: &str, cursor: usize) -> Option<(&str, Range<usize>)> {
     if cursor > text.len() || !text.is_char_boundary(cursor) {
         return None;
     }
-    let start = text[..cursor]
+    let token_start = text[..cursor]
         .char_indices()
         .rev()
         .find_map(|(index, character)| {
@@ -347,17 +389,15 @@ fn skill_trigger(text: &str, cursor: usize) -> Option<(&str, Range<usize>)> {
                 .then_some(index + character.len_utf8())
         })
         .unwrap_or(0);
-    let token = &text[start..cursor];
-    let query = token.strip_prefix('$')?;
-    if query.starts_with(['$', '{', '('])
-        || query
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_digit())
-        || query.chars().any(char::is_whitespace)
-    {
-        return None;
-    }
+    let start =
+        text[token_start..cursor]
+            .char_indices()
+            .rev()
+            .find_map(|(offset, character)| {
+                let start = token_start + offset;
+                (character == '$' && skill_marker_start_is_valid(text, start)).then_some(start)
+            })?;
+    let query = &text[start + 1..cursor];
     Some((query, start..cursor))
 }
 

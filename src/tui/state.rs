@@ -352,10 +352,13 @@ impl TuiState {
     fn sync_composer_completion(&mut self) {
         let key = self.composer_key();
         let catalog = self.current_skill_catalog().cloned();
+        self.composers.resolve_skills(key, catalog.as_ref());
+        let bound_skills = self.composers.valid_skill_ids(key);
         self.composer_completion.sync(
             self.composers.text(key),
             self.composers.cursor(key),
             catalog.as_ref(),
+            &bound_skills,
         );
     }
 
@@ -400,29 +403,6 @@ impl TuiState {
         .flatten()
     }
 
-    fn draft_has_stale_skill_bindings(&self) -> bool {
-        let invocations = self.composers.skill_invocations(self.composer_key());
-        if invocations.is_empty() {
-            return false;
-        }
-        let Some(catalog) = self.current_skill_catalog() else {
-            return true;
-        };
-        if !matches!(
-            catalog.status,
-            crate::protocol::SkillCatalogStatus::Fresh { .. }
-        ) {
-            return true;
-        }
-        invocations.iter().any(|invocation| {
-            !catalog.skills.iter().any(|skill| {
-                skill.id == invocation.skill_id
-                    && skill.name == invocation.name
-                    && skill.scope == invocation.scope
-            })
-        })
-    }
-
     fn edit_composer(&mut self, edit: impl FnOnce(&mut ComposerMemory, ComposerKey)) {
         let key = self.composer_key();
         edit(&mut self.composers, key);
@@ -437,11 +417,22 @@ impl TuiState {
     }
 
     fn paste_into_composer(&mut self, text: &str) {
+        self.edit_composer_without_completion(|composers, key| composers.insert(key, text));
+    }
+
+    fn restore_composer_history(&mut self, restore: impl FnOnce(&mut ComposerMemory, ComposerKey)) {
+        self.edit_composer_without_completion(restore);
+    }
+
+    fn edit_composer_without_completion(
+        &mut self,
+        edit: impl FnOnce(&mut ComposerMemory, ComposerKey),
+    ) {
         let key = self.composer_key();
-        self.composers.insert(key, text);
+        edit(&mut self.composers, key);
         self.submission_error = None;
-        self.composer_completion
-            .dismiss_for_text(self.composers.text(key));
+        self.sync_composer_completion();
+        self.composer_completion.dismiss_active();
     }
 
     pub fn apply(&mut self, event: ManagedEvent) {
@@ -998,7 +989,7 @@ impl TuiState {
     }
 
     pub(super) fn composer_border_style(&self, theme: &Theme) -> Style {
-        if self.draft_has_stale_skill_bindings() {
+        if self.composers.skill_issue(self.composer_key()).is_some() {
             theme.form_field.invalid
         } else if self.composer_focused {
             theme.form_field.border
@@ -1625,10 +1616,10 @@ impl Application {
                 .navigate_composer(|composers, key| composers.move_right(key)),
             CommandId::HistoryPrevious => self
                 .state
-                .edit_composer(|composers, key| composers.history_previous(key)),
+                .restore_composer_history(|composers, key| composers.history_previous(key)),
             CommandId::HistoryNext => self
                 .state
-                .edit_composer(|composers, key| composers.history_next(key)),
+                .restore_composer_history(|composers, key| composers.history_next(key)),
             _ => {}
         }
         if may_retry_skills && let Some(request) = self.state.skill_catalog_retry_request() {
@@ -1676,9 +1667,7 @@ impl Application {
             }
             CommandId::SelectNextCompletion => self.state.composer_completion.select_next(),
             CommandId::DismissCompletion => {
-                let key = self.state.composer_key();
-                let text = self.state.composers.text(key);
-                self.state.composer_completion.dismiss_for_text(text);
+                self.state.composer_completion.dismiss_active();
             }
             CommandId::ConfirmSelectedCompletion => return self.accept_completion(),
             _ => {}
@@ -1921,6 +1910,12 @@ impl Application {
         if self.state.composers.text(key).trim().is_empty() {
             self.state.submission_error =
                 Some("Prompt must contain non-whitespace text".to_owned());
+            return ApplicationTransition::Continue;
+        }
+        self.state.sync_composer_completion();
+        if let Some(error) = self.state.composers.skill_issue(key) {
+            self.state.submission_error = Some(error.to_owned());
+            self.state.composer_completion.dismiss_active();
             return ApplicationTransition::Continue;
         }
         let prompt = self.state.composers.begin_submission(key);
