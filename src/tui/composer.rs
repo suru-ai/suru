@@ -1,6 +1,7 @@
 //! Client-local multiline composer memory keyed by landing route or Session.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use crate::protocol::{InitialPrompt, PromptId, SessionId};
 
@@ -50,6 +51,10 @@ impl ComposerMemory {
 
     pub(super) fn insert(&mut self, key: ComposerKey, text: &str) {
         self.composer_mut(key).insert(text);
+    }
+
+    pub(super) fn replace(&mut self, key: ComposerKey, range: Range<usize>, text: &str) -> bool {
+        self.composer_mut(key).replace(range, text)
     }
 
     pub(super) fn delete_backward(&mut self, key: ComposerKey) {
@@ -158,6 +163,22 @@ impl ComposerState {
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
         self.invalidate_retry_after_edit();
+    }
+
+    fn replace(&mut self, range: Range<usize>, replacement: &str) -> bool {
+        if range.start > range.end
+            || range.end > self.text.len()
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return false;
+        }
+        self.leave_history_navigation();
+        let cursor = range.start + replacement.len();
+        self.text.replace_range(range, replacement);
+        self.cursor = cursor;
+        self.invalidate_retry_after_edit();
+        true
     }
 
     fn delete_backward(&mut self) {

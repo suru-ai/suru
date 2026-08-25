@@ -50,7 +50,7 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
     }
 }
 
-pub(super) fn command_for_autocomplete_event(event: InputEvent) -> Option<CommandId> {
+pub(super) fn command_for_completion_event(event: InputEvent) -> Option<CommandId> {
     let InputEvent::Key(key) = event else {
         return None;
     };
@@ -59,13 +59,15 @@ pub(super) fn command_for_autocomplete_event(event: InputEvent) -> Option<Comman
     }
     match (key.code, key.modifiers) {
         (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-            Some(CommandId::SelectPreviousAutocomplete)
+            Some(CommandId::SelectPreviousCompletion)
         }
         (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
-            Some(CommandId::SelectNextAutocomplete)
+            Some(CommandId::SelectNextCompletion)
         }
-        (KeyCode::Enter | KeyCode::Tab, KeyModifiers::NONE) => Some(CommandId::SelectAutocomplete),
-        (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::DismissAutocomplete),
+        (KeyCode::Enter | KeyCode::Tab, KeyModifiers::NONE) => {
+            Some(CommandId::ConfirmSelectedCompletion)
+        }
+        (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::DismissCompletion),
         _ => None,
     }
 }

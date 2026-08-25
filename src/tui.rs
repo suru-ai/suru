@@ -1,6 +1,7 @@
 //! Ratatui view state and terminal lifecycle.
 
 mod commands;
+mod completion;
 mod composer;
 mod event_loop;
 mod keymap;
@@ -17,6 +18,7 @@ mod state;
 mod transcript;
 
 pub use commands::{NumericDigit, SemanticCommandId};
+pub use completion::CompletionMode;
 pub use event_loop::run;
 pub use keymap::command_for_terminal_event;
 pub use render::render;

@@ -26,10 +26,11 @@ use crate::{
 };
 
 use super::{
-    commands::{CommandAutocomplete, SemanticCommandId, SemanticInvocation, SemanticSubject},
+    commands::{SemanticCommandId, SemanticInvocation, SemanticSubject},
+    completion::{CompletionConfirmation, CompletionMode, ComposerCompletion},
     composer::{ComposerKey, ComposerMemory},
     keymap::{
-        command_for_autocomplete_event, command_for_interrupt_confirmation_event,
+        command_for_completion_event, command_for_interrupt_confirmation_event,
         command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
         command_for_numeric_editor_event, command_for_queued_prompt_event,
         command_for_session_picker_event, command_for_settings_panel_event,
@@ -244,7 +245,7 @@ pub struct TuiState {
     failed_submissions: HashMap<PromptId, FailedSubmission>,
     pending_steers: Vec<PendingSteer>,
     pub(super) command_mode: CommandMode,
-    pub(super) command_autocomplete: CommandAutocomplete,
+    pub(super) composer_completion: ComposerCompletion,
     pending_model_options: bool,
     pub(super) model_options: ModelOptions,
     pub(super) model_picker: ModelPicker,
@@ -337,7 +338,7 @@ impl TuiState {
             failed_submissions: HashMap::new(),
             pending_steers: Vec::new(),
             command_mode: CommandMode::Composer,
-            command_autocomplete: CommandAutocomplete::default(),
+            composer_completion: ComposerCompletion::default(),
             pending_model_options: false,
             model_options: ModelOptions::default(),
             model_picker: ModelPicker::default(),
@@ -346,9 +347,9 @@ impl TuiState {
         }
     }
 
-    fn sync_command_autocomplete(&mut self) {
+    fn sync_composer_completion(&mut self) {
         let key = self.composer_key();
-        self.command_autocomplete
+        self.composer_completion
             .sync(self.composers.text(key), self.composers.cursor(key));
     }
 
@@ -356,20 +357,20 @@ impl TuiState {
         let key = self.composer_key();
         edit(&mut self.composers, key);
         self.submission_error = None;
-        self.sync_command_autocomplete();
+        self.sync_composer_completion();
     }
 
     fn navigate_composer(&mut self, navigate: impl FnOnce(&mut ComposerMemory, ComposerKey)) {
         let key = self.composer_key();
         navigate(&mut self.composers, key);
-        self.sync_command_autocomplete();
+        self.sync_composer_completion();
     }
 
     fn paste_into_composer(&mut self, text: &str) {
         let key = self.composer_key();
         self.composers.insert(key, text);
         self.submission_error = None;
-        self.command_autocomplete
+        self.composer_completion
             .dismiss_for_text(self.composers.text(key));
     }
 
@@ -403,7 +404,7 @@ impl TuiState {
                     self.session_events_blocked = true;
                     self.submission_error =
                         Some("Session ended because the shared server was replaced".to_owned());
-                    self.sync_command_autocomplete();
+                    self.sync_composer_completion();
                 }
                 if self.session.is_none() {
                     self.landing_agent_selection = health.landing_agent_selection.clone();
@@ -538,7 +539,7 @@ impl TuiState {
         self.submission_error = Some("Session ended because it was deleted".to_owned());
         self.model_picker
             .refocus(self.landing_agent_selection.as_ref());
-        self.sync_command_autocomplete();
+        self.sync_composer_completion();
     }
 
     fn apply_session(&mut self, event: SessionEvent) -> Result<()> {
@@ -601,7 +602,7 @@ impl TuiState {
         self.submission_error = None;
         self.session = Some(SessionProjection::new(snapshot));
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
-        self.sync_command_autocomplete();
+        self.sync_composer_completion();
     }
 
     fn composer_key(&self) -> ComposerKey {
@@ -1233,10 +1234,11 @@ pub enum CommandId {
     RequestInterrupt,
     ConfirmInterrupt,
     CloseCommandMode,
-    SelectPreviousAutocomplete,
-    SelectNextAutocomplete,
-    DismissAutocomplete,
-    SelectAutocomplete,
+    SelectPreviousCompletion,
+    SelectNextCompletion,
+    DismissCompletion,
+    ConfirmSelectedCompletion,
+    ActivateCompletion(CompletionMode),
     InsertSessionSearch(String),
     DeleteSessionSearchBackward,
     SelectPreviousSession,
@@ -1408,6 +1410,10 @@ impl Application {
             CommandId::SubmitSteer => Ok(self.submit_prompt(PromptDelivery::Steer)),
             CommandId::SubmitQueue => Ok(self.submit_prompt(PromptDelivery::Queue)),
             CommandId::InvokeSemantic(command) => self.invoke_semantic(command),
+            CommandId::ActivateCompletion(mode) => {
+                self.state.composer_completion.activate(mode);
+                Ok(ApplicationTransition::Continue)
+            }
             command @ (CommandId::ClearOrExit
             | CommandId::InsertText(_)
             | CommandId::PasteText(_)
@@ -1426,10 +1432,10 @@ impl Application {
             | CommandId::ToggleTranscriptDisclosureAt { .. }) => {
                 self.handle_transcript_command(command)
             }
-            command @ (CommandId::SelectPreviousAutocomplete
-            | CommandId::SelectNextAutocomplete
-            | CommandId::DismissAutocomplete
-            | CommandId::SelectAutocomplete) => self.handle_autocomplete_command(command),
+            command @ (CommandId::SelectPreviousCompletion
+            | CommandId::SelectNextCompletion
+            | CommandId::DismissCompletion
+            | CommandId::ConfirmSelectedCompletion) => self.handle_completion_command(command),
             command @ (CommandId::InsertSessionSearch(_)
             | CommandId::DeleteSessionSearchBackward
             | CommandId::SelectPreviousSession
@@ -1556,41 +1562,55 @@ impl Application {
         Ok(ApplicationTransition::Continue)
     }
 
-    /// Handles the slash command autocomplete commands routed here; any other
-    /// command leaves the suggestion list alone.
-    fn handle_autocomplete_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
+    /// Handles composer completion commands; any other command leaves the
+    /// suggestion list alone.
+    fn handle_completion_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
         match command {
-            CommandId::SelectPreviousAutocomplete => {
-                self.state.command_autocomplete.select_previous();
+            CommandId::SelectPreviousCompletion => {
+                self.state.composer_completion.select_previous();
             }
-            CommandId::SelectNextAutocomplete => self.state.command_autocomplete.select_next(),
-            CommandId::DismissAutocomplete => {
+            CommandId::SelectNextCompletion => self.state.composer_completion.select_next(),
+            CommandId::DismissCompletion => {
                 let key = self.state.composer_key();
                 let text = self.state.composers.text(key);
-                self.state.command_autocomplete.dismiss_for_text(text);
+                self.state.composer_completion.dismiss_for_text(text);
             }
-            CommandId::SelectAutocomplete => return self.accept_autocomplete(),
+            CommandId::ConfirmSelectedCompletion => return self.accept_completion(),
             _ => {}
         }
         Ok(ApplicationTransition::Continue)
     }
 
-    fn accept_autocomplete(&mut self) -> Result<ApplicationTransition> {
-        let Some(command) = self.state.command_autocomplete.selected() else {
+    fn accept_completion(&mut self) -> Result<ApplicationTransition> {
+        let Some(confirmation) = self.state.composer_completion.selected_confirmation() else {
             return Ok(ApplicationTransition::Continue);
         };
-        if self.state.selection_update_pending()
-            && matches!(
-                command,
-                SemanticCommandId::SessionList | SemanticCommandId::SessionNew
-            )
-        {
-            return Ok(ApplicationTransition::Continue);
+        match confirmation {
+            CompletionConfirmation::InvokeSemantic(command) => {
+                if self.state.selection_update_pending()
+                    && matches!(
+                        command,
+                        SemanticCommandId::SessionList | SemanticCommandId::SessionNew
+                    )
+                {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                let key = self.state.composer_key();
+                self.state.composers.clear(key);
+                self.state.sync_composer_completion();
+                self.invoke_semantic(command)
+            }
+            CompletionConfirmation::Insert {
+                replacement,
+                canonical,
+            } => {
+                let inserted = format!("{canonical} ");
+                self.state.edit_composer(|composers, key| {
+                    composers.replace(key, replacement, &inserted);
+                });
+                Ok(ApplicationTransition::Continue)
+            }
         }
-        let key = self.state.composer_key();
-        self.state.composers.clear(key);
-        self.state.sync_command_autocomplete();
-        self.invoke_semantic(command)
     }
 
     /// Handles the Session picker commands routed here; any other command
@@ -1793,7 +1813,7 @@ impl Application {
             return ApplicationTransition::Continue;
         }
         let prompt = self.state.composers.begin_submission(key);
-        self.state.sync_command_autocomplete();
+        self.state.sync_composer_completion();
         self.state.failed_submissions.remove(&prompt.id);
         self.state.submission_error = None;
         if let ComposerKey::Session(session_id) = key {
@@ -2108,7 +2128,7 @@ impl Application {
                     self.state.confirmed_agent_selection = None;
                 }
                 self.state.session_events_blocked = detached;
-                self.state.sync_command_autocomplete();
+                self.state.sync_composer_completion();
                 Ok(if detached {
                     ApplicationTransition::DetachSession
                 } else {
@@ -2441,8 +2461,8 @@ impl Application {
         if self.state.session_picker.is_open() {
             return command_for_session_picker_event(event);
         }
-        if self.state.command_autocomplete.is_visible()
-            && let Some(command) = command_for_autocomplete_event(event.clone())
+        if self.state.composer_completion.is_visible()
+            && let Some(command) = command_for_completion_event(event.clone())
         {
             return Some(command);
         }

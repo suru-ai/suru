@@ -8,7 +8,7 @@ use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
 use suru::{
     protocol::{PromptId, SessionId},
-    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId},
+    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, CompletionMode},
 };
 
 #[test]
@@ -37,6 +37,43 @@ fn slash_autocomplete_invokes_new_session_from_a_description_match() {
     assert!(landing.contains("Type a Prompt and press Enter"));
     assert!(!landing.contains("Long-running work"));
     assert!(!landing.contains("/new"));
+}
+
+#[test]
+fn insert_completion_replaces_its_range_and_keeps_the_composer_open() {
+    let mut application = Application::default();
+    type_terminal_text(&mut application, "Ask $revlater");
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::ActivateCompletion(
+                CompletionMode::insertion("rev", 4..8, "$review"),
+            ),))
+            .expect("activate inert insert completion"),
+        ApplicationTransition::Continue
+    );
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("confirm inert insert completion"),
+        ApplicationTransition::Continue
+    );
+
+    type_terminal_text(&mut application, "now ");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("submit the completed Prompt separately")
+    else {
+        panic!("completion confirmation should not submit the composer");
+    };
+    assert_eq!(request.prompt.text, "Ask $review now later");
 }
 
 #[test]

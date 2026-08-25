@@ -1,4 +1,4 @@
-//! Typed semantic commands and slash autocomplete state.
+//! Typed semantic commands and the Command completion mode.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -531,96 +531,15 @@ fn command_for_semantic_binding(
     })
 }
 
-#[derive(Clone, Debug, Default)]
-pub(super) struct CommandAutocomplete {
-    query: Option<String>,
-    dismissed_text: Option<String>,
-    matches: Vec<SemanticCommandId>,
-    selected: usize,
-}
-
-impl CommandAutocomplete {
-    pub(super) fn sync(&mut self, text: &str, cursor: usize) {
-        if self.dismissed_text.as_deref() != Some(text) {
-            self.dismissed_text = None;
-        }
-        let Some(query) = slash_query(text, cursor) else {
-            self.hide();
-            return;
-        };
-        if self.dismissed_text.as_deref() == Some(text) {
-            self.hide();
-            return;
-        }
-        if self.query.as_deref() != Some(query) {
-            self.selected = 0;
-        }
-        self.query = Some(query.to_owned());
-        self.matches = autocomplete_matches(query);
-        self.selected = self.selected.min(self.matches.len().saturating_sub(1));
-    }
-
-    pub(super) fn dismiss_for_text(&mut self, text: &str) {
-        self.dismissed_text = Some(text.to_owned());
-        self.hide();
-    }
-
-    pub(super) fn is_visible(&self) -> bool {
-        !self.matches.is_empty()
-    }
-
-    pub(super) fn selected(&self) -> Option<SemanticCommandId> {
-        self.matches.get(self.selected).copied()
-    }
-
-    pub(super) fn select_previous(&mut self) {
-        if !self.matches.is_empty() {
-            self.selected = self
-                .selected
-                .checked_sub(1)
-                .unwrap_or(self.matches.len() - 1);
-        }
-    }
-
-    pub(super) fn select_next(&mut self) {
-        if !self.matches.is_empty() {
-            self.selected = (self.selected + 1) % self.matches.len();
-        }
-    }
-
-    pub(super) fn rows(
-        &self,
-    ) -> impl ExactSizeIterator<Item = (bool, &'static SemanticCommandDescriptor)> + '_ {
-        self.matches
-            .iter()
-            .enumerate()
-            .map(|(index, id)| (index == self.selected, descriptor(*id)))
-    }
-
-    pub(super) fn visible_rows(
-        &self,
-        capacity: usize,
-    ) -> impl Iterator<Item = (bool, &'static SemanticCommandDescriptor)> + '_ {
-        let start = self.selected.saturating_add(1).saturating_sub(capacity);
-        self.rows().skip(start).take(capacity)
-    }
-
-    fn hide(&mut self) {
-        self.query = None;
-        self.matches.clear();
-        self.selected = 0;
-    }
-}
-
-fn slash_query(text: &str, cursor: usize) -> Option<&str> {
+pub(super) fn slash_trigger(text: &str, cursor: usize) -> Option<(&str, std::ops::Range<usize>)> {
     if cursor != text.len() || text.contains('\n') {
         return None;
     }
     let query = text.strip_prefix('/')?;
-    (!query.chars().any(char::is_whitespace)).then_some(query)
+    (!query.chars().any(char::is_whitespace)).then_some((query, 0..text.len()))
 }
 
-fn autocomplete_matches(query: &str) -> Vec<SemanticCommandId> {
+pub(super) fn command_matches(query: &str) -> Vec<SemanticCommandId> {
     let mut matches = SEMANTIC_COMMANDS
         .iter()
         .filter_map(|command| {

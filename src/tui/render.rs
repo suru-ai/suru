@@ -22,6 +22,7 @@ use crate::{
 };
 
 use super::{
+    completion::CompletionRow,
     composer::ComposerKey,
     keymap::binding_label,
     model_options::ModelOptionChoiceRow,
@@ -93,8 +94,8 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     } else {
         render_landing(frame, state, slots, &theme)
     };
-    if state.command_autocomplete.is_visible() && !state.reconnect_overlay_visible {
-        render_command_autocomplete(frame, state, composer.area, &theme);
+    if state.composer_completion.is_visible() && !state.reconnect_overlay_visible {
+        render_composer_completion(frame, state, composer.area, &theme);
     }
     if state.session_picker.is_open() && !state.reconnect_overlay_visible {
         render_session_picker(frame, state, &theme);
@@ -933,7 +934,7 @@ struct RenderedComposer {
     cursor: Position,
 }
 
-fn render_command_autocomplete(
+fn render_composer_completion(
     frame: &mut Frame<'_>,
     state: &TuiState,
     composer_area: Rect,
@@ -943,7 +944,7 @@ fn render_command_autocomplete(
     let width = available_width.clamp(1, 72);
     let room_above = composer_area.y.saturating_sub(frame.area().y);
     let bordered = room_above >= 3;
-    let row_count = state.command_autocomplete.rows().len() as u16;
+    let row_count = state.composer_completion.rows().len() as u16;
     let height = if bordered {
         row_count.saturating_add(2).min(room_above)
     } else {
@@ -957,19 +958,27 @@ fn render_command_autocomplete(
     let area = Rect::new(x, y, width, height);
     let content_width = width.saturating_sub(if bordered { 2 } else { 0 });
     let rows = state
-        .command_autocomplete
+        .composer_completion
         .visible_rows(usize::from(row_capacity))
-        .map(|(selected, command)| {
-            let slash = command
-                .slash
-                .expect("autocomplete only contains commands with slash metadata");
-            let content = truncate_to_width(
-                &format!(
-                    "/{}  {} · {}",
-                    slash.name, command.title, command.description
-                ),
-                usize::from(content_width),
-            );
+        .into_iter()
+        .map(|(selected, row)| {
+            let content = match row {
+                CompletionRow::Command(command) => {
+                    let slash = command
+                        .slash
+                        .expect("Command completion only contains slash-enabled commands");
+                    truncate_to_width(
+                        &format!(
+                            "/{}  {} · {}",
+                            slash.name, command.title, command.description
+                        ),
+                        usize::from(content_width),
+                    )
+                }
+                CompletionRow::Insertion(canonical) => {
+                    truncate_to_width(canonical, usize::from(content_width))
+                }
+            };
             Line::styled(
                 content,
                 if selected {
@@ -984,7 +993,7 @@ fn render_command_autocomplete(
         Paragraph::new(rows).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Commands ")
+                .title(state.composer_completion.title())
                 .border_style(theme.border.default)
                 .style(theme.surface.overlay),
         )
