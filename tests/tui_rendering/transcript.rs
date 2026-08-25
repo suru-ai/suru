@@ -1491,6 +1491,52 @@ fn command_activity_session(
     (snapshot, activity_id)
 }
 
+#[test]
+fn an_expanded_command_wraps_beneath_its_text_and_nests_its_details() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let (mut snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        "output-start",
+        false,
+    );
+    let Activity::Command { command, cwd, .. } = &mut snapshot.activities[0] else {
+        panic!("the Session's Activity is a command");
+    };
+    *command =
+        "command-start alpha beta gamma delta epsilon zeta eta command-continuation".to_owned();
+    *cwd = Some("/workspace-start".into());
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with an overlong command");
+    press_leader_chord(&mut application, 'f');
+
+    let buffer = rendered_application_buffer(&application, 50, 24);
+    let rows = buffer_rows(&buffer);
+    let first_occupied_column = |needle: &str| {
+        rows.iter()
+            .find(|row| row.contains(needle))
+            .and_then(|row| row.chars().position(|character| !character.is_whitespace()))
+            .unwrap_or_else(|| panic!("rendered frame contains {needle:?}")) as u16
+    };
+    let command_column = text_position(&buffer, "command-start").0;
+    assert_eq!(
+        first_occupied_column("command-continuation"),
+        command_column,
+        "the command continuation hangs beneath the command text:\n{}",
+        rows.join("\n")
+    );
+    for detail in ["in /workspace-start", "output-start"] {
+        assert_eq!(
+            text_position(&buffer, detail).0,
+            command_column + 2,
+            "command details sit one level beneath the command text:\n{}",
+            rows.join("\n")
+        );
+    }
+}
+
 fn numbered_output(lines: usize) -> String {
     prefixed_output("output", lines)
 }

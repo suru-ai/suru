@@ -73,6 +73,11 @@ const LIVE_COMMAND_TAIL_ROWS: usize = 3;
 /// truncation marker lines up with the lines it stands in for.
 const OUTPUT_INDENT: &str = "    ";
 
+/// The gutter for workspace and output rows belonging to a command. A command
+/// header's Marker already seats its text at the ordinary Activity-body level;
+/// these details sit one level beneath that text.
+const COMMAND_DETAIL_INDENT: &str = "      ";
+
 /// The extra gutter an expanded Group's or Turn Fold's members sit in, so a
 /// member reads as subordinate to the header row it folds back into.
 const MEMBER_INDENT: &str = "  ";
@@ -2315,8 +2320,8 @@ fn push_command_activity(
                 links: projection.links,
             },
             ContentGutter {
-                lead: OUTPUT_INDENT,
-                indent: OUTPUT_INDENT,
+                lead: COMMAND_DETAIL_INDENT,
+                indent: COMMAND_DETAIL_INDENT,
             },
             output,
             theme.text.subdued,
@@ -2342,12 +2347,21 @@ fn push_command_activity(
     };
     let command = format!("{command}{exit_suffix}");
     let header_start = projection.lines.len();
-    push_prefixed_lines(projection.lines, &format!("  {marker}"), &command, style);
+    let header_prefix = format!("  {marker}");
+    let header_indent = " ".repeat(header_prefix.width());
+    push_prefixed_lines_with_indent(
+        projection.lines,
+        &header_prefix,
+        &header_indent,
+        &command,
+        style,
+    );
     let header_source_lines = projection.lines.len() - header_start;
     if let Some(cwd) = cwd {
+        let cwd_prefix = format!("{COMMAND_DETAIL_INDENT}in ");
         push_prefixed_lines(
             projection.lines,
-            "    in ",
+            &cwd_prefix,
             cwd.to_string_lossy().as_ref(),
             theme.text.subdued,
         );
@@ -2369,7 +2383,7 @@ fn push_command_activity(
         push_truncation_marker(
             projection.lines,
             CappedStream::CommandOutput,
-            OUTPUT_INDENT,
+            COMMAND_DETAIL_INDENT,
             theme,
         );
     }
@@ -2455,7 +2469,12 @@ fn fold_output_to_tail(
     let hidden = tail_start;
     let tail = lines.split_off(tail_start);
     lines.clear();
-    lines.push(fold_marker_line(hidden, "lines", OUTPUT_INDENT, theme));
+    lines.push(fold_marker_line(
+        hidden,
+        "lines",
+        COMMAND_DETAIL_INDENT,
+        theme,
+    ));
     lines.extend(tail);
     (lines, true)
 }
@@ -2779,10 +2798,20 @@ fn push_agent_message(
 }
 
 fn push_prefixed_lines(lines: &mut Vec<Line<'static>>, prefix: &str, content: &str, style: Style) {
+    push_prefixed_lines_with_indent(lines, prefix, "  ", content, style);
+}
+
+fn push_prefixed_lines_with_indent(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    indent: &str,
+    content: &str,
+    style: Style,
+) {
     let content = sanitize_content(content);
     for (index, line) in content.lines().enumerate() {
         lines.push(Line::styled(
-            format!("{}{line}", if index == 0 { prefix } else { "  " }),
+            format!("{}{line}", if index == 0 { prefix } else { indent }),
             style,
         ));
     }
@@ -3114,7 +3143,7 @@ fn continuation_prefix(symbols: &[StyledSymbol], width: u16) -> Vec<StyledSymbol
         .position(|symbol| !symbol.is_whitespace())
         .unwrap_or(symbols.len());
     let mut prefix_end = leading_end;
-    while let Some(marker_end) = markdown_marker_end(symbols, prefix_end) {
+    while let Some(marker_end) = structural_marker_end(symbols, prefix_end) {
         prefix_end = marker_end;
     }
     if prefix_end == 0 || width <= 1 {
@@ -3142,9 +3171,9 @@ fn continuation_prefix(symbols: &[StyledSymbol], width: u16) -> Vec<StyledSymbol
     prefix
 }
 
-fn markdown_marker_end(symbols: &[StyledSymbol], start: usize) -> Option<usize> {
+fn structural_marker_end(symbols: &[StyledSymbol], start: usize) -> Option<usize> {
     let symbol = |index: usize| symbols.get(index).map(|symbol| symbol.symbol.as_str());
-    if matches!(symbol(start), Some("•" | "│"))
+    if matches!(symbol(start), Some("•" | "│" | "✓" | "×" | "⠋"))
         && symbols
             .get(start + 1)
             .is_some_and(StyledSymbol::is_whitespace)
@@ -3951,7 +3980,7 @@ mod tests {
         );
 
         let marker = lines.last().expect("render the truncation marker");
-        assert_eq!(rendered_text(marker), "    [output truncated]");
+        assert_eq!(rendered_text(marker), "      [output truncated]");
         assert!(
             marker.style.add_modifier.contains(Modifier::ITALIC),
             "the marker carries a style command output cannot: {marker:?}"
@@ -4087,7 +4116,7 @@ mod tests {
             !marker.style.add_modifier.contains(Modifier::ITALIC),
             "output the Provider sent keeps the style of command output: {marker:?}"
         );
-        assert_eq!(rendered_text(marker), "    [output truncated]");
+        assert_eq!(rendered_text(marker), "      [output truncated]");
     }
 
     #[test]
@@ -4352,8 +4381,8 @@ mod tests {
             [
                 "  Preparing the workspace",
                 "  ✓ cargo test",
-                "    running 2 tests",
-                "    all green",
+                "      running 2 tests",
+                "      all green",
                 "",
                 "  Done",
             ]
@@ -4458,8 +4487,8 @@ mod tests {
             [
                 "  ✓ Ran 2 commands",
                 "    ✓ cargo fmt",
-                "      reformatted 3 files",
-                "      reformatted 1 file",
+                "        reformatted 3 files",
+                "        reformatted 1 file",
                 "",
                 "    ✓ cargo clippy",
             ]
@@ -4930,7 +4959,7 @@ mod tests {
                 "  ✓ Worked",
                 "    ✓ Ran 2 commands",
                 "      ✓ cargo fmt",
-                "        reformatted 1 file",
+                "          reformatted 1 file",
                 "",
                 "      ✓ cargo clippy",
                 "",
@@ -5245,7 +5274,7 @@ mod tests {
         assert_eq!(row_text(&opening_on_it), ["", "  ✓ cargo test"]);
         assert_eq!(
             row_text(&opening_past_it),
-            ["  ✓ cargo test", "    running 2 tests"]
+            ["  ✓ cargo test", "      running 2 tests"]
         );
     }
 
