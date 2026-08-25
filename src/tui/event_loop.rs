@@ -25,10 +25,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use crossterm::{
     cursor::{Hide, Show},
-    event::{
-        DisableBracketedPaste, EnableBracketedPaste, Event as InputEvent, EventStream,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-    },
+    event::{DisableBracketedPaste, EnableBracketedPaste, Event as InputEvent, EventStream},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -1178,17 +1175,43 @@ impl crossterm::Command for DisableMouseButtonReporting {
     }
 }
 
+struct PushModifiedKeyReporting;
+
+impl crossterm::Command for PushModifiedKeyReporting {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[>1u")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        )
+        .execute_winapi()
+    }
+}
+
+struct PopModifiedKeyReporting;
+
+impl crossterm::Command for PopModifiedKeyReporting {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[<1u")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        crossterm::event::PopKeyboardEnhancementFlags.execute_winapi()
+    }
+}
+
 fn enable_terminal_features(output: &mut impl std::io::Write) -> std::io::Result<()> {
     execute!(output, EnableBracketedPaste, EnableMouseButtonReporting)?;
-    let _ = execute!(
-        output,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    );
+    let _ = execute!(output, PushModifiedKeyReporting);
     Ok(())
 }
 
 fn disable_terminal_features(output: &mut impl std::io::Write) -> std::io::Result<()> {
-    let _ = execute!(output, PopKeyboardEnhancementFlags);
+    let _ = execute!(output, PopModifiedKeyReporting);
     execute!(output, DisableMouseButtonReporting, DisableBracketedPaste)
 }
 
@@ -1236,13 +1259,22 @@ impl Drop for TerminalSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{disable_terminal_features, enable_terminal_features};
+    use crossterm::Command;
+
+    use super::{
+        DisableMouseButtonReporting, EnableMouseButtonReporting, PopModifiedKeyReporting,
+        PushModifiedKeyReporting,
+    };
 
     #[test]
     fn terminal_input_capabilities_enable_mouse_and_modified_key_reporting() {
-        let mut enabled = Vec::new();
-        enable_terminal_features(&mut enabled).expect("enable terminal features");
-        let enabled = String::from_utf8(enabled).expect("terminal commands are ANSI");
+        let mut enabled = String::new();
+        EnableMouseButtonReporting
+            .write_ansi(&mut enabled)
+            .expect("format mouse reporting command");
+        PushModifiedKeyReporting
+            .write_ansi(&mut enabled)
+            .expect("format modified key reporting command");
         assert!(
             enabled.contains("\x1b[?1000h"),
             "mouse capture was not enabled"
@@ -1252,9 +1284,13 @@ mod tests {
             "modified key reporting was not enabled"
         );
 
-        let mut disabled = Vec::new();
-        disable_terminal_features(&mut disabled).expect("disable terminal features");
-        let disabled = String::from_utf8(disabled).expect("terminal commands are ANSI");
+        let mut disabled = String::new();
+        PopModifiedKeyReporting
+            .write_ansi(&mut disabled)
+            .expect("format modified key restoration command");
+        DisableMouseButtonReporting
+            .write_ansi(&mut disabled)
+            .expect("format mouse reporting restoration command");
         assert!(
             disabled.contains("\x1b[?1000l"),
             "mouse capture was not disabled"
