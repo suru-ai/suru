@@ -11,6 +11,9 @@ You have access to the following codebases under ./references/ you should use fo
 - Do not account for backwards compatibility with previous versions.
 - Build using interfaces designed for an eventual plugin architecture based on that of OpenCode.
 - User-facing configuration has a surface: Settings are declared in the compile-time schema in `src/settings.rs`, pinned by Config Documents under the config root, and edited from the settings panel. Each Setting also declares the group whose tab of that panel presents it. Promoting a value to a Setting is a schema entry, not new machinery — but promote deliberately.
+- Suru runs on Windows, macOS, and Linux, and every change must work on all three — tests included. Gate genuinely
+platform-specific behavior with `cfg` so the other platforms keep working, and root path fixtures per platform rather
+than assuming POSIX: `Path::is_absolute` is platform-defined, so `/home/user` is a relative path on Windows.
 - Run tests with `cargo nextest run` (parallelizes across test binaries and reports per-test timings); `cargo test` also works. Tests must not wait out production-scale delays: timing constants (timeouts, backoff, keepalive) are injectable via builders such as `ManagedClientConfig::with_startup_timeout`, `ServerTimings`, and `CodexRuntime::with_interrupt_request_timeout`, so inject millisecond-scale values instead of sleeping.
 
 ## Plugins
