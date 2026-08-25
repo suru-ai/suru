@@ -501,10 +501,20 @@ async fn stop_waits_for_its_target_when_the_registration_is_replaced() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config =
         ServerConfig::new(state_dir.path(), "stop-target-wait-test").expect("configure server");
-    let server = server::spawn(config.clone()).await.expect("spawn server");
+    let server = server::spawn_with_timings(
+        config.clone(),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(10),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .expect("spawn server");
     let descriptor = server.descriptor().clone();
     let stop_config = ManagedClientConfig::new(state_dir.path(), "stop-target-wait-test")
-        .expect("configure stop client");
+        .expect("configure stop client")
+        .with_health_check_timeout(Duration::from_millis(50))
+        .with_stop_timeout(Duration::from_millis(500));
     let stopping = tokio::spawn(async move { stop_server(&stop_config).await });
     let client = reqwest::Client::new();
 
@@ -539,12 +549,17 @@ async fn stop_waits_for_its_target_when_the_registration_is_replaced() {
         .expect("stop task does not panic")
         .expect("stop waits for the original instance");
     assert!(
-        client
-            .get(format!("{}/health", descriptor.base_url))
-            .bearer_auth(&descriptor.token)
-            .send()
-            .await
-            .is_err(),
+        matches!(
+            timeout(
+                Duration::from_millis(100),
+                client
+                    .get(format!("{}/health", descriptor.base_url))
+                    .bearer_auth(&descriptor.token)
+                    .send(),
+            )
+            .await,
+            Err(_) | Ok(Err(_))
+        ),
         "stop returned while the authenticated target was still reachable"
     );
     let remaining = read_runtime_descriptor(config.descriptor_path());

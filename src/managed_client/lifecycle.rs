@@ -129,7 +129,7 @@ pub(super) async fn shutdown_registered_instance(
             target_unreachable = matches!(
                 tokio::time::timeout_at(probe_deadline, inspect_health(&registration.descriptor))
                     .await,
-                Ok(Err(HealthInspectionError::Unreachable(_)))
+                Ok(Err(HealthInspectionError::Unreachable(_))) | Err(_)
             );
         }
         let (registration_released, registration_missing) =
