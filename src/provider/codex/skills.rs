@@ -37,6 +37,7 @@ impl CodexSkills {
         executable: &OsStr,
         processes: ProcessRegistry,
         workspace: &Path,
+        force_reload: bool,
     ) -> Result<SkillCatalog, ProviderError> {
         let connection = JsonRpcTransport::launch(executable, processes).await?;
         let result = connection
@@ -45,7 +46,7 @@ impl CodexSkills {
                 "skills/list",
                 &SkillsListParams {
                     cwds: [workspace],
-                    force_reload: false,
+                    force_reload,
                 },
             )
             .await;

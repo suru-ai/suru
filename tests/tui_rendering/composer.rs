@@ -146,6 +146,122 @@ fn skill_completion_replaces_only_the_query_binds_it_and_keeps_the_prompt_open()
 }
 
 #[test]
+fn skill_completion_shows_live_catalog_states_and_retries_failed_discovery() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let selection = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-fixture"),
+        options: Vec::new(),
+    };
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(Uuid::new_v4(), 42).with_landing_agent_selection(Some(selection)),
+        )))
+        .expect("connect application");
+    let request = SkillCatalogRequest {
+        provider: ProviderId::new("codex"),
+        workspace: Workspace {
+            path: workspace.path().to_owned(),
+        },
+    };
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "$".to_owned(),
+        )))
+        .expect("type a Skill marker while prefetch is pending");
+    let loading = rendered_application_rows(&application).join("\n");
+    assert!(loading.contains(" Skills "));
+    assert!(loading.contains("Loading Skills"));
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::ClearOrExit))
+            .expect("clear the pending marker"),
+        ApplicationTransition::Continue
+    );
+
+    let stale_skill = SkillDescriptor {
+        id: SkillId::new("stale-review-id"),
+        name: "review".to_owned(),
+        description: "Review the current change".to_owned(),
+        scope: Some("Workspace".to_owned()),
+    };
+    application
+        .handle_event(ApplicationEvent::SkillsListed {
+            request: request.clone(),
+            catalog: SkillCatalog {
+                provider: request.provider.clone(),
+                workspace: request.workspace.clone(),
+                skills: vec![stale_skill],
+                capabilities: SkillCatalogCapabilities {
+                    max_distinct_invocations: None,
+                    supported_deliveries: vec![SkillPromptDelivery::Initial],
+                },
+                status: SkillCatalogStatus::Stale {
+                    message: "refresh failed".to_owned(),
+                },
+            },
+        })
+        .expect("load stale Skill Catalog");
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+                "$".to_owned(),
+            )))
+            .expect("typing a Skill marker retries stale discovery"),
+        ApplicationTransition::RefreshSkills(request.clone())
+    );
+    let stale = rendered_application_rows(&application).join("\n");
+    assert!(
+        stale.contains("$review"),
+        "stale entries remain presentational"
+    );
+    assert!(stale.contains("refresh failed"));
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(
+                CommandId::ConfirmSelectedCompletion,
+            ))
+            .expect("stale row cannot be confirmed"),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+                "r".to_owned(),
+            )))
+            .expect("ordinary editing does not trigger another retry"),
+        ApplicationTransition::Continue
+    );
+
+    application
+        .handle_event(ApplicationEvent::SkillsListed {
+            request: request.clone(),
+            catalog: SkillCatalog {
+                provider: request.provider,
+                workspace: request.workspace,
+                skills: vec![SkillDescriptor {
+                    id: SkillId::new("fresh-review-id"),
+                    name: "review".to_owned(),
+                    description: "Review the current change".to_owned(),
+                    scope: Some("Workspace".to_owned()),
+                }],
+                capabilities: SkillCatalogCapabilities {
+                    max_distinct_invocations: None,
+                    supported_deliveries: vec![SkillPromptDelivery::Initial],
+                },
+                status: SkillCatalogStatus::Fresh {
+                    warning: Some("1 invalid Skill was skipped".to_owned()),
+                },
+            },
+        })
+        .expect("load partial Skill Catalog");
+    let partial = rendered_application_rows(&application).join("\n");
+    assert!(partial.contains("$review"));
+    assert!(partial.contains("1 invalid Skill was skipped"));
+}
+
+#[test]
 fn composer_cursor_wraps_at_the_right_edge_and_remains_visible_when_scrolled() {
     let mut wrapped = Application::default();
     wrapped

@@ -678,6 +678,7 @@ where
 
 /// A Codex notification Suru understands, decoded out of its wire params.
 pub(super) enum NativeNotification {
+    SkillsChanged,
     AgentSelectionChanged {
         thread_id: String,
         model: String,

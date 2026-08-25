@@ -181,12 +181,14 @@ pub(super) fn provider_events(
     notifications: mpsc::UnboundedReceiver<Result<NativeNotification, ProviderError>>,
     process: Arc<ProcessGuard>,
     correlation: Arc<StdMutex<NativeCorrelation>>,
+    skill_catalog_invalidations: tokio::sync::watch::Sender<u64>,
 ) -> ProviderEventStream {
     Box::pin(stream::unfold(
         GuardedEventReceiver {
             receiver: notifications,
             _process: process,
             correlation,
+            skill_catalog_invalidations,
             pending: VecDeque::new(),
         },
         next_provider_event,
@@ -197,6 +199,7 @@ struct GuardedEventReceiver {
     receiver: mpsc::UnboundedReceiver<Result<NativeNotification, ProviderError>>,
     _process: Arc<ProcessGuard>,
     correlation: Arc<StdMutex<NativeCorrelation>>,
+    skill_catalog_invalidations: tokio::sync::watch::Sender<u64>,
     pending: VecDeque<Result<ProviderEvent, ProviderError>>,
 }
 
@@ -211,6 +214,14 @@ async fn next_provider_event(
         match native {
             Err(error) => return Some((Err(error), events)),
             Ok(native) => {
+                if matches!(native, NativeNotification::SkillsChanged) {
+                    events
+                        .skill_catalog_invalidations
+                        .send_modify(|generation| {
+                            *generation = generation.saturating_add(1);
+                        });
+                    continue;
+                }
                 let projected = {
                     let mut correlation = events
                         .correlation
@@ -232,6 +243,7 @@ fn project_native_notification(
     notification: NativeNotification,
 ) -> Result<Vec<ProviderEvent>, ProviderError> {
     match notification {
+        NativeNotification::SkillsChanged => Ok(Vec::new()),
         NativeNotification::AgentSelectionChanged {
             thread_id,
             model,

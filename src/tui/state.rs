@@ -365,12 +365,6 @@ impl TuiState {
             .as_ref()
             .filter(|(loaded, _)| *loaded == request)
             .map(|(_, catalog)| catalog)
-            .filter(|catalog| {
-                matches!(
-                    catalog.status,
-                    crate::protocol::SkillCatalogStatus::Fresh { .. }
-                )
-            })
     }
 
     fn skill_catalog_request(&self) -> Option<SkillCatalogRequest> {
@@ -379,6 +373,7 @@ impl TuiState {
             || self.workspace.clone(),
             |session| session.snapshot().session.workspace.path.clone(),
         );
+        let workspace = std::fs::canonicalize(&workspace).unwrap_or(workspace);
         Some(SkillCatalogRequest {
             provider: selection.provider.clone(),
             workspace: Workspace { path: workspace },
@@ -390,6 +385,42 @@ impl TuiState {
             self.skill_catalog = Some((request, catalog));
             self.sync_composer_completion();
         }
+    }
+
+    fn skill_catalog_retry_request(&self) -> Option<SkillCatalogRequest> {
+        if !self.composer_completion.is_skill_completion() {
+            return None;
+        }
+        matches!(
+            self.current_skill_catalog()?.status,
+            crate::protocol::SkillCatalogStatus::Stale { .. }
+                | crate::protocol::SkillCatalogStatus::Unavailable { .. }
+        )
+        .then(|| self.skill_catalog_request())
+        .flatten()
+    }
+
+    fn draft_has_stale_skill_bindings(&self) -> bool {
+        let invocations = self.composers.skill_invocations(self.composer_key());
+        if invocations.is_empty() {
+            return false;
+        }
+        let Some(catalog) = self.current_skill_catalog() else {
+            return true;
+        };
+        if !matches!(
+            catalog.status,
+            crate::protocol::SkillCatalogStatus::Fresh { .. }
+        ) {
+            return true;
+        }
+        invocations.iter().any(|invocation| {
+            !catalog.skills.iter().any(|skill| {
+                skill.id == invocation.skill_id
+                    && skill.name == invocation.name
+                    && skill.scope == invocation.scope
+            })
+        })
     }
 
     fn edit_composer(&mut self, edit: impl FnOnce(&mut ComposerMemory, ComposerKey)) {
@@ -461,6 +492,13 @@ impl TuiState {
                 self.fatal_error = None;
             }
             ManagedEvent::SettingsSnapshot(snapshot) => self.adopt_settings(snapshot),
+            ManagedEvent::SkillCatalogUpdated(catalog) => {
+                let request = SkillCatalogRequest {
+                    provider: catalog.provider.clone(),
+                    workspace: catalog.workspace.clone(),
+                };
+                self.load_skill_catalog(request, catalog);
+            }
             ManagedEvent::Recovering(status) => {
                 if self.recovery.is_none() {
                     self.reconnect_overlay_visible = false;
@@ -960,7 +998,9 @@ impl TuiState {
     }
 
     pub(super) fn composer_border_style(&self, theme: &Theme) -> Style {
-        if self.composer_focused {
+        if self.draft_has_stale_skill_bindings() {
+            theme.form_field.invalid
+        } else if self.composer_focused {
             theme.form_field.border
         } else {
             theme.border.subdued
@@ -1343,6 +1383,7 @@ pub enum ApplicationTransition {
     AttachSession(SessionId),
     ListSessions(SessionListRequest),
     ListModels(ModelListRequest),
+    RefreshSkills(SkillCatalogRequest),
     ConfirmLandingAgentSelection(AgentSelection),
     UpdateAgentSelection {
         session_id: SessionId,
@@ -1552,6 +1593,8 @@ impl Application {
     /// Handles the composer editing commands routed here; any other command
     /// leaves the composer untouched.
     fn handle_composer_command(&mut self, command: CommandId) -> ApplicationTransition {
+        let may_retry_skills =
+            matches!(&command, CommandId::InsertText(text) if text.as_str() == "$");
         match command {
             CommandId::ClearOrExit => {
                 let key = self.state.composer_key();
@@ -1587,6 +1630,9 @@ impl Application {
                 .state
                 .edit_composer(|composers, key| composers.history_next(key)),
             _ => {}
+        }
+        if may_retry_skills && let Some(request) = self.state.skill_catalog_retry_request() {
+            return ApplicationTransition::RefreshSkills(request);
         }
         ApplicationTransition::Continue
     }

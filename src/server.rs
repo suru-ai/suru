@@ -34,10 +34,10 @@ use crate::protocol::{
     LifecycleState, Message, MessageId, MessageRole, MessageStatus, PROTOCOL_VERSION, ProviderId,
     RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT,
     SESSION_CATALOG_UPDATED_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
-    SETTINGS_SNAPSHOT_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision, SessionChange,
-    SessionError, SessionErrorCode, SessionId, SessionRevision, SessionUpdate, SettingMutation,
-    SettingsSnapshot, ShutdownReason, SkillCatalogRequest, SkillPromptDelivery, TurnId,
-    UpdateAgentSelectionRequest,
+    SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, ServerIdentity, ServerShutdown,
+    SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode, SessionId,
+    SessionRevision, SessionUpdate, SettingMutation, SettingsSnapshot, ShutdownReason,
+    SkillCatalog, SkillCatalogRequest, SkillPromptDelivery, TurnId, UpdateAgentSelectionRequest,
 };
 use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
@@ -506,6 +506,7 @@ pub async fn spawn_with_providers_and_timings(
         .route("/v1/models", get(list_models))
         .route("/v1/models/refresh", post(refresh_models))
         .route("/v1/skills", post(list_skills))
+        .route("/v1/skills/refresh", post(refresh_skills))
         .route(
             "/v1/landing-agent-selection",
             put(confirm_landing_agent_selection),
@@ -623,6 +624,23 @@ async fn list_skills(State(state): State<AppState>, request: Request) -> Respons
         Err(response) => return response,
     };
     match state.skill_catalog.list(request).await {
+        Ok(catalog) => Json(catalog).into_response(),
+        Err(error) => skill_catalog_error_response(error),
+    }
+}
+
+async fn refresh_skills(State(state): State<AppState>, request: Request) -> Response {
+    let request = match decode_session_command::<SkillCatalogRequest>(
+        &state,
+        request,
+        "Skill Catalog refresh",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state.skill_catalog.refresh(request).await {
         Ok(catalog) => Json(catalog).into_response(),
         Err(error) => skill_catalog_error_response(error),
     }
@@ -794,6 +812,7 @@ async fn session_catalog_events(State(state): State<AppState>, headers: HeaderMa
     }
     Sse::new(session_catalog_event_stream(
         state.sessions.subscribe_catalog(),
+        state.skill_catalog.subscribe(),
         shutdown,
         state.timings.sse_keepalive_interval,
     ))
@@ -802,23 +821,90 @@ async fn session_catalog_events(State(state): State<AppState>, headers: HeaderMa
 
 fn session_catalog_event_stream(
     feed: SessionCatalogFeed,
+    skills: broadcast::Receiver<SkillCatalog>,
     shutdown: watch::Receiver<Option<ServerShutdown>>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
     let revision = feed.snapshot.revision;
-    snapshot_first_event_stream(
-        feed.snapshot,
-        revision,
-        feed.updates,
-        shutdown,
-        keepalive_interval,
-        RevisionedEventProtocol {
-            event_names: RevisionedEventNames {
-                snapshot: SESSION_CATALOG_SNAPSHOT_EVENT,
-                update: SESSION_CATALOG_UPDATED_EVENT,
+    let snapshot = Event::default()
+        .event(SESSION_CATALOG_SNAPSHOT_EVENT)
+        .id(revision.event_id())
+        .json_data(feed.snapshot)
+        .expect("Session catalog snapshots always serialize");
+    stream::once(async move { Ok::<_, std::convert::Infallible>(snapshot) }).chain(
+        stream::unfold(
+            (
+                tokio::time::interval_at(
+                    Instant::now() + keepalive_interval,
+                    keepalive_interval,
+                ),
+                shutdown,
+                feed.updates,
+                skills,
+                revision,
+            ),
+            |(mut keepalive, mut shutdown, mut sessions, mut skills, delivered_revision)| async move {
+                if shutdown.borrow().is_some() {
+                    return None;
+                }
+                tokio::select! {
+                    biased;
+                    changed = shutdown.changed() => {
+                        let _ = changed;
+                        None
+                    }
+                    received = sessions.recv() => {
+                        let update = match received {
+                            Ok(update) => update,
+                            Err(broadcast::error::RecvError::Closed | broadcast::error::RecvError::Lagged(_)) => return None,
+                        };
+                        if !update.revision.immediately_follows(delivered_revision) {
+                            return None;
+                        }
+                        let next_revision = update.revision;
+                        let event = Event::default()
+                            .event(SESSION_CATALOG_UPDATED_EVENT)
+                            .id(next_revision.event_id())
+                            .json_data(update)
+                            .expect("Session catalog updates always serialize");
+                        Some((
+                            Ok::<_, std::convert::Infallible>(event),
+                            (keepalive, shutdown, sessions, skills, next_revision),
+                        ))
+                    }
+                    received = skills.recv() => {
+                        match received {
+                            Ok(catalog) => {
+                                let event = Event::default()
+                                    .event(SKILL_CATALOG_UPDATED_EVENT)
+                                    .json_data(catalog)
+                                    .expect("Skill Catalog updates always serialize");
+                                Some((
+                                    Ok::<_, std::convert::Infallible>(event),
+                                    (keepalive, shutdown, sessions, skills, delivered_revision),
+                                ))
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "client Skill Catalog event stream lagged");
+                                Some((
+                                    Ok::<_, std::convert::Infallible>(
+                                        Event::default().comment("skill-catalog-updates-lagged"),
+                                    ),
+                                    (keepalive, shutdown, sessions, skills, delivered_revision),
+                                ))
+                            }
+                            Err(broadcast::error::RecvError::Closed) => None,
+                        }
+                    }
+                    _ = keepalive.tick() => Some((
+                        Ok::<_, std::convert::Infallible>(
+                            Event::default().comment("keep-alive"),
+                        ),
+                        (keepalive, shutdown, sessions, skills, delivered_revision),
+                    )),
+                }
             },
-            update_revision: |update| update.revision,
-        },
+        ),
     )
 }
 
@@ -1155,11 +1241,6 @@ fn skill_catalog_error_response(error: SkillCatalogError) -> Response {
             StatusCode::CONFLICT,
             SessionErrorCode::AgentSelectionProviderConflict,
             format!("Provider `{provider}` is not hosted by this server"),
-        ),
-        SkillCatalogError::Discovery => (
-            StatusCode::BAD_GATEWAY,
-            SessionErrorCode::InvalidSkillInvocation,
-            "The Provider could not list Skills for this Workspace".to_owned(),
         ),
         SkillCatalogError::InvalidCatalog(message) => (
             StatusCode::BAD_GATEWAY,

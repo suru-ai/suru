@@ -421,6 +421,7 @@ fn decode_notification(
     params: Option<&Value>,
 ) -> Result<Option<NativeNotification>, ProviderError> {
     match method {
+        "skills/changed" => Ok(Some(NativeNotification::SkillsChanged)),
         "thread/settings/updated" => {
             let params: ThreadSettingsUpdatedParams = decode_notification_params(method, params)?;
             Ok(Some(NativeNotification::AgentSelectionChanged {

@@ -4,7 +4,7 @@ use suru::{
     managed_client::{ManagedClient, ManagedEvent},
     protocol::{
         Health, RuntimeDescriptor, SESSION_CATALOG_UPDATED_EVENT, ServerShutdown,
-        SessionCatalogChange, SessionCatalogUpdate, ShutdownReason, TitleErrand,
+        SessionCatalogChange, SessionCatalogUpdate, ShutdownReason, SkillCatalog, TitleErrand,
     },
 };
 use tokio::time::{Duration, timeout};
@@ -51,6 +51,18 @@ pub async fn receive_initial_state(client: &mut ManagedClient) -> Health {
         "expected settings snapshot event, got {settings:?}"
     );
     identity
+}
+
+pub async fn next_skill_catalog(client: &mut ManagedClient) -> SkillCatalog {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(ManagedEvent::SkillCatalogUpdated(catalog)) = client.next().await {
+                return catalog;
+            }
+        }
+    })
+    .await
+    .expect("Skill Catalog update reaches attached client")
 }
 
 pub async fn request_server_shutdown(

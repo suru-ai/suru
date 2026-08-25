@@ -988,6 +988,19 @@ fn render_composer_completion(
                         usize::from(content_width),
                     )
                 }
+                CompletionRow::StaleSkill(skill) => {
+                    let scope = skill
+                        .scope
+                        .as_deref()
+                        .map_or(String::new(), |scope| format!(" · {scope}"));
+                    truncate_to_width(
+                        &format!("${}  {}{} · stale", skill.name, skill.description, scope),
+                        usize::from(content_width),
+                    )
+                }
+                CompletionRow::Message(message) => {
+                    truncate_to_width(message, usize::from(content_width))
+                }
             };
             Line::styled(
                 content,

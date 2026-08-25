@@ -9,8 +9,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::protocol::{
     RuntimeDescriptor, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
-    SessionCatalogChange, SessionCatalogRevision, SessionCatalogSnapshot, SessionCatalogUpdate,
-    SessionDeleted, SessionId, SessionTitleChanged,
+    SKILL_CATALOG_UPDATED_EVENT, SessionCatalogChange, SessionCatalogRevision,
+    SessionCatalogSnapshot, SessionCatalogUpdate, SessionDeleted, SessionId, SessionTitleChanged,
+    SkillCatalog,
 };
 
 use super::ManagedEvent;
@@ -82,6 +83,15 @@ pub(super) async fn consume(
                     return Ok(StreamOutcome::ReceiverClosed);
                 }
             }
+            CatalogEvent::Skill(catalog) => {
+                if events
+                    .send(ManagedEvent::SkillCatalogUpdated(catalog))
+                    .await
+                    .is_err()
+                {
+                    return Ok(StreamOutcome::ReceiverClosed);
+                }
+            }
         }
     }
     Ok(StreamOutcome::Disconnected)
@@ -148,6 +158,7 @@ fn apply_update(
 enum CatalogEvent {
     Snapshot(SessionCatalogSnapshot),
     Update(SessionCatalogUpdate),
+    Skill(SkillCatalog),
 }
 
 fn decode_event(event: Event, revision: Option<SessionCatalogRevision>) -> Result<CatalogEvent> {
@@ -170,6 +181,11 @@ fn decode_event(event: Event, revision: Option<SessionCatalogRevision>) -> Resul
                 bail!("Session catalog revision sequence is discontinuous");
             }
             Ok(CatalogEvent::Update(update))
+        }
+        SKILL_CATALOG_UPDATED_EVENT => {
+            let catalog: SkillCatalog =
+                serde_json::from_str(&event.data).context("decode Skill Catalog update")?;
+            Ok(CatalogEvent::Skill(catalog))
         }
         name => bail!("server sent unknown Session catalog event type '{name}'"),
     }

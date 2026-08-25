@@ -49,6 +49,12 @@ impl ComposerMemory {
             .map_or(0, |composer| composer.cursor)
     }
 
+    pub(super) fn skill_invocations(&self, key: ComposerKey) -> &[SkillInvocation] {
+        self.composers
+            .get(&key)
+            .map_or(&[], |composer| composer.skill_invocations.as_slice())
+    }
+
     pub(super) fn is_empty(&self, key: ComposerKey) -> bool {
         self.text(key).is_empty()
     }

@@ -146,6 +146,9 @@ pub enum ManagedEvent {
     /// The server's effective-settings view: pushed right after every connect
     /// and again whenever the server replaces it.
     SettingsSnapshot(SettingsSnapshot),
+    /// A server-authoritative Skill Catalog changed after discovery or
+    /// invalidation. Every attached client receives the same state transition.
+    SkillCatalogUpdated(SkillCatalog),
     Recovering(RecoveryStatus),
     ServerShutdown(ServerShutdown),
     SessionDeleted(SessionDeleted),
@@ -322,6 +325,10 @@ impl ManagedClient {
         self.session_commands().list_skills(request).await
     }
 
+    pub async fn refresh_skills(&self, request: SkillCatalogRequest) -> Result<SkillCatalog> {
+        self.session_commands().refresh_skills(request).await
+    }
+
     pub async fn attach_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
         self.session_commands().attach_session(session_id).await
     }
@@ -346,6 +353,22 @@ impl SessionCommandClient {
             .await
             .context("send Skill Catalog listing")?;
         decode_api_response(response, "Skill Catalog listing").await
+    }
+
+    pub(crate) async fn refresh_skills(
+        &self,
+        request: SkillCatalogRequest,
+    ) -> Result<SkillCatalog> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(format!("{}/v1/skills/refresh", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .json(&request)
+            .send()
+            .await
+            .context("send Skill Catalog refresh")?;
+        decode_api_response(response, "Skill Catalog refresh").await
     }
 
     pub(crate) async fn list_models(&self) -> Result<ModelCatalog> {

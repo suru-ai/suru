@@ -215,7 +215,24 @@ impl SessionTasks {
         }
         let results = results.clone();
         replace_listing(&mut self.listing_skills, request, |request| {
-            spawn_skill_listing(commands, request, results)
+            spawn_skill_catalog_operation(commands, request, results, SkillCatalogOperation::List)
+        });
+    }
+
+    fn refresh_skills(
+        &mut self,
+        commands: SessionCommandClient,
+        request: SkillCatalogRequest,
+        results: &UnboundedSender<SkillCatalogResult>,
+    ) {
+        let results = results.clone();
+        replace_listing(&mut self.listing_skills, request, |request| {
+            spawn_skill_catalog_operation(
+                commands,
+                request,
+                results,
+                SkillCatalogOperation::Refresh,
+            )
         });
     }
 }
@@ -449,6 +466,13 @@ impl RunLoop {
                     &self.channels.models,
                 );
             }
+            ApplicationTransition::RefreshSkills(request) => {
+                self.tasks.refresh_skills(
+                    self.client.session_commands(),
+                    request,
+                    &self.channels.skills,
+                );
+            }
             ApplicationTransition::ConfirmLandingAgentSelection(selection) => {
                 spawn_landing_agent_selection_confirmation(
                     self.client.session_commands(),
@@ -527,6 +551,7 @@ impl RunLoop {
             | ApplicationTransition::AttachSession(_)
             | ApplicationTransition::ListSessions(_)
             | ApplicationTransition::ListModels(_)
+            | ApplicationTransition::RefreshSkills(_)
             | ApplicationTransition::ConfirmLandingAgentSelection(_)
             | ApplicationTransition::UpdateAgentSelection { .. }
             | ApplicationTransition::MutateSetting(_) => {
@@ -910,13 +935,24 @@ enum SkillCatalogResult {
     },
 }
 
-fn spawn_skill_listing(
+#[derive(Clone, Copy)]
+enum SkillCatalogOperation {
+    List,
+    Refresh,
+}
+
+fn spawn_skill_catalog_operation(
     commands: SessionCommandClient,
     request: SkillCatalogRequest,
     results: UnboundedSender<SkillCatalogResult>,
+    operation: SkillCatalogOperation,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let result = match commands.list_skills(request.clone()).await {
+        let response = match operation {
+            SkillCatalogOperation::List => commands.list_skills(request.clone()).await,
+            SkillCatalogOperation::Refresh => commands.refresh_skills(request.clone()).await,
+        };
+        let result = match response {
             Ok(catalog) => SkillCatalogResult::Listed { request, catalog },
             Err(error) => SkillCatalogResult::Failed {
                 request,

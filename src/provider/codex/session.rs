@@ -13,7 +13,7 @@ use std::{
 };
 
 use tokio::{
-    sync::Notify,
+    sync::{Notify, watch},
     time::{Duration, timeout},
 };
 
@@ -64,6 +64,7 @@ pub struct CodexRuntime {
     /// when it starts rather than the one its Session opened with.
     reasoning_summary: Arc<StdMutex<ReasoningSummaryDetail>>,
     skills: CodexSkills,
+    skill_catalog_invalidations: watch::Sender<u64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -83,6 +84,7 @@ impl CodexThreadId {
 
 impl CodexRuntime {
     pub fn new(executable: impl AsRef<OsStr>) -> Self {
+        let (skill_catalog_invalidations, _) = watch::channel(0);
         Self {
             executable: executable.as_ref().to_owned(),
             processes: ProcessRegistry::new(super::CODEX_HARNESS_NAME),
@@ -90,6 +92,7 @@ impl CodexRuntime {
             shutdown_interrupt_timeout: SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT,
             reasoning_summary: Arc::new(StdMutex::new(ReasoningSummaryDetail::default())),
             skills: CodexSkills::default(),
+            skill_catalog_invalidations,
         }
     }
 
@@ -147,7 +150,30 @@ impl ProviderRuntime for CodexRuntime {
         let processes = self.processes.clone();
         let skills = self.skills.clone();
         let workspace = workspace.to_owned();
-        Box::pin(async move { skills.discover(&executable, processes, &workspace).await })
+        Box::pin(async move {
+            skills
+                .discover(&executable, processes, &workspace, false)
+                .await
+        })
+    }
+
+    fn refresh_skill_catalog(
+        &self,
+        workspace: &std::path::Path,
+    ) -> ProviderFuture<'_, SkillCatalog> {
+        let executable = self.executable.clone();
+        let processes = self.processes.clone();
+        let skills = self.skills.clone();
+        let workspace = workspace.to_owned();
+        Box::pin(async move {
+            skills
+                .discover(&executable, processes, &workspace, true)
+                .await
+        })
+    }
+
+    fn subscribe_skill_catalog_invalidations(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.skill_catalog_invalidations.subscribe())
     }
 
     fn start_session(
@@ -163,6 +189,7 @@ impl ProviderRuntime for CodexRuntime {
             },
             reasoning_summary: self.reasoning_summary.clone(),
             skills: self.skills.clone(),
+            skill_catalog_invalidations: self.skill_catalog_invalidations.clone(),
             workspace: request.workspace.clone(),
         };
         Box::pin(async move { start_codex_session(executable, request, processes, context).await })
@@ -260,6 +287,7 @@ struct SessionContext {
     timeouts: SessionTimeouts,
     reasoning_summary: Arc<StdMutex<ReasoningSummaryDetail>>,
     skills: CodexSkills,
+    skill_catalog_invalidations: watch::Sender<u64>,
     workspace: std::path::PathBuf,
 }
 
@@ -376,6 +404,7 @@ async fn start_codex_thread(
         started.thread.id.clone(),
     )));
     let turn_start_changed = Arc::new(Notify::new());
+    let skill_catalog_invalidations = context.skill_catalog_invalidations.clone();
     let session = Arc::new(CodexSession {
         thread_id: started.thread.id,
         context,
@@ -385,7 +414,12 @@ async fn start_codex_thread(
         process: process.clone(),
         shutdown_started: AtomicBool::new(false),
     });
-    let events = provider_events(notifications, process, correlation);
+    let events = provider_events(
+        notifications,
+        process,
+        correlation,
+        skill_catalog_invalidations,
+    );
     Ok(ProviderSessionConnection::new(
         AgentIdentity {
             agent: AgentId::new("codex"),

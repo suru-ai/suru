@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use crate::protocol::{SkillCatalog, SkillDescriptor};
+use crate::protocol::{SkillCatalog, SkillCatalogStatus, SkillDescriptor};
 
 use super::commands::{
     AUTOCOMPLETE_LIMIT, SemanticCommandDescriptor, SemanticCommandId, command_matches, descriptor,
@@ -46,6 +46,8 @@ pub struct CompletionMode {
     trigger: CompletionTrigger,
     candidates: Vec<CompletionCandidate>,
     selected: usize,
+    presentations: Vec<SkillDescriptor>,
+    message: Option<String>,
 }
 
 impl CompletionMode {
@@ -62,6 +64,8 @@ impl CompletionMode {
             trigger: CompletionTrigger::new(query, replacement),
             candidates: vec![CompletionCandidate::Insert(canonical.into())],
             selected: 0,
+            presentations: Vec::new(),
+            message: None,
         }
     }
 
@@ -78,10 +82,38 @@ impl CompletionMode {
                 .map(CompletionCandidate::Command)
                 .collect(),
             selected,
+            presentations: Vec::new(),
+            message: None,
         }
     }
 
-    fn skills(trigger: CompletionTrigger, matches: Vec<SkillDescriptor>, selected: usize) -> Self {
+    fn skills(trigger: CompletionTrigger, catalog: Option<&SkillCatalog>, selected: usize) -> Self {
+        let (matches, presentations, message) = match catalog.map(|catalog| &catalog.status) {
+            None | Some(SkillCatalogStatus::Loading) => {
+                (Vec::new(), Vec::new(), Some("Loading Skills…".to_owned()))
+            }
+            Some(SkillCatalogStatus::Fresh { warning }) => (
+                catalog.map_or_else(Vec::new, |catalog| skill_matches(&trigger.query, catalog)),
+                Vec::new(),
+                warning.clone(),
+            ),
+            Some(SkillCatalogStatus::Refreshing) => (
+                Vec::new(),
+                catalog.map_or_else(Vec::new, |catalog| skill_matches(&trigger.query, catalog)),
+                Some("Refreshing Skills…".to_owned()),
+            ),
+            Some(SkillCatalogStatus::Stale { message }) => (
+                Vec::new(),
+                catalog.map_or_else(Vec::new, |catalog| skill_matches(&trigger.query, catalog)),
+                Some(format!("Skills unavailable · {message}")),
+            ),
+            Some(SkillCatalogStatus::Unavailable { message }) => (
+                Vec::new(),
+                Vec::new(),
+                Some(format!("Skills unavailable · {message}")),
+            ),
+        };
+        let selected = selected.min(matches.len().saturating_sub(1));
         Self {
             kind: CompletionKind::Skills,
             trigger,
@@ -90,6 +122,8 @@ impl CompletionMode {
                 .map(CompletionCandidate::Skill)
                 .collect(),
             selected,
+            presentations,
+            message,
         }
     }
 
@@ -141,7 +175,8 @@ impl CompletionMode {
     }
 
     fn rows(&self) -> Vec<(bool, CompletionRow<'_>)> {
-        self.candidates
+        let mut rows = self
+            .candidates
             .iter()
             .enumerate()
             .map(|(index, candidate)| {
@@ -154,7 +189,18 @@ impl CompletionMode {
                 };
                 (index == self.selected, row)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        rows.extend(
+            self.presentations
+                .iter()
+                .map(|skill| (false, CompletionRow::StaleSkill(skill))),
+        );
+        rows.extend(
+            self.message
+                .as_deref()
+                .map(|message| (false, CompletionRow::Message(message))),
+        );
+        rows
     }
 }
 
@@ -176,6 +222,8 @@ pub(super) enum CompletionRow<'a> {
     Command(&'static SemanticCommandDescriptor),
     Insertion(&'a str),
     Skill(&'a SkillDescriptor),
+    StaleSkill(&'a SkillDescriptor),
+    Message(&'a str),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -200,10 +248,7 @@ impl ComposerCompletion {
                 .as_ref()
                 .filter(|mode| mode.is_skills_for(&trigger))
                 .map_or(0, |mode| mode.selected);
-            let matches =
-                catalog.map_or_else(Vec::new, |catalog| skill_matches(&trigger.query, catalog));
-            let selected = selected.min(matches.len().saturating_sub(1));
-            self.mode = Some(CompletionMode::skills(trigger, matches, selected));
+            self.mode = Some(CompletionMode::skills(trigger, catalog, selected));
             return;
         }
         let Some((query, replacement)) = slash_trigger(text, cursor) else {
@@ -238,7 +283,13 @@ impl ComposerCompletion {
     pub(super) fn is_visible(&self) -> bool {
         self.mode
             .as_ref()
-            .is_some_and(|mode| !mode.candidates.is_empty())
+            .is_some_and(|mode| !mode.rows().is_empty())
+    }
+
+    pub(super) fn is_skill_completion(&self) -> bool {
+        self.mode
+            .as_ref()
+            .is_some_and(|mode| mode.kind == CompletionKind::Skills)
     }
 
     pub(super) fn selected_confirmation(&self) -> Option<CompletionConfirmation> {

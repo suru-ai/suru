@@ -15,7 +15,7 @@ use suru::provider::{
     ProviderPrompt, ProviderRuntime, ProviderSession, ProviderSessionConnection,
     ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 pub struct ControlledProvider {
     starts: mpsc::UnboundedReceiver<StartRequest>,
@@ -47,8 +47,11 @@ pub struct ControlledProviderRuntime {
     /// the one demand that needs counting.
     discoveries: Arc<AtomicUsize>,
     skill_discoveries: Arc<AtomicUsize>,
+    skill_refreshes: Arc<AtomicUsize>,
     skill_catalog: Arc<Mutex<Option<SkillCatalog>>>,
     skill_catalog_error: Arc<Mutex<Option<String>>>,
+    skill_discovery_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    skill_catalog_invalidations: watch::Sender<u64>,
     starts: mpsc::UnboundedSender<StartRequest>,
     errands: mpsc::UnboundedSender<ErrandRequest>,
     /// Where a session-shaped Errand's startup goes. It is kept apart from
@@ -119,6 +122,7 @@ impl ControlledProvider {
         let (starts_tx, starts_rx) = mpsc::unbounded_channel();
         let (errands_tx, errands_rx) = mpsc::unbounded_channel();
         let (errand_starts_tx, errand_starts_rx) = mpsc::unbounded_channel();
+        let (skill_catalog_invalidations, _) = watch::channel(0);
         (
             Arc::new(ControlledProviderRuntime {
                 provider,
@@ -127,8 +131,11 @@ impl ControlledProvider {
                 unavailable: Arc::new(Mutex::new(None)),
                 discoveries: Arc::new(AtomicUsize::new(0)),
                 skill_discoveries: Arc::new(AtomicUsize::new(0)),
+                skill_refreshes: Arc::new(AtomicUsize::new(0)),
                 skill_catalog: Arc::new(Mutex::new(None)),
                 skill_catalog_error: Arc::new(Mutex::new(None)),
+                skill_discovery_gate: Arc::new(Mutex::new(None)),
+                skill_catalog_invalidations,
                 starts: starts_tx,
                 errands: errands_tx,
                 errand_starts: errand_starts_tx,
@@ -196,8 +203,39 @@ impl ControlledProviderRuntime {
             .expect("controlled Provider Skill error lock is not poisoned") = Some(message.into());
     }
 
+    pub fn clear_skill_discovery_failure(&self) {
+        *self
+            .skill_catalog_error
+            .lock()
+            .expect("controlled Provider Skill error lock is not poisoned") = None;
+    }
+
+    pub fn invalidate_skill_catalog(&self) {
+        self.skill_catalog_invalidations.send_modify(|generation| {
+            *generation = generation.saturating_add(1);
+        });
+    }
+
     pub fn skill_discoveries(&self) -> usize {
         self.skill_discoveries.load(Ordering::SeqCst)
+    }
+
+    pub fn skill_refreshes(&self) -> usize {
+        self.skill_refreshes.load(Ordering::SeqCst)
+    }
+
+    pub fn block_next_skill_discovery(&self) -> oneshot::Sender<()> {
+        let (release, blocked) = oneshot::channel();
+        let replaced = self
+            .skill_discovery_gate
+            .lock()
+            .expect("controlled Provider Skill gate lock is not poisoned")
+            .replace(blocked);
+        assert!(
+            replaced.is_none(),
+            "only one Skill discovery may be blocked"
+        );
+        release
     }
 
     /// Makes Model discovery report `reason`, or — with `None` — serve the
@@ -466,14 +504,34 @@ impl ProviderRuntime for ControlledProviderRuntime {
             .lock()
             .expect("controlled Provider Skill error lock is not poisoned")
             .clone();
+        let blocked = self
+            .skill_discovery_gate
+            .lock()
+            .expect("controlled Provider Skill gate lock is not poisoned")
+            .take();
         let provider = self.provider.clone();
         let workspace = workspace.to_owned();
         Box::pin(async move {
+            if let Some(blocked) = blocked {
+                let _ = blocked.await;
+            }
             if let Some(error) = error {
                 return Err(ProviderError::new(error));
             }
             Ok(catalog.unwrap_or_else(|| fixture_skill_catalog(provider, workspace)))
         })
+    }
+
+    fn refresh_skill_catalog(
+        &self,
+        workspace: &std::path::Path,
+    ) -> ProviderFuture<'_, SkillCatalog> {
+        self.skill_refreshes.fetch_add(1, Ordering::SeqCst);
+        self.skill_catalog(workspace)
+    }
+
+    fn subscribe_skill_catalog_invalidations(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.skill_catalog_invalidations.subscribe())
     }
 
     fn start_session(

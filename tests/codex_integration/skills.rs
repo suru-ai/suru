@@ -2,13 +2,16 @@
 
 use std::sync::Arc;
 
-use crate::support::{ScriptedCodex, receive_initial_state};
+use crate::{
+    server_support::next_skill_catalog,
+    support::{ScriptedCodex, receive_initial_state},
+};
 use serde_json::{Value, json};
 use suru::{
-    managed_client::{ManagedClient, ManagedClientConfig},
+    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        CreateSessionRequest, InitialPrompt, PromptId, SkillCatalog, SkillCatalogStatus,
-        SkillInvocation, SkillMarkerSpan, Workspace,
+        CreateSessionRequest, InitialPrompt, PromptId, SkillCatalogStatus, SkillInvocation,
+        SkillMarkerSpan, Workspace,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -30,6 +33,114 @@ const SKILL_CODEX: &str = r#"
       ;;
 "#;
 
+const CHANGING_SKILL_CODEX: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"skills/list"'*)
+      case "$line" in
+        *'"forceReload":true'*)
+          printf '%s\n' '{"id":2,"result":{"data":[{"cwd":$SKILL_WORKSPACE,"skills":[{"name":"review","description":"Replacement","path":"/private/codex/skills/replacement/SKILL.md","scope":"repo","enabled":true}],"errors":[]}]}}'
+          ;;
+        *)
+          printf '%s\n' '{"id":2,"result":{"data":[{"cwd":$SKILL_WORKSPACE,"skills":[{"name":"review","description":"Original","path":"/private/codex/skills/original/SKILL.md","scope":"repo","enabled":true}],"errors":[]}]}}'
+          ;;
+      esac
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"skill-change-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"method":"skills/changed","params":{}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"skill-change-turn"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"skill-change-thread","turn":{"id":"skill-change-turn","status":"completed","items":[]}}}'
+      ;;
+"#;
+
+#[tokio::test]
+async fn codex_skill_changes_force_refresh_server_authority() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let canonical_workspace =
+        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+    let workspace_json = serde_json::to_string(&canonical_workspace).expect("encode Workspace");
+    let fixture = ScriptedCodex::new_multiprocess(
+        &CHANGING_SKILL_CODEX.replace("$SKILL_WORKSPACE", &workspace_json),
+    );
+    let channel = "codex-skill-change-test";
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    assert!(matches!(
+        client.next().await,
+        Some(ManagedEvent::SettingsSnapshot(_))
+    ));
+    let request = suru::protocol::SkillCatalogRequest {
+        provider: suru::protocol::ProviderId::new("codex"),
+        workspace: Workspace {
+            path: workspace.path().to_owned(),
+        },
+    };
+    assert!(matches!(
+        client
+            .list_skills(request)
+            .await
+            .expect("prefetch Codex Skills")
+            .status,
+        SkillCatalogStatus::Loading
+    ));
+    let original = next_skill_catalog(&mut client).await;
+    assert_eq!(original.skills[0].description, "Original");
+    let original_id = original.skills[0].id.clone();
+
+    client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Notice native Skill changes".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Codex Session");
+
+    assert!(matches!(
+        next_skill_catalog(&mut client).await.status,
+        SkillCatalogStatus::Refreshing
+    ));
+    let replacement = next_skill_catalog(&mut client).await;
+    assert!(matches!(
+        replacement.status,
+        SkillCatalogStatus::Fresh { .. }
+    ));
+    assert_eq!(replacement.skills[0].description, "Replacement");
+    assert_ne!(replacement.skills[0].id, original_id);
+    let refresh = fixture.requests().into_iter().find(|request| {
+        request.get("method").and_then(Value::as_str) == Some("skills/list")
+            && request["params"]["forceReload"] == true
+    });
+    assert!(
+        refresh.is_some(),
+        "Codex invalidation forces native refresh"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
 #[tokio::test]
 async fn codex_discovers_enabled_skills_and_receives_structured_input_with_visible_text() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -45,7 +156,6 @@ async fn codex_discovers_enabled_skills_and_receives_structured_input_with_visib
     )
     .await
     .expect("spawn server");
-    let descriptor = server.descriptor().clone();
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), "codex-skill-test").expect("configure client"),
     )
@@ -53,21 +163,17 @@ async fn codex_discovers_enabled_skills_and_receives_structured_input_with_visib
     .expect("connect client");
     receive_initial_state(&mut client).await;
 
-    let catalog = reqwest::Client::new()
-        .post(format!("{}/v1/skills", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .json(&json!({
-            "provider": "codex",
-            "workspace": { "path": canonical_workspace }
-        }))
-        .send()
+    let loading = client
+        .list_skills(suru::protocol::SkillCatalogRequest {
+            provider: suru::protocol::ProviderId::new("codex"),
+            workspace: Workspace {
+                path: canonical_workspace,
+            },
+        })
         .await
-        .expect("list Codex Skills")
-        .error_for_status()
-        .expect("Codex Skill listing succeeds")
-        .json::<SkillCatalog>()
-        .await
-        .expect("decode Codex Skill Catalog");
+        .expect("list Codex Skills");
+    assert!(matches!(loading.status, SkillCatalogStatus::Loading));
+    let catalog = next_skill_catalog(&mut client).await;
     assert!(matches!(
         catalog.status,
         SkillCatalogStatus::Fresh { warning: None }

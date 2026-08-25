@@ -437,6 +437,20 @@ pub trait ProviderRuntime: Send + Sync + 'static {
         Box::pin(async move { Ok(catalog) })
     }
 
+    /// Forces the Provider to refresh its native Skill authority. Providers
+    /// without a native cache inherit ordinary discovery; adapters such as
+    /// Codex override this to request their native force-refresh operation.
+    fn refresh_skill_catalog(&self, workspace: &Path) -> ProviderFuture<'_, SkillCatalog> {
+        self.skill_catalog(workspace)
+    }
+
+    /// Reports Provider-native Skill changes as invalidations. The generation
+    /// value is deliberately opaque: the server refreshes every cached
+    /// Workspace for this Provider instead of interpreting native details.
+    fn subscribe_skill_catalog_invalidations(&self) -> Option<watch::Receiver<u64>> {
+        None
+    }
+
     fn start_session(
         &self,
         request: ProviderSessionRequest,
