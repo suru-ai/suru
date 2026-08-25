@@ -36,6 +36,8 @@ pub(super) async fn ensure_server(
             )
         })?;
     let mut spawned = None;
+    let mut registration_seen = false;
+    let mut awaiting_election = false;
     loop {
         let probe_deadline =
             (tokio::time::Instant::now() + config.health_check_timeout).min(deadline);
@@ -59,6 +61,7 @@ pub(super) async fn ensure_server(
                     if registration.health.build_identity != launching_build_identity =>
                 {
                     spawned = None;
+                    registration_seen = true;
                     lifecycle::shutdown_registered_instance(
                         config,
                         &registration,
@@ -92,7 +95,8 @@ pub(super) async fn ensure_server(
                 }
             },
             Err(error) => {
-                if spawned.is_none() {
+                if spawned.is_none() && !awaiting_election {
+                    registration_seen |= config.descriptor_path().exists();
                     spawned = Some(spawn_detached(config).map_err(|spawn_error| {
                         startup_error(
                             config,
@@ -110,8 +114,11 @@ pub(super) async fn ensure_server(
             None => None,
         };
         if let Some(status) = spawned_exit {
-            if lifecycle::channel_is_owned(config).unwrap_or(false) {
+            // Once a registration has been observed, an exiting child may have lost the election
+            // during a lock handoff. Wait for the winner instead of spawning into the same race.
+            if registration_seen || lifecycle::channel_is_owned(config).unwrap_or(false) {
                 spawned = None;
+                awaiting_election = registration_seen;
             } else {
                 return Err(startup_error(
                     config,

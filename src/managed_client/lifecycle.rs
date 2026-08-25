@@ -140,16 +140,21 @@ pub(super) async fn shutdown_registered_instance(
                     (missing, missing)
                 }
             };
+        let replacement_registered =
+            policy.transition_races_are_expected && registration_released && !registration_missing;
+        // Publishing a replacement requires owning the channel lock, so it proves the old owner
+        // released the channel even when Windows keeps its dead endpoint probe pending.
         let target_settled = target_unreachable
+            || replacement_registered
             || (policy.missing_registration_settles_target && registration_missing);
         let channel_released = !policy.wait_for_channel_release || !channel_is_owned(config)?;
-        if target_settled && registration_released && channel_released {
+        if target_settled && registration_released && (replacement_registered || channel_released) {
             return Ok(());
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
             bail!(
-                "{}: target endpoint unreachable={target_unreachable}, registration released={registration_released}, registration missing={registration_missing}, channel released={channel_released}",
+                "{}: target endpoint unreachable={target_unreachable}, registration released={registration_released}, registration missing={registration_missing}, replacement registered={replacement_registered}, channel released={channel_released}",
                 policy.timeout_message
             )
         }
@@ -207,7 +212,7 @@ fn shutdown_policy(
                 "mismatched Suru server did not release the channel before startup timed out"
                     .to_owned(),
             health_check_timeout,
-            missing_registration_settles_target: false,
+            missing_registration_settles_target: true,
         },
     }
 }
