@@ -1,9 +1,10 @@
+#[cfg(target_os = "linux")]
+use std::io::Write;
 use std::{
     convert::Infallible,
     fs::{File, OpenOptions},
-    io::Write,
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -33,7 +34,7 @@ use suru::{
 };
 use sysinfo::{Pid, System};
 use tokio::sync::{oneshot, watch};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, timeout, timeout_at};
 use uuid::Uuid;
 
 #[allow(dead_code)]
@@ -300,7 +301,9 @@ async fn simultaneous_replacement_launchers_converge_on_one_new_instance() {
     let previous_instance_id = fixture.descriptor().instance_id;
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure replacement launchers")
-        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
+        .with_server_executable(env!("CARGO_BIN_EXE_suru"))
+        .with_startup_timeout(Duration::from_secs(2))
+        .with_health_check_timeout(Duration::from_millis(100));
     let launchers = (0..8)
         .map(|_| {
             let config = config.clone();
@@ -309,10 +312,17 @@ async fn simultaneous_replacement_launchers_converge_on_one_new_instance() {
         .collect::<Vec<_>>();
 
     let mut replacements = Vec::new();
-    for launcher in launchers {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    for (index, launcher) in launchers.into_iter().enumerate() {
         replacements.push(
-            launcher
+            timeout_at(deadline, launcher)
                 .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "replacement launcher {index} did not settle within 3s; {}",
+                        describe_test_registration(state_dir.path(), channel)
+                    )
+                })
                 .expect("replacement launcher does not panic")
                 .expect("replacement launcher succeeds"),
         );
@@ -413,7 +423,9 @@ async fn simultaneous_launchers_converge_on_one_authenticated_server() {
     let channel = "concurrent-election-test";
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
+        .with_server_executable(env!("CARGO_BIN_EXE_suru"))
+        .with_startup_timeout(Duration::from_secs(2))
+        .with_health_check_timeout(Duration::from_millis(100));
 
     let client_launches = (0..4)
         .map(|_| {
@@ -424,31 +436,37 @@ async fn simultaneous_launchers_converge_on_one_authenticated_server() {
     let command_launches = (0..4)
         .map(|_| {
             let state_dir = state_dir.path().to_path_buf();
-            tokio::task::spawn_blocking(move || {
-                Command::new(env!("CARGO_BIN_EXE_suru"))
-                    .args(["server", "start"])
-                    .env("SURU_STATE_DIR", &state_dir)
-                    .env("SURU_DATA_DIR", &state_dir)
-                    .env("SURU_CONFIG_DIR", &state_dir)
-                    .env("SURU_CHANNEL", channel)
-                    .output()
-                    .expect("run concurrent server start command")
-            })
+            tokio::spawn(async move { run_server_cli(&state_dir, channel, "start").await })
         })
         .collect::<Vec<_>>();
 
     let mut clients = Vec::new();
-    for launch in client_launches {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    for (index, launch) in client_launches.into_iter().enumerate() {
         clients.push(
-            launch
+            timeout_at(deadline, launch)
                 .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "managed client launcher {index} did not settle within 4s; {}",
+                        describe_test_registration(state_dir.path(), channel)
+                    )
+                })
                 .expect("managed client launch task does not panic")
                 .expect("managed client launch succeeds"),
         );
     }
     let mut command_outputs = Vec::new();
-    for launch in command_launches {
-        let output = launch.await.expect("server start task does not panic");
+    for (index, launch) in command_launches.into_iter().enumerate() {
+        let output = timeout_at(deadline, launch)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "server start launcher {index} did not settle within 4s; {}",
+                    describe_test_registration(state_dir.path(), channel)
+                )
+            })
+            .expect("server start task does not panic");
         assert!(
             output.status.success(),
             "concurrent server start failed: {}",
@@ -709,21 +727,21 @@ async fn authenticated_shutdown_intent_does_not_trigger_crash_recovery() {
 async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let unrelated_channel = "unrelated-live-process";
-    let mut unrelated = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_suru"))
-            .arg("__server")
-            .arg("--state-dir")
-            .arg(state_dir.path())
-            .arg("--data-dir")
-            .arg(state_dir.path())
-            .arg("--channel")
-            .arg(unrelated_channel)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn unrelated live process"),
-    );
+    let mut unrelated = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru"));
+    unrelated
+        .arg("__server")
+        .arg("--state-dir")
+        .arg(state_dir.path())
+        .arg("--data-dir")
+        .arg(state_dir.path())
+        .arg("--channel")
+        .arg(unrelated_channel)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut unrelated = unrelated.spawn().expect("spawn unrelated live process");
+    let unrelated_pid = unrelated.id().expect("unrelated process has a PID");
     let unrelated_descriptor = state_dir
         .path()
         .join(unrelated_channel)
@@ -746,7 +764,7 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
             token: "stale-token".to_owned(),
             identity: ServerIdentity {
                 instance_id: Uuid::new_v4(),
-                pid: unrelated.0.id(),
+                pid: unrelated_pid,
                 protocol_version: PROTOCOL_VERSION,
                 build_identity: "stale-build".to_owned(),
             },
@@ -757,7 +775,6 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
     assert!(!stop.status.success());
     assert!(
         unrelated
-            .0
             .try_wait()
             .expect("inspect unrelated process after refused stop")
             .is_none(),
@@ -767,16 +784,17 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
             .expect("configure managed client")
-            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
+            .with_server_executable(env!("CARGO_BIN_EXE_suru"))
+            .with_startup_timeout(Duration::from_secs(2))
+            .with_health_check_timeout(Duration::from_millis(100)),
     )
     .await
     .expect("recover from stale descriptor");
     let identity = receive_initial_state(&mut client).await;
 
-    assert_ne!(identity.pid, unrelated.0.id());
+    assert_ne!(identity.pid, unrelated_pid);
     assert!(
         unrelated
-            .0
             .try_wait()
             .expect("inspect unrelated live process")
             .is_none(),
@@ -785,6 +803,13 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
 
     drop(client);
     stop_test_server(state_dir.path(), channel);
+    unrelated
+        .start_kill()
+        .expect("terminate unrelated process fixture");
+    timeout(Duration::from_secs(2), unrelated.wait())
+        .await
+        .expect("unrelated process fixture exits within 2s")
+        .expect("wait for unrelated process fixture");
 }
 
 #[tokio::test]
@@ -864,15 +889,6 @@ fn mutate_wrong_token(descriptor: &mut RuntimeDescriptor) {
 
 fn mutate_instance_id(descriptor: &mut RuntimeDescriptor) {
     descriptor.instance_id = Uuid::new_v4();
-}
-
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 #[tokio::test]
@@ -2026,12 +2042,12 @@ impl BuildReplacementFixture {
         let task_descriptor_path = descriptor_path.clone();
         let task = tokio::spawn(async move {
             let _lock = lock;
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .expect("serve old-build fixture");
+            let server = async { axum::serve(listener, app).await };
+            tokio::pin!(server);
+            tokio::select! {
+                result = &mut server => result.expect("serve old-build fixture"),
+                _ = shutdown_rx => {}
+            }
             if task_descriptor_path.exists()
                 && read_runtime_descriptor(&task_descriptor_path).instance_id == instance_id
             {

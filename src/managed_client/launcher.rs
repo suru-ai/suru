@@ -37,18 +37,22 @@ pub(super) async fn ensure_server(
         })?;
     let mut spawned = None;
     loop {
-        let probe_result = match tokio::time::timeout_at(deadline, lifecycle::probe(config)).await {
-            Ok(result) => result,
-            Err(_) => {
-                return Err(startup_error(
-                    config,
-                    &format!(
-                        "detached Suru server did not become ready within {:?}",
-                        config.startup_timeout
-                    ),
-                ));
-            }
-        };
+        let probe_deadline =
+            (tokio::time::Instant::now() + config.health_check_timeout).min(deadline);
+        let probe_result =
+            match tokio::time::timeout_at(probe_deadline, lifecycle::probe(config)).await {
+                Ok(result) => result,
+                Err(_) if tokio::time::Instant::now() >= deadline => {
+                    return Err(startup_error(
+                        config,
+                        &format!(
+                            "detached Suru server did not become ready within {:?}",
+                            config.startup_timeout
+                        ),
+                    ));
+                }
+                Err(_) => Err(anyhow!("authenticated health check timed out")),
+            };
         let error = match probe_result {
             Ok(registration) => match registration.health.lifecycle {
                 LifecycleState::Ready
