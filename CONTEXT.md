@@ -96,6 +96,10 @@ _Avoid_: Shell invocation, exec
 The ordered, user-visible history of a Session: its Messages and Activities in presentation order.
 _Avoid_: History, log, conversation
 
+**Session Content Column**:
+The main working column of an open Session: its Transcript, queued Prompts, latest-position affordance, composer extensions, composer, and composer footer. The Session header and the Landing sit outside it.
+_Avoid_: Conversation column, transcript column
+
 **Truncation**:
 The condition of a Message, command Activity, or Reasoning Activity whose stored content Suru's cap cut short of everything the Provider sent. Truncation is carried as a typed property beside the content rather than as text within it, so a client reads it as data and draws its own **truncation marker**: the line a Transcript shows in place of what the cap dropped.
 _Avoid_: Elision, clipping
