@@ -39,18 +39,29 @@ enum CliCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServerCommand {
-    Start,
+    Start {
+        #[arg(long, hide = true)]
+        startup_timeout_ms: Option<u64>,
+    },
     Status,
-    Stop,
+    Stop {
+        #[arg(long, hide = true)]
+        stop_timeout_ms: Option<u64>,
+        #[arg(long, hide = true)]
+        health_check_timeout_ms: Option<u64>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Some(CliCommand::Server {
-            command: ServerCommand::Start,
+            command: ServerCommand::Start { startup_timeout_ms },
         }) => {
-            let config = default_client_config()?;
+            let mut config = default_client_config()?;
+            if let Some(timeout_ms) = startup_timeout_ms {
+                config = config.with_startup_timeout(std::time::Duration::from_millis(timeout_ms));
+            }
             let health = start_server(&config).await?;
             println!(
                 "Suru server ready (pid {}, instance {})",
@@ -70,9 +81,21 @@ async fn main() -> Result<()> {
             }
         }
         Some(CliCommand::Server {
-            command: ServerCommand::Stop,
+            command:
+                ServerCommand::Stop {
+                    stop_timeout_ms,
+                    health_check_timeout_ms,
+                },
         }) => {
-            let health = stop_server(&default_client_config()?).await?;
+            let mut config = default_client_config()?;
+            if let Some(timeout_ms) = stop_timeout_ms {
+                config = config.with_stop_timeout(std::time::Duration::from_millis(timeout_ms));
+            }
+            if let Some(timeout_ms) = health_check_timeout_ms {
+                config =
+                    config.with_health_check_timeout(std::time::Duration::from_millis(timeout_ms));
+            }
+            let health = stop_server(&config).await?;
             println!(
                 "Suru server stopped (pid {}, instance {})",
                 health.identity.pid, health.identity.instance_id

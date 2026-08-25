@@ -13,8 +13,6 @@ use crate::protocol::{Health, RuntimeDescriptor, ServerShutdown, ShutdownReason}
 
 use super::ManagedClientConfig;
 
-const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
-
 pub(super) struct Registration {
     pub(super) descriptor: RuntimeDescriptor,
     pub(super) health: Health,
@@ -52,7 +50,7 @@ pub(super) async fn inspect_registration(
     if let Err(error) = validate_loopback_url(&descriptor.base_url) {
         return Ok(RegistrationInspection::Stale(format!("{error:#}")));
     }
-    match tokio::time::timeout(STATUS_TIMEOUT, inspect_health(&descriptor)).await {
+    match tokio::time::timeout(config.health_check_timeout, inspect_health(&descriptor)).await {
         Ok(Ok(health)) => Ok(RegistrationInspection::Live(Registration {
             descriptor,
             health,
@@ -86,7 +84,7 @@ pub(super) async fn shutdown_registered_instance(
     reason: ShutdownReason,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
-    let policy = shutdown_policy(reason, deadline);
+    let policy = shutdown_policy(reason, deadline, config.health_check_timeout);
     let instance_id = registration.health.instance_id;
     let request = ServerShutdown {
         instance_id,
@@ -123,25 +121,37 @@ pub(super) async fn shutdown_registered_instance(
         Err(error) => return Err(error),
     }
 
-    let mut target_stopped = false;
+    let mut target_unreachable = false;
     loop {
-        if !target_stopped {
-            target_stopped = matches!(
-                tokio::time::timeout_at(deadline, inspect_health(&registration.descriptor)).await,
+        if !target_unreachable {
+            let probe_deadline =
+                (tokio::time::Instant::now() + policy.health_check_timeout).min(deadline);
+            target_unreachable = matches!(
+                tokio::time::timeout_at(probe_deadline, inspect_health(&registration.descriptor))
+                    .await,
                 Ok(Err(HealthInspectionError::Unreachable(_)))
             );
         }
-        let registration_released = match read_descriptor(&config.descriptor_path()) {
-            Ok(current) => current.instance_id != instance_id,
-            Err(_) => !config.descriptor_path().exists(),
-        };
+        let (registration_released, registration_missing) =
+            match read_descriptor(&config.descriptor_path()) {
+                Ok(current) => (current.instance_id != instance_id, false),
+                Err(_) => {
+                    let missing = !config.descriptor_path().exists();
+                    (missing, missing)
+                }
+            };
+        let target_settled = target_unreachable
+            || (policy.missing_registration_settles_target && registration_missing);
         let channel_released = !policy.wait_for_channel_release || !channel_is_owned(config)?;
-        if target_stopped && registration_released && channel_released {
+        if target_settled && registration_released && channel_released {
             return Ok(());
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            bail!(policy.timeout_message)
+            bail!(
+                "{}: target endpoint unreachable={target_unreachable}, registration released={registration_released}, registration missing={registration_missing}, channel released={channel_released}",
+                policy.timeout_message
+            )
         }
         tokio::time::sleep_until((now + Duration::from_millis(25)).min(deadline)).await;
     }
@@ -165,24 +175,39 @@ struct ShutdownPolicy {
     transition_races_are_expected: bool,
     wait_for_channel_release: bool,
     action: &'static str,
-    timeout_message: &'static str,
+    timeout_message: String,
+    health_check_timeout: Duration,
+    missing_registration_settles_target: bool,
 }
 
-fn shutdown_policy(reason: ShutdownReason, deadline: tokio::time::Instant) -> ShutdownPolicy {
+fn shutdown_policy(
+    reason: ShutdownReason,
+    deadline: tokio::time::Instant,
+    health_check_timeout: Duration,
+) -> ShutdownPolicy {
     match reason {
         ShutdownReason::Manual => ShutdownPolicy {
-            request_deadline: (tokio::time::Instant::now() + STATUS_TIMEOUT).min(deadline),
+            request_deadline: (tokio::time::Instant::now() + health_check_timeout).min(deadline),
             transition_races_are_expected: false,
             wait_for_channel_release: false,
             action: "manual stop",
-            timeout_message: "Suru server did not stop within 5s",
+            timeout_message: format!(
+                "Suru server did not stop before the manual-stop deadline ({:?})",
+                deadline.saturating_duration_since(tokio::time::Instant::now())
+            ),
+            health_check_timeout,
+            missing_registration_settles_target: true,
         },
         ShutdownReason::Replacement => ShutdownPolicy {
             request_deadline: deadline,
             transition_races_are_expected: true,
             wait_for_channel_release: true,
             action: "replacement stop",
-            timeout_message: "mismatched Suru server did not release the channel before startup timed out",
+            timeout_message:
+                "mismatched Suru server did not release the channel before startup timed out"
+                    .to_owned(),
+            health_check_timeout,
+            missing_registration_settles_target: false,
         },
     }
 }

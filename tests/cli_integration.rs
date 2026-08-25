@@ -907,7 +907,12 @@ async fn server_status_reports_authenticated_ready_and_missing_states() {
     assert!(stdout.contains(&descriptor.pid.to_string()));
     assert!(stdout.contains(&descriptor.instance_id.to_string()));
 
-    stop_test_server(state_dir.path(), channel);
+    let stopped = run_server_cli(state_dir.path(), channel, "stop").await;
+    assert!(
+        stopped.status.success(),
+        "server stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
 }
 
 #[tokio::test]
@@ -997,7 +1002,9 @@ async fn server_stop_notifies_attached_clients_and_remains_stopped() {
     let mut managed = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
             .expect("configure attached managed client")
-            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
+            .with_server_executable(env!("CARGO_BIN_EXE_suru"))
+            .with_startup_timeout(Duration::from_millis(500))
+            .with_recovery_backoff(Duration::from_millis(10), Duration::from_millis(20)),
     )
     .await
     .expect("attach managed client before manual stop");
@@ -1340,35 +1347,45 @@ async fn run_server_cli(
     channel: &str,
     command: &str,
 ) -> std::process::Output {
-    let state_dir = state_dir.to_path_buf();
-    let channel = channel.to_owned();
-    let command = command.to_owned();
-    tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_suru"))
-            .args(["server", &command])
-            .env("SURU_STATE_DIR", &state_dir)
-            .env("SURU_DATA_DIR", &state_dir)
-            .env("SURU_CONFIG_DIR", &state_dir)
-            .env("SURU_CHANNEL", channel)
-            .output()
-            .expect("run server CLI command")
-    })
-    .await
-    .expect("server CLI command task does not panic")
+    const PROCESS_TIMEOUT: Duration = Duration::from_secs(3);
+    let timing_args = match command {
+        "start" => &["--startup-timeout-ms", "2000"][..],
+        "stop" => &[
+            "--stop-timeout-ms",
+            "1000",
+            "--health-check-timeout-ms",
+            "100",
+        ][..],
+        _ => &[],
+    };
+    let mut process = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru"));
+    process
+        .arg("server")
+        .arg(command)
+        .args(timing_args)
+        .env("SURU_STATE_DIR", state_dir)
+        .env("SURU_DATA_DIR", state_dir)
+        .env("SURU_CONFIG_DIR", state_dir)
+        .env("SURU_CHANNEL", channel)
+        .kill_on_drop(true);
+
+    match timeout(PROCESS_TIMEOUT, process.output()).await {
+        Ok(output) => output.expect("run server CLI command"),
+        Err(_) => {
+            let registration = describe_test_registration(state_dir, channel);
+            request_test_server_shutdown_if_present(state_dir, channel).await;
+            panic!(
+                "server {command} process boundary did not settle within {PROCESS_TIMEOUT:?}; {registration}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
 async fn server_start_returns_after_a_detached_server_is_ready() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "detached-start-test";
-    let output = Command::new(env!("CARGO_BIN_EXE_suru"))
-        .args(["server", "start"])
-        .env("SURU_STATE_DIR", state_dir.path())
-        .env("SURU_DATA_DIR", state_dir.path())
-        .env("SURU_CONFIG_DIR", state_dir.path())
-        .env("SURU_CHANNEL", channel)
-        .output()
-        .expect("run server start command");
+    let output = run_server_cli(state_dir.path(), channel, "start").await;
 
     assert!(
         output.status.success(),
@@ -1378,14 +1395,7 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
     let descriptor_path = state_dir.path().join(channel).join("runtime.json");
     let first_descriptor = read_runtime_descriptor(&descriptor_path);
 
-    let repeated = Command::new(env!("CARGO_BIN_EXE_suru"))
-        .args(["server", "start"])
-        .env("SURU_STATE_DIR", state_dir.path())
-        .env("SURU_DATA_DIR", state_dir.path())
-        .env("SURU_CONFIG_DIR", state_dir.path())
-        .env("SURU_CHANNEL", channel)
-        .output()
-        .expect("repeat server start command");
+    let repeated = run_server_cli(state_dir.path(), channel, "start").await;
     assert!(
         repeated.status.success(),
         "repeated server start failed: {}",
@@ -1401,7 +1411,8 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), channel)
             .expect("configure managed client")
-            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
+            .with_server_executable(env!("CARGO_BIN_EXE_suru"))
+            .with_startup_timeout(Duration::from_millis(500)),
     )
     .await
     .expect("connect after start command has exited");
@@ -1411,11 +1422,16 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
     assert_eq!(identity.instance_id, first_descriptor.instance_id);
 
     drop(client);
-    stop_test_server(state_dir.path(), channel);
+    let stopped = run_server_cli(state_dir.path(), channel, "stop").await;
+    assert!(
+        stopped.status.success(),
+        "server stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
 }
 
-#[test]
-fn build_profile_selects_isolated_default_state_and_data_roots() {
+#[tokio::test]
+async fn build_profile_selects_isolated_default_state_and_data_roots() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let (expected_channel, other_channel) = if cfg!(debug_assertions) {
@@ -1423,13 +1439,24 @@ fn build_profile_selects_isolated_default_state_and_data_roots() {
     } else {
         ("release", "debug")
     };
-    let output = Command::new(env!("CARGO_BIN_EXE_suru"))
-        .args(["server", "start"])
+    let mut process = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru"));
+    process
+        .args(["server", "start", "--startup-timeout-ms", "2000"])
         .env("SURU_STATE_DIR", state_dir.path())
         .env("SURU_DATA_DIR", data_dir.path())
         .env("SURU_CONFIG_DIR", state_dir.path())
         .env_remove("SURU_CHANNEL")
-        .output()
+        .kill_on_drop(true);
+    let output = match timeout(Duration::from_secs(5), process.output()).await {
+        Ok(output) => output,
+        Err(_) => {
+            let registration = describe_test_registration(state_dir.path(), expected_channel);
+            request_test_server_shutdown_if_present(state_dir.path(), expected_channel).await;
+            panic!(
+                "default-channel server start process boundary did not settle within 5s; {registration}"
+            )
+        }
+    }
         .expect("start server on the build profile's default channel");
 
     assert!(
@@ -1444,7 +1471,12 @@ fn build_profile_selects_isolated_default_state_and_data_roots() {
     assert!(!state_dir.path().join(other_channel).exists());
     assert!(!data_dir.path().join(other_channel).exists());
 
-    stop_test_server(state_dir.path(), expected_channel);
+    let stopped = run_server_cli(state_dir.path(), expected_channel, "stop").await;
+    assert!(
+        stopped.status.success(),
+        "server stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
 }
 
 #[tokio::test]
@@ -2179,6 +2211,42 @@ fn stop_test_server(state_dir: &std::path::Path, channel: &str) {
         .process(Pid::from_u32(descriptor.pid))
         .expect("find detached test server");
     assert!(process.kill(), "stop detached test server");
+}
+
+fn describe_test_registration(state_dir: &std::path::Path, channel: &str) -> String {
+    let descriptor_path = test_runtime_root(state_dir, channel).join("runtime.json");
+    let Ok(contents) = std::fs::read(&descriptor_path) else {
+        return format!("runtime registration missing at {descriptor_path:?}");
+    };
+    let Ok(descriptor) = serde_json::from_slice::<RuntimeDescriptor>(&contents) else {
+        return format!("runtime registration unreadable at {descriptor_path:?}");
+    };
+    let mut system = System::new_all();
+    system.refresh_all();
+    let process_state = if system.process(Pid::from_u32(descriptor.pid)).is_some() {
+        "running"
+    } else {
+        "exited"
+    };
+    format!(
+        "runtime registration points to {process_state} pid {}, instance {}",
+        descriptor.pid, descriptor.instance_id
+    )
+}
+
+async fn request_test_server_shutdown_if_present(state_dir: &std::path::Path, channel: &str) {
+    let descriptor_path = test_runtime_root(state_dir, channel).join("runtime.json");
+    let Ok(contents) = std::fs::read(descriptor_path) else {
+        return;
+    };
+    let Ok(descriptor) = serde_json::from_slice::<RuntimeDescriptor>(&contents) else {
+        return;
+    };
+    let _ = timeout(
+        Duration::from_millis(500),
+        request_server_shutdown(&descriptor, ShutdownReason::Manual),
+    )
+    .await;
 }
 
 fn test_runtime_root(base_dir: &std::path::Path, channel: &str) -> std::path::PathBuf {

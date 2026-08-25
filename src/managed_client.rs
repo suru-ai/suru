@@ -36,6 +36,7 @@ pub use session_stream::{SessionEvent, SessionStreamError, SessionSubscription};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const INITIAL_RECOVERY_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
 
@@ -44,6 +45,8 @@ pub struct ManagedClientConfig {
     runtime: RuntimeConfig,
     server_executable: PathBuf,
     startup_timeout: Duration,
+    stop_timeout: Duration,
+    health_check_timeout: Duration,
     initial_recovery_backoff: Duration,
     max_recovery_backoff: Duration,
 }
@@ -54,6 +57,8 @@ impl ManagedClientConfig {
             runtime: RuntimeConfig::new(state_base_dir, channel)?,
             server_executable: std::env::current_exe().context("find current Suru executable")?,
             startup_timeout: STARTUP_TIMEOUT,
+            stop_timeout: STOP_TIMEOUT,
+            health_check_timeout: HEALTH_CHECK_TIMEOUT,
             initial_recovery_backoff: INITIAL_RECOVERY_BACKOFF,
             max_recovery_backoff: MAX_RECOVERY_BACKOFF,
         })
@@ -68,6 +73,20 @@ impl ManagedClientConfig {
     /// so tests can exercise the deadline without waiting out the default.
     pub fn with_startup_timeout(mut self, timeout: Duration) -> Self {
         self.startup_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long a manual stop waits for the target process and runtime
+    /// registration to settle.
+    pub fn with_stop_timeout(mut self, timeout: Duration) -> Self {
+        self.stop_timeout = timeout;
+        self
+    }
+
+    /// Bounds individual authenticated health probes used by status and
+    /// shutdown settlement.
+    pub fn with_health_check_timeout(mut self, timeout: Duration) -> Self {
+        self.health_check_timeout = timeout;
         self
     }
 
@@ -597,7 +616,7 @@ pub async fn stop_server(config: &ManagedClientConfig) -> Result<Health> {
             bail!("cannot stop unreachable Suru server: {reason}")
         }
     };
-    let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + config.stop_timeout;
     lifecycle::shutdown_registered_instance(
         config,
         &registration,

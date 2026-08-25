@@ -169,6 +169,8 @@ fn spawn_detached(config: &ManagedClientConfig) -> Result<Child> {
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     configure_detached_process(&mut command);
+    #[cfg(windows)]
+    let _standard_handle_guard = StandardHandleInheritanceGuard::disable()?;
     command.spawn().context("spawn detached Suru server")
 }
 
@@ -219,4 +221,73 @@ fn configure_detached_process(command: &mut Command) {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+}
+
+#[cfg(windows)]
+static STANDARD_HANDLE_INHERITANCE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(windows)]
+struct StandardHandleInheritanceGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    changed: Vec<(windows_sys::Win32::Foundation::HANDLE, u32)>,
+}
+
+#[cfg(windows)]
+impl StandardHandleInheritanceGuard {
+    fn disable() -> Result<Self> {
+        use windows_sys::Win32::{
+            Foundation::{
+                GetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+                SetHandleInformation,
+            },
+            System::Console::{
+                GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            },
+        };
+
+        let lock = STANDARD_HANDLE_INHERITANCE
+            .lock()
+            .map_err(|_| anyhow!("standard handle inheritance lock is poisoned"))?;
+        let mut guard = Self {
+            _lock: lock,
+            changed: Vec::new(),
+        };
+        for standard_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: GetStdHandle returns a borrowed process-wide handle.
+            let handle = unsafe { GetStdHandle(standard_handle) };
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            let mut flags = 0;
+            // SAFETY: flags points to writable storage and handle is borrowed for this call.
+            if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("inspect standard handle inheritance");
+            }
+            if flags & HANDLE_FLAG_INHERIT == 0 {
+                continue;
+            }
+            // SAFETY: this changes only the inheritance flag on a valid process handle.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("disable standard handle inheritance");
+            }
+            guard.changed.push((handle, flags));
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StandardHandleInheritanceGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+        for (handle, flags) in self.changed.drain(..) {
+            // SAFETY: each borrowed handle is process-wide and remains valid across spawn.
+            unsafe {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, flags & HANDLE_FLAG_INHERIT);
+            }
+        }
+    }
 }
