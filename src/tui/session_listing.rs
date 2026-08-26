@@ -69,12 +69,22 @@ impl SessionListing {
     /// caller hands the returned request to the runtime and back to `load` or
     /// `fail` when the answer arrives.
     pub(super) fn refresh(&mut self) -> SessionListRequest {
+        let request = self.catch_up();
+        self.sessions.clear();
+        self.loading = true;
+        request
+    }
+
+    /// Asks again without dropping what this listing holds, which is how a
+    /// surface already on screen catches up with a catalog another client
+    /// moved: the rows the reader is reading stand until the answer arrives,
+    /// and the answer replaces them whole. Numbering the request is what
+    /// supersedes whatever this listing was waiting for before.
+    pub(super) fn catch_up(&mut self) -> SessionListRequest {
         self.request_sequence = self.request_sequence.wrapping_add(1);
         let request =
             SessionListRequest::new(self.surface, self.request_sequence, self.scope.clone());
         self.pending_request = Some(request.clone());
-        self.sessions.clear();
-        self.loading = true;
         request
     }
 
@@ -98,11 +108,41 @@ impl SessionListing {
         if !self.awaits(request) {
             return false;
         }
-        sessions.sort_unstable_by_key(|summary| Reverse(summary.updated_at()));
+        Self::order(&mut sessions);
         self.sessions = sessions;
         self.loading = false;
         self.pending_request = None;
         true
+    }
+
+    /// Whether a reply the server sent would move anything this listing holds.
+    /// A catch-up after a change the client had already taken in place is
+    /// answered with the listing already drawn, and an idle TUI must not pay a
+    /// frame for that (ADR 0007) — nor for a straggler, which lands nowhere.
+    pub(super) fn would_move(
+        &self,
+        request: &SessionListRequest,
+        sessions: &[SessionListItem],
+    ) -> bool {
+        if !self.awaits(request) {
+            return false;
+        }
+        // A listing still on its way, or one that failed, says so on screen,
+        // so the answer moves the frame whatever Sessions it carries.
+        if self.loading || self.error.is_some() {
+            return true;
+        }
+        let mut arriving = sessions.to_vec();
+        Self::order(&mut arriving);
+        arriving != self.sessions
+    }
+
+    /// The one order a listing keeps: the most recently updated Session first.
+    /// It is stable, so two Sessions last updated at the same moment keep the
+    /// order the server listed them in — and a reply carrying what the listing
+    /// already holds is recognised as the same listing rather than a new one.
+    fn order(sessions: &mut [SessionListItem]) {
+        sessions.sort_by_key(|summary| Reverse(summary.updated_at()));
     }
 
     /// Takes the server's refusal of a listing, reporting whether it answered
@@ -218,7 +258,9 @@ impl SessionListing {
         self.error = None;
     }
 
-    fn awaits(&self, request: &SessionListRequest) -> bool {
+    /// Whether this listing is still waiting for the reply to `request`. Any
+    /// other reply is a straggler from a listing the reader has moved past.
+    pub(super) fn awaits(&self, request: &SessionListRequest) -> bool {
         self.pending_request.as_ref() == Some(request)
     }
 }

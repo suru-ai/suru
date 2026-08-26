@@ -18,10 +18,11 @@ use ratatui::{buffer::Cell, style::Color};
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AutoSettle, EffectiveSettings, ModelAvailability, PromptId, Session, SessionDeleted,
-        SessionId, SessionListItem, SessionSettlementChanged, SessionStatus, SessionSummary,
-        SessionTimestamp, SessionTitleChanged, SettingsSnapshot, SidebarScope, SidebarSettings,
-        SidebarVisibility, UnreadableSessionSummary, Workspace,
+        AutoSettle, EffectiveSettings, ModelAvailability, PromptId, Session,
+        SessionCatalogRevision, SessionCatalogSnapshot, SessionCreated, SessionDeleted, SessionId,
+        SessionListItem, SessionSettlementChanged, SessionStatus, SessionSummary, SessionTimestamp,
+        SessionTitleChanged, SettingsSnapshot, SidebarScope, SidebarSettings, SidebarVisibility,
+        UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -1545,10 +1546,9 @@ fn a_session_unsettled_after_a_long_idle_comes_back_to_the_active_list() {
     assert!(sidebar_divider(&rows) < rendered_row(&rows, "Long set aside"));
 
     // The server clears the marker and stamps the Session's last activity with
-    // the moment the reader reached for it, which the refreshed listing brings.
-    settle_elsewhere(&mut application, set_apart, None);
-    press_toggle(&mut application);
-    let request = expect_sidebar_listing(press_toggle(&mut application));
+    // the moment the reader reached for it, which only the listing the Sidebar
+    // catches up with can bring.
+    let request = expect_sidebar_listing(settle_elsewhere(&mut application, set_apart, None));
     application
         .handle_event(ApplicationEvent::SessionsListed {
             request,
@@ -1799,12 +1799,13 @@ fn drawn_in_sidebar(rows: &[String], needle: &str) -> bool {
     rows.iter().any(|row| sidebar_column(row).contains(needle))
 }
 
-/// A settlement another client made, arriving on the session-catalog stream.
+/// A settlement another client made, arriving on the session-catalog stream,
+/// reporting whatever the Sidebar asks for in answer.
 fn settle_elsewhere(
     application: &mut Application,
     session_id: SessionId,
     settled_at: Option<SessionTimestamp>,
-) {
+) -> ApplicationTransition {
     application
         .handle_event(ApplicationEvent::Managed(
             ManagedEvent::SessionSettlementChanged(SessionSettlementChanged {
@@ -1812,7 +1813,7 @@ fn settle_elsewhere(
                 settled_at,
             }),
         ))
-        .expect("take the settlement another client made");
+        .expect("take the settlement another client made")
 }
 
 /// The row the divider closing the active list is drawn on, where there is a
@@ -3598,4 +3599,500 @@ fn add_workspace(application: &mut Application, path: &str) -> ApplicationTransi
     press_add_workspace(application);
     type_terminal_text(application, path);
     press_sidebar_key(application, KeyCode::Enter)
+}
+
+/// The Sidebar stays truthful without the reader asking: every change the
+/// session-catalog stream reports — a Session made, retitled, deleted, set
+/// aside, brought back, or a whole catalog reconciled after a reconnection —
+/// is taken in place where the change says enough, and caught up with by
+/// asking the server again for everything it does not say.
+#[test]
+fn every_catalog_change_asks_the_sidebar_for_the_listing_again() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let listed_session = SessionId::new();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![listed_as(
+            listed_session,
+            "Listed work",
+            workspace.path(),
+            1,
+        )],
+    );
+
+    for (ordinal, (what, change)) in [
+        (
+            "a Session made",
+            ManagedEvent::SessionCreated(SessionCreated {
+                session_id: SessionId::new(),
+            }),
+        ),
+        (
+            "a Session retitled",
+            ManagedEvent::SessionTitleChanged(SessionTitleChanged {
+                session_id: listed_session,
+                title: "Retitled work".to_owned(),
+                emoji: None,
+            }),
+        ),
+        (
+            "a Session set aside",
+            ManagedEvent::SessionSettlementChanged(SessionSettlementChanged {
+                session_id: listed_session,
+                settled_at: Some(SessionTimestamp(now())),
+            }),
+        ),
+        (
+            "a Session brought back",
+            ManagedEvent::SessionSettlementChanged(SessionSettlementChanged {
+                session_id: listed_session,
+                settled_at: None,
+            }),
+        ),
+        (
+            "a catalog reconciled",
+            ManagedEvent::SessionCatalogReconciled(SessionCatalogSnapshot {
+                revision: SessionCatalogRevision::INITIAL,
+                session_ids: vec![listed_session],
+            }),
+        ),
+        (
+            "a Session deleted",
+            ManagedEvent::SessionDeleted(SessionDeleted {
+                session_id: listed_session,
+            }),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let transition = application
+            .handle_event(ApplicationEvent::Managed(change))
+            .expect("take the catalog change");
+        let ApplicationTransition::ListSessions(request) = transition else {
+            panic!("{what} asks the Sidebar for its listing again, not {transition:?}");
+        };
+        assert_eq!(
+            request.surface(),
+            SessionListSurface::Sidebar,
+            "the listing {what} asks for is the Sidebar's own"
+        );
+
+        let caught_up = format!("Caught up {ordinal}");
+        application
+            .handle_event(ApplicationEvent::SessionsListed {
+                request,
+                sessions: vec![listed_as(listed_session, &caught_up, workspace.path(), 1)],
+            })
+            .expect("adopt the listing the Sidebar caught up with");
+
+        let rows = rendered_application_rows_at(&application, WIDE, 20);
+        assert!(
+            drawn_in_sidebar(&rows, &caught_up),
+            "the listing {what} asked for reaches the rows the Sidebar draws: {rows:?}"
+        );
+    }
+}
+
+#[test]
+fn a_session_made_elsewhere_arrives_in_the_sidebar() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let standing = listed_as(SessionId::new(), "Work already listed", workspace.path(), 1);
+    let mut application = sidebar_showing(workspace.path(), vec![standing.clone()]);
+
+    let made = SessionId::new();
+    let request = expect_sidebar_listing(create_elsewhere(&mut application, made));
+    assert!(
+        drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "Work already listed"
+        ),
+        "the rows the reader is reading stand until the answer arrives"
+    );
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![
+                listed_as(made, "Work made elsewhere", workspace.path(), 2),
+                standing,
+            ],
+        })
+        .expect("adopt the listing the Sidebar caught up with");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        drawn_in_sidebar(&rows, "Work made elsewhere"),
+        "a Session another client made is drawn from the listing the Sidebar asked for: {rows:?}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Work already listed"),
+        "beside the work that was already there: {rows:?}"
+    );
+}
+
+/// A reconnection reconciles the catalog against what the client last knew of
+/// it. The reconciliation names the Sessions the server holds and nothing
+/// about them, so what the client missed while it was away — Sessions made,
+/// retitled, set aside — comes back with the listing it asks for in answer.
+#[test]
+fn a_reconnection_brings_the_sidebar_the_work_it_missed() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let kept = SessionId::new();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed_as(kept, "Work still held", workspace.path(), 2),
+            listed_as(SessionId::new(), "Work taken away", workspace.path(), 1),
+        ],
+    );
+
+    let made_while_away = SessionId::new();
+    let request = expect_sidebar_listing(
+        application
+            .handle_event(ApplicationEvent::Managed(
+                ManagedEvent::SessionCatalogReconciled(SessionCatalogSnapshot {
+                    revision: SessionCatalogRevision(4),
+                    session_ids: vec![kept, made_while_away],
+                }),
+            ))
+            .expect("take the catalog the reconnection reconciled"),
+    );
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        !drawn_in_sidebar(&rows, "Work taken away"),
+        "a Session the reconciliation does not name leaves the Sidebar at once: {rows:?}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![
+                listed_as(made_while_away, "Work made while away", workspace.path(), 3),
+                listed_as(kept, "Work still held", workspace.path(), 2),
+            ],
+        })
+        .expect("adopt the listing the reconciliation asked for");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        drawn_in_sidebar(&rows, "Work made while away"),
+        "and the work made while the client was away arrives with the listing: {rows:?}"
+    );
+}
+
+/// Clearing a settled marker is not enough on its own: a Session left alone
+/// for a month would auto-settle straight back onto the shelf the reader just
+/// took it off. The server moves its last activity to the moment they reached
+/// for it, and only the listing the Sidebar catches up with carries that.
+#[test]
+fn a_session_unsettled_elsewhere_comes_back_when_the_catch_up_lands() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let set_apart = SessionId::new();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![set_aside(
+            listed_at(set_apart, "Long set aside", workspace.path(), days_ago(30)),
+            days_ago(30),
+        )],
+    );
+
+    let request = expect_sidebar_listing(settle_elsewhere(&mut application, set_apart, None));
+    assert!(
+        sidebar_divider_row(&rendered_application_rows_at(&application, WIDE, 20)).is_some(),
+        "the listing in hand still says the work has sat for a month, so the Sidebar goes on \
+         settling it of its own accord"
+    );
+
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![listed_at(
+                set_apart,
+                "Long set aside",
+                workspace.path(),
+                now(),
+            )],
+        })
+        .expect("adopt the listing the Sidebar caught up with");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        sidebar_divider_row(&rows).is_none(),
+        "the last activity the server moved empties the shelf for good: {rows:?}"
+    );
+}
+
+/// A catch-up is the Sidebar's own doing rather than the reader looking again,
+/// so it leaves everything they are in the middle of exactly where it is.
+#[test]
+fn a_catch_up_leaves_the_reader_on_the_row_they_were_on() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let newer = SessionId::new();
+    let older = SessionId::new();
+    let listing = |extra: Option<SessionId>| {
+        extra
+            .map(|made| vec![listed_as(made, "Work made elsewhere", workspace.path(), 3)])
+            .unwrap_or_default()
+            .into_iter()
+            .chain([
+                listed_as(newer, "Newer work", workspace.path(), 2),
+                listed_as(older, "Older work", workspace.path(), 1),
+            ])
+            .collect::<Vec<_>>()
+    };
+    let mut application = sidebar_focused(workspace.path(), listing(None));
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(
+        selected_sidebar_text(&application).contains("Older work"),
+        "the reader walks down onto the older of the two"
+    );
+
+    let made = SessionId::new();
+    let request = expect_sidebar_listing(create_elsewhere(&mut application, made));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: listing(Some(made)),
+        })
+        .expect("adopt the listing the Sidebar caught up with");
+
+    assert!(
+        selected_sidebar_text(&application).contains("Older work"),
+        "a listing arriving underneath the reader leaves them on the Session they were on"
+    );
+}
+
+#[test]
+fn a_catch_up_leaves_the_settled_shelf_as_deep_as_the_reader_walked_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(workspace.path(), set_aside_shelf(workspace.path(), 12));
+    // Up off the list onto the selector's own line — the add-Workspace
+    // affordance, then the selector — and up again onto the affordance at the
+    // shelf's foot.
+    press_sidebar_key(&mut application, KeyCode::Up);
+    press_sidebar_key(&mut application, KeyCode::Up);
+    press_sidebar_key(&mut application, KeyCode::Up);
+    press_sidebar_key(&mut application, KeyCode::Enter);
+    assert!(
+        drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "Ended 11"
+        ),
+        "the reader revealed the whole of the shelf"
+    );
+
+    let request = expect_sidebar_listing(create_elsewhere(&mut application, SessionId::new()));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: set_aside_shelf(workspace.path(), 12),
+        })
+        .expect("adopt the listing the Sidebar caught up with");
+
+    assert!(
+        drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "Ended 11"
+        ),
+        "a catch-up is not the reader moving anywhere, so the shelf stays as deep as they left it"
+    );
+}
+
+#[test]
+fn a_catch_up_leaves_a_menu_the_reader_opened_standing() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
+    let _ = open_menu_on(&mut application, "Wanted work");
+    assert!(
+        menu_is_drawn(&application),
+        "the reader opened a menu on the row they were on"
+    );
+
+    let request = expect_sidebar_listing(create_elsewhere(&mut application, SessionId::new()));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: two_listed(workspace.path(), wanted),
+        })
+        .expect("adopt the listing the Sidebar caught up with");
+
+    assert!(
+        menu_is_drawn(&application),
+        "the menu the reader opened stands through a listing they did not ask for"
+    );
+
+    // Unless the Session it was offering to act on left with that listing.
+    let request = expect_sidebar_listing(create_elsewhere(&mut application, SessionId::new()));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![listed_as(
+                SessionId::new(),
+                "Other work",
+                workspace.path(),
+                1,
+            )],
+        })
+        .expect("adopt the listing the Sidebar caught up with");
+
+    assert!(
+        !menu_is_drawn(&application),
+        "a menu offering to act on work that is gone is put away"
+    );
+}
+
+/// A Sidebar the reader closed asks the server for nothing, however much the
+/// catalog moves. Opening it asks anyway, so nothing is missed by not asking.
+#[test]
+fn a_sidebar_the_reader_closed_asks_for_nothing() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![listed_as(
+            SessionId::new(),
+            "Listed work",
+            workspace.path(),
+            1,
+        )],
+    );
+    press_toggle(&mut application);
+
+    let made = SessionId::new();
+    assert_eq!(
+        create_elsewhere(&mut application, made),
+        ApplicationTransition::Continue,
+        "a Sidebar nobody is looking at asks for no listing"
+    );
+
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![listed_as(made, "Work made elsewhere", workspace.path(), 2)],
+        })
+        .expect("hydrate the Sidebar the reader opened");
+
+    assert!(
+        drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "Work made elsewhere"
+        ),
+        "and opening it again brings the work made while it was closed"
+    );
+}
+
+/// An idle TUI draws when something changed and not otherwise (ADR 0007). Most
+/// catalog changes the Sidebar has already taken in place by the time the
+/// catch-up it asked for answers, so most answers carry the listing already on
+/// screen — and those must cost no frame at all.
+#[test]
+fn a_catch_up_answering_with_the_listing_already_drawn_costs_no_frame() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let set_apart = SessionId::new();
+    let standing = listed_at(
+        set_apart,
+        "Work set aside",
+        workspace.path(),
+        minutes_ago(5),
+    );
+    let mut application = sidebar_showing(workspace.path(), vec![standing.clone()]);
+
+    let settled_at = now();
+    let request = expect_sidebar_listing(settle_elsewhere(
+        &mut application,
+        set_apart,
+        Some(SessionTimestamp(settled_at)),
+    ));
+    let caught_up = vec![set_aside(standing, settled_at)];
+    let before = rendered_application_rows_at(&application, WIDE, 20);
+
+    assert!(
+        !application.listing_moves_the_frame(&request, &caught_up),
+        "a catch-up answering with the listing already drawn moves nothing on screen"
+    );
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: caught_up,
+        })
+        .expect("adopt the listing the Sidebar caught up with");
+
+    assert_eq!(
+        rendered_application_rows_at(&application, WIDE, 20),
+        before,
+        "and the frame it leaves is the frame that was already there"
+    );
+}
+
+/// Two catch-ups can be in flight at once — a burst of work elsewhere asks
+/// twice — and the reply to the one the Sidebar has moved past is a straggler.
+#[test]
+fn a_stale_listing_reply_lands_nowhere_and_costs_no_frame() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let standing = listed_as(SessionId::new(), "Listed work", workspace.path(), 1);
+    let mut application = sidebar_showing(workspace.path(), vec![standing.clone()]);
+
+    let superseded = expect_sidebar_listing(create_elsewhere(&mut application, SessionId::new()));
+    let current = expect_sidebar_listing(create_elsewhere(&mut application, SessionId::new()));
+    let stale = vec![listed_as(
+        SessionId::new(),
+        "Stale answer",
+        workspace.path(),
+        9,
+    )];
+
+    assert!(
+        !application.listing_moves_the_frame(&superseded, &stale),
+        "a reply to a listing the Sidebar has moved past lands nowhere"
+    );
+    assert!(
+        !application.awaits_listing(&superseded),
+        "and a refusal of that listing is worth no more of a frame than its reply"
+    );
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request: superseded,
+            sessions: stale,
+        })
+        .expect("take the straggler");
+    assert!(
+        !drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "Stale answer"
+        ),
+        "the stale reply is not drawn"
+    );
+
+    let fresh = vec![
+        listed_as(SessionId::new(), "Fresh answer", workspace.path(), 2),
+        standing,
+    ];
+    assert!(
+        application.listing_moves_the_frame(&current, &fresh),
+        "while the reply the Sidebar is waiting for carries work it is not drawing"
+    );
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request: current,
+            sessions: fresh,
+        })
+        .expect("adopt the listing the Sidebar awaits");
+    assert!(
+        drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "Fresh answer"
+        ),
+        "and the reply it is waiting for lands"
+    );
+}
+
+/// A Session another client made, arriving on the session-catalog stream,
+/// reporting whatever the Sidebar asks for in answer.
+fn create_elsewhere(application: &mut Application, session_id: SessionId) -> ApplicationTransition {
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SessionCreated(
+            SessionCreated { session_id },
+        )))
+        .expect("take the Session another client made")
 }

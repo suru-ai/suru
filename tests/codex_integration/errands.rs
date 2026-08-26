@@ -9,20 +9,19 @@
 //! arrives, or fails to, at the far end.
 
 use crate::{
-    server_support::receive_initial_state,
+    server_support::{assert_no_title_reaches, next_derived_title, receive_initial_state},
     support::{ScriptedCodex, assert_process_exited},
 };
 use std::sync::Arc;
 use suru::{
-    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
+    managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        CreateSessionRequest, InitialPrompt, PromptId, SessionDeleted, SessionId,
-        SessionTitleChanged, Workspace,
+        CreateSessionRequest, InitialPrompt, PromptId, SessionId, SessionTitleChanged, Workspace,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig, ServerTimings},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::Duration;
 
 /// The first Prompt every Session here is started with, and so the Title each
 /// one carries until an Errand replaces it.
@@ -182,23 +181,6 @@ async fn listed_title(client: &ManagedClient, session_id: SessionId) -> (String,
     )
 }
 
-/// Proves nothing retitled `session_id` without waiting out a deadline: the
-/// Session is deleted, and the deletion is the very next thing the client hears
-/// about the catalog. A Title change would have arrived in front of it.
-async fn assert_no_title_reaches(client: &mut ManagedClient, session_id: SessionId) {
-    client
-        .delete_session(session_id)
-        .await
-        .expect("delete the Session");
-    assert_eq!(
-        timeout(Duration::from_secs(1), client.next())
-            .await
-            .expect("the deletion reaches the client"),
-        Some(ManagedEvent::SessionDeleted(SessionDeleted { session_id })),
-        "no Title reached the client ahead of the deletion"
-    );
-}
-
 /// The whole of Codex's Errand: one non-interactive run that persists nothing,
 /// sandboxes itself as tightly as the harness allows, is handed the schema
 /// natively, and answers in the Session's own Workspace — with the Title and
@@ -265,14 +247,12 @@ async fn codex_derives_a_title_through_its_own_one_shot_mode() {
     );
 
     assert_eq!(
-        timeout(Duration::from_secs(2), client.next())
-            .await
-            .expect("the derived Title reaches the client"),
-        Some(ManagedEvent::SessionTitleChanged(SessionTitleChanged {
+        next_derived_title(&mut client).await,
+        SessionTitleChanged {
             session_id,
             title: "Fix reasoning group flicker".to_owned(),
             emoji: Some("\u{1F41B}".to_owned()),
-        }))
+        }
     );
     assert_eq!(
         listed_title(&client, session_id).await,
@@ -346,7 +326,12 @@ async fn a_failing_codex_errand_leaves_the_prompt_derived_title_standing() {
         (FIRST_PROMPT.to_owned(), None),
         "the Title the first Prompt gave the Session stands"
     );
-    assert_no_title_reaches(&mut client, session_id).await;
+    assert_no_title_reaches(
+        &mut client,
+        session_id,
+        "a failed Errand leaves the Prompt-derived Title standing and says nothing",
+    )
+    .await;
 
     server.shutdown().await.expect("shut down server");
 }
@@ -376,7 +361,12 @@ async fn a_codex_errand_that_never_answers_leaves_the_prompt_derived_title_stand
         FIRST_PROMPT,
         "the Title the first Prompt gave the Session stands"
     );
-    assert_no_title_reaches(&mut client, session_id).await;
+    assert_no_title_reaches(
+        &mut client,
+        session_id,
+        "an abandoned Errand leaves the Prompt-derived Title standing and says nothing",
+    )
+    .await;
 
     server.shutdown().await.expect("shut down server");
 }

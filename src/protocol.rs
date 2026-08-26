@@ -1778,6 +1778,17 @@ pub struct ServerShutdown {
     pub reason: ShutdownReason,
 }
 
+/// A Session joined the catalog, carried to every client listing Sessions
+/// whether or not it made the Session itself. It names the Session and no
+/// more: what a row draws — a Title, a Workspace, when the work was made —
+/// comes with the listing a client asks for in answer, because the catalog
+/// carries the changes to a body of work rather than the work itself.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCreated {
+    pub session_id: SessionId,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionDeleted {

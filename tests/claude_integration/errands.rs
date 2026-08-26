@@ -3,13 +3,16 @@
 
 use std::sync::Arc;
 
-use crate::support::{
-    CLAUDE_MODELS, ScriptedClaude, connect, conversation_arms, crashing_errand_preamble,
-    derived_title_envelope, errand_preamble, failed_errand_envelope, models_without,
-    silent_errand_preamble,
+use crate::{
+    server_support::{assert_no_title_reaches, next_derived_title},
+    support::{
+        CLAUDE_MODELS, ScriptedClaude, connect, conversation_arms, crashing_errand_preamble,
+        derived_title_envelope, errand_preamble, failed_errand_envelope, models_without,
+        silent_errand_preamble,
+    },
 };
 use suru::{
-    managed_client::{ManagedClient, ManagedEvent},
+    managed_client::ManagedClient,
     protocol::{
         AgentSelection, CreateSessionRequest, InitialPrompt, ModelId, ModelOptionChoiceId,
         ModelOptionId, ModelOptionSelection, ModelOptionValue, PromptId, ProviderId, SessionId,
@@ -103,39 +106,6 @@ async fn errand_reaches_the_cli(claude: &ScriptedClaude) {
     .expect("the Errand reaches the CLI");
 }
 
-/// Proves no Title reached the client without waiting out a deadline: the Session is deleted, and
-/// the deletion is the very next thing the client hears. A Title change would have arrived in front
-/// of it.
-async fn assert_no_title_reaches(client: &mut ManagedClient, session_id: SessionId, what: &str) {
-    client
-        .delete_session(session_id)
-        .await
-        .expect("delete the Session");
-    assert!(
-        matches!(
-            timeout(Duration::from_secs(10), client.next())
-                .await
-                .expect("the deletion reaches the client"),
-            Some(ManagedEvent::SessionDeleted(deleted)) if deleted.session_id == session_id
-        ),
-        "{what}"
-    );
-}
-
-/// The derived Title once it reaches the client, past whatever else the client hears first.
-async fn derived_title(client: &mut ManagedClient) -> SessionTitleChanged {
-    timeout(Duration::from_secs(10), async {
-        loop {
-            match client.next().await.expect("the client stays connected") {
-                ManagedEvent::SessionTitleChanged(changed) => return changed,
-                _ => continue,
-            }
-        }
-    })
-    .await
-    .expect("a derived Title reaches the client")
-}
-
 /// A Session opened on Claude is retitled by an Errand Claude ran through its own print mode: the
 /// Prompt goes in on stdin, the schema goes in as a flag the CLI enforces itself, and the answer
 /// comes back as one object — with no Tools, no permission bypass, and nothing left to resume.
@@ -159,7 +129,7 @@ async fn a_session_on_claude_is_titled_by_a_print_mode_errand() {
     .await;
 
     assert_eq!(
-        derived_title(&mut client).await,
+        next_derived_title(&mut client).await,
         SessionTitleChanged {
             session_id,
             title: "Fix reasoning group flicker".to_owned(),
@@ -351,7 +321,10 @@ async fn an_errand_falls_back_to_claudes_default_model_once_the_cheap_row_is_wit
     )
     .await;
 
-    assert_eq!(derived_title(&mut client).await.title, "Fix the flicker");
+    assert_eq!(
+        next_derived_title(&mut client).await.title,
+        "Fix the flicker"
+    );
     assert_eq!(
         claude.launch_carrying("--json-schema").value("--model"),
         "default",

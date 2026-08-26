@@ -17,10 +17,10 @@ use crate::{
     protocol::{
         AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, LifecycleState,
         ModelCatalog, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
-        SessionDeleted, SessionError, SessionId, SessionListItem, SessionSettlementChanged,
-        SessionSnapshot, SessionSummary, SessionTitleChanged, SettingMutation, SettingsSnapshot,
-        SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest, Turn, TurnId,
-        UpdateAgentSelectionRequest,
+        SessionCreated, SessionDeleted, SessionError, SessionId, SessionListItem,
+        SessionSettlementChanged, SessionSnapshot, SessionSummary, SessionTitleChanged,
+        SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
+        SkillCatalogRequest, Turn, TurnId, UpdateAgentSelectionRequest,
     },
 };
 
@@ -152,6 +152,10 @@ pub enum ManagedEvent {
     SkillCatalogUpdated(SkillCatalog),
     Recovering(RecoveryStatus),
     ServerShutdown(ServerShutdown),
+    /// A Session joined the catalog. It carries an id and no more, so a
+    /// surface listing Sessions answers it by asking for the listing the new
+    /// row is drawn from.
+    SessionCreated(SessionCreated),
     SessionDeleted(SessionDeleted),
     /// A Session's derived Title and Emoji landed. It arrives for every Session
     /// the server holds, open or not, because the picker lists Sessions this
@@ -163,6 +167,33 @@ pub enum ManagedEvent {
     SessionSettlementChanged(SessionSettlementChanged),
     SessionCatalogReconciled(SessionCatalogSnapshot),
     Fatal(String),
+}
+
+impl ManagedEvent {
+    /// Whether this event says anything a client draws the moment it lands. A
+    /// Session another client made says an id and no more — the row it becomes
+    /// comes with the listing a surface asks for in answer — so a client that
+    /// draws on demand pays for the answer rather than for the announcement
+    /// (ADR 0007). Everything else moves something on screen as it arrives.
+    pub const fn is_drawn_on_arrival(&self) -> bool {
+        !matches!(self, Self::SessionCreated(_))
+    }
+
+    /// Whether this event reports the body of work moving: a Session made,
+    /// retitled, deleted, set aside, brought back, or a whole catalog
+    /// reconciled after a reconnection. A surface listing Sessions is only as
+    /// truthful as the last such change it was told about, so it asks the
+    /// server again for everything the change itself does not say.
+    pub const fn moves_the_session_catalog(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionCreated(_)
+                | Self::SessionDeleted(_)
+                | Self::SessionTitleChanged(_)
+                | Self::SessionSettlementChanged(_)
+                | Self::SessionCatalogReconciled(_)
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

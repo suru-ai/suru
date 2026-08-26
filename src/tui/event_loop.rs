@@ -543,8 +543,10 @@ impl RunLoop {
     }
 
     fn receive_managed_event(&mut self, event: Option<ManagedEvent>) -> Result<ControlFlow<Exit>> {
-        self.needs_redraw = true;
         let event = event.ok_or_else(|| anyhow!("managed client stopped unexpectedly"))?;
+        if event.is_drawn_on_arrival() {
+            self.needs_redraw = true;
+        }
         if matches!(&event, ManagedEvent::Connecting) {
             self.tasks.reset_skill_listing();
         }
@@ -585,6 +587,11 @@ impl RunLoop {
             | ApplicationTransition::MutateSetting(_) => {
                 unreachable!("managed events issue no other Session command");
             }
+        }
+        // The transition carries at most one Session command, and the Sidebar
+        // can ask to catch up on an event that already produced another one.
+        if let Some(request) = self.application.take_listing_request() {
+            self.list_sessions(request);
         }
         if self.application.session_id().is_none() {
             self.tasks.detach();
@@ -829,9 +836,21 @@ impl RunLoop {
         &mut self,
         result: Option<SessionPickerResult>,
     ) -> Result<ControlFlow<Exit>> {
-        self.needs_redraw = true;
         let result =
             result.ok_or_else(|| anyhow!("Session picker task channel stopped unexpectedly"))?;
+        // A Sidebar catching up with a change it had already taken in place is
+        // answered with the listing it is already drawing, and a straggler
+        // lands nowhere at all. Neither is worth a frame to an idle TUI
+        // (ADR 0007); everything else the picker tasks report is.
+        self.needs_redraw |= match &result {
+            SessionPickerResult::Listed { request, sessions } => {
+                self.application.listing_moves_the_frame(request, sessions)
+            }
+            SessionPickerResult::ListingFailed { request, .. } => {
+                self.application.awaits_listing(request)
+            }
+            SessionPickerResult::Attached { .. } | SessionPickerResult::AttachmentFailed(_) => true,
+        };
         match result {
             SessionPickerResult::Listed { request, sessions } => {
                 self.tasks.finish_listing_sessions(&request);

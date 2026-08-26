@@ -4,7 +4,8 @@ use suru::{
     managed_client::{ManagedClient, ManagedEvent},
     protocol::{
         Health, RuntimeDescriptor, SESSION_CATALOG_UPDATED_EVENT, ServerShutdown,
-        SessionCatalogChange, SessionCatalogUpdate, ShutdownReason, SkillCatalog, TitleErrand,
+        SessionCatalogChange, SessionCatalogUpdate, SessionId, SessionTitleChanged, ShutdownReason,
+        SkillCatalog, TitleErrand,
     },
 };
 use tokio::time::{Duration, timeout};
@@ -63,6 +64,45 @@ pub async fn next_skill_catalog(client: &mut ManagedClient) -> SkillCatalog {
     })
     .await
     .expect("Skill Catalog update reaches attached client")
+}
+
+/// The next derived Title to reach this client, past whatever else the catalog announced first —
+/// the Session being made, most of all.
+pub async fn next_derived_title(client: &mut ManagedClient) -> SessionTitleChanged {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(ManagedEvent::SessionTitleChanged(changed)) = client.next().await {
+                return changed;
+            }
+        }
+    })
+    .await
+    .expect("a derived Title reaches the client")
+}
+
+/// Proves nothing retitled `session_id` without waiting out a deadline: the Session is deleted, and
+/// the deletion is the last the client hears of it, so a Title change would have arrived in front
+/// of it — among whatever else the catalog announced about a Session being made and taken away.
+pub async fn assert_no_title_reaches(
+    client: &mut ManagedClient,
+    session_id: SessionId,
+    what: &str,
+) {
+    client
+        .delete_session(session_id)
+        .await
+        .expect("delete the Session");
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match client.next().await.expect("the client stays connected") {
+                ManagedEvent::SessionTitleChanged(_) => panic!("{what}"),
+                ManagedEvent::SessionDeleted(deleted) if deleted.session_id == session_id => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the deletion reaches the client");
 }
 
 pub async fn request_server_shutdown(

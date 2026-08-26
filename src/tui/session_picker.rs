@@ -116,6 +116,22 @@ impl SessionPicker {
         self.listing.settle(session_id, settled_at);
     }
 
+    /// Whether a listing the server answered with would move anything the
+    /// picker draws.
+    pub(super) fn would_move(
+        &self,
+        request: &SessionListRequest,
+        sessions: &[SessionListItem],
+    ) -> bool {
+        self.listing.would_move(request, sessions)
+    }
+
+    /// Whether a reply the server sent answers the listing this surface is
+    /// still waiting for.
+    pub(super) fn awaits_listing(&self, request: &SessionListRequest) -> bool {
+        self.listing.awaits(request)
+    }
+
     pub(super) fn fail_listing(&mut self, request: &SessionListRequest, error: String) {
         if !self.listing.fail(request, error) {
             return;

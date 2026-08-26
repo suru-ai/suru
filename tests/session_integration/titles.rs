@@ -2,18 +2,21 @@
 
 use crate::{
     provider_support::ControlledProvider,
-    server_support::{catalog_changes_through_title, config_root_pinning, open_catalog_stream},
+    server_support::{
+        assert_no_title_reaches, catalog_changes_through_title, config_root_pinning,
+        next_derived_title, open_catalog_stream,
+    },
     support::{hosted_model, hosted_selection},
 };
 use serde_json::json;
 use suru::{
-    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
+    managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
         AgentId, AgentIdentity, AgentSelection, CreateSessionRequest, InitialPrompt,
         ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
         ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
         ModelOptionSelection, ModelOptionValue, PromptId, ProviderId, SessionCatalogChange,
-        SessionDeleted, SessionId, SessionListItem, SessionTitleChanged, TitleErrand, Workspace,
+        SessionId, SessionListItem, SessionTitleChanged, TitleErrand, Workspace,
     },
     provider::ProviderEvent,
     server::{self, ServerConfig, ServerTimings},
@@ -122,23 +125,6 @@ async fn listed_title(client: &ManagedClient, session_id: SessionId) -> (String,
     )
 }
 
-/// Proves nothing retitled `session_id` without waiting out a deadline: the
-/// Session is deleted, and the deletion is the very next thing the client hears
-/// about the catalog. A Title change would have arrived in front of it.
-async fn assert_no_title_reaches(client: &mut ManagedClient, session_id: SessionId) {
-    client
-        .delete_session(session_id)
-        .await
-        .expect("delete the Session");
-    assert_eq!(
-        timeout(Duration::from_secs(1), client.next())
-            .await
-            .expect("the deletion reaches the client"),
-        Some(ManagedEvent::SessionDeleted(SessionDeleted { session_id })),
-        "no Title reached the client ahead of the deletion"
-    );
-}
-
 async fn connected_client(state_dir: &std::path::Path, channel: &str) -> ManagedClient {
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir, channel).expect("configure client"),
@@ -204,14 +190,12 @@ async fn an_answered_errand_becomes_the_sessions_title_and_emoji_without_touchin
     }));
 
     assert_eq!(
-        timeout(Duration::from_secs(1), client.next())
-            .await
-            .expect("the derived Title reaches the client"),
-        Some(ManagedEvent::SessionTitleChanged(SessionTitleChanged {
+        next_derived_title(&mut client).await,
+        SessionTitleChanged {
             session_id,
             title: "Fix reasoning group flicker".to_owned(),
             emoji: Some("\u{1F41B}".to_owned()),
-        }))
+        }
     );
     assert_eq!(
         listed_title(&client, session_id).await,
@@ -412,7 +396,12 @@ async fn a_failed_errand_leaves_the_prompt_derived_title_standing() {
         ("Explain the seam".to_owned(), None),
         "the Prompt-derived Title stands and no Emoji is invented"
     );
-    assert_no_title_reaches(&mut client, session_id).await;
+    assert_no_title_reaches(
+        &mut client,
+        session_id,
+        "no Title reached the client ahead of the deletion",
+    )
+    .await;
 
     server.shutdown().await.expect("shut down server");
 }
@@ -447,7 +436,12 @@ async fn an_errand_that_never_answers_leaves_the_prompt_derived_title_standing()
         listed_title(&client, session_id).await,
         ("Explain the seam".to_owned(), None)
     );
-    assert_no_title_reaches(&mut client, session_id).await;
+    assert_no_title_reaches(
+        &mut client,
+        session_id,
+        "no Title reached the client ahead of the deletion",
+    )
+    .await;
 
     server.shutdown().await.expect("shut down server");
 }
@@ -481,7 +475,12 @@ async fn an_errand_answering_outside_its_schema_yields_no_partial_title() {
         ("Explain the seam".to_owned(), None),
         "a reply Suru cannot read is discarded whole rather than half-applied"
     );
-    assert_no_title_reaches(&mut client, session_id).await;
+    assert_no_title_reaches(
+        &mut client,
+        session_id,
+        "no Title reached the client ahead of the deletion",
+    )
+    .await;
 
     server.shutdown().await.expect("shut down server");
 }
@@ -639,14 +638,12 @@ async fn interrupting_the_first_turn_still_yields_a_derived_title() {
         .succeed(json!({ "title": "Explain the Provider seam", "emoji": "\u{1F9F5}" }));
 
     assert_eq!(
-        timeout(Duration::from_secs(1), client.next())
-            .await
-            .expect("the derived Title reaches the client"),
-        Some(ManagedEvent::SessionTitleChanged(SessionTitleChanged {
+        next_derived_title(&mut client).await,
+        SessionTitleChanged {
             session_id,
             title: "Explain the Provider seam".to_owned(),
             emoji: Some("\u{1F9F5}".to_owned()),
-        }))
+        }
     );
 
     server.shutdown().await.expect("shut down server");
@@ -764,14 +761,12 @@ async fn a_derived_title_outlives_a_restart_and_is_never_derived_again() {
         }
     }
     assert_eq!(
-        timeout(Duration::from_secs(1), client.next())
-            .await
-            .expect("the derived Title reaches the client"),
-        Some(ManagedEvent::SessionTitleChanged(SessionTitleChanged {
+        next_derived_title(&mut client).await,
+        SessionTitleChanged {
             session_id: derived.session.id,
             title: "Explain the Provider seam".to_owned(),
             emoji: Some("\u{1F9F5}".to_owned()),
-        }))
+        }
     );
     drop(client);
     server.shutdown().await.expect("shut down server");
@@ -910,14 +905,12 @@ async fn a_pinned_selection_titles_a_session_whatever_that_session_converses_at(
     errand.succeed(json!({ "title": "Explain the Provider seam", "emoji": "\u{1F9F5}" }));
 
     assert_eq!(
-        timeout(Duration::from_secs(1), client.next())
-            .await
-            .expect("the derived Title reaches the client"),
-        Some(ManagedEvent::SessionTitleChanged(SessionTitleChanged {
+        next_derived_title(&mut client).await,
+        SessionTitleChanged {
             session_id: created.session.id,
             title: "Explain the Provider seam".to_owned(),
             emoji: Some("\u{1F9F5}".to_owned()),
-        }))
+        }
     );
 
     server.shutdown().await.expect("shut down server");

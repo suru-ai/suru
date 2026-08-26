@@ -475,6 +475,15 @@ impl TuiState {
     }
 
     pub fn apply(&mut self, event: ManagedEvent) {
+        // Every change the session-catalog stream reports leaves the Sidebar
+        // asking the server for its listing again. What the change says is
+        // taken in place below, so the frame is right before the answer lands;
+        // the ask is what carries everything the change does not say — a new
+        // Session's Title and Workspace, and the last activity the server
+        // moves as a Session is unsettled, most of all.
+        if event.moves_the_session_catalog() {
+            self.sidebar.catch_up();
+        }
         match event {
             ManagedEvent::Connecting => {
                 self.skill_catalog = None;
@@ -545,6 +554,10 @@ impl TuiState {
                     self.fatal_error = None;
                 }
             }
+            // A creation says an id and nothing a row is drawn from, so there
+            // is nothing to take in place: the catch-up above is the whole of
+            // the Sidebar's answer to it.
+            ManagedEvent::SessionCreated(_) => {}
             ManagedEvent::SessionDeleted(deleted) => {
                 self.session_picker.remove(deleted.session_id);
                 self.sidebar.remove(deleted.session_id);
@@ -2791,6 +2804,45 @@ impl Application {
     /// caller that draws on demand knows to redraw.
     pub fn note_interaction(&mut self, event: &InputEvent) -> bool {
         is_reader_interaction(event) && self.state.landing_notice.dismiss()
+    }
+
+    /// The listing a surface has asked for and nobody has dispatched yet. One
+    /// managed event can both end the open Session and leave the Sidebar
+    /// asking to catch up — another client deleting that Session does exactly
+    /// that — and one transition cannot say both, so the caller drains what
+    /// the transition did not carry.
+    pub fn take_listing_request(&mut self) -> Option<SessionListRequest> {
+        self.state.sidebar.take_listing_request()
+    }
+
+    /// Whether a listing the server answered with would move anything on
+    /// screen. A caller that draws on demand asks this before handing the
+    /// listing over: the Sidebar catches up with every session-catalog change,
+    /// and most of them it has already taken in place, so most answers carry
+    /// the listing already drawn — which an idle TUI must not pay a frame for
+    /// (ADR 0007). Such an answer names the same Sessions the surface already
+    /// holds, so nothing adopting it does besides replacing them — moving a
+    /// selection, forgetting what a departed Session stood under — has
+    /// anything to move either.
+    pub fn listing_moves_the_frame(
+        &self,
+        request: &SessionListRequest,
+        sessions: &[SessionListItem],
+    ) -> bool {
+        match request.surface() {
+            SessionListSurface::Picker => self.state.session_picker.would_move(request, sessions),
+            SessionListSurface::Sidebar => self.state.sidebar.would_move(request, sessions),
+        }
+    }
+
+    /// Whether a reply the server sent answers the listing a surface is still
+    /// waiting for. A straggler from a listing the reader has moved past lands
+    /// nowhere, so it moves nothing on screen — a refusal included.
+    pub fn awaits_listing(&self, request: &SessionListRequest) -> bool {
+        match request.surface() {
+            SessionListSurface::Picker => self.state.session_picker.awaits_listing(request),
+            SessionListSurface::Sidebar => self.state.sidebar.awaits_listing(request),
+        }
     }
 
     /// Translates a terminal event through the active input mode. `None` means

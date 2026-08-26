@@ -35,8 +35,8 @@ use suru::{
         PromptDelivery, PromptId, PromptOrder, PromptStatus, RuntimeDescriptor,
         SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
         ServerIdentity, Session, SessionCatalogRevision, SessionCatalogSnapshot, SessionChange,
-        SessionDeleted, SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionUpdate,
-        TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        SessionCreated, SessionDeleted, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
+        SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
     server::ServerConfig,
 };
@@ -251,6 +251,14 @@ async fn managed_clients_observe_durable_session_deletion() {
         subscription.next().await,
         Some(Ok(SessionEvent::Snapshot(_)))
     ));
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), observing_client.next())
+            .await
+            .expect("creation reaches connected client"),
+        Some(ManagedEvent::SessionCreated(SessionCreated { session_id })),
+        "a Session one client made is announced to every other client listing Sessions"
+    );
 
     deleting_client
         .delete_session(session_id)

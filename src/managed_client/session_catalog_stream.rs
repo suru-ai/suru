@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::protocol::{
     RuntimeDescriptor, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
     SKILL_CATALOG_UPDATED_EVENT, SessionCatalogChange, SessionCatalogRevision,
-    SessionCatalogSnapshot, SessionCatalogUpdate, SessionDeleted, SessionId,
+    SessionCatalogSnapshot, SessionCatalogUpdate, SessionCreated, SessionDeleted, SessionId,
     SessionSettlementChanged, SessionTitleChanged, SkillCatalog,
 };
 
@@ -77,9 +77,7 @@ pub(super) async fn consume(
             CatalogEvent::Update(update) => {
                 let announced = apply_update(known_session_ids, update.change)?;
                 revision = Some(update.revision);
-                if let Some(announced) = announced
-                    && events.send(announced).await.is_err()
-                {
+                if events.send(announced).await.is_err() {
                     return Ok(StreamOutcome::ReceiverClosed);
                 }
             }
@@ -112,12 +110,13 @@ fn reconcile_snapshot(
 }
 
 /// Folds one catalog change into what this client knows the catalog holds, and
-/// answers with the event a reader should hear about — `None` for a change that
-/// only moves the client's own bookkeeping.
+/// answers with the event a reader should hear about. Every change is worth
+/// hearing: a surface listing Sessions is only as truthful as the last change
+/// it was told about.
 fn apply_update(
     known_session_ids: &mut Option<HashSet<SessionId>>,
     change: SessionCatalogChange,
-) -> Result<Option<ManagedEvent>> {
+) -> Result<ManagedEvent> {
     let known = known_session_ids
         .as_mut()
         .expect("a catalog update is decoded only after its snapshot");
@@ -126,15 +125,13 @@ fn apply_update(
             if !known.insert(session_id) {
                 bail!("Session catalog created an existing Session");
             }
-            Ok(None)
+            Ok(ManagedEvent::SessionCreated(SessionCreated { session_id }))
         }
         SessionCatalogChange::Deleted { session_id } => {
             if !known.remove(&session_id) {
                 bail!("Session catalog deleted an unknown Session");
             }
-            Ok(Some(ManagedEvent::SessionDeleted(SessionDeleted {
-                session_id,
-            })))
+            Ok(ManagedEvent::SessionDeleted(SessionDeleted { session_id }))
         }
         SessionCatalogChange::TitleChanged {
             session_id,
@@ -144,13 +141,11 @@ fn apply_update(
             if !known.contains(&session_id) {
                 bail!("Session catalog retitled an unknown Session");
             }
-            Ok(Some(ManagedEvent::SessionTitleChanged(
-                SessionTitleChanged {
-                    session_id,
-                    title,
-                    emoji,
-                },
-            )))
+            Ok(ManagedEvent::SessionTitleChanged(SessionTitleChanged {
+                session_id,
+                title,
+                emoji,
+            }))
         }
         SessionCatalogChange::SettlementChanged {
             session_id,
@@ -159,12 +154,12 @@ fn apply_update(
             if !known.contains(&session_id) {
                 bail!("Session catalog settled an unknown Session");
             }
-            Ok(Some(ManagedEvent::SessionSettlementChanged(
+            Ok(ManagedEvent::SessionSettlementChanged(
                 SessionSettlementChanged {
                     session_id,
                     settled_at,
                 },
-            )))
+            ))
         }
     }
 }
@@ -243,7 +238,10 @@ mod tests {
                 },
             )
             .expect("track the created Session"),
-            None
+            ManagedEvent::SessionCreated(SessionCreated {
+                session_id: created_after_connect,
+            }),
+            "a Session another client made is announced to every client listing Sessions"
         );
 
         assert_eq!(

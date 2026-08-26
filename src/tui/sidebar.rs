@@ -164,6 +164,12 @@ pub(super) struct Sidebar {
     /// where the work is rather than where the row was.
     selected: Option<SidebarSelection>,
     attaching: Option<SessionId>,
+    /// Whether the listing in flight is one the reader asked for by opening
+    /// the Sidebar, rather than one it asked for on its own to catch up with a
+    /// catalog another client moved. Their own ask is them looking again, so
+    /// what they had left open is put away when it lands; a catch-up must
+    /// leave them exactly where they are.
+    asked_afresh: bool,
     /// A listing the Sidebar has asked for but has not yet handed to whoever
     /// dispatches it. Revealing the Sidebar is not always something a reader
     /// did — the initial-visibility Setting reveals it too — so the request
@@ -624,6 +630,7 @@ impl Sidebar {
             query: String::new(),
             selected: None,
             attaching: None,
+            asked_afresh: false,
             awaiting_dispatch: None,
             // Until a frame says otherwise, which it does before anything the
             // reader types can reach a surface.
@@ -1039,7 +1046,46 @@ impl Sidebar {
     /// moving anywhere, and must leave their shelf where they left it.
     fn ask_for_sessions(&mut self) {
         self.settled_on_show = SETTLED_SHELF_OPENING;
+        self.asked_afresh = true;
         self.awaiting_dispatch = Some(self.listing.refresh());
+    }
+
+    /// Asks for the Sessions again because the session-catalog stream reported
+    /// the body of work moving under this client — a Session made, retitled,
+    /// deleted, set aside, brought back, or a whole catalog reconciled after a
+    /// reconnection. What the stream says is taken in place first, so the
+    /// frame is right before the answer lands; the ask is what carries
+    /// everything the stream does not say, a new Session's Title and Workspace
+    /// most of all.
+    ///
+    /// A Sidebar the reader has closed asks for nothing, because revealing it
+    /// asks anyway — while one the frame merely has no columns for goes on
+    /// asking, so that the columns coming back bring a Sidebar that is true. A
+    /// catch-up is not the reader looking again either, so the rows stand
+    /// until the answer arrives, the settled shelf stays as deep as they
+    /// walked it, and the row they are on stays under them.
+    pub(super) fn catch_up(&mut self) {
+        if !self.revealed {
+            return;
+        }
+        self.asked_afresh = false;
+        self.awaiting_dispatch = Some(self.listing.catch_up());
+    }
+
+    /// Whether a listing the server answered with would move anything the
+    /// Sidebar draws, per [`SessionListing::would_move`].
+    pub(super) fn would_move(
+        &self,
+        request: &SessionListRequest,
+        sessions: &[SessionListItem],
+    ) -> bool {
+        self.listing.would_move(request, sessions)
+    }
+
+    /// Whether a reply the server sent answers the listing this surface is
+    /// still waiting for.
+    pub(super) fn awaits_listing(&self, request: &SessionListRequest) -> bool {
+        self.listing.awaits(request)
     }
 
     /// Whether the reader wants the Sidebar on screen, which is not the same
@@ -1087,11 +1133,19 @@ impl Sidebar {
         if !self.listing.load(request, sessions) {
             return;
         }
-        self.attaching = None;
-        // A menu stands on one row of the listing it was opened over. A fresh
-        // listing is the reader looking again, so it is put away rather than
-        // left pointing at whatever now stands where its row did.
-        self.menu = None;
+        if std::mem::take(&mut self.asked_afresh) {
+            self.attaching = None;
+            // A menu stands on one row of the listing it was opened over. A
+            // listing the reader asked for is them looking again, so it is put
+            // away rather than left pointing at whatever now stands where its
+            // row did.
+            self.menu = None;
+        } else {
+            // A catch-up leaves the reader in whatever they were in the middle
+            // of, so long as the Session behind it survived the listing that
+            // arrived.
+            self.forget_absent();
+        }
         // A listing the reader was already reading keeps them where they were;
         // a fresh one starts them on the Session they have open, and failing
         // that on the row nearest them.
