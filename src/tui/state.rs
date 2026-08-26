@@ -42,6 +42,7 @@ use super::{
     render::render_with_slots,
     session_picker::SessionPicker,
     settings_panel::{AvailabilityRead, SettingsPanel},
+    sidebar::Sidebar,
     slots::RenderSlots,
     transcript::{
         FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups,
@@ -84,8 +85,19 @@ impl SessionListScope {
     }
 }
 
+/// Which surface a Session listing answers. Two of them list Sessions at once —
+/// the picker over the main view and the Sidebar beside it — so every request
+/// names its own, and neither surface can take the other's reply for one of
+/// its own.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SessionListSurface {
+    Picker,
+    Sidebar,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionListRequest {
+    surface: SessionListSurface,
     id: u64,
     pub(super) scope: SessionListScope,
 }
@@ -102,12 +114,16 @@ impl ModelListRequest {
 }
 
 impl SessionListRequest {
-    pub(super) fn new(id: u64, scope: SessionListScope) -> Self {
-        Self { id, scope }
+    pub(super) fn new(surface: SessionListSurface, id: u64, scope: SessionListScope) -> Self {
+        Self { surface, id, scope }
     }
 
     pub fn scope(&self) -> &SessionListScope {
         &self.scope
+    }
+
+    pub fn surface(&self) -> SessionListSurface {
+        self.surface
     }
 }
 
@@ -261,6 +277,7 @@ pub struct TuiState {
     pub(super) model_options: ModelOptions,
     pub(super) model_picker: ModelPicker,
     pub(super) session_picker: SessionPicker,
+    pub(super) sidebar: Sidebar,
     pub(super) settings_panel: SettingsPanel,
 }
 
@@ -354,7 +371,8 @@ impl TuiState {
             pending_model_options: false,
             model_options: ModelOptions::default(),
             model_picker: ModelPicker::default(),
-            session_picker: SessionPicker::new(workspace),
+            session_picker: SessionPicker::new(workspace.clone()),
+            sidebar: Sidebar::new(workspace),
             settings_panel: SettingsPanel::default(),
         }
     }
@@ -518,18 +536,26 @@ impl TuiState {
             }
             ManagedEvent::SessionDeleted(deleted) => {
                 self.session_picker.remove(deleted.session_id);
+                self.sidebar.remove(deleted.session_id);
                 self.remove_deleted_session(deleted.session_id);
             }
             ManagedEvent::SessionTitleChanged(retitled) => {
-                self.session_picker
+                self.session_picker.retitle(
+                    retitled.session_id,
+                    retitled.title.clone(),
+                    retitled.emoji.clone(),
+                );
+                self.sidebar
                     .retitle(retitled.session_id, retitled.title, retitled.emoji);
             }
             ManagedEvent::SessionSettlementChanged(settled) => {
                 self.session_picker
                     .settle(settled.session_id, settled.settled_at);
+                self.sidebar.settle(settled.session_id, settled.settled_at);
             }
             ManagedEvent::SessionCatalogReconciled(snapshot) => {
                 self.session_picker.retain_catalog(&snapshot.session_ids);
+                self.sidebar.retain_catalog(&snapshot.session_ids);
                 if let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id)
                     && !snapshot.session_ids.contains(&session_id)
                 {
@@ -552,6 +578,10 @@ impl TuiState {
         // and moves what the reader is looking at.
         self.settings = snapshot.settings;
         self.pinned_settings = snapshot.pinned;
+        // The Sidebar's launch visibility is the one Client Setting that acts
+        // on arrival rather than on the next view opened, because the frame it
+        // governs is already on screen.
+        self.sidebar.seed(self.settings.sidebar.launch_visibility);
         self.landing_notice.receive(&snapshot.diagnostics);
     }
 
@@ -1456,12 +1486,22 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::SessionsListed { request, sessions } => {
-                let current = self.session_id();
-                self.state.session_picker.load(&request, sessions, current);
+                match request.surface() {
+                    SessionListSurface::Picker => {
+                        let current = self.session_id();
+                        self.state.session_picker.load(&request, sessions, current);
+                    }
+                    SessionListSurface::Sidebar => self.state.sidebar.load(&request, sessions),
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::SessionListingFailed { request, error } => {
-                self.state.session_picker.fail_listing(&request, error);
+                match request.surface() {
+                    SessionListSurface::Picker => {
+                        self.state.session_picker.fail_listing(&request, error);
+                    }
+                    SessionListSurface::Sidebar => self.state.sidebar.fail_listing(&request, error),
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::ModelsListed { request, catalog } => {
@@ -1984,7 +2024,10 @@ impl Application {
                 if had_session && self.state.session.is_none() {
                     Ok(ApplicationTransition::SessionEnded)
                 } else {
-                    Ok(ApplicationTransition::Continue)
+                    Ok(self.state.sidebar.take_listing_request().map_or(
+                        ApplicationTransition::Continue,
+                        ApplicationTransition::ListSessions,
+                    ))
                 }
             }
         }
@@ -2241,6 +2284,14 @@ impl Application {
                         ApplicationTransition::Continue,
                         ApplicationTransition::SettleSession,
                     ))
+            }
+            SemanticCommandId::SidebarToggle => {
+                self.state.sidebar.toggle();
+                self.state.command_mode = CommandMode::Composer;
+                Ok(self.state.sidebar.take_listing_request().map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::ListSessions,
+                ))
             }
             SemanticCommandId::SessionDelete => {
                 Ok(self.state.session_picker.begin_deletion().map_or(

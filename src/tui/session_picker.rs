@@ -4,7 +4,9 @@ use std::path::Path;
 
 use crate::protocol::{SessionId, SessionListItem, SessionStatus, SessionTimestamp};
 
-use super::{SessionListRequest, SessionListScope, session_listing::SessionListing};
+use super::{
+    SessionListRequest, SessionListScope, SessionListSurface, session_listing::SessionListing,
+};
 
 #[derive(Clone, Debug)]
 pub(super) struct SessionPicker {
@@ -41,7 +43,7 @@ impl SessionPicker {
     pub(super) fn new(current_workspace: std::path::PathBuf) -> Self {
         Self {
             open: false,
-            listing: SessionListing::new(current_workspace),
+            listing: SessionListing::new(SessionListSurface::Picker, current_workspace),
             query: String::new(),
             selected: None,
             attaching: None,

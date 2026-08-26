@@ -31,6 +31,7 @@ use super::{
     settings_panel::{
         PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, TabBar, TabSpan,
     },
+    sidebar::{self, SidebarRow},
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
         PromptFooterSlotContext, PromptStatusSlotContext, RenderSlots, RenderedSlot,
@@ -89,30 +90,33 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
         render_terminal_too_small(frame, &theme);
         return;
     }
+    let main = render_sidebar(frame, state, &theme);
     let composer = if state.session.is_some() {
-        render_session(frame, state, slots, &theme)
+        render_session(frame, state, main, slots, &theme)
     } else {
-        render_landing(frame, state, slots, &theme)
+        render_landing(frame, state, main, slots, &theme)
     };
     if state.composer_completion.is_visible() && !state.reconnect_overlay_visible {
         render_composer_completion(frame, state, composer.area, &theme);
     }
+    // Every overlay is centered on the main view rather than the whole frame:
+    // the Sidebar sits beside them and is neither opened over nor obscured.
     if state.session_picker.is_open() && !state.reconnect_overlay_visible {
-        render_session_picker(frame, state, &theme);
+        render_session_picker(frame, state, main, &theme);
     }
     if state.model_options.is_open() && !state.reconnect_overlay_visible {
-        render_model_options(frame, state, &theme);
+        render_model_options(frame, state, main, &theme);
     }
     if state.settings_panel.is_open() && !state.reconnect_overlay_visible {
-        render_settings_panel(frame, state, &theme);
+        render_settings_panel(frame, state, main, &theme);
         if state.settings_panel.numeric_editor().is_some() {
-            render_numeric_editor(frame, state, &theme);
+            render_numeric_editor(frame, state, main, &theme);
         }
     }
     // Last of the overlays, because a settings panel row opens it: the picker
     // is what the reader is answering, so it is drawn over whatever asked.
     if state.model_picker.is_open() && !state.reconnect_overlay_visible {
-        render_model_picker(frame, state, &theme);
+        render_model_picker(frame, state, main, &theme);
     }
     if state.reconnect_overlay_visible {
         render_reconnect_overlay(frame, &theme);
@@ -127,15 +131,15 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     }
 }
 
-fn render_numeric_editor(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+fn render_numeric_editor(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
     let editor = state
         .settings_panel
         .numeric_editor()
         .expect("the numeric editor is open when it is rendered");
     let area = centered_rect(
-        frame.area(),
-        frame.area().width.saturating_sub(4).min(44),
-        frame.area().height.saturating_sub(2).min(6),
+        main,
+        main.width.saturating_sub(4).min(44),
+        main.height.saturating_sub(2).min(6),
     );
     let lines = vec![
         Line::styled(editor.label, theme.text.subdued),
@@ -146,11 +150,11 @@ fn render_numeric_editor(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
     render_overlay_box(frame, area, lines, " Number ", theme);
 }
 
-fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
     let area = centered_rect(
-        frame.area(),
-        frame.area().width.saturating_sub(4).min(72),
-        frame.area().height.saturating_sub(2).min(12),
+        main,
+        main.width.saturating_sub(4).min(72),
+        main.height.saturating_sub(2).min(12),
     );
     let content_width = area.width.saturating_sub(2);
     let content_height = area.height.saturating_sub(2);
@@ -246,11 +250,11 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
     );
 }
 
-fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
     let area = centered_rect(
-        frame.area(),
-        frame.area().width.saturating_sub(4).min(76),
-        frame.area().height.saturating_sub(2).min(14),
+        main,
+        main.width.saturating_sub(4).min(76),
+        main.height.saturating_sub(2).min(14),
     );
     let content_width = area.width.saturating_sub(2);
     let content_height = area.height.saturating_sub(2);
@@ -379,7 +383,7 @@ const SETTINGS_TAB_GAP: &str = "  ";
 /// height, the tab labels' columns, and the window of rows that fit are all
 /// decided here. A pointer is resolved against that record, so the reader can
 /// only ever click something this frame actually drew.
-fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
     let rows = state
         .settings_panel
         .rows(state.settings(), state.pinned_settings());
@@ -388,9 +392,9 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
     // Setting, and the controls.
     let wanted = u16::try_from(rows.len().saturating_add(5)).unwrap_or(u16::MAX);
     let area = centered_rect(
-        frame.area(),
-        frame.area().width.saturating_sub(4).min(76),
-        frame.area().height.saturating_sub(2).min(wanted),
+        main,
+        main.width.saturating_sub(4).min(76),
+        main.height.saturating_sub(2).min(wanted),
     );
     let content_width = usize::from(area.width.saturating_sub(2));
     let content_height = usize::from(area.height.saturating_sub(2));
@@ -557,11 +561,11 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme)
     render_overlay_box(frame, area, lines, " Settings ", theme);
 }
 
-fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
     let area = centered_rect(
-        frame.area(),
-        frame.area().width.saturating_sub(4).min(76),
-        frame.area().height.saturating_sub(2).min(14),
+        main,
+        main.width.saturating_sub(4).min(76),
+        main.height.saturating_sub(2).min(14),
     );
     let content_width = usize::from(area.width.saturating_sub(2));
     let content_height = usize::from(area.height.saturating_sub(2));
@@ -1033,19 +1037,102 @@ fn render_composer_completion(
     frame.render_widget(paragraph, area);
 }
 
+/// Draws the Sidebar down the left of the frame and reports what is left for
+/// the main view — the whole frame when the reader has the Sidebar hidden, or
+/// when the terminal cannot spare its columns.
+fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rect {
+    let frame_area = frame.area();
+    if !state.sidebar.is_revealed() {
+        return frame_area;
+    }
+    let Some(width) = sidebar::width_beside(frame_area.width) else {
+        return frame_area;
+    };
+    let [column, main] =
+        Layout::horizontal([Constraint::Length(width), Constraint::Min(1)]).areas(frame_area);
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(theme.border.subdued);
+    let content = horizontally_inset(block.inner(column), 1);
+    frame.render_widget(block, column);
+    frame.render_widget(
+        Paragraph::new(sidebar_lines(state, usize::from(content.width), theme)),
+        content,
+    );
+    main
+}
+
+/// The Sidebar's whole body: one three-line entry per Session, or the one line
+/// that stands in for a list there is nothing to draw.
+fn sidebar_lines(state: &TuiState, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let rows = state
+        .sidebar
+        .rows(state.session.as_ref().map(SessionProjection::session_id));
+    if rows.is_empty() {
+        let standing_in = if let Some(error) = state.sidebar.error() {
+            Line::styled(truncate_to_width(error, width), theme.feedback.error)
+        } else if state.sidebar.is_loading() {
+            Line::styled("Loading Sessions…", theme.text.subdued)
+        } else {
+            Line::styled("No Sessions yet", theme.text.subdued)
+        };
+        return vec![standing_in];
+    }
+    let now = current_time_millis();
+    rows.into_iter()
+        .flat_map(|row| sidebar_row_lines(row, width, now, theme))
+        .collect()
+}
+
+/// One Session as three lines: where the work lives and how long ago it moved,
+/// then what the work is, then a line held blank for the git awareness of
+/// <https://github.com/jake-tucker/suru/issues/169>.
+fn sidebar_row_lines(
+    row: SidebarRow<'_>,
+    width: usize,
+    now: u64,
+    theme: &Theme,
+) -> [Line<'static>; 3] {
+    let elapsed = relative_update_time_compact(row.updated_at, now);
+    let workspace = row
+        .workspace
+        .map(sidebar::workspace_name)
+        .unwrap_or_default();
+    let workspace = truncate_to_width(&workspace, width.saturating_sub(elapsed.width() + 1));
+    let gap = " ".repeat(width.saturating_sub(workspace.width() + elapsed.width()));
+    let title = match row.emoji {
+        Some(emoji) => format!("{emoji} {}", row.title),
+        None => row.title.to_owned(),
+    };
+    let title_style = if row.current {
+        theme.accent.primary
+    } else {
+        theme.text.primary
+    };
+    [
+        Line::from(vec![
+            Span::styled(workspace, theme.text.subdued),
+            Span::raw(gap),
+            Span::styled(elapsed, theme.text.subdued),
+        ]),
+        Line::styled(truncate_to_width(&title, width), title_style),
+        Line::raw(String::new()),
+    ]
+}
+
 fn render_landing(
     frame: &mut Frame<'_>,
     state: &TuiState,
+    area: Rect,
     slots: &RenderSlots,
     theme: &Theme,
 ) -> RenderedComposer {
-    let detail = ResponsiveDetail::for_width(frame.area().width);
-    let show_brand = frame.area().height >= LANDING_BRAND_MINIMUM_HEIGHT;
+    let detail = ResponsiveDetail::for_width(area.width);
+    let show_brand = area.height >= LANDING_BRAND_MINIMUM_HEIGHT;
     let footer_detail = detail.secondary_only_when(show_brand);
-    let footer_width = frame
-        .area()
+    let footer_width = area
         .width
-        .saturating_sub(horizontal_padding(frame.area().width).saturating_mul(2));
+        .saturating_sub(horizontal_padding(area.width).saturating_mul(2));
     let agent = agent_selection_context(state, footer_detail);
     let context = if footer_detail.shows_secondary() {
         format!("{agent} · Workspace {}", state.workspace.to_string_lossy())
@@ -1071,14 +1158,14 @@ fn render_landing(
         Constraint::Min(1),
         Constraint::Length(footer.height()),
     ])
-    .areas(frame.area());
-    let content = horizontally_inset(main, horizontal_padding(frame.area().width));
+    .areas(area);
+    let content = horizontally_inset(main, horizontal_padding(area.width));
     let key = ComposerKey::Landing;
     let composer_text = state.composers.text(key);
     let composer_cursor = state.composers.cursor(key);
     let skill_markers = state.composers.skill_markers(key);
     let composer_height = composer_block_height(
-        frame.area().height,
+        area.height,
         72_u16.min(content.width),
         composer_text,
         composer_cursor,
@@ -1136,13 +1223,13 @@ fn render_landing(
 
     render_slot(
         frame,
-        horizontally_inset(notice_area, horizontal_padding(frame.area().width)),
+        horizontally_inset(notice_area, horizontal_padding(area.width)),
         notice,
         theme,
     );
     render_slot(
         frame,
-        horizontally_inset(footer_area, horizontal_padding(frame.area().width)),
+        horizontally_inset(footer_area, horizontal_padding(area.width)),
         footer,
         theme,
     );
@@ -1155,6 +1242,7 @@ fn render_landing(
 fn render_session(
     frame: &mut Frame<'_>,
     state: &TuiState,
+    area: Rect,
     slots: &RenderSlots,
     theme: &Theme,
 ) -> RenderedComposer {
@@ -1163,25 +1251,21 @@ fn render_session(
         .as_ref()
         .expect("Session renderer requires a Session")
         .snapshot();
-    let padding = horizontal_padding(frame.area().width);
-    let normally_padded = horizontally_inset(frame.area(), padding);
+    let padding = horizontal_padding(area.width);
+    let normally_padded = horizontally_inset(area, padding);
     let content_column =
         session_content_column(normally_padded, state.settings().session.content_width);
     let content_width = content_column.width;
     let content_detail = ResponsiveDetail::for_width(content_width);
     let header_detail = ResponsiveDetail::for_width(normally_padded.width);
-    let show_header = frame.area().height >= SESSION_HEADER_MINIMUM_HEIGHT;
+    let show_header = area.height >= SESSION_HEADER_MINIMUM_HEIGHT;
     let session_id = snapshot.session.id;
     let key = ComposerKey::Session(session_id);
     let composer_text = state.composers.text(key);
     let composer_cursor = state.composers.cursor(key);
     let skill_markers = state.composers.skill_markers(key);
-    let desired_composer_height = composer_block_height(
-        frame.area().height,
-        content_width,
-        composer_text,
-        composer_cursor,
-    );
+    let desired_composer_height =
+        composer_block_height(area.height, content_width, composer_text, composer_cursor);
     let composer_top = slots.session_composer_top(&SessionComposerTopSlotContext {
         session_id,
         width: content_width,
@@ -1253,7 +1337,7 @@ fn render_session(
         .saturating_add(footer.height())
         .saturating_add(TRANSCRIPT_BOTTOM_MARGIN)
         .saturating_add(1);
-    let pending_room = frame.area().height.saturating_sub(core_height);
+    let pending_room = area.height.saturating_sub(core_height);
     let pending_height = if pending_room >= 3 {
         desired_pending_height.min(pending_room)
     } else {
@@ -1266,7 +1350,7 @@ fn render_session(
         .saturating_add(TRANSCRIPT_BOTTOM_MARGIN)
         .saturating_add(1);
     let composer_height =
-        desired_composer_height.min(frame.area().height.saturating_sub(reserved_height).max(1));
+        desired_composer_height.min(area.height.saturating_sub(reserved_height).max(1));
     let provisional_prompts = state.provisional_prompts(session_id);
     let interaction = state
         .session_interaction(session_id)
@@ -1288,7 +1372,7 @@ fn render_session(
         content_width,
     );
     let [_, transcript_without_latest, _, _, _, _, _, _] = session_areas(
-        frame.area(),
+        area,
         u16::from(show_header),
         pending_height,
         0,
@@ -1298,7 +1382,7 @@ fn render_session(
     );
     let viewport_without_latest = transcript_viewport_height(transcript_without_latest);
     let [_, transcript_with_latest, _, _, _, _, _, _] = session_areas(
-        frame.area(),
+        area,
         u16::from(show_header),
         pending_height,
         1,
@@ -1359,7 +1443,7 @@ fn render_session(
         composer_area,
         status_area,
     ] = session_areas(
-        frame.area(),
+        area,
         u16::from(show_header),
         pending_height,
         latest_height,

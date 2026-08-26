@@ -13,6 +13,7 @@ mod render;
 mod session_listing;
 mod session_picker;
 mod settings_panel;
+mod sidebar;
 mod slots;
 mod spinner;
 mod state;
@@ -25,5 +26,5 @@ pub use keymap::command_for_terminal_event;
 pub use render::render;
 pub use state::{
     Application, ApplicationEvent, ApplicationTransition, CommandId, ModelListRequest,
-    SessionListRequest, SessionListScope, TuiState,
+    SessionListRequest, SessionListScope, SessionListSurface, TuiState,
 };

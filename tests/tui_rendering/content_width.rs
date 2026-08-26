@@ -11,7 +11,8 @@ use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
         Activity, ActivityStatus, EffectiveSettings, MessageRole, SessionContentWidth,
-        SessionSettings, SessionStatus, SettingsSnapshot, TurnStatus,
+        SessionSettings, SessionStatus, SettingsSnapshot, SidebarSettings, SidebarVisibility,
+        TurnStatus,
     },
     tui::{Application, ApplicationEvent, CommandId},
 };
@@ -121,6 +122,12 @@ fn content_width_snapshot(
             session: SessionSettings {
                 content_width,
                 ..SessionSettings::default()
+            },
+            // The Session Content Column is what every measurement here is
+            // about, so the Sidebar stays off the frame rather than standing
+            // in the middle of it.
+            sidebar: SidebarSettings {
+                launch_visibility: SidebarVisibility::Hidden,
             },
             ..EffectiveSettings::default()
         },
@@ -296,17 +303,10 @@ fn session_content_width_does_not_change_the_landing() {
     let mut application = connected_application(workspace.path());
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
-            SettingsSnapshot {
-                settings: EffectiveSettings {
-                    session: SessionSettings {
-                        content_width: SessionContentWidth::Maximum(50),
-                        ..SessionSettings::default()
-                    },
-                    ..EffectiveSettings::default()
-                },
-                pinned: vec!["session.contentWidth".to_owned()],
-                diagnostics: Vec::new(),
-            },
+            content_width_snapshot(
+                SessionContentWidth::Maximum(50),
+                vec!["session.contentWidth".to_owned()],
+            ),
         )))
         .expect("receive Session content width");
 

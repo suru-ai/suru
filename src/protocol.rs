@@ -732,6 +732,25 @@ pub struct SessionSettings {
     pub title: TitleSettings,
 }
 
+/// Whether a TUI's Sidebar is on screen.
+///
+/// The Setting this spells governs only the first frame: a reader who toggles
+/// the Sidebar afterwards is changing their view, not their configuration, so
+/// nothing writes the choice back.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarVisibility {
+    #[default]
+    Shown,
+    Hidden,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SidebarSettings {
+    pub launch_visibility: SidebarVisibility,
+}
+
 /// Whether the user wants Suru to offer a Provider at all. Every Provider
 /// carries one, and each spells its own built-in default by hand rather than
 /// deriving it, because a derived `bool` is `false` and a Provider is on unless
@@ -791,6 +810,7 @@ pub struct ProviderSettings {
 pub struct EffectiveSettings {
     pub transcript: TranscriptSettings,
     pub session: SessionSettings,
+    pub sidebar: SidebarSettings,
     pub provider: ProviderSettings,
 }
 
@@ -834,6 +854,9 @@ pub enum SettingMutation {
     },
     SessionTitleErrand {
         value: Option<TitleErrand>,
+    },
+    SidebarLaunchVisibility {
+        value: Option<SidebarVisibility>,
     },
     ProviderCodexEnabled {
         value: Option<bool>,
@@ -1110,6 +1133,13 @@ impl SessionListItem {
         match self {
             Self::Readable(summary) => summary.emoji.as_deref(),
             Self::Unreadable(_) => None,
+        }
+    }
+
+    pub const fn created_at(&self) -> SessionTimestamp {
+        match self {
+            Self::Readable(summary) => summary.created_at,
+            Self::Unreadable(summary) => summary.created_at,
         }
     }
 

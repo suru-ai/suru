@@ -3,6 +3,7 @@
 //! carry out the transitions the Application returns.
 
 use std::{
+    collections::HashMap,
     future::{Future, pending},
     io::{Stdout, stdout},
     ops::ControlFlow,
@@ -36,6 +37,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::spinner;
 use super::state::{
     Application, ApplicationEvent, ApplicationTransition, ModelListRequest, SessionListRequest,
+    SessionListSurface,
 };
 
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
@@ -63,7 +65,11 @@ struct SessionTasks {
     subscription: Option<SessionSubscription>,
     subscribing: Option<(SessionId, tokio::task::JoinHandle<()>)>,
     attaching: Option<tokio::task::JoinHandle<()>>,
-    listing_sessions: Option<(SessionListRequest, tokio::task::JoinHandle<()>)>,
+    /// One in-flight Session listing per surface that lists Sessions: the
+    /// picker and the Sidebar list at once, and a fresh request from either
+    /// must replace only that surface's own.
+    listing_sessions:
+        HashMap<SessionListSurface, (SessionListRequest, tokio::task::JoinHandle<()>)>,
     listing_models: Option<(ModelListRequest, tokio::task::JoinHandle<()>)>,
     listing_skills: Option<(SkillCatalogRequest, tokio::task::JoinHandle<()>)>,
 }
@@ -169,7 +175,13 @@ impl SessionTasks {
     }
 
     fn finish_listing_sessions(&mut self, request: &SessionListRequest) {
-        finish_listing(&mut self.listing_sessions, request);
+        if self
+            .listing_sessions
+            .get(&request.surface())
+            .is_some_and(|(active, _)| active == request)
+        {
+            self.listing_sessions.remove(&request.surface());
+        }
     }
 
     fn finish_listing_models(&mut self, request: &ModelListRequest) {
@@ -183,9 +195,12 @@ impl SessionTasks {
         results: &UnboundedSender<SessionPickerResult>,
     ) {
         let results = results.clone();
-        replace_listing(&mut self.listing_sessions, request, |request| {
-            spawn_session_listing(commands, request, results)
-        });
+        let surface = request.surface();
+        if let Some((_, superseded)) = self.listing_sessions.remove(&surface) {
+            superseded.abort();
+        }
+        let task = spawn_session_listing(commands, request.clone(), results);
+        self.listing_sessions.insert(surface, (request, task));
     }
 
     fn list_models(
@@ -543,6 +558,10 @@ impl RunLoop {
             ApplicationTransition::SessionEnded => self.tasks.end_subscription(),
             // The shutdown state is worth one last frame before the screen goes.
             ApplicationTransition::Exit => return Ok(ControlFlow::Break(Exit::AfterFinalFrame)),
+            // The one command a managed event issues: the effective-settings
+            // snapshot decides whether the Sidebar opens, and a Sidebar that
+            // opens wants the Sessions it lists.
+            ApplicationTransition::ListSessions(request) => self.list_sessions(request),
             ApplicationTransition::CreateSession(_)
             | ApplicationTransition::DetachSession
             | ApplicationTransition::DeleteSession(_)
@@ -553,13 +572,12 @@ impl RunLoop {
             | ApplicationTransition::InterruptTurn { .. }
             | ApplicationTransition::SubscribeSession(_)
             | ApplicationTransition::AttachSession(_)
-            | ApplicationTransition::ListSessions(_)
             | ApplicationTransition::ListModels(_)
             | ApplicationTransition::RefreshSkills(_)
             | ApplicationTransition::ConfirmLandingAgentSelection(_)
             | ApplicationTransition::UpdateAgentSelection { .. }
             | ApplicationTransition::MutateSetting(_) => {
-                unreachable!("managed events do not issue Session commands");
+                unreachable!("managed events issue no other Session command");
             }
         }
         if self.application.session_id().is_none() {

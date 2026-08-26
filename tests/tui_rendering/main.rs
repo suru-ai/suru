@@ -17,5 +17,6 @@ mod reasoning_cycle;
 mod session_picker;
 mod settings_panel;
 mod shell;
+mod sidebar;
 mod support;
 mod transcript;

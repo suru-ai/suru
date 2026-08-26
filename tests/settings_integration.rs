@@ -10,7 +10,7 @@ use suru::{
     protocol::{
         AgentSelection, FoldPosture, ModelId, ProviderId, ReasoningSummaryDetail,
         ReasoningVisibility, SessionContentWidth, SettingMutation, SettingsDiagnosticSeverity,
-        SettingsSnapshot, TitleErrand,
+        SettingsSnapshot, SidebarVisibility, TitleErrand,
     },
     server::{self, ServerConfig},
 };
@@ -125,6 +125,49 @@ async fn showing_reasoning_pins_from_a_document_and_resets_to_the_hidden_default
     assert_eq!(
         answered.settings.transcript.reasoning_visibility,
         ReasoningVisibility::Hidden,
+        "unpinning it lets the built-in default resume"
+    );
+    assert_eq!(answered.pinned, [] as [String; 0]);
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_hidden_sidebar_pins_from_a_document_and_resets_to_the_shown_default() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            // I would rather have the columns.
+            "sidebar": { "launchVisibility": "hidden" },
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-sidebar")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (client, opening) = attach(state_dir.path(), "settings-sidebar").await;
+    assert_eq!(
+        opening.settings.sidebar.launch_visibility,
+        SidebarVisibility::Hidden
+    );
+    assert_eq!(opening.pinned, ["sidebar.launchVisibility"]);
+    assert_eq!(opening.diagnostics, []);
+
+    let answered = client
+        .mutate_setting(SettingMutation::SidebarLaunchVisibility { value: None })
+        .await
+        .expect("reset the Setting");
+    assert_eq!(
+        answered.settings.sidebar.launch_visibility,
+        SidebarVisibility::Shown,
         "unpinning it lets the built-in default resume"
     );
     assert_eq!(answered.pinned, [] as [String; 0]);

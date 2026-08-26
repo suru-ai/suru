@@ -6,7 +6,7 @@ use std::{cmp::Reverse, path::PathBuf};
 
 use crate::protocol::{SessionId, SessionListItem, SessionSummary, SessionTimestamp};
 
-use super::{SessionListRequest, SessionListScope};
+use super::{SessionListRequest, SessionListScope, SessionListSurface};
 
 /// One surface's view of the Sessions the server holds.
 ///
@@ -19,6 +19,9 @@ use super::{SessionListRequest, SessionListScope};
 /// sorts what it derives from them.
 #[derive(Clone, Debug)]
 pub(super) struct SessionListing {
+    /// The surface this listing belongs to, stamped on every request it makes
+    /// so a reply lands on the listing that asked and on no other.
+    surface: SessionListSurface,
     /// The Workspace `CurrentWorkspace` scope means, kept so narrowing back to
     /// it needs nothing from the caller.
     current_workspace: PathBuf,
@@ -34,9 +37,21 @@ pub(super) struct SessionListing {
 
 impl SessionListing {
     /// A listing scoped, as it opens, to the Workspace this client runs in.
-    pub(super) fn new(current_workspace: PathBuf) -> Self {
+    pub(super) fn new(surface: SessionListSurface, current_workspace: PathBuf) -> Self {
+        let scope = SessionListScope::CurrentWorkspace(current_workspace.clone());
+        Self::scoped(surface, current_workspace, scope)
+    }
+
+    /// A listing that opens on a scope of the caller's choosing, for a surface
+    /// whose opening scope is not the Workspace the client runs in.
+    pub(super) fn scoped(
+        surface: SessionListSurface,
+        current_workspace: PathBuf,
+        scope: SessionListScope,
+    ) -> Self {
         Self {
-            scope: SessionListScope::CurrentWorkspace(current_workspace.clone()),
+            surface,
+            scope,
             current_workspace,
             request_sequence: 0,
             pending_request: None,
@@ -52,7 +67,8 @@ impl SessionListing {
     /// `fail` when the answer arrives.
     pub(super) fn refresh(&mut self) -> SessionListRequest {
         self.request_sequence = self.request_sequence.wrapping_add(1);
-        let request = SessionListRequest::new(self.request_sequence, self.scope.clone());
+        let request =
+            SessionListRequest::new(self.surface, self.request_sequence, self.scope.clone());
         self.pending_request = Some(request.clone());
         self.sessions.clear();
         self.loading = true;
@@ -194,13 +210,14 @@ mod tests {
             ModelAvailability, Session, SessionId, SessionListItem, SessionStatus, SessionSummary,
             SessionTimestamp, Workspace,
         },
-        tui::{SessionListScope, session_listing::SessionListing},
+        tui::{SessionListScope, SessionListSurface, session_listing::SessionListing},
     };
 
     #[test]
     fn a_reply_to_a_superseded_request_is_dropped_and_the_current_one_lands() {
         let workspace = tempfile::tempdir().expect("create Workspace");
-        let mut listing = SessionListing::new(workspace.path().to_owned());
+        let mut listing =
+            SessionListing::new(SessionListSurface::Picker, workspace.path().to_owned());
         let superseded = listing.refresh();
         let current = listing.refresh();
 
@@ -217,7 +234,8 @@ mod tests {
     #[test]
     fn a_listing_orders_its_sessions_most_recently_updated_first() {
         let workspace = tempfile::tempdir().expect("create Workspace");
-        let mut listing = SessionListing::new(workspace.path().to_owned());
+        let mut listing =
+            SessionListing::new(SessionListSurface::Picker, workspace.path().to_owned());
         let request = listing.refresh();
 
         listing.load(
@@ -235,7 +253,8 @@ mod tests {
     #[test]
     fn toggling_scope_widens_to_every_workspace_and_asks_again() {
         let workspace = tempfile::tempdir().expect("create Workspace");
-        let mut listing = SessionListing::new(workspace.path().to_owned());
+        let mut listing =
+            SessionListing::new(SessionListSurface::Picker, workspace.path().to_owned());
         let request = listing.refresh();
         listing.fail(&request, "unreachable".to_owned());
 
@@ -261,7 +280,8 @@ mod tests {
     #[test]
     fn a_failure_reports_against_the_request_it_answers() {
         let workspace = tempfile::tempdir().expect("create Workspace");
-        let mut listing = SessionListing::new(workspace.path().to_owned());
+        let mut listing =
+            SessionListing::new(SessionListSurface::Picker, workspace.path().to_owned());
         let superseded = listing.refresh();
         let current = listing.refresh();
 
@@ -275,7 +295,8 @@ mod tests {
     #[test]
     fn a_derived_title_and_emoji_land_on_the_session_they_name() {
         let workspace = tempfile::tempdir().expect("create Workspace");
-        let mut listing = SessionListing::new(workspace.path().to_owned());
+        let mut listing =
+            SessionListing::new(SessionListSurface::Picker, workspace.path().to_owned());
         let request = listing.refresh();
         listing.load(&request, vec![summary("Ask about tests", 1)]);
         let session_id = listing.sessions()[0].id();
@@ -289,7 +310,8 @@ mod tests {
     #[test]
     fn a_settle_lands_on_the_session_it_names_without_moving_the_order() {
         let workspace = tempfile::tempdir().expect("create Workspace");
-        let mut listing = SessionListing::new(workspace.path().to_owned());
+        let mut listing =
+            SessionListing::new(SessionListSurface::Picker, workspace.path().to_owned());
         let request = listing.refresh();
         listing.load(&request, vec![summary("Newer", 2), summary("Set aside", 1)]);
         let session_id = listing.sessions()[1].id();
@@ -311,7 +333,8 @@ mod tests {
     #[test]
     fn a_deleted_session_leaves_the_listing() {
         let workspace = tempfile::tempdir().expect("create Workspace");
-        let mut listing = SessionListing::new(workspace.path().to_owned());
+        let mut listing =
+            SessionListing::new(SessionListSurface::Picker, workspace.path().to_owned());
         let request = listing.refresh();
         listing.load(&request, vec![summary("Kept", 2), summary("Deleted", 1)]);
         let deleted = listing.sessions()[1].id();
@@ -325,7 +348,8 @@ mod tests {
     #[test]
     fn a_catalog_reconciliation_keeps_only_the_sessions_it_names() {
         let workspace = tempfile::tempdir().expect("create Workspace");
-        let mut listing = SessionListing::new(workspace.path().to_owned());
+        let mut listing =
+            SessionListing::new(SessionListSurface::Picker, workspace.path().to_owned());
         let request = listing.refresh();
         listing.load(&request, vec![summary("Kept", 2), summary("Gone", 1)]);
         let kept = listing.sessions()[0].id();
@@ -338,7 +362,8 @@ mod tests {
     #[test]
     fn clearing_a_listing_drops_what_it_held_and_what_it_awaited() {
         let workspace = tempfile::tempdir().expect("create Workspace");
-        let mut listing = SessionListing::new(workspace.path().to_owned());
+        let mut listing =
+            SessionListing::new(SessionListSurface::Picker, workspace.path().to_owned());
         let request = listing.refresh();
         listing.load(&request, vec![summary("Listed", 1)]);
         listing.fail(&request, "unreachable".to_owned());
@@ -358,7 +383,8 @@ mod tests {
     #[test]
     fn a_failure_of_its_own_stands_beside_the_sessions_already_listed() {
         let workspace = tempfile::tempdir().expect("create Workspace");
-        let mut listing = SessionListing::new(workspace.path().to_owned());
+        let mut listing =
+            SessionListing::new(SessionListSurface::Picker, workspace.path().to_owned());
         let request = listing.refresh();
         listing.load(&request, vec![summary("Listed", 1)]);
 

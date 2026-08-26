@@ -21,6 +21,7 @@ pub enum SemanticCommandId {
     SessionDelete,
     SessionNew,
     SessionSettle,
+    SidebarToggle,
     SettingsOpen,
     SettingsPrevious,
     SettingsNext,
@@ -158,6 +159,7 @@ impl SemanticCommandId {
             Self::SessionDelete => "session.delete",
             Self::SessionNew => "session.new",
             Self::SessionSettle => "session.settle",
+            Self::SidebarToggle => "sidebar.toggle",
             Self::SettingsOpen => "settings.open",
             Self::SettingsPrevious => "settings.previous",
             Self::SettingsNext => "settings.next",
@@ -418,6 +420,23 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             aliases: &[],
         }),
         keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SidebarToggle,
+        title: "Toggle Sidebar",
+        description: "Show the Sidebar beside the main view, or reclaim its columns",
+        slash: Some(SlashCommand {
+            name: "sidebar",
+            aliases: &[],
+        }),
+        // Direct rather than behind the leader, because t3 code's own Ctrl+B is
+        // the binding a reader arrives with.
+        keybinding: Some(SemanticKeybinding {
+            prefix: None,
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+            label: "Ctrl+B",
+        }),
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsOpen,

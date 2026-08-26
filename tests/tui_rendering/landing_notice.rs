@@ -14,6 +14,7 @@ use suru::{
     managed_client::ManagedEvent,
     protocol::{
         EffectiveSettings, SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot,
+        SidebarSettings, SidebarVisibility,
     },
     tui::{Application, ApplicationEvent},
 };
@@ -32,7 +33,14 @@ fn deliver_snapshot(application: &mut Application, diagnostics: Vec<SettingsDiag
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
             SettingsSnapshot {
-                settings: EffectiveSettings::default(),
+                settings: EffectiveSettings {
+                    // The Notice is the Landing's own row, so the Sidebar stays
+                    // off the frame rather than sharing it.
+                    sidebar: SidebarSettings {
+                        launch_visibility: SidebarVisibility::Hidden,
+                    },
+                    ..EffectiveSettings::default()
+                },
                 pinned: Vec::new(),
                 diagnostics,
             },

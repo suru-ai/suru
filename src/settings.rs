@@ -32,7 +32,7 @@ use serde_json::Value;
 use crate::protocol::{
     AgentSelection, EffectiveSettings, FoldPosture, ProviderId, ReasoningSummaryDetail,
     ReasoningVisibility, SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
-    SettingsDiagnosticSeverity, SettingsSnapshot, TitleErrand,
+    SettingsDiagnosticSeverity, SettingsSnapshot, SidebarVisibility, TitleErrand,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -49,6 +49,7 @@ const SESSION_CONTENT_WIDTH: &str = "session.contentWidth";
 // later gets its own key and turning Titles off can never silently disable
 // work that has nothing to do with them.
 const SESSION_TITLE_ERRAND: &str = "session.title.errand";
+const SIDEBAR_LAUNCH_VISIBILITY: &str = "sidebar.launchVisibility";
 const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
 const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary";
 const PROVIDER_COPILOT_ENABLED: &str = "provider.copilot.enabled";
@@ -363,6 +364,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::SessionTitleErrand { value } => {
             value.as_ref() == Some(&settings.session.title.errand)
         }
+        SettingMutation::SidebarLaunchVisibility { value } => {
+            *value == Some(settings.sidebar.launch_visibility)
+        }
         SettingMutation::ProviderCodexEnabled { value } => {
             *value == Some(settings.provider.codex.enabled)
         }
@@ -521,6 +525,33 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |errand| {
                 settings.session.title.errand = errand;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: SIDEBAR_LAUNCH_VISIBILITY,
+        label: "Sidebar at launch",
+        description: "Whether a TUI opens with the Sidebar beside its main view",
+        group: SettingGroup::General,
+        scope: SettingScope::Client,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "shown",
+                pin: SettingMutation::SidebarLaunchVisibility {
+                    value: Some(SidebarVisibility::Shown),
+                },
+            },
+            SettingChoice {
+                value: "hidden",
+                pin: SettingMutation::SidebarLaunchVisibility {
+                    value: Some(SidebarVisibility::Hidden),
+                },
+            },
+        ]),
+        reset: SettingMutation::SidebarLaunchVisibility { value: None },
+        apply: |settings, value| {
+            apply_value(value, |visibility| {
+                settings.sidebar.launch_visibility = visibility;
             })
         },
     },
@@ -794,6 +825,9 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         }
         SettingMutation::SessionContentWidth { value } => (SESSION_CONTENT_WIDTH, pinned(value)),
         SettingMutation::SessionTitleErrand { value } => (SESSION_TITLE_ERRAND, pinned(value)),
+        SettingMutation::SidebarLaunchVisibility { value } => {
+            (SIDEBAR_LAUNCH_VISIBILITY, pinned(value))
+        }
         SettingMutation::ProviderCodexEnabled { value } => (PROVIDER_CODEX_ENABLED, pinned(value)),
         SettingMutation::ProviderCodexReasoningSummary { value } => {
             (PROVIDER_CODEX_REASONING_SUMMARY, pinned(value))
@@ -1307,6 +1341,7 @@ mod tests {
                 // A Setting the schema can only partly enumerate names what it
                 // can and describes the rest, in the same breath.
                 "one of \"session\", \"off\", or an Agent Selection".to_owned(),
+                "one of \"shown\" or \"hidden\"".to_owned(),
                 // A boolean Setting is diagnosed as accepting `true` or
                 // `false`, unquoted, because that is what the reader must type.
                 "one of true or false".to_owned(),

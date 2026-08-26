@@ -2823,6 +2823,10 @@ fn a_saturated_live_command_tail_keeps_its_height_as_the_latest_line_wraps() {
     let live_tail_height = |application: &Application| {
         rendered_application_rows_at(application, 60, 24)
             .iter()
+            // The Session header spells the Workspace path, and a temp
+            // directory's random name spells a Z often enough to be counted as
+            // a row of output unless the header is left out of the count.
+            .filter(|row| !row.contains("Workspace"))
             .filter(|row| row.contains('Z') || row.contains("… +"))
             .count()
     };
