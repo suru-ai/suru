@@ -797,7 +797,7 @@ impl AutoSettle {
 
 impl Default for AutoSettle {
     fn default() -> Self {
-        Self::Idle(2)
+        Self::Idle(3)
     }
 }
 

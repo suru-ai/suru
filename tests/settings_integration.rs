@@ -220,8 +220,8 @@ async fn the_auto_settle_setting_pins_from_a_document_and_resets_to_its_default(
         .expect("reset the Setting");
     assert_eq!(
         answered.settings.sidebar.auto_settle,
-        AutoSettle::Idle(2),
-        "unpinning it lets the built-in two days resume"
+        AutoSettle::Idle(3),
+        "unpinning it lets the built-in three days resume"
     );
     assert_eq!(answered.pinned, [] as [String; 0]);
 
@@ -261,7 +261,7 @@ async fn invalid_auto_settle_pins_are_ignored_individually_with_diagnostics() {
         let snapshot = attach(state_dir.path(), &channel).await.1;
         assert_eq!(
             snapshot.settings.sidebar.auto_settle,
-            AutoSettle::Idle(2),
+            AutoSettle::Idle(3),
             "{case} keeps the built-in fallback"
         );
         assert_eq!(

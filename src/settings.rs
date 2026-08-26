@@ -241,7 +241,7 @@ const SIDEBAR_AUTO_SETTLE_NUMERIC: NumericSettingChoice = NumericSettingChoice::
     |settings| match settings.sidebar.auto_settle {
         // The built-in threshold, so a reader turning settling back on begins
         // where it began rather than at nothing.
-        AutoSettle::Off => 2,
+        AutoSettle::Off => 3,
         AutoSettle::Idle(days) => days,
     },
     validate_auto_settle_idle_days,

@@ -1220,7 +1220,7 @@ fn a_session_left_alone_past_the_threshold_settles_itself() {
         workspace.path(),
         vec![
             listed("Still warm", None, workspace.path(), 2, hours_ago(1)),
-            listed("Left alone", None, workspace.path(), 1, days_ago(3)),
+            listed("Left alone", None, workspace.path(), 1, days_ago(5)),
         ],
     );
 
@@ -1228,7 +1228,7 @@ fn a_session_left_alone_past_the_threshold_settles_itself() {
     let divider = sidebar_divider(&rows);
     assert!(
         divider < rendered_row(&rows, "Left alone"),
-        "a Session past the two-day default settles on its own: {rows:?}"
+        "a Session past the three-day default settles on its own: {rows:?}"
     );
     assert!(
         rendered_row(&rows, "Still warm") < divider,
@@ -1349,7 +1349,7 @@ fn moving_the_auto_settle_settings_reclassifies_the_sidebar_in_place() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = sidebar_showing(
         workspace.path(),
-        vec![listed("Left alone", None, workspace.path(), 1, days_ago(3))],
+        vec![listed("Left alone", None, workspace.path(), 1, days_ago(5))],
     );
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     assert!(
@@ -1439,7 +1439,7 @@ fn a_session_suru_cannot_read_never_settles_however_long_it_has_sat() {
                     path: workspace.path().to_owned(),
                 }),
             }),
-            listed("Left alone", None, workspace.path(), 1, days_ago(3)),
+            listed("Left alone", None, workspace.path(), 1, days_ago(5)),
         ],
     );
 

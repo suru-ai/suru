@@ -1461,7 +1461,7 @@ fn the_auto_settle_row_spells_its_threshold_and_space_turns_settling_off() {
     focus_setting(&mut application, "sidebar.autoSettle");
 
     assert!(
-        row(&application, "Settle idle Sessions").contains("2 days [default]"),
+        row(&application, "Settle idle Sessions").contains("3 days [default]"),
         "the built-in threshold is visible as a default: {:?}",
         row(&application, "Settle idle Sessions")
     );
@@ -1480,7 +1480,7 @@ fn the_auto_settle_row_spells_its_threshold_and_space_turns_settling_off() {
     );
     let rendered = rendered_application_rows(&application).join("\n");
     assert!(
-        rendered.contains("Days idle") && rendered.contains('2'),
+        rendered.contains("Days idle") && rendered.contains('3'),
         "the numeric editor opens prefilled with the threshold in force: {rendered}"
     );
     press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
