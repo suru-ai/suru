@@ -32,9 +32,9 @@ use super::{
         PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, TabBar, TabSpan,
     },
     sidebar::{
-        self, SIDEBAR_MENU_ITEMS, Sidebar, SidebarEntry, SidebarMenuGeometry, SidebarRow,
-        SidebarScopeEntry, SidebarSelectorView, SidebarShelf, SidebarShowMore, SidebarSpan,
-        SidebarTarget,
+        self, ADD_WORKSPACE, SIDEBAR_MENU_ITEMS, Sidebar, SidebarEntry, SidebarMenuGeometry,
+        SidebarRow, SidebarScopeEntry, SidebarSelectorView, SidebarShelf, SidebarShowMore,
+        SidebarSpan, SidebarTarget, SidebarWorkspaceEntryView,
     },
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
@@ -1071,7 +1071,9 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     frame.render_widget(block, column);
     let (lines, rows) = sidebar_lines(state, content, theme);
     // The columns inside the rule rather than the content's own, so the
-    // padding a row is inset by presses the row it insets.
+    // padding a row is inset by presses the row it insets. The spans the body
+    // narrows to a run of one line are measured from the same edges, in
+    // `sidebar_lines`.
     state
         .sidebar
         .record_geometry(inside.x..inside.right(), rows);
@@ -1172,7 +1174,8 @@ fn sidebar_lines(
     }
     // The selector stands between the search box and the list it governs, and
     // is a row the reader can press, so it is the first span this frame
-    // records.
+    // records — along with the affordance sharing its line, which answers the
+    // columns at the right of it.
     let selector_row = content
         .y
         .saturating_add(u16::try_from(lines.len()).unwrap_or_default());
@@ -1182,10 +1185,33 @@ fn sidebar_lines(
         focused,
         theme,
     ));
-    let mut rows = vec![SidebarSpan {
-        rows: selector_row..selector_row.saturating_add(1),
-        target: SidebarTarget::Selector,
-    }];
+    let selector_rows = selector_row..selector_row.saturating_add(1);
+    // Where the label gives way to the affordance, and the Sidebar's own edges
+    // either side of the pair: the padding a row is inset by presses the row it
+    // insets, so the spans run out to the rule rather than to the content.
+    let split = content
+        .right()
+        .saturating_sub(u16::try_from(ADD_WORKSPACE.width()).unwrap_or_default());
+    let mut rows = vec![
+        SidebarSpan {
+            rows: selector_rows.clone(),
+            columns: Some(content.x.saturating_sub(1)..split),
+            target: SidebarTarget::Selector,
+        },
+        SidebarSpan {
+            rows: selector_rows,
+            columns: Some(split..content.right().saturating_add(1)),
+            target: SidebarTarget::AddWorkspace,
+        },
+    ];
+    // A path entry stands in place of the list, so nothing below the selector's
+    // line is pressable while it stands — but the line itself goes on answering
+    // the pointer, because a reader who opened the entry by pointing has to be
+    // able to be done with it the same way.
+    if let Some(entry) = state.sidebar.workspace_entry() {
+        lines.extend(sidebar_workspace_entry_lines(&entry, width, theme));
+        return (lines, rows);
+    }
     let capacity = usize::from(content.height).saturating_sub(lines.len());
     let entries = state.sidebar.visible_entries(
         capacity,
@@ -1209,6 +1235,7 @@ fn sidebar_lines(
         if let Some(target) = target {
             rows.push(SidebarSpan {
                 rows: top..bottom,
+                columns: None,
                 target,
             });
         }
@@ -1314,7 +1341,13 @@ fn sidebar_entry_lines(
 
 /// The Workspace selector: what the Sidebar is narrowed to, with the affordance
 /// that opens its entries — the same one the settings panel opens a row's
-/// choices with, because it is the same gesture on the same kind of list.
+/// choices with, because it is the same gesture on the same kind of list — and,
+/// at the right of the line, the affordance that opens a path entry for a
+/// Workspace the Sidebar has never listed.
+///
+/// The two share the line and are highlighted apart, each within its own
+/// columns, because the reader is on one or the other and the frame has to say
+/// which.
 fn sidebar_selector_line(
     selector: &SidebarSelectorView,
     width: usize,
@@ -1322,12 +1355,47 @@ fn sidebar_selector_line(
     theme: &Theme,
 ) -> Line<'static> {
     let affordance = if selector.open { "▾ " } else { "▸ " };
-    sidebar_plain_line(
-        &format!("{affordance}{}", selector.label),
-        width,
-        sidebar_selection_style(selector.selected, focused, theme),
-        theme.text.subdued,
-    )
+    Line::from(vec![
+        sidebar_plain_span(
+            &format!("{affordance}{}", selector.label),
+            width.saturating_sub(ADD_WORKSPACE.width()),
+            sidebar_selection_style(selector.selected, focused, theme),
+            theme.text.subdued,
+        ),
+        sidebar_plain_span(
+            ADD_WORKSPACE,
+            ADD_WORKSPACE.width(),
+            sidebar_selection_style(selector.adding, focused, theme),
+            theme.text.subdued,
+        ),
+    ])
+}
+
+/// The path entry the add-Workspace affordance opens, standing in place of the
+/// list.
+///
+/// It is drawn as the search box is — a label and what the reader has typed,
+/// held to its end so the part of a long path that says which directory it is
+/// stays in view — with what their last path was refused for beneath it.
+fn sidebar_workspace_entry_lines(
+    entry: &SidebarWorkspaceEntryView<'_>,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    const LABEL: &str = "Workspace: ";
+    let mut lines = vec![Line::from(vec![
+        Span::styled(LABEL, theme.text.subdued),
+        Span::styled(
+            tail_to_width(entry.path, width.saturating_sub(LABEL.width())),
+            theme.text.primary,
+        ),
+    ])];
+    lines.extend(
+        entry.rejection.map(|rejection| {
+            Line::styled(truncate_to_width(rejection, width), theme.feedback.error)
+        }),
+    );
+    lines
 }
 
 /// One Workspace the open selector offers, stepped in past the affordance that
@@ -1379,20 +1447,32 @@ fn sidebar_show_more_line(
     )
 }
 
-/// One line of the Sidebar carrying nothing but a label: the whole column wide,
-/// so a row the reader is on reads as one block rather than as lit text, and
-/// cut rather than wrapped where the label is longer than the column. Every row
-/// with no right slot to lay out is drawn here.
+/// One run of a Sidebar line carrying nothing but a label: padded out to the
+/// columns it is given, so a row the reader is on reads as one block rather
+/// than as lit text, and cut rather than wrapped where the label is longer than
+/// those columns.
+fn sidebar_plain_span(
+    label: &str,
+    width: usize,
+    selected: Option<Style>,
+    unselected: Style,
+) -> Span<'static> {
+    Span::styled(
+        pad_to_width(&truncate_to_width(label, width), width),
+        selected.unwrap_or(unselected),
+    )
+}
+
+/// A whole line of the Sidebar drawn that way, the column wide. Every row with
+/// no right slot to lay out and nothing sharing its line is drawn here; the
+/// selector's line, which is shared, lays out two spans of its own.
 fn sidebar_plain_line(
     label: &str,
     width: usize,
     selected: Option<Style>,
     unselected: Style,
 ) -> Line<'static> {
-    Line::styled(
-        pad_to_width(&truncate_to_width(label, width), width),
-        selected.unwrap_or(unselected),
-    )
+    Line::from(sidebar_plain_span(label, width, selected, unselected))
 }
 
 /// One active Session, as three lines: where the work lives beside what its

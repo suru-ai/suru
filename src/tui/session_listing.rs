@@ -187,6 +187,19 @@ impl SessionListing {
         &self.current_workspace
     }
 
+    /// Takes the Workspace this client has moved to. A listing narrowed to the
+    /// one it was made for follows the reader across, so "where I am" goes on
+    /// meaning where they are; one asking for every Workspace is already asking
+    /// for the new one and is left alone. Nothing is asked of the server here:
+    /// a surface that wants its listing to answer for the new Workspace asks
+    /// for it.
+    pub(super) fn adopt_current_workspace(&mut self, workspace: PathBuf) {
+        if matches!(self.scope, SessionListScope::CurrentWorkspace(_)) {
+            self.scope = SessionListScope::CurrentWorkspace(workspace.clone());
+        }
+        self.current_workspace = workspace;
+    }
+
     pub(super) const fn is_loading(&self) -> bool {
         self.loading
     }

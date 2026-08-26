@@ -59,6 +59,12 @@ impl SessionPicker {
         self.begin_listing()
     }
 
+    /// Takes the Workspace this client has moved to, so the picker's own
+    /// narrowing to "where I am" narrows to where the reader now is.
+    pub(super) fn adopt_workspace(&mut self, workspace: std::path::PathBuf) {
+        self.listing.adopt_current_workspace(workspace);
+    }
+
     pub(super) fn close(&mut self) {
         self.open = false;
         self.query.clear();

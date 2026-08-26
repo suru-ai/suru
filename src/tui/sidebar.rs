@@ -47,6 +47,21 @@ pub(super) const fn width_beside(frame_width: u16) -> Option<u16> {
 /// rather than for any one Workspace.
 const ALL_WORKSPACES: &str = "All Workspaces";
 
+/// The affordance beside the selector, opening the path entry a reader names a
+/// Workspace in. It shares the selector's line, so it is drawn — and pressed —
+/// within its own columns of it.
+pub(super) const ADD_WORKSPACE: &str = " + ";
+
+/// What the path entry says when the reader offers it nothing.
+const NAME_A_DIRECTORY: &str = "Name a directory";
+
+/// What it says of a path nothing stands at.
+const NO_DIRECTORY_THERE: &str = "No directory there";
+
+/// What it says of a path standing at something other than a directory, which
+/// a Workspace cannot be rooted at.
+const NOT_A_DIRECTORY: &str = "Not a directory";
+
 /// The Workspaces the Sidebar draws: every one the reader has work in, or a
 /// single one of them.
 ///
@@ -93,8 +108,8 @@ impl WorkspaceScope {
     }
 }
 
-/// The Sidebar's own state: whether the reader wants it, and the Sessions it
-/// lists.
+/// The Sidebar's own state: whether the reader wants it, where the reader
+/// works, and the Sessions it lists.
 ///
 /// Visibility has two independent halves. The reader's choice — seeded once
 /// from the initial-visibility Setting and flipped by the toggle — lives here
@@ -127,6 +142,11 @@ pub(super) struct Sidebar {
     /// are the list: the reader is choosing a Workspace rather than a Session,
     /// so both shelves stand down as they do under a query.
     selector_open: bool,
+    /// The path entry the affordance beside the selector opened, where one is
+    /// open. It stands in place of the list for the same reason the selector's
+    /// entries do — a reader saying where to work is not choosing what to open
+    /// — and it takes what they type, because a path is not a query.
+    workspace_entry: Option<WorkspaceEntry>,
     listing: SessionListing,
     /// How much of the settled shelf is on show. History is the longest part
     /// of a body of work and the least of what a reader is choosing between,
@@ -198,8 +218,29 @@ enum SidebarSelection {
     Selector,
     /// One entry of the open selector, named by the scope it stands for.
     Scope(WorkspaceScope),
+    /// The affordance beside the selector, which Enter opens a path entry from
+    /// rather than attaching anything.
+    AddWorkspace,
     Session(SessionId),
     ShowMore,
+}
+
+/// The path a reader is naming a Workspace by, and how the last one they
+/// offered was refused.
+#[derive(Clone, Debug, Default)]
+struct WorkspaceEntry {
+    path: String,
+    /// Why the path they last offered was refused, and `None` before they have
+    /// offered one — or once they have typed anything since, because a refusal
+    /// is about the path it read rather than about the entry it stands under.
+    rejection: Option<&'static str>,
+}
+
+/// The path entry as a frame draws it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SidebarWorkspaceEntryView<'a> {
+    pub(super) path: &'a str,
+    pub(super) rejection: Option<&'static str>,
 }
 
 /// One Session as the Sidebar draws it. The shelf it stands on decides its
@@ -297,6 +338,10 @@ pub(super) struct SidebarSelectorView {
     /// Whether the entries stand open beneath it.
     pub(super) open: bool,
     pub(super) selected: bool,
+    /// Whether the reader is on the add-Workspace affordance beside it, which
+    /// shares the selector's line and is highlighted within its own columns of
+    /// it.
+    pub(super) adding: bool,
 }
 
 /// The affordance closing a settled shelf with rows still under it.
@@ -367,18 +412,25 @@ pub(super) struct SidebarGeometry {
 #[derive(Clone, Debug)]
 pub(super) struct SidebarSpan {
     pub(super) rows: Range<u16>,
+    /// The columns this entry answers within, where it shares its line with
+    /// another — the selector and the affordance beside it are the one such
+    /// pair. `None` is the whole of the Sidebar, which is what every entry
+    /// with its line to itself answers across.
+    pub(super) columns: Option<Range<u16>>,
     pub(super) target: SidebarTarget,
 }
 
 /// What a drawn entry stands for. Most of them stand for a Session; the rest
 /// stand for the Sidebar's own affordances — the settled shelf's next batch,
-/// the Workspace selector, and one of the Workspaces it offers.
+/// the Workspace selector, one of the Workspaces it offers, and the affordance
+/// beside the selector that opens a path entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SidebarTarget {
     Session(SessionId),
     ShowMore,
     Selector,
     Scope(WorkspaceScope),
+    AddWorkspace,
 }
 
 /// The context menu as one frame drew it: the columns its box holds and where
@@ -399,7 +451,13 @@ impl SidebarGeometry {
         }
         self.rows
             .iter()
-            .find(|span| span.rows.contains(&position.y))
+            .find(|span| {
+                span.rows.contains(&position.y)
+                    && span
+                        .columns
+                        .as_ref()
+                        .is_none_or(|columns| columns.contains(&position.x))
+            })
             .map(|span| span.target.clone())
     }
 
@@ -430,6 +488,24 @@ pub(super) enum SidebarPress {
     /// The press landed somewhere the Sidebar has not drawn, so whatever is
     /// drawn there answers it.
     Elsewhere,
+}
+
+/// What acting on the row the reader is on came to. Most rows stand for a
+/// Session and are attached; the rest are the Sidebar's own affordances, which
+/// it answers itself — except the one that names a Workspace, which is the
+/// client's to take rather than the Sidebar's.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
+pub(super) enum SidebarActivation {
+    /// The Sidebar answered it itself: the shelf opened further, the selector
+    /// opened or narrowed, a path was refused, or the reader was already on
+    /// the Session they asked for.
+    Answered,
+    Attach(SessionId),
+    /// The reader named a directory to work in. It is the client's current
+    /// Workspace from here: the root of the Sessions they make next, and what
+    /// current-Workspace scope comes to mean.
+    Workspace(PathBuf),
 }
 
 /// The items a Sidebar row's context menu offers. Which of the first two it
@@ -538,6 +614,7 @@ impl Sidebar {
             auto_settle: AutoSettle::default(),
             scope: WorkspaceScope::AllWorkspaces,
             selector_open: false,
+            workspace_entry: None,
             listing: SessionListing::scoped(
                 SessionListSurface::Sidebar,
                 current_workspace,
@@ -598,12 +675,17 @@ impl Sidebar {
     }
 
     /// Backs the reader out of the Sidebar one step at a time, which is what
-    /// Esc asks for. The selector's entries are the innermost step, being the
-    /// newest thing the reader opened; a query in hand is the next, given up so
+    /// Esc asks for. A path entry standing open is the innermost step, given up
+    /// with the path in it; the selector's entries are the next, being the
+    /// newest thing left that the reader opened; a query in hand is the next
+    /// after that, given up so
     /// they go on driving the whole list they are back to. Only from there do
     /// the keys go to the composer, leaving the Sidebar standing — done
     /// choosing, not done looking.
     pub(super) fn leave(&mut self) {
+        if self.workspace_entry.take().is_some() {
+            return;
+        }
         if self.selector_open {
             self.close_selector();
             return;
@@ -620,17 +702,36 @@ impl Sidebar {
         &self.query
     }
 
-    /// Takes what the reader typed into the search box, narrowing the list to
-    /// the Sessions whose Titles carry it.
+    /// Takes what the reader typed into the line they are typing into: the
+    /// path entry where one stands open, and the search box otherwise —
+    /// narrowing the list to the Sessions whose Titles carry it.
     pub(super) fn insert(&mut self, text: &str) {
+        if let Some(entry) = self.path_being_typed() {
+            entry.path.push_str(text);
+            return;
+        }
         self.query.push_str(text);
         self.keep_selection_drawn();
     }
 
-    /// Takes the query back a character, widening the results to match.
+    /// Takes that line back a character, widening the results to match where
+    /// it is the query.
     pub(super) fn delete_backward(&mut self) {
+        if let Some(entry) = self.path_being_typed() {
+            entry.path.pop();
+            return;
+        }
         self.query.pop();
         self.keep_selection_drawn();
+    }
+
+    /// The path entry to type into, where one stands open — with whatever it
+    /// last refused given up, because a refusal is about the path it read and
+    /// the reader is changing that path.
+    fn path_being_typed(&mut self) -> Option<&mut WorkspaceEntry> {
+        let entry = self.workspace_entry.as_mut()?;
+        entry.rejection = None;
+        Some(entry)
     }
 
     /// Gives up the query and the results with it, putting the reader back on
@@ -648,6 +749,9 @@ impl Sidebar {
     fn hand_back_keys(&mut self) {
         self.focused = false;
         self.menu = None;
+        // A path entry is a line the reader was typing into, and they have
+        // stopped typing.
+        self.workspace_entry = None;
         self.close_selector();
         self.clear_query();
     }
@@ -692,12 +796,31 @@ impl Sidebar {
     /// is spent there — a reader dismissing a menu is not also acting on
     /// whatever it was covering. Otherwise the press lands on a row, which
     /// takes the selection and is opened, or on one of the Sidebar's own
-    /// affordances — the settled shelf's next batch, the Workspace selector, or
-    /// one of the Workspaces it offers. Every one of them is what Enter already
+    /// affordances — the settled shelf's next batch, the Workspace selector,
+    /// one of the Workspaces it offers, or the affordance beside it that opens
+    /// a path entry. Every one of them is what Enter already
     /// does from that row, so the press mints no behavior of its own: it says
     /// which row, by a position only this frame can know, and the command does
     /// the rest.
     pub(super) fn press_at(&mut self, position: Position) -> SidebarPress {
+        // A path entry standing open is what the reader is doing, so a press on
+        // the line that opened it is a press to be done with it — the
+        // affordance because pointing at it twice is asking to be back where
+        // they started, and the selector beside it because reaching for the
+        // other control puts this one away. Either way the press is spent
+        // there: they are out of the entry, and what they do next is theirs to
+        // point at. The rest of the column draws nothing pressable while the
+        // entry stands, so nothing else can be pointed at anyway.
+        if self.workspace_entry.is_some() {
+            let hit = self.geometry.borrow().hit(position);
+            return match hit {
+                Some(SidebarTarget::Selector | SidebarTarget::AddWorkspace) => {
+                    self.workspace_entry = None;
+                    SidebarPress::Answered
+                }
+                _ => SidebarPress::Elsewhere,
+            };
+        }
         if self.menu_is_open() {
             let item = self.geometry.borrow().menu_hit(position);
             return match item {
@@ -843,6 +966,7 @@ impl Sidebar {
             SidebarTarget::ShowMore => SidebarSelection::ShowMore,
             SidebarTarget::Selector => SidebarSelection::Selector,
             SidebarTarget::Scope(scope) => SidebarSelection::Scope(scope),
+            SidebarTarget::AddWorkspace => SidebarSelection::AddWorkspace,
         });
     }
 
@@ -889,6 +1013,7 @@ impl Sidebar {
             // it is where the reader works rather than a look they were
             // taking.
             self.menu = None;
+            self.workspace_entry = None;
             self.close_selector();
             self.clear_query();
             self.ask_for_sessions();
@@ -1020,41 +1145,155 @@ impl Sidebar {
     /// Acts on the row the reader is on, reporting the Session to attach where
     /// that is what the row asks for.
     ///
+    /// A path entry standing open is what Enter acts on first, whatever row the
+    /// reader came to it from: it is the line they are typing into, and
+    /// offering the path is the only thing acting on it can mean.
+    ///
     /// Standing on one of the Sidebar's own affordances it acts on that
     /// instead, and there is nothing to attach: the settled shelf's row brings
-    /// up more of the shelf, the selector opens its entries, and an entry
-    /// narrows the Sidebar to the Workspace it names. Nor is there anything to
-    /// attach when the row stands for a Session Suru could not read, or for the
-    /// Session already open — in which case Enter means only that the reader is
-    /// done choosing, and the composer takes the keys back.
-    pub(super) fn activate(&mut self, current: Option<SessionId>) -> Option<SessionId> {
-        let selected = match self.selected.clone()? {
+    /// up more of the shelf, the selector opens its entries, an entry narrows
+    /// the Sidebar to the Workspace it names, and the affordance beside the
+    /// selector opens the path entry. Nor is there anything to attach when the
+    /// row stands for a Session Suru could not read, or for the Session already
+    /// open — in which case Enter means only that the reader is done choosing,
+    /// and the composer takes the keys back.
+    pub(super) fn activate(&mut self, current: Option<SessionId>) -> SidebarActivation {
+        if self.workspace_entry.is_some() {
+            return self.offer_workspace();
+        }
+        let Some(selection) = self.selected.clone() else {
+            return SidebarActivation::Answered;
+        };
+        let selected = match selection {
             SidebarSelection::Session(session_id) => session_id,
             SidebarSelection::ShowMore => {
                 self.show_more();
-                return None;
+                return SidebarActivation::Answered;
             }
             SidebarSelection::Selector => {
                 self.toggle_selector();
-                return None;
+                return SidebarActivation::Answered;
             }
             SidebarSelection::Scope(scope) => {
                 self.choose_scope(scope);
-                return None;
+                return SidebarActivation::Answered;
+            }
+            SidebarSelection::AddWorkspace => {
+                self.open_workspace_entry();
+                return SidebarActivation::Answered;
             }
         };
-        self.listing
+        let readable = self
+            .listing
             .sessions()
             .iter()
-            .find(|summary| summary.id() == selected)?
-            .readable()?;
+            .find(|summary| summary.id() == selected)
+            .and_then(SessionListItem::readable)
+            .is_some();
+        if !readable {
+            return SidebarActivation::Answered;
+        }
         if current == Some(selected) {
             self.hand_back_keys();
-            return None;
+            return SidebarActivation::Answered;
         }
         self.listing.clear_error();
         self.attaching = Some(selected);
-        Some(selected)
+        SidebarActivation::Attach(selected)
+    }
+
+    /// Opens the path entry the affordance stands for.
+    ///
+    /// The selector's entries are put away: naming a Workspace and choosing
+    /// between the ones already known are two answers to the same question, and
+    /// only one of them is being asked. The keys come with it, however the
+    /// reader asked — a pointer as readily as Enter — because an entry nobody
+    /// can type into is no entry at all.
+    fn open_workspace_entry(&mut self) {
+        self.close_selector();
+        self.focused = true;
+        self.selected = Some(SidebarSelection::AddWorkspace);
+        self.workspace_entry = Some(WorkspaceEntry::default());
+    }
+
+    /// Reads the path the reader offered.
+    ///
+    /// A path given relative is read from the Workspace they are working in
+    /// rather than from wherever the process happened to be started, and an
+    /// absolute one replaces it outright — which is one reading of a path on
+    /// every platform, rather than a POSIX one dressed up as a general rule.
+    ///
+    /// What is taken is the canonical path rather than the spelling: the server
+    /// canonicalizes the Workspace it roots a Session at and the Workspace it
+    /// narrows a listing by, and this scope is compared against what comes back
+    /// from that listing. A client holding some other spelling of the same
+    /// directory would narrow to a Workspace none of its own Sessions matched
+    /// and offer the reader two selector entries of the same name — and would
+    /// do it on Windows always, where the canonical form carries a prefix no
+    /// reader types.
+    ///
+    /// Only a directory is taken: a Workspace is rooted at one, so a path
+    /// standing at a file or at nothing is refused where the reader can see it
+    /// and the entry stands open for them to correct. Nothing else moves — the
+    /// scope, the shelves, and the Sessions in them are as they were.
+    fn offer_workspace(&mut self) -> SidebarActivation {
+        let Some(entry) = self.workspace_entry.as_ref() else {
+            return SidebarActivation::Answered;
+        };
+        let named = entry.path.trim();
+        if named.is_empty() {
+            return self.refuse_workspace(NAME_A_DIRECTORY);
+        }
+        let named = self.listing.current_workspace().join(named);
+        let Ok(candidate) = std::fs::canonicalize(&named) else {
+            return self.refuse_workspace(NO_DIRECTORY_THERE);
+        };
+        if !candidate.is_dir() {
+            return self.refuse_workspace(NOT_A_DIRECTORY);
+        }
+        // The reader is done in the Sidebar: they came to say where the work
+        // is, and the work itself is written in the composer.
+        self.hand_back_keys();
+        SidebarActivation::Workspace(candidate)
+    }
+
+    /// Draws the refusal under the entry, leaving it open on the path that
+    /// earned it.
+    fn refuse_workspace(&mut self, rejection: &'static str) -> SidebarActivation {
+        if let Some(entry) = &mut self.workspace_entry {
+            entry.rejection = Some(rejection);
+        }
+        SidebarActivation::Answered
+    }
+
+    /// Takes the Workspace this client has moved to, which the reader named at
+    /// the path entry.
+    ///
+    /// The Sidebar narrows to it: a reader who has just said where they work is
+    /// saying which work they mean, and the settled shelf opens on its first
+    /// rows again as it does under any other narrowing. Nothing is asked of the
+    /// server — the listing is the whole body of work either way.
+    ///
+    /// The row left marked is the selector, which now says where they are. It
+    /// is the dim mark rather than the lit one, because taking the Workspace
+    /// handed the keys back to the composer: it says where Enter would land
+    /// were the reader to come back, which is what that mark says everywhere
+    /// else in the column.
+    pub(super) fn adopt_workspace(&mut self, workspace: PathBuf) {
+        self.listing.adopt_current_workspace(workspace.clone());
+        self.choose_scope(WorkspaceScope::Workspace(workspace));
+        self.selected = Some(SidebarSelection::Selector);
+    }
+
+    /// The path entry as a frame draws it, and `None` where there is none to
+    /// draw.
+    pub(super) fn workspace_entry(&self) -> Option<SidebarWorkspaceEntryView<'_>> {
+        self.workspace_entry
+            .as_ref()
+            .map(|entry| SidebarWorkspaceEntryView {
+                path: &entry.path,
+                rejection: entry.rejection,
+            })
     }
 
     /// Brings up the next of the settled shelf. Where that was the whole of
@@ -1116,6 +1355,7 @@ impl Sidebar {
             label: self.scope.label(),
             open: self.selector_open,
             selected: self.selected == Some(SidebarSelection::Selector),
+            adding: self.selected == Some(SidebarSelection::AddWorkspace),
         }
     }
 
@@ -1228,13 +1468,24 @@ impl Sidebar {
 
     /// The Sidebar's body top to bottom: the active Sessions, then the divider
     /// and as much of the settled shelf as is on show — or, while the reader is
-    /// searching, the results in place of both, and while they are choosing a
-    /// Workspace, the selector's own entries in place of everything.
+    /// searching, the results in place of both; while they are choosing a
+    /// Workspace, the selector's own entries in place of everything; and while
+    /// they are naming one, nothing at all, the path entry the frame draws
+    /// there standing for no work.
     ///
     /// Everything the Sidebar has to say about what stands where is said here
     /// and nowhere else, so the rows the frame draws and the rows the arrows
     /// walk can never disagree.
     fn body(&self) -> Vec<BodyEntry<'_>> {
+        // A path entry stands in place of the whole list, for the same reason
+        // the selector's entries do and more so: a reader saying where to work
+        // is not choosing what to open, and what they type is a path rather
+        // than a query the list could answer. Standing for no rows also stands
+        // the tick down, because [`Self::shows_live_work`] reads this body: a
+        // column drawing no work has none to animate.
+        if self.workspace_entry.is_some() {
+            return Vec::new();
+        }
         // The entries stand in place of both shelves, as the results of a query
         // do: a reader choosing where to look is not choosing what to open.
         if self.selector_open {
@@ -1412,13 +1663,19 @@ impl Sidebar {
 
     /// Every row the reader can be on, in the order the Sidebar draws them,
     /// which is the order the arrows walk: the selector standing above the
-    /// list, then the body without the divider, which is a rule rather than a
-    /// row.
+    /// list and the affordance sharing its line, left to right, then the body
+    /// without the divider, which is a rule rather than a row.
     ///
     /// The selector is not among them while its own entries are open: the
     /// reader is inside the control rather than on it, and Esc is the way back
     /// out.
     fn selectable(&self) -> Vec<SidebarSelection> {
+        // A path entry is the one thing a reader with one open is doing, so the
+        // affordance that opened it is the one place they can be: the arrows
+        // have nowhere to walk while they are saying where to work.
+        if self.workspace_entry.is_some() {
+            return vec![SidebarSelection::AddWorkspace];
+        }
         let rows = self.body().into_iter().filter_map(|entry| match entry {
             BodyEntry::Session(session, _) => Some(SidebarSelection::Session(session.id())),
             BodyEntry::ShowMore(_) => Some(SidebarSelection::ShowMore),
@@ -1428,7 +1685,8 @@ impl Sidebar {
         if self.selector_open {
             return rows.collect();
         }
-        std::iter::once(SidebarSelection::Selector)
+        [SidebarSelection::Selector, SidebarSelection::AddWorkspace]
+            .into_iter()
             .chain(rows)
             .collect()
     }
@@ -1635,14 +1893,20 @@ fn earliest_opening(heights: &[usize], last_shown: usize, capacity: usize) -> us
 /// having gone, or their never having stood anywhere yet: the first row of the
 /// list itself.
 ///
-/// Never the selector above it, which is a way of choosing what to list rather
-/// than a place in the listing: a reader is put on their work, and reaches the
-/// selector by asking for it. A Sidebar listing nothing leaves them on nothing,
-/// and the arrows land them on the selector, which is all there is.
+/// Never the selector above it or the affordance beside that, which are ways
+/// of choosing what to list rather than places in the listing: a reader is put
+/// on their work, and reaches either by asking for it. A Sidebar listing
+/// nothing leaves them on nothing, and the arrows land them on the selector's
+/// own line, which is all there is.
 fn first_row(selectable: &[SidebarSelection]) -> Option<SidebarSelection> {
     selectable
         .iter()
-        .find(|selection| **selection != SidebarSelection::Selector)
+        .find(|selection| {
+            !matches!(
+                selection,
+                SidebarSelection::Selector | SidebarSelection::AddWorkspace
+            )
+        })
         .cloned()
 }
 
@@ -1681,7 +1945,8 @@ mod tests {
             SessionSummary, SessionTimestamp, SidebarSettings, SidebarVisibility, Workspace,
         },
         tui::sidebar::{
-            MINIMUM_MAIN_WIDTH, SIDEBAR_WIDTH, Sidebar, SidebarEntry, width_beside, workspace_name,
+            MINIMUM_MAIN_WIDTH, SIDEBAR_WIDTH, Sidebar, SidebarActivation, SidebarEntry,
+            width_beside, workspace_name,
         },
     };
 
@@ -1879,7 +2144,7 @@ mod tests {
         let request = sidebar.take_listing_request().expect("ask for Sessions");
         sidebar.load(&request, vec![identified(open, "Open", 1)], Some(open));
 
-        assert_eq!(sidebar.activate(Some(open)), None);
+        assert_eq!(sidebar.activate(Some(open)), SidebarActivation::Answered);
         assert!(
             !sidebar.has_focus(),
             "the reader is already in this Session, so Enter means only that they are done"
@@ -2028,16 +2293,18 @@ mod tests {
     fn the_affordance_brings_up_a_batch_at_a_time_to_the_end_of_the_shelf() {
         let mut sidebar = showing(set_aside_shelf(40));
 
-        // Past the top of the list is the selector standing above it, and past
-        // that the affordance at the shelf's foot. Neither stands for a
-        // Session; which of the two the reader is on is what activating says.
+        // Past the top of the list is the selector's own line — the affordance
+        // beside it, then the selector — and past that the affordance at the
+        // shelf's foot. None of them stands for a Session; which one the reader
+        // is on is what activating says.
+        sidebar.select_previous();
         sidebar.select_previous();
         sidebar.select_previous();
         assert_eq!(selected(&sidebar), None);
 
         assert_eq!(
             sidebar.activate(None),
-            None,
+            SidebarActivation::Answered,
             "asking for more of the shelf attaches nothing"
         );
         let revealed = drawn(&sidebar);
@@ -2048,7 +2315,7 @@ mod tests {
         );
         assert_eq!(revealed[36], "Show 5 more");
 
-        sidebar.activate(None);
+        let _ = sidebar.activate(None);
 
         assert_eq!(
             drawn(&sidebar).len(),
@@ -2096,9 +2363,13 @@ mod tests {
     #[test]
     fn a_sidebar_asked_for_afresh_opens_the_shelf_on_its_first_rows_again() {
         let mut sidebar = showing(set_aside_shelf(12));
+        // Up off the list onto the selector's own line — the add-Workspace
+        // affordance, then the selector — and up again onto the affordance at
+        // the shelf's foot.
         sidebar.select_previous();
         sidebar.select_previous();
-        sidebar.activate(None);
+        sidebar.select_previous();
+        let _ = sidebar.activate(None);
         assert_eq!(drawn(&sidebar).len(), 13, "the whole shelf is on show");
 
         sidebar.toggle();

@@ -42,7 +42,7 @@ use super::{
     render::render_with_slots,
     session_picker::SessionPicker,
     settings_panel::{AvailabilityRead, SettingsPanel},
-    sidebar::{Sidebar, SidebarPress},
+    sidebar::{Sidebar, SidebarActivation, SidebarPress},
     slots::RenderSlots,
     transcript::{
         FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups,
@@ -373,6 +373,19 @@ impl TuiState {
             sidebar: Sidebar::new(workspace),
             settings_panel: SettingsPanel::default(),
         }
+    }
+
+    /// Takes the Workspace this client works in, which the reader moved by
+    /// naming a directory in the Sidebar.
+    ///
+    /// It is where the Sessions they make next are rooted and what
+    /// current-Workspace scope comes to mean, so every surface holding a
+    /// reading of it is given the new one here rather than being left to
+    /// answer for a Workspace the reader has left.
+    fn adopt_workspace(&mut self, workspace: PathBuf) {
+        self.workspace = workspace.clone();
+        self.session_picker.adopt_workspace(workspace.clone());
+        self.sidebar.adopt_workspace(workspace);
     }
 
     fn sync_composer_completion(&mut self) {
@@ -1377,8 +1390,10 @@ pub enum CommandId {
     ActivateCompletion(CompletionMode),
     InsertSessionSearch(String),
     DeleteSessionSearchBackward,
-    InsertSidebarSearch(String),
-    DeleteSidebarSearchBackward,
+    /// What the reader typed into the line the Sidebar has them typing into:
+    /// its search box, or the path entry standing open over it.
+    InsertSidebarText(String),
+    DeleteSidebarTextBackward,
     SelectPreviousSession,
     SelectNextSession,
     PagePreviousSessions,
@@ -1629,9 +1644,8 @@ impl Application {
             | CommandId::ToggleSessionScope
             | CommandId::SelectSession
             | CommandId::CloseSessionPicker) => Ok(self.handle_session_picker_command(command)),
-            command @ (CommandId::InsertSidebarSearch(_)
-            | CommandId::DeleteSidebarSearchBackward) => {
-                Ok(self.handle_sidebar_search_command(command))
+            command @ (CommandId::InsertSidebarText(_) | CommandId::DeleteSidebarTextBackward) => {
+                Ok(self.handle_sidebar_text_command(command))
             }
             command @ (CommandId::InsertModelSearch(_)
             | CommandId::DeleteModelSearchBackward
@@ -1866,14 +1880,14 @@ impl Application {
         ApplicationTransition::Continue
     }
 
-    /// Handles what the reader typed into the Sidebar's search box; any other
-    /// command leaves the query alone. A Sidebar the reader has closed takes
+    /// Handles what the reader typed into the Sidebar; any other command leaves
+    /// the line they are typing into alone. A Sidebar the reader has closed takes
     /// no typing, for the same reason it takes no arrows.
-    fn handle_sidebar_search_command(&mut self, command: CommandId) -> ApplicationTransition {
+    fn handle_sidebar_text_command(&mut self, command: CommandId) -> ApplicationTransition {
         if self.state.sidebar.is_revealed() {
             match command {
-                CommandId::InsertSidebarSearch(text) => self.state.sidebar.insert(&text),
-                CommandId::DeleteSidebarSearchBackward => self.state.sidebar.delete_backward(),
+                CommandId::InsertSidebarText(text) => self.state.sidebar.insert(&text),
+                CommandId::DeleteSidebarTextBackward => self.state.sidebar.delete_backward(),
                 _ => {}
             }
         }
@@ -1893,10 +1907,16 @@ impl Application {
             SemanticCommandId::SidebarLeave => self.state.sidebar.leave(),
             SemanticCommandId::SidebarAttach => {
                 let current = self.session_id();
-                return self.state.sidebar.activate(current).map_or(
-                    ApplicationTransition::Continue,
-                    ApplicationTransition::AttachSession,
-                );
+                return match self.state.sidebar.activate(current) {
+                    SidebarActivation::Answered => ApplicationTransition::Continue,
+                    SidebarActivation::Attach(session_id) => {
+                        ApplicationTransition::AttachSession(session_id)
+                    }
+                    SidebarActivation::Workspace(workspace) => {
+                        self.state.adopt_workspace(workspace);
+                        ApplicationTransition::Continue
+                    }
+                };
             }
             _ => {}
         }

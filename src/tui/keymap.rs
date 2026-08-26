@@ -108,7 +108,7 @@ pub(super) fn command_for_model_picker_event(event: InputEvent) -> Option<Comman
 pub(super) fn command_for_sidebar_event(event: InputEvent) -> Option<CommandId> {
     let key = match event {
         InputEvent::Key(key) => key,
-        InputEvent::Paste(text) => return Some(CommandId::InsertSidebarSearch(text)),
+        InputEvent::Paste(text) => return Some(CommandId::InsertSidebarText(text)),
         event @ InputEvent::Mouse(_) => return command_for_terminal_event(event),
         _ => return None,
     };
@@ -133,8 +133,8 @@ pub(super) fn command_for_sidebar_event(event: InputEvent) -> Option<CommandId> 
         }
         _ => command_for_search_key(
             key,
-            &CommandId::DeleteSidebarSearchBackward,
-            CommandId::InsertSidebarSearch,
+            &CommandId::DeleteSidebarTextBackward,
+            CommandId::InsertSidebarText,
         ),
     }
 }

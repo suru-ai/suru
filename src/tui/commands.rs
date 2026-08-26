@@ -498,18 +498,22 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarAttach,
         title: "Attach Selected Session",
-        // Acting on the settled shelf's own affordance shows more of the shelf
-        // rather than opening anything, so the account of the command says so.
-        description: "Open the Session the Sidebar has selected, or show more of the settled shelf",
+        // Every one of the Sidebar's own affordances is acted on from the row
+        // the reader is on, so this is what Enter comes to there as well as on
+        // a Session, and the account of the command names the rest of them.
+        description: "Open the Session the Sidebar has selected, show more of the settled shelf, \
+                      or act on the Workspace selector",
         slash: None,
         keybinding: None,
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarLeave,
         title: "Leave Sidebar",
-        // Backing out of a search is the inner step of backing out of the
-        // Sidebar, so the account of the command says which one it takes.
-        description: "Clear the Sidebar's search, or hand the keys back to the composer",
+        // Backing out of a path entry, a set of selector entries, or a search
+        // is an inner step of backing out of the Sidebar, so the account of the
+        // command says it takes one step rather than all of them.
+        description: "Back out of the Sidebar a step: close what is open, clear its search, \
+                      or hand the keys back to the composer",
         slash: None,
         keybinding: None,
     },
