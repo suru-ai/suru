@@ -31,7 +31,7 @@ use super::{
     settings_panel::{
         PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, TabBar, TabSpan,
     },
-    sidebar::{self, SidebarEntry, SidebarRow, SidebarShelf, SidebarShowMore},
+    sidebar::{self, Sidebar, SidebarEntry, SidebarRow, SidebarShelf, SidebarShowMore},
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
         PromptFooterSlotContext, PromptStatusSlotContext, RenderSlots, RenderedSlot,
@@ -1069,18 +1069,19 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     main
 }
 
-/// The Sidebar's whole body: what the server last refused, then the active
-/// Sessions, then the divider and the settled ones — as many of them as the
-/// column is tall — or the one line that stands in for a list there is nothing
-/// to draw.
+/// The Sidebar's whole body: the search box, then what the server last
+/// refused, then the active Sessions, then the divider and the settled ones —
+/// as many of them as the column is tall — or the one line that stands in for
+/// a list there is nothing to draw.
 fn sidebar_lines(
     state: &TuiState,
     width: usize,
     height: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    if let Some(error) = state.sidebar.error() {
+    let mut lines = vec![sidebar_search_line(state.sidebar.query(), width, theme)];
+    let error = state.sidebar.error();
+    if let Some(error) = error {
         lines.push(Line::styled(
             truncate_to_width(error, width),
             theme.feedback.error,
@@ -1092,11 +1093,10 @@ fn sidebar_lines(
         state.session.as_ref().map(SessionProjection::session_id),
     );
     if entries.is_empty() {
-        if state.sidebar.is_loading() {
-            lines.push(Line::styled("Loading Sessions…", theme.text.subdued));
-        } else if lines.is_empty() {
-            lines.push(Line::styled("No Sessions yet", theme.text.subdued));
-        }
+        lines.extend(
+            sidebar_empty_reading(&state.sidebar)
+                .map(|reading| Line::styled(reading, theme.text.subdued)),
+        );
         return lines;
     }
     let now = SessionTimestamp::now().0;
@@ -1107,6 +1107,61 @@ fn sidebar_lines(
             .flat_map(|entry| sidebar_entry_lines(entry, width, now, focused, theme)),
     );
     lines
+}
+
+/// The Sidebar's search box, standing at the top of the column whether or not
+/// the reader is searching, so the way to narrow a long list is always in
+/// view. It is labelled the way the session picker's search line is, because
+/// it is the same act on the same body of work — but the query itself is
+/// drawn plainly rather than subdued, because unlike the picker's the Sidebar
+/// stands open while the reader works elsewhere, and what it is narrowed to
+/// has to be legible at a glance.
+fn sidebar_search_line(query: &str, width: usize, theme: &Theme) -> Line<'static> {
+    const LABEL: &str = "Search: ";
+    Line::from(vec![
+        Span::styled(LABEL, theme.text.subdued),
+        Span::styled(
+            tail_to_width(query, width.saturating_sub(LABEL.width())),
+            theme.text.primary,
+        ),
+    ])
+}
+
+/// The last `width` columns of `text`, and the whole of it where it fits. This
+/// is what a line being typed into shows, rather than the leading columns
+/// every other line shows: a reader watches the end of what they are writing,
+/// and the Sidebar's box is narrow enough that a query of any length would
+/// otherwise run off where they cannot see it.
+fn tail_to_width(text: &str, width: usize) -> String {
+    let mut tail = String::new();
+    let mut taken = 0;
+    for character in text.chars().rev() {
+        taken += UnicodeWidthChar::width(character).unwrap_or(0);
+        if taken > width {
+            break;
+        }
+        tail.insert(0, character);
+    }
+    tail
+}
+
+/// What the Sidebar says in place of a list there is nothing to draw: that it
+/// is still asking the server, that the reader's query matched nothing, or
+/// that there is no work yet. An error already drawn is its own account of an
+/// empty column, and it comes first: a listing that failed has told the reader
+/// nothing about whether their query matches anything.
+fn sidebar_empty_reading(sidebar: &Sidebar) -> Option<&'static str> {
+    if sidebar.is_loading() {
+        return Some("Loading Sessions…");
+    }
+    if sidebar.error().is_some() {
+        return None;
+    }
+    Some(if sidebar.query().is_empty() {
+        "No Sessions yet"
+    } else {
+        "No Sessions match"
+    })
 }
 
 /// One entry of the Sidebar's body: a Session on either shelf, or the rule

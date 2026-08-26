@@ -68,6 +68,12 @@ pub(super) struct Sidebar {
     /// so the shelf opens on its first rows and the tail stands behind an
     /// affordance they ask for.
     settled_on_show: usize,
+    /// What the reader has typed into the search box. While it says anything
+    /// both shelves stand down and the Sidebar answers with the Sessions whose
+    /// Titles carry it; empty, it is the whole list again. It belongs to the
+    /// look the reader is taking rather than to the Sidebar, so it is given up
+    /// the moment they are done looking.
+    query: String,
     /// The row the reader is on, held by what the row stands for rather than
     /// by position, so a listing arriving underneath them leaves the selection
     /// where the work is rather than where the row was.
@@ -236,6 +242,7 @@ impl Sidebar {
                 SessionListScope::AllWorkspaces,
             ),
             settled_on_show: SETTLED_SHELF_OPENING,
+            query: String::new(),
             selected: None,
             attaching: None,
             awaiting_dispatch: None,
@@ -269,13 +276,60 @@ impl Sidebar {
     /// Sidebar is typing their first Prompt.
     pub(super) fn toggle(&mut self) {
         self.reveal(!self.revealed);
-        self.focused = self.revealed;
+        if self.revealed {
+            self.focused = true;
+        } else {
+            // Closing is one of the ways out of the Sidebar, so it leaves by
+            // the same door the others do — and a Sidebar nobody can see is
+            // not one holding a query on the reader's behalf.
+            self.hand_back_keys();
+        }
     }
 
-    /// Hands the keys back to the composer and leaves the Sidebar standing,
-    /// which is what Esc asks for: done choosing, not done looking.
+    /// Backs the reader out of the Sidebar one step at a time, which is what
+    /// Esc asks for. A query in hand is the innermost step: it is given up
+    /// first, and the reader goes on driving the whole list they are back to.
+    /// Only from there do the keys go to the composer, leaving the Sidebar
+    /// standing — done choosing, not done looking.
     pub(super) fn leave(&mut self) {
+        if !self.query.is_empty() {
+            self.clear_query();
+            return;
+        }
+        self.hand_back_keys();
+    }
+
+    /// What the reader has typed into the search box.
+    pub(super) fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Takes what the reader typed into the search box, narrowing the list to
+    /// the Sessions whose Titles carry it.
+    pub(super) fn insert(&mut self, text: &str) {
+        self.query.push_str(text);
+        self.keep_selection_drawn();
+    }
+
+    /// Takes the query back a character, widening the results to match.
+    pub(super) fn delete_backward(&mut self) {
+        self.query.pop();
+        self.keep_selection_drawn();
+    }
+
+    /// Gives up the query and the results with it, putting the reader back on
+    /// the whole list. A widening list never drops a row, so the row they were
+    /// on is still there and still theirs.
+    fn clear_query(&mut self) {
+        self.query.clear();
+        self.keep_selection_drawn();
+    }
+
+    /// Hands the keys to the composer, and the query goes with them: it was a
+    /// way of finding a Session, and the reader is no longer looking for one.
+    fn hand_back_keys(&mut self) {
         self.focused = false;
+        self.clear_query();
     }
 
     /// Whether the reader is driving the Sidebar. A Sidebar the frame could not
@@ -310,6 +364,11 @@ impl Sidebar {
             // frame reports otherwise, so that run reaches the surface the
             // reader just opened.
             self.on_screen.set(true);
+            // A query belongs to the look the reader was taking, and a Sidebar
+            // coming into view is the start of another one — so it opens on
+            // the whole body of work, as the settled shelf opens on its first
+            // rows again.
+            self.clear_query();
             self.ask_for_sessions();
         }
     }
@@ -362,7 +421,7 @@ impl Sidebar {
             .filter(|selected| self.holds(*selected))
             .or_else(|| {
                 current
-                    .filter(|current| self.listing.contains(*current))
+                    .filter(|current| self.draws(*current))
                     .map(SidebarSelection::Session)
             })
             .or_else(|| self.first_listed());
@@ -374,6 +433,9 @@ impl Sidebar {
 
     pub(super) fn retitle(&mut self, session_id: SessionId, title: String, emoji: Option<String>) {
         self.listing.retitle(session_id, title, emoji);
+        // A Title is what a query is read against, so another client's retitle
+        // can carry the row the reader is on out of the results under them.
+        self.keep_selection_drawn();
     }
 
     pub(super) fn settle(&mut self, session_id: SessionId, settled_at: Option<SessionTimestamp>) {
@@ -419,7 +481,7 @@ impl Sidebar {
             .find(|summary| summary.id() == selected)?
             .readable()?;
         if current == Some(selected) {
-            self.focused = false;
+            self.hand_back_keys();
             return None;
         }
         self.listing.clear_error();
@@ -451,7 +513,7 @@ impl Sidebar {
     /// they just opened.
     pub(super) fn finish_attachment(&mut self) {
         self.attaching = None;
-        self.focused = false;
+        self.hand_back_keys();
     }
 
     /// The server refused the attachment. The reader keeps the keys and the
@@ -502,15 +564,18 @@ impl Sidebar {
             .collect()
     }
 
-    /// The Sidebar's body in the order it is drawn: the active Sessions, then
-    /// the divider and the settled ones where anything is settled.
+    /// The Sidebar's body as the frame draws it, which is [`Self::body`] with
+    /// each entry given what its row says.
     fn entries(&self, current: Option<SessionId>) -> Vec<SidebarEntry<'_>> {
-        let settlement = self.settlement();
-        let mut entries = self
-            .active(settlement)
+        self.body()
             .into_iter()
-            .map(|session| {
-                self.row(
+            .map(|entry| match entry {
+                BodyEntry::Divider => SidebarEntry::Divider,
+                BodyEntry::ShowMore(count) => SidebarEntry::ShowMore(SidebarShowMore {
+                    count,
+                    selected: self.selected == Some(SidebarSelection::ShowMore),
+                }),
+                BodyEntry::Session(session, Standing::Active) => self.row(
                     session,
                     current,
                     SidebarShelf::Active {
@@ -519,30 +584,70 @@ impl Sidebar {
                             .map(|workspace| workspace.path.as_path()),
                         updated_at: session.updated_at(),
                     },
-                )
+                ),
+                BodyEntry::Session(session, Standing::Settled) => self.row(
+                    session,
+                    current,
+                    SidebarShelf::Settled {
+                        ended_at: ended_at(session),
+                    },
+                ),
             })
+            .collect()
+    }
+
+    /// The Sidebar's body top to bottom: the active Sessions, then the divider
+    /// and as much of the settled shelf as is on show — or, while the reader
+    /// is searching, the results in place of both. Everything the Sidebar has
+    /// to say about what stands where is said here and nowhere else, so the
+    /// rows the frame draws and the rows the arrows walk can never disagree.
+    fn body(&self) -> Vec<BodyEntry<'_>> {
+        let settlement = self.settlement();
+        if !self.query.is_empty() {
+            return self.results(settlement);
+        }
+        let mut body = self
+            .active(settlement)
+            .into_iter()
+            .map(|session| BodyEntry::Session(session, Standing::Active))
             .collect::<Vec<_>>();
         let shelf = self.shelf(settlement);
         if shelf.on_show.is_empty() {
-            return entries;
+            return body;
         }
-        entries.push(SidebarEntry::Divider);
-        entries.extend(shelf.on_show.into_iter().map(|session| {
-            self.row(
-                session,
-                current,
-                SidebarShelf::Settled {
-                    ended_at: ended_at(session),
-                },
+        body.push(BodyEntry::Divider);
+        body.extend(
+            shelf
+                .on_show
+                .into_iter()
+                .map(|session| BodyEntry::Session(session, Standing::Settled)),
+        );
+        body.extend(shelf.batch.map(BodyEntry::ShowMore));
+        body
+    }
+
+    /// What a query narrows the Sidebar to: the Sessions whose Titles carry it,
+    /// as one flat list.
+    ///
+    /// Searching is a look across the whole body of work rather than down one
+    /// shelf, so both shelves stand down: no divider parts the results, and
+    /// nothing stands behind the affordance — a reader who narrowed the list
+    /// themselves is shown the whole of what they narrowed it to. The results
+    /// keep the order the shelves would have drawn them in, so a Session sits
+    /// where the reader would have gone looking for it, and each keeps the
+    /// shape its shelf gives it, so they can still tell live work from history.
+    fn results(&self, settlement: Settlement) -> Vec<BodyEntry<'_>> {
+        self.active(settlement)
+            .into_iter()
+            .map(|session| (session, Standing::Active))
+            .chain(
+                self.settled(settlement)
+                    .into_iter()
+                    .map(|session| (session, Standing::Settled)),
             )
-        }));
-        if let Some(count) = shelf.batch {
-            entries.push(SidebarEntry::ShowMore(SidebarShowMore {
-                count,
-                selected: self.selected == Some(SidebarSelection::ShowMore),
-            }));
-        }
-        entries
+            .filter(|(session, _)| title_carries(&self.query, session.title()))
+            .map(|(session, standing)| BodyEntry::Session(session, standing))
+            .collect()
     }
 
     /// The settled shelf as one pass over the listing draws it: the rows on
@@ -633,31 +738,55 @@ impl Sidebar {
     }
 
     /// Every row the reader can be on, in the order the Sidebar draws them,
-    /// which is the order the arrows walk: down the active list, across the
-    /// divider, down as much of the settled shelf as is revealed, and onto the
-    /// affordance revealing the rest.
+    /// which is the order the arrows walk: the body without the divider, which
+    /// is a rule rather than a row.
     fn selectable(&self) -> Vec<SidebarSelection> {
-        let settlement = self.settlement();
-        let shelf = self.shelf(settlement);
-        let mut selectable = self
-            .active(settlement)
+        self.body()
             .into_iter()
-            .chain(shelf.on_show)
-            .map(|session| SidebarSelection::Session(session.id()))
-            .collect::<Vec<_>>();
-        if shelf.batch.is_some() {
-            selectable.push(SidebarSelection::ShowMore);
-        }
-        selectable
+            .filter_map(|entry| match entry {
+                BodyEntry::Session(session, _) => Some(SidebarSelection::Session(session.id())),
+                BodyEntry::ShowMore(_) => Some(SidebarSelection::ShowMore),
+                BodyEntry::Divider => None,
+            })
+            .collect()
     }
 
-    /// Whether the row the reader is on is one the Sidebar still draws. A
-    /// Session is, wherever it stands, because the shelf shows the row they
-    /// are on however deep it sits.
+    /// Whether the row the reader is on is one the Sidebar still draws — which
+    /// asks the body, so a Session dropped from the listing and one a query
+    /// passed over are answered by the same reading.
     fn holds(&self, selection: SidebarSelection) -> bool {
-        match selection {
-            SidebarSelection::Session(session_id) => self.listing.contains(session_id),
-            SidebarSelection::ShowMore => self.shelf(self.settlement()).batch.is_some(),
+        self.selectable().contains(&selection)
+    }
+
+    /// Whether the Sidebar would put the reader on this Session: it is one it
+    /// lists, and one their query carries.
+    ///
+    /// This is the question [`Self::holds`] cannot answer, because the settled
+    /// shelf shows the row the reader is on however deep it sits — so asking
+    /// the body whether a Session they are not yet on is drawn would answer no
+    /// for the very rows the shelf would have made room for.
+    fn draws(&self, session_id: SessionId) -> bool {
+        self.listing
+            .sessions()
+            .iter()
+            .find(|session| session.id() == session_id)
+            .is_some_and(|session| {
+                self.query.is_empty() || title_carries(&self.query, session.title())
+            })
+    }
+
+    /// Puts the reader back on a row that is drawn, where the one they were on
+    /// no longer is. Narrowing the list is the ordinary way that happens: they
+    /// type another letter and the row under them steps aside. The rows are
+    /// read once and asked both questions, because reading them means walking
+    /// and sorting the whole listing.
+    fn keep_selection_drawn(&mut self) {
+        let selectable = self.selectable();
+        if self
+            .selected
+            .is_none_or(|selected| !selectable.contains(&selected))
+        {
+            self.selected = selectable.first().copied();
         }
     }
 
@@ -690,10 +819,27 @@ impl Sidebar {
         {
             self.attaching = None;
         }
-        if self.selected.is_some_and(|selected| !self.holds(selected)) {
-            self.selected = self.first_listed();
-        }
+        self.keep_selection_drawn();
     }
+}
+
+/// One entry of the Sidebar's body, before a frame gives it anything to say.
+#[derive(Clone, Copy, Debug)]
+enum BodyEntry<'a> {
+    Session(&'a SessionListItem, Standing),
+    Divider,
+    /// The affordance closing a capped settled shelf, and how many rows acting
+    /// on it brings up.
+    ShowMore(usize),
+}
+
+/// Which of the Sidebar's two shelves a Session stands on, which is what
+/// decides the shape of its row. A query puts the shelves themselves away but
+/// not this: a result still reads as live work or as history.
+#[derive(Clone, Copy, Debug)]
+enum Standing {
+    Active,
+    Settled,
 }
 
 /// The settled shelf as the Sidebar draws it on one pass.
@@ -784,6 +930,18 @@ fn earliest_opening(heights: &[usize], last_shown: usize, capacity: usize) -> us
         opening = index;
     }
     opening
+}
+
+/// Whether this Title carries the query the reader typed: a plain
+/// case-insensitive substring, because they are searching by words they
+/// remember rather than spelling out a pattern.
+///
+/// The session picker matches the same Titles more loosely, by subsequence,
+/// and rightly: it is a jump-to that a reader opens, narrows, and closes in one
+/// breath. The Sidebar is a list they read, and a match they cannot see the
+/// reason for is a row standing in the way of the ones they wanted.
+fn title_carries(query: &str, title: &str) -> bool {
+    title.to_lowercase().contains(&query.to_lowercase())
 }
 
 /// The Workspace as a Sidebar row names it: its last path component, which is

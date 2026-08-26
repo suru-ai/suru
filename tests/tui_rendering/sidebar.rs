@@ -17,8 +17,8 @@ use suru::{
     protocol::{
         AutoSettle, EffectiveSettings, ModelAvailability, PromptId, Session, SessionDeleted,
         SessionId, SessionListItem, SessionSettlementChanged, SessionStatus, SessionSummary,
-        SessionTimestamp, SettingsSnapshot, SidebarSettings, SidebarVisibility,
-        UnreadableSessionSummary, Workspace,
+        SessionTimestamp, SessionTitleChanged, SettingsSnapshot, SidebarSettings,
+        SidebarVisibility, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -29,6 +29,10 @@ use suru::{
 /// Wide enough for the Sidebar and a main view both, which is what every test
 /// about the Sidebar's own content needs.
 const WIDE: u16 = 100;
+
+/// Short enough that six active rows do not fit: the search box and four
+/// three-line rows fill the column, so the rest is read through the window.
+const WINDOWED: u16 = 13;
 
 #[test]
 fn the_sidebar_stands_beside_the_landing_and_the_main_view_takes_what_is_left() {
@@ -590,12 +594,17 @@ fn opening_the_sidebar_takes_the_keys_from_the_composer() {
         vec![listed("Listed work", None, workspace.path(), 1, now())],
     );
 
-    type_terminal_text(&mut application, "hello");
+    type_terminal_text(&mut application, "listed");
 
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     assert!(
-        !rows.iter().any(|row| row.contains("hello")),
+        rows.iter()
+            .any(|row| row.contains("Type a Prompt and press Enter")),
         "the Sidebar the reader opened has the keys, so nothing reaches the composer: {rows:?}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Search: listed"),
+        "what they type goes to the Sidebar's own search box: {rows:?}"
     );
     assert!(
         selected_sidebar_text(&application).contains("Listed work"),
@@ -649,7 +658,7 @@ fn the_column_windows_onto_the_selection_for_a_list_longer_than_it() {
         .collect();
     let mut application = sidebar_focused(workspace.path(), sessions);
 
-    let opening = rendered_application_rows_at(&application, WIDE, 12);
+    let opening = rendered_application_rows_at(&application, WIDE, WINDOWED);
     assert!(
         opening.iter().any(|row| row.contains("Row 1")),
         "the list opens at the top: {opening:?}"
@@ -663,7 +672,7 @@ fn the_column_windows_onto_the_selection_for_a_list_longer_than_it() {
         press_sidebar_key(&mut application, KeyCode::Down);
     }
 
-    let scrolled = rendered_application_rows_at(&application, WIDE, 12);
+    let scrolled = rendered_application_rows_at(&application, WIDE, WINDOWED);
     assert!(
         scrolled.iter().any(|row| row.contains("Row 6")),
         "moving past the window's end brings the selected row into view: {scrolled:?}"
@@ -860,23 +869,37 @@ fn a_terminal_too_narrow_to_draw_the_sidebar_leaves_the_keys_with_the_composer()
     );
 }
 
+/// A Title carried in from somewhere else is as good a way to find a Session
+/// as one the reader types out, so a paste goes to the search box whole — and
+/// not, on any account, to the composer that does not have the keys.
 #[test]
-fn a_paste_does_not_slip_past_the_focused_sidebar() {
+fn a_paste_goes_to_the_search_box_rather_than_the_composer() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = sidebar_focused(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![
+            listed("Listed work", None, workspace.path(), 2, now()),
+            listed("Other work", None, workspace.path(), 1, now()),
+        ],
     );
 
     application
-        .handle_terminal_event(InputEvent::Paste("pasted".to_owned()))
+        .handle_terminal_event(InputEvent::Paste("Listed".to_owned()))
         .expect("paste while the Sidebar has the keys");
 
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
     assert!(
-        !rendered_application_rows_at(&application, WIDE, 20)
-            .iter()
-            .any(|row| row.contains("pasted")),
-        "nothing a reader types or pastes reaches a composer that does not have the keys"
+        drawn_in_sidebar(&rows, "Search: Listed"),
+        "the paste lands in the search box whole: {rows:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&rows, "Other work"),
+        "and narrows the list as typing it would have: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Type a Prompt and press Enter")),
+        "nothing of it reaches a composer that does not have the keys: {rows:?}"
     );
 }
 
@@ -925,15 +948,15 @@ fn the_window_holds_still_while_the_selection_moves_inside_it() {
     // Only a frame knows how many rows the column holds, so a frame is what
     // settles the window — one is drawn after each run of keys, as the run
     // loop draws after each run of terminal events.
-    rendered_application_rows_at(&application, WIDE, 12);
+    rendered_application_rows_at(&application, WIDE, WINDOWED);
     for _ in 0..5 {
         press_sidebar_key(&mut application, KeyCode::Down);
-        rendered_application_rows_at(&application, WIDE, 12);
+        rendered_application_rows_at(&application, WIDE, WINDOWED);
     }
 
     press_sidebar_key(&mut application, KeyCode::Up);
 
-    let rows = rendered_application_rows_at(&application, WIDE, 12);
+    let rows = rendered_application_rows_at(&application, WIDE, WINDOWED);
     assert!(
         rows.iter().any(|row| row.contains("Row 5")),
         "the row the reader moved onto is in view: {rows:?}"
@@ -1707,4 +1730,398 @@ fn set_aside(session: SessionListItem, settled_at: u64) -> SessionListItem {
     };
     summary.settled_at = Some(SessionTimestamp(settled_at));
     SessionListItem::Readable(summary)
+}
+
+/// The search box stands at the top of the column whether or not the reader is
+/// searching, so the way to narrow a long list is always in view.
+#[test]
+fn the_search_box_stands_at_the_top_of_the_sidebar() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![listed("Listed work", None, workspace.path(), 1, now())],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert_eq!(
+        sidebar_column(&rows[0]),
+        "Search:",
+        "the box opens the column, above everything it filters: {rows:?}"
+    );
+}
+
+/// A reader searches by the words they remember, in whatever case they
+/// remember them.
+#[test]
+fn typing_narrows_the_sidebar_by_title_whatever_case_either_is_in() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed("Sidebar shell", None, workspace.path(), 2, now()),
+            listed("Codex runtime", None, workspace.path(), 1, now()),
+        ],
+    );
+
+    type_terminal_text(&mut application, "SHELL");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        drawn_in_sidebar(&rows, "Search: SHELL"),
+        "the box carries what the reader typed: {rows:?}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Sidebar shell"),
+        "a Title carrying the query stands however either is cased: {rows:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&rows, "Codex runtime"),
+        "and a Title that does not carry it steps aside: {rows:?}"
+    );
+}
+
+/// The query is a substring of the Title rather than a pattern spelled through
+/// it: the Sidebar is a list a reader reads, and a looser match would leave
+/// rows standing they cannot see the reason for.
+#[test]
+fn the_query_has_to_run_whole_through_the_title() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![listed("Sidebar shell", None, workspace.path(), 1, now())],
+    );
+
+    type_terminal_text(&mut application, "sdbr");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        !drawn_in_sidebar(&rows, "Sidebar shell"),
+        "letters scattered through the Title are not the query running through it: {rows:?}"
+    );
+}
+
+/// Searching is a look across the whole body of work rather than down one
+/// shelf, so a query puts both shelves away and answers with one list.
+#[test]
+fn a_query_replaces_both_shelves_with_one_flat_list_in_shelf_order() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed("Live match", None, workspace.path(), 3, now()),
+            listed("Other work", None, workspace.path(), 2, now()),
+            settled(
+                "Shelved match",
+                None,
+                workspace.path(),
+                1,
+                hours_ago(2),
+                hours_ago(1),
+            ),
+        ],
+    );
+
+    type_terminal_text(&mut application, "match");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        sidebar_divider_row(&rows).is_none(),
+        "the results are one list rather than two shelves: {rows:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&rows, "Other work"),
+        "work the query passed over is not among the results: {rows:?}"
+    );
+    assert!(
+        rendered_row(&rows, "Live match") < rendered_row(&rows, "Shelved match"),
+        "the results keep the order the shelves would have drawn them in: {rows:?}"
+    );
+}
+
+/// The shelf's cap is what keeps history from drowning a list nobody narrowed.
+/// A query is the reader narrowing it themselves, so every result stands.
+#[test]
+fn a_query_shows_every_result_rather_than_a_capped_shelf() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(workspace.path(), set_aside_shelf(workspace.path(), 12));
+
+    type_terminal_text(&mut application, "ended");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        drawn_in_sidebar(&rows, "Ended 11"),
+        "a result the shelf would have held back stands with the rest: {rows:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&rows, "Show "),
+        "with nothing left behind an affordance to ask for: {rows:?}"
+    );
+}
+
+#[test]
+fn a_query_nothing_carries_says_so_rather_than_drawing_an_empty_column() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![listed("Sidebar shell", None, workspace.path(), 1, now())],
+    );
+
+    type_terminal_text(&mut application, "nothing");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        drawn_in_sidebar(&rows, "No Sessions match"),
+        "an empty result says why the column is empty: {rows:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&rows, "No Sessions yet"),
+        "which is not the same as having no work at all: {rows:?}"
+    );
+}
+
+#[test]
+fn backspace_takes_the_query_back_a_letter_and_widens_the_results() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed("Sidebar shell", None, workspace.path(), 2, now()),
+            listed("Shelf paging", None, workspace.path(), 1, now()),
+        ],
+    );
+
+    type_terminal_text(&mut application, "shell");
+    assert!(
+        !drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "Shelf paging"
+        ),
+        "the whole query narrows to one result"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Backspace);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        drawn_in_sidebar(&rows, "Search: shel"),
+        "the box gives up the last letter: {rows:?}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Shelf paging") && drawn_in_sidebar(&rows, "Sidebar shell"),
+        "and the results widen to what the shorter query carries: {rows:?}"
+    );
+}
+
+/// Esc backs out one step at a time: the query first, and only then the keys.
+#[test]
+fn esc_clears_the_query_and_keeps_the_keys_in_the_sidebar() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed("Sidebar shell", None, workspace.path(), 2, now()),
+            listed("Codex runtime", None, workspace.path(), 1, now()),
+        ],
+    );
+    type_terminal_text(&mut application, "shell");
+
+    press_sidebar_key(&mut application, KeyCode::Esc);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert_eq!(
+        sidebar_column(&rows[0]),
+        "Search:",
+        "the box is empty again: {rows:?}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Codex runtime"),
+        "and the whole list is back with it: {rows:?}"
+    );
+    assert!(
+        !selected_sidebar_text(&application).is_empty(),
+        "the reader is still driving the Sidebar: they cleared a query, not the surface"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Esc);
+    type_terminal_text(&mut application, "hello");
+
+    assert!(
+        rendered_application_rows_at(&application, WIDE, 20)
+            .iter()
+            .any(|row| row.contains("hello")),
+        "and the Esc after that hands the keys back to the composer"
+    );
+}
+
+#[test]
+fn enter_attaches_the_result_the_reader_is_on() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed_as(SessionId::new(), "Nearest work", workspace.path(), 3),
+            listed_as(wanted, "The work wanted", workspace.path(), 2),
+            listed_as(SessionId::new(), "Older work", workspace.path(), 1),
+        ],
+    );
+
+    type_terminal_text(&mut application, "wanted");
+
+    assert!(
+        selected_sidebar_text(&application).contains("The work wanted"),
+        "a query that leaves the selection nowhere puts the reader on the first result"
+    );
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::AttachSession(wanted),
+        "Enter attaches the result the reader is on"
+    );
+}
+
+/// The arrows walk the results and nothing else: a row the query put away is
+/// not one the reader can land on.
+#[test]
+fn the_arrows_walk_the_results_and_wrap_within_them() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed("Match first", None, workspace.path(), 3, now()),
+            listed("Passed over", None, workspace.path(), 2, now()),
+            listed("Match second", None, workspace.path(), 1, now()),
+        ],
+    );
+
+    type_terminal_text(&mut application, "match");
+
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(
+        selected_sidebar_text(&application).contains("Match second"),
+        "the arrows step over the work the query put away"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(
+        selected_sidebar_text(&application).contains("Match first"),
+        "and wrap within the results rather than past them into the rest"
+    );
+}
+
+/// A query narrows a look at one listing. The Sidebar coming back into view
+/// asks for its Sessions afresh, and that look is over.
+#[test]
+fn a_sidebar_coming_back_into_view_opens_on_the_whole_list_again() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let sessions = vec![
+        listed("Sidebar shell", None, workspace.path(), 2, now()),
+        listed("Codex runtime", None, workspace.path(), 1, now()),
+    ];
+    let mut application = sidebar_focused(workspace.path(), sessions.clone());
+    type_terminal_text(&mut application, "shell");
+
+    press_toggle(&mut application);
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+        .expect("hydrate the Sidebar it asked for afresh");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert_eq!(
+        sidebar_column(&rows[0]),
+        "Search:",
+        "the query went with the look that made it: {rows:?}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Codex runtime"),
+        "so the whole body of work is listed again: {rows:?}"
+    );
+}
+
+/// A Title is what a query is read against, so another client's retitle can
+/// carry the row the reader is on out of the results under them.
+#[test]
+fn a_result_retitled_elsewhere_out_of_the_query_takes_the_reader_with_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let moved = SessionId::new();
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed_as(SessionId::new(), "Match kept", workspace.path(), 2),
+            listed_as(moved, "Match moving", workspace.path(), 1),
+        ],
+    );
+    type_terminal_text(&mut application, "match");
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(
+        selected_sidebar_text(&application).contains("Match moving"),
+        "the reader is on the row about to be retitled"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Managed(
+            ManagedEvent::SessionTitleChanged(SessionTitleChanged {
+                session_id: moved,
+                title: "Renamed away".to_owned(),
+                emoji: None,
+            }),
+        ))
+        .expect("take the retitle another client made");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        !drawn_in_sidebar(&rows, "Renamed away"),
+        "a Title the query no longer carries leaves the results: {rows:?}"
+    );
+    assert!(
+        selected_sidebar_text(&application).contains("Match kept"),
+        "and the reader lands back on a row that is drawn, rather than on one that is not"
+    );
+}
+
+/// The box is narrow, so it shows the end of a long query rather than its
+/// beginning: a reader watches the letters they are typing.
+#[test]
+fn a_long_query_keeps_its_end_in_the_box() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![listed("Listed work", None, workspace.path(), 1, now())],
+    );
+
+    type_terminal_text(&mut application, "a query longer than the box is wide");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        sidebar_column(&rows[0]).ends_with("box is wide"),
+        "the letters the reader just typed are the ones in view: {:?}",
+        sidebar_column(&rows[0])
+    );
+}
+
+/// A listing that failed has told the reader nothing about whether their query
+/// matches anything, so the refusal is the only account the column gives.
+#[test]
+fn a_refused_listing_says_so_rather_than_blaming_the_query() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = connected_application(workspace.path());
+    deliver_launch_visibility(&mut application, SidebarVisibility::Hidden);
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    type_terminal_text(&mut application, "shell");
+    application
+        .handle_event(ApplicationEvent::SessionListingFailed {
+            request,
+            error: "the server refused".to_owned(),
+        })
+        .expect("take the refusal");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        drawn_in_sidebar(&rows, "the server refused"),
+        "the refusal stands under the search box: {rows:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&rows, "No Sessions match"),
+        "and nothing under it blames the reader's query for a list that never arrived: {rows:?}"
+    );
 }

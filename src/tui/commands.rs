@@ -472,7 +472,9 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarLeave,
         title: "Leave Sidebar",
-        description: "Hand the keys back to the composer, leaving the Sidebar standing",
+        // Backing out of a search is the inner step of backing out of the
+        // Sidebar, so the account of the command says which one it takes.
+        description: "Clear the Sidebar's search, or hand the keys back to the composer",
         slash: None,
         keybinding: None,
     },

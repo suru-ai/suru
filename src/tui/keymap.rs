@@ -88,22 +88,27 @@ pub(super) fn command_for_model_picker_event(event: InputEvent) -> Option<Comman
 }
 
 /// The Sidebar has the keyboard and not the mouse. Up and Down move through
-/// the rows, Enter opens the Session the reader is on, Esc hands the keys back
-/// to the composer, and the toggle closes the Sidebar from inside it as
-/// readily as from outside. Nothing else a reader types or pastes reaches the
-/// Sidebar — least of all the composer, which does not have the keys — and the
-/// search box that would take the typing arrives with
-/// <https://github.com/jake-tucker/suru/issues/178>.
+/// the rows, Enter opens the Session the reader is on, Esc backs out of the
+/// Sidebar a step at a time, and the toggle closes it from inside as readily
+/// as from outside. Everything else they type goes to the search box, as it
+/// does in the pickers, so a reader looking for a Session by name simply types
+/// its name — and none of it reaches the composer, which does not have the
+/// keys.
+///
+/// A paste goes to the search box whole, as it does in the pickers: a Title
+/// carried in from somewhere else is as good a way to find a Session as one
+/// the reader types out.
 ///
 /// The mouse is the exception, and answers as it does from the composer: the
 /// Sidebar stands beside the main view rather than over it, so the wheel is
 /// still the reader's way through a Transcript. The Sidebar's own rows take
 /// the mouse in <https://github.com/jake-tucker/suru/issues/181>.
 pub(super) fn command_for_sidebar_event(event: InputEvent) -> Option<CommandId> {
-    let InputEvent::Key(key) = event else {
-        return matches!(event, InputEvent::Mouse(_))
-            .then(|| command_for_terminal_event(event))
-            .flatten();
+    let key = match event {
+        InputEvent::Key(key) => key,
+        InputEvent::Paste(text) => return Some(CommandId::InsertSidebarSearch(text)),
+        event @ InputEvent::Mouse(_) => return command_for_terminal_event(event),
+        _ => return None,
     };
     if key.kind != KeyEventKind::Press {
         return None;
@@ -123,6 +128,31 @@ pub(super) fn command_for_sidebar_event(event: InputEvent) -> Option<CommandId> 
         }
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
             Some(CommandId::InvokeSemantic(SemanticCommandId::SidebarToggle))
+        }
+        _ => command_for_search_key(
+            key,
+            &CommandId::DeleteSidebarSearchBackward,
+            CommandId::InsertSidebarSearch,
+        ),
+    }
+}
+
+/// The keys that make a search box: the character the reader typed, and the
+/// Backspace taking one back. Every surface that narrows a list by what a
+/// reader types reads them here, so a query behaves the same wherever they
+/// type it — and so the surface's own keys, read first, keep whatever letters
+/// they have claimed.
+fn command_for_search_key(
+    key: KeyEvent,
+    delete_backward: &CommandId,
+    insert: fn(String) -> CommandId,
+) -> Option<CommandId> {
+    match (key.code, key.modifiers) {
+        (KeyCode::Backspace, KeyModifiers::NONE) => Some(delete_backward.clone()),
+        (KeyCode::Char(character), modifiers)
+            if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            Some(insert(character.to_string()))
         }
         _ => None,
     }
@@ -280,13 +310,7 @@ fn command_for_picker_event(
             (KeyCode::Char('a'), KeyModifiers::CONTROL) => bindings.toggle_scope.clone(),
             (KeyCode::Enter, KeyModifiers::NONE) => Some(bindings.select.clone()),
             (KeyCode::Esc, KeyModifiers::NONE) => Some(bindings.close.clone()),
-            (KeyCode::Backspace, KeyModifiers::NONE) => Some(bindings.delete_backward.clone()),
-            (KeyCode::Char(character), modifiers)
-                if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
-            {
-                Some((bindings.insert)(character.to_string()))
-            }
-            _ => None,
+            _ => command_for_search_key(key, &bindings.delete_backward, bindings.insert),
         },
         InputEvent::Paste(text) => Some((bindings.insert)(text)),
         _ => None,

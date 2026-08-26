@@ -1369,6 +1369,8 @@ pub enum CommandId {
     ActivateCompletion(CompletionMode),
     InsertSessionSearch(String),
     DeleteSessionSearchBackward,
+    InsertSidebarSearch(String),
+    DeleteSidebarSearchBackward,
     SelectPreviousSession,
     SelectNextSession,
     PagePreviousSessions,
@@ -1607,6 +1609,10 @@ impl Application {
             | CommandId::ToggleSessionScope
             | CommandId::SelectSession
             | CommandId::CloseSessionPicker) => Ok(self.handle_session_picker_command(command)),
+            command @ (CommandId::InsertSidebarSearch(_)
+            | CommandId::DeleteSidebarSearchBackward) => {
+                Ok(self.handle_sidebar_search_command(command))
+            }
             command @ (CommandId::InsertModelSearch(_)
             | CommandId::DeleteModelSearchBackward
             | CommandId::SelectPreviousModel
@@ -1817,6 +1823,20 @@ impl Application {
             }
             CommandId::CloseSessionPicker => self.edit_session_picker(SessionPicker::close),
             _ => {}
+        }
+        ApplicationTransition::Continue
+    }
+
+    /// Handles what the reader typed into the Sidebar's search box; any other
+    /// command leaves the query alone. A Sidebar the reader has closed takes
+    /// no typing, for the same reason it takes no arrows.
+    fn handle_sidebar_search_command(&mut self, command: CommandId) -> ApplicationTransition {
+        if self.state.sidebar.is_revealed() {
+            match command {
+                CommandId::InsertSidebarSearch(text) => self.state.sidebar.insert(&text),
+                CommandId::DeleteSidebarSearchBackward => self.state.sidebar.delete_backward(),
+                _ => {}
+            }
         }
         ApplicationTransition::Continue
     }
