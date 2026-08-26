@@ -113,8 +113,8 @@ The main working column of an open Session: its Transcript, queued Prompts, late
 _Avoid_: Conversation column, transcript column
 
 **Sidebar**:
-The collapsible column a client shows beside its main view, listing Sessions with the active apart from the settled, searched by Title, and scoped to one Workspace or all of them. Whether it begins shown, and how wide its scope begins, are Settings; showing or hiding it afterwards is the reader's own view state, and a terminal too narrow for both it and the main view keeps the main view.
-_Avoid_: Panel, drawer, session list, nav
+The collapsible column a client shows beside its main view, listing Sessions with the active apart from the settled, searched by Title, and scoped to one Workspace or all of them. Whether it begins shown, and how wide its scope begins, are Settings; showing or hiding it afterwards is the reader's own view state, and a terminal too narrow for both it and the main view keeps the main view. The settled Sessions stand on a **shelf** below a **divider**: a rule the Sidebar draws only where something is settled, closing the active list and naming what the rows beneath it are. Shelf rows are slim where active rows are not, because settled work is history a reader keeps in view rather than work they are choosing between.
+_Avoid_: Panel, drawer, session list, nav; archive or section (for the settled shelf)
 
 **Truncation**:
 The condition of a Message, command Activity, or Reasoning Activity whose stored content Suru's cap cut short of everything the Provider sent. Truncation is carried as a typed property beside the content rather than as text within it, so a client reads it as data and draws its own **truncation marker**: the line a Transcript shows in place of what the cap dropped.

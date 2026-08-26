@@ -16,8 +16,8 @@ use suru::{
     managed_client::ManagedEvent,
     protocol::{
         EffectiveSettings, ModelAvailability, PromptId, Session, SessionDeleted, SessionId,
-        SessionListItem, SessionStatus, SessionSummary, SessionTimestamp, SettingsSnapshot,
-        SidebarSettings, SidebarVisibility, UnreadableSessionSummary, Workspace,
+        SessionListItem, SessionSettlementChanged, SessionStatus, SessionSummary, SessionTimestamp,
+        SettingsSnapshot, SidebarSettings, SidebarVisibility, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -505,13 +505,23 @@ fn the_sidebar_survives_every_terminal_the_frame_will_draw() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let application = sidebar_showing(
         workspace.path(),
-        vec![listed(
-            "A Title long enough to run past the Sidebar's own columns",
-            Some("🧪"),
-            &workspace.path().join("suru"),
-            1,
-            days_ago(400),
-        )],
+        vec![
+            listed(
+                "A Title long enough to run past the Sidebar's own columns",
+                Some("🧪"),
+                &workspace.path().join("suru"),
+                2,
+                days_ago(400),
+            ),
+            settled(
+                "A settled Title long enough to run past them too",
+                Some("🧪"),
+                &workspace.path().join("suru"),
+                1,
+                days_ago(400),
+                days_ago(399),
+            ),
+        ],
     );
 
     for width in [1_u16, 28, 85, 86, 87, 200] {
@@ -945,4 +955,313 @@ fn sidebar_text_on(application: &Application, background: Color) -> String {
 /// The Sidebar row the reader is on while they are driving the Sidebar.
 fn selected_sidebar_text(application: &Application) -> String {
     sidebar_text_on(application, Color::Blue)
+}
+
+#[test]
+fn a_settled_session_stands_below_the_divider_as_one_slim_line() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed("Active work", None, workspace.path(), 2, now()),
+            settled(
+                "Wrapped up",
+                Some("🧪"),
+                workspace.path(),
+                1,
+                hours_ago(3),
+                minutes_ago(5),
+            ),
+            settled(
+                "Wrapped up earlier",
+                None,
+                workspace.path(),
+                3,
+                hours_ago(9),
+                hours_ago(8),
+            ),
+        ],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let divider = sidebar_divider(&rows);
+    assert!(
+        rendered_row(&rows, "Active work") < divider,
+        "the Sessions still in flight stand above the divider: {rows:?}"
+    );
+    let shelf = rendered_row(&rows, "Wrapped up");
+    assert_eq!(
+        shelf,
+        divider + 1,
+        "the settled shelf opens on the line below the divider: {rows:?}"
+    );
+    let row = sidebar_column(&rows[shelf]);
+    assert!(
+        row.starts_with('🧪') && row.contains("Wrapped up"),
+        "a settled row leads with the Emoji and the Title: {row:?}"
+    );
+    assert!(
+        row.ends_with("5m"),
+        "and closes with how long ago the work ended: {row:?}"
+    );
+    assert_eq!(
+        rendered_row(&rows, "Wrapped up earlier"),
+        shelf + 1,
+        "a settled Session takes one slim line, so the next one is the line below it: {rows:?}"
+    );
+}
+
+#[test]
+fn the_settled_shelf_orders_by_when_the_work_ended() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    // Creation order and activity order both disagree with the order the work
+    // ended in, so a shelf reading either would be caught out.
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![
+            settled(
+                "Ended first",
+                None,
+                workspace.path(),
+                3,
+                minutes_ago(1),
+                hours_ago(9),
+            ),
+            settled(
+                "Ended last",
+                None,
+                workspace.path(),
+                1,
+                hours_ago(20),
+                minutes_ago(2),
+            ),
+            settled(
+                "Ended in between",
+                None,
+                workspace.path(),
+                2,
+                hours_ago(10),
+                hours_ago(4),
+            ),
+        ],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        rendered_row(&rows, "Ended last") < rendered_row(&rows, "Ended in between"),
+        "the work that wrapped up most recently is nearest the divider: {rows:?}"
+    );
+    assert!(
+        rendered_row(&rows, "Ended in between") < rendered_row(&rows, "Ended first"),
+        "and the work that wrapped up longest ago is furthest from it: {rows:?}"
+    );
+}
+
+#[test]
+fn a_session_settled_elsewhere_moves_shelves_and_comes_back_when_it_is_unsettled() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = connected_application(workspace.path());
+    let request = expect_sidebar_listing(deliver_launch_visibility(
+        &mut application,
+        SidebarVisibility::Shown,
+    ));
+    let set_aside = SessionId::new();
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![
+                listed_as(set_aside, "Work set aside", workspace.path(), 2),
+                listed_as(SessionId::new(), "Work still going", workspace.path(), 1),
+            ],
+        })
+        .expect("hydrate the Sidebar");
+    assert!(
+        sidebar_divider_row(&rendered_application_rows_at(&application, WIDE, 20)).is_none(),
+        "a reader with nothing set aside is shown no shelf to set it on"
+    );
+
+    settle_elsewhere(&mut application, set_aside, Some(SessionTimestamp(now())));
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let divider = sidebar_divider(&rows);
+    assert!(
+        rendered_row(&rows, "Work still going") < divider,
+        "the Session still in flight keeps its place above the divider: {rows:?}"
+    );
+    assert!(
+        divider < rendered_row(&rows, "Work set aside"),
+        "the settled Session moves onto the shelf below it: {rows:?}"
+    );
+
+    settle_elsewhere(&mut application, set_aside, None);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        sidebar_divider_row(&rows).is_none(),
+        "unsettling empties the shelf, and an empty shelf takes its divider with it: {rows:?}"
+    );
+    assert!(
+        rendered_row(&rows, "Work set aside") < rendered_row(&rows, "Work still going"),
+        "and the Session comes back to the place its creation order gives it: {rows:?}"
+    );
+}
+
+#[test]
+fn a_listing_refreshed_with_a_settled_marker_moves_the_session_onto_the_shelf() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let set_apart = SessionId::new();
+    let steady = SessionId::new();
+    let listing = |settled: bool| {
+        let questioned = listed_as(set_apart, "Work in question", workspace.path(), 2);
+        vec![
+            if settled {
+                set_aside(questioned, now())
+            } else {
+                questioned
+            },
+            listed_as(steady, "Steady work", workspace.path(), 1),
+        ]
+    };
+    let mut application = sidebar_showing(workspace.path(), listing(false));
+    assert!(
+        sidebar_divider_row(&rendered_application_rows_at(&application, WIDE, 20)).is_none(),
+        "the Session opens on the active list, where an unmarked Session belongs"
+    );
+
+    // Hiding and showing the Sidebar is what asks the server afresh, so this
+    // is a whole listing landing rather than a change announced in place.
+    press_toggle(&mut application);
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: listing(true),
+        })
+        .expect("adopt the refreshed listing");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let divider = sidebar_divider(&rows);
+    assert!(
+        divider < rendered_row(&rows, "Work in question"),
+        "a listing carrying the marker puts the Session on the settled shelf: {rows:?}"
+    );
+    assert!(
+        rendered_row(&rows, "Steady work") < divider,
+        "and leaves the Session it does not mark on the active list: {rows:?}"
+    );
+}
+
+#[test]
+fn a_never_prompted_session_lists_as_active() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    // A Session made and then left alone: no Prompt, so nothing has moved it
+    // since. Settling is the reader's say-so, and they have not said so.
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed("Never prompted", None, workspace.path(), 1, days_ago(30)),
+            settled(
+                "Set aside",
+                None,
+                workspace.path(),
+                2,
+                hours_ago(2),
+                hours_ago(1),
+            ),
+        ],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        rendered_row(&rows, "Never prompted") < sidebar_divider(&rows),
+        "the Session a reader just made is never hidden on the settled shelf: {rows:?}"
+    );
+}
+
+#[test]
+fn the_arrows_walk_across_the_divider_onto_the_settled_shelf() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed("Still going", None, workspace.path(), 1, now()),
+            settled(
+                "Set aside",
+                None,
+                workspace.path(),
+                2,
+                hours_ago(2),
+                hours_ago(1),
+            ),
+        ],
+    );
+
+    assert!(
+        selected_sidebar_text(&application).contains("Still going"),
+        "an opened Sidebar starts on the row nearest the reader"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(
+        selected_sidebar_text(&application).contains("Set aside"),
+        "the divider is a rule rather than a row, so the arrows step over it onto the shelf"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(
+        selected_sidebar_text(&application).contains("Still going"),
+        "and past the end of the shelf they wrap back to the top of the active list"
+    );
+}
+
+/// A settlement another client made, arriving on the session-catalog stream.
+fn settle_elsewhere(
+    application: &mut Application,
+    session_id: SessionId,
+    settled_at: Option<SessionTimestamp>,
+) {
+    application
+        .handle_event(ApplicationEvent::Managed(
+            ManagedEvent::SessionSettlementChanged(SessionSettlementChanged {
+                session_id,
+                settled_at,
+            }),
+        ))
+        .expect("take the settlement another client made");
+}
+
+/// The row the divider closing the active list is drawn on, where there is a
+/// settled shelf for it to open.
+fn sidebar_divider_row(rows: &[String]) -> Option<usize> {
+    rows.iter()
+        .position(|row| sidebar_column(row).starts_with("Settled ─"))
+}
+
+fn sidebar_divider(rows: &[String]) -> usize {
+    sidebar_divider_row(rows)
+        .unwrap_or_else(|| panic!("the divider opens the settled shelf: {rows:?}"))
+}
+
+/// A Session the reader has set aside as done for now.
+fn settled(
+    title: &str,
+    emoji: Option<&str>,
+    workspace: &Path,
+    created_at: u64,
+    updated_at: u64,
+    settled_at: u64,
+) -> SessionListItem {
+    set_aside(
+        listed(title, emoji, workspace, created_at, updated_at),
+        settled_at,
+    )
+}
+
+/// A listed Session as a listing that carries its settled marker reports it.
+fn set_aside(session: SessionListItem, settled_at: u64) -> SessionListItem {
+    let SessionListItem::Readable(mut summary) = session else {
+        unreachable!("the fixture builds a readable Session");
+    };
+    summary.settled_at = Some(SessionTimestamp(settled_at));
+    SessionListItem::Readable(summary)
 }

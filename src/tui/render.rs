@@ -1,7 +1,10 @@
 //! Frame rendering: the landing and Session screens, the pickers and overlays,
 //! and the shared text and layout helpers they draw with.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use ratatui::{
     Frame,
@@ -31,7 +34,7 @@ use super::{
     settings_panel::{
         PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, TabBar, TabSpan,
     },
-    sidebar::{self, SidebarRow},
+    sidebar::{self, SidebarEntry, SidebarRow, SidebarShelf},
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
         PromptFooterSlotContext, PromptStatusSlotContext, RenderSlots, RenderedSlot,
@@ -1054,7 +1057,7 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     state.sidebar.record_drawn();
     let [column, main] =
         Layout::horizontal([Constraint::Length(width), Constraint::Min(1)]).areas(frame_area);
-    // The divider stands out while the reader is driving the Sidebar, which is
+    // The Sidebar's edge stands out while the reader is driving it, which is
     // the same account of focus the composer's own border gives.
     let block =
         Block::default()
@@ -1078,15 +1081,10 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     main
 }
 
-/// The lines one active Sidebar row takes, the third of them saying nothing
-/// until git awareness gives it something to say. The column reads its list in
-/// whole rows, so a row that does not fit is wound past rather than cut in
-/// half.
-const SIDEBAR_ROW_LINES: usize = 3;
-
-/// The Sidebar's whole body: what the server last refused, then one
-/// three-line entry per Session — as many of them as the column is tall — or
-/// the one line that stands in for a list there is nothing to draw.
+/// The Sidebar's whole body: what the server last refused, then the active
+/// Sessions, then the divider and the settled ones — as many of them as the
+/// column is tall — or the one line that stands in for a list there is nothing
+/// to draw.
 fn sidebar_lines(
     state: &TuiState,
     width: usize,
@@ -1100,12 +1098,12 @@ fn sidebar_lines(
             theme.feedback.error,
         ));
     }
-    let capacity = height.saturating_sub(lines.len()) / SIDEBAR_ROW_LINES;
-    let rows = state.sidebar.visible_rows(
+    let capacity = height.saturating_sub(lines.len());
+    let entries = state.sidebar.visible_entries(
         capacity,
         state.session.as_ref().map(SessionProjection::session_id),
     );
-    if rows.is_empty() {
+    if entries.is_empty() {
         if state.sidebar.is_loading() {
             lines.push(Line::styled("Loading Sessions…", theme.text.subdued));
         } else if lines.is_empty() {
@@ -1116,60 +1114,159 @@ fn sidebar_lines(
     let now = current_time_millis();
     let focused = state.sidebar.has_focus();
     lines.extend(
-        rows.into_iter()
-            .flat_map(|row| sidebar_row_lines(row, width, now, focused, theme)),
+        entries
+            .into_iter()
+            .flat_map(|entry| sidebar_entry_lines(entry, width, now, focused, theme)),
     );
     lines
 }
 
-/// One Session as three lines: where the work lives and how long ago it moved,
-/// then what the work is, then a line saying nothing until the git awareness of
-/// <https://github.com/jake-tucker/suru/issues/169> gives it something to say.
-fn sidebar_row_lines(
-    row: SidebarRow<'_>,
+/// One entry of the Sidebar's body: a Session on either shelf, or the rule
+/// between the two.
+fn sidebar_entry_lines(
+    entry: SidebarEntry<'_>,
     width: usize,
     now: u64,
     focused: bool,
     theme: &Theme,
-) -> [Line<'static>; SIDEBAR_ROW_LINES] {
-    // The row the reader is on is drawn whole, so the selection reads as one
-    // block rather than as three lines that happen to be lit. It keeps its
-    // highlight when the keys are elsewhere, dimmed, because it is still the
-    // row Enter would act on once they come back.
-    let selected = row.selected.then_some(if focused {
-        theme.selection.focused
-    } else {
-        theme.selection.unfocused
-    });
-    let elapsed = relative_update_time_compact(row.updated_at, now);
-    let workspace = row
-        .workspace
-        .map(sidebar::workspace_name)
-        .unwrap_or_default();
-    let workspace = truncate_to_width(&workspace, width.saturating_sub(elapsed.width() + 1));
-    let gap = " ".repeat(width.saturating_sub(workspace.width() + elapsed.width()));
-    let title = match row.emoji {
-        Some(emoji) => format!("{emoji} {}", row.title),
-        None => row.title.to_owned(),
-    };
-    let title_style = selected.unwrap_or(if row.current {
-        theme.accent.primary
-    } else {
-        theme.text.primary
-    });
+) -> Vec<Line<'static>> {
+    match entry {
+        SidebarEntry::Divider => vec![sidebar_divider_line(width, theme)],
+        SidebarEntry::Row(row) => match row.shelf {
+            SidebarShelf::Active {
+                workspace,
+                updated_at,
+            } => sidebar_active_row_lines(row, workspace, updated_at, width, now, focused, theme)
+                .to_vec(),
+            SidebarShelf::Settled { ended_at } => {
+                vec![sidebar_settled_row_line(
+                    row, ended_at, width, now, focused, theme,
+                )]
+            }
+        },
+    }
+}
+
+/// The rule closing the active list and opening the settled shelf, named so a
+/// reader knows what the slim rows below it are.
+fn sidebar_divider_line(width: usize, theme: &Theme) -> Line<'static> {
+    const LABEL: &str = "Settled";
+    let rule = "\u{2500}".repeat(width.saturating_sub(LABEL.width() + 1));
+    Line::styled(
+        truncate_to_width(&format!("{LABEL} {rule}"), width),
+        theme.text.subdued,
+    )
+}
+
+/// One active Session, as three lines: where the work lives and how long ago
+/// it moved, then what the work is, then a line saying nothing until
+/// the git awareness of <https://github.com/jake-tucker/suru/issues/169> gives
+/// it something to say.
+fn sidebar_active_row_lines(
+    row: SidebarRow<'_>,
+    workspace: Option<&Path>,
+    updated_at: SessionTimestamp,
+    width: usize,
+    now: u64,
+    focused: bool,
+    theme: &Theme,
+) -> [Line<'static>; sidebar::ACTIVE_ROW_LINES] {
+    let selected = sidebar_selection_style(row, focused, theme);
+    let workspace = workspace.map(sidebar::workspace_name).unwrap_or_default();
     let label_style = selected.unwrap_or(theme.text.subdued);
     [
-        Line::from(vec![
-            Span::styled(workspace, label_style),
-            Span::styled(gap, selected.unwrap_or_default()),
-            Span::styled(elapsed, label_style),
-        ]),
+        sidebar_slotted_line(
+            &workspace,
+            label_style,
+            updated_at,
+            width,
+            now,
+            selected,
+            theme,
+        ),
         Line::styled(
-            pad_to_width(&truncate_to_width(&title, width), width),
-            title_style,
+            pad_to_width(&truncate_to_width(&sidebar_title(row), width), width),
+            sidebar_title_style(row, selected, theme),
         ),
         Line::styled(" ".repeat(width), selected.unwrap_or_default()),
     ]
+}
+
+/// One Session set aside, as the single slim line the settled shelf gives it:
+/// what the work was, and how long ago it ended.
+fn sidebar_settled_row_line(
+    row: SidebarRow<'_>,
+    ended_at: SessionTimestamp,
+    width: usize,
+    now: u64,
+    focused: bool,
+    theme: &Theme,
+) -> Line<'static> {
+    let selected = sidebar_selection_style(row, focused, theme);
+    sidebar_slotted_line(
+        &sidebar_title(row),
+        sidebar_title_style(row, selected, theme),
+        ended_at,
+        width,
+        now,
+        selected,
+        theme,
+    )
+}
+
+/// A Sidebar line with a label down its left and a compact time in its right
+/// slot, the two held apart by the whole of what the column has left. Both
+/// shelves lay their right slot out this way, so both lay it out here: an
+/// active row's Workspace beside its last activity, a settled row's Title
+/// beside when its work ended.
+fn sidebar_slotted_line(
+    label: &str,
+    label_style: Style,
+    slot: SessionTimestamp,
+    width: usize,
+    now: u64,
+    selected: Option<Style>,
+    theme: &Theme,
+) -> Line<'static> {
+    let elapsed = relative_update_time_compact(slot, now);
+    let label = truncate_to_width(label, width.saturating_sub(elapsed.width() + 1));
+    let gap = " ".repeat(width.saturating_sub(label.width() + elapsed.width()));
+    Line::from(vec![
+        Span::styled(label, label_style),
+        Span::styled(gap, selected.unwrap_or_default()),
+        Span::styled(elapsed, selected.unwrap_or(theme.text.subdued)),
+    ])
+}
+
+/// How the row the reader is on is drawn, and `None` for every other row. A
+/// selected row is drawn whole, so it reads as one block rather than as lines
+/// that happen to be lit. It keeps its highlight when the keys are elsewhere,
+/// dimmed, because it is still the row Enter would act on once they come back.
+fn sidebar_selection_style(row: SidebarRow<'_>, focused: bool, theme: &Theme) -> Option<Style> {
+    row.selected.then_some(if focused {
+        theme.selection.focused
+    } else {
+        theme.selection.unfocused
+    })
+}
+
+/// What a Session is called in the Sidebar: its Emoji, where it has one, and
+/// then its Title.
+fn sidebar_title(row: SidebarRow<'_>) -> String {
+    match row.emoji {
+        Some(emoji) => format!("{emoji} {}", row.title),
+        None => row.title.to_owned(),
+    }
+}
+
+/// How a Session's name is drawn: highlighted where the reader is on it,
+/// accented where it is the Session they have open, and plain otherwise.
+fn sidebar_title_style(row: SidebarRow<'_>, selected: Option<Style>, theme: &Theme) -> Style {
+    selected.unwrap_or(if row.current {
+        theme.accent.primary
+    } else {
+        theme.text.primary
+    })
 }
 
 /// `text` with enough trailing spaces to fill `width` columns, so a line that

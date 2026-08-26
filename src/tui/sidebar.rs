@@ -71,28 +71,22 @@ pub(super) struct Sidebar {
     /// reads it back: a Sidebar squeezed off a narrow terminal keeps the
     /// reader's focus but cannot act on it.
     on_screen: Cell<bool>,
-    /// The row the column's window opens on. Only a frame knows how many rows
-    /// it holds, so the window is settled at draw time and remembered here: a
-    /// selection moving to a row already in view leaves it where it is, and
-    /// only a selection moving out of view carries it along.
+    /// The entry the column's window opens on. Only a frame knows how many
+    /// lines it holds, so the window is settled at draw time and remembered
+    /// here: a selection moving to a row already in view leaves it where it
+    /// is, and only a selection moving out of view carries it along.
     window_start: Cell<usize>,
 }
 
-/// One Session as the Sidebar draws it: three lines, the third of them saying
-/// nothing until git awareness gives it something to say
+/// The lines one active Sidebar row takes, the third of them saying nothing
+/// until git awareness gives it something to say
 /// (<https://github.com/jake-tucker/suru/issues/169>).
+pub(super) const ACTIVE_ROW_LINES: usize = 3;
+
+/// One Session as the Sidebar draws it. The shelf it stands on decides its
+/// shape, so a row carries its shelf alongside what every row says.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SidebarRow<'a> {
-    /// The Workspace this Session is rooted in, drawn by its last component. A
-    /// Session Suru could not read may not know its Workspace at all.
-    pub(super) workspace: Option<&'a Path>,
-    /// How long ago this Session was last active, drawn in the row's right
-    /// slot.
-    // The right slot holds only a time today. Working with a ticking duration
-    // arrives with <https://github.com/jake-tucker/suru/issues/182>, and the
-    // remaining status labels with
-    // <https://github.com/jake-tucker/suru/issues/168>.
-    pub(super) updated_at: SessionTimestamp,
     pub(super) emoji: Option<&'a str>,
     pub(super) title: &'a str,
     /// Whether this is the Session the reader has open.
@@ -100,6 +94,76 @@ pub(super) struct SidebarRow<'a> {
     /// Whether this is the row the reader is on, which is the one Enter acts
     /// on and the one the column draws highlighted.
     pub(super) selected: bool,
+    pub(super) shelf: SidebarShelf<'a>,
+}
+
+/// Which of the Sidebar's two shelves a Session stands on, carrying what that
+/// shelf gives its row to say.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SidebarShelf<'a> {
+    /// Work still active, drawn in full so a reader can tell one Session from
+    /// another at a glance.
+    Active {
+        /// The Workspace this Session is rooted in, drawn by its last
+        /// component. A Session Suru could not read may not know its Workspace
+        /// at all.
+        workspace: Option<&'a Path>,
+        /// How long ago this Session was last active, drawn in the row's right
+        /// slot.
+        // The right slot holds only a time today. Working with a ticking
+        // duration arrives with
+        // <https://github.com/jake-tucker/suru/issues/182>, and the remaining
+        // status labels with
+        // <https://github.com/jake-tucker/suru/issues/168>.
+        updated_at: SessionTimestamp,
+    },
+    /// Work set aside as done for now, drawn slim: settled Sessions are
+    /// history the reader keeps in view, not work they are choosing between.
+    Settled {
+        /// When this Session's work ended, drawn in the row's right slot. The
+        /// shelf orders on the same reading, so what a row says can never
+        /// disagree with where it sits.
+        ended_at: SessionTimestamp,
+    },
+}
+
+impl SidebarShelf<'_> {
+    /// The lines a row on this shelf takes.
+    const fn lines(&self) -> usize {
+        match self {
+            Self::Active { .. } => ACTIVE_ROW_LINES,
+            Self::Settled { .. } => 1,
+        }
+    }
+}
+
+/// The Sidebar's body, top to bottom: the active Sessions, then — where there
+/// is a settled shelf to open — the divider, then the settled ones.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SidebarEntry<'a> {
+    Row(SidebarRow<'a>),
+    /// The rule closing the active list and opening the settled shelf. It
+    /// stands only where something is settled: a reader with nothing set aside
+    /// is shown no shelf to set it on.
+    Divider,
+}
+
+impl SidebarEntry<'_> {
+    /// The lines this entry takes, which is what a column measures its window
+    /// in: entries are not all the same height, so the window is settled in
+    /// lines rather than in rows.
+    const fn lines(&self) -> usize {
+        match self {
+            Self::Row(row) => row.shelf.lines(),
+            Self::Divider => 1,
+        }
+    }
+
+    /// Whether this is the entry the reader is on. The divider never is: it
+    /// is a rule rather than a row, so the arrows step over it.
+    const fn is_selected(&self) -> bool {
+        matches!(self, Self::Row(row) if row.selected)
+    }
 }
 
 impl Sidebar {
@@ -311,46 +375,124 @@ impl Sidebar {
         self.listing.error()
     }
 
-    /// The rows a column this tall can hold: a list longer than the Sidebar is
-    /// read through a window rather than being crammed into the rows
+    /// What a column this many lines tall shows: a list longer than the Sidebar
+    /// is read through a window rather than being crammed into the lines
     /// available. The window moves only as far as it must to keep the row the
     /// reader is on in view, so moving within it leaves every other row where
-    /// the reader last saw it.
-    pub(super) fn visible_rows(
+    /// the reader last saw it, and an entry the last line cannot hold whole is
+    /// left off rather than cut in half.
+    pub(super) fn visible_entries(
         &self,
         capacity: usize,
         current: Option<SessionId>,
-    ) -> Vec<SidebarRow<'_>> {
-        let rows = self.rows(current);
-        let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
-        let start = window_start(self.window_start.get(), selected, rows.len(), capacity);
+    ) -> Vec<SidebarEntry<'_>> {
+        let entries = self.entries(current);
+        let heights = entries.iter().map(SidebarEntry::lines).collect::<Vec<_>>();
+        let selected = entries
+            .iter()
+            .position(SidebarEntry::is_selected)
+            .unwrap_or(0);
+        let start = window_start(self.window_start.get(), selected, &heights, capacity);
         self.window_start.set(start);
-        rows.into_iter().skip(start).take(capacity).collect()
-    }
-
-    fn rows(&self, current: Option<SessionId>) -> Vec<SidebarRow<'_>> {
-        self.ordered()
+        let mut remaining = capacity;
+        entries
             .into_iter()
-            .map(|session| SidebarRow {
-                workspace: session
-                    .workspace()
-                    .map(|workspace| workspace.path.as_path()),
-                updated_at: session.updated_at(),
-                emoji: session.emoji(),
-                title: session.title(),
-                current: current == Some(session.id()),
-                selected: self.selected == Some(session.id()),
+            .skip(start)
+            .take_while(|entry| {
+                let Some(left) = remaining.checked_sub(entry.lines()) else {
+                    return false;
+                };
+                remaining = left;
+                true
             })
             .collect()
     }
 
-    /// The Sessions in the order the Sidebar shows them: newest created first,
-    /// and never reordered by activity, so a row a reader has their eye on
-    /// holds its place while the work behind it moves.
-    fn ordered(&self) -> Vec<&SessionListItem> {
-        let mut sessions = self.listing.sessions().iter().collect::<Vec<_>>();
+    /// The Sidebar's body in the order it is drawn: the active Sessions, then
+    /// the divider and the settled ones where anything is settled.
+    fn entries(&self, current: Option<SessionId>) -> Vec<SidebarEntry<'_>> {
+        let mut entries = self
+            .active()
+            .into_iter()
+            .map(|session| {
+                self.row(
+                    session,
+                    current,
+                    SidebarShelf::Active {
+                        workspace: session
+                            .workspace()
+                            .map(|workspace| workspace.path.as_path()),
+                        updated_at: session.updated_at(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let settled = self.settled();
+        if settled.is_empty() {
+            return entries;
+        }
+        entries.push(SidebarEntry::Divider);
+        entries.extend(settled.into_iter().map(|session| {
+            self.row(
+                session,
+                current,
+                SidebarShelf::Settled {
+                    ended_at: ended_at(session),
+                },
+            )
+        }));
+        entries
+    }
+
+    fn row<'a>(
+        &self,
+        session: &'a SessionListItem,
+        current: Option<SessionId>,
+        shelf: SidebarShelf<'a>,
+    ) -> SidebarEntry<'a> {
+        SidebarEntry::Row(SidebarRow {
+            emoji: session.emoji(),
+            title: session.title(),
+            current: current == Some(session.id()),
+            selected: self.selected == Some(session.id()),
+            shelf,
+        })
+    }
+
+    /// The active Sessions: newest created first, and never reordered by
+    /// activity, so a row a reader has their eye on holds its place while the
+    /// work behind it moves.
+    fn active(&self) -> Vec<&SessionListItem> {
+        let mut sessions = self
+            .listing
+            .sessions()
+            .iter()
+            .filter(|session| !is_settled(session))
+            .collect::<Vec<_>>();
         sessions.sort_by_key(|session| Reverse(session.created_at()));
         sessions
+    }
+
+    /// The Sessions set aside, ordered by when the work ended rather than by
+    /// when it began, so what wrapped up most recently is nearest the divider.
+    fn settled(&self) -> Vec<&SessionListItem> {
+        let mut sessions = self
+            .listing
+            .sessions()
+            .iter()
+            .filter(|session| is_settled(session))
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|session| Reverse(ended_at(session)));
+        sessions
+    }
+
+    /// Every listed Session in the order the Sidebar draws it, which is the
+    /// order the arrows walk: down the active list, across the divider, and on
+    /// down the settled shelf.
+    fn ordered(&self) -> Vec<&SessionListItem> {
+        let mut ordered = self.active();
+        ordered.extend(self.settled());
+        ordered
     }
 
     fn first_listed(&self) -> Option<SessionId> {
@@ -395,15 +537,55 @@ impl Sidebar {
     }
 }
 
-/// Where a column holding `capacity` rows opens, given the window it last
-/// opened on and the row the reader is now on. The window holds still while
-/// the selection is inside it and is carried only as far as the selection
-/// takes it, and never so far that it runs off the end of a list that has
-/// since grown shorter.
-fn window_start(last: usize, selected: usize, listed: usize, capacity: usize) -> usize {
-    let furthest = listed.saturating_sub(capacity);
-    let earliest = selected.saturating_add(1).saturating_sub(capacity);
+/// Whether a Session stands on the settled shelf. The reader's own say-so is
+/// the only thing that settles one today; a Session settling on its own after
+/// long enough idle arrives with
+/// <https://github.com/jake-tucker/suru/issues/176>.
+fn is_settled(session: &SessionListItem) -> bool {
+    session.settled_at().is_some()
+}
+
+/// When a Session's work ended, which is both where it sits on the settled
+/// shelf and what its row says. Both read this one function, so the order and
+/// the label can never disagree.
+///
+/// Settling by the reader's say-so is stamped with the moment it happened.
+/// Settling on its own after long enough idle
+/// (<https://github.com/jake-tucker/suru/issues/176>) carries no such stamp,
+/// so the reading falls back to when the Session was last active — which is
+/// the moment the idle it settled for began.
+fn ended_at(session: &SessionListItem) -> SessionTimestamp {
+    session.settled_at().unwrap_or_else(|| session.updated_at())
+}
+
+/// Where a column holding `capacity` lines opens, given the entry it last
+/// opened on and the entry the reader is now on. Entries are not all one
+/// height — an active Session takes three lines, a settled one and the divider
+/// take one — so the window is measured in lines and reported as the entry it
+/// starts at. It holds still while the selection is inside it, is carried only
+/// as far as the selection takes it, and never so far that it trails blank
+/// lines below a list that has since grown shorter.
+fn window_start(last: usize, selected: usize, heights: &[usize], capacity: usize) -> usize {
+    let furthest = earliest_opening(heights, heights.len().saturating_sub(1), capacity);
+    let earliest = earliest_opening(heights, selected, capacity);
     last.min(selected).min(furthest).max(earliest)
+}
+
+/// The earliest entry a column holding `capacity` lines can open on while
+/// still showing every line of the entry at `last_shown`. An entry too tall
+/// for the column at all is opened on regardless, because a column that showed
+/// nothing would be worse than one that shows what it can.
+fn earliest_opening(heights: &[usize], last_shown: usize, capacity: usize) -> usize {
+    let mut used = 0;
+    let mut opening = last_shown;
+    for (index, height) in heights.iter().enumerate().take(last_shown + 1).rev() {
+        used += height;
+        if used > capacity {
+            break;
+        }
+        opening = index;
+    }
+    opening
 }
 
 /// The Workspace as a Sidebar row names it: its last path component, which is
@@ -428,7 +610,9 @@ mod tests {
             ModelAvailability, Session, SessionId, SessionListItem, SessionStatus, SessionSummary,
             SessionTimestamp, SidebarVisibility, Workspace,
         },
-        tui::sidebar::{MINIMUM_MAIN_WIDTH, SIDEBAR_WIDTH, Sidebar, width_beside, workspace_name},
+        tui::sidebar::{
+            MINIMUM_MAIN_WIDTH, SIDEBAR_WIDTH, Sidebar, SidebarEntry, width_beside, workspace_name,
+        },
     };
 
     #[test]
@@ -496,14 +680,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(
-            sidebar
-                .rows(None)
-                .into_iter()
-                .map(|row| row.title)
-                .collect::<Vec<_>>(),
-            vec!["Newest", "Middle", "Oldest"]
-        );
+        assert_eq!(drawn(&sidebar), vec!["Newest", "Middle", "Oldest"]);
     }
 
     #[test]
@@ -656,14 +833,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_settled_stand_below_the_divider_in_the_order_their_work_ended() {
+        let mut sidebar = Sidebar::new(root());
+        sidebar.toggle();
+        let request = sidebar.take_listing_request().expect("ask for Sessions");
+        sidebar.load(
+            &request,
+            vec![
+                set_aside("Ended first", 4, 90, 30),
+                summary("Older, still going", 1, 20),
+                set_aside("Ended last", 2, 10, 70),
+                summary("Newer, still going", 3, 80),
+            ],
+            None,
+        );
+
+        assert_eq!(
+            drawn(&sidebar),
+            vec![
+                "Newer, still going",
+                "Older, still going",
+                DIVIDER,
+                "Ended last",
+                "Ended first"
+            ],
+            "the active list keeps its creation order and the shelf takes the order work ended in"
+        );
+    }
+
+    #[test]
+    fn a_column_windows_in_lines_because_the_two_shelves_are_not_one_height() {
+        let mut sidebar = Sidebar::new(root());
+        sidebar.toggle();
+        let request = sidebar.take_listing_request().expect("ask for Sessions");
+        sidebar.load(
+            &request,
+            vec![
+                summary("Still going", 2, 20),
+                set_aside("Ended last", 1, 10, 9),
+                set_aside("Ended first", 3, 8, 7),
+            ],
+            None,
+        );
+
+        assert_eq!(
+            drawn_within(&sidebar, 5),
+            vec!["Still going", DIVIDER, "Ended last"],
+            "three lines for the active Session, one for the divider, one for the shelf"
+        );
+        assert_eq!(
+            drawn_within(&sidebar, 6),
+            vec!["Still going", DIVIDER, "Ended last", "Ended first"],
+            "a column measuring in rows would have wound past what the sixth line holds"
+        );
+        assert!(
+            drawn_within(&sidebar, 2).is_empty(),
+            "an entry the column cannot hold whole is left off rather than cut in half"
+        );
+    }
+
+    /// What stands in for the divider where the Titles the Sidebar draws are
+    /// read out in order.
+    const DIVIDER: &str = "<divider>";
+
+    /// The Sidebar's whole body, top to bottom, as the Titles it draws.
+    fn drawn(sidebar: &Sidebar) -> Vec<&str> {
+        entry_titles(sidebar.entries(None))
+    }
+
+    /// The Sidebar's body as a column `capacity` lines tall shows it.
+    fn drawn_within(sidebar: &Sidebar, capacity: usize) -> Vec<&str> {
+        entry_titles(sidebar.visible_entries(capacity, None))
+    }
+
+    fn entry_titles<'a>(entries: Vec<SidebarEntry<'a>>) -> Vec<&'a str> {
+        entries
+            .into_iter()
+            .map(|entry| match entry {
+                SidebarEntry::Row(row) => row.title,
+                SidebarEntry::Divider => DIVIDER,
+            })
+            .collect()
+    }
+
     /// The Title of the row the reader is on, which is what a selection is
     /// for.
     fn selected(sidebar: &Sidebar) -> Option<&str> {
         sidebar
-            .rows(None)
+            .entries(None)
             .into_iter()
-            .find(|row| row.selected)
-            .map(|row| row.title)
+            .find_map(|entry| match entry {
+                SidebarEntry::Row(row) if row.selected => Some(row.title),
+                _ => None,
+            })
     }
 
     fn identified(session_id: SessionId, title: &str, created_at: u64) -> SessionListItem {
@@ -671,6 +934,20 @@ mod tests {
             unreachable!("the fixture builds a readable Session");
         };
         listed.session.id = session_id;
+        SessionListItem::Readable(listed)
+    }
+
+    /// A Session the reader has set aside as done for now.
+    fn set_aside(
+        title: &str,
+        created_at: u64,
+        updated_at: u64,
+        settled_at: u64,
+    ) -> SessionListItem {
+        let SessionListItem::Readable(mut listed) = summary(title, created_at, updated_at) else {
+            unreachable!("the fixture builds a readable Session");
+        };
+        listed.settled_at = Some(SessionTimestamp(settled_at));
         SessionListItem::Readable(listed)
     }
 
