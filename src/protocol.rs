@@ -765,64 +765,79 @@ pub enum SidebarVisibility {
     Hidden,
 }
 
-/// How long a Session may go untouched before it settles on its own, in whole
-/// days. Never less than one: a threshold of zero would settle a Session the
-/// moment its work stopped, which is not leaving work alone, it is emptying the
-/// active list.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(transparent)]
-pub struct IdleDays(pub u64);
-
-impl IdleDays {
-    pub const MINIMUM: u64 = 1;
-
-    /// The threshold as the milliseconds a Session's timestamps are measured
-    /// in, so reading a Session against it is a subtraction rather than a
-    /// conversion at every call site.
-    pub const fn millis(self) -> u64 {
-        self.0.saturating_mul(24 * 60 * 60 * 1_000)
-    }
-}
-
-impl Default for IdleDays {
-    fn default() -> Self {
-        Self(2)
-    }
-}
-
-impl<'de> Deserialize<'de> for IdleDays {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let days = u64::deserialize(deserializer)?;
-        if days < Self::MINIMUM {
-            return Err(serde::de::Error::custom(format!(
-                "{days} is below the one-day minimum"
-            )));
-        }
-        Ok(Self(days))
-    }
-}
-
-/// When a Session settles without the user saying so, having been left alone
-/// long enough.
+/// When a Session settles on its own, having been left alone long enough.
+/// `Off` leaves the settled shelf to the user's own say-so alone; `Idle`
+/// settles a Session that has gone that many whole days untouched. An idle
+/// threshold is always at least one day.
 ///
-/// Nothing is stored for this and no clock fires for it: a client derives it
-/// wherever it lists Sessions, from the Session's last activity and these two
-/// values, so turning it off or moving the threshold reclassifies every Session
-/// at once and prompting one brings it straight back.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct AutoSettleSettings {
-    pub enabled: bool,
-    pub idle_days: IdleDays,
+/// Nothing is stored for any of this and no clock fires for it: a client
+/// derives settlement wherever it lists Sessions, from each Session's last
+/// activity against this one value — so turning it off or moving the threshold
+/// reclassifies every Session at once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutoSettle {
+    Off,
+    Idle(u64),
 }
 
-impl Default for AutoSettleSettings {
+impl AutoSettle {
+    pub const MINIMUM_IDLE_DAYS: u64 = 1;
+
+    /// How long a Session must go untouched to settle itself, in the
+    /// milliseconds a Session's timestamps are measured in, and `None` where
+    /// nothing settles itself. This is the whole of what a classifier needs, so
+    /// no caller reads the days back out or asks whether settling is on.
+    pub const fn idle_millis(self) -> Option<u64> {
+        match self {
+            Self::Off => None,
+            Self::Idle(days) => Some(days.saturating_mul(24 * 60 * 60 * 1_000)),
+        }
+    }
+}
+
+impl Default for AutoSettle {
     fn default() -> Self {
-        // Spelled by hand rather than derived, because a derived `bool` is
-        // `false` and Sessions settle themselves unless the user says not to.
-        Self {
-            enabled: true,
-            idle_days: IdleDays::default(),
+        Self::Idle(2)
+    }
+}
+
+/// How a Config Document spells an [`AutoSettle`]: the one word for the value
+/// that is not a duration, or the days themselves. The same scalar shape
+/// `session.contentWidth` takes, and for the same reason — the value's own
+/// shape says which of the two it is, so nothing has to be written down twice.
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum AutoSettleDocument {
+    Named(String),
+    Idle(u64),
+}
+
+impl Serialize for AutoSettle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => AutoSettleDocument::Named("off".to_owned()),
+            Self::Idle(days) => AutoSettleDocument::Idle(*days),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoSettle {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match AutoSettleDocument::deserialize(deserializer)? {
+            AutoSettleDocument::Named(word) if word == "off" => Ok(Self::Off),
+            AutoSettleDocument::Named(word) => Err(serde::de::Error::custom(format!(
+                "{word:?} is not a way of settling a Session on its own"
+            ))),
+            AutoSettleDocument::Idle(days) if days >= Self::MINIMUM_IDLE_DAYS => {
+                Ok(Self::Idle(days))
+            }
+            // A threshold of zero would settle a Session the moment its work
+            // stopped, which is not leaving work alone, it is emptying the
+            // active list.
+            AutoSettleDocument::Idle(days) => Err(serde::de::Error::custom(format!(
+                "{days} is below the one-day minimum"
+            ))),
         }
     }
 }
@@ -831,7 +846,7 @@ impl Default for AutoSettleSettings {
 #[serde(deny_unknown_fields)]
 pub struct SidebarSettings {
     pub launch_visibility: SidebarVisibility,
-    pub auto_settle: AutoSettleSettings,
+    pub auto_settle: AutoSettle,
 }
 
 /// Whether the user wants Suru to offer a Provider at all. Every Provider
@@ -941,11 +956,8 @@ pub enum SettingMutation {
     SidebarLaunchVisibility {
         value: Option<SidebarVisibility>,
     },
-    SidebarAutoSettleEnabled {
-        value: Option<bool>,
-    },
-    SidebarAutoSettleIdleDays {
-        value: Option<IdleDays>,
+    SidebarAutoSettle {
+        value: Option<AutoSettle>,
     },
     ProviderCodexEnabled {
         value: Option<bool>,

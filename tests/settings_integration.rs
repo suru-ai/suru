@@ -8,7 +8,7 @@ use std::path::Path;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        AgentSelection, FoldPosture, IdleDays, ModelId, ProviderId, ReasoningSummaryDetail,
+        AgentSelection, AutoSettle, FoldPosture, ModelId, ProviderId, ReasoningSummaryDetail,
         ReasoningVisibility, SessionContentWidth, SettingMutation, SettingsDiagnosticSeverity,
         SettingsSnapshot, SidebarVisibility, TitleErrand,
     },
@@ -177,14 +177,14 @@ async fn a_hidden_sidebar_pins_from_a_document_and_resets_to_the_shown_default()
 }
 
 #[tokio::test]
-async fn the_auto_settle_settings_pin_from_a_document_and_reset_to_their_defaults() {
+async fn the_auto_settle_setting_pins_from_a_document_and_resets_to_its_default() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
     std::fs::write(
         config_dir.path().join("suru.jsonc"),
         r#"{
             // A week is how long I leave a thing before it is done with me.
-            "sidebar": { "autoSettle": { "enabled": false, "idleDays": 7 } },
+            "sidebar": { "autoSettle": 7 },
         }"#,
     )
     .expect("write Config Document");
@@ -197,42 +197,31 @@ async fn the_auto_settle_settings_pin_from_a_document_and_reset_to_their_default
     .expect("spawn server");
 
     let (client, opening) = attach(state_dir.path(), "settings-auto-settle").await;
-    assert!(!opening.settings.sidebar.auto_settle.enabled);
-    assert_eq!(opening.settings.sidebar.auto_settle.idle_days, IdleDays(7));
-    assert_eq!(
-        opening.pinned,
-        ["sidebar.autoSettle.enabled", "sidebar.autoSettle.idleDays"]
-    );
+    assert_eq!(opening.settings.sidebar.auto_settle, AutoSettle::Idle(7));
+    assert_eq!(opening.pinned, ["sidebar.autoSettle"]);
     assert_eq!(opening.diagnostics, []);
 
     let answered = client
-        .mutate_setting(SettingMutation::SidebarAutoSettleIdleDays {
-            value: Some(IdleDays(3)),
+        .mutate_setting(SettingMutation::SidebarAutoSettle {
+            value: Some(AutoSettle::Off),
         })
         .await
-        .expect("pin the idle threshold");
+        .expect("turn settling off");
     assert_eq!(
-        answered.settings.sidebar.auto_settle.idle_days,
-        IdleDays(3),
-        "a client pins the threshold through its own typed mutation"
+        answered.settings.sidebar.auto_settle,
+        AutoSettle::Off,
+        "one Setting holds both the threshold and the word that suspends it"
     );
+    assert_eq!(answered.pinned, ["sidebar.autoSettle"]);
 
     let answered = client
-        .mutate_setting(SettingMutation::SidebarAutoSettleEnabled { value: None })
-        .await
-        .expect("reset the Setting");
-    assert!(
-        answered.settings.sidebar.auto_settle.enabled,
-        "unpinning it lets Sessions settle themselves again"
-    );
-    let answered = client
-        .mutate_setting(SettingMutation::SidebarAutoSettleIdleDays { value: None })
+        .mutate_setting(SettingMutation::SidebarAutoSettle { value: None })
         .await
         .expect("reset the Setting");
     assert_eq!(
-        answered.settings.sidebar.auto_settle.idle_days,
-        IdleDays::default(),
-        "and the threshold falls back to the built-in two days"
+        answered.settings.sidebar.auto_settle,
+        AutoSettle::Idle(2),
+        "unpinning it lets the built-in two days resume"
     );
     assert_eq!(answered.pinned, [] as [String; 0]);
 
@@ -241,51 +230,61 @@ async fn the_auto_settle_settings_pin_from_a_document_and_reset_to_their_default
 }
 
 #[tokio::test]
-async fn an_idle_threshold_below_a_day_is_ignored_with_a_diagnostic() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let config_dir = tempfile::tempdir().expect("create isolated config directory");
-    std::fs::write(
-        config_dir.path().join("suru.jsonc"),
-        r#"{
-            "sidebar": { "autoSettle": { "idleDays": 0, "enabled": false } }
-        }"#,
-    )
-    .expect("write Config Document");
-    let server = server::spawn(
-        ServerConfig::new(state_dir.path(), "settings-auto-settle-invalid")
-            .expect("configure server")
-            .with_config_dir(config_dir.path()),
-    )
-    .await
-    .expect("spawn server");
-
-    let snapshot = attach(state_dir.path(), "settings-auto-settle-invalid")
+async fn invalid_auto_settle_pins_are_ignored_individually_with_diagnostics() {
+    for (case, invalid) in [
+        ("fraction", "1.5"),
+        ("boolean", "false"),
+        ("word", r#""never""#),
+        ("below-minimum", "0"),
+    ] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let config_dir = tempfile::tempdir().expect("create isolated config directory");
+        std::fs::write(
+            config_dir.path().join("suru.jsonc"),
+            format!(
+                r#"{{
+                    "sidebar": {{ "autoSettle": {invalid} }},
+                    "transcript": {{ "reasoningVisibility": "shown" }}
+                }}"#
+            ),
+        )
+        .expect("write Config Document");
+        let channel = format!("settings-auto-settle-invalid-{case}");
+        let server = server::spawn(
+            ServerConfig::new(state_dir.path(), &channel)
+                .expect("configure server")
+                .with_config_dir(config_dir.path()),
+        )
         .await
-        .1;
-    assert_eq!(
-        snapshot.settings.sidebar.auto_settle.idle_days,
-        IdleDays::default(),
-        "a threshold no Session could survive keeps the built-in fallback"
-    );
-    assert!(
-        !snapshot.settings.sidebar.auto_settle.enabled,
-        "and only the invalid pin is ignored"
-    );
-    assert_eq!(snapshot.pinned, ["sidebar.autoSettle.enabled"]);
-    let [diagnostic] = snapshot.diagnostics.as_slice() else {
-        panic!("expected one diagnostic, got {:?}", snapshot.diagnostics);
-    };
-    assert_eq!(diagnostic.severity, SettingsDiagnosticSeverity::Warning);
-    assert_eq!(
-        diagnostic.key.as_deref(),
-        Some("sidebar.autoSettle.idleDays")
-    );
-    assert_eq!(
-        diagnostic.message,
-        "ignored because its value is not a whole number of days, at least 1"
-    );
+        .expect("spawn server");
 
-    server.shutdown().await.expect("shut down server");
+        let snapshot = attach(state_dir.path(), &channel).await.1;
+        assert_eq!(
+            snapshot.settings.sidebar.auto_settle,
+            AutoSettle::Idle(2),
+            "{case} keeps the built-in fallback"
+        );
+        assert_eq!(
+            snapshot.settings.transcript.reasoning_visibility,
+            ReasoningVisibility::Shown,
+            "{case} ignores only the invalid pin"
+        );
+        assert_eq!(snapshot.pinned, ["transcript.reasoningVisibility"]);
+        let [diagnostic] = snapshot.diagnostics.as_slice() else {
+            panic!(
+                "{case} should produce one diagnostic: {:?}",
+                snapshot.diagnostics
+            );
+        };
+        assert_eq!(diagnostic.severity, SettingsDiagnosticSeverity::Warning);
+        assert_eq!(diagnostic.key.as_deref(), Some("sidebar.autoSettle"));
+        assert_eq!(
+            diagnostic.message,
+            "ignored because its value is not one of \"off\" or a whole number of days, at least 1"
+        );
+
+        server.shutdown().await.expect("shut down server");
+    }
 }
 
 #[tokio::test]

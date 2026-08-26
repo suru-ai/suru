@@ -7,8 +7,7 @@ use std::{
 };
 
 use crate::protocol::{
-    AutoSettleSettings, SessionId, SessionListItem, SessionTimestamp, SidebarSettings,
-    SidebarVisibility,
+    AutoSettle, SessionId, SessionListItem, SessionTimestamp, SidebarSettings, SidebarVisibility,
 };
 
 use super::{
@@ -62,7 +61,7 @@ pub(super) struct Sidebar {
     /// snapshot rather than seeded from the first, because unlike the launch
     /// Setting this one governs what the Sidebar shows for as long as it is
     /// open: editing it reclassifies every listed Session on the next frame.
-    auto_settle: AutoSettleSettings,
+    auto_settle: AutoSettle,
     listing: SessionListing,
     /// The row the reader is on, held by Session rather than by position so a
     /// listing arriving underneath them leaves the selection where the work
@@ -188,7 +187,7 @@ impl Sidebar {
             revealed: false,
             focused: false,
             seeded: false,
-            auto_settle: AutoSettleSettings::default(),
+            auto_settle: AutoSettle::default(),
             listing: SessionListing::scoped(
                 SessionListSurface::Sidebar,
                 current_workspace,
@@ -572,7 +571,7 @@ impl Sidebar {
 /// fire for it, and work that moves is active again on the very next frame.
 #[derive(Clone, Copy, Debug)]
 struct Settlement {
-    auto: AutoSettleSettings,
+    auto: AutoSettle,
     now: SessionTimestamp,
 }
 
@@ -590,14 +589,14 @@ impl Settlement {
     /// a Session Suru could not read has no activity it can see, which is the
     /// same reason it is never settled by the marker either.
     fn left_alone(&self, session: &SessionListItem) -> bool {
+        let Some(idle) = self.auto.idle_millis() else {
+            return false;
+        };
         let last_activity = session.updated_at();
-        if !self.auto.enabled
-            || session.readable().is_none()
-            || last_activity == session.created_at()
-        {
+        if session.readable().is_none() || last_activity == session.created_at() {
             return false;
         }
-        self.now.0.saturating_sub(last_activity.0) >= self.auto.idle_days.millis()
+        self.now.0.saturating_sub(last_activity.0) >= idle
     }
 }
 
@@ -662,9 +661,8 @@ mod tests {
 
     use crate::{
         protocol::{
-            AutoSettleSettings, IdleDays, ModelAvailability, Session, SessionId, SessionListItem,
-            SessionStatus, SessionSummary, SessionTimestamp, SidebarSettings, SidebarVisibility,
-            Workspace,
+            AutoSettle, ModelAvailability, Session, SessionId, SessionListItem, SessionStatus,
+            SessionSummary, SessionTimestamp, SidebarSettings, SidebarVisibility, Workspace,
         },
         tui::sidebar::{
             MINIMUM_MAIN_WIDTH, SIDEBAR_WIDTH, Sidebar, SidebarEntry, width_beside, workspace_name,
@@ -926,13 +924,12 @@ mod tests {
         let mut sidebar = Sidebar::new(root());
         sidebar.adopt_settings(&SidebarSettings {
             launch_visibility: SidebarVisibility::Shown,
-            auto_settle: AutoSettleSettings {
-                enabled: true,
-                idle_days: IdleDays(1),
-            },
+            auto_settle: AutoSettle::Idle(1),
         });
         let request = sidebar.take_listing_request().expect("ask for Sessions");
-        let a_day = IdleDays(1).millis();
+        let a_day = AutoSettle::Idle(1)
+            .idle_millis()
+            .expect("a threshold in days is a threshold");
         let now = SessionTimestamp::now().0;
         sidebar.load(
             &request,
@@ -1073,10 +1070,7 @@ mod tests {
     fn settling_nothing() -> SidebarSettings {
         SidebarSettings {
             launch_visibility: SidebarVisibility::Shown,
-            auto_settle: AutoSettleSettings {
-                enabled: false,
-                ..AutoSettleSettings::default()
-            },
+            auto_settle: AutoSettle::Off,
         }
     }
 

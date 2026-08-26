@@ -15,9 +15,9 @@ use ratatui::{buffer::Cell, style::Color};
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AutoSettleSettings, EffectiveSettings, IdleDays, ModelAvailability, PromptId, Session,
-        SessionDeleted, SessionId, SessionListItem, SessionSettlementChanged, SessionStatus,
-        SessionSummary, SessionTimestamp, SettingsSnapshot, SidebarSettings, SidebarVisibility,
+        AutoSettle, EffectiveSettings, ModelAvailability, PromptId, Session, SessionDeleted,
+        SessionId, SessionListItem, SessionSettlementChanged, SessionStatus, SessionSummary,
+        SessionTimestamp, SettingsSnapshot, SidebarSettings, SidebarVisibility,
         UnreadableSessionSummary, Workspace,
     },
     tui::{
@@ -111,7 +111,7 @@ fn the_compact_time_reads_now_minutes_hours_and_days() {
     // every Session keeps the active row the reading is drawn on.
     let application = sidebar_settling(
         workspace.path(),
-        auto_settling(false, 2),
+        AutoSettle::Off,
         vec![
             listed("Just now", None, &workspace.path().join("a"), 4, now()),
             listed(
@@ -149,7 +149,7 @@ fn the_list_is_ordered_by_creation_and_activity_never_reorders_it() {
     // and the whole listing stays on it however long ago each Session moved.
     let application = sidebar_settling(
         workspace.path(),
-        auto_settling(false, 2),
+        AutoSettle::Off,
         vec![
             listed("Oldest", None, workspace.path(), 1, now()),
             listed("Newest", None, workspace.path(), 3, days_ago(2)),
@@ -380,13 +380,13 @@ fn an_overlay_opens_over_the_main_view_and_never_over_the_sidebar() {
 /// A connected client whose Sidebar is open on the Sessions given, settling
 /// idle work the way the built-in defaults do.
 fn sidebar_showing(workspace: &Path, sessions: Vec<SessionListItem>) -> Application {
-    sidebar_settling(workspace, AutoSettleSettings::default(), sessions)
+    sidebar_settling(workspace, AutoSettle::default(), sessions)
 }
 
-/// The same, under the auto-settle Settings the reader has chosen.
+/// The same, under the auto-settle Setting the reader has chosen.
 fn sidebar_settling(
     workspace: &Path,
-    auto_settle: AutoSettleSettings,
+    auto_settle: AutoSettle,
     sessions: Vec<SessionListItem>,
 ) -> Application {
     let mut application = connected_application(workspace);
@@ -432,14 +432,6 @@ fn deliver_sidebar_settings(
             },
         )))
         .expect("receive the effective-settings snapshot")
-}
-
-/// Auto-settle as the reader left it: on or off, and how long is long enough.
-fn auto_settling(enabled: bool, idle_days: u64) -> AutoSettleSettings {
-    AutoSettleSettings {
-        enabled,
-        idle_days: IdleDays(idle_days),
-    }
 }
 
 fn press_toggle(application: &mut Application) -> ApplicationTransition {
@@ -1249,7 +1241,7 @@ fn the_idle_setting_says_how_long_being_left_alone_has_to_be() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let application = sidebar_settling(
         workspace.path(),
-        auto_settling(true, 7),
+        AutoSettle::Idle(7),
         vec![
             listed("Left alone", None, workspace.path(), 2, days_ago(3)),
             settled(
@@ -1275,7 +1267,7 @@ fn turning_auto_settle_off_leaves_only_what_the_reader_settled_on_the_shelf() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let application = sidebar_settling(
         workspace.path(),
-        auto_settling(false, 2),
+        AutoSettle::Off,
         vec![
             listed("Left alone", None, workspace.path(), 2, days_ago(30)),
             settled("Set aside", None, workspace.path(), 1, hours_ago(2), now()),
@@ -1369,7 +1361,7 @@ fn moving_the_auto_settle_settings_reclassifies_the_sidebar_in_place() {
         &mut application,
         SidebarSettings {
             launch_visibility: SidebarVisibility::Shown,
-            auto_settle: auto_settling(false, 2),
+            auto_settle: AutoSettle::Off,
         },
     );
 

@@ -19,7 +19,7 @@ use crate::support::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AgentSelection, CodexSettings, CopilotSettings, EffectiveSettings, FoldPosture, IdleDays,
+        AgentSelection, AutoSettle, CodexSettings, CopilotSettings, EffectiveSettings, FoldPosture,
         ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId,
         ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
@@ -1450,24 +1450,27 @@ fn a_valid_numeric_edit_emits_a_typed_mutation_and_waits_for_the_refreshed_snaps
     );
 }
 
-/// Every value this Setting takes is a number, so it has no named choices to
-/// step between: the numeric editor is the whole of how a reader chooses one.
+/// One Setting holds both the threshold and the word that suspends it, the way
+/// `session.contentWidth` holds both a maximum and `fill`: Space steps onto the
+/// named value, and the numeric editor chooses any of the rest.
 #[test]
-fn the_idle_threshold_is_chosen_at_its_numeric_editor_and_nowhere_else() {
+fn the_auto_settle_row_spells_its_threshold_and_space_turns_settling_off() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
-    focus_setting(&mut application, "sidebar.autoSettle.idleDays");
+    focus_setting(&mut application, "sidebar.autoSettle");
 
     assert!(
-        row(&application, "Idle before settling").contains("2 days [default]"),
+        row(&application, "Settle idle Sessions").contains("2 days [default]"),
         "the built-in threshold is visible as a default: {:?}",
-        row(&application, "Idle before settling")
+        row(&application, "Settle idle Sessions")
     );
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::Continue,
-        "a Setting the schema names no value for has nowhere to step"
+        ApplicationTransition::MutateSetting(SettingMutation::SidebarAutoSettle {
+            value: Some(AutoSettle::Off),
+        }),
+        "Space selects the Setting's one named choice"
     );
 
     assert_eq!(
@@ -1484,8 +1487,8 @@ fn the_idle_threshold_is_chosen_at_its_numeric_editor_and_nowhere_else() {
     press(&mut application, KeyCode::Char('7'), KeyModifiers::NONE);
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SidebarAutoSettleIdleDays {
-            value: Some(IdleDays(7)),
+        ApplicationTransition::MutateSetting(SettingMutation::SidebarAutoSettle {
+            value: Some(AutoSettle::Idle(7)),
         }),
         "Enter applies the edited number through the Setting's typed mutation"
     );
