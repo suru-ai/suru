@@ -463,7 +463,9 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarAttach,
         title: "Attach Selected Session",
-        description: "Open the Session the Sidebar has selected, in this TUI",
+        // Acting on the settled shelf's own affordance shows more of the shelf
+        // rather than opening anything, so the account of the command says so.
+        description: "Open the Session the Sidebar has selected, or show more of the settled shelf",
         slash: None,
         keybinding: None,
     },

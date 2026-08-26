@@ -1486,6 +1486,154 @@ fn the_arrows_walk_across_the_divider_onto_the_settled_shelf() {
     );
 }
 
+/// Recent history is what a reader looks back for; the whole of it would
+/// drown the work they are choosing between, so the shelf is bounded and the
+/// tail stands behind an affordance.
+#[test]
+fn the_settled_shelf_shows_ten_rows_and_offers_the_rest() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = sidebar_showing(workspace.path(), set_aside_shelf(workspace.path(), 12));
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+
+    let divider = sidebar_divider(&rows);
+    assert_eq!(
+        rendered_row(&rows, "Ended 00"),
+        divider + 1,
+        "the shelf opens on the work that ended most recently: {rows:?}"
+    );
+    assert_eq!(
+        rendered_row(&rows, "Ended 09"),
+        divider + 10,
+        "and closes ten rows later: {rows:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&rows, "Ended 10"),
+        "the eleventh stands under the affordance rather than on the shelf: {rows:?}"
+    );
+    assert_eq!(
+        sidebar_column(&rows[divider + 11]),
+        "Show 2 more",
+        "which offers what is left rather than a batch that is not there: {rows:?}"
+    );
+}
+
+#[test]
+fn the_affordance_shows_twenty_five_more_and_repeats_to_the_end_of_the_shelf() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(workspace.path(), set_aside_shelf(workspace.path(), 40));
+
+    press_sidebar_key(&mut application, KeyCode::Up);
+    assert_eq!(
+        selected_sidebar_text(&application).trim(),
+        "Show 25 more",
+        "past the top of the list is the affordance closing the shelf"
+    );
+
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "asking for more of the shelf attaches nothing"
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, TALL);
+    assert!(
+        drawn_in_sidebar(&rows, "Ended 34"),
+        "twenty-five more rows stand on the shelf: {rows:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&rows, "Ended 35"),
+        "and the rest still stand under it: {rows:?}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Show 5 more"),
+        "the affordance goes on offering what is left: {rows:?}"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Enter);
+
+    let rows = rendered_application_rows_at(&application, WIDE, TALL);
+    assert!(
+        drawn_in_sidebar(&rows, "Ended 39"),
+        "the whole shelf is on show: {rows:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&rows, "Show "),
+        "with nothing left to ask for: {rows:?}"
+    );
+    assert!(
+        selected_sidebar_text(&application).contains("Ended 39"),
+        "the affordance the reader was on is gone, so they land on the last row it uncovered"
+    );
+}
+
+/// The revealed tail belongs to the listing it was revealed on. A Sidebar
+/// asking for its Sessions afresh opens the shelf on its first rows again
+/// rather than inheriting however deep the reader had walked into some other
+/// body of work — coming back into view here, and narrowed to another
+/// Workspace once the selector arrives
+/// (<https://github.com/jake-tucker/suru/issues/179>), which asks the same
+/// way.
+#[test]
+fn a_sidebar_asking_for_its_sessions_afresh_opens_the_shelf_on_its_first_rows() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(workspace.path(), set_aside_shelf(workspace.path(), 12));
+    press_sidebar_key(&mut application, KeyCode::Up);
+    press_sidebar_key(&mut application, KeyCode::Enter);
+    assert!(
+        drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "Ended 11"
+        ),
+        "the reader revealed the whole of the shelf"
+    );
+
+    press_toggle(&mut application);
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: set_aside_shelf(workspace.path(), 12),
+        })
+        .expect("hydrate the Sidebar it asked for afresh");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        !drawn_in_sidebar(&rows, "Ended 11"),
+        "the tail they had revealed went with the listing it was revealed on: {rows:?}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Show 2 more"),
+        "and the shelf offers it again: {rows:?}"
+    );
+}
+
+/// Tall enough to draw a whole settled shelf, which is what a test about
+/// paging through one asks for.
+const TALL: u16 = 48;
+
+/// A shelf of Sessions the reader set aside, one minute apart, so the order
+/// the shelf draws them in is the order they are numbered.
+fn set_aside_shelf(workspace: &Path, count: u64) -> Vec<SessionListItem> {
+    (0..count)
+        .map(|ordinal| {
+            settled(
+                &format!("Ended {ordinal:02}"),
+                None,
+                workspace,
+                ordinal + 1,
+                minutes_ago(ordinal + 1),
+                minutes_ago(ordinal + 1),
+            )
+        })
+        .collect()
+}
+
+/// Whether the Sidebar's own columns carry `needle` anywhere down the frame.
+fn drawn_in_sidebar(rows: &[String], needle: &str) -> bool {
+    rows.iter().any(|row| sidebar_column(row).contains(needle))
+}
+
 /// A settlement another client made, arriving on the session-catalog stream.
 fn settle_elsewhere(
     application: &mut Application,

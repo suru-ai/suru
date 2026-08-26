@@ -1834,7 +1834,7 @@ impl Application {
             SemanticCommandId::SidebarLeave => self.state.sidebar.leave(),
             SemanticCommandId::SidebarAttach => {
                 let current = self.session_id();
-                return self.state.sidebar.begin_attachment(current).map_or(
+                return self.state.sidebar.activate(current).map_or(
                     ApplicationTransition::Continue,
                     ApplicationTransition::AttachSession,
                 );

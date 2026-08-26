@@ -31,7 +31,7 @@ use super::{
     settings_panel::{
         PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, TabBar, TabSpan,
     },
-    sidebar::{self, SidebarEntry, SidebarRow, SidebarShelf},
+    sidebar::{self, SidebarEntry, SidebarRow, SidebarShelf, SidebarShowMore},
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
         PromptFooterSlotContext, PromptStatusSlotContext, RenderSlots, RenderedSlot,
@@ -1120,6 +1120,7 @@ fn sidebar_entry_lines(
 ) -> Vec<Line<'static>> {
     match entry {
         SidebarEntry::Divider => vec![sidebar_divider_line(width, theme)],
+        SidebarEntry::ShowMore(more) => vec![sidebar_show_more_line(more, width, focused, theme)],
         SidebarEntry::Row(row) => match row.shelf {
             SidebarShelf::Active {
                 workspace,
@@ -1146,6 +1147,23 @@ fn sidebar_divider_line(width: usize, theme: &Theme) -> Line<'static> {
     )
 }
 
+/// The row closing a settled shelf with more under it, saying how much one ask
+/// would bring into view. It is drawn as a row rather than as a rule, because
+/// it is one the reader can stand on and act on.
+fn sidebar_show_more_line(
+    more: SidebarShowMore,
+    width: usize,
+    focused: bool,
+    theme: &Theme,
+) -> Line<'static> {
+    let selected = sidebar_selection_style(more.selected, focused, theme);
+    let label = format!("Show {} more", more.count);
+    Line::styled(
+        pad_to_width(&truncate_to_width(&label, width), width),
+        selected.unwrap_or(theme.text.subdued),
+    )
+}
+
 /// One active Session, as three lines: where the work lives and how long ago
 /// it moved, then what the work is, then a line saying nothing until
 /// the git awareness of <https://github.com/jake-tucker/suru/issues/169> gives
@@ -1159,7 +1177,7 @@ fn sidebar_active_row_lines(
     focused: bool,
     theme: &Theme,
 ) -> [Line<'static>; sidebar::ACTIVE_ROW_LINES] {
-    let selected = sidebar_selection_style(row, focused, theme);
+    let selected = sidebar_selection_style(row.selected, focused, theme);
     let workspace = workspace.map(sidebar::workspace_name).unwrap_or_default();
     let label_style = selected.unwrap_or(theme.text.subdued);
     [
@@ -1190,7 +1208,7 @@ fn sidebar_settled_row_line(
     focused: bool,
     theme: &Theme,
 ) -> Line<'static> {
-    let selected = sidebar_selection_style(row, focused, theme);
+    let selected = sidebar_selection_style(row.selected, focused, theme);
     sidebar_slotted_line(
         &sidebar_title(row),
         sidebar_title_style(row, selected, theme),
@@ -1230,8 +1248,8 @@ fn sidebar_slotted_line(
 /// selected row is drawn whole, so it reads as one block rather than as lines
 /// that happen to be lit. It keeps its highlight when the keys are elsewhere,
 /// dimmed, because it is still the row Enter would act on once they come back.
-fn sidebar_selection_style(row: SidebarRow<'_>, focused: bool, theme: &Theme) -> Option<Style> {
-    row.selected.then_some(if focused {
+fn sidebar_selection_style(selected: bool, focused: bool, theme: &Theme) -> Option<Style> {
+    selected.then_some(if focused {
         theme.selection.focused
     } else {
         theme.selection.unfocused

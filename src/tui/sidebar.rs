@@ -63,10 +63,15 @@ pub(super) struct Sidebar {
     /// open: editing it reclassifies every listed Session on the next frame.
     auto_settle: AutoSettle,
     listing: SessionListing,
-    /// The row the reader is on, held by Session rather than by position so a
-    /// listing arriving underneath them leaves the selection where the work
-    /// is rather than where the row was.
-    selected: Option<SessionId>,
+    /// How much of the settled shelf is on show. History is the longest part
+    /// of a body of work and the least of what a reader is choosing between,
+    /// so the shelf opens on its first rows and the tail stands behind an
+    /// affordance they ask for.
+    settled_on_show: usize,
+    /// The row the reader is on, held by what the row stands for rather than
+    /// by position, so a listing arriving underneath them leaves the selection
+    /// where the work is rather than where the row was.
+    selected: Option<SidebarSelection>,
     attaching: Option<SessionId>,
     /// A listing the Sidebar has asked for but has not yet handed to whoever
     /// dispatches it. Revealing the Sidebar is not always something a reader
@@ -89,6 +94,24 @@ pub(super) struct Sidebar {
 /// until git awareness gives it something to say
 /// (<https://github.com/jake-tucker/suru/issues/169>).
 pub(super) const ACTIVE_ROW_LINES: usize = 3;
+
+/// The settled rows a shelf opens on. Recent history is what a reader looks
+/// back for, so that much is on show and the rest is theirs to ask for.
+const SETTLED_SHELF_OPENING: usize = 10;
+
+/// The settled rows one ask brings up, which is enough that a reader walking
+/// back through a long history is not asking over and over.
+const SETTLED_SHELF_BATCH: usize = 25;
+
+/// What the reader is on in the Sidebar's body. Almost always that is a
+/// Session, named by its id so the selection follows the work rather than the
+/// row it happened to be drawn on. The one row standing for no Session at all
+/// is the settled shelf's own affordance, which brings up more of the shelf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarSelection {
+    Session(SessionId),
+    ShowMore,
+}
 
 /// One Session as the Sidebar draws it. The shelf it stands on decides its
 /// shape, so a row carries its shelf alongside what every row says.
@@ -153,6 +176,21 @@ pub(super) enum SidebarEntry<'a> {
     /// stands only where something is settled: a reader with nothing set aside
     /// is shown no shelf to set it on.
     Divider,
+    /// The row at the foot of a settled shelf holding more than is on show,
+    /// which brings up the next of it.
+    ShowMore(SidebarShowMore),
+}
+
+/// The affordance closing a settled shelf with rows still under it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SidebarShowMore {
+    /// How many rows acting on it brings up: the batch, or the whole of what
+    /// is left where that is less, so the affordance never offers rows that
+    /// are not there.
+    pub(super) count: usize,
+    /// Whether this is the row the reader is on. The affordance is a row like
+    /// any other in that respect: the arrows land on it and Enter acts on it.
+    pub(super) selected: bool,
 }
 
 impl SidebarEntry<'_> {
@@ -162,21 +200,25 @@ impl SidebarEntry<'_> {
     const fn lines(&self) -> usize {
         match self {
             Self::Row(row) => row.shelf.lines(),
-            Self::Divider => 1,
+            Self::Divider | Self::ShowMore(_) => 1,
         }
     }
 
     /// Whether this is the entry the reader is on. The divider never is: it
     /// is a rule rather than a row, so the arrows step over it.
     const fn is_selected(&self) -> bool {
-        matches!(self, Self::Row(row) if row.selected)
+        match self {
+            Self::Row(row) => row.selected,
+            Self::ShowMore(more) => more.selected,
+            Self::Divider => false,
+        }
     }
 }
 
 impl Sidebar {
     /// A Sidebar listing every Workspace's Sessions, which is the whole body of
     /// work a reader has. Narrowing to one Workspace is the selector's job
-    /// (<https://github.com/jake-tucker/suru/issues/177>).
+    /// (<https://github.com/jake-tucker/suru/issues/179>).
     pub(super) fn new(current_workspace: PathBuf) -> Self {
         Self {
             // Down until the launch Setting raises it. A Sidebar with no
@@ -193,6 +235,7 @@ impl Sidebar {
                 current_workspace,
                 SessionListScope::AllWorkspaces,
             ),
+            settled_on_show: SETTLED_SHELF_OPENING,
             selected: None,
             attaching: None,
             awaiting_dispatch: None,
@@ -267,8 +310,26 @@ impl Sidebar {
             // frame reports otherwise, so that run reaches the surface the
             // reader just opened.
             self.on_screen.set(true);
-            self.awaiting_dispatch = Some(self.listing.refresh());
+            self.ask_for_sessions();
         }
+    }
+
+    /// Asks the server for the Sessions in scope and leaves the request for
+    /// whoever can dispatch it.
+    ///
+    /// The settled shelf opens on its first rows again with every ask. The
+    /// tail a reader brought up belongs to the listing they brought it up on,
+    /// so a Sidebar coming back into view — or narrowed to another Workspace
+    /// once the selector arrives
+    /// (<https://github.com/jake-tucker/suru/issues/179>), which asks the same
+    /// way — starts back at the top of the shelf rather than inheriting
+    /// however deep they had walked into some other body of work. A listing
+    /// re-asked only to catch up with the server
+    /// (<https://github.com/jake-tucker/suru/issues/183>) is not the reader
+    /// moving anywhere, and must leave their shelf where they left it.
+    fn ask_for_sessions(&mut self) {
+        self.settled_on_show = SETTLED_SHELF_OPENING;
+        self.awaiting_dispatch = Some(self.listing.refresh());
     }
 
     /// Whether the reader wants the Sidebar on screen, which is not the same
@@ -298,8 +359,12 @@ impl Sidebar {
         // that on the row nearest them.
         self.selected = self
             .selected
-            .filter(|selected| self.listing.contains(*selected))
-            .or_else(|| current.filter(|current| self.listing.contains(*current)))
+            .filter(|selected| self.holds(*selected))
+            .or_else(|| {
+                current
+                    .filter(|current| self.listing.contains(*current))
+                    .map(SidebarSelection::Session)
+            })
             .or_else(|| self.first_listed());
     }
 
@@ -335,13 +400,19 @@ impl Sidebar {
         self.move_selection(1);
     }
 
-    /// Begins attaching the Session the reader is on, reporting the Session to
-    /// attach where there is one to attach to. There is none when the row
-    /// stands for a Session Suru could not read, and none when it stands for
-    /// the Session already open — in which case Enter means only that the
-    /// reader is done choosing, and the composer takes the keys back.
-    pub(super) fn begin_attachment(&mut self, current: Option<SessionId>) -> Option<SessionId> {
-        let selected = self.selected?;
+    /// Acts on the row the reader is on, reporting the Session to attach where
+    /// that is what the row asks for.
+    ///
+    /// Standing on the settled shelf's affordance, it asks for more of the
+    /// shelf instead, and there is nothing to attach. Nor is there when the
+    /// row stands for a Session Suru could not read, or for the Session
+    /// already open — in which case Enter means only that the reader is done
+    /// choosing, and the composer takes the keys back.
+    pub(super) fn activate(&mut self, current: Option<SessionId>) -> Option<SessionId> {
+        let SidebarSelection::Session(selected) = self.selected? else {
+            self.show_more();
+            return None;
+        };
         self.listing
             .sessions()
             .iter()
@@ -354,6 +425,17 @@ impl Sidebar {
         self.listing.clear_error();
         self.attaching = Some(selected);
         Some(selected)
+    }
+
+    /// Brings up the next of the settled shelf. Where that was the whole of
+    /// what was left, the affordance the reader was standing on goes with it,
+    /// so they land on the last row it brought up rather than on nothing.
+    fn show_more(&mut self) {
+        self.settled_on_show = self.settled_on_show.saturating_add(SETTLED_SHELF_BATCH);
+        let selectable = self.selectable();
+        if !selectable.contains(&SidebarSelection::ShowMore) {
+            self.selected = selectable.last().copied();
+        }
     }
 
     pub(super) fn attaching_to(&self, session_id: SessionId) -> bool {
@@ -440,12 +522,12 @@ impl Sidebar {
                 )
             })
             .collect::<Vec<_>>();
-        let settled = self.settled(settlement);
-        if settled.is_empty() {
+        let shelf = self.shelf(settlement);
+        if shelf.on_show.is_empty() {
             return entries;
         }
         entries.push(SidebarEntry::Divider);
-        entries.extend(settled.into_iter().map(|session| {
+        entries.extend(shelf.on_show.into_iter().map(|session| {
             self.row(
                 session,
                 current,
@@ -454,7 +536,47 @@ impl Sidebar {
                 },
             )
         }));
+        if let Some(count) = shelf.batch {
+            entries.push(SidebarEntry::ShowMore(SidebarShowMore {
+                count,
+                selected: self.selected == Some(SidebarSelection::ShowMore),
+            }));
+        }
         entries
+    }
+
+    /// The settled shelf as one pass over the listing draws it: the rows on
+    /// show, and what the affordance under them offers. Both readings are
+    /// settled here and nowhere else, so the rows the arrows walk and the rows
+    /// the frame draws can never disagree about where the shelf ends.
+    fn shelf(&self, settlement: Settlement) -> DrawnShelf<'_> {
+        let settled = self.settled(settlement);
+        let mut on_show = settled
+            .iter()
+            .take(self.settled_on_show)
+            .copied()
+            .collect::<Vec<_>>();
+        // The row the reader is on stands whatever the cap says. They reach a
+        // Session from elsewhere than the shelf — the session picker, or the
+        // one they had open when it settled — and a selection drawn nowhere is
+        // one the arrows cannot step off and Enter cannot act on. The clone
+        // makes the same exception for the same reason. It stands at the foot
+        // of the shelf rather than in the order the rest keep, because it is
+        // there on the reader's account rather than on its work's.
+        if let Some(SidebarSelection::Session(selected)) = self.selected
+            && let Some(deeper) = settled
+                .iter()
+                .skip(self.settled_on_show)
+                .find(|session| session.id() == selected)
+                .copied()
+        {
+            on_show.push(deeper);
+        }
+        let hidden = settled.len() - on_show.len();
+        DrawnShelf {
+            batch: (hidden > 0).then(|| hidden.min(SETTLED_SHELF_BATCH)),
+            on_show,
+        }
     }
 
     fn row<'a>(
@@ -467,7 +589,7 @@ impl Sidebar {
             emoji: session.emoji(),
             title: session.title(),
             current: current == Some(session.id()),
-            selected: self.selected == Some(session.id()),
+            selected: self.selected == Some(SidebarSelection::Session(session.id())),
             shelf,
         })
     }
@@ -510,37 +632,52 @@ impl Sidebar {
         sessions
     }
 
-    /// Every listed Session in the order the Sidebar draws it, which is the
-    /// order the arrows walk: down the active list, across the divider, and on
-    /// down the settled shelf.
-    fn ordered(&self) -> Vec<&SessionListItem> {
+    /// Every row the reader can be on, in the order the Sidebar draws them,
+    /// which is the order the arrows walk: down the active list, across the
+    /// divider, down as much of the settled shelf as is revealed, and onto the
+    /// affordance revealing the rest.
+    fn selectable(&self) -> Vec<SidebarSelection> {
         let settlement = self.settlement();
-        let mut ordered = self.active(settlement);
-        ordered.extend(self.settled(settlement));
-        ordered
+        let shelf = self.shelf(settlement);
+        let mut selectable = self
+            .active(settlement)
+            .into_iter()
+            .chain(shelf.on_show)
+            .map(|session| SidebarSelection::Session(session.id()))
+            .collect::<Vec<_>>();
+        if shelf.batch.is_some() {
+            selectable.push(SidebarSelection::ShowMore);
+        }
+        selectable
     }
 
-    fn first_listed(&self) -> Option<SessionId> {
-        self.ordered().first().map(|session| session.id())
+    /// Whether the row the reader is on is one the Sidebar still draws. A
+    /// Session is, wherever it stands, because the shelf shows the row they
+    /// are on however deep it sits.
+    fn holds(&self, selection: SidebarSelection) -> bool {
+        match selection {
+            SidebarSelection::Session(session_id) => self.listing.contains(session_id),
+            SidebarSelection::ShowMore => self.shelf(self.settlement()).batch.is_some(),
+        }
+    }
+
+    fn first_listed(&self) -> Option<SidebarSelection> {
+        self.selectable().first().copied()
     }
 
     fn move_selection(&mut self, distance: isize) {
-        let listed = self
-            .ordered()
-            .into_iter()
-            .map(SessionListItem::id)
-            .collect::<Vec<_>>();
-        if listed.is_empty() {
+        let selectable = self.selectable();
+        if selectable.is_empty() {
             self.selected = None;
             return;
         }
         let current = self
             .selected
-            .and_then(|selected| listed.iter().position(|id| *id == selected))
+            .and_then(|selected| selectable.iter().position(|row| *row == selected))
             .unwrap_or(0);
-        let len = listed.len() as isize;
+        let len = selectable.len() as isize;
         let next = (current as isize + distance).rem_euclid(len) as usize;
-        self.selected = listed.get(next).copied();
+        self.selected = selectable.get(next).copied();
     }
 
     /// Drops what the Sidebar was pointing at once the Session behind it has
@@ -553,13 +690,20 @@ impl Sidebar {
         {
             self.attaching = None;
         }
-        if self
-            .selected
-            .is_some_and(|selected| !self.listing.contains(selected))
-        {
+        if self.selected.is_some_and(|selected| !self.holds(selected)) {
             self.selected = self.first_listed();
         }
     }
+}
+
+/// The settled shelf as the Sidebar draws it on one pass.
+#[derive(Debug)]
+struct DrawnShelf<'a> {
+    /// The rows on show, top to bottom.
+    on_show: Vec<&'a SessionListItem>,
+    /// How many rows the affordance under them brings up, and `None` where the
+    /// whole shelf is up and there is no affordance to draw.
+    batch: Option<usize>,
 }
 
 /// What settles a Session, read at the moment the Sidebar lists one.
@@ -863,7 +1007,7 @@ mod tests {
         let request = sidebar.take_listing_request().expect("ask for Sessions");
         sidebar.load(&request, vec![identified(open, "Open", 1)], Some(open));
 
-        assert_eq!(sidebar.begin_attachment(Some(open)), None);
+        assert_eq!(sidebar.activate(Some(open)), None);
         assert!(
             !sidebar.has_focus(),
             "the reader is already in this Session, so Enter means only that they are done"
@@ -977,32 +1121,187 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_settled_shelf_opens_on_ten_rows_and_offers_what_is_under_them() {
+        let sidebar = showing(set_aside_shelf(12));
+
+        let drawn = drawn(&sidebar);
+
+        assert_eq!(
+            drawn.len(),
+            12,
+            "the divider, ten rows of the shelf, and the affordance: {drawn:?}"
+        );
+        assert_eq!(drawn[0], DIVIDER);
+        assert_eq!(drawn[10], "Settled 9", "the tenth row is the last on show");
+        assert_eq!(
+            drawn[11], "Show 2 more",
+            "the affordance offers what is left rather than a batch that is not there"
+        );
+    }
+
+    #[test]
+    fn a_shelf_no_longer_than_it_opens_on_is_shown_whole_and_offers_nothing() {
+        let sidebar = showing(set_aside_shelf(10));
+
+        assert_eq!(
+            drawn(&sidebar).len(),
+            11,
+            "the divider and every row of the shelf, with nothing left to ask for"
+        );
+    }
+
+    #[test]
+    fn the_affordance_brings_up_a_batch_at_a_time_to_the_end_of_the_shelf() {
+        let mut sidebar = showing(set_aside_shelf(40));
+
+        sidebar.select_previous();
+        assert_eq!(
+            selected(&sidebar),
+            None,
+            "past the top of the list is the affordance, which stands for no Session"
+        );
+
+        assert_eq!(
+            sidebar.activate(None),
+            None,
+            "asking for more of the shelf attaches nothing"
+        );
+        let revealed = drawn(&sidebar);
+        assert_eq!(
+            revealed.len(),
+            37,
+            "the divider, 35 rows, and the affordance"
+        );
+        assert_eq!(revealed[36], "Show 5 more");
+
+        sidebar.activate(None);
+
+        assert_eq!(
+            drawn(&sidebar).len(),
+            41,
+            "the divider and the whole shelf, with no affordance left to draw"
+        );
+        assert_eq!(
+            selected(&sidebar),
+            Some("Settled 39"),
+            "the affordance the reader was on is gone, so they land on the last row it uncovered"
+        );
+    }
+
+    /// A reader reaches a Session from somewhere other than the shelf — the
+    /// session picker, or the Session they had open when it settled — and the
+    /// cap must not then hide the row they are on: a selection drawn nowhere
+    /// is one the arrows cannot step off and Enter cannot act on.
+    #[test]
+    fn the_shelf_shows_the_row_the_reader_is_on_however_deep_it_sits() {
+        let deep = SessionId::new();
+        let mut shelf = set_aside_shelf(12);
+        let SessionListItem::Readable(deepest) = &mut shelf[11] else {
+            unreachable!("the fixture builds readable Sessions");
+        };
+        deepest.session.id = deep;
+
+        let sidebar = showing_on(shelf, Some(deep));
+
+        let drawn = drawn(&sidebar);
+        assert_eq!(
+            drawn[11], "Settled 11",
+            "the row the reader is on stands at the foot of the shelf, on their account rather than its work's: {drawn:?}"
+        );
+        assert_eq!(
+            drawn[12], "Show 1 more",
+            "and is no longer one of the rows the affordance offers: {drawn:?}"
+        );
+        assert_eq!(
+            selected(&sidebar),
+            Some("Settled 11"),
+            "so the reader can see the row they are on, and step off it"
+        );
+    }
+
+    #[test]
+    fn a_sidebar_asked_for_afresh_opens_the_shelf_on_its_first_rows_again() {
+        let mut sidebar = showing(set_aside_shelf(12));
+        sidebar.select_previous();
+        sidebar.activate(None);
+        assert_eq!(drawn(&sidebar).len(), 13, "the whole shelf is on show");
+
+        sidebar.toggle();
+        sidebar.toggle();
+        let request = sidebar
+            .take_listing_request()
+            .expect("a Sidebar coming back into view asks for its Sessions");
+        sidebar.load(&request, set_aside_shelf(12), None);
+
+        assert_eq!(
+            drawn(&sidebar).last().map(String::as_str),
+            Some("Show 2 more"),
+            "the tail belongs to the listing it was revealed on, so a fresh one opens on the first rows"
+        );
+    }
+
     /// What stands in for the divider where the Titles the Sidebar draws are
     /// read out in order.
     const DIVIDER: &str = "<divider>";
 
-    /// The Sidebar's whole body, top to bottom, as the Titles it draws.
-    fn drawn(sidebar: &Sidebar) -> Vec<&str> {
-        entry_titles(sidebar.entries(None))
-    }
-
-    /// The Sidebar's body as a column `capacity` lines tall shows it.
-    fn drawn_within(sidebar: &Sidebar, capacity: usize) -> Vec<&str> {
-        entry_titles(sidebar.visible_entries(capacity, None))
-    }
-
-    fn entry_titles<'a>(entries: Vec<SidebarEntry<'a>>) -> Vec<&'a str> {
-        entries
-            .into_iter()
-            .map(|entry| match entry {
-                SidebarEntry::Row(row) => row.title,
-                SidebarEntry::Divider => DIVIDER,
+    /// A shelf of Sessions the reader set aside, the first of them the most
+    /// recently ended and so the nearest the divider.
+    fn set_aside_shelf(count: u64) -> Vec<SessionListItem> {
+        (0..count)
+            .map(|ordinal| {
+                set_aside(
+                    &format!("Settled {ordinal}"),
+                    ordinal + 1,
+                    ordinal + 1,
+                    count - ordinal,
+                )
             })
             .collect()
     }
 
-    /// The Title of the row the reader is on, which is what a selection is
-    /// for.
+    /// A Sidebar open on the Sessions given, with nothing settling itself, so
+    /// the shelf holds what the listing marked settled and no more.
+    fn showing(sessions: Vec<SessionListItem>) -> Sidebar {
+        showing_on(sessions, None)
+    }
+
+    /// The same, for a reader who has one of those Sessions open.
+    fn showing_on(sessions: Vec<SessionListItem>, current: Option<SessionId>) -> Sidebar {
+        let mut sidebar = Sidebar::new(root());
+        sidebar.adopt_settings(&settling_nothing());
+        let request = sidebar
+            .take_listing_request()
+            .expect("a revealed Sidebar asks for its Sessions");
+        sidebar.load(&request, sessions, current);
+        sidebar
+    }
+
+    /// The Sidebar's whole body, top to bottom, as the Titles it draws — and,
+    /// for the rows standing for no Session, what they say instead.
+    fn drawn(sidebar: &Sidebar) -> Vec<String> {
+        entry_titles(sidebar.entries(None))
+    }
+
+    /// The Sidebar's body as a column `capacity` lines tall shows it.
+    fn drawn_within(sidebar: &Sidebar, capacity: usize) -> Vec<String> {
+        entry_titles(sidebar.visible_entries(capacity, None))
+    }
+
+    fn entry_titles(entries: Vec<SidebarEntry<'_>>) -> Vec<String> {
+        entries
+            .into_iter()
+            .map(|entry| match entry {
+                SidebarEntry::Row(row) => row.title.to_owned(),
+                SidebarEntry::Divider => DIVIDER.to_owned(),
+                SidebarEntry::ShowMore(more) => format!("Show {} more", more.count),
+            })
+            .collect()
+    }
+
+    /// The Title of the row the reader is on, where they are on a Session. The
+    /// settled shelf's affordance stands for none, so a reader on it is on no
+    /// Title at all.
     fn selected(sidebar: &Sidebar) -> Option<&str> {
         sidebar
             .entries(None)
