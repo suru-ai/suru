@@ -1,17 +1,22 @@
 //! The Sidebar: the collapsible column beside the main view listing Sessions.
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     cmp::Reverse,
+    ops::Range,
     path::{Path, PathBuf},
 };
+
+use ratatui::layout::Position;
 
 use crate::protocol::{
     AutoSettle, SessionId, SessionListItem, SessionTimestamp, SidebarSettings, SidebarVisibility,
 };
 
 use super::{
-    SessionListRequest, SessionListScope, SessionListSurface, session_listing::SessionListing,
+    SessionListRequest, SessionListScope, SessionListSurface,
+    commands::{SemanticCommandId, SemanticInvocation},
+    session_listing::SessionListing,
 };
 
 /// The columns the Sidebar occupies, cloning t3 code's own fixed column. There
@@ -94,6 +99,16 @@ pub(super) struct Sidebar {
     /// here: a selection moving to a row already in view leaves it where it
     /// is, and only a selection moving out of view carries it along.
     window_start: Cell<usize>,
+    /// Where the frame in force drew the rows, which is what a press resolves
+    /// against. Rendering leaves it here, so it is held behind a cell rather
+    /// than taken by an edit.
+    geometry: RefCell<SidebarGeometry>,
+    /// The context menu the reader opened on a row, where one is open.
+    menu: Option<SidebarMenu>,
+    /// The Session the Sidebar asked the server to take away, held so a
+    /// refusal is drawn by the surface that asked rather than by whichever
+    /// other one happens to be listing the same work.
+    deleting: Option<SessionId>,
 }
 
 /// The lines one active Sidebar row takes, the third of them saying nothing
@@ -123,6 +138,10 @@ enum SidebarSelection {
 /// shape, so a row carries its shelf alongside what every row says.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SidebarRow<'a> {
+    /// The Session this row stands for, which is what a frame records against
+    /// the screen rows it draws so a press lands on the work rather than on
+    /// the position.
+    pub(super) session_id: SessionId,
     pub(super) emoji: Option<&'a str>,
     pub(super) title: &'a str,
     /// Whether this is the Session the reader has open.
@@ -219,6 +238,189 @@ impl SidebarEntry<'_> {
             Self::Divider => false,
         }
     }
+
+    /// What pressing this entry asks for, and `None` for the divider, which is
+    /// a rule rather than a row and so answers no press.
+    pub(super) const fn target(&self) -> Option<SidebarTarget> {
+        match self {
+            Self::Row(row) => Some(SidebarTarget::Session(row.session_id)),
+            Self::ShowMore(_) => Some(SidebarTarget::ShowMore),
+            Self::Divider => None,
+        }
+    }
+}
+
+/// Where a frame drew the Sidebar, which is what a press resolves against.
+/// Everything here is terminal geometry the drawing decided, which is why
+/// drawing is what records it: a Sidebar no frame has drawn answers no press,
+/// because geometry claimed rather than drawn would act on a row the reader
+/// never pointed at.
+#[derive(Clone, Debug, Default)]
+pub(super) struct SidebarGeometry {
+    /// The columns inside the Sidebar's own rule, so a press on the rule
+    /// itself or out in the main view lands on nothing.
+    columns: Range<u16>,
+    /// The entries the body drew, top to bottom. The divider draws no span:
+    /// it stands for nothing to press.
+    rows: Vec<SidebarSpan>,
+    /// Where the context menu drew its items, where one was open. It is drawn
+    /// over the rows, so it is asked first.
+    menu: Option<SidebarMenuGeometry>,
+}
+
+/// One drawn entry: the screen rows it filled, and what pressing it asks for.
+#[derive(Clone, Debug)]
+pub(super) struct SidebarSpan {
+    pub(super) rows: Range<u16>,
+    pub(super) target: SidebarTarget,
+}
+
+/// What a drawn entry stands for: a Session, or the settled shelf's own
+/// affordance, which stands for no Session at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SidebarTarget {
+    Session(SessionId),
+    ShowMore,
+}
+
+/// The context menu as one frame drew it: the columns its box holds and where
+/// its items went, one line each.
+#[derive(Clone, Debug)]
+pub(super) struct SidebarMenuGeometry {
+    pub(super) columns: Range<u16>,
+    pub(super) top: u16,
+    pub(super) count: u16,
+}
+
+impl SidebarGeometry {
+    /// The entry drawn at this cell, and `None` for a cell the Sidebar drew
+    /// nothing pressable on.
+    fn hit(&self, position: Position) -> Option<SidebarTarget> {
+        if !self.columns.contains(&position.x) {
+            return None;
+        }
+        self.rows
+            .iter()
+            .find(|span| span.rows.contains(&position.y))
+            .map(|span| span.target)
+    }
+
+    /// The menu item drawn at this cell, and `None` for a cell outside the
+    /// menu's own box — including the rows behind it, because a menu is drawn
+    /// over them.
+    fn menu_hit(&self, position: Position) -> Option<usize> {
+        let menu = self.menu.as_ref()?;
+        if !menu.columns.contains(&position.x) {
+            return None;
+        }
+        let offset = position.y.checked_sub(menu.top)?;
+        (offset < menu.count).then_some(usize::from(offset))
+    }
+}
+
+/// What one press of the Sidebar came to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub(super) enum SidebarPress {
+    /// The press asked for a behavior, which its caller invokes: a press
+    /// mints no behavior of its own, it only says which one and on what.
+    Invoke(SemanticInvocation),
+    /// The Sidebar answered the press itself and there is nothing to invoke —
+    /// a menu put away, or an item that asked to be confirmed rather than
+    /// acting. Either way the press is spent and reaches nothing else.
+    Answered,
+    /// The press landed somewhere the Sidebar has not drawn, so whatever is
+    /// drawn there answers it.
+    Elsewhere,
+}
+
+/// The items a Sidebar row's context menu offers. Which of the first two it
+/// carries follows the shelf the row stands on: a settled Session is brought
+/// back where an active one is set aside.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SidebarMenuItem {
+    Settle,
+    Unsettle,
+    Delete,
+}
+
+/// How many items a Sidebar row's menu offers: what its shelf asks for, and
+/// Delete.
+pub(super) const SIDEBAR_MENU_ITEMS: usize = 2;
+
+/// The context menu a reader opened on one Sidebar row.
+#[derive(Clone, Copy, Debug)]
+struct SidebarMenu {
+    /// The Session the menu stands on, named rather than positioned so a
+    /// listing arriving underneath it acts on the work the reader pointed at.
+    session: SessionId,
+    /// Whether that row stands on the settled shelf, read when the menu was
+    /// opened, which is what decides whether it offers to set the Session
+    /// aside or to bring it back.
+    settled: bool,
+    selected: usize,
+    /// Whether Delete has been asked for once. A Session and everything it
+    /// owns is not something one stray press may take away, so the item asks
+    /// again before it acts.
+    confirming_delete: bool,
+    /// The cell the reader pointed at, which is the corner the box is drawn
+    /// from.
+    anchor: Position,
+}
+
+impl SidebarMenuItem {
+    /// What this item says on the row it is drawn on. Delete says something
+    /// else while it is waiting to be confirmed, because the reader has to be
+    /// able to see that pressing again is what acts.
+    const fn label(self, confirming_delete: bool) -> &'static str {
+        match self {
+            Self::Settle => "Settle",
+            Self::Unsettle => "Unsettle",
+            Self::Delete if confirming_delete => "Delete — confirm",
+            Self::Delete => "Delete",
+        }
+    }
+
+    /// The command acting on this item names, which is the same command the
+    /// slash and the keys reach and never one minted for the menu.
+    const fn command(self) -> SemanticCommandId {
+        match self {
+            Self::Settle => SemanticCommandId::SessionSettle,
+            Self::Unsettle => SemanticCommandId::SessionUnsettle,
+            Self::Delete => SemanticCommandId::SessionDelete,
+        }
+    }
+}
+
+impl SidebarMenu {
+    const fn items(&self) -> [SidebarMenuItem; SIDEBAR_MENU_ITEMS] {
+        [
+            if self.settled {
+                SidebarMenuItem::Unsettle
+            } else {
+                SidebarMenuItem::Settle
+            },
+            SidebarMenuItem::Delete,
+        ]
+    }
+}
+
+/// The context menu as a frame draws it: where it is anchored and what each of
+/// its items says.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SidebarMenuView {
+    pub(super) anchor: Position,
+    pub(super) items: [SidebarMenuEntry; SIDEBAR_MENU_ITEMS],
+}
+
+/// One menu item as a frame draws it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SidebarMenuEntry {
+    pub(super) label: &'static str,
+    pub(super) selected: bool,
+    /// Whether acting on this item takes work away, which is drawn so a reader
+    /// can tell the item that asks again from the ones that simply act.
+    pub(super) destructive: bool,
 }
 
 impl Sidebar {
@@ -250,6 +452,9 @@ impl Sidebar {
             // reader types can reach a surface.
             on_screen: Cell::new(true),
             window_start: Cell::new(0),
+            geometry: RefCell::default(),
+            menu: None,
+            deleting: None,
         }
     }
 
@@ -327,8 +532,11 @@ impl Sidebar {
 
     /// Hands the keys to the composer, and the query goes with them: it was a
     /// way of finding a Session, and the reader is no longer looking for one.
+    /// So does any menu standing open: it was opened on a row the reader has
+    /// since moved on from.
     fn hand_back_keys(&mut self) {
         self.focused = false;
+        self.menu = None;
         self.clear_query();
     }
 
@@ -343,11 +551,203 @@ impl Sidebar {
     /// reads is always the one on screen.
     pub(super) fn forget_frame(&self) {
         self.on_screen.set(false);
+        self.geometry.replace(SidebarGeometry::default());
     }
 
     /// Records that this frame found the columns for the Sidebar and drew it.
     pub(super) fn record_drawn(&self) {
         self.on_screen.set(true);
+    }
+
+    /// Takes the geometry the frame just drew its body in, which is the only
+    /// account of the Sidebar a press can be resolved against.
+    pub(super) fn record_geometry(&self, columns: Range<u16>, rows: Vec<SidebarSpan>) {
+        let mut geometry = self.geometry.borrow_mut();
+        geometry.columns = columns;
+        geometry.rows = rows;
+    }
+
+    /// Takes the geometry the frame drew the context menu in, which is drawn
+    /// after the body it stands over and so is recorded on its own.
+    pub(super) fn record_menu_geometry(&self, menu: SidebarMenuGeometry) {
+        self.geometry.borrow_mut().menu = Some(menu);
+    }
+
+    /// Answers a press at one cell of the frame.
+    ///
+    /// The layers are asked in the order they were drawn: a menu standing over
+    /// the rows takes the press first, and a press outside it puts it away and
+    /// is spent there — a reader dismissing a menu is not also acting on
+    /// whatever it was covering. Otherwise the press lands on a row, which
+    /// takes the selection and is opened, or on the settled shelf's affordance,
+    /// which brings up more of the shelf. Both are what Enter already does from
+    /// that row, so the press mints no behavior of its own: it says which row,
+    /// by a position only this frame can know, and the command does the rest.
+    pub(super) fn press_at(&mut self, position: Position) -> SidebarPress {
+        if self.menu_is_open() {
+            let item = self.geometry.borrow().menu_hit(position);
+            return match item {
+                Some(index) => self.act_on_menu_item(index),
+                None => {
+                    self.menu = None;
+                    SidebarPress::Answered
+                }
+            };
+        }
+        let hit = self.geometry.borrow().hit(position);
+        let Some(target) = hit else {
+            return SidebarPress::Elsewhere;
+        };
+        self.select(target);
+        SidebarPress::Invoke(SemanticCommandId::SidebarAttach.into())
+    }
+
+    /// Opens the context menu on the row the reader asked for one on, which
+    /// also puts them on that row: a menu acts on the Session under it, and a
+    /// selection drawn elsewhere would say otherwise.
+    ///
+    /// The settled shelf's affordance stands for no Session, so it offers no
+    /// menu — and neither does a press out in the main view. Both put away
+    /// whatever menu was up, because asking for a menu somewhere else is done
+    /// with the one in hand.
+    pub(super) fn open_menu_at(&mut self, position: Position) {
+        // Asking for a menu inside the menu asks for nothing: the box stands
+        // over a row it did not open on, and re-opening there would carry the
+        // reader onto whichever row it happens to cover.
+        if self.menu_is_open() && self.geometry.borrow().menu_hit(position).is_some() {
+            return;
+        }
+        let hit = self.geometry.borrow().hit(position);
+        self.menu = None;
+        let Some(SidebarTarget::Session(session_id)) = hit else {
+            return;
+        };
+        let Some(settled) = self
+            .listing
+            .sessions()
+            .iter()
+            .find(|session| session.id() == session_id)
+            .map(|session| self.settlement().settles(session))
+        else {
+            return;
+        };
+        self.select(SidebarTarget::Session(session_id));
+        self.menu = Some(SidebarMenu {
+            session: session_id,
+            settled,
+            selected: 0,
+            confirming_delete: false,
+            anchor: position,
+        });
+    }
+
+    /// Whether a context menu is up, which is what gives it the keys: it is
+    /// the newest thing on screen, so the arrows walk it rather than the rows
+    /// behind it.
+    ///
+    /// A menu is part of the column it was opened in, so a frame that could
+    /// not spare the Sidebar's columns draws no menu either and holds none of
+    /// the keys — the reader keeps the menu they opened, as they keep the
+    /// focus, and both come back when the terminal widens.
+    pub(super) fn menu_is_open(&self) -> bool {
+        self.menu.is_some() && self.on_screen.get()
+    }
+
+    /// The menu as a frame draws it, and `None` where there is none to draw.
+    pub(super) fn menu(&self) -> Option<SidebarMenuView> {
+        if !self.on_screen.get() {
+            return None;
+        }
+        let menu = self.menu.as_ref()?;
+        let items = menu.items();
+        Some(SidebarMenuView {
+            anchor: menu.anchor,
+            items: std::array::from_fn(|index| SidebarMenuEntry {
+                label: items[index].label(menu.confirming_delete),
+                selected: menu.selected == index,
+                destructive: items[index] == SidebarMenuItem::Delete,
+            }),
+        })
+    }
+
+    pub(super) fn menu_select_previous(&mut self) {
+        self.move_menu_selection(-1);
+    }
+
+    pub(super) fn menu_select_next(&mut self) {
+        self.move_menu_selection(1);
+    }
+
+    fn move_menu_selection(&mut self, distance: isize) {
+        let Some(menu) = &mut self.menu else {
+            return;
+        };
+        let length = SIDEBAR_MENU_ITEMS as isize;
+        menu.selected = (menu.selected as isize + distance).rem_euclid(length) as usize;
+    }
+
+    /// Acts on the item the reader is on, which is what Enter asks for.
+    pub(super) fn activate_menu_item(&mut self) -> SidebarPress {
+        let Some(menu) = &self.menu else {
+            return SidebarPress::Answered;
+        };
+        self.act_on_menu_item(menu.selected)
+    }
+
+    /// Puts the menu away, leaving the row it stood on alone.
+    pub(super) fn close_menu(&mut self) {
+        self.menu = None;
+    }
+
+    /// Acts on one menu item, answering with the command it asks for.
+    ///
+    /// Pointing at an item is choosing it, so the selection follows the press
+    /// before the item acts. Settling and unsettling act at once and the menu
+    /// is done; Delete asks again the first time and acts the second, so the
+    /// menu stands until the reader has said it twice.
+    fn act_on_menu_item(&mut self, index: usize) -> SidebarPress {
+        let Some(menu) = &mut self.menu else {
+            return SidebarPress::Answered;
+        };
+        let Some(item) = menu.items().get(index).copied() else {
+            return SidebarPress::Answered;
+        };
+        menu.selected = index;
+        if item == SidebarMenuItem::Delete && !menu.confirming_delete {
+            menu.confirming_delete = true;
+            return SidebarPress::Answered;
+        }
+        let session_id = menu.session;
+        self.menu = None;
+        SidebarPress::Invoke(item.command().on_session(session_id))
+    }
+
+    /// Puts the reader on the row a press landed on.
+    fn select(&mut self, target: SidebarTarget) {
+        self.selected = Some(match target {
+            SidebarTarget::Session(session_id) => SidebarSelection::Session(session_id),
+            SidebarTarget::ShowMore => SidebarSelection::ShowMore,
+        });
+    }
+
+    /// Notes the Session the Sidebar has asked the server to take away, so a
+    /// refusal is drawn here rather than by some other surface listing the
+    /// same work. The listing's own complaint goes with it: the reader is
+    /// being answered afresh.
+    pub(super) fn begin_deletion(&mut self, session_id: SessionId) {
+        self.deleting = Some(session_id);
+        self.listing.clear_error();
+    }
+
+    /// Takes the server's refusal to delete, where it was this Sidebar that
+    /// asked. Answering `false` leaves the refusal for whichever surface did.
+    pub(super) fn fail_deletion(&mut self, session_id: SessionId, error: String) -> bool {
+        if self.deleting != Some(session_id) {
+            return false;
+        }
+        self.deleting = None;
+        self.listing.report_error(error);
+        true
     }
 
     /// A Sidebar the reader can see wants Sessions to show, so every reveal —
@@ -367,7 +767,9 @@ impl Sidebar {
             // A query belongs to the look the reader was taking, and a Sidebar
             // coming into view is the start of another one — so it opens on
             // the whole body of work, as the settled shelf opens on its first
-            // rows again.
+            // rows again, and a menu left open on some earlier look is put
+            // away with it.
+            self.menu = None;
             self.clear_query();
             self.ask_for_sessions();
         }
@@ -413,6 +815,10 @@ impl Sidebar {
             return;
         }
         self.attaching = None;
+        // A menu stands on one row of the listing it was opened over. A fresh
+        // listing is the reader looking again, so it is put away rather than
+        // left pointing at whatever now stands where its row did.
+        self.menu = None;
         // A listing the reader was already reading keeps them where they were;
         // a fresh one starts them on the Session they have open, and failing
         // that on the row nearest them.
@@ -691,6 +1097,7 @@ impl Sidebar {
         shelf: SidebarShelf<'a>,
     ) -> SidebarEntry<'a> {
         SidebarEntry::Row(SidebarRow {
+            session_id: session.id(),
             emoji: session.emoji(),
             title: session.title(),
             current: current == Some(session.id()),
@@ -810,14 +1217,26 @@ impl Sidebar {
     }
 
     /// Drops what the Sidebar was pointing at once the Session behind it has
-    /// left the listing, so no row is attached twice and the reader lands back
-    /// on a row that is there.
+    /// left the listing, so no row is attached twice, no menu offers to act on
+    /// work that is gone, and the reader lands back on a row that is there.
     fn forget_absent(&mut self) {
         if self
             .attaching
             .is_some_and(|attaching| !self.listing.contains(attaching))
         {
             self.attaching = None;
+        }
+        if self
+            .deleting
+            .is_some_and(|deleting| !self.listing.contains(deleting))
+        {
+            self.deleting = None;
+        }
+        if self
+            .menu
+            .is_some_and(|menu| !self.listing.contains(menu.session))
+        {
+            self.menu = None;
         }
         self.keep_selection_drawn();
     }

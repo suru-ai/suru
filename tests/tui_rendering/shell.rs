@@ -671,7 +671,10 @@ async fn headless_slash_settle_sets_the_open_session_aside_on_a_real_server() {
         .expect("open the created Session");
 
     type_terminal_text(&mut application, "/settle");
-    let ApplicationTransition::SettleSession(named) = application
+    let ApplicationTransition::SettleSession {
+        session_id: named,
+        settled: set_aside,
+    } = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,
@@ -683,6 +686,10 @@ async fn headless_slash_settle_sets_the_open_session_aside_on_a_real_server() {
     assert_eq!(
         named, session_id,
         "the command names the Session the reader is in"
+    );
+    assert!(
+        set_aside,
+        "and asks for it to be set aside rather than brought back"
     );
 
     let settled = client

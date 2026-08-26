@@ -2,7 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::protocol::TurnId;
+use crate::protocol::{SessionId, TurnId};
 
 pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
 
@@ -21,11 +21,16 @@ pub enum SemanticCommandId {
     SessionDelete,
     SessionNew,
     SessionSettle,
+    SessionUnsettle,
     SidebarToggle,
     SidebarPrevious,
     SidebarNext,
     SidebarAttach,
     SidebarLeave,
+    SidebarMenuPrevious,
+    SidebarMenuNext,
+    SidebarMenuSelect,
+    SidebarMenuClose,
     SettingsOpen,
     SettingsPrevious,
     SettingsNext,
@@ -118,6 +123,9 @@ impl NumericDigit {
 pub(super) enum SemanticSubject {
     View,
     Turn(TurnId),
+    /// One Session, which is what a reader names by acting on its row rather
+    /// than on the Session they have open.
+    Session(SessionId),
 }
 
 /// One invocation of a semantic command: which command, and what it acts on.
@@ -148,6 +156,15 @@ impl SemanticCommandId {
         }
     }
 
+    /// This command invoked against one Session, which is what a reader asks
+    /// for from that Session's own row in the Sidebar.
+    pub(super) const fn on_session(self, session_id: SessionId) -> SemanticInvocation {
+        SemanticInvocation {
+            id: self,
+            subject: SemanticSubject::Session(session_id),
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ApplicationExit => "application.exit",
@@ -163,11 +180,16 @@ impl SemanticCommandId {
             Self::SessionDelete => "session.delete",
             Self::SessionNew => "session.new",
             Self::SessionSettle => "session.settle",
+            Self::SessionUnsettle => "session.unsettle",
             Self::SidebarToggle => "sidebar.toggle",
             Self::SidebarPrevious => "sidebar.previous",
             Self::SidebarNext => "sidebar.next",
             Self::SidebarAttach => "sidebar.attach",
             Self::SidebarLeave => "sidebar.leave",
+            Self::SidebarMenuPrevious => "sidebar.menu.previous",
+            Self::SidebarMenuNext => "sidebar.menu.next",
+            Self::SidebarMenuSelect => "sidebar.menu.select",
+            Self::SidebarMenuClose => "sidebar.menu.close",
             Self::SettingsOpen => "settings.open",
             Self::SettingsPrevious => "settings.previous",
             Self::SettingsNext => "settings.next",
@@ -422,9 +444,22 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SessionSettle,
         title: "Settle Session",
-        description: "Set the open Session aside as done for now",
+        // The command acts on the Session it names, and names the open one
+        // when nothing else says otherwise — which is what the slash means and
+        // what a Sidebar row overrules.
+        description: "Set a Session aside as done for now",
         slash: Some(SlashCommand {
             name: "settle",
+            aliases: &[],
+        }),
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SessionUnsettle,
+        title: "Unsettle Session",
+        description: "Take a Session back off the settled shelf",
+        slash: Some(SlashCommand {
+            name: "unsettle",
             aliases: &[],
         }),
         keybinding: None,
@@ -475,6 +510,36 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         // Backing out of a search is the inner step of backing out of the
         // Sidebar, so the account of the command says which one it takes.
         description: "Clear the Sidebar's search, or hand the keys back to the composer",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SidebarMenuPrevious,
+        title: "Previous Sidebar Menu Item",
+        description: "Move the Sidebar menu's selection to the item above, wrapping past the top",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SidebarMenuNext,
+        title: "Next Sidebar Menu Item",
+        description: "Move the Sidebar menu's selection to the item below, wrapping past the end",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SidebarMenuSelect,
+        title: "Invoke Sidebar Menu Item",
+        // Delete asks again rather than acting, so the account of the command
+        // says that acting on an item is not always the end of it.
+        description: "Act on the Sidebar menu's selected item, or ask it to confirm",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SidebarMenuClose,
+        title: "Close Sidebar Menu",
+        description: "Dismiss the Sidebar's context menu, leaving its row alone",
         slash: None,
         keybinding: None,
     },

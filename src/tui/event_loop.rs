@@ -463,8 +463,14 @@ impl RunLoop {
             ApplicationTransition::DeleteSession(session_id) => {
                 self.spawn_operation(SessionOperation::DeleteSession { session_id });
             }
-            ApplicationTransition::SettleSession(session_id) => {
-                self.spawn_operation(SessionOperation::SettleSession { session_id });
+            ApplicationTransition::SettleSession {
+                session_id,
+                settled,
+            } => {
+                self.spawn_operation(SessionOperation::SettleSession {
+                    session_id,
+                    settled,
+                });
             }
             ApplicationTransition::SubscribeSession(_) => {
                 unreachable!("terminal input cannot end a Session subscription")
@@ -565,7 +571,7 @@ impl RunLoop {
             ApplicationTransition::CreateSession(_)
             | ApplicationTransition::DetachSession
             | ApplicationTransition::DeleteSession(_)
-            | ApplicationTransition::SettleSession(_)
+            | ApplicationTransition::SettleSession { .. }
             | ApplicationTransition::AdmitPrompt { .. }
             | ApplicationTransition::PromotePrompt { .. }
             | ApplicationTransition::CancelPrompt { .. }
@@ -1150,6 +1156,7 @@ enum SessionOperation {
     },
     SettleSession {
         session_id: SessionId,
+        settled: bool,
     },
     PromotePrompt {
         session_id: SessionId,
@@ -1178,9 +1185,15 @@ impl SessionOperation {
             // Nothing but the failure needs reporting: the summary the server
             // answers with reaches every client on the catalog stream, this one
             // included.
-            Self::SettleSession { session_id } => {
-                operation_result(commands.settle_session(session_id, true).await.map(|_| ()))
-            }
+            Self::SettleSession {
+                session_id,
+                settled,
+            } => operation_result(
+                commands
+                    .settle_session(session_id, settled)
+                    .await
+                    .map(|_| ()),
+            ),
             Self::PromotePrompt {
                 session_id,
                 prompt_id,

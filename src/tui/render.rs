@@ -31,7 +31,10 @@ use super::{
     settings_panel::{
         PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, TabBar, TabSpan,
     },
-    sidebar::{self, Sidebar, SidebarEntry, SidebarRow, SidebarShelf, SidebarShowMore},
+    sidebar::{
+        self, SIDEBAR_MENU_ITEMS, Sidebar, SidebarEntry, SidebarMenuGeometry, SidebarRow,
+        SidebarShelf, SidebarShowMore, SidebarSpan,
+    },
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
         PromptFooterSlotContext, PromptStatusSlotContext, RenderSlots, RenderedSlot,
@@ -102,6 +105,12 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     if state.composer_completion.is_visible() && !state.reconnect_overlay_visible {
         render_composer_completion(frame, state, composer.area, &theme);
     }
+    // The Sidebar's own context menu, drawn over the column and whatever of
+    // the main view it runs into, because it stands in front of the row it was
+    // opened on.
+    if !state.reconnect_overlay_visible {
+        render_sidebar_menu(frame, state, &theme);
+    }
     // Every overlay is centered on the main view rather than the whole frame:
     // the Sidebar sits beside them and is neither opened over nor obscured.
     if state.session_picker.is_open() && !state.reconnect_overlay_visible {
@@ -127,6 +136,7 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
         && !state.model_picker.is_open()
         && !state.model_options.is_open()
         && !state.settings_panel.is_open()
+        && !state.sidebar.menu_is_open()
         && state.composer_focused()
         && matches!(state.command_mode, CommandMode::Composer)
     {
@@ -1055,30 +1065,101 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
             } else {
                 theme.border.subdued
             });
-    let content = horizontally_inset(block.inner(column), 1);
+    let inside = block.inner(column);
+    let content = horizontally_inset(inside, 1);
     frame.render_widget(block, column);
-    frame.render_widget(
-        Paragraph::new(sidebar_lines(
-            state,
-            usize::from(content.width),
-            usize::from(content.height),
-            theme,
-        )),
-        content,
-    );
+    let (lines, rows) = sidebar_lines(state, content, theme);
+    // The columns inside the rule rather than the content's own, so the
+    // padding a row is inset by presses the row it insets.
+    state
+        .sidebar
+        .record_geometry(inside.x..inside.right(), rows);
+    frame.render_widget(Paragraph::new(lines), content);
     main
+}
+
+/// Draws the context menu a reader opened on a Sidebar row, anchored at the
+/// cell they pointed at and pulled back inside the frame where the box would
+/// otherwise run off it. Drawn after the main view, because a menu stands over
+/// whatever it was opened in front of.
+fn render_sidebar_menu(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+    let Some(menu) = state.sidebar.menu() else {
+        return;
+    };
+    let widest = menu
+        .items
+        .iter()
+        .map(|item| item.label.width())
+        .max()
+        .unwrap_or_default();
+    // The label, a column of padding either side of it, and the box's own two
+    // borders; likewise two borders around the items down the box.
+    let width = u16::try_from(widest.saturating_add(4)).unwrap_or(u16::MAX);
+    let height = u16::try_from(SIDEBAR_MENU_ITEMS.saturating_add(2)).unwrap_or(u16::MAX);
+    let frame_area = frame.area();
+    if frame_area.width < width || frame_area.height < height {
+        return;
+    }
+    let area = Rect {
+        x: menu.anchor.x.min(frame_area.right().saturating_sub(width)),
+        y: menu
+            .anchor
+            .y
+            .min(frame_area.bottom().saturating_sub(height)),
+        width,
+        height,
+    };
+    let lines = menu
+        .items
+        .iter()
+        .map(|item| {
+            Line::styled(
+                pad_to_width(
+                    &format!(" {}", item.label),
+                    usize::from(width.saturating_sub(2)),
+                ),
+                if item.selected {
+                    theme.selection.focused
+                } else if item.destructive {
+                    theme.feedback.error
+                } else {
+                    theme.text.primary
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.border.default)
+                .style(theme.surface.overlay),
+        ),
+        area,
+    );
+    state.sidebar.record_menu_geometry(SidebarMenuGeometry {
+        columns: area.x + 1..area.right().saturating_sub(1),
+        top: area.y + 1,
+        count: height.saturating_sub(2),
+    });
 }
 
 /// The Sidebar's whole body: the search box, then what the server last
 /// refused, then the active Sessions, then the divider and the settled ones —
 /// as many of them as the column is tall — or the one line that stands in for
 /// a list there is nothing to draw.
+///
+/// Reports the geometry the body came out at alongside the lines themselves,
+/// because only the pass that lays the rows out knows which screen rows each
+/// one took: rows are not all the same height, and the window decides how many
+/// of them there are.
 fn sidebar_lines(
     state: &TuiState,
-    width: usize,
-    height: usize,
+    content: Rect,
     theme: &Theme,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<SidebarSpan>) {
+    let width = usize::from(content.width);
     let mut lines = vec![sidebar_search_line(state.sidebar.query(), width, theme)];
     let error = state.sidebar.error();
     if let Some(error) = error {
@@ -1087,7 +1168,7 @@ fn sidebar_lines(
             theme.feedback.error,
         ));
     }
-    let capacity = height.saturating_sub(lines.len());
+    let capacity = usize::from(content.height).saturating_sub(lines.len());
     let entries = state.sidebar.visible_entries(
         capacity,
         state.session.as_ref().map(SessionProjection::session_id),
@@ -1097,16 +1178,28 @@ fn sidebar_lines(
             sidebar_empty_reading(&state.sidebar)
                 .map(|reading| Line::styled(reading, theme.text.subdued)),
         );
-        return lines;
+        return (lines, Vec::new());
     }
     let now = SessionTimestamp::now().0;
     let focused = state.sidebar.has_focus();
-    lines.extend(
-        entries
-            .into_iter()
-            .flat_map(|entry| sidebar_entry_lines(entry, width, now, focused, theme)),
-    );
-    lines
+    let mut rows = Vec::new();
+    let mut top = content
+        .y
+        .saturating_add(u16::try_from(lines.len()).unwrap_or_default());
+    for entry in entries {
+        let target = entry.target();
+        let drawn = sidebar_entry_lines(entry, width, now, focused, theme);
+        let bottom = top.saturating_add(u16::try_from(drawn.len()).unwrap_or_default());
+        if let Some(target) = target {
+            rows.push(SidebarSpan {
+                rows: top..bottom,
+                target,
+            });
+        }
+        top = bottom;
+        lines.extend(drawn);
+    }
+    (lines, rows)
 }
 
 /// The Sidebar's search box, standing at the top of the column whether or not

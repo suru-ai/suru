@@ -19,13 +19,15 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
         InputEvent::Mouse(mouse) => match mouse.kind {
             MouseEventKind::ScrollUp => Some(CommandId::ScrollTranscriptLinesUp),
             MouseEventKind::ScrollDown => Some(CommandId::ScrollTranscriptLinesDown),
-            // A press, not a release, so a Fold answers the click the reader
-            // just made rather than trailing a drag that ends elsewhere.
-            MouseEventKind::Down(MouseButton::Left) => {
-                Some(CommandId::ToggleTranscriptDisclosureAt {
-                    position: Position::new(mouse.column, mouse.row),
-                })
-            }
+            // A press, not a release, so the frame answers the click the
+            // reader just made rather than trailing a drag that ends
+            // elsewhere.
+            MouseEventKind::Down(MouseButton::Left) => Some(CommandId::PressAt {
+                position: Position::new(mouse.column, mouse.row),
+            }),
+            MouseEventKind::Down(MouseButton::Right) => Some(CommandId::OpenContextMenuAt {
+                position: Position::new(mouse.column, mouse.row),
+            }),
             _ => None,
         },
         InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,
@@ -101,8 +103,8 @@ pub(super) fn command_for_model_picker_event(event: InputEvent) -> Option<Comman
 ///
 /// The mouse is the exception, and answers as it does from the composer: the
 /// Sidebar stands beside the main view rather than over it, so the wheel is
-/// still the reader's way through a Transcript. The Sidebar's own rows take
-/// the mouse in <https://github.com/jake-tucker/suru/issues/181>.
+/// still the reader's way through a Transcript, and a press is resolved
+/// against the whole frame's geometry rather than against this surface alone.
 pub(super) fn command_for_sidebar_event(event: InputEvent) -> Option<CommandId> {
     let key = match event {
         InputEvent::Key(key) => key,
@@ -156,6 +158,36 @@ fn command_for_search_key(
         }
         _ => None,
     }
+}
+
+/// A Sidebar row's context menu is the newest thing on screen while it is up,
+/// so it has the keys whether or not the Sidebar itself does: the arrows walk
+/// its items, Enter acts on the one the reader is on, and Esc puts the menu
+/// away leaving the row alone. Nothing else reaches the rows behind it — a
+/// letter typed at a menu is not a query — and the mouse answers as it does
+/// everywhere else, because a press outside a menu is how a reader dismisses
+/// one.
+pub(super) fn command_for_sidebar_menu_event(event: InputEvent) -> Option<CommandId> {
+    let key = match event {
+        InputEvent::Key(key) => key,
+        event @ InputEvent::Mouse(_) => return command_for_terminal_event(event),
+        _ => return None,
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let semantic = match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::SidebarMenuPrevious
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::SidebarMenuNext
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::SidebarMenuSelect,
+        (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::SidebarMenuClose,
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(semantic))
 }
 
 pub(super) fn command_for_model_options_event(event: InputEvent) -> Option<CommandId> {

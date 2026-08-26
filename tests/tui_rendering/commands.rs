@@ -58,7 +58,10 @@ fn slash_settle_sets_the_open_session_aside() {
                 KeyModifiers::NONE,
             )))
             .expect("invoke the settle command"),
-        ApplicationTransition::SettleSession(session_id)
+        ApplicationTransition::SettleSession {
+            session_id,
+            settled: true,
+        }
     );
     assert!(
         !rendered_application_rows(&application)

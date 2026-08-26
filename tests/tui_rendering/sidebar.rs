@@ -10,7 +10,9 @@ use crate::support::{
     connected_application, enter_session, failed_session_snapshot, rendered_application_buffer,
     rendered_application_rows_at, rendered_row, type_terminal_text,
 };
-use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{buffer::Cell, style::Color};
 use suru::{
     managed_client::ManagedEvent,
@@ -2123,5 +2125,438 @@ fn a_refused_listing_says_so_rather_than_blaming_the_query() {
     assert!(
         !drawn_in_sidebar(&rows, "No Sessions match"),
         "and nothing under it blames the reader's query for a list that never arrived: {rows:?}"
+    );
+}
+
+/// A column well inside the Sidebar's own, which is where a reader points at a
+/// row.
+const SIDEBAR_CELL: u16 = 4;
+
+/// The frame every press test draws: tall enough for a menu opened on any row
+/// its fixtures list to stand whole.
+const PRESS_HEIGHT: u16 = 20;
+
+/// A press of one mouse button on one cell. The press rather than the release,
+/// so a row answers the click the reader has just made rather than trailing a
+/// drag that ends elsewhere.
+fn press_at(
+    application: &mut Application,
+    button: MouseButton,
+    column: u16,
+    row: u16,
+) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(button),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("handle a press")
+}
+
+/// Presses the line the Sidebar drew `label` on. The frame is drawn first,
+/// because a press resolves against the geometry the frame in force drew.
+fn press_line(
+    application: &mut Application,
+    button: MouseButton,
+    label: &str,
+) -> ApplicationTransition {
+    let row = drawn_at(application, label);
+    press_at(application, button, SIDEBAR_CELL, row)
+}
+
+/// The screen row the Sidebar draws `label` on, with the frame drawn to find
+/// out.
+fn drawn_at(application: &Application, label: &str) -> u16 {
+    let rows = rendered_application_rows_at(application, WIDE, PRESS_HEIGHT);
+    u16::try_from(rendered_row(&rows, label)).expect("the row fits a screen row")
+}
+
+/// Opens one row's context menu the way a reader does, and reports the cell it
+/// was anchored at, which is the corner the box is drawn from.
+fn open_menu_on(application: &mut Application, title: &str) -> u16 {
+    let anchor = drawn_at(application, title);
+    assert!(
+        anchor + MENU_LINES <= PRESS_HEIGHT,
+        "the fixture anchors the menu where the frame has room for the whole box"
+    );
+    assert_eq!(
+        press_at(application, MouseButton::Right, SIDEBAR_CELL, anchor),
+        ApplicationTransition::Continue,
+        "asking for a menu asks nothing of the server"
+    );
+    anchor
+}
+
+/// The lines the menu's box takes: an item apiece, and its two borders.
+const MENU_LINES: u16 = 4;
+
+/// What the menu anchored at `anchor` says, item by item, read off the frame.
+fn menu_items(application: &Application, anchor: u16) -> Vec<String> {
+    let rows = rendered_application_rows_at(application, WIDE, PRESS_HEIGHT);
+    (1..MENU_LINES - 1)
+        .map(|offset| rows[usize::from(anchor + offset)].clone())
+        .collect()
+}
+
+/// Presses one item of the menu anchored at `anchor`. The box is drawn from
+/// that cell, so its items stand one row down and one column in.
+fn press_menu_item(
+    application: &mut Application,
+    anchor: u16,
+    index: u16,
+) -> ApplicationTransition {
+    let _ = rendered_application_rows_at(application, WIDE, PRESS_HEIGHT);
+    press_at(
+        application,
+        MouseButton::Left,
+        SIDEBAR_CELL + 1,
+        anchor + 1 + index,
+    )
+}
+
+/// Two Sessions, the second of which every press test points at.
+fn two_listed(workspace: &Path, wanted: SessionId) -> Vec<SessionListItem> {
+    vec![
+        listed_as(SessionId::new(), "Other work", workspace, 2),
+        listed_as(wanted, "Wanted work", workspace, 1),
+    ]
+}
+
+/// A press is how a reader opens a Session without reaching for the keyboard,
+/// and it opens the row it landed on rather than the row they were on.
+#[test]
+fn a_left_press_on_a_row_attaches_the_session_it_stands_on() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
+
+    assert_eq!(
+        press_line(&mut application, MouseButton::Left, "Wanted work"),
+        ApplicationTransition::AttachSession(wanted),
+        "the press opens the Session under it, keys or no keys"
+    );
+}
+
+/// The affordance is a row like any other to the pointer, and acting on it
+/// brings up more of the shelf rather than opening anything.
+#[test]
+fn a_left_press_on_the_shelf_affordance_brings_up_more_of_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_showing(workspace.path(), set_aside_shelf(workspace.path(), 12));
+
+    assert_eq!(
+        press_line(&mut application, MouseButton::Left, "Show 2 more"),
+        ApplicationTransition::Continue,
+        "asking for more of the shelf attaches nothing"
+    );
+    assert!(
+        drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "Ended 11"
+        ),
+        "and the rest of the shelf stands up"
+    );
+}
+
+/// Only the rows answer a press. The search box, the rule between the shelves,
+/// and the main view beside the column all stand for no Session.
+#[test]
+fn a_left_press_off_the_rows_attaches_nothing() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed_as(wanted, "Active work", workspace.path(), 2),
+            settled(
+                "Wrapped up",
+                None,
+                workspace.path(),
+                1,
+                hours_ago(3),
+                minutes_ago(5),
+            ),
+        ],
+    );
+
+    assert_eq!(
+        press_at(&mut application, MouseButton::Left, SIDEBAR_CELL, 0),
+        ApplicationTransition::Continue,
+        "the search box stands for no Session"
+    );
+    assert_eq!(
+        press_line(&mut application, MouseButton::Left, "Settled ─"),
+        ApplicationTransition::Continue,
+        "nor does the rule closing the active list"
+    );
+    let row = drawn_at(&application, "Active work");
+    assert_eq!(
+        press_at(&mut application, MouseButton::Left, 60, row),
+        ApplicationTransition::Continue,
+        "and a press out in the main view is none of the Sidebar's business"
+    );
+}
+
+/// A press resolves against the frame in force. A Sidebar the terminal has
+/// since squeezed out has drawn nothing, so it answers nothing.
+#[test]
+fn a_press_resolves_against_the_frame_in_force_rather_than_the_one_before_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
+    let row = drawn_at(&application, "Wanted work");
+
+    let squeezed = rendered_application_rows_at(&application, 85, 20);
+    assert!(
+        !squeezed.iter().any(|drawn| drawn.contains("Wanted work")),
+        "the frame in force is one too narrow for the Sidebar: {squeezed:?}"
+    );
+    assert_eq!(
+        press_at(&mut application, MouseButton::Left, SIDEBAR_CELL, row),
+        ApplicationTransition::Continue,
+        "a press cannot land on a row this frame never drew"
+    );
+}
+
+/// The menu offers what the row's own shelf asks for: active work is set
+/// aside, and either way the Session can be taken away.
+#[test]
+fn a_right_press_on_an_active_row_offers_settle_and_delete() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
+
+    let anchor = open_menu_on(&mut application, "Wanted work");
+
+    let items = menu_items(&application, anchor);
+    assert!(
+        items[0].contains("Settle") && !items[0].contains("Unsettle"),
+        "an active row is offered the shelf: {items:?}"
+    );
+    assert!(items[1].contains("Delete"), "and the way off it: {items:?}");
+}
+
+#[test]
+fn a_right_press_on_a_settled_row_offers_unsettle_and_delete() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed("Active work", None, workspace.path(), 2, now()),
+            settled(
+                "Wrapped up",
+                None,
+                workspace.path(),
+                1,
+                hours_ago(3),
+                minutes_ago(5),
+            ),
+        ],
+    );
+
+    let anchor = open_menu_on(&mut application, "Wrapped up");
+
+    let items = menu_items(&application, anchor);
+    assert!(
+        items[0].contains("Unsettle"),
+        "a row already on the shelf is offered the way back: {items:?}"
+    );
+    assert!(items[1].contains("Delete"), "and the way off it: {items:?}");
+}
+
+#[test]
+fn the_menu_sets_the_row_it_stands_on_aside() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
+
+    let anchor = open_menu_on(&mut application, "Wanted work");
+
+    assert_eq!(
+        press_menu_item(&mut application, anchor, 0),
+        ApplicationTransition::SettleSession {
+            session_id: wanted,
+            settled: true,
+        },
+        "the menu acts on the Session it was opened on rather than the one that is open"
+    );
+    assert!(
+        !menu_is_drawn(&application),
+        "and is done once it has acted"
+    );
+}
+
+#[test]
+fn the_menu_takes_a_settled_row_back_off_the_shelf() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let brought_back = SessionId::new();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed("Active work", None, workspace.path(), 2, now()),
+            set_aside(
+                listed_as(brought_back, "Wrapped up", workspace.path(), 1),
+                minutes_ago(5),
+            ),
+        ],
+    );
+
+    let anchor = open_menu_on(&mut application, "Wrapped up");
+
+    assert_eq!(
+        press_menu_item(&mut application, anchor, 0),
+        ApplicationTransition::SettleSession {
+            session_id: brought_back,
+            settled: false,
+        },
+        "a settled row is brought back rather than set aside again"
+    );
+}
+
+/// A Session and everything it owns is not something one stray press may take
+/// away, so the item asks again before it acts.
+#[test]
+fn the_menu_asks_again_before_it_deletes() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
+
+    let anchor = open_menu_on(&mut application, "Wanted work");
+
+    assert_eq!(
+        press_menu_item(&mut application, anchor, 1),
+        ApplicationTransition::Continue,
+        "the first press takes nothing away"
+    );
+    let items = menu_items(&application, anchor);
+    assert!(
+        items[1].contains("confirm"),
+        "it asks the reader to say it again: {items:?}"
+    );
+
+    assert_eq!(
+        press_menu_item(&mut application, anchor, 1),
+        ApplicationTransition::DeleteSession(wanted),
+        "and the second press acts on the Session the menu stands on"
+    );
+    assert!(
+        !menu_is_drawn(&application),
+        "leaving no menu standing over a row that is going away"
+    );
+}
+
+/// A press outside an open menu puts it away and is spent there: dismissing a
+/// menu is not also acting on whatever it was drawn over.
+#[test]
+fn a_press_outside_the_menu_puts_it_away_and_nothing_more() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
+
+    let _ = open_menu_on(&mut application, "Wanted work");
+
+    let row = drawn_at(&application, "Other work");
+    assert_eq!(
+        press_at(&mut application, MouseButton::Left, SIDEBAR_CELL, row),
+        ApplicationTransition::Continue,
+        "the press that dismisses a menu opens no Session"
+    );
+    assert!(!menu_is_drawn(&application), "the menu is put away");
+}
+
+/// The menu is the newest thing on screen while it is up, so it has the keys
+/// whether or not the Sidebar itself does.
+#[test]
+fn the_menu_answers_the_arrows_and_backs_out_on_esc() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
+
+    let anchor = open_menu_on(&mut application, "Wanted work");
+    press_sidebar_key(&mut application, KeyCode::Down);
+
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "the arrows walk the items, and Delete asks again rather than acting"
+    );
+    let items = menu_items(&application, anchor);
+    assert!(
+        items[1].contains("confirm"),
+        "which is the item the arrows landed on: {items:?}"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Esc);
+    assert!(
+        !menu_is_drawn(&application),
+        "and Esc puts the menu away, leaving the row it stood on alone"
+    );
+    assert!(
+        drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "Wanted work"
+        ),
+        "the row itself is still listed"
+    );
+}
+
+/// Whether a context menu is standing anywhere on the frame.
+fn menu_is_drawn(application: &Application) -> bool {
+    rendered_application_rows_at(application, WIDE, PRESS_HEIGHT)
+        .iter()
+        .any(|row| row.contains("Delete"))
+}
+
+/// The menu belongs to the column it was opened in. A terminal too narrow for
+/// the Sidebar draws neither, and holds none of the keys — the reader keeps
+/// the menu, as they keep the focus, and both come back when it widens.
+#[test]
+fn a_terminal_too_narrow_for_the_sidebar_draws_no_menu_and_holds_no_keys() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
+    let _ = open_menu_on(&mut application, "Wanted work");
+
+    let squeezed = rendered_application_rows_at(&application, 85, PRESS_HEIGHT);
+    assert!(
+        !squeezed.iter().any(|row| row.contains("Delete")),
+        "no menu stands over a main view the Sidebar was squeezed off: {squeezed:?}"
+    );
+
+    type_terminal_text(&mut application, "not-a-menu-key");
+    assert!(
+        rendered_application_rows_at(&application, 85, PRESS_HEIGHT)
+            .join("\n")
+            .contains("not-a-menu-key"),
+        "and the composer has the keys a menu nobody can see is not holding"
+    );
+}
+
+/// The box stands over rows it was not opened on, so asking it for a menu
+/// asks for nothing rather than carrying the reader onto whatever it covers.
+#[test]
+fn a_right_press_inside_the_menu_leaves_it_where_it_is() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
+
+    let anchor = open_menu_on(&mut application, "Wanted work");
+    let _ = rendered_application_rows_at(&application, WIDE, PRESS_HEIGHT);
+    press_at(
+        &mut application,
+        MouseButton::Right,
+        SIDEBAR_CELL + 1,
+        anchor + 1,
+    );
+
+    assert_eq!(
+        press_menu_item(&mut application, anchor, 0),
+        ApplicationTransition::SettleSession {
+            session_id: wanted,
+            settled: true,
+        },
+        "the menu stands where it was, on the row it was opened on"
     );
 }

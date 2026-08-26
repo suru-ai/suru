@@ -34,7 +34,7 @@ use super::{
         command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
         command_for_numeric_editor_event, command_for_queued_prompt_event,
         command_for_session_picker_event, command_for_settings_panel_event,
-        command_for_sidebar_event, command_for_terminal_event,
+        command_for_sidebar_event, command_for_sidebar_menu_event, command_for_terminal_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
@@ -42,7 +42,7 @@ use super::{
     render::render_with_slots,
     session_picker::SessionPicker,
     settings_panel::{AvailabilityRead, SettingsPanel},
-    sidebar::Sidebar,
+    sidebar::{Sidebar, SidebarPress},
     slots::RenderSlots,
     transcript::{
         FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups,
@@ -1350,7 +1350,15 @@ pub enum CommandId {
     ScrollTranscriptLinesUp,
     ScrollTranscriptLinesDown,
     FollowLatest,
-    ToggleTranscriptDisclosureAt {
+    /// Where in the frame the reader pressed, resolved against the geometry
+    /// the frame in force drew: the Sidebar owns the columns it drew, and the
+    /// main view answers everywhere else.
+    PressAt {
+        position: Position,
+    },
+    /// Where the reader asked for a context menu. Only the Sidebar's own rows
+    /// offer one; everywhere else the ask puts away whatever menu was up.
+    OpenContextMenuAt {
         position: Position,
     },
     BeginLeader,
@@ -1404,8 +1412,14 @@ pub enum ApplicationTransition {
     SessionEnded,
     DetachSession,
     DeleteSession(SessionId),
-    /// The open Session, set aside as done for now.
-    SettleSession(SessionId),
+    /// A Session set aside as done for now, or brought back off the shelf.
+    /// Which of the two is stated rather than toggled, so a client acting on a
+    /// listing that has moved on cannot flip a Session it meant to leave
+    /// alone.
+    SettleSession {
+        session_id: SessionId,
+        settled: bool,
+    },
     CreateSession(CreateSessionRequest),
     AdmitPrompt {
         session_id: SessionId,
@@ -1476,7 +1490,11 @@ impl Application {
                 }
             }
             ApplicationEvent::SessionDeletionFailed { session_id, error } => {
-                self.state.session_picker.fail_deletion(session_id, error);
+                // Whichever surface asked is the one that answers, so the
+                // refusal is drawn where the reader was looking.
+                if !self.state.sidebar.fail_deletion(session_id, error.clone()) {
+                    self.state.session_picker.fail_deletion(session_id, error);
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::SessionOperationFailed(error) => {
@@ -1592,9 +1610,11 @@ impl Application {
             | CommandId::ScrollTranscriptPageDown
             | CommandId::ScrollTranscriptLinesUp
             | CommandId::ScrollTranscriptLinesDown
-            | CommandId::FollowLatest
-            | CommandId::ToggleTranscriptDisclosureAt { .. }) => {
-                self.handle_transcript_command(command)
+            | CommandId::FollowLatest) => self.handle_transcript_command(command),
+            CommandId::PressAt { position } => self.handle_press(position),
+            CommandId::OpenContextMenuAt { position } => {
+                self.state.sidebar.open_menu_at(position);
+                Ok(ApplicationTransition::Continue)
             }
             command @ (CommandId::SelectPreviousCompletion
             | CommandId::SelectNextCompletion
@@ -1725,14 +1745,33 @@ impl Application {
                     .navigate_transcript_lines(TranscriptDirection::Down);
             }
             CommandId::FollowLatest => self.state.follow_latest(),
-            CommandId::ToggleTranscriptDisclosureAt { position } => {
-                if let Some(invocation) = self.state.toggle_disclosure_at(position) {
-                    return self.invoke_semantic(invocation);
-                }
-            }
             _ => {}
         }
         Ok(ApplicationTransition::Continue)
+    }
+
+    /// Answers a press at one cell of the frame, asking the layers in the
+    /// order they were drawn: the Sidebar owns the columns it drew, and a
+    /// press it does not claim falls through to the Transcript beside it.
+    fn handle_press(&mut self, position: Position) -> Result<ApplicationTransition> {
+        let press = self.state.sidebar.press_at(position);
+        if press != SidebarPress::Elsewhere {
+            return self.answer_sidebar_press(press);
+        }
+        match self.state.toggle_disclosure_at(position) {
+            Some(invocation) => self.invoke_semantic(invocation),
+            None => Ok(ApplicationTransition::Continue),
+        }
+    }
+
+    /// Answers what one press of the Sidebar came to. A press mints no
+    /// behavior of its own, so all that is left is to invoke the command it
+    /// named.
+    fn answer_sidebar_press(&mut self, press: SidebarPress) -> Result<ApplicationTransition> {
+        match press {
+            SidebarPress::Invoke(invocation) => self.invoke_semantic(invocation),
+            SidebarPress::Answered | SidebarPress::Elsewhere => Ok(ApplicationTransition::Continue),
+        }
     }
 
     /// Handles composer completion commands; any other command leaves the
@@ -1862,6 +1901,30 @@ impl Application {
             _ => {}
         }
         ApplicationTransition::Continue
+    }
+
+    /// Handles the Sidebar context menu's commands routed here; any other
+    /// command leaves the menu alone. A menu that is not open answers none of
+    /// them, so an invocation arriving from elsewhere cannot act on a row the
+    /// reader cannot see.
+    fn handle_sidebar_menu_command(
+        &mut self,
+        command: SemanticCommandId,
+    ) -> Result<ApplicationTransition> {
+        if !self.state.sidebar.menu_is_open() {
+            return Ok(ApplicationTransition::Continue);
+        }
+        match command {
+            SemanticCommandId::SidebarMenuPrevious => self.state.sidebar.menu_select_previous(),
+            SemanticCommandId::SidebarMenuNext => self.state.sidebar.menu_select_next(),
+            SemanticCommandId::SidebarMenuClose => self.state.sidebar.close_menu(),
+            SemanticCommandId::SidebarMenuSelect => {
+                let press = self.state.sidebar.activate_menu_item();
+                return self.answer_sidebar_press(press);
+            }
+            _ => {}
+        }
+        Ok(ApplicationTransition::Continue)
     }
 
     /// Handles the Model picker commands routed here; any other command leaves
@@ -2333,24 +2396,36 @@ impl Application {
                 }
                 Ok(ApplicationTransition::Continue)
             }
-            // The command acts on the Session the reader is in, so on the
-            // Landing there is nothing to set aside and the view stays put.
-            SemanticCommandId::SessionSettle => {
+            // The command acts on the Session it names — a Sidebar row names
+            // one — and on the Session the reader is in where it names none,
+            // so on the Landing there is nothing to set aside and the view
+            // stays put.
+            command @ (SemanticCommandId::SessionSettle | SemanticCommandId::SessionUnsettle) => {
                 self.state.command_mode = CommandMode::Composer;
-                Ok(self
-                    .state
-                    .session
-                    .as_ref()
-                    .map(SessionProjection::session_id)
-                    .map_or(
-                        ApplicationTransition::Continue,
-                        ApplicationTransition::SettleSession,
-                    ))
+                let settled = command == SemanticCommandId::SessionSettle;
+                let named = match invocation.subject {
+                    SemanticSubject::Session(session_id) => Some(session_id),
+                    SemanticSubject::View | SemanticSubject::Turn(_) => self
+                        .state
+                        .session
+                        .as_ref()
+                        .map(SessionProjection::session_id),
+                };
+                Ok(named.map_or(ApplicationTransition::Continue, |session_id| {
+                    ApplicationTransition::SettleSession {
+                        session_id,
+                        settled,
+                    }
+                }))
             }
             command @ (SemanticCommandId::SidebarPrevious
             | SemanticCommandId::SidebarNext
             | SemanticCommandId::SidebarAttach
             | SemanticCommandId::SidebarLeave) => Ok(self.handle_sidebar_command(command)),
+            command @ (SemanticCommandId::SidebarMenuPrevious
+            | SemanticCommandId::SidebarMenuNext
+            | SemanticCommandId::SidebarMenuSelect
+            | SemanticCommandId::SidebarMenuClose) => self.handle_sidebar_menu_command(command),
             SemanticCommandId::SidebarToggle => {
                 self.state.sidebar.toggle();
                 self.state.command_mode = CommandMode::Composer;
@@ -2359,7 +2434,15 @@ impl Application {
                     ApplicationTransition::ListSessions,
                 ))
             }
+            // A command naming a Session takes that one away: the surface
+            // that named it has already had the reader say it twice, which is
+            // what asking again is for. Naming none means the row the session
+            // picker is on, which asks there.
             SemanticCommandId::SessionDelete => {
+                if let SemanticSubject::Session(session_id) = invocation.subject {
+                    self.state.sidebar.begin_deletion(session_id);
+                    return Ok(ApplicationTransition::DeleteSession(session_id));
+                }
                 Ok(self.state.session_picker.begin_deletion().map_or(
                     ApplicationTransition::Continue,
                     ApplicationTransition::DeleteSession,
@@ -2713,6 +2796,13 @@ impl Application {
         }
         if self.state.session_picker.is_open() {
             return command_for_session_picker_event(event);
+        }
+        // A Sidebar row's context menu is drawn over the rows and takes the
+        // keys while it is up, whether or not the Sidebar itself has them: a
+        // reader who opened it by pointing must be able to walk it and back
+        // out of it without reaching for the mouse again.
+        if self.state.sidebar.menu_is_open() {
+            return command_for_sidebar_menu_event(event);
         }
         // The Sidebar comes after every overlay and before the composer's own
         // surfaces: it stands beside the main view rather than over it, so an
