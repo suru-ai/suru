@@ -1359,6 +1359,16 @@ pub enum SessionCatalogChange {
         session_id: SessionId,
         settled_at: Option<SessionTimestamp>,
     },
+    /// A Session's latest Turn began, or settled, so what
+    /// [`SessionSummary::working_since`] reads changed. It rides the catalog
+    /// stream for the same reason the others do — every client lists the
+    /// Session, and only some have it open — and it carries the new reading
+    /// whole, so a listing in hand says the right thing before the ask that
+    /// carries what the commit's own stamp moved.
+    WorkingChanged {
+        session_id: SessionId,
+        working_since: Option<SessionTimestamp>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1802,6 +1812,16 @@ pub struct SessionDeleted {
 pub struct SessionSettlementChanged {
     pub session_id: SessionId,
     pub settled_at: Option<SessionTimestamp>,
+}
+
+/// A Session's latest Turn began or settled, carried to a client that may be
+/// listing that Session without having it open: what a listing says live work
+/// has been running for is only true while someone announces it changing.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionWorkingChanged {
+    pub session_id: SessionId,
+    pub working_since: Option<SessionTimestamp>,
 }
 
 /// A Session's Title — and the Emoji beside it — as a derivation left them,

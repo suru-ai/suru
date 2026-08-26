@@ -2,6 +2,7 @@
 
 use crate::{
     provider_support::ControlledProvider,
+    server_support::{next_catalog_change, open_catalog_stream},
     support::{
         controlled_selection, next_session_update, read_session_at_least_revision,
         receive_managed_client_initial_state,
@@ -13,8 +14,9 @@ use suru::{
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection,
         CreateSessionRequest, FileChange, InitialPrompt, MessageRole, MessageStatus, ModelId,
-        PromptDelivery, PromptId, PromptStatus, ProviderId, SessionChange, SessionError,
-        SessionErrorCode, SessionId, SessionListItem, SessionRevision, SessionSnapshot,
+        PromptDelivery, PromptId, PromptStatus, ProviderId, SessionCatalogChange, SessionChange,
+        SessionError, SessionErrorCode, SessionId, SessionListItem, SessionRevision,
+        SessionSnapshot,
         SessionStatus, SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan, TranscriptItem,
         TurnStatus, Workspace,
     },
@@ -1940,6 +1942,105 @@ async fn a_listed_summary_says_when_its_running_turn_began_and_stops_once_it_set
         done.updated_at > running.updated_at,
         "the Turn moved the Session while it ran, which is why last activity \
          cannot stand in for when the work began"
+    );
+
+    drop(provider_session);
+    drop(feed);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn turn_liveness_is_announced_on_the_session_catalog_stream() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "working-catalog-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "working-catalog-test")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_managed_client_initial_state(&mut client).await;
+    let descriptor = server.descriptor().clone();
+    let mut catalog = open_catalog_stream(&descriptor).await;
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            // No Agent Selection, so no Title Errand runs and the catalog
+            // stream carries nothing but the creation and what the Turn puts
+            // on it.
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Work on this".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let session_id = created.session.id;
+    let mut feed = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to Session");
+    assert_eq!(
+        timeout(Duration::from_secs(1), feed.next())
+            .await
+            .expect("initial snapshot arrives")
+            .expect("Session stream remains open")
+            .expect("initial snapshot is valid"),
+        SessionEvent::Snapshot(created.clone())
+    );
+    assert_eq!(
+        next_catalog_change(&mut catalog).await,
+        SessionCatalogChange::Created { session_id }
+    );
+
+    let mut provider_session = provider.next_start().await.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-working", "high", "fast"),
+    });
+    next_session_update(&mut feed).await;
+    let delivery = next_session_update(&mut feed).await;
+    let started_at = delivery
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            SessionChange::TurnAdded { turn } => turn.started_at,
+            _ => None,
+        })
+        .expect("Prompt delivery creates a Turn that knows when it started");
+    assert_eq!(
+        next_catalog_change(&mut catalog).await,
+        SessionCatalogChange::WorkingChanged {
+            session_id,
+            working_since: Some(started_at),
+        },
+        "a Turn starting reaches every client listing the Session, \
+         open or not, so a Sidebar's Working label can be true"
+    );
+
+    provider_session.next_turn().await.succeed();
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    next_session_update(&mut feed).await;
+    assert_eq!(
+        next_catalog_change(&mut catalog).await,
+        SessionCatalogChange::WorkingChanged {
+            session_id,
+            working_since: None,
+        },
+        "and a Turn settling clears the reading, which is what lets an \
+         idle client's Spinner tick stand down"
     );
 
     drop(provider_session);

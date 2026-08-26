@@ -577,6 +577,13 @@ impl TuiState {
                     .settle(settled.session_id, settled.settled_at);
                 self.sidebar.settle(settled.session_id, settled.settled_at);
             }
+            // The picker takes nothing in place: it draws no Working label, so
+            // what the change carries is nothing it shows — and it asks for a
+            // fresh listing every time it opens.
+            ManagedEvent::SessionWorkingChanged(working) => {
+                self.sidebar
+                    .set_working(working.session_id, working.working_since);
+            }
             ManagedEvent::SessionCatalogReconciled(snapshot) => {
                 self.session_picker.retain_catalog(&snapshot.session_ids);
                 self.sidebar.retain_catalog(&snapshot.session_ids);

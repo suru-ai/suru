@@ -14,13 +14,14 @@ use tokio::sync::broadcast;
 
 use crate::protocol::{
     AgentSelection, AgentSelectionOperationId, PromptId, PromptOrder, ProviderId,
-    SessionCatalogChange, SessionCatalogRevision, SessionCatalogSnapshot, SessionCatalogUpdate,
+    SessionCatalogChange, SessionCatalogSnapshot, SessionCatalogUpdate,
     SessionId, SessionListItem, SessionSnapshot, SessionSummary, SessionTimestamp, SessionUpdate,
     TurnId, UnreadableSessionSummary,
 };
 use crate::provider::ProviderResumeState;
 use crate::storage::{PersistedSession, RestoredSessions, StorageSink, StoredResumeState};
 
+mod catalog;
 mod emoji;
 mod output;
 mod projection;
@@ -44,6 +45,7 @@ pub(crate) use settlement::{
 };
 pub(crate) use title::TitleDerivation;
 
+use catalog::SessionCatalogPublisher;
 use prompts::{PromptOrigin, PromptOwner};
 
 const SESSION_UPDATE_CAPACITY: usize = 256;
@@ -65,14 +67,17 @@ struct SessionStoreState {
     unreadable_sessions: HashMap<SessionId, UnreadableSessionSummary>,
     prompts: HashMap<PromptId, PromptOwner>,
     last_timestamp: Option<SessionTimestamp>,
-    catalog_revision: SessionCatalogRevision,
-    catalog_updates: broadcast::Sender<SessionCatalogUpdate>,
+    catalog: SessionCatalogPublisher,
 }
 
 struct SessionRecord {
     snapshot: SessionSnapshot,
     summary: SessionSummary,
     updates: broadcast::Sender<SessionUpdate>,
+    /// The catalog's one publisher, held here because a commit is where a
+    /// Turn's liveness is derived and a commit cannot reach the store state
+    /// that announces everything else.
+    catalog: SessionCatalogPublisher,
     next_prompt_order: PromptOrder,
     steer_targets: HashMap<PromptId, TurnId>,
     selection_operations: HashMap<AgentSelectionOperationId, AgentSelection>,
@@ -122,6 +127,7 @@ impl SessionStore {
             .flatten()
             .chain(unreadable.iter().map(|summary| summary.updated_at))
             .max();
+        let catalog = SessionCatalogPublisher::new();
         let mut sessions = HashMap::new();
         let mut prompts = HashMap::new();
         for persisted in persisted_sessions {
@@ -158,6 +164,7 @@ impl SessionStore {
                     snapshot,
                     summary,
                     updates,
+                    catalog: catalog.clone(),
                     next_prompt_order,
                     steer_targets: HashMap::new(),
                     selection_operations: HashMap::new(),
@@ -166,7 +173,6 @@ impl SessionStore {
                 },
             );
         }
-        let (catalog_updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
         let unreadable_sessions = unreadable
             .into_iter()
             .map(|summary| (summary.id, summary))
@@ -177,8 +183,7 @@ impl SessionStore {
                 unreadable_sessions,
                 prompts,
                 last_timestamp,
-                catalog_revision: SessionCatalogRevision::INITIAL,
-                catalog_updates,
+                catalog,
             })),
             storage,
         }
@@ -208,12 +213,13 @@ impl SessionStore {
             .copied()
             .collect::<Vec<_>>();
         session_ids.sort_unstable_by_key(ToString::to_string);
+        let (revision, updates) = state.catalog.subscribe();
         SessionCatalogFeed {
             snapshot: SessionCatalogSnapshot {
-                revision: state.catalog_revision,
+                revision,
                 session_ids,
             },
-            updates: state.catalog_updates.subscribe(),
+            updates,
         }
     }
 
@@ -363,16 +369,7 @@ impl SessionStore {
 
 impl SessionStoreState {
     fn publish_catalog_change(&mut self, change: SessionCatalogChange) {
-        self.catalog_revision = SessionCatalogRevision(
-            self.catalog_revision
-                .0
-                .checked_add(1)
-                .expect("Session catalog revision space is not exhausted"),
-        );
-        let _ = self.catalog_updates.send(SessionCatalogUpdate {
-            revision: self.catalog_revision,
-            change,
-        });
+        self.catalog.publish(change);
     }
 
     fn next_timestamp(&mut self) -> SessionTimestamp {

@@ -5,8 +5,8 @@
 use anyhow::anyhow;
 
 use crate::protocol::{
-    PromptOrder, SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
-    SessionTimestamp, SessionUpdate, TurnId, TurnStatus,
+    PromptOrder, SessionCatalogChange, SessionChange, SessionId, SessionRevision, SessionSnapshot,
+    SessionStatus, SessionTimestamp, SessionUpdate, TurnId, TurnStatus,
 };
 use crate::session_projection::apply_update;
 use crate::storage::StorageSink;
@@ -46,10 +46,23 @@ impl SessionRecord {
         updated_at: SessionTimestamp,
     ) -> anyhow::Result<SessionUpdate> {
         stamp_turn_timing(&mut changes, updated_at);
+        let was_working_since = self.summary.working_since;
         let update = self.publish(session_id, changes)?;
         self.summary.updated_at = updated_at;
         storage.updated(self.summary.clone(), &update)?;
         let _ = self.updates.send(update.clone());
+        // Turn liveness rides the catalog stream, because a client subscribes
+        // only to the Session it has open while the Working label it draws is
+        // for every Session it lists. Announced only when the reading flips:
+        // a Turn moves the Session with every commit it streams, and none of
+        // those change what a listing says about when the work began.
+        if self.summary.working_since != was_working_since {
+            self.catalog
+                .publish(SessionCatalogChange::WorkingChanged {
+                    session_id,
+                    working_since: self.summary.working_since,
+                });
+        }
         Ok(update)
     }
 

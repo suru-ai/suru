@@ -148,6 +148,18 @@ pub async fn open_catalog_stream(
     )
 }
 
+/// The next change the Session catalog stream announces, however long the
+/// commits between it stream for.
+pub async fn next_catalog_change(
+    catalog: &mut (impl futures_util::Stream<Item = SessionCatalogUpdate> + Unpin),
+) -> SessionCatalogChange {
+    timeout(Duration::from_secs(5), catalog.next())
+        .await
+        .expect("a catalog change arrives")
+        .expect("the catalog stream stays open")
+        .change
+}
+
 /// Every catalog change up to and including the derived Title.
 pub async fn catalog_changes_through_title(
     catalog: &mut (impl futures_util::Stream<Item = SessionCatalogUpdate> + Unpin),

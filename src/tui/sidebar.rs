@@ -1101,14 +1101,11 @@ impl Sidebar {
     /// could not spare the columns for, shows no live work whatever its
     /// listing holds.
     ///
-    /// It answers from the listing in hand, which is as live as the listing
-    /// is. Nothing announces a Turn starting or settling in a Session this
-    /// client does not have open, so a row that was working when the listing
-    /// landed goes on saying so — and goes on arming the tick — until the
-    /// next listing. That is a wakeup an idle TUI should not be paying, which
-    /// ADR 0007 and ADR 0009 are the reason to care about:
-    /// <https://github.com/jake-tucker/suru/issues/184> carries Turn liveness
-    /// to the Sidebar and closes it.
+    /// It answers from the listing in hand, which the session-catalog stream
+    /// keeps true: a Turn starting or settling anywhere arrives as a working
+    /// change and is taken in place by [`Self::set_working`], so the tick is
+    /// armed exactly while something listed is live and an idle TUI schedules
+    /// zero wakeups (ADR 0007, ADR 0009).
     pub(super) fn shows_live_work(&self) -> bool {
         self.revealed
             && self.on_screen.get()
@@ -1174,6 +1171,17 @@ impl Sidebar {
 
     pub(super) fn settle(&mut self, session_id: SessionId, settled_at: Option<SessionTimestamp>) {
         self.listing.settle(session_id, settled_at);
+    }
+
+    /// Takes a Turn the server reports starting or settling into the listing
+    /// in hand, so the row's Working label — and the tick
+    /// [`Self::shows_live_work`] arms off it — is true between listings.
+    pub(super) fn set_working(
+        &mut self,
+        session_id: SessionId,
+        working_since: Option<SessionTimestamp>,
+    ) {
+        self.listing.set_working(session_id, working_since);
     }
 
     pub(super) fn remove(&mut self, session_id: SessionId) {
@@ -2497,6 +2505,32 @@ mod tests {
         assert!(
             !sidebar.shows_live_work(),
             "and neither does one the reader closed"
+        );
+    }
+
+    /// The catalog stream reporting a Turn starting and settling is what keeps
+    /// the tick honest between listings: a row that settles takes the tick
+    /// down with it, and one that starts working arms it, without waiting for
+    /// the reader to ask for the listing again.
+    #[test]
+    fn a_working_change_arms_the_tick_and_the_turn_settling_drops_it() {
+        let idle = SessionId::new();
+        let mut sidebar = showing(vec![identified(idle, "Quiet", 1)]);
+        assert!(!sidebar.shows_live_work());
+
+        sidebar.set_working(idle, Some(SessionTimestamp(5)));
+
+        assert!(
+            sidebar.shows_live_work(),
+            "a Turn starting in a listed Session arms the tick its Working duration rises on"
+        );
+
+        sidebar.set_working(idle, None);
+
+        assert!(
+            !sidebar.shows_live_work(),
+            "and the last live row settling stands the tick down, so an idle \
+             TUI schedules zero wakeups again"
         );
     }
 

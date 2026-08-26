@@ -222,12 +222,14 @@ impl SessionStore {
             },
         );
         let persisted_summary = summary.clone();
+        let catalog = state.catalog.clone();
         state.sessions.insert(
             session_id,
             SessionRecord {
                 snapshot: snapshot.clone(),
                 summary,
                 updates,
+                catalog,
                 next_prompt_order: PromptOrder(2),
                 steer_targets: HashMap::new(),
                 selection_operations: HashMap::new(),

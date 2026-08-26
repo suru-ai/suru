@@ -19,6 +19,7 @@ use crate::{
         ModelCatalog, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
         SessionCreated, SessionDeleted, SessionError, SessionId, SessionListItem,
         SessionSettlementChanged, SessionSnapshot, SessionSummary, SessionTitleChanged,
+        SessionWorkingChanged,
         SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
         SkillCatalogRequest, Turn, TurnId, UpdateAgentSelectionRequest,
     },
@@ -165,6 +166,11 @@ pub enum ManagedEvent {
     /// the same terms as a Title change, and for the same reason: every client
     /// lists the Session, and only some have it open.
     SessionSettlementChanged(SessionSettlementChanged),
+    /// A Session's latest Turn began or settled, moving what a listing says
+    /// live work has been running for. It arrives on the same terms as a Title
+    /// change, and for the same reason: every client lists the Session, and
+    /// only some have it open.
+    SessionWorkingChanged(SessionWorkingChanged),
     SessionCatalogReconciled(SessionCatalogSnapshot),
     Fatal(String),
 }
@@ -180,10 +186,12 @@ impl ManagedEvent {
     }
 
     /// Whether this event reports the body of work moving: a Session made,
-    /// retitled, deleted, set aside, brought back, or a whole catalog
-    /// reconciled after a reconnection. A surface listing Sessions is only as
-    /// truthful as the last such change it was told about, so it asks the
-    /// server again for everything the change itself does not say.
+    /// retitled, deleted, set aside, brought back, worked on, or a whole
+    /// catalog reconciled after a reconnection. A surface listing Sessions is
+    /// only as truthful as the last such change it was told about, so it asks
+    /// the server again for everything the change itself does not say — for a
+    /// Turn starting, the last activity the commit moved and the order a
+    /// listing keeps by it.
     pub const fn moves_the_session_catalog(&self) -> bool {
         matches!(
             self,
@@ -191,6 +199,7 @@ impl ManagedEvent {
                 | Self::SessionDeleted(_)
                 | Self::SessionTitleChanged(_)
                 | Self::SessionSettlementChanged(_)
+                | Self::SessionWorkingChanged(_)
                 | Self::SessionCatalogReconciled(_)
         )
     }

@@ -185,6 +185,21 @@ impl SessionListing {
         }
     }
 
+    /// Records when the Session the server names had its latest Turn begin,
+    /// or `None` as that Turn settles — which is what keeps a Working label
+    /// true on a listing drawn before the work moved. The order this listing
+    /// keeps is by when a Session was last updated, which this change does not
+    /// carry, so nothing moves until the next listing lands.
+    pub(super) fn set_working(
+        &mut self,
+        session_id: SessionId,
+        working_since: Option<SessionTimestamp>,
+    ) {
+        if let Some(summary) = self.readable_mut(session_id) {
+            summary.working_since = working_since;
+        }
+    }
+
     /// The listed summary a catalog change names, for the changes that revise
     /// one Session in place. A Session Suru could not read carries no summary
     /// to revise, so it is passed over rather than reported missing.
@@ -392,6 +407,34 @@ mod tests {
         listing.settle(session_id, None);
 
         assert_eq!(listing.sessions()[1].settled_at(), None);
+    }
+
+    #[test]
+    fn a_working_change_lands_on_the_session_it_names_without_moving_the_order() {
+        let workspace = tempfile::tempdir().expect("create Workspace");
+        let mut listing =
+            SessionListing::new(SessionListSurface::Picker, workspace.path().to_owned());
+        let request = listing.refresh();
+        listing.load(&request, vec![summary("Newer", 2), summary("Working", 1)]);
+        let session_id = listing.sessions()[1].id();
+
+        listing.set_working(session_id, Some(SessionTimestamp(9)));
+
+        assert_eq!(titles(&listing), vec!["Newer", "Working"]);
+        assert_eq!(
+            listing.sessions()[1].working_since(),
+            Some(SessionTimestamp(9)),
+            "the row the change names says its work is live"
+        );
+        assert_eq!(listing.sessions()[0].working_since(), None);
+
+        listing.set_working(session_id, None);
+
+        assert_eq!(
+            listing.sessions()[1].working_since(),
+            None,
+            "and the Turn settling clears the reading"
+        );
     }
 
     #[test]

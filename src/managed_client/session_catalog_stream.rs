@@ -11,7 +11,7 @@ use crate::protocol::{
     RuntimeDescriptor, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
     SKILL_CATALOG_UPDATED_EVENT, SessionCatalogChange, SessionCatalogRevision,
     SessionCatalogSnapshot, SessionCatalogUpdate, SessionCreated, SessionDeleted, SessionId,
-    SessionSettlementChanged, SessionTitleChanged, SkillCatalog,
+    SessionSettlementChanged, SessionTitleChanged, SessionWorkingChanged, SkillCatalog,
 };
 
 use super::ManagedEvent;
@@ -161,6 +161,18 @@ fn apply_update(
                 },
             ))
         }
+        SessionCatalogChange::WorkingChanged {
+            session_id,
+            working_since,
+        } => {
+            if !known.contains(&session_id) {
+                bail!("Session catalog reported work on an unknown Session");
+            }
+            Ok(ManagedEvent::SessionWorkingChanged(SessionWorkingChanged {
+                session_id,
+                working_since,
+            }))
+        }
     }
 }
 
@@ -211,6 +223,7 @@ fn validate_event_id(id: &str, revision: SessionCatalogRevision) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::SessionTimestamp;
 
     #[test]
     fn reconnect_snapshot_recovers_a_missed_deletion() {
@@ -254,6 +267,48 @@ mod tests {
             ),
             vec![deleted],
             "reconnect reconciliation reports the deletion missed while disconnected"
+        );
+    }
+
+    #[test]
+    fn a_working_change_is_announced_for_a_listed_session_and_refused_for_an_unknown_one() {
+        let listed = SessionId::new();
+        let mut known = None;
+        reconcile_snapshot(
+            &mut known,
+            SessionCatalogSnapshot {
+                revision: SessionCatalogRevision::INITIAL,
+                session_ids: vec![listed],
+            },
+        );
+
+        assert_eq!(
+            apply_update(
+                &mut known,
+                SessionCatalogChange::WorkingChanged {
+                    session_id: listed,
+                    working_since: Some(SessionTimestamp(7)),
+                },
+            )
+            .expect("announce the Turn another client's Session is running"),
+            ManagedEvent::SessionWorkingChanged(SessionWorkingChanged {
+                session_id: listed,
+                working_since: Some(SessionTimestamp(7)),
+            }),
+            "a Turn starting in a Session this client never opened is \
+             announced to every surface listing it"
+        );
+        assert!(
+            apply_update(
+                &mut known,
+                SessionCatalogChange::WorkingChanged {
+                    session_id: SessionId::new(),
+                    working_since: None,
+                },
+            )
+            .is_err(),
+            "work reported on a Session the catalog never listed is a \
+             discontinuity, not something to draw"
         );
     }
 }

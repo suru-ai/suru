@@ -21,7 +21,8 @@ use suru::{
         AutoSettle, EffectiveSettings, ModelAvailability, PromptId, Session,
         SessionCatalogRevision, SessionCatalogSnapshot, SessionCreated, SessionDeleted, SessionId,
         SessionListItem, SessionSettlementChanged, SessionStatus, SessionSummary, SessionTimestamp,
-        SessionTitleChanged, SettingsSnapshot, SidebarScope, SidebarSettings, SidebarVisibility,
+        SessionTitleChanged, SessionWorkingChanged, SettingsSnapshot, SidebarScope,
+        SidebarSettings, SidebarVisibility,
         UnreadableSessionSummary, Workspace,
     },
     tui::{
@@ -246,6 +247,52 @@ fn the_working_duration_reads_seconds_minutes_and_hours() {
             sidebar_column(&rows[row - 1])
         );
     }
+}
+
+/// A Turn starting or settling in any Session — another client's as readily as
+/// this one's — arrives on the session-catalog stream, so the right slot's
+/// Working label is true rather than as-of-listing.
+#[test]
+fn a_turn_reported_on_the_catalog_stream_moves_the_working_label() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let session_id = SessionId::new();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![listed_at(
+            session_id,
+            "Quiet work",
+            workspace.path(),
+            minutes_ago(5),
+        )],
+    );
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let row = rendered_row(&rows, "Quiet work");
+    assert!(
+        !sidebar_column(&rows[row - 1]).contains("Working"),
+        "a Session with nothing running reads the compact time: {rows:?}"
+    );
+
+    work_elsewhere(
+        &mut application,
+        session_id,
+        Some(SessionTimestamp(seconds_ago(90))),
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let slot = sidebar_column(&rows[rendered_row(&rows, "Quiet work") - 1]);
+    assert!(
+        slot.ends_with("Working 1m"),
+        "the Turn the stream reported starting reads as live work: {slot:?}"
+    );
+
+    work_elsewhere(&mut application, session_id, None);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let slot = sidebar_column(&rows[rendered_row(&rows, "Quiet work") - 1]);
+    assert!(
+        !slot.contains("Working"),
+        "and the Turn settling clears the label without waiting for a listing: {slot:?}"
+    );
 }
 
 #[test]
@@ -1797,6 +1844,23 @@ fn set_aside_shelf(workspace: &Path, count: u64) -> Vec<SessionListItem> {
 /// Whether the Sidebar's own columns carry `needle` anywhere down the frame.
 fn drawn_in_sidebar(rows: &[String], needle: &str) -> bool {
     rows.iter().any(|row| sidebar_column(row).contains(needle))
+}
+
+/// A Turn starting or settling in some client's Session, arriving on the
+/// session-catalog stream, reporting whatever the Sidebar asks for in answer.
+fn work_elsewhere(
+    application: &mut Application,
+    session_id: SessionId,
+    working_since: Option<SessionTimestamp>,
+) -> ApplicationTransition {
+    application
+        .handle_event(ApplicationEvent::Managed(
+            ManagedEvent::SessionWorkingChanged(SessionWorkingChanged {
+                session_id,
+                working_since,
+            }),
+        ))
+        .expect("take the Turn the catalog stream reported")
 }
 
 /// A settlement another client made, arriving on the session-catalog stream,

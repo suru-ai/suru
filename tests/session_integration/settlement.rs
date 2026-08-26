@@ -3,16 +3,15 @@
 
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
-    server_support::open_catalog_stream,
+    server_support::{next_catalog_change, open_catalog_stream},
     support::{create_session, receive_managed_client_initial_state},
 };
 use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
-use futures_util::StreamExt;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
         AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId,
-        RuntimeDescriptor, SessionCatalogChange, SessionCatalogUpdate, SessionError,
+        RuntimeDescriptor, SessionCatalogChange, SessionError,
         SessionErrorCode, SessionId, SessionListItem, SessionSettlementChanged, SessionSummary,
         SessionTimestamp, SettleSessionRequest, Workspace,
     },
@@ -83,16 +82,6 @@ async fn listed(descriptor: &RuntimeDescriptor, session_id: SessionId) -> Sessio
         .into_iter()
         .find(|item| item.id() == session_id)
         .expect("the Session remains listed")
-}
-
-async fn next_catalog_change(
-    catalog: &mut (impl futures_util::Stream<Item = SessionCatalogUpdate> + Unpin),
-) -> SessionCatalogChange {
-    timeout(Duration::from_secs(5), catalog.next())
-        .await
-        .expect("a catalog change arrives")
-        .expect("the catalog stream stays open")
-        .change
 }
 
 #[tokio::test]
