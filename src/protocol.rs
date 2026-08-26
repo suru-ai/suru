@@ -860,7 +860,7 @@ impl<'de> Deserialize<'de> for AutoSettle {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SidebarSettings {
-    pub launch_visibility: SidebarVisibility,
+    pub initial_visibility: SidebarVisibility,
     pub initial_scope: SidebarScope,
     pub auto_settle: AutoSettle,
 }
@@ -969,7 +969,7 @@ pub enum SettingMutation {
     SessionTitleErrand {
         value: Option<TitleErrand>,
     },
-    SidebarLaunchVisibility {
+    SidebarInitialVisibility {
         value: Option<SidebarVisibility>,
     },
     SidebarInitialScope {

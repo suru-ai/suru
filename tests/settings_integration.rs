@@ -141,7 +141,7 @@ async fn a_hidden_sidebar_pins_from_a_document_and_resets_to_the_shown_default()
         config_dir.path().join("suru.jsonc"),
         r#"{
             // I would rather have the columns.
-            "sidebar": { "launchVisibility": "hidden" },
+            "sidebar": { "initialVisibility": "hidden" },
         }"#,
     )
     .expect("write Config Document");
@@ -155,18 +155,18 @@ async fn a_hidden_sidebar_pins_from_a_document_and_resets_to_the_shown_default()
 
     let (client, opening) = attach(state_dir.path(), "settings-sidebar").await;
     assert_eq!(
-        opening.settings.sidebar.launch_visibility,
+        opening.settings.sidebar.initial_visibility,
         SidebarVisibility::Hidden
     );
-    assert_eq!(opening.pinned, ["sidebar.launchVisibility"]);
+    assert_eq!(opening.pinned, ["sidebar.initialVisibility"]);
     assert_eq!(opening.diagnostics, []);
 
     let answered = client
-        .mutate_setting(SettingMutation::SidebarLaunchVisibility { value: None })
+        .mutate_setting(SettingMutation::SidebarInitialVisibility { value: None })
         .await
         .expect("reset the Setting");
     assert_eq!(
-        answered.settings.sidebar.launch_visibility,
+        answered.settings.sidebar.initial_visibility,
         SidebarVisibility::Shown,
         "unpinning it lets the built-in default resume"
     );

@@ -97,7 +97,8 @@ impl WorkspaceScope {
 /// lists.
 ///
 /// Visibility has two independent halves. The reader's choice — seeded once
-/// from the launch Setting and flipped by the toggle — lives here and is never
+/// from the initial-visibility Setting and flipped by the toggle — lives here
+/// and is never
 /// written back to configuration. Whether the frame can actually spare the
 /// columns is decided at draw time by [`width_beside`], so a terminal that
 /// squeezes the Sidebar out forgets nothing.
@@ -108,14 +109,15 @@ pub(super) struct Sidebar {
     /// Opening it themselves is what claims the keys; Esc, the toggle, and the
     /// Session they attach hand them back.
     focused: bool,
-    /// Whether the launch Setting has had its say. Only the first snapshot
+    /// Whether the Settings that seed the Sidebar have had their say. Only the
+    /// first snapshot
     /// seeds: every later one carries some other Setting's edit, and a reader
     /// who toggled the Sidebar since should not have it flipped back under
     /// them.
     seeded: bool,
     /// When a Session settles without anyone saying so. Adopted from every
-    /// snapshot rather than seeded from the first, because unlike the launch
-    /// Setting this one governs what the Sidebar shows for as long as it is
+    /// snapshot rather than seeded from the first, because unlike the two
+    /// Settings that seed the Sidebar this one governs what the Sidebar shows for as long as it is
     /// open: editing it reclassifies every listed Session on the next frame.
     auto_settle: AutoSettle,
     /// The Workspaces the Sidebar draws, seeded once from the initial-scope
@@ -144,7 +146,8 @@ pub(super) struct Sidebar {
     attaching: Option<SessionId>,
     /// A listing the Sidebar has asked for but has not yet handed to whoever
     /// dispatches it. Revealing the Sidebar is not always something a reader
-    /// did — the launch Setting reveals it too — so the request waits here for
+    /// did — the initial-visibility Setting reveals it too — so the request
+    /// waits here for
     /// the next caller able to carry it.
     awaiting_dispatch: Option<SessionListRequest>,
     /// Whether the last frame had the columns to draw the Sidebar. Only a
@@ -525,7 +528,7 @@ impl Sidebar {
     /// the initial-scope Setting's before that.
     pub(super) fn new(current_workspace: PathBuf) -> Self {
         Self {
-            // Down until the launch Setting raises it. A Sidebar with no
+            // Down until the initial-visibility Setting raises it. A Sidebar with no
             // Settings in hand has not spoken to a server either, so it has
             // nothing to list; drawing one before the snapshot lands would put
             // an empty column on screen and take it away again for a reader
@@ -557,7 +560,7 @@ impl Sidebar {
     }
 
     /// Takes the Sidebar's own Settings, each on its own schedule: auto-settle
-    /// governs every frame from here on, while the two launch Settings have
+    /// governs every frame from here on, while the two initial Settings have
     /// their say once and are then the reader's to overrule. Returns nothing: a
     /// Sidebar that wants its Sessions leaves the request in
     /// [`Self::take_listing_request`].
@@ -573,15 +576,15 @@ impl Sidebar {
                 WorkspaceScope::Workspace(self.listing.current_workspace().to_owned())
             }
         };
-        self.reveal(settings.launch_visibility == SidebarVisibility::Shown);
+        self.reveal(settings.initial_visibility == SidebarVisibility::Shown);
     }
 
     /// Shows the Sidebar, or hides it. This is view state and nothing more: the
-    /// launch Setting is not rewritten.
+    /// initial-visibility Setting is not rewritten.
     ///
     /// A reader who opens the Sidebar is asking to drive it, so it takes the
-    /// keys; closing hands them back. The launch Setting's own reveal in
-    /// [`Self::seed`] does neither, because a reader who has not touched the
+    /// keys; closing hands them back. The initial-visibility Setting's own
+    /// reveal in [`Self::adopt_settings`] does neither, because a reader who has not touched the
     /// Sidebar is typing their first Prompt.
     pub(super) fn toggle(&mut self) {
         self.reveal(!self.revealed);
@@ -865,7 +868,8 @@ impl Sidebar {
     }
 
     /// A Sidebar the reader can see wants Sessions to show, so every reveal —
-    /// the launch Setting's and the toggle's alike — asks for them afresh.
+    /// the initial-visibility Setting's and the toggle's alike — asks for them
+    /// afresh.
     /// Hiding keeps what it holds: nothing is looking at it, and revealing
     /// again asks anyway.
     fn reveal(&mut self, revealed: bool) {
@@ -1658,7 +1662,7 @@ mod tests {
     };
 
     #[test]
-    fn the_launch_setting_has_its_say_once_and_the_toggle_has_it_after() {
+    fn the_initial_visibility_setting_has_its_say_once_and_the_toggle_has_it_after() {
         let mut sidebar = Sidebar::new(root());
         sidebar.adopt_settings(&launching(SidebarVisibility::Hidden));
 
@@ -1687,7 +1691,7 @@ mod tests {
 
         assert!(
             !sidebar.is_revealed(),
-            "the launch Setting is what raises the Sidebar, so nothing is drawn before it lands"
+            "the initial-visibility Setting is what raises the Sidebar, so nothing is drawn before it lands"
         );
         assert!(sidebar.take_listing_request().is_none());
     }
@@ -1726,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn the_toggle_takes_the_keys_and_the_launch_setting_leaves_them_alone() {
+    fn the_toggle_takes_the_keys_and_the_initial_visibility_setting_leaves_them_alone() {
         let mut sidebar = Sidebar::new(root());
         sidebar.adopt_settings(&launching(SidebarVisibility::Shown));
 
@@ -1911,7 +1915,7 @@ mod tests {
     fn a_session_settles_itself_the_moment_its_idle_reaches_the_threshold() {
         let mut sidebar = Sidebar::new(root());
         sidebar.adopt_settings(&SidebarSettings {
-            launch_visibility: SidebarVisibility::Shown,
+            initial_visibility: SidebarVisibility::Shown,
             auto_settle: AutoSettle::Idle(1),
             ..SidebarSettings::default()
         });
@@ -2200,11 +2204,11 @@ mod tests {
         })
     }
 
-    /// The Sidebar's Settings as a TUI launching under `launch_visibility`
+    /// The Sidebar's Settings as a TUI launching under `initial_visibility`
     /// takes them, everything else left where its built-in default is.
-    fn launching(launch_visibility: SidebarVisibility) -> SidebarSettings {
+    fn launching(initial_visibility: SidebarVisibility) -> SidebarSettings {
         SidebarSettings {
-            launch_visibility,
+            initial_visibility,
             ..SidebarSettings::default()
         }
     }
@@ -2215,7 +2219,7 @@ mod tests {
     /// reads as work left alone since the epoch.
     fn settling_nothing() -> SidebarSettings {
         SidebarSettings {
-            launch_visibility: SidebarVisibility::Shown,
+            initial_visibility: SidebarVisibility::Shown,
             auto_settle: AutoSettle::Off,
             ..SidebarSettings::default()
         }

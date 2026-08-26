@@ -49,7 +49,7 @@ const SESSION_CONTENT_WIDTH: &str = "session.contentWidth";
 // later gets its own key and turning Titles off can never silently disable
 // work that has nothing to do with them.
 const SESSION_TITLE_ERRAND: &str = "session.title.errand";
-const SIDEBAR_LAUNCH_VISIBILITY: &str = "sidebar.launchVisibility";
+const SIDEBAR_INITIAL_VISIBILITY: &str = "sidebar.initialVisibility";
 const SIDEBAR_INITIAL_SCOPE: &str = "sidebar.initialScope";
 const SIDEBAR_AUTO_SETTLE: &str = "sidebar.autoSettle";
 const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
@@ -397,8 +397,8 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::SessionTitleErrand { value } => {
             value.as_ref() == Some(&settings.session.title.errand)
         }
-        SettingMutation::SidebarLaunchVisibility { value } => {
-            *value == Some(settings.sidebar.launch_visibility)
+        SettingMutation::SidebarInitialVisibility { value } => {
+            *value == Some(settings.sidebar.initial_visibility)
         }
         SettingMutation::SidebarInitialScope { value } => {
             *value == Some(settings.sidebar.initial_scope)
@@ -568,7 +568,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         },
     },
     SettingDescriptor {
-        key: SIDEBAR_LAUNCH_VISIBILITY,
+        key: SIDEBAR_INITIAL_VISIBILITY,
         label: "Sidebar at launch",
         description: "Whether a TUI opens with the Sidebar beside its main view",
         group: SettingGroup::General,
@@ -576,21 +576,21 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "shown",
-                pin: SettingMutation::SidebarLaunchVisibility {
+                pin: SettingMutation::SidebarInitialVisibility {
                     value: Some(SidebarVisibility::Shown),
                 },
             },
             SettingChoice {
                 value: "hidden",
-                pin: SettingMutation::SidebarLaunchVisibility {
+                pin: SettingMutation::SidebarInitialVisibility {
                     value: Some(SidebarVisibility::Hidden),
                 },
             },
         ]),
-        reset: SettingMutation::SidebarLaunchVisibility { value: None },
+        reset: SettingMutation::SidebarInitialVisibility { value: None },
         apply: |settings, value| {
             apply_value(value, |visibility| {
-                settings.sidebar.launch_visibility = visibility;
+                settings.sidebar.initial_visibility = visibility;
             })
         },
     },
@@ -921,8 +921,8 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         }
         SettingMutation::SessionContentWidth { value } => (SESSION_CONTENT_WIDTH, pinned(value)),
         SettingMutation::SessionTitleErrand { value } => (SESSION_TITLE_ERRAND, pinned(value)),
-        SettingMutation::SidebarLaunchVisibility { value } => {
-            (SIDEBAR_LAUNCH_VISIBILITY, pinned(value))
+        SettingMutation::SidebarInitialVisibility { value } => {
+            (SIDEBAR_INITIAL_VISIBILITY, pinned(value))
         }
         SettingMutation::SidebarInitialScope { value } => (SIDEBAR_INITIAL_SCOPE, pinned(value)),
         SettingMutation::SidebarAutoSettle { value } => (SIDEBAR_AUTO_SETTLE, pinned(value)),

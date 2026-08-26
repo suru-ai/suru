@@ -37,7 +37,7 @@ fn deliver_snapshot(application: &mut Application, diagnostics: Vec<SettingsDiag
                     // The Notice is the Landing's own row, so the Sidebar stays
                     // off the frame rather than sharing it.
                     sidebar: SidebarSettings {
-                        launch_visibility: SidebarVisibility::Hidden,
+                        initial_visibility: SidebarVisibility::Hidden,
                         ..SidebarSettings::default()
                     },
                     ..EffectiveSettings::default()

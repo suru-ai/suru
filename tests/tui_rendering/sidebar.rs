@@ -1,4 +1,5 @@
-//! The Sidebar: its column beside both views, the toggle, the launch Setting,
+//! The Sidebar: its column beside both views, the toggle, the Settings it
+//! launches under,
 //! and the shape of an active row.
 
 use std::{
@@ -237,19 +238,19 @@ fn a_sidebar_the_setting_hides_is_absent_until_the_reader_asks_for_it() {
     let mut application = connected_application(workspace.path());
 
     assert_eq!(
-        deliver_launch_visibility(&mut application, SidebarVisibility::Hidden),
+        deliver_initial_visibility(&mut application, SidebarVisibility::Hidden),
         ApplicationTransition::Continue,
         "a Sidebar nobody can see asks for no Sessions"
     );
     assert!(
         !sidebar_is_drawn(&rendered_application_rows_at(&application, WIDE, 20)),
-        "the first frame honors the launch Setting"
+        "the first frame honors the initial-visibility Setting"
     );
 
     expect_sidebar_listing(press_toggle(&mut application));
     assert!(
         sidebar_is_drawn(&rendered_application_rows_at(&application, WIDE, 20)),
-        "the toggle overrides the launch Setting for this run"
+        "the toggle overrides the initial-visibility Setting for this run"
     );
 }
 
@@ -259,7 +260,7 @@ fn a_later_settings_snapshot_leaves_the_readers_own_choice_alone() {
     let mut application = sidebar_showing(workspace.path(), Vec::new());
     press_toggle(&mut application);
 
-    deliver_launch_visibility(&mut application, SidebarVisibility::Shown);
+    deliver_initial_visibility(&mut application, SidebarVisibility::Shown);
 
     assert!(
         !sidebar_is_drawn(&rendered_application_rows_at(&application, WIDE, 20)),
@@ -321,7 +322,7 @@ fn the_landing_footer_is_spread_across_the_columns_the_sidebar_left() {
 fn a_session_deleted_elsewhere_leaves_the_sidebar_it_was_listed_in() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = connected_application(workspace.path());
-    let request = expect_sidebar_listing(deliver_launch_visibility(
+    let request = expect_sidebar_listing(deliver_initial_visibility(
         &mut application,
         SidebarVisibility::Shown,
     ));
@@ -400,7 +401,7 @@ fn sidebar_settling(
     let request = expect_sidebar_listing(deliver_sidebar_settings(
         &mut application,
         SidebarSettings {
-            launch_visibility: SidebarVisibility::Shown,
+            initial_visibility: SidebarVisibility::Shown,
             auto_settle,
             ..SidebarSettings::default()
         },
@@ -411,14 +412,14 @@ fn sidebar_settling(
     application
 }
 
-fn deliver_launch_visibility(
+fn deliver_initial_visibility(
     application: &mut Application,
-    launch_visibility: SidebarVisibility,
+    initial_visibility: SidebarVisibility,
 ) -> ApplicationTransition {
     deliver_sidebar_settings(
         application,
         SidebarSettings {
-            launch_visibility,
+            initial_visibility,
             ..SidebarSettings::default()
         },
     )
@@ -573,7 +574,7 @@ fn the_sidebar_survives_every_terminal_the_frame_will_draw() {
 }
 
 #[test]
-fn the_launch_setting_shows_the_sidebar_without_taking_the_keys() {
+fn the_initial_visibility_setting_shows_the_sidebar_without_taking_the_keys() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = sidebar_showing(
         workspace.path(),
@@ -917,7 +918,7 @@ fn a_paste_goes_to_the_search_box_rather_than_the_composer() {
 fn the_keys_after_the_toggle_reach_the_sidebar_before_the_next_frame() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = connected_application(workspace.path());
-    deliver_launch_visibility(&mut application, SidebarVisibility::Hidden);
+    deliver_initial_visibility(&mut application, SidebarVisibility::Hidden);
     // A frame with no Sidebar on it, which is the state the toggle acts from.
     rendered_application_rows_at(&application, WIDE, 20);
     let request = expect_sidebar_listing(press_toggle(&mut application));
@@ -985,7 +986,7 @@ fn the_window_holds_still_while_the_selection_moves_inside_it() {
 /// Sidebar that has the keys.
 fn sidebar_focused(workspace: &Path, sessions: Vec<SessionListItem>) -> Application {
     let mut application = connected_application(workspace);
-    deliver_launch_visibility(&mut application, SidebarVisibility::Hidden);
+    deliver_initial_visibility(&mut application, SidebarVisibility::Hidden);
     let request = expect_sidebar_listing(press_toggle(&mut application));
     application
         .handle_event(ApplicationEvent::SessionsListed { request, sessions })
@@ -1127,7 +1128,7 @@ fn the_settled_shelf_orders_by_when_the_work_ended() {
 fn a_session_settled_elsewhere_moves_shelves_and_comes_back_when_it_is_unsettled() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = connected_application(workspace.path());
-    let request = expect_sidebar_listing(deliver_launch_visibility(
+    let request = expect_sidebar_listing(deliver_initial_visibility(
         &mut application,
         SidebarVisibility::Shown,
     ));
@@ -1393,7 +1394,7 @@ fn moving_the_auto_settle_settings_reclassifies_the_sidebar_in_place() {
     deliver_sidebar_settings(
         &mut application,
         SidebarSettings {
-            launch_visibility: SidebarVisibility::Shown,
+            initial_visibility: SidebarVisibility::Shown,
             auto_settle: AutoSettle::Off,
             ..SidebarSettings::default()
         },
@@ -2131,7 +2132,7 @@ fn a_long_query_keeps_its_end_in_the_box() {
 fn a_refused_listing_says_so_rather_than_blaming_the_query() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = connected_application(workspace.path());
-    deliver_launch_visibility(&mut application, SidebarVisibility::Hidden);
+    deliver_initial_visibility(&mut application, SidebarVisibility::Hidden);
     let request = expect_sidebar_listing(press_toggle(&mut application));
     type_terminal_text(&mut application, "shell");
     application
@@ -2742,7 +2743,7 @@ fn a_scope_the_reader_chose_is_ephemeral_and_survives_a_later_snapshot() {
     deliver_sidebar_settings(
         &mut application,
         SidebarSettings {
-            launch_visibility: SidebarVisibility::Shown,
+            initial_visibility: SidebarVisibility::Shown,
             initial_scope: SidebarScope::CurrentWorkspace,
             ..SidebarSettings::default()
         },
@@ -2878,7 +2879,7 @@ fn sidebar_scoped(
     let request = expect_sidebar_listing(deliver_sidebar_settings(
         &mut application,
         SidebarSettings {
-            launch_visibility: SidebarVisibility::Shown,
+            initial_visibility: SidebarVisibility::Shown,
             initial_scope,
             ..SidebarSettings::default()
         },

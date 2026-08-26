@@ -127,7 +127,7 @@ fn content_width_snapshot(
             // about, so the Sidebar stays off the frame rather than standing
             // in the middle of it.
             sidebar: SidebarSettings {
-                launch_visibility: SidebarVisibility::Hidden,
+                initial_visibility: SidebarVisibility::Hidden,
                 ..SidebarSettings::default()
             },
             ..EffectiveSettings::default()
