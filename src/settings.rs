@@ -30,7 +30,7 @@ use jsonc_parser::{
 use serde_json::Value;
 
 use crate::protocol::{
-    AgentSelection, EffectiveSettings, FoldPosture, ProviderId, ReasoningSummaryDetail,
+    AgentSelection, EffectiveSettings, FoldPosture, IdleDays, ProviderId, ReasoningSummaryDetail,
     ReasoningVisibility, SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
     SettingsDiagnosticSeverity, SettingsSnapshot, SidebarVisibility, TitleErrand,
 };
@@ -50,6 +50,8 @@ const SESSION_CONTENT_WIDTH: &str = "session.contentWidth";
 // work that has nothing to do with them.
 const SESSION_TITLE_ERRAND: &str = "session.title.errand";
 const SIDEBAR_LAUNCH_VISIBILITY: &str = "sidebar.launchVisibility";
+const SIDEBAR_AUTO_SETTLE_ENABLED: &str = "sidebar.autoSettle.enabled";
+const SIDEBAR_AUTO_SETTLE_IDLE_DAYS: &str = "sidebar.autoSettle.idleDays";
 const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
 const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary";
 const PROVIDER_COPILOT_ENABLED: &str = "provider.copilot.enabled";
@@ -219,6 +221,32 @@ const SESSION_CONTENT_WIDTH_NUMERIC: NumericSettingChoice = NumericSettingChoice
     },
 );
 
+fn spell_auto_settle_idle_days(days: u64) -> String {
+    if days == 1 {
+        "1 day".to_owned()
+    } else {
+        format!("{days} days")
+    }
+}
+
+fn validate_auto_settle_idle_days(value: &str) -> Result<u64, &'static str> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|days| *days >= IdleDays::MINIMUM)
+        .ok_or("minimum: 1")
+}
+
+const SIDEBAR_AUTO_SETTLE_IDLE_DAYS_NUMERIC: NumericSettingChoice = NumericSettingChoice::new(
+    "Days idle",
+    |settings| settings.sidebar.auto_settle.idle_days.0,
+    validate_auto_settle_idle_days,
+    spell_auto_settle_idle_days,
+    |days| SettingMutation::SidebarAutoSettleIdleDays {
+        value: Some(IdleDays(days)),
+    },
+);
+
 impl SettingValues {
     /// The values the schema names, which is everything a Fixed Setting accepts
     /// and only part of what an Open one does. This is the list a client cycles
@@ -366,6 +394,12 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         }
         SettingMutation::SidebarLaunchVisibility { value } => {
             *value == Some(settings.sidebar.launch_visibility)
+        }
+        SettingMutation::SidebarAutoSettleEnabled { value } => {
+            *value == Some(settings.sidebar.auto_settle.enabled)
+        }
+        SettingMutation::SidebarAutoSettleIdleDays { value } => {
+            *value == Some(settings.sidebar.auto_settle.idle_days)
         }
         SettingMutation::ProviderCodexEnabled { value } => {
             *value == Some(settings.provider.codex.enabled)
@@ -552,6 +586,56 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |visibility| {
                 settings.sidebar.launch_visibility = visibility;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: SIDEBAR_AUTO_SETTLE_ENABLED,
+        label: "Settle idle Sessions",
+        description: "Whether a Session settles itself once it has been left alone long enough",
+        group: SettingGroup::General,
+        scope: SettingScope::Client,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "true",
+                pin: SettingMutation::SidebarAutoSettleEnabled { value: Some(true) },
+            },
+            SettingChoice {
+                value: "false",
+                pin: SettingMutation::SidebarAutoSettleEnabled { value: Some(false) },
+            },
+        ]),
+        reset: SettingMutation::SidebarAutoSettleEnabled { value: None },
+        apply: |settings, value| {
+            apply_value(value, |enabled| {
+                settings.sidebar.auto_settle.enabled = enabled;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: SIDEBAR_AUTO_SETTLE_IDLE_DAYS,
+        label: "Idle before settling",
+        description: "How long a Session goes untouched before it settles itself",
+        group: SettingGroup::General,
+        scope: SettingScope::Client,
+        // Every value this Setting takes is a number, so the schema names none
+        // of them: a reader cycling it has nowhere to step, and the numeric
+        // editor is the whole of how it is chosen.
+        values: SettingValues::Open {
+            named: &[],
+            accepts: "a whole number of days, at least 1",
+            spell: |settings| {
+                SIDEBAR_AUTO_SETTLE_IDLE_DAYS_NUMERIC
+                    .spell(settings.sidebar.auto_settle.idle_days.0)
+            },
+            chosen_at: Some(SettingChoiceSurface::Numeric(
+                SIDEBAR_AUTO_SETTLE_IDLE_DAYS_NUMERIC,
+            )),
+        },
+        reset: SettingMutation::SidebarAutoSettleIdleDays { value: None },
+        apply: |settings, value| {
+            apply_value(value, |idle_days| {
+                settings.sidebar.auto_settle.idle_days = idle_days;
             })
         },
     },
@@ -827,6 +911,12 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::SessionTitleErrand { value } => (SESSION_TITLE_ERRAND, pinned(value)),
         SettingMutation::SidebarLaunchVisibility { value } => {
             (SIDEBAR_LAUNCH_VISIBILITY, pinned(value))
+        }
+        SettingMutation::SidebarAutoSettleEnabled { value } => {
+            (SIDEBAR_AUTO_SETTLE_ENABLED, pinned(value))
+        }
+        SettingMutation::SidebarAutoSettleIdleDays { value } => {
+            (SIDEBAR_AUTO_SETTLE_IDLE_DAYS, pinned(value))
         }
         SettingMutation::ProviderCodexEnabled { value } => (PROVIDER_CODEX_ENABLED, pinned(value)),
         SettingMutation::ProviderCodexReasoningSummary { value } => {
@@ -1344,6 +1434,11 @@ mod tests {
                 "one of \"shown\" or \"hidden\"".to_owned(),
                 // A boolean Setting is diagnosed as accepting `true` or
                 // `false`, unquoted, because that is what the reader must type.
+                "one of true or false".to_owned(),
+                // A Setting the schema names no value for is described whole:
+                // there is no word to tell the reader to type, so the
+                // description stands alone rather than beside a list.
+                "a whole number of days, at least 1".to_owned(),
                 "one of true or false".to_owned(),
                 "one of \"auto\", \"concise\", \"detailed\", or \"none\"".to_owned(),
                 "one of true or false".to_owned(),

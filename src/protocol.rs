@@ -1,4 +1,8 @@
-use std::{fmt, path::PathBuf};
+use std::{
+    fmt,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -396,6 +400,22 @@ impl PromptOrder {
 #[serde(transparent)]
 pub struct SessionTimestamp(pub u64);
 
+impl SessionTimestamp {
+    /// The moment now, read the way a Session's own timestamps are stamped, so
+    /// anything measuring how long ago one of them was is measuring against the
+    /// same clock they were written from.
+    pub fn now() -> Self {
+        Self(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Workspace {
@@ -745,10 +765,73 @@ pub enum SidebarVisibility {
     Hidden,
 }
 
+/// How long a Session may go untouched before it settles on its own, in whole
+/// days. Never less than one: a threshold of zero would settle a Session the
+/// moment its work stopped, which is not leaving work alone, it is emptying the
+/// active list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct IdleDays(pub u64);
+
+impl IdleDays {
+    pub const MINIMUM: u64 = 1;
+
+    /// The threshold as the milliseconds a Session's timestamps are measured
+    /// in, so reading a Session against it is a subtraction rather than a
+    /// conversion at every call site.
+    pub const fn millis(self) -> u64 {
+        self.0.saturating_mul(24 * 60 * 60 * 1_000)
+    }
+}
+
+impl Default for IdleDays {
+    fn default() -> Self {
+        Self(2)
+    }
+}
+
+impl<'de> Deserialize<'de> for IdleDays {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let days = u64::deserialize(deserializer)?;
+        if days < Self::MINIMUM {
+            return Err(serde::de::Error::custom(format!(
+                "{days} is below the one-day minimum"
+            )));
+        }
+        Ok(Self(days))
+    }
+}
+
+/// When a Session settles without the user saying so, having been left alone
+/// long enough.
+///
+/// Nothing is stored for this and no clock fires for it: a client derives it
+/// wherever it lists Sessions, from the Session's last activity and these two
+/// values, so turning it off or moving the threshold reclassifies every Session
+/// at once and prompting one brings it straight back.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoSettleSettings {
+    pub enabled: bool,
+    pub idle_days: IdleDays,
+}
+
+impl Default for AutoSettleSettings {
+    fn default() -> Self {
+        // Spelled by hand rather than derived, because a derived `bool` is
+        // `false` and Sessions settle themselves unless the user says not to.
+        Self {
+            enabled: true,
+            idle_days: IdleDays::default(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SidebarSettings {
     pub launch_visibility: SidebarVisibility,
+    pub auto_settle: AutoSettleSettings,
 }
 
 /// Whether the user wants Suru to offer a Provider at all. Every Provider
@@ -857,6 +940,12 @@ pub enum SettingMutation {
     },
     SidebarLaunchVisibility {
         value: Option<SidebarVisibility>,
+    },
+    SidebarAutoSettleEnabled {
+        value: Option<bool>,
+    },
+    SidebarAutoSettleIdleDays {
+        value: Option<IdleDays>,
     },
     ProviderCodexEnabled {
         value: Option<bool>,

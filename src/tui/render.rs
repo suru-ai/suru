@@ -1,10 +1,7 @@
 //! Frame rendering: the landing and Session screens, the pickers and overlays,
 //! and the shared text and layout helpers they draw with.
 
-use std::{
-    path::Path,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::path::Path;
 
 use ratatui::{
     Frame,
@@ -193,7 +190,7 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         let current = state.session.as_ref().map(SessionProjection::session_id);
         let footer_rows = usize::from(shows_search_and_footer);
         let row_capacity = usize::from(content_height).saturating_sub(lines.len() + footer_rows);
-        let now = current_time_millis();
+        let now = SessionTimestamp::now().0;
         let rows = state
             .session_picker
             .visible_rows(row_capacity, current)
@@ -909,15 +906,6 @@ fn truncate_from_left_to_width(value: &str, width: usize) -> String {
     format!("…{suffix}")
 }
 
-fn current_time_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
 fn relative_update_time(updated_at: SessionTimestamp, now: u64) -> String {
     let elapsed_seconds = now.saturating_sub(updated_at.0) / 1_000;
     match elapsed_seconds {
@@ -1111,7 +1099,7 @@ fn sidebar_lines(
         }
         return lines;
     }
-    let now = current_time_millis();
+    let now = SessionTimestamp::now().0;
     let focused = state.sidebar.has_focus();
     lines.extend(
         entries

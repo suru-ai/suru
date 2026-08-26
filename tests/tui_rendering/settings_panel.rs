@@ -19,7 +19,7 @@ use crate::support::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AgentSelection, CodexSettings, CopilotSettings, EffectiveSettings, FoldPosture,
+        AgentSelection, CodexSettings, CopilotSettings, EffectiveSettings, FoldPosture, IdleDays,
         ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId,
         ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
@@ -1447,6 +1447,47 @@ fn a_valid_numeric_edit_emits_a_typed_mutation_and_waits_for_the_refreshed_snaps
     assert!(
         row(&application, "Session content width").contains("max 120 columns [pinned]"),
         "the refreshed snapshot moves the row to the accepted maximum"
+    );
+}
+
+/// Every value this Setting takes is a number, so it has no named choices to
+/// step between: the numeric editor is the whole of how a reader chooses one.
+#[test]
+fn the_idle_threshold_is_chosen_at_its_numeric_editor_and_nowhere_else() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "sidebar.autoSettle.idleDays");
+
+    assert!(
+        row(&application, "Idle before settling").contains("2 days [default]"),
+        "the built-in threshold is visible as a default: {:?}",
+        row(&application, "Idle before settling")
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "a Setting the schema names no value for has nowhere to step"
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "opening an editor is local presentation state"
+    );
+    let rendered = rendered_application_rows(&application).join("\n");
+    assert!(
+        rendered.contains("Days idle") && rendered.contains('2'),
+        "the numeric editor opens prefilled with the threshold in force: {rendered}"
+    );
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Char('7'), KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::SidebarAutoSettleIdleDays {
+            value: Some(IdleDays(7)),
+        }),
+        "Enter applies the edited number through the Setting's typed mutation"
     );
 }
 

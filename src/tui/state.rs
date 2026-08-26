@@ -576,10 +576,10 @@ impl TuiState {
         // and moves what the reader is looking at.
         self.settings = snapshot.settings;
         self.pinned_settings = snapshot.pinned;
-        // The Sidebar's launch visibility is the one Client Setting that acts
-        // on arrival rather than on the next view opened, because the frame it
-        // governs is already on screen.
-        self.sidebar.seed(self.settings.sidebar.launch_visibility);
+        // The Sidebar's own Settings are the ones that act on arrival rather
+        // than on the next view opened, because the frame they govern is
+        // already on screen.
+        self.sidebar.adopt_settings(&self.settings.sidebar);
         self.landing_notice.receive(&snapshot.diagnostics);
     }
 

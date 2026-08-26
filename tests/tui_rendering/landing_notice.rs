@@ -38,6 +38,7 @@ fn deliver_snapshot(application: &mut Application, diagnostics: Vec<SettingsDiag
                     // off the frame rather than sharing it.
                     sidebar: SidebarSettings {
                         launch_visibility: SidebarVisibility::Hidden,
+                        ..SidebarSettings::default()
                     },
                     ..EffectiveSettings::default()
                 },

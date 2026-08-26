@@ -28,6 +28,12 @@ impl SessionStore {
     /// Asking for the state a Session is already in changes nothing: it neither
     /// re-stamps the moment the work was set aside — saying it twice does not
     /// make it more recent — nor announces a change that did not happen.
+    ///
+    /// Bringing a Session back also moves its last activity to now, because a
+    /// user reaching for work they had set aside is the most recent thing to
+    /// have happened to it. Without that, a client deriving settlement from
+    /// idle would read the untouched activity of a Session set aside months ago
+    /// and put it straight back on the shelf the user just took it off.
     pub(crate) fn settle(
         &self,
         session_id: SessionId,
@@ -43,12 +49,16 @@ impl SessionStore {
         if record.summary.settled_at.is_some() == settled {
             return Ok(record.summary.clone());
         }
-        let settled_at = settled.then(|| state.next_timestamp());
+        let stamp = state.next_timestamp();
+        let settled_at = settled.then_some(stamp);
         let record = state
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
         record.summary.settled_at = settled_at;
+        if !settled {
+            record.summary.updated_at = stamp;
+        }
         let summary = record.summary.clone();
         self.storage.summary_changed(summary.clone());
         state.publish_catalog_change(SessionCatalogChange::SettlementChanged {

@@ -128,6 +128,7 @@ fn content_width_snapshot(
             // in the middle of it.
             sidebar: SidebarSettings {
                 launch_visibility: SidebarVisibility::Hidden,
+                ..SidebarSettings::default()
             },
             ..EffectiveSettings::default()
         },

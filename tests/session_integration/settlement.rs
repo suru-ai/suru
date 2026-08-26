@@ -119,10 +119,17 @@ async fn settling_a_session_marks_its_summary_and_unsettling_clears_it() {
         "a Session nobody set aside is active"
     );
 
+    let active = listed(&descriptor, created).await;
     let settled = settled_summary(&descriptor, created, true).await;
     let marked_at = settled
         .settled_at
         .expect("settling stamps the moment it happened");
+    assert_eq!(
+        settled.updated_at,
+        active.updated_at(),
+        "setting work aside is a judgement about it rather than work on it, so \
+         the shelf reads the marker's own stamp and last activity stands still"
+    );
     assert_eq!(
         listed(&descriptor, created).await.settled_at(),
         Some(marked_at),
@@ -132,6 +139,11 @@ async fn settling_a_session_marks_its_summary_and_unsettling_clears_it() {
     let unsettled = settled_summary(&descriptor, created, false).await;
     assert_eq!(unsettled.settled_at, None);
     assert_eq!(listed(&descriptor, created).await.settled_at(), None);
+    assert!(
+        unsettled.updated_at > settled.updated_at,
+        "a user reaching for work they set aside is the latest thing to happen \
+         to it, so a client deriving settlement from idle reads it as active"
+    );
 
     server.shutdown().await.expect("stop server");
 }

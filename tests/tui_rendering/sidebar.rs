@@ -15,9 +15,10 @@ use ratatui::{buffer::Cell, style::Color};
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        EffectiveSettings, ModelAvailability, PromptId, Session, SessionDeleted, SessionId,
-        SessionListItem, SessionSettlementChanged, SessionStatus, SessionSummary, SessionTimestamp,
-        SettingsSnapshot, SidebarSettings, SidebarVisibility, UnreadableSessionSummary, Workspace,
+        AutoSettleSettings, EffectiveSettings, IdleDays, ModelAvailability, PromptId, Session,
+        SessionDeleted, SessionId, SessionListItem, SessionSettlementChanged, SessionStatus,
+        SessionSummary, SessionTimestamp, SettingsSnapshot, SidebarSettings, SidebarVisibility,
+        UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -106,8 +107,11 @@ fn an_active_row_is_three_lines_of_workspace_time_emoji_and_title() {
 #[test]
 fn the_compact_time_reads_now_minutes_hours_and_days() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let application = sidebar_showing(
+    // What a row reads is the question here, so nothing settles itself and
+    // every Session keeps the active row the reading is drawn on.
+    let application = sidebar_settling(
         workspace.path(),
+        auto_settling(false, 2),
         vec![
             listed("Just now", None, &workspace.path().join("a"), 4, now()),
             listed(
@@ -141,8 +145,11 @@ fn the_compact_time_reads_now_minutes_hours_and_days() {
 #[test]
 fn the_list_is_ordered_by_creation_and_activity_never_reorders_it() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let application = sidebar_showing(
+    // The order of the active list is the question, so nothing settles itself
+    // and the whole listing stays on it however long ago each Session moved.
+    let application = sidebar_settling(
         workspace.path(),
+        auto_settling(false, 2),
         vec![
             listed("Oldest", None, workspace.path(), 1, now()),
             listed("Newest", None, workspace.path(), 3, days_ago(2)),
@@ -370,12 +377,25 @@ fn an_overlay_opens_over_the_main_view_and_never_over_the_sidebar() {
     );
 }
 
-/// A connected client whose Sidebar is open on the Sessions given.
+/// A connected client whose Sidebar is open on the Sessions given, settling
+/// idle work the way the built-in defaults do.
 fn sidebar_showing(workspace: &Path, sessions: Vec<SessionListItem>) -> Application {
+    sidebar_settling(workspace, AutoSettleSettings::default(), sessions)
+}
+
+/// The same, under the auto-settle Settings the reader has chosen.
+fn sidebar_settling(
+    workspace: &Path,
+    auto_settle: AutoSettleSettings,
+    sessions: Vec<SessionListItem>,
+) -> Application {
     let mut application = connected_application(workspace);
-    let request = expect_sidebar_listing(deliver_launch_visibility(
+    let request = expect_sidebar_listing(deliver_sidebar_settings(
         &mut application,
-        SidebarVisibility::Shown,
+        SidebarSettings {
+            launch_visibility: SidebarVisibility::Shown,
+            auto_settle,
+        },
     ));
     application
         .handle_event(ApplicationEvent::SessionsListed { request, sessions })
@@ -387,11 +407,24 @@ fn deliver_launch_visibility(
     application: &mut Application,
     launch_visibility: SidebarVisibility,
 ) -> ApplicationTransition {
+    deliver_sidebar_settings(
+        application,
+        SidebarSettings {
+            launch_visibility,
+            ..SidebarSettings::default()
+        },
+    )
+}
+
+fn deliver_sidebar_settings(
+    application: &mut Application,
+    sidebar: SidebarSettings,
+) -> ApplicationTransition {
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
             SettingsSnapshot {
                 settings: EffectiveSettings {
-                    sidebar: SidebarSettings { launch_visibility },
+                    sidebar,
                     ..EffectiveSettings::default()
                 },
                 pinned: Vec::new(),
@@ -399,6 +432,14 @@ fn deliver_launch_visibility(
             },
         )))
         .expect("receive the effective-settings snapshot")
+}
+
+/// Auto-settle as the reader left it: on or off, and how long is long enough.
+fn auto_settling(enabled: bool, idle_days: u64) -> AutoSettleSettings {
+    AutoSettleSettings {
+        enabled,
+        idle_days: IdleDays(idle_days),
+    }
 }
 
 fn press_toggle(application: &mut Application) -> ApplicationTransition {
@@ -1155,11 +1196,11 @@ fn a_listing_refreshed_with_a_settled_marker_moves_the_session_onto_the_shelf() 
 fn a_never_prompted_session_lists_as_active() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     // A Session made and then left alone: no Prompt, so nothing has moved it
-    // since. Settling is the reader's say-so, and they have not said so.
+    // since — which is why the idle it has been sitting in settles nothing.
     let application = sidebar_showing(
         workspace.path(),
         vec![
-            listed("Never prompted", None, workspace.path(), 1, days_ago(30)),
+            never_prompted("Never prompted", workspace.path(), days_ago(30)),
             settled(
                 "Set aside",
                 None,
@@ -1175,6 +1216,245 @@ fn a_never_prompted_session_lists_as_active() {
     assert!(
         rendered_row(&rows, "Never prompted") < sidebar_divider(&rows),
         "the Session a reader just made is never hidden on the settled shelf: {rows:?}"
+    );
+}
+
+/// Nobody settled this Session and nothing is stored saying they did: the
+/// Sidebar reads its last activity against the threshold each time it lists.
+#[test]
+fn a_session_left_alone_past_the_threshold_settles_itself() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed("Still warm", None, workspace.path(), 2, hours_ago(1)),
+            listed("Left alone", None, workspace.path(), 1, days_ago(3)),
+        ],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let divider = sidebar_divider(&rows);
+    assert!(
+        divider < rendered_row(&rows, "Left alone"),
+        "a Session past the two-day default settles on its own: {rows:?}"
+    );
+    assert!(
+        rendered_row(&rows, "Still warm") < divider,
+        "and one the reader touched today stays active: {rows:?}"
+    );
+}
+
+#[test]
+fn the_idle_setting_says_how_long_being_left_alone_has_to_be() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = sidebar_settling(
+        workspace.path(),
+        auto_settling(true, 7),
+        vec![
+            listed("Left alone", None, workspace.path(), 2, days_ago(3)),
+            settled(
+                "Set aside",
+                None,
+                workspace.path(),
+                1,
+                hours_ago(2),
+                hours_ago(1),
+            ),
+        ],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        rendered_row(&rows, "Left alone") < sidebar_divider(&rows),
+        "three days is not long enough for a reader who asked for seven: {rows:?}"
+    );
+}
+
+#[test]
+fn turning_auto_settle_off_leaves_only_what_the_reader_settled_on_the_shelf() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = sidebar_settling(
+        workspace.path(),
+        auto_settling(false, 2),
+        vec![
+            listed("Left alone", None, workspace.path(), 2, days_ago(30)),
+            settled("Set aside", None, workspace.path(), 1, hours_ago(2), now()),
+        ],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let divider = sidebar_divider(&rows);
+    assert!(
+        rendered_row(&rows, "Left alone") < divider,
+        "no idle is long enough once the reader has turned settling off: {rows:?}"
+    );
+    assert!(
+        divider < rendered_row(&rows, "Set aside"),
+        "and the marker the reader set stands whatever the Setting says: {rows:?}"
+    );
+}
+
+#[test]
+fn a_session_the_reader_settled_stays_settled_however_recently_it_moved() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![settled(
+            "Set aside",
+            None,
+            workspace.path(),
+            1,
+            now(),
+            now(),
+        )],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        sidebar_divider(&rows) < rendered_row(&rows, "Set aside"),
+        "the reader's own say-so is not something an idle threshold overrules: {rows:?}"
+    );
+}
+
+/// A Session that settled itself has no settled marker to read a moment off,
+/// so both its place on the shelf and the time its row shows come from its last
+/// activity — the moment the idle it settled for began.
+#[test]
+fn a_session_that_settled_itself_stands_and_reads_by_its_last_activity() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed("Left alone", None, workspace.path(), 2, days_ago(5)),
+            settled(
+                "Set aside",
+                None,
+                workspace.path(),
+                1,
+                days_ago(9),
+                hours_ago(1),
+            ),
+        ],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let left_alone = rendered_row(&rows, "Left alone");
+    assert!(
+        rendered_row(&rows, "Set aside") < left_alone,
+        "the marker's own stamp is more recent, so it stands nearer the divider: {rows:?}"
+    );
+    assert!(
+        sidebar_column(&rows[left_alone]).ends_with("5d"),
+        "and the row that settled itself reads the activity it settled for: {:?}",
+        sidebar_column(&rows[left_alone])
+    );
+}
+
+/// The reader edits the Setting while the Sidebar is open: the derivation is
+/// read afresh on the next frame, so the shelves move without a new listing.
+#[test]
+fn moving_the_auto_settle_settings_reclassifies_the_sidebar_in_place() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![listed("Left alone", None, workspace.path(), 1, days_ago(3))],
+    );
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        sidebar_divider(&rows) < rendered_row(&rows, "Left alone"),
+        "the default threshold settles it: {rows:?}"
+    );
+
+    deliver_sidebar_settings(
+        &mut application,
+        SidebarSettings {
+            launch_visibility: SidebarVisibility::Shown,
+            auto_settle: auto_settling(false, 2),
+        },
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        sidebar_divider_row(&rows).is_none(),
+        "turning settling off empties the shelf and takes the divider with it: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("Left alone")),
+        "and leaves the Session standing on the active list: {rows:?}"
+    );
+}
+
+/// Unsettling is the reader saying this work is live again, and the server
+/// answers by moving the Session's last activity — so the idle the Sidebar
+/// derives cannot put back what the reader just took off the shelf.
+#[test]
+fn a_session_unsettled_after_a_long_idle_comes_back_to_the_active_list() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let set_apart = SessionId::new();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![set_aside(
+            listed_at(set_apart, "Long set aside", workspace.path(), days_ago(30)),
+            days_ago(30),
+        )],
+    );
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(sidebar_divider(&rows) < rendered_row(&rows, "Long set aside"));
+
+    // The server clears the marker and stamps the Session's last activity with
+    // the moment the reader reached for it, which the refreshed listing brings.
+    settle_elsewhere(&mut application, set_apart, None);
+    press_toggle(&mut application);
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![listed_at(
+                set_apart,
+                "Long set aside",
+                workspace.path(),
+                now(),
+            )],
+        })
+        .expect("adopt the refreshed listing");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        sidebar_divider_row(&rows).is_none(),
+        "nothing is left on the shelf the reader emptied: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("Long set aside")),
+        "the work the reader picked back up is on the active list: {rows:?}"
+    );
+}
+
+/// A settled Session is one a reader can prompt back to life, and a Session
+/// Suru could not read is not one: the marker never lands on it, and neither
+/// does the idle the Sidebar derives.
+#[test]
+fn a_session_suru_cannot_read_never_settles_however_long_it_has_sat() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![
+            SessionListItem::Unreadable(UnreadableSessionSummary {
+                id: SessionId::new(),
+                title: "Unreadable work".to_owned(),
+                created_at: SessionTimestamp(days_ago(90)),
+                updated_at: SessionTimestamp(days_ago(60)),
+                workspace: Some(Workspace {
+                    path: workspace.path().to_owned(),
+                }),
+            }),
+            listed("Left alone", None, workspace.path(), 1, days_ago(3)),
+        ],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        rendered_row(&rows, "Unreadable work") < sidebar_divider(&rows),
+        "the shelf is for work a reader set down, not for a record Suru cannot open: {rows:?}"
     );
 }
 
@@ -1240,6 +1520,29 @@ fn sidebar_divider_row(rows: &[String]) -> Option<usize> {
 fn sidebar_divider(rows: &[String]) -> usize {
     sidebar_divider_row(rows)
         .unwrap_or_else(|| panic!("the divider opens the settled shelf: {rows:?}"))
+}
+
+/// A listed Session with an id the test can name and a last activity it
+/// chooses, which is what a Session moving between shelves needs to keep its
+/// identity across two listings.
+fn listed_at(
+    session_id: SessionId,
+    title: &str,
+    workspace: &Path,
+    updated_at: u64,
+) -> SessionListItem {
+    let SessionListItem::Readable(mut summary) = listed(title, None, workspace, 1, updated_at)
+    else {
+        unreachable!("the fixture builds a readable Session");
+    };
+    summary.session.id = session_id;
+    SessionListItem::Readable(summary)
+}
+
+/// A Session made and never prompted since, which is a Session whose last
+/// activity is the moment it was made.
+fn never_prompted(title: &str, workspace: &Path, made_at: u64) -> SessionListItem {
+    listed(title, None, workspace, made_at, made_at)
 }
 
 /// A Session the reader has set aside as done for now.

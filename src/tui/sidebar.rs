@@ -6,7 +6,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::protocol::{SessionId, SessionListItem, SessionTimestamp, SidebarVisibility};
+use crate::protocol::{
+    AutoSettleSettings, SessionId, SessionListItem, SessionTimestamp, SidebarSettings,
+    SidebarVisibility,
+};
 
 use super::{
     SessionListRequest, SessionListScope, SessionListSurface, session_listing::SessionListing,
@@ -55,6 +58,11 @@ pub(super) struct Sidebar {
     /// who toggled the Sidebar since should not have it flipped back under
     /// them.
     seeded: bool,
+    /// When a Session settles without anyone saying so. Adopted from every
+    /// snapshot rather than seeded from the first, because unlike the launch
+    /// Setting this one governs what the Sidebar shows for as long as it is
+    /// open: editing it reclassifies every listed Session on the next frame.
+    auto_settle: AutoSettleSettings,
     listing: SessionListing,
     /// The row the reader is on, held by Session rather than by position so a
     /// listing arriving underneath them leaves the selection where the work
@@ -180,6 +188,7 @@ impl Sidebar {
             revealed: false,
             focused: false,
             seeded: false,
+            auto_settle: AutoSettleSettings::default(),
             listing: SessionListing::scoped(
                 SessionListSurface::Sidebar,
                 current_workspace,
@@ -195,14 +204,18 @@ impl Sidebar {
         }
     }
 
-    /// Puts the launch Setting in force, once. Returns nothing: a Sidebar that
-    /// wants its Sessions leaves the request in [`Self::take_listing_request`].
-    pub(super) fn seed(&mut self, visibility: SidebarVisibility) {
+    /// Takes the Sidebar's own Settings, each on its own schedule: auto-settle
+    /// governs every frame from here on, while the launch Setting has its say
+    /// once and is then the reader's to overrule. Returns nothing: a Sidebar
+    /// that wants its Sessions leaves the request in
+    /// [`Self::take_listing_request`].
+    pub(super) fn adopt_settings(&mut self, settings: &SidebarSettings) {
+        self.auto_settle = settings.auto_settle;
         if self.seeded {
             return;
         }
         self.seeded = true;
-        self.reveal(visibility == SidebarVisibility::Shown);
+        self.reveal(settings.launch_visibility == SidebarVisibility::Shown);
     }
 
     /// Shows the Sidebar, or hides it. This is view state and nothing more: the
@@ -411,8 +424,9 @@ impl Sidebar {
     /// The Sidebar's body in the order it is drawn: the active Sessions, then
     /// the divider and the settled ones where anything is settled.
     fn entries(&self, current: Option<SessionId>) -> Vec<SidebarEntry<'_>> {
+        let settlement = self.settlement();
         let mut entries = self
-            .active()
+            .active(settlement)
             .into_iter()
             .map(|session| {
                 self.row(
@@ -427,7 +441,7 @@ impl Sidebar {
                 )
             })
             .collect::<Vec<_>>();
-        let settled = self.settled();
+        let settled = self.settled(settlement);
         if settled.is_empty() {
             return entries;
         }
@@ -459,15 +473,26 @@ impl Sidebar {
         })
     }
 
+    /// What settles a Session as of now. Each pass over the listing takes one
+    /// reading and hands it to both shelves, so a Session whose threshold falls
+    /// between two readings of the clock cannot come out on both of them or on
+    /// neither.
+    fn settlement(&self) -> Settlement {
+        Settlement {
+            auto: self.auto_settle,
+            now: SessionTimestamp::now(),
+        }
+    }
+
     /// The active Sessions: newest created first, and never reordered by
     /// activity, so a row a reader has their eye on holds its place while the
     /// work behind it moves.
-    fn active(&self) -> Vec<&SessionListItem> {
+    fn active(&self, settlement: Settlement) -> Vec<&SessionListItem> {
         let mut sessions = self
             .listing
             .sessions()
             .iter()
-            .filter(|session| !is_settled(session))
+            .filter(|session| !settlement.settles(session))
             .collect::<Vec<_>>();
         sessions.sort_by_key(|session| Reverse(session.created_at()));
         sessions
@@ -475,12 +500,12 @@ impl Sidebar {
 
     /// The Sessions set aside, ordered by when the work ended rather than by
     /// when it began, so what wrapped up most recently is nearest the divider.
-    fn settled(&self) -> Vec<&SessionListItem> {
+    fn settled(&self, settlement: Settlement) -> Vec<&SessionListItem> {
         let mut sessions = self
             .listing
             .sessions()
             .iter()
-            .filter(|session| is_settled(session))
+            .filter(|session| settlement.settles(session))
             .collect::<Vec<_>>();
         sessions.sort_by_key(|session| Reverse(ended_at(session)));
         sessions
@@ -490,8 +515,9 @@ impl Sidebar {
     /// order the arrows walk: down the active list, across the divider, and on
     /// down the settled shelf.
     fn ordered(&self) -> Vec<&SessionListItem> {
-        let mut ordered = self.active();
-        ordered.extend(self.settled());
+        let settlement = self.settlement();
+        let mut ordered = self.active(settlement);
+        ordered.extend(self.settled(settlement));
         ordered
     }
 
@@ -537,12 +563,42 @@ impl Sidebar {
     }
 }
 
-/// Whether a Session stands on the settled shelf. The reader's own say-so is
-/// the only thing that settles one today; a Session settling on its own after
-/// long enough idle arrives with
-/// <https://github.com/jake-tucker/suru/issues/176>.
-fn is_settled(session: &SessionListItem) -> bool {
-    session.settled_at().is_some()
+/// What settles a Session, read at the moment the Sidebar lists one.
+///
+/// Two things settle one and only the first is written down. The reader's own
+/// say-so is stamped on the Session by the server and always wins. Settling on
+/// its own is derived here and nowhere else, from the Session's last activity
+/// and the two auto-settle Settings: nothing is stored for it, no clock has to
+/// fire for it, and work that moves is active again on the very next frame.
+#[derive(Clone, Copy, Debug)]
+struct Settlement {
+    auto: AutoSettleSettings,
+    now: SessionTimestamp,
+}
+
+impl Settlement {
+    /// Whether this Session stands on the settled shelf.
+    fn settles(&self, session: &SessionListItem) -> bool {
+        session.settled_at().is_some() || self.left_alone(session)
+    }
+
+    /// Whether this Session has been left alone long enough to settle itself.
+    ///
+    /// The idle is measured from the Session's last activity, so this asks
+    /// after work there was: a Session nothing has moved since it was made has
+    /// set nothing aside — the reader made it and it is theirs to prompt — and
+    /// a Session Suru could not read has no activity it can see, which is the
+    /// same reason it is never settled by the marker either.
+    fn left_alone(&self, session: &SessionListItem) -> bool {
+        let last_activity = session.updated_at();
+        if !self.auto.enabled
+            || session.readable().is_none()
+            || last_activity == session.created_at()
+        {
+            return false;
+        }
+        self.now.0.saturating_sub(last_activity.0) >= self.auto.idle_days.millis()
+    }
 }
 
 /// When a Session's work ended, which is both where it sits on the settled
@@ -550,9 +606,8 @@ fn is_settled(session: &SessionListItem) -> bool {
 /// the label can never disagree.
 ///
 /// Settling by the reader's say-so is stamped with the moment it happened.
-/// Settling on its own after long enough idle
-/// (<https://github.com/jake-tucker/suru/issues/176>) carries no such stamp,
-/// so the reading falls back to when the Session was last active — which is
+/// Settling on its own carries no such stamp — nothing is stored for it at all
+/// — so the reading falls back to when the Session was last active, which is
 /// the moment the idle it settled for began.
 fn ended_at(session: &SessionListItem) -> SessionTimestamp {
     session.settled_at().unwrap_or_else(|| session.updated_at())
@@ -607,8 +662,9 @@ mod tests {
 
     use crate::{
         protocol::{
-            ModelAvailability, Session, SessionId, SessionListItem, SessionStatus, SessionSummary,
-            SessionTimestamp, SidebarVisibility, Workspace,
+            AutoSettleSettings, IdleDays, ModelAvailability, Session, SessionId, SessionListItem,
+            SessionStatus, SessionSummary, SessionTimestamp, SidebarSettings, SidebarVisibility,
+            Workspace,
         },
         tui::sidebar::{
             MINIMUM_MAIN_WIDTH, SIDEBAR_WIDTH, Sidebar, SidebarEntry, width_beside, workspace_name,
@@ -618,7 +674,7 @@ mod tests {
     #[test]
     fn the_launch_setting_has_its_say_once_and_the_toggle_has_it_after() {
         let mut sidebar = Sidebar::new(root());
-        sidebar.seed(SidebarVisibility::Hidden);
+        sidebar.adopt_settings(&launching(SidebarVisibility::Hidden));
 
         assert!(!sidebar.is_revealed());
         assert!(
@@ -631,7 +687,7 @@ mod tests {
         assert!(sidebar.is_revealed());
         assert!(sidebar.take_listing_request().is_some());
 
-        sidebar.seed(SidebarVisibility::Hidden);
+        sidebar.adopt_settings(&launching(SidebarVisibility::Hidden));
 
         assert!(
             sidebar.is_revealed(),
@@ -653,7 +709,7 @@ mod tests {
     #[test]
     fn a_sidebar_seeded_shown_asks_for_its_sessions() {
         let mut sidebar = Sidebar::new(root());
-        sidebar.seed(SidebarVisibility::Shown);
+        sidebar.adopt_settings(&launching(SidebarVisibility::Shown));
 
         assert!(sidebar.is_revealed());
         assert!(sidebar.take_listing_request().is_some());
@@ -666,7 +722,7 @@ mod tests {
     #[test]
     fn rows_are_ordered_by_creation_and_activity_never_moves_them() {
         let mut sidebar = Sidebar::new(root());
-        sidebar.seed(SidebarVisibility::Shown);
+        sidebar.adopt_settings(&settling_nothing());
         let request = sidebar
             .take_listing_request()
             .expect("a revealed Sidebar asks for its Sessions");
@@ -686,7 +742,7 @@ mod tests {
     #[test]
     fn the_toggle_takes_the_keys_and_the_launch_setting_leaves_them_alone() {
         let mut sidebar = Sidebar::new(root());
-        sidebar.seed(SidebarVisibility::Shown);
+        sidebar.adopt_settings(&launching(SidebarVisibility::Shown));
 
         assert!(
             !sidebar.has_focus(),
@@ -715,7 +771,7 @@ mod tests {
     #[test]
     fn a_sidebar_the_frame_could_not_draw_holds_no_keys() {
         let mut sidebar = Sidebar::new(root());
-        sidebar.seed(SidebarVisibility::Hidden);
+        sidebar.adopt_settings(&launching(SidebarVisibility::Hidden));
         sidebar.toggle();
         assert!(sidebar.has_focus());
 
@@ -752,7 +808,7 @@ mod tests {
         let mut sidebar = Sidebar::new(root());
         let wanted = SessionId::new();
 
-        sidebar.toggle();
+        sidebar.adopt_settings(&settling_nothing());
         let request = sidebar.take_listing_request().expect("ask for Sessions");
         sidebar.load(
             &request,
@@ -836,7 +892,7 @@ mod tests {
     #[test]
     fn the_settled_stand_below_the_divider_in_the_order_their_work_ended() {
         let mut sidebar = Sidebar::new(root());
-        sidebar.toggle();
+        sidebar.adopt_settings(&settling_nothing());
         let request = sidebar.take_listing_request().expect("ask for Sessions");
         sidebar.load(
             &request,
@@ -862,10 +918,41 @@ mod tests {
         );
     }
 
+    /// The threshold is a moment a Session reaches rather than one it has to
+    /// pass, and it is read against the clock each time the Sidebar lists:
+    /// nothing here was stored, and nobody said any of it.
+    #[test]
+    fn a_session_settles_itself_the_moment_its_idle_reaches_the_threshold() {
+        let mut sidebar = Sidebar::new(root());
+        sidebar.adopt_settings(&SidebarSettings {
+            launch_visibility: SidebarVisibility::Shown,
+            auto_settle: AutoSettleSettings {
+                enabled: true,
+                idle_days: IdleDays(1),
+            },
+        });
+        let request = sidebar.take_listing_request().expect("ask for Sessions");
+        let a_day = IdleDays(1).millis();
+        let now = SessionTimestamp::now().0;
+        sidebar.load(
+            &request,
+            vec![
+                summary("Reached it", 1, now - a_day),
+                summary("A minute short of it", 2, now - a_day + 60_000),
+            ],
+            None,
+        );
+
+        assert_eq!(
+            drawn(&sidebar),
+            vec!["A minute short of it", DIVIDER, "Reached it"]
+        );
+    }
+
     #[test]
     fn a_column_windows_in_lines_because_the_two_shelves_are_not_one_height() {
         let mut sidebar = Sidebar::new(root());
-        sidebar.toggle();
+        sidebar.adopt_settings(&settling_nothing());
         let request = sidebar.take_listing_request().expect("ask for Sessions");
         sidebar.load(
             &request,
@@ -968,6 +1055,29 @@ mod tests {
             created_at: SessionTimestamp(created_at),
             updated_at: SessionTimestamp(updated_at),
         })
+    }
+
+    /// The Sidebar's Settings as a TUI launching under `launch_visibility`
+    /// takes them, everything else left where its built-in default is.
+    fn launching(launch_visibility: SidebarVisibility) -> SidebarSettings {
+        SidebarSettings {
+            launch_visibility,
+            ..SidebarSettings::default()
+        }
+    }
+
+    /// The Sidebar shown with nothing settling itself, which is what a test
+    /// about the order or the shape of the list asks for: its fixtures stamp
+    /// Sessions with ordinals rather than with moments, and every one of those
+    /// reads as work left alone since the epoch.
+    fn settling_nothing() -> SidebarSettings {
+        SidebarSettings {
+            launch_visibility: SidebarVisibility::Shown,
+            auto_settle: AutoSettleSettings {
+                enabled: false,
+                ..AutoSettleSettings::default()
+            },
+        }
     }
 
     fn root() -> PathBuf {
