@@ -86,6 +86,9 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     // where. Every frame starts by giving up what the last one recorded, so the
     // geometry a click resolves against is always the one on screen.
     state.settings_panel.forget_layout();
+    // The Sidebar's own frame record, given up for the same reason: whether it
+    // has the keys depends on whether the frame had the columns to draw it.
+    state.sidebar.forget_frame();
     if terminal_is_too_small(frame.area()) {
         render_terminal_too_small(frame, &theme);
         return;
@@ -124,7 +127,7 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
         && !state.model_picker.is_open()
         && !state.model_options.is_open()
         && !state.settings_panel.is_open()
-        && state.composer_focused
+        && state.composer_focused()
         && matches!(state.command_mode, CommandMode::Composer)
     {
         frame.set_cursor_position(composer.cursor);
@@ -1048,51 +1051,96 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     let Some(width) = sidebar::width_beside(frame_area.width) else {
         return frame_area;
     };
+    state.sidebar.record_drawn();
     let [column, main] =
         Layout::horizontal([Constraint::Length(width), Constraint::Min(1)]).areas(frame_area);
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(theme.border.subdued);
+    // The divider stands out while the reader is driving the Sidebar, which is
+    // the same account of focus the composer's own border gives.
+    let block =
+        Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(if state.sidebar.has_focus() {
+                theme.border.default
+            } else {
+                theme.border.subdued
+            });
     let content = horizontally_inset(block.inner(column), 1);
     frame.render_widget(block, column);
     frame.render_widget(
-        Paragraph::new(sidebar_lines(state, usize::from(content.width), theme)),
+        Paragraph::new(sidebar_lines(
+            state,
+            usize::from(content.width),
+            usize::from(content.height),
+            theme,
+        )),
         content,
     );
     main
 }
 
-/// The Sidebar's whole body: one three-line entry per Session, or the one line
-/// that stands in for a list there is nothing to draw.
-fn sidebar_lines(state: &TuiState, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-    let rows = state
-        .sidebar
-        .rows(state.session.as_ref().map(SessionProjection::session_id));
+/// The lines one active Sidebar row takes, the third of them saying nothing
+/// until git awareness gives it something to say. The column reads its list in
+/// whole rows, so a row that does not fit is wound past rather than cut in
+/// half.
+const SIDEBAR_ROW_LINES: usize = 3;
+
+/// The Sidebar's whole body: what the server last refused, then one
+/// three-line entry per Session — as many of them as the column is tall — or
+/// the one line that stands in for a list there is nothing to draw.
+fn sidebar_lines(
+    state: &TuiState,
+    width: usize,
+    height: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(error) = state.sidebar.error() {
+        lines.push(Line::styled(
+            truncate_to_width(error, width),
+            theme.feedback.error,
+        ));
+    }
+    let capacity = height.saturating_sub(lines.len()) / SIDEBAR_ROW_LINES;
+    let rows = state.sidebar.visible_rows(
+        capacity,
+        state.session.as_ref().map(SessionProjection::session_id),
+    );
     if rows.is_empty() {
-        let standing_in = if let Some(error) = state.sidebar.error() {
-            Line::styled(truncate_to_width(error, width), theme.feedback.error)
-        } else if state.sidebar.is_loading() {
-            Line::styled("Loading Sessions…", theme.text.subdued)
-        } else {
-            Line::styled("No Sessions yet", theme.text.subdued)
-        };
-        return vec![standing_in];
+        if state.sidebar.is_loading() {
+            lines.push(Line::styled("Loading Sessions…", theme.text.subdued));
+        } else if lines.is_empty() {
+            lines.push(Line::styled("No Sessions yet", theme.text.subdued));
+        }
+        return lines;
     }
     let now = current_time_millis();
-    rows.into_iter()
-        .flat_map(|row| sidebar_row_lines(row, width, now, theme))
-        .collect()
+    let focused = state.sidebar.has_focus();
+    lines.extend(
+        rows.into_iter()
+            .flat_map(|row| sidebar_row_lines(row, width, now, focused, theme)),
+    );
+    lines
 }
 
 /// One Session as three lines: where the work lives and how long ago it moved,
-/// then what the work is, then a line held blank for the git awareness of
-/// <https://github.com/jake-tucker/suru/issues/169>.
+/// then what the work is, then a line saying nothing until the git awareness of
+/// <https://github.com/jake-tucker/suru/issues/169> gives it something to say.
 fn sidebar_row_lines(
     row: SidebarRow<'_>,
     width: usize,
     now: u64,
+    focused: bool,
     theme: &Theme,
-) -> [Line<'static>; 3] {
+) -> [Line<'static>; SIDEBAR_ROW_LINES] {
+    // The row the reader is on is drawn whole, so the selection reads as one
+    // block rather than as three lines that happen to be lit. It keeps its
+    // highlight when the keys are elsewhere, dimmed, because it is still the
+    // row Enter would act on once they come back.
+    let selected = row.selected.then_some(if focused {
+        theme.selection.focused
+    } else {
+        theme.selection.unfocused
+    });
     let elapsed = relative_update_time_compact(row.updated_at, now);
     let workspace = row
         .workspace
@@ -1104,20 +1152,32 @@ fn sidebar_row_lines(
         Some(emoji) => format!("{emoji} {}", row.title),
         None => row.title.to_owned(),
     };
-    let title_style = if row.current {
+    let title_style = selected.unwrap_or(if row.current {
         theme.accent.primary
     } else {
         theme.text.primary
-    };
+    });
+    let label_style = selected.unwrap_or(theme.text.subdued);
     [
         Line::from(vec![
-            Span::styled(workspace, theme.text.subdued),
-            Span::raw(gap),
-            Span::styled(elapsed, theme.text.subdued),
+            Span::styled(workspace, label_style),
+            Span::styled(gap, selected.unwrap_or_default()),
+            Span::styled(elapsed, label_style),
         ]),
-        Line::styled(truncate_to_width(&title, width), title_style),
-        Line::raw(String::new()),
+        Line::styled(
+            pad_to_width(&truncate_to_width(&title, width), width),
+            title_style,
+        ),
+        Line::styled(" ".repeat(width), selected.unwrap_or_default()),
     ]
+}
+
+/// `text` with enough trailing spaces to fill `width` columns, so a line that
+/// carries a background carries it the whole way across.
+fn pad_to_width(text: &str, width: usize) -> String {
+    let mut padded = text.to_owned();
+    padded.push_str(&" ".repeat(width.saturating_sub(text.width())));
+    padded
 }
 
 fn render_landing(

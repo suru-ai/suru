@@ -7,16 +7,17 @@ use std::{
 };
 
 use crate::support::{
-    connected_application, enter_session, rendered_application_rows_at, rendered_row,
-    type_terminal_text,
+    connected_application, enter_session, failed_session_snapshot, rendered_application_buffer,
+    rendered_application_rows_at, rendered_row, type_terminal_text,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{buffer::Cell, style::Color};
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        EffectiveSettings, ModelAvailability, Session, SessionDeleted, SessionId, SessionListItem,
-        SessionStatus, SessionSummary, SessionTimestamp, SettingsSnapshot, SidebarSettings,
-        SidebarVisibility, Workspace,
+        EffectiveSettings, ModelAvailability, PromptId, Session, SessionDeleted, SessionId,
+        SessionListItem, SessionStatus, SessionSummary, SessionTimestamp, SettingsSnapshot,
+        SidebarSettings, SidebarVisibility, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -518,4 +519,430 @@ fn the_sidebar_survives_every_terminal_the_frame_will_draw() {
             rendered_application_rows_at(&application, width, height);
         }
     }
+}
+
+#[test]
+fn the_launch_setting_shows_the_sidebar_without_taking_the_keys() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![listed("Listed work", None, workspace.path(), 1, now())],
+    );
+
+    type_terminal_text(&mut application, "hello");
+
+    assert!(
+        rendered_application_rows_at(&application, WIDE, 20)
+            .iter()
+            .any(|row| row.contains("hello")),
+        "a Sidebar the reader never opened leaves them typing where they were"
+    );
+}
+
+#[test]
+fn opening_the_sidebar_takes_the_keys_from_the_composer() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![listed("Listed work", None, workspace.path(), 1, now())],
+    );
+
+    type_terminal_text(&mut application, "hello");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        !rows.iter().any(|row| row.contains("hello")),
+        "the Sidebar the reader opened has the keys, so nothing reaches the composer: {rows:?}"
+    );
+    assert!(
+        selected_sidebar_text(&application).contains("Listed work"),
+        "the row the reader would act on stands out from the rest of the column"
+    );
+}
+
+#[test]
+fn the_arrows_move_the_selection_and_wrap_past_the_ends() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed("Newest", None, workspace.path(), 3, now()),
+            listed("Middle", None, workspace.path(), 2, now()),
+            listed("Oldest", None, workspace.path(), 1, now()),
+        ],
+    );
+
+    assert!(
+        selected_sidebar_text(&application).contains("Newest"),
+        "an opened Sidebar starts on the row nearest the reader"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(selected_sidebar_text(&application).contains("Middle"));
+
+    press_sidebar_key(&mut application, KeyCode::Up);
+    assert!(selected_sidebar_text(&application).contains("Newest"));
+
+    press_sidebar_key(&mut application, KeyCode::Up);
+    assert!(
+        selected_sidebar_text(&application).contains("Oldest"),
+        "moving off the top wraps to the end of the list"
+    );
+}
+
+#[test]
+fn the_column_windows_onto_the_selection_for_a_list_longer_than_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let sessions = (1..=6)
+        .map(|index| {
+            listed(
+                &format!("Row {}", 7 - index),
+                None,
+                workspace.path(),
+                index,
+                now(),
+            )
+        })
+        .collect();
+    let mut application = sidebar_focused(workspace.path(), sessions);
+
+    let opening = rendered_application_rows_at(&application, WIDE, 12);
+    assert!(
+        opening.iter().any(|row| row.contains("Row 1")),
+        "the list opens at the top: {opening:?}"
+    );
+    assert!(
+        !opening.iter().any(|row| row.contains("Row 6")),
+        "a list longer than the column is drawn through a window, not crammed in: {opening:?}"
+    );
+
+    for _ in 0..5 {
+        press_sidebar_key(&mut application, KeyCode::Down);
+    }
+
+    let scrolled = rendered_application_rows_at(&application, WIDE, 12);
+    assert!(
+        scrolled.iter().any(|row| row.contains("Row 6")),
+        "moving past the window's end brings the selected row into view: {scrolled:?}"
+    );
+    assert!(
+        !scrolled.iter().any(|row| row.contains("Row 1")),
+        "the window moved rather than growing: {scrolled:?}"
+    );
+}
+
+#[test]
+fn enter_attaches_the_selected_session_in_place() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed_as(SessionId::new(), "Nearest work", workspace.path(), 3),
+            listed_as(wanted, "The work wanted", workspace.path(), 2),
+            listed_as(SessionId::new(), "Older work", workspace.path(), 1),
+        ],
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Down);
+
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::AttachSession(wanted),
+        "Enter attaches the Session the reader has selected"
+    );
+}
+
+#[test]
+fn the_attached_session_hands_the_keys_back_to_the_composer() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let wanted = SessionId::new();
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![listed_as(wanted, "The work wanted", workspace.path(), 1)],
+    );
+    press_sidebar_key(&mut application, KeyCode::Enter);
+
+    application
+        .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
+            wanted,
+            PromptId::new(),
+            "Initial Prompt",
+            workspace.path(),
+        )))
+        .expect("attach the selected Session");
+
+    type_terminal_text(&mut application, "hello");
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        rows.iter().any(|row| row.contains("hello")),
+        "the reader is done choosing, so the composer takes the keys back: {rows:?}"
+    );
+    assert!(
+        sidebar_is_drawn(&rows),
+        "the Sidebar stays beside the Session it just opened"
+    );
+}
+
+#[test]
+fn esc_hands_the_keys_back_without_hiding_the_sidebar() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![listed("Listed work", None, workspace.path(), 1, now())],
+    );
+
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Esc),
+        ApplicationTransition::Continue
+    );
+
+    type_terminal_text(&mut application, "hello");
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        rows.iter().any(|row| row.contains("hello")),
+        "Esc hands the keys back to the composer: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("Listed work")) && sidebar_is_drawn(&rows),
+        "the Sidebar stays standing, only without the keys: {rows:?}"
+    );
+    assert!(
+        selected_sidebar_text(&application).is_empty(),
+        "nothing in the column claims the keys any more"
+    );
+    assert!(
+        sidebar_text_on(&application, Color::DarkGray).contains("Listed work"),
+        "the row the reader left off on is still marked, dimly, because it is still the row \
+         Enter would act on"
+    );
+}
+
+#[test]
+fn the_toggle_closes_the_sidebar_from_inside_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![listed("Listed work", None, workspace.path(), 1, now())],
+    );
+
+    press_toggle(&mut application);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        !sidebar_is_drawn(&rows),
+        "the toggle closes the Sidebar from within it as readily as from the composer: {rows:?}"
+    );
+    type_terminal_text(&mut application, "hello");
+    assert!(
+        rendered_application_rows_at(&application, WIDE, 20)
+            .iter()
+            .any(|row| row.contains("hello")),
+        "a closed Sidebar holds no keys"
+    );
+}
+
+#[test]
+fn an_open_overlay_keeps_the_keys_while_the_sidebar_holds_focus() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed("Nearest work", None, workspace.path(), 2, now()),
+            listed("Older work", None, workspace.path(), 1, now()),
+        ],
+    );
+    let ApplicationTransition::ListSessions(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionList,
+        )))
+        .expect("open the Session picker")
+    else {
+        panic!("opening the picker asks for its own listing");
+    };
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![listed("Nearest work", None, workspace.path(), 2, now())],
+        })
+        .expect("hydrate the picker");
+
+    press_sidebar_key(&mut application, KeyCode::Down);
+
+    assert!(
+        selected_sidebar_text(&application).contains("Nearest work"),
+        "an overlay over the main view owns the keys, so the Sidebar's selection stays put"
+    );
+}
+
+#[test]
+fn a_session_suru_cannot_read_is_not_attached() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![SessionListItem::Unreadable(UnreadableSessionSummary {
+            id: SessionId::new(),
+            title: "Unreadable work".to_owned(),
+            created_at: SessionTimestamp(1),
+            updated_at: SessionTimestamp(now()),
+            workspace: Some(Workspace {
+                path: workspace.path().to_owned(),
+            }),
+        })],
+    );
+
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "there is nothing to attach to in a Session Suru could not read"
+    );
+}
+
+#[test]
+fn a_terminal_too_narrow_to_draw_the_sidebar_leaves_the_keys_with_the_composer() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![listed("Listed work", None, workspace.path(), 1, now())],
+    );
+
+    rendered_application_rows_at(&application, 85, 20);
+    type_terminal_text(&mut application, "hello");
+
+    assert!(
+        rendered_application_rows_at(&application, 85, 20)
+            .iter()
+            .any(|row| row.contains("hello")),
+        "a Sidebar the frame cannot spare the columns for cannot hold the keys either"
+    );
+}
+
+#[test]
+fn a_paste_does_not_slip_past_the_focused_sidebar() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![listed("Listed work", None, workspace.path(), 1, now())],
+    );
+
+    application
+        .handle_terminal_event(InputEvent::Paste("pasted".to_owned()))
+        .expect("paste while the Sidebar has the keys");
+
+    assert!(
+        !rendered_application_rows_at(&application, WIDE, 20)
+            .iter()
+            .any(|row| row.contains("pasted")),
+        "nothing a reader types or pastes reaches a composer that does not have the keys"
+    );
+}
+
+#[test]
+fn the_keys_after_the_toggle_reach_the_sidebar_before_the_next_frame() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = connected_application(workspace.path());
+    deliver_launch_visibility(&mut application, SidebarVisibility::Hidden);
+    // A frame with no Sidebar on it, which is the state the toggle acts from.
+    rendered_application_rows_at(&application, WIDE, 20);
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![
+                listed("Newest", None, workspace.path(), 2, now()),
+                listed("Older", None, workspace.path(), 1, now()),
+            ],
+        })
+        .expect("hydrate the Sidebar");
+
+    press_sidebar_key(&mut application, KeyCode::Down);
+
+    assert!(
+        selected_sidebar_text(&application).contains("Older"),
+        "a run of keys the terminal delivered together reaches the Sidebar the first of them \
+         opened, without waiting for a frame to be drawn between them"
+    );
+}
+
+#[test]
+fn the_window_holds_still_while_the_selection_moves_inside_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let sessions = (1..=6)
+        .map(|index| {
+            listed(
+                &format!("Row {}", 7 - index),
+                None,
+                workspace.path(),
+                index,
+                now(),
+            )
+        })
+        .collect();
+    let mut application = sidebar_focused(workspace.path(), sessions);
+    // Only a frame knows how many rows the column holds, so a frame is what
+    // settles the window — one is drawn after each run of keys, as the run
+    // loop draws after each run of terminal events.
+    rendered_application_rows_at(&application, WIDE, 12);
+    for _ in 0..5 {
+        press_sidebar_key(&mut application, KeyCode::Down);
+        rendered_application_rows_at(&application, WIDE, 12);
+    }
+
+    press_sidebar_key(&mut application, KeyCode::Up);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 12);
+    assert!(
+        rows.iter().any(|row| row.contains("Row 5")),
+        "the row the reader moved onto is in view: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("Row 3")),
+        "a selection moving to a row already in view leaves the window where it was: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("Row 2")),
+        "the window did not follow the selection it never left: {rows:?}"
+    );
+}
+
+/// A connected client whose Sidebar the reader opened themselves, which is the
+/// Sidebar that has the keys.
+fn sidebar_focused(workspace: &Path, sessions: Vec<SessionListItem>) -> Application {
+    let mut application = connected_application(workspace);
+    deliver_launch_visibility(&mut application, SidebarVisibility::Hidden);
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+        .expect("hydrate the Sidebar");
+    application
+}
+
+fn press_sidebar_key(application: &mut Application, code: KeyCode) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+        .expect("press a Sidebar key")
+}
+
+/// The Sidebar text this frame draws on `background`. The row the reader is on
+/// is drawn highlighted while they are driving the Sidebar, and dimly once the
+/// keys have gone back to the composer, so the two backgrounds tell where the
+/// selection is from where the keys are.
+fn sidebar_text_on(application: &Application, background: Color) -> String {
+    let buffer = rendered_application_buffer(application, WIDE, 20);
+    (0..20)
+        .map(|row| {
+            (0..31)
+                .filter_map(|column| buffer.cell((column, row)))
+                .filter(|cell| cell.bg == background)
+                .map(Cell::symbol)
+                .collect::<String>()
+        })
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The Sidebar row the reader is on while they are driving the Sidebar.
+fn selected_sidebar_text(application: &Application) -> String {
+    sidebar_text_on(application, Color::Blue)
 }

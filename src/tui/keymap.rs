@@ -87,6 +87,47 @@ pub(super) fn command_for_model_picker_event(event: InputEvent) -> Option<Comman
     command_for_picker_event(event, &MODEL_PICKER_COMMANDS)
 }
 
+/// The Sidebar has the keyboard and not the mouse. Up and Down move through
+/// the rows, Enter opens the Session the reader is on, Esc hands the keys back
+/// to the composer, and the toggle closes the Sidebar from inside it as
+/// readily as from outside. Nothing else a reader types or pastes reaches the
+/// Sidebar — least of all the composer, which does not have the keys — and the
+/// search box that would take the typing arrives with
+/// <https://github.com/jake-tucker/suru/issues/178>.
+///
+/// The mouse is the exception, and answers as it does from the composer: the
+/// Sidebar stands beside the main view rather than over it, so the wheel is
+/// still the reader's way through a Transcript. The Sidebar's own rows take
+/// the mouse in <https://github.com/jake-tucker/suru/issues/181>.
+pub(super) fn command_for_sidebar_event(event: InputEvent) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return matches!(event, InputEvent::Mouse(_))
+            .then(|| command_for_terminal_event(event))
+            .flatten();
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(
+            CommandId::InvokeSemantic(SemanticCommandId::SidebarPrevious),
+        ),
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::SidebarNext))
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::SidebarAttach))
+        }
+        (KeyCode::Esc, KeyModifiers::NONE) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::SidebarLeave))
+        }
+        (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::SidebarToggle))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn command_for_model_options_event(event: InputEvent) -> Option<CommandId> {
     let InputEvent::Key(key) = event else {
         return None;

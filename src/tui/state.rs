@@ -34,7 +34,7 @@ use super::{
         command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
         command_for_numeric_editor_event, command_for_queued_prompt_event,
         command_for_session_picker_event, command_for_settings_panel_event,
-        command_for_terminal_event,
+        command_for_sidebar_event, command_for_terminal_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
@@ -253,7 +253,6 @@ pub struct TuiState {
     /// Which Spinner frame is showing, advanced by the run loop's tick and
     /// read only at draw time — never by the transcript projection (ADR 0009).
     pub(super) spinner_frame: usize,
-    pub(super) composer_focused: bool,
     pub(super) submission_error: Option<String>,
     pub(super) session: Option<SessionProjection>,
     landing_agent_selection: Option<AgentSelection>,
@@ -350,7 +349,6 @@ impl TuiState {
             transcript_cache: TranscriptCache::default(),
             transcript_generation: 0,
             spinner_frame: 0,
-            composer_focused: true,
             submission_error: None,
             session: None,
             landing_agent_selection: None,
@@ -1032,10 +1030,17 @@ impl TuiState {
         interaction.anchor.set(None);
     }
 
+    /// Whether the composer has the keys. The Sidebar is the one surface that
+    /// takes them without opening over the composer, so a composer that has
+    /// them is simply one the Sidebar is not driving.
+    pub(super) fn composer_focused(&self) -> bool {
+        !self.sidebar.has_focus()
+    }
+
     pub(super) fn composer_border_style(&self, theme: &Theme) -> Style {
         if self.composers.skill_issue(self.composer_key()).is_some() {
             theme.form_field.invalid
-        } else if self.composer_focused {
+        } else if self.composer_focused() {
             theme.form_field.border
         } else {
             theme.border.subdued
@@ -1458,8 +1463,15 @@ impl Application {
             }
             ApplicationEvent::SessionAttached(snapshot) => self.attach_session(snapshot),
             ApplicationEvent::SessionAttachmentFailed(error) => {
-                let request = self.state.session_picker.fail_attachment(error);
-                Ok(ApplicationTransition::ListSessions(request))
+                if self.state.sidebar.is_attaching() {
+                    // The Sidebar keeps its list and the reader keeps the keys:
+                    // the refusal is drawn above the rows they are still on.
+                    self.state.sidebar.fail_attachment(error);
+                    Ok(ApplicationTransition::Continue)
+                } else {
+                    let request = self.state.session_picker.fail_attachment(error);
+                    Ok(ApplicationTransition::ListSessions(request))
+                }
             }
             ApplicationEvent::SessionDeletionFailed { session_id, error } => {
                 self.state.session_picker.fail_deletion(session_id, error);
@@ -1491,7 +1503,10 @@ impl Application {
                         let current = self.session_id();
                         self.state.session_picker.load(&request, sessions, current);
                     }
-                    SessionListSurface::Sidebar => self.state.sidebar.load(&request, sessions),
+                    SessionListSurface::Sidebar => {
+                        let current = self.session_id();
+                        self.state.sidebar.load(&request, sessions, current);
+                    }
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -1806,6 +1821,29 @@ impl Application {
         ApplicationTransition::Continue
     }
 
+    /// Handles the Sidebar commands routed here; any other command leaves the
+    /// Sidebar alone. A Sidebar the reader has closed is not one they are
+    /// driving, so nothing routed here acts on a list nobody can see.
+    fn handle_sidebar_command(&mut self, command: SemanticCommandId) -> ApplicationTransition {
+        if !self.state.sidebar.is_revealed() {
+            return ApplicationTransition::Continue;
+        }
+        match command {
+            SemanticCommandId::SidebarPrevious => self.state.sidebar.select_previous(),
+            SemanticCommandId::SidebarNext => self.state.sidebar.select_next(),
+            SemanticCommandId::SidebarLeave => self.state.sidebar.leave(),
+            SemanticCommandId::SidebarAttach => {
+                let current = self.session_id();
+                return self.state.sidebar.begin_attachment(current).map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::AttachSession,
+                );
+            }
+            _ => {}
+        }
+        ApplicationTransition::Continue
+    }
+
     /// Handles the Model picker commands routed here; any other command leaves
     /// the picker alone.
     fn handle_model_picker_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
@@ -2035,9 +2073,13 @@ impl Application {
 
     fn attach_session(&mut self, snapshot: SessionSnapshot) -> Result<ApplicationTransition> {
         let closes_picker = self.state.session_picker.attaching_to(snapshot.session.id);
+        let answers_sidebar = self.state.sidebar.attaching_to(snapshot.session.id);
         self.state.apply_attached_session(snapshot)?;
         if closes_picker {
             self.state.session_picker.close();
+        }
+        if answers_sidebar {
+            self.state.sidebar.finish_attachment();
         }
         Ok(ApplicationTransition::Continue)
     }
@@ -2285,6 +2327,10 @@ impl Application {
                         ApplicationTransition::SettleSession,
                     ))
             }
+            command @ (SemanticCommandId::SidebarPrevious
+            | SemanticCommandId::SidebarNext
+            | SemanticCommandId::SidebarAttach
+            | SemanticCommandId::SidebarLeave) => Ok(self.handle_sidebar_command(command)),
             SemanticCommandId::SidebarToggle => {
                 self.state.sidebar.toggle();
                 self.state.command_mode = CommandMode::Composer;
@@ -2647,6 +2693,13 @@ impl Application {
         }
         if self.state.session_picker.is_open() {
             return command_for_session_picker_event(event);
+        }
+        // The Sidebar comes after every overlay and before the composer's own
+        // surfaces: it stands beside the main view rather than over it, so an
+        // overlay a reader opened is still the newer surface and owns the keys,
+        // while a completion list left standing over the composer does not.
+        if self.state.sidebar.has_focus() {
+            return command_for_sidebar_event(event);
         }
         if self.state.composer_completion.is_visible()
             && let Some(command) = command_for_completion_event(event.clone())

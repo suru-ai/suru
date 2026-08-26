@@ -96,7 +96,6 @@ pub(crate) struct FeedbackRoles {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BorderRoles {
-    #[allow(dead_code)] // Default borders are available for upcoming non-subdued panels.
     pub(crate) default: Style,
     pub(crate) subdued: Style,
 }
@@ -113,7 +112,6 @@ pub(crate) struct MarkdownRoles {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Selection UI is outside this issue but the Theme contract includes it.
 pub(crate) struct SelectionRoles {
     pub(crate) focused: Style,
     pub(crate) unfocused: Style,
