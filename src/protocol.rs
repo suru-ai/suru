@@ -765,6 +765,21 @@ pub enum SidebarVisibility {
     Hidden,
 }
 
+/// Which Workspaces a TUI's Sidebar lists.
+///
+/// The Setting this spells governs only the scope a Sidebar launches with: the
+/// selector above the list is the reader's to move afterwards, and — as with
+/// the Sidebar's own visibility — nothing writes that choice back.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarScope {
+    /// The reader's whole body of work, whichever Workspace it is rooted in.
+    #[default]
+    AllWorkspaces,
+    /// Only the Workspace the client itself runs in.
+    CurrentWorkspace,
+}
+
 /// When a Session settles on its own, having been left alone long enough.
 /// `Off` leaves the settled shelf to the user's own say-so alone; `Idle`
 /// settles a Session that has gone that many whole days untouched. An idle
@@ -846,6 +861,7 @@ impl<'de> Deserialize<'de> for AutoSettle {
 #[serde(deny_unknown_fields)]
 pub struct SidebarSettings {
     pub launch_visibility: SidebarVisibility,
+    pub initial_scope: SidebarScope,
     pub auto_settle: AutoSettle,
 }
 
@@ -955,6 +971,9 @@ pub enum SettingMutation {
     },
     SidebarLaunchVisibility {
         value: Option<SidebarVisibility>,
+    },
+    SidebarInitialScope {
+        value: Option<SidebarScope>,
     },
     SidebarAutoSettle {
         value: Option<AutoSettle>,

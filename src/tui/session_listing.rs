@@ -2,7 +2,10 @@
 //! Workspace scope, and catalog reconciliation that every surface listing
 //! Sessions needs, held in one place so no surface reimplements them.
 
-use std::{cmp::Reverse, path::PathBuf};
+use std::{
+    cmp::Reverse,
+    path::{Path, PathBuf},
+};
 
 use crate::protocol::{SessionId, SessionListItem, SessionSummary, SessionTimestamp};
 
@@ -176,6 +179,12 @@ impl SessionListing {
 
     pub(super) fn scope(&self) -> &SessionListScope {
         &self.scope
+    }
+
+    /// The Workspace this client runs in, which is what `CurrentWorkspace`
+    /// scope means and what a surface narrowing to "where I am" narrows to.
+    pub(super) fn current_workspace(&self) -> &Path {
+        &self.current_workspace
     }
 
     pub(super) const fn is_loading(&self) -> bool {

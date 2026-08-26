@@ -19,7 +19,7 @@ use suru::{
     protocol::{
         AutoSettle, EffectiveSettings, ModelAvailability, PromptId, Session, SessionDeleted,
         SessionId, SessionListItem, SessionSettlementChanged, SessionStatus, SessionSummary,
-        SessionTimestamp, SessionTitleChanged, SettingsSnapshot, SidebarSettings,
+        SessionTimestamp, SessionTitleChanged, SettingsSnapshot, SidebarScope, SidebarSettings,
         SidebarVisibility, UnreadableSessionSummary, Workspace,
     },
     tui::{
@@ -32,8 +32,9 @@ use suru::{
 /// about the Sidebar's own content needs.
 const WIDE: u16 = 100;
 
-/// Short enough that six active rows do not fit: the search box and four
-/// three-line rows fill the column, so the rest is read through the window.
+/// Short enough that six active rows do not fit: the search box, the selector,
+/// and three three-line rows fill the column, so the rest is read through the
+/// window.
 const WINDOWED: u16 = 13;
 
 #[test]
@@ -401,6 +402,7 @@ fn sidebar_settling(
         SidebarSettings {
             launch_visibility: SidebarVisibility::Shown,
             auto_settle,
+            ..SidebarSettings::default()
         },
     ));
     application
@@ -639,8 +641,14 @@ fn the_arrows_move_the_selection_and_wrap_past_the_ends() {
 
     press_sidebar_key(&mut application, KeyCode::Up);
     assert!(
+        selected_sidebar_text(&application).contains(ALL_WORKSPACES),
+        "moving off the top of the list lands on the selector standing above it"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Up);
+    assert!(
         selected_sidebar_text(&application).contains("Oldest"),
-        "moving off the top wraps to the end of the list"
+        "and moving off the selector wraps to the end of the list"
     );
 }
 
@@ -964,11 +972,11 @@ fn the_window_holds_still_while_the_selection_moves_inside_it() {
         "the row the reader moved onto is in view: {rows:?}"
     );
     assert!(
-        rows.iter().any(|row| row.contains("Row 3")),
+        rows.iter().any(|row| row.contains("Row 4")),
         "a selection moving to a row already in view leaves the window where it was: {rows:?}"
     );
     assert!(
-        !rows.iter().any(|row| row.contains("Row 2")),
+        !rows.iter().any(|row| row.contains("Row 3")),
         "the window did not follow the selection it never left: {rows:?}"
     );
 }
@@ -1387,6 +1395,7 @@ fn moving_the_auto_settle_settings_reclassifies_the_sidebar_in_place() {
         SidebarSettings {
             launch_visibility: SidebarVisibility::Shown,
             auto_settle: AutoSettle::Off,
+            ..SidebarSettings::default()
         },
     );
 
@@ -1506,8 +1515,14 @@ fn the_arrows_walk_across_the_divider_onto_the_settled_shelf() {
 
     press_sidebar_key(&mut application, KeyCode::Down);
     assert!(
+        selected_sidebar_text(&application).contains(ALL_WORKSPACES),
+        "and past the end of the shelf they wrap back to the selector above the list"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(
         selected_sidebar_text(&application).contains("Still going"),
-        "and past the end of the shelf they wrap back to the top of the active list"
+        "and on to the top of the active list"
     );
 }
 
@@ -1548,11 +1563,14 @@ fn the_affordance_shows_twenty_five_more_and_repeats_to_the_end_of_the_shelf() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = sidebar_focused(workspace.path(), set_aside_shelf(workspace.path(), 40));
 
+    // Past the top of the list is the selector standing above it, and past that
+    // the affordance closing the shelf.
+    press_sidebar_key(&mut application, KeyCode::Up);
     press_sidebar_key(&mut application, KeyCode::Up);
     assert_eq!(
         selected_sidebar_text(&application).trim(),
         "Show 25 more",
-        "past the top of the list is the affordance closing the shelf"
+        "past the selector is the affordance closing the shelf"
     );
 
     assert_eq!(
@@ -1595,14 +1613,14 @@ fn the_affordance_shows_twenty_five_more_and_repeats_to_the_end_of_the_shelf() {
 /// The revealed tail belongs to the listing it was revealed on. A Sidebar
 /// asking for its Sessions afresh opens the shelf on its first rows again
 /// rather than inheriting however deep the reader had walked into some other
-/// body of work — coming back into view here, and narrowed to another
-/// Workspace once the selector arrives
-/// (<https://github.com/jake-tucker/suru/issues/179>), which asks the same
-/// way.
+/// body of work.
 #[test]
 fn a_sidebar_asking_for_its_sessions_afresh_opens_the_shelf_on_its_first_rows() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = sidebar_focused(workspace.path(), set_aside_shelf(workspace.path(), 12));
+    // Up onto the selector standing above the list, and up again onto the
+    // affordance at the shelf's foot.
+    press_sidebar_key(&mut application, KeyCode::Up);
     press_sidebar_key(&mut application, KeyCode::Up);
     press_sidebar_key(&mut application, KeyCode::Enter);
     assert!(
@@ -2005,8 +2023,14 @@ fn the_arrows_walk_the_results_and_wrap_within_them() {
 
     press_sidebar_key(&mut application, KeyCode::Down);
     assert!(
+        selected_sidebar_text(&application).contains(ALL_WORKSPACES),
+        "past the last result is the selector, as it is past the last row of any list"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(
         selected_sidebar_text(&application).contains("Match first"),
-        "and wrap within the results rather than past them into the rest"
+        "and they wrap within the results rather than past them into the rest"
     );
 }
 
@@ -2559,4 +2583,374 @@ fn a_right_press_inside_the_menu_leaves_it_where_it_is() {
         },
         "the menu stands where it was, on the row it was opened on"
     );
+}
+
+/// The words the selector's first entry stands for, which is the whole body of
+/// work rather than any one Workspace.
+const ALL_WORKSPACES: &str = "All Workspaces";
+
+/// The Workspace selector stands between the search box and the list it
+/// governs, saying what the Sidebar is narrowed to before it says anything
+/// about the work itself.
+#[test]
+fn the_selector_stands_under_the_search_box_and_says_what_is_in_scope() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![listed("Listed work", None, workspace.path(), 1, now())],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert_eq!(
+        sidebar_column(&rows[1]),
+        format!("▸ {ALL_WORKSPACES}"),
+        "the selector opens on the reader's whole body of work: {rows:?}"
+    );
+}
+
+/// The entries are the ways into the reader's work: all of it, then each
+/// Workspace the Sidebar has listed a Session in, and the Workspace this
+/// client itself runs in — which stands whether or not there is work in it
+/// yet, because it is where the next Session will be.
+#[test]
+fn the_selector_lists_all_workspaces_first_then_the_workspaces_it_has_work_in() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed("Notes", None, &workspace.path().join("notes"), 2, now()),
+            listed("Suru", None, &workspace.path().join("suru"), 1, now()),
+        ],
+    );
+
+    open_selector(&mut application);
+
+    assert_eq!(
+        selector_entries(&application),
+        vec![
+            ALL_WORKSPACES.to_owned(),
+            workspace_name(workspace.path()),
+            "notes".to_owned(),
+            "suru".to_owned(),
+        ],
+        "every Workspace the reader has work in, and the one they are standing in"
+    );
+}
+
+/// Choosing an entry narrows the whole Sidebar to that Workspace: the active
+/// list, the settled shelf, and the results a query answers with.
+#[test]
+fn choosing_a_workspace_narrows_both_shelves() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(workspace.path(), two_workspaces(workspace.path()));
+
+    choose_workspace(&mut application, "notes");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        drawn_in_sidebar(&rows, "Notes work") && drawn_in_sidebar(&rows, "Notes history"),
+        "both shelves go on listing the Workspace the reader narrowed to: {rows:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&rows, "Suru work") && !drawn_in_sidebar(&rows, "Suru history"),
+        "and neither lists the Workspace they narrowed away from: {rows:?}"
+    );
+    assert_eq!(
+        sidebar_column(&rows[1]),
+        "▸ notes",
+        "the selector says which Workspace the list is answering for: {rows:?}"
+    );
+}
+
+#[test]
+fn choosing_all_workspaces_widens_the_sidebar_again() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(workspace.path(), two_workspaces(workspace.path()));
+    choose_workspace(&mut application, "notes");
+
+    choose_workspace(&mut application, ALL_WORKSPACES);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    for title in ["Notes work", "Suru work", "Notes history", "Suru history"] {
+        assert!(
+            drawn_in_sidebar(&rows, title),
+            "the whole body of work is listed again: {title} is missing from {rows:?}"
+        );
+    }
+}
+
+/// A query is read against the Sessions in scope, so narrowing to a Workspace
+/// narrows what searching can turn up.
+#[test]
+fn a_query_answers_within_the_workspace_the_selector_is_narrowed_to() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(workspace.path(), two_workspaces(workspace.path()));
+    choose_workspace(&mut application, "notes");
+
+    type_terminal_text(&mut application, "work");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        drawn_in_sidebar(&rows, "Notes work"),
+        "the query answers with the work in scope: {rows:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&rows, "Suru work"),
+        "and not with work the reader has narrowed away from: {rows:?}"
+    );
+}
+
+/// The Setting seeds the scope a TUI launches with, and nothing more: the
+/// selector is the reader's to move afterwards.
+#[test]
+fn the_initial_scope_setting_narrows_the_sidebar_a_tui_launches_with() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = sidebar_scoped(
+        workspace.path(),
+        SidebarScope::CurrentWorkspace,
+        two_workspaces(workspace.path()),
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert_eq!(
+        sidebar_column(&rows[1]),
+        format!("▸ {}", workspace_name(workspace.path())),
+        "the Sidebar launches narrowed to the Workspace the client runs in: {rows:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&rows, "Notes work") && !drawn_in_sidebar(&rows, "Suru work"),
+        "and lists nothing rooted elsewhere: {rows:?}"
+    );
+}
+
+/// The reader's own choice is view state: it is not written back, and a later
+/// snapshot carrying some other Setting's edit does not undo it.
+#[test]
+fn a_scope_the_reader_chose_is_ephemeral_and_survives_a_later_snapshot() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_scoped(
+        workspace.path(),
+        SidebarScope::CurrentWorkspace,
+        two_workspaces(workspace.path()),
+    );
+
+    assert_eq!(
+        choose_workspace(&mut application, "notes"),
+        ApplicationTransition::Continue,
+        "moving the selector edits no Config Document"
+    );
+    deliver_sidebar_settings(
+        &mut application,
+        SidebarSettings {
+            launch_visibility: SidebarVisibility::Shown,
+            initial_scope: SidebarScope::CurrentWorkspace,
+            ..SidebarSettings::default()
+        },
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert_eq!(
+        sidebar_column(&rows[1]),
+        "▸ notes",
+        "a later snapshot leaves the scope the reader chose alone: {rows:?}"
+    );
+}
+
+/// Esc backs the reader out one step at a time, and the entries they opened
+/// are the innermost of them.
+#[test]
+fn esc_closes_the_selector_before_it_gives_up_the_query() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(workspace.path(), two_workspaces(workspace.path()));
+    type_terminal_text(&mut application, "work");
+    open_selector(&mut application);
+
+    press_sidebar_key(&mut application, KeyCode::Esc);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert_eq!(
+        sidebar_column(&rows[1]),
+        format!("▸ {ALL_WORKSPACES}"),
+        "the entries are put away, leaving the scope where it was: {rows:?}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Search: work"),
+        "and the query the reader was reading by is still theirs: {rows:?}"
+    );
+}
+
+/// The selector answers a pointer as readily as the keys: one press opens the
+/// entries, and a press on one of them chooses it.
+#[test]
+fn a_press_on_the_selector_opens_it_and_a_press_on_an_entry_chooses_it() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_showing(workspace.path(), two_workspaces(workspace.path()));
+
+    assert_eq!(
+        press_line(&mut application, MouseButton::Left, "▸ "),
+        ApplicationTransition::Continue,
+        "opening the entries asks nothing of the server"
+    );
+    assert_eq!(
+        selector_entries(&application).first(),
+        Some(&ALL_WORKSPACES.to_owned()),
+        "the entries stand open under the selector"
+    );
+
+    press_line(&mut application, MouseButton::Left, "  notes");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert_eq!(
+        sidebar_column(&rows[1]),
+        "▸ notes",
+        "the entry the reader pressed is the scope in force: {rows:?}"
+    );
+
+    press_line(&mut application, MouseButton::Left, "▸ ");
+    press_line(&mut application, MouseButton::Left, "▾ ");
+
+    assert!(
+        selector_entries(&application).is_empty(),
+        "pointing at the same affordance twice puts the entries away again"
+    );
+}
+
+/// The selector is a row like any other in that the arrows reach it: it stands
+/// above the list, so moving off the top of the list lands on it.
+#[test]
+fn the_arrows_reach_the_selector_above_the_list() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![listed("Listed work", None, workspace.path(), 1, now())],
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Up);
+
+    assert!(
+        selected_sidebar_text(&application).contains(ALL_WORKSPACES),
+        "the row above the list is the selector"
+    );
+    press_sidebar_key(&mut application, KeyCode::Enter);
+    assert_eq!(
+        selector_entries(&application).first(),
+        Some(&ALL_WORKSPACES.to_owned()),
+        "which Enter opens rather than attaching anything"
+    );
+}
+
+/// The server keeps a Session it could not place in every listing it narrows,
+/// and the selector must give the same reading: narrowing is a claim about
+/// where work is, and a Session nobody can place is not work it can hide.
+#[test]
+fn a_session_suru_cannot_place_stands_however_narrow_the_scope() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut sessions = two_workspaces(workspace.path());
+    sessions.push(SessionListItem::Unreadable(UnreadableSessionSummary {
+        id: SessionId::new(),
+        title: "Unplaceable work".to_owned(),
+        created_at: SessionTimestamp(minutes_ago(9)),
+        updated_at: SessionTimestamp(minutes_ago(9)),
+        workspace: None,
+    }));
+    let mut application = sidebar_focused(workspace.path(), sessions);
+
+    choose_workspace(&mut application, "notes");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        drawn_in_sidebar(&rows, "Unplaceable work"),
+        "a Session with no Workspace to read stands wherever the listing does: {rows:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&rows, "Suru work"),
+        "and the narrowing is otherwise as narrow as ever: {rows:?}"
+    );
+}
+
+/// A connected client whose Sidebar launches under `initial_scope`.
+fn sidebar_scoped(
+    workspace: &Path,
+    initial_scope: SidebarScope,
+    sessions: Vec<SessionListItem>,
+) -> Application {
+    let mut application = connected_application(workspace);
+    let request = expect_sidebar_listing(deliver_sidebar_settings(
+        &mut application,
+        SidebarSettings {
+            launch_visibility: SidebarVisibility::Shown,
+            initial_scope,
+            ..SidebarSettings::default()
+        },
+    ));
+    application
+        .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+        .expect("hydrate the Sidebar");
+    application
+}
+
+/// Work on both shelves in each of two Workspaces beside the one the client
+/// runs in, which is what a narrowing is read against.
+fn two_workspaces(root: &Path) -> Vec<SessionListItem> {
+    vec![
+        listed("Notes work", None, &root.join("notes"), 4, now()),
+        listed("Suru work", None, &root.join("suru"), 3, now()),
+        settled(
+            "Notes history",
+            None,
+            &root.join("notes"),
+            2,
+            hours_ago(3),
+            minutes_ago(5),
+        ),
+        settled(
+            "Suru history",
+            None,
+            &root.join("suru"),
+            1,
+            hours_ago(4),
+            minutes_ago(6),
+        ),
+    ]
+}
+
+/// Opens the selector's entries the way a reader driving the Sidebar from the
+/// keyboard does: up onto the row above the list, then Enter.
+fn open_selector(application: &mut Application) {
+    press_sidebar_key(application, KeyCode::Up);
+    press_sidebar_key(application, KeyCode::Enter);
+}
+
+/// Chooses one of the selector's entries by pressing it, opening the entries
+/// first where they are not already open.
+fn choose_workspace(application: &mut Application, label: &str) -> ApplicationTransition {
+    if selector_entries(application).is_empty() {
+        press_line(application, MouseButton::Left, "▸ ");
+    }
+    press_line(application, MouseButton::Left, &format!("  {label}"))
+}
+
+/// The entries standing open under the selector, and nothing where it is
+/// closed. They are the lines stepped in past the affordance that opened them.
+fn selector_entries(application: &Application) -> Vec<String> {
+    let rows = rendered_application_rows_at(application, WIDE, 20);
+    if !sidebar_column(&rows[1]).starts_with('▾') {
+        return Vec::new();
+    }
+    rows.iter()
+        .skip(2)
+        .map(|row| row.chars().take_while(|character| *character != '│'))
+        .map(|column| column.collect::<String>())
+        .take_while(|column| column.starts_with("  ") && !column.trim().is_empty())
+        .map(|column| column.trim().to_owned())
+        .collect()
+}
+
+/// The Workspace as the Sidebar names it: the last component of its path.
+fn workspace_name(workspace: &Path) -> String {
+    workspace
+        .file_name()
+        .expect("the fixture's Workspace has a name")
+        .to_string_lossy()
+        .into_owned()
 }

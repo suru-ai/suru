@@ -10,7 +10,7 @@ use suru::{
     protocol::{
         AgentSelection, AutoSettle, FoldPosture, ModelId, ProviderId, ReasoningSummaryDetail,
         ReasoningVisibility, SessionContentWidth, SettingMutation, SettingsDiagnosticSeverity,
-        SettingsSnapshot, SidebarVisibility, TitleErrand,
+        SettingsSnapshot, SidebarScope, SidebarVisibility, TitleErrand,
     },
     server::{self, ServerConfig},
 };
@@ -169,6 +169,49 @@ async fn a_hidden_sidebar_pins_from_a_document_and_resets_to_the_shown_default()
         answered.settings.sidebar.launch_visibility,
         SidebarVisibility::Shown,
         "unpinning it lets the built-in default resume"
+    );
+    assert_eq!(answered.pinned, [] as [String; 0]);
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_sidebar_narrowed_at_launch_pins_from_a_document_and_resets_to_every_workspace() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            // One directory at a time is how I work.
+            "sidebar": { "initialScope": "current_workspace" },
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-sidebar-scope")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (client, opening) = attach(state_dir.path(), "settings-sidebar-scope").await;
+    assert_eq!(
+        opening.settings.sidebar.initial_scope,
+        SidebarScope::CurrentWorkspace
+    );
+    assert_eq!(opening.pinned, ["sidebar.initialScope"]);
+    assert_eq!(opening.diagnostics, []);
+
+    let answered = client
+        .mutate_setting(SettingMutation::SidebarInitialScope { value: None })
+        .await
+        .expect("reset the Setting");
+    assert_eq!(
+        answered.settings.sidebar.initial_scope,
+        SidebarScope::AllWorkspaces,
+        "unpinning it lets the whole body of work resume"
     );
     assert_eq!(answered.pinned, [] as [String; 0]);
 

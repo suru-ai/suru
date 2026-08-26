@@ -32,7 +32,7 @@ use serde_json::Value;
 use crate::protocol::{
     AgentSelection, AutoSettle, EffectiveSettings, FoldPosture, ProviderId, ReasoningSummaryDetail,
     ReasoningVisibility, SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
-    SettingsDiagnosticSeverity, SettingsSnapshot, SidebarVisibility, TitleErrand,
+    SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility, TitleErrand,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -50,6 +50,7 @@ const SESSION_CONTENT_WIDTH: &str = "session.contentWidth";
 // work that has nothing to do with them.
 const SESSION_TITLE_ERRAND: &str = "session.title.errand";
 const SIDEBAR_LAUNCH_VISIBILITY: &str = "sidebar.launchVisibility";
+const SIDEBAR_INITIAL_SCOPE: &str = "sidebar.initialScope";
 const SIDEBAR_AUTO_SETTLE: &str = "sidebar.autoSettle";
 const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
 const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary";
@@ -399,6 +400,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::SidebarLaunchVisibility { value } => {
             *value == Some(settings.sidebar.launch_visibility)
         }
+        SettingMutation::SidebarInitialScope { value } => {
+            *value == Some(settings.sidebar.initial_scope)
+        }
         SettingMutation::SidebarAutoSettle { value } => {
             *value == Some(settings.sidebar.auto_settle)
         }
@@ -587,6 +591,33 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |visibility| {
                 settings.sidebar.launch_visibility = visibility;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: SIDEBAR_INITIAL_SCOPE,
+        label: "Sidebar scope at launch",
+        description: "Which Workspaces a TUI's Sidebar lists when it opens",
+        group: SettingGroup::General,
+        scope: SettingScope::Client,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "all_workspaces",
+                pin: SettingMutation::SidebarInitialScope {
+                    value: Some(SidebarScope::AllWorkspaces),
+                },
+            },
+            SettingChoice {
+                value: "current_workspace",
+                pin: SettingMutation::SidebarInitialScope {
+                    value: Some(SidebarScope::CurrentWorkspace),
+                },
+            },
+        ]),
+        reset: SettingMutation::SidebarInitialScope { value: None },
+        apply: |settings, value| {
+            apply_value(value, |scope| {
+                settings.sidebar.initial_scope = scope;
             })
         },
     },
@@ -893,6 +924,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::SidebarLaunchVisibility { value } => {
             (SIDEBAR_LAUNCH_VISIBILITY, pinned(value))
         }
+        SettingMutation::SidebarInitialScope { value } => (SIDEBAR_INITIAL_SCOPE, pinned(value)),
         SettingMutation::SidebarAutoSettle { value } => (SIDEBAR_AUTO_SETTLE, pinned(value)),
         SettingMutation::ProviderCodexEnabled { value } => (PROVIDER_CODEX_ENABLED, pinned(value)),
         SettingMutation::ProviderCodexReasoningSummary { value } => {
@@ -1408,6 +1440,7 @@ mod tests {
                 // can and describes the rest, in the same breath.
                 "one of \"session\", \"off\", or an Agent Selection".to_owned(),
                 "one of \"shown\" or \"hidden\"".to_owned(),
+                "one of \"all_workspaces\" or \"current_workspace\"".to_owned(),
                 "one of \"off\" or a whole number of days, at least 1".to_owned(),
                 // A boolean Setting is diagnosed as accepting `true` or
                 // `false`, unquoted, because that is what the reader must type.

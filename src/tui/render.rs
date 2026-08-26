@@ -33,7 +33,8 @@ use super::{
     },
     sidebar::{
         self, SIDEBAR_MENU_ITEMS, Sidebar, SidebarEntry, SidebarMenuGeometry, SidebarRow,
-        SidebarShelf, SidebarShowMore, SidebarSpan,
+        SidebarScopeEntry, SidebarSelectorView, SidebarShelf, SidebarShowMore, SidebarSpan,
+        SidebarTarget,
     },
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
@@ -1146,9 +1147,9 @@ fn render_sidebar_menu(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
 }
 
 /// The Sidebar's whole body: the search box, then what the server last
-/// refused, then the active Sessions, then the divider and the settled ones —
-/// as many of them as the column is tall — or the one line that stands in for
-/// a list there is nothing to draw.
+/// refused, then the Workspace selector, then the active Sessions, then the
+/// divider and the settled ones — as many of them as the column is tall — or
+/// the one line that stands in for a list there is nothing to draw.
 ///
 /// Reports the geometry the body came out at alongside the lines themselves,
 /// because only the pass that lays the rows out knows which screen rows each
@@ -1160,6 +1161,7 @@ fn sidebar_lines(
     theme: &Theme,
 ) -> (Vec<Line<'static>>, Vec<SidebarSpan>) {
     let width = usize::from(content.width);
+    let focused = state.sidebar.has_focus();
     let mut lines = vec![sidebar_search_line(state.sidebar.query(), width, theme)];
     let error = state.sidebar.error();
     if let Some(error) = error {
@@ -1168,6 +1170,22 @@ fn sidebar_lines(
             theme.feedback.error,
         ));
     }
+    // The selector stands between the search box and the list it governs, and
+    // is a row the reader can press, so it is the first span this frame
+    // records.
+    let selector_row = content
+        .y
+        .saturating_add(u16::try_from(lines.len()).unwrap_or_default());
+    lines.push(sidebar_selector_line(
+        &state.sidebar.selector(),
+        width,
+        focused,
+        theme,
+    ));
+    let mut rows = vec![SidebarSpan {
+        rows: selector_row..selector_row.saturating_add(1),
+        target: SidebarTarget::Selector,
+    }];
     let capacity = usize::from(content.height).saturating_sub(lines.len());
     let entries = state.sidebar.visible_entries(
         capacity,
@@ -1178,11 +1196,9 @@ fn sidebar_lines(
             sidebar_empty_reading(&state.sidebar)
                 .map(|reading| Line::styled(reading, theme.text.subdued)),
         );
-        return (lines, Vec::new());
+        return (lines, rows);
     }
     let now = SessionTimestamp::now().0;
-    let focused = state.sidebar.has_focus();
-    let mut rows = Vec::new();
     let mut top = content
         .y
         .saturating_add(u16::try_from(lines.len()).unwrap_or_default());
@@ -1250,10 +1266,13 @@ fn sidebar_empty_reading(sidebar: &Sidebar) -> Option<&'static str> {
     if sidebar.error().is_some() {
         return None;
     }
-    Some(if sidebar.query().is_empty() {
-        "No Sessions yet"
-    } else {
-        "No Sessions match"
+    Some(match (sidebar.query().is_empty(), sidebar.is_narrowed()) {
+        (false, _) => "No Sessions match",
+        // A reader who narrowed to one Workspace is told that Workspace is
+        // empty rather than that they have no work, which would be a lie about
+        // the rest of it.
+        (true, true) => "No Sessions in this Workspace",
+        (true, false) => "No Sessions yet",
     })
 }
 
@@ -1269,6 +1288,7 @@ fn sidebar_entry_lines(
     match entry {
         SidebarEntry::Divider => vec![sidebar_divider_line(width, theme)],
         SidebarEntry::ShowMore(more) => vec![sidebar_show_more_line(more, width, focused, theme)],
+        SidebarEntry::Scope(scope) => vec![sidebar_scope_line(&scope, width, focused, theme)],
         SidebarEntry::Row(row) => match row.shelf {
             SidebarShelf::Active {
                 workspace,
@@ -1282,6 +1302,45 @@ fn sidebar_entry_lines(
             }
         },
     }
+}
+
+/// The Workspace selector: what the Sidebar is narrowed to, with the affordance
+/// that opens its entries — the same one the settings panel opens a row's
+/// choices with, because it is the same gesture on the same kind of list.
+fn sidebar_selector_line(
+    selector: &SidebarSelectorView,
+    width: usize,
+    focused: bool,
+    theme: &Theme,
+) -> Line<'static> {
+    let affordance = if selector.open { "▾ " } else { "▸ " };
+    sidebar_plain_line(
+        &format!("{affordance}{}", selector.label),
+        width,
+        sidebar_selection_style(selector.selected, focused, theme),
+        theme.text.subdued,
+    )
+}
+
+/// One Workspace the open selector offers, stepped in past the affordance that
+/// opened it. The scope in force is accented, the way the Session the reader
+/// has open is: both say "you are already here".
+fn sidebar_scope_line(
+    scope: &SidebarScopeEntry,
+    width: usize,
+    focused: bool,
+    theme: &Theme,
+) -> Line<'static> {
+    sidebar_plain_line(
+        &format!("  {}", scope.label),
+        width,
+        sidebar_selection_style(scope.selected, focused, theme),
+        if scope.chosen {
+            theme.accent.primary
+        } else {
+            theme.text.primary
+        },
+    )
 }
 
 /// The rule closing the active list and opening the settled shelf, named so a
@@ -1304,11 +1363,27 @@ fn sidebar_show_more_line(
     focused: bool,
     theme: &Theme,
 ) -> Line<'static> {
-    let selected = sidebar_selection_style(more.selected, focused, theme);
-    let label = format!("Show {} more", more.count);
+    sidebar_plain_line(
+        &format!("Show {} more", more.count),
+        width,
+        sidebar_selection_style(more.selected, focused, theme),
+        theme.text.subdued,
+    )
+}
+
+/// One line of the Sidebar carrying nothing but a label: the whole column wide,
+/// so a row the reader is on reads as one block rather than as lit text, and
+/// cut rather than wrapped where the label is longer than the column. Every row
+/// with no right slot to lay out is drawn here.
+fn sidebar_plain_line(
+    label: &str,
+    width: usize,
+    selected: Option<Style>,
+    unselected: Style,
+) -> Line<'static> {
     Line::styled(
-        pad_to_width(&truncate_to_width(&label, width), width),
-        selected.unwrap_or(theme.text.subdued),
+        pad_to_width(&truncate_to_width(label, width), width),
+        selected.unwrap_or(unselected),
     )
 }
 
@@ -1338,8 +1413,10 @@ fn sidebar_active_row_lines(
             selected,
             theme,
         ),
-        Line::styled(
-            pad_to_width(&truncate_to_width(&sidebar_title(row), width), width),
+        sidebar_plain_line(
+            &sidebar_title(row),
+            width,
+            None,
             sidebar_title_style(row, selected, theme),
         ),
         Line::styled(" ".repeat(width), selected.unwrap_or_default()),
