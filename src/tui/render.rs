@@ -1293,8 +1293,16 @@ fn sidebar_entry_lines(
             SidebarShelf::Active {
                 workspace,
                 updated_at,
-            } => sidebar_active_row_lines(row, workspace, updated_at, width, now, focused, theme)
-                .to_vec(),
+                working_since,
+            } => sidebar_active_row_lines(
+                row,
+                workspace,
+                sidebar_active_slot(working_since, updated_at, now),
+                width,
+                focused,
+                theme,
+            )
+            .to_vec(),
             SidebarShelf::Settled { ended_at } => {
                 vec![sidebar_settled_row_line(
                     row, ended_at, width, now, focused, theme,
@@ -1387,16 +1395,15 @@ fn sidebar_plain_line(
     )
 }
 
-/// One active Session, as three lines: where the work lives and how long ago
-/// it moved, then what the work is, then a line saying nothing until
+/// One active Session, as three lines: where the work lives beside what its
+/// right slot reads, then what the work is, then a line saying nothing until
 /// the git awareness of <https://github.com/jake-tucker/suru/issues/169> gives
 /// it something to say.
 fn sidebar_active_row_lines(
     row: SidebarRow<'_>,
     workspace: Option<&Path>,
-    updated_at: SessionTimestamp,
+    slot: String,
     width: usize,
-    now: u64,
     focused: bool,
     theme: &Theme,
 ) -> [Line<'static>; sidebar::ACTIVE_ROW_LINES] {
@@ -1404,15 +1411,7 @@ fn sidebar_active_row_lines(
     let workspace = workspace.map(sidebar::workspace_name).unwrap_or_default();
     let label_style = selected.unwrap_or(theme.text.subdued);
     [
-        sidebar_slotted_line(
-            &workspace,
-            label_style,
-            updated_at,
-            width,
-            now,
-            selected,
-            theme,
-        ),
+        sidebar_slotted_line(&workspace, label_style, &slot, width, selected, theme),
         sidebar_plain_line(
             &sidebar_title(row),
             width,
@@ -1437,35 +1436,68 @@ fn sidebar_settled_row_line(
     sidebar_slotted_line(
         &sidebar_title(row),
         sidebar_title_style(row, selected, theme),
-        ended_at,
+        &relative_update_time_compact(ended_at, now),
         width,
-        now,
         selected,
         theme,
     )
 }
 
-/// A Sidebar line with a label down its left and a compact time in its right
-/// slot, the two held apart by the whole of what the column has left. Both
+/// What an active row's right slot reads. Working comes first, because live
+/// work is what a reader scanning the column is looking for; under it stands
+/// the compact time since the Session last moved, which is what a row says
+/// when there is nothing louder to say.
+///
+/// t3 resolves this slot through a fuller precedence — Working, Monitoring,
+/// Approval, Input, Failed, Woke, Done, then the time. The rest hang off state
+/// Suru does not track yet, so each label lands here when its backing state
+/// does: <https://github.com/jake-tucker/suru/issues/168>.
+fn sidebar_active_slot(
+    working_since: Option<SessionTimestamp>,
+    updated_at: SessionTimestamp,
+    now: u64,
+) -> String {
+    match working_since {
+        Some(since) => format!("Working {}", working_duration(since, now)),
+        None => relative_update_time_compact(updated_at, now),
+    }
+}
+
+/// How long work has been running, read the way t3 reads it: seconds until
+/// there is a minute to say, then minutes, then hours and the minutes past
+/// them. Unlike the compact time beside it this is a duration rather than an
+/// age, so it is granular enough to be seen moving.
+fn working_duration(since: SessionTimestamp, now: u64) -> String {
+    let seconds = now.saturating_sub(since.0) / 1_000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    format!("{}h {}m", minutes / 60, minutes % 60)
+}
+
+/// A Sidebar line with a label down its left and its slot's reading in the
+/// right, the two held apart by the whole of what the column has left. Both
 /// shelves lay their right slot out this way, so both lay it out here: an
-/// active row's Workspace beside its last activity, a settled row's Title
+/// active row's Workspace beside what its work is doing, a settled row's Title
 /// beside when its work ended.
 fn sidebar_slotted_line(
     label: &str,
     label_style: Style,
-    slot: SessionTimestamp,
+    slot: &str,
     width: usize,
-    now: u64,
     selected: Option<Style>,
     theme: &Theme,
 ) -> Line<'static> {
-    let elapsed = relative_update_time_compact(slot, now);
-    let label = truncate_to_width(label, width.saturating_sub(elapsed.width() + 1));
-    let gap = " ".repeat(width.saturating_sub(label.width() + elapsed.width()));
+    let label = truncate_to_width(label, width.saturating_sub(slot.width() + 1));
+    let gap = " ".repeat(width.saturating_sub(label.width() + slot.width()));
     Line::from(vec![
         Span::styled(label, label_style),
         Span::styled(gap, selected.unwrap_or_default()),
-        Span::styled(elapsed, selected.unwrap_or(theme.text.subdued)),
+        Span::styled(slot.to_owned(), selected.unwrap_or(theme.text.subdued)),
     ])
 }
 

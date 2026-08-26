@@ -194,6 +194,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         title: "Explain this workspace".to_owned(),
         emoji: Some("\u{1F5FA}\u{FE0F}".to_owned()),
         settled_at: Some(SessionTimestamp(1_755_497_600_999)),
+        working_since: Some(SessionTimestamp(1_755_497_600_100)),
         created_at: SessionTimestamp(1_755_497_600_000),
         updated_at: SessionTimestamp(1_755_497_600_321),
     };
@@ -202,6 +203,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         "title": "Explain this workspace",
         "emoji": "\u{1F5FA}\u{FE0F}",
         "settled_at": 1_755_497_600_999_u64,
+        "working_since": 1_755_497_600_100_u64,
         "workspace": { "path": "/work/suru" },
         "agent_selection": {
             "provider": "codex",
@@ -226,17 +228,20 @@ fn session_summary_round_trips_with_discovery_metadata() {
     // A Session whose Title was never derived carries no Emoji at all, which is
     // every Session that predates Title derivation. A Session nobody set aside
     // carries no settle moment either, which is every Session that predates the
-    // marker.
+    // marker. A Session with nothing running carries no working moment, which
+    // is every Session that is not working right now.
     let mut without_optionals = expected;
     let fields = without_optionals
         .as_object_mut()
         .expect("the encoded summary is an object");
     fields.remove("emoji");
     fields.remove("settled_at");
+    fields.remove("working_since");
     let decoded = serde_json::from_value::<SessionSummary>(without_optionals)
-        .expect("decode a Session summary carrying neither");
+        .expect("decode a Session summary carrying none of them");
     assert_eq!(decoded.emoji, None);
     assert_eq!(decoded.settled_at, None);
+    assert_eq!(decoded.working_since, None);
 }
 
 #[test]

@@ -327,7 +327,7 @@ fn load_session(
     row: SessionRow,
 ) -> Result<PersistedSession, StorageError> {
     let stored_session_id = row.id.clone();
-    let (summary, revision) = row.into_summary_and_revision()?;
+    let (mut summary, revision) = row.into_summary_and_revision()?;
     let prompt_rows = prompts::table
         .filter(prompts::session_id.eq(&stored_session_id))
         .order(prompts::row_order.asc())
@@ -415,6 +415,10 @@ fn load_session(
         activities,
         transcript: transcript.into_iter().map(|(_, item)| item).collect(),
     };
+    // Read back off the Turns rather than out of a column of its own: live
+    // work is the Turn's own state, and a stored copy of it could only ever
+    // disagree with the Turn it was copied from.
+    summary.working_since = snapshot.working_since();
     Ok(PersistedSession {
         summary,
         snapshot,

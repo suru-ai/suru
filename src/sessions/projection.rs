@@ -104,6 +104,9 @@ impl SessionRecord {
             .retain(|_, turn_id| !terminal_turns.contains(turn_id));
         self.snapshot = next;
         self.summary.session = self.snapshot.session.clone();
+        // Taken off the snapshot the commit just settled, so what a listing
+        // says about live work is the same reading the transcript would give.
+        self.summary.working_since = self.snapshot.working_since();
         Ok(update)
     }
 }

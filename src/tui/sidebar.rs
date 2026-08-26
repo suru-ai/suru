@@ -231,14 +231,13 @@ pub(super) enum SidebarShelf<'a> {
         /// component. A Session Suru could not read may not know its Workspace
         /// at all.
         workspace: Option<&'a Path>,
-        /// How long ago this Session was last active, drawn in the row's right
-        /// slot.
-        // The right slot holds only a time today. Working with a ticking
-        // duration arrives with
-        // <https://github.com/jake-tucker/suru/issues/182>, and the remaining
-        // status labels with
-        // <https://github.com/jake-tucker/suru/issues/168>.
+        /// How long ago this Session was last active, which is what the
+        /// row's right slot reads when nothing else claims it.
         updated_at: SessionTimestamp,
+        /// When the work this Session is running began, and `None` where it is
+        /// running none. It is what the right slot says first, because live
+        /// work is what a reader scanning the column is looking for.
+        working_since: Option<SessionTimestamp>,
     },
     /// Work set aside as done for now, drawn slim: settled Sessions are
     /// history the reader keeps in view, not work they are choosing between.
@@ -924,6 +923,30 @@ impl Sidebar {
         self.revealed
     }
 
+    /// Whether a row the Sidebar has on screen is running work, which is what
+    /// arms the tick its Working durations rise on. It asks the body rather
+    /// than the listing, so a query the reader has narrowed to narrows what
+    /// animates with it — and a Sidebar the reader closed, or one the frame
+    /// could not spare the columns for, shows no live work whatever its
+    /// listing holds.
+    ///
+    /// It answers from the listing in hand, which is as live as the listing
+    /// is. Nothing announces a Turn starting or settling in a Session this
+    /// client does not have open, so a row that was working when the listing
+    /// landed goes on saying so — and goes on arming the tick — until the
+    /// next listing. That is a wakeup an idle TUI should not be paying, which
+    /// ADR 0007 and ADR 0009 are the reason to care about:
+    /// <https://github.com/jake-tucker/suru/issues/184> carries Turn liveness
+    /// to the Sidebar and closes it.
+    pub(super) fn shows_live_work(&self) -> bool {
+        self.revealed
+            && self.on_screen.get()
+            && self.body().into_iter().any(|entry| match entry {
+                BodyEntry::Session(session, _) => session.working_since().is_some(),
+                BodyEntry::Scope(_) | BodyEntry::Divider | BodyEntry::ShowMore(_) => false,
+            })
+    }
+
     /// The listing the Sidebar is waiting on, handed over exactly once so the
     /// caller that can dispatch it does so and no later caller repeats it.
     pub(super) fn take_listing_request(&mut self) -> Option<SessionListRequest> {
@@ -1189,6 +1212,7 @@ impl Sidebar {
                             .workspace()
                             .map(|workspace| workspace.path.as_path()),
                         updated_at: session.updated_at(),
+                        working_since: session.working_since(),
                     },
                 ),
                 BodyEntry::Session(session, Standing::Settled) => self.row(
@@ -2110,6 +2134,47 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn live_work_ticks_only_while_the_sidebar_is_showing_it() {
+        assert!(
+            !showing(vec![summary("Idle", 1, 10)]).shows_live_work(),
+            "a listing with nothing running animates nothing"
+        );
+
+        let mut sidebar = showing(vec![working("Working", 1, 10)]);
+
+        assert!(sidebar.shows_live_work());
+
+        sidebar.insert("nothing matches this");
+
+        assert!(
+            !sidebar.shows_live_work(),
+            "a query the live row falls outside of takes it off screen with the rest"
+        );
+
+        sidebar.leave();
+
+        assert!(
+            sidebar.shows_live_work(),
+            "and giving the query up puts it back"
+        );
+
+        sidebar.forget_frame();
+
+        assert!(
+            !sidebar.shows_live_work(),
+            "a Sidebar the frame found no columns for animates nothing"
+        );
+
+        sidebar.record_drawn();
+        sidebar.toggle();
+
+        assert!(
+            !sidebar.shows_live_work(),
+            "and neither does one the reader closed"
+        );
+    }
+
     /// A Sidebar open on the Sessions given, with nothing settling itself, so
     /// the shelf holds what the listing marked settled and no more.
     fn showing(sessions: Vec<SessionListItem>) -> Sidebar {
@@ -2185,6 +2250,17 @@ mod tests {
         SessionListItem::Readable(listed)
     }
 
+    /// A listed Session whose latest Turn began and has not Settled, which is
+    /// what a listing reports of a Session running work now.
+    fn working(title: &str, created_at: u64, updated_at: u64) -> SessionListItem {
+        let SessionListItem::Readable(mut listed) = summary(title, created_at, updated_at) else {
+            unreachable!("the fixture builds a readable Session");
+        };
+        listed.session.status = SessionStatus::Active;
+        listed.working_since = Some(SessionTimestamp(updated_at));
+        SessionListItem::Readable(listed)
+    }
+
     fn summary(title: &str, created_at: u64, updated_at: u64) -> SessionListItem {
         SessionListItem::Readable(SessionSummary {
             session: Session {
@@ -2199,6 +2275,7 @@ mod tests {
             title: title.to_owned(),
             emoji: None,
             settled_at: None,
+            working_since: None,
             created_at: SessionTimestamp(created_at),
             updated_at: SessionTimestamp(updated_at),
         })

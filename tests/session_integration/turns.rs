@@ -14,8 +14,9 @@ use suru::{
         Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection,
         CreateSessionRequest, FileChange, InitialPrompt, MessageRole, MessageStatus, ModelId,
         PromptDelivery, PromptId, PromptStatus, ProviderId, SessionChange, SessionError,
-        SessionErrorCode, SessionRevision, SessionSnapshot, SessionStatus, SkillId,
-        SkillInvocation, SkillMarkerSpan, TranscriptItem, TurnStatus, Workspace,
+        SessionErrorCode, SessionId, SessionListItem, SessionRevision, SessionSnapshot,
+        SessionStatus, SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan, TranscriptItem,
+        TurnStatus, Workspace,
     },
     provider::{
         ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderFileChangeStatus,
@@ -1850,4 +1851,116 @@ async fn turn_timing_spans_the_delivery_commit_and_every_settle_path() {
     drop(feed);
     drop(client);
     server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_listed_summary_says_when_its_running_turn_began_and_stops_once_it_settles() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "working-since-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "working-since-test").expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_managed_client_initial_state(&mut client).await;
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Work on this".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let mut feed = client
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe to Session");
+    assert_eq!(
+        timeout(Duration::from_secs(1), feed.next())
+            .await
+            .expect("initial snapshot arrives")
+            .expect("Session stream remains open")
+            .expect("initial snapshot is valid"),
+        SessionEvent::Snapshot(created.clone())
+    );
+
+    let mut provider_session = provider.next_start().await.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-working", "high", "fast"),
+    });
+    next_session_update(&mut feed).await;
+    let delivery = next_session_update(&mut feed).await;
+    let started_at = delivery
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            SessionChange::TurnAdded { turn } => turn.started_at,
+            _ => None,
+        })
+        .expect("Prompt delivery creates a Turn that knows when it started");
+
+    let running = listed_summary(&mut client, created.session.id).await;
+    assert_eq!(
+        running.session.status,
+        SessionStatus::Active,
+        "a Session with a running Turn lists as active"
+    );
+    assert_eq!(
+        running.working_since,
+        Some(started_at),
+        "a listing says live work has been running since its Turn began, \
+         which is what a client draws a Working duration from"
+    );
+
+    provider_session.next_turn().await.succeed();
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    next_session_update(&mut feed).await;
+
+    let done = listed_summary(&mut client, created.session.id).await;
+    assert_eq!(done.session.status, SessionStatus::Idle);
+    assert_eq!(
+        done.working_since, None,
+        "a settled Turn leaves nothing running to say how long about"
+    );
+    assert!(
+        done.updated_at > running.updated_at,
+        "the Turn moved the Session while it ran, which is why last activity \
+         cannot stand in for when the work began"
+    );
+
+    drop(provider_session);
+    drop(feed);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// The one Session in a listing, which is where a client reads a summary from.
+async fn listed_summary(client: &mut ManagedClient, session_id: SessionId) -> SessionSummary {
+    match client
+        .list_sessions(None)
+        .await
+        .expect("list Sessions")
+        .into_iter()
+        .find(|item| item.id() == session_id)
+        .expect("the Session remains listed")
+    {
+        SessionListItem::Readable(summary) => summary,
+        SessionListItem::Unreadable(summary) => {
+            panic!("expected readable Session {}, got unreadable", summary.id)
+        }
+    }
 }

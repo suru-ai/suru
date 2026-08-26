@@ -151,6 +151,103 @@ fn the_compact_time_reads_now_minutes_hours_and_days() {
 }
 
 #[test]
+fn the_right_slot_says_working_and_how_long_while_the_latest_turn_is_unsettled() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![working(
+            listed(
+                "Running a build",
+                None,
+                &workspace.path().join("suru"),
+                1,
+                now(),
+            ),
+            seconds_ago(90),
+        )],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let row = rendered_row(&rows, "Running a build");
+    let slot = sidebar_column(&rows[row - 1]);
+    assert!(
+        slot.ends_with("Working 1m"),
+        "the right slot says the work is live and how long it has been: {slot:?}"
+    );
+}
+
+#[test]
+fn the_right_slot_falls_back_to_the_compact_time_once_the_turn_settles() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    // The same Session on both readings: one with its latest Turn still
+    // running, one with nothing running and five minutes since it last moved.
+    let running = listed(
+        "Running a build",
+        None,
+        &workspace.path().join("suru"),
+        1,
+        minutes_ago(5),
+    );
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![working(running.clone(), seconds_ago(90))],
+    );
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let row = rendered_row(&rows, "Running a build");
+    assert!(sidebar_column(&rows[row - 1]).ends_with("Working 1m"));
+
+    let application = sidebar_showing(workspace.path(), vec![running]);
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let row = rendered_row(&rows, "Running a build");
+    let slot = sidebar_column(&rows[row - 1]);
+    assert!(
+        slot.ends_with("5m") && !slot.contains("Working"),
+        "a Session with nothing running reads the compact time again: {slot:?}"
+    );
+}
+
+#[test]
+fn the_working_duration_reads_seconds_minutes_and_hours() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![
+            working(
+                listed("Seconds", None, &workspace.path().join("a"), 4, now()),
+                seconds_ago(12),
+            ),
+            working(
+                listed("Minutes", None, &workspace.path().join("b"), 3, now()),
+                minutes_ago(5),
+            ),
+            working(
+                listed("Hours", None, &workspace.path().join("c"), 2, now()),
+                seconds_ago(2 * 60 * 60 + 3 * 60),
+            ),
+            working(
+                listed("Barely", None, &workspace.path().join("d"), 1, now()),
+                seconds_ago(0),
+            ),
+        ],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    for (title, duration) in [
+        ("Seconds", "Working 12s"),
+        ("Minutes", "Working 5m"),
+        ("Hours", "Working 2h 3m"),
+        ("Barely", "Working 0s"),
+    ] {
+        let row = rendered_row(&rows, title);
+        assert!(
+            sidebar_column(&rows[row - 1]).ends_with(duration),
+            "{title:?} reads as {duration:?}: {:?}",
+            sidebar_column(&rows[row - 1])
+        );
+    }
+}
+
+#[test]
 fn the_list_is_ordered_by_creation_and_activity_never_reorders_it() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     // The order of the active list is the question, so nothing settles itself
@@ -516,6 +613,7 @@ fn listed(
         title: title.to_owned(),
         emoji: emoji.map(str::to_owned),
         settled_at: None,
+        working_since: None,
         created_at: SessionTimestamp(created_at),
         updated_at: SessionTimestamp(updated_at),
     })
@@ -528,6 +626,10 @@ fn now() -> u64 {
         .as_millis()
         .try_into()
         .expect("the clock fits a Session timestamp")
+}
+
+fn seconds_ago(seconds: u64) -> u64 {
+    now().saturating_sub(seconds * 1_000)
 }
 
 fn minutes_ago(minutes: u64) -> u64 {
@@ -552,7 +654,19 @@ fn the_sidebar_survives_every_terminal_the_frame_will_draw() {
                 "A Title long enough to run past the Sidebar's own columns",
                 Some("🧪"),
                 &workspace.path().join("suru"),
-                2,
+                3,
+                days_ago(400),
+            ),
+            // Working plus a duration is the widest reading the right slot
+            // takes, so it is what the narrowest drawn column is tried with.
+            working(
+                listed(
+                    "A working Title long enough to run past them as well",
+                    Some("🧪"),
+                    &workspace.path().join("a-workspace-named-at-length"),
+                    2,
+                    now(),
+                ),
                 days_ago(400),
             ),
             settled(
@@ -1742,6 +1856,17 @@ fn settled(
         listed(title, emoji, workspace, created_at, updated_at),
         settled_at,
     )
+}
+
+/// A listed Session whose latest Turn began at `working_since` and has not
+/// Settled, which is what a listing reports of a Session running work now.
+fn working(session: SessionListItem, working_since: u64) -> SessionListItem {
+    let SessionListItem::Readable(mut summary) = session else {
+        unreachable!("the fixture builds a readable Session");
+    };
+    summary.session.status = SessionStatus::Active;
+    summary.working_since = Some(SessionTimestamp(working_since));
+    SessionListItem::Readable(summary)
 }
 
 /// A listed Session as a listing that carries its settled marker reports it.

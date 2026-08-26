@@ -1152,6 +1152,7 @@ fn session_summary(
         title: title.to_owned(),
         emoji: None,
         settled_at: None,
+        working_since: None,
         created_at: SessionTimestamp(1),
         updated_at: SessionTimestamp(updated_at),
     })

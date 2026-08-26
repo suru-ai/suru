@@ -985,6 +985,101 @@ async fn turn_timing_survives_a_restart_and_a_session_stored_before_it_stays_rea
         .expect("stop replacement server");
 }
 
+#[tokio::test]
+async fn a_restored_summary_reads_live_work_back_off_the_turn_that_is_running() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "working-since-storage-test")
+        .expect("configure original server")
+        .with_data_dir(data_dir.path());
+    let (original_runtime, mut original_provider) = ControlledProvider::new();
+    let original = server::spawn_with_provider(config.clone(), original_runtime)
+        .await
+        .expect("spawn original server");
+    let descriptor = original.descriptor().clone();
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Leave this Turn running".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+
+    let mut provider_session = timeout(Duration::from_secs(1), original_provider.next_start())
+        .await
+        .expect("Provider startup begins")
+        .succeed(AgentIdentity {
+            agent: AgentId::new("controlled-agent"),
+            selection: controlled_selection("gpt-working", "high", "fast"),
+        });
+    timeout(Duration::from_secs(1), provider_session.next_turn())
+        .await
+        .expect("initial Turn reaches Provider")
+        .succeed();
+    let running = read_session_at_least_revision(
+        &client,
+        &descriptor,
+        created.session.id,
+        SessionRevision(3),
+    )
+    .await;
+    let started_at = running.turns[0]
+        .started_at
+        .expect("the delivery commit stamps when the Turn started");
+    assert_eq!(running.turns[0].status, TurnStatus::Active);
+    drop(provider_session);
+    original.shutdown().await.expect("stop original server");
+
+    // The Turn was still running when the server went down, so it is stored
+    // running: what a restored summary says about live work has to come back
+    // off that Turn, because no column of its own ever held it.
+    let (restart_runtime, _restart_provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(config, restart_runtime)
+        .await
+        .expect("spawn restarted server");
+    let summaries = readable_session_summaries(
+        reqwest::Client::new()
+            .get(format!("{}/v1/sessions", restarted.descriptor().base_url))
+            .bearer_auth(&restarted.descriptor().token)
+            .send()
+            .await
+            .expect("list restored Sessions")
+            .error_for_status()
+            .expect("Session listing succeeds")
+            .json::<Vec<SessionListItem>>()
+            .await
+            .expect("decode the restored listing"),
+    );
+    let restored = summaries
+        .into_iter()
+        .find(|summary| summary.session.id == created.session.id)
+        .expect("the Session is listed after the restart");
+    assert_eq!(restored.session.status, SessionStatus::Active);
+    assert_eq!(
+        restored.working_since,
+        Some(started_at),
+        "a restored listing says live work has been running since its Turn began"
+    );
+    restarted.shutdown().await.expect("stop restarted server");
+}
+
 async fn read_persisted_session(
     descriptor: &suru::protocol::RuntimeDescriptor,
     session_id: SessionId,

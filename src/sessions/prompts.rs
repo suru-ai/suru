@@ -202,6 +202,9 @@ impl SessionStore {
             // And it begins active: a Session created by a Prompt is work
             // beginning, which is the opposite of work set aside.
             settled_at: None,
+            // And with nothing working: the Prompt that made it has not been
+            // admitted yet, so there is no Turn to be running.
+            working_since: None,
             created_at: timestamp,
             updated_at: timestamp,
         };

@@ -2854,6 +2854,9 @@ impl Application {
         // A Provider's Availability being read is live work like any other, and
         // the row showing it animates only while the tick is armed.
         self.state.settings_panel.is_reading(&self.state.settings)
+            // So is another Session's Turn, drawn in a Sidebar row whose
+            // Working duration has to be seen rising.
+            || self.state.sidebar.shows_live_work()
             || self.state.session.as_ref().is_some_and(|session| {
                 let snapshot = session.snapshot();
                 snapshot.session.status == SessionStatus::Active

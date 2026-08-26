@@ -317,6 +317,9 @@ impl SessionRow {
                 .map(|settled_at| i64_to_u64(&session_id, "settled_at", settled_at))
                 .transpose()?
                 .map(SessionTimestamp),
+            // Live work is the latest Turn's own state, so the row holds no
+            // column for it and the caller reads it off the Turns it loads.
+            working_since: None,
             created_at: SessionTimestamp(i64_to_u64(&session_id, "created_at", self.created_at)?),
             updated_at: SessionTimestamp(i64_to_u64(&session_id, "updated_at", self.updated_at)?),
         };

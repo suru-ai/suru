@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
@@ -1215,6 +1215,17 @@ pub struct SessionSummary {
     /// much as the fact of it.
     #[serde(default)]
     pub settled_at: Option<SessionTimestamp>,
+    /// When this Session's latest Turn began, while that Turn has not Settled,
+    /// and `None` where nothing is working. It is what a client listing
+    /// Sessions says live work has been running for — `updated_at` cannot,
+    /// because a Turn moves it with every commit it streams.
+    ///
+    /// Derived from the Turn rather than stored beside it, so a listing can
+    /// never disagree with the Session's own transcript. A Turn stored before
+    /// Suru recorded Turn timing leaves it absent, so a client states how long
+    /// work has been running only when it knows.
+    #[serde(default)]
+    pub working_since: Option<SessionTimestamp>,
     pub created_at: SessionTimestamp,
     pub updated_at: SessionTimestamp,
 }
@@ -1277,6 +1288,16 @@ impl SessionListItem {
     pub const fn settled_at(&self) -> Option<SessionTimestamp> {
         match self {
             Self::Readable(summary) => summary.settled_at,
+            Self::Unreadable(_) => None,
+        }
+    }
+
+    /// When this Session's latest Turn began, while that Turn has not Settled,
+    /// and `None` where nothing is working. A Session Suru could not read is
+    /// never working, because a Turn it cannot read is one it cannot run.
+    pub const fn working_since(&self) -> Option<SessionTimestamp> {
+        match self {
+            Self::Readable(summary) => summary.working_since,
             Self::Unreadable(_) => None,
         }
     }
@@ -1406,6 +1427,20 @@ pub struct SessionSnapshot {
     pub messages: Vec<Message>,
     pub activities: Vec<Activity>,
     pub transcript: Vec<TranscriptItem>,
+}
+
+impl SessionSnapshot {
+    /// When the latest Turn began, while it has not Settled, and `None` where
+    /// there is no Turn or the latest one is done. This is the one reading
+    /// [`SessionSummary::working_since`] carries, taken here so a listing and
+    /// a transcript can never tell a reader different things about the same
+    /// work.
+    pub fn working_since(&self) -> Option<SessionTimestamp> {
+        self.turns
+            .last()
+            .filter(|turn| !turn.status.is_terminal())
+            .and_then(|turn| turn.started_at)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
