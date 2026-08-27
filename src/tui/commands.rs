@@ -44,6 +44,8 @@ pub enum SemanticCommandId {
     SettingsNumericDeleteBackward,
     SettingsNumericApply,
     SettingsNumericCancel,
+    SubagentOpen,
+    SubagentLeave,
     TranscriptFoldsToggle,
     TranscriptGroupsToggle,
     TranscriptTurnToggle,
@@ -203,6 +205,8 @@ impl SemanticCommandId {
             Self::SettingsNumericDeleteBackward => "settings.numeric.delete-backward",
             Self::SettingsNumericApply => "settings.numeric.apply",
             Self::SettingsNumericCancel => "settings.numeric.cancel",
+            Self::SubagentOpen => "subagent.open",
+            Self::SubagentLeave => "subagent.leave",
             Self::TranscriptFoldsToggle => "transcript.folds.toggle",
             Self::TranscriptGroupsToggle => "transcript.groups.toggle",
             Self::TranscriptTurnToggle => "transcript.turn.fold.toggle",
@@ -615,6 +619,26 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::SettingsClose,
         title: "Close Settings",
         description: "Leave the settings panel",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SubagentOpen,
+        title: "Open Subagent",
+        description: "Open a Subagent's Session from the row that names it",
+        // The command names the child Session it opens, so it is invoked from
+        // the Subagent's row — its Transcript row today, a Picker entry later
+        // — rather than from a key or a slash that would have no way to say
+        // which Subagent it meant.
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SubagentLeave,
+        title: "Leave Subagent",
+        description: "Return from a Subagent's Session to its parent",
+        // Bound to Escape only while a Subagent's Session is open, so the
+        // binding lives in that view's own key table rather than here.
         slash: None,
         keybinding: None,
     },

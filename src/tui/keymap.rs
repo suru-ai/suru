@@ -52,6 +52,49 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
     }
 }
 
+/// A Subagent's Session is read rather than conversed with, so its view keeps
+/// only the reading keys: the pointer and the scroll gestures work as they do
+/// anywhere, Escape returns to the parent Session, and the composer's keys —
+/// text entry, history, submission, the interrupt Escape would otherwise mean
+/// — reach nothing, which is what keeps Prompt delivery out of the view.
+/// Ctrl+B keeps the Sidebar, so the reader can leave for any Session, and
+/// Ctrl+C still exits.
+pub(super) fn command_for_subagent_view_event(event: InputEvent) -> Option<CommandId> {
+    match event {
+        InputEvent::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => Some(CommandId::ScrollTranscriptLinesUp),
+            MouseEventKind::ScrollDown => Some(CommandId::ScrollTranscriptLinesDown),
+            // A press, not a release, for the same reason the composer's view
+            // answers presses: the click the reader just made, not a drag.
+            MouseEventKind::Down(MouseButton::Left) => Some(CommandId::PressAt {
+                position: Position::new(mouse.column, mouse.row),
+            }),
+            MouseEventKind::Down(MouseButton::Right) => Some(CommandId::OpenContextMenuAt {
+                position: Position::new(mouse.column, mouse.row),
+            }),
+            _ => None,
+        },
+        InputEvent::Key(key) if key.kind == KeyEventKind::Press => {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, KeyModifiers::NONE) => {
+                    Some(CommandId::InvokeSemantic(SemanticCommandId::SubagentLeave))
+                }
+                (KeyCode::PageUp, KeyModifiers::NONE) => Some(CommandId::ScrollTranscriptPageUp),
+                (KeyCode::PageDown, KeyModifiers::NONE) => {
+                    Some(CommandId::ScrollTranscriptPageDown)
+                }
+                (KeyCode::End, KeyModifiers::NONE) => Some(CommandId::FollowLatest),
+                (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                    Some(CommandId::InvokeSemantic(SemanticCommandId::SidebarToggle))
+                }
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(CommandId::ClearOrExit),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn command_for_completion_event(event: InputEvent) -> Option<CommandId> {
     let InputEvent::Key(key) = event else {
         return None;

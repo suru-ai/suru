@@ -140,6 +140,9 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
         && !state.sidebar.menu_is_open()
         && state.composer_focused()
         && matches!(state.command_mode, CommandMode::Composer)
+        // A Subagent's Session draws no composer, so there is nowhere for a
+        // caret to invite typing.
+        && state.open_subagent_parent().is_none()
     {
         frame.set_cursor_position(composer.cursor);
     }
@@ -1788,18 +1791,30 @@ fn render_session(
     let header_detail = ResponsiveDetail::for_width(normally_padded.width);
     let show_header = area.height >= SESSION_HEADER_MINIMUM_HEIGHT;
     let session_id = snapshot.session.id;
+    // A Subagent's Session is read rather than conversed with: the composer
+    // stands down for a one-line way back, and Escape means leaving rather
+    // than interrupting.
+    let subagent_view = snapshot.session.parent.is_some();
     let key = ComposerKey::Session(session_id);
     let composer_text = state.composers.text(key);
     let composer_cursor = state.composers.cursor(key);
     let skill_markers = state.composers.skill_markers(key);
-    let desired_composer_height =
-        composer_block_height(area.height, content_width, composer_text, composer_cursor);
+    let desired_composer_height = if subagent_view {
+        1
+    } else {
+        composer_block_height(area.height, content_width, composer_text, composer_cursor)
+    };
     let composer_top = slots.session_composer_top(&SessionComposerTopSlotContext {
         session_id,
         width: content_width,
     });
     let status = match snapshot.session.status {
         SessionStatus::Idle => "idle".to_owned(),
+        // Escape leaves a Subagent's Session instead of interrupting it, so
+        // its status offers no interrupt gesture to mislead with.
+        SessionStatus::Active if subagent_view => {
+            format!("{} active", spinner::frame(state.spinner_frame))
+        }
         SessionStatus::Active => {
             let interrupt = binding_label(&CommandId::RequestInterrupt);
             let glyph = spinner::frame(state.spinner_frame);
@@ -2053,18 +2068,29 @@ fn render_session(
         );
     }
     render_slot(frame, composer_top_area, composer_top, theme);
-    let cursor = render_composer(
-        frame,
-        composer_area,
-        ComposerContent {
-            text: composer_text,
-            cursor: composer_cursor,
-            skill_markers: &skill_markers,
-        },
-        state.composer_border_style(theme),
-        content_detail,
-        theme,
-    );
+    let cursor = if subagent_view {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "Subagent Session · Esc returns to the parent",
+                theme.text.subdued,
+            )),
+            composer_area,
+        );
+        Position::new(composer_area.x, composer_area.y)
+    } else {
+        render_composer(
+            frame,
+            composer_area,
+            ComposerContent {
+                text: composer_text,
+                cursor: composer_cursor,
+                skill_markers: &skill_markers,
+            },
+            state.composer_border_style(theme),
+            content_detail,
+            theme,
+        )
+    };
     render_slot(frame, footer_area, footer, theme);
     RenderedComposer {
         area: composer_area,

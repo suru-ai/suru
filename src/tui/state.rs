@@ -34,7 +34,8 @@ use super::{
         command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
         command_for_numeric_editor_event, command_for_queued_prompt_event,
         command_for_session_picker_event, command_for_settings_panel_event,
-        command_for_sidebar_event, command_for_sidebar_menu_event, command_for_terminal_event,
+        command_for_sidebar_event, command_for_sidebar_menu_event, command_for_subagent_view_event,
+        command_for_terminal_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
@@ -761,6 +762,16 @@ impl TuiState {
             })
     }
 
+    /// The parent of the open Session, present exactly while the reader is in
+    /// a Subagent's Session. Every property of viewing one keys off this one
+    /// reading: Escape returning to the parent, the composer standing down,
+    /// and the input mode that keeps Prompt delivery out of reach.
+    pub(super) fn open_subagent_parent(&self) -> Option<SessionId> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.snapshot().session.parent)
+    }
+
     pub(super) fn agent_selection(&self) -> Option<&AgentSelection> {
         let Some(session) = self.session.as_ref() else {
             return self.landing_agent_selection.as_ref();
@@ -968,6 +979,11 @@ impl TuiState {
             }
             UnitKey::TurnFold(turn_id) => {
                 return Some(SemanticCommandId::TranscriptTurnToggle.on_turn(turn_id));
+            }
+            // The whole row is the way into the child Session it names, so any
+            // press on it resolves to the open command rather than to a Fold.
+            UnitKey::Subagent(session_id) => {
+                return Some(SemanticCommandId::SubagentOpen.on_session(session_id));
             }
             UnitKey::Message(_) | UnitKey::Provisional(_) => {}
         }
@@ -2124,6 +2140,11 @@ impl Application {
     }
 
     fn submit_prompt(&mut self, delivery: PromptDelivery) -> ApplicationTransition {
+        // A Subagent's Session refuses Prompts, and its view offers no way to
+        // write one; this guard keeps that true whatever surface asks.
+        if self.state.open_subagent_parent().is_some() {
+            return ApplicationTransition::Continue;
+        }
         if self.state.pending_submission.is_some() {
             return ApplicationTransition::Continue;
         }
@@ -2432,6 +2453,23 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::Continue)
             }
+            // The child Session is the command's subject, so an invocation
+            // that names none has nothing to open and leaves the view put.
+            SemanticCommandId::SubagentOpen => Ok(match invocation.subject {
+                SemanticSubject::Session(session_id) => {
+                    ApplicationTransition::AttachSession(session_id)
+                }
+                SemanticSubject::View | SemanticSubject::Turn(_) => ApplicationTransition::Continue,
+            }),
+            // Leaving acts on the Session the reader is in: only a Subagent's
+            // Session has a parent to return to, so anywhere else the command
+            // has nowhere to go and leaves the view put.
+            SemanticCommandId::SubagentLeave => Ok(self
+                .state
+                .open_subagent_parent()
+                .map_or(ApplicationTransition::Continue, |parent| {
+                    ApplicationTransition::AttachSession(parent)
+                })),
             // The Turn is the command's subject, so an invocation that names
             // none has no Turn to flip and leaves the view where it is.
             SemanticCommandId::TranscriptTurnToggle => {
@@ -2898,6 +2936,13 @@ impl Application {
             && let Some(command) = command_for_completion_event(event.clone())
         {
             return Some(command);
+        }
+        // A Subagent's Session is read, never prompted, so its view keeps its
+        // own key table: Escape leaves for the parent instead of arming an
+        // interrupt, the reading keys stay, and the composer's keys — text,
+        // history, submission — reach nothing.
+        if self.state.open_subagent_parent().is_some() {
+            return command_for_subagent_view_event(event);
         }
         match self.state.command_mode {
             CommandMode::Composer => command_for_terminal_event(event),

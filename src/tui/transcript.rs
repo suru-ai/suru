@@ -682,12 +682,20 @@ impl RenderUnit<'_> {
     fn key(&self) -> UnitKey {
         match self {
             Self::Message(message) => UnitKey::Message(message.id),
-            Self::Activity(activity) => UnitKey::Activity(activity.id()),
+            Self::Activity(activity) | Self::GroupMember(activity) => {
+                Self::activity_unit_key(activity)
+            }
             Self::Group { members, .. } => UnitKey::Group(members[0].id()),
-            Self::GroupMember(activity) => UnitKey::Activity(activity.id()),
             Self::TurnMember(unit) => unit.key(),
             Self::TurnFold(marker) => UnitKey::TurnFold(marker.turn_id),
             Self::Provisional(prompt) => UnitKey::Provisional(prompt.id),
+        }
+    }
+
+    fn activity_unit_key(activity: &Activity) -> UnitKey {
+        match activity {
+            Activity::Subagent { session_id, .. } => UnitKey::Subagent(*session_id),
+            _ => UnitKey::Activity(activity.id()),
         }
     }
 
@@ -1530,6 +1538,10 @@ fn in_turn_gutter(unit: RenderUnit<'_>, disclosed: bool) -> RenderUnit<'_> {
 pub(super) enum UnitKey {
     Message(MessageId),
     Activity(ActivityId),
+    /// A Subagent's row, keyed by the child Session it stands for: a press on
+    /// it opens that Session rather than toggling a Fold, so the key carries
+    /// what the invocation needs.
+    Subagent(SessionId),
     /// A Group, identified by its first member: the anchor a run keeps as it
     /// absorbs the next Activity to join it, where a key over the member set
     /// would read the grown Group as a new unit and re-render it every time.
@@ -2071,17 +2083,14 @@ fn render_activity(
             description,
             duration_ms,
             ..
-        } => {
-            push_subagent_activity(
-                projection.lines,
-                *status,
-                name,
-                description,
-                *duration_ms,
-                theme,
-            );
-            None
-        }
+        } => Some(push_subagent_activity(
+            projection.lines,
+            *status,
+            name,
+            description,
+            *duration_ms,
+            theme,
+        )),
     }
 }
 
@@ -2762,7 +2771,7 @@ fn push_subagent_activity(
     description: &str,
     duration_ms: Option<u64>,
     theme: &Theme,
-) {
+) -> UnitAnchor {
     use crate::protocol::ActivityStatus;
 
     let (marker, style) = match status {
@@ -2779,7 +2788,11 @@ fn push_subagent_activity(
         header.push_str(" · ");
         header.push_str(&humanized_duration(duration_ms));
     }
+    let start = lines.len();
     push_prefixed_lines(lines, &format!("  {marker}"), &header, style);
+    // The row hides nothing — it is the way into the child Session, so the
+    // anchor exists to make its whole extent a press target.
+    UnitAnchor::binary(lines.len() - start, false)
 }
 
 /// Re-styles a rendered Markdown line as subdued prose in the Activity gutter.

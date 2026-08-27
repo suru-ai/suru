@@ -18,5 +18,6 @@ mod session_picker;
 mod settings_panel;
 mod shell;
 mod sidebar;
+mod subagent_view;
 mod support;
 mod transcript;
