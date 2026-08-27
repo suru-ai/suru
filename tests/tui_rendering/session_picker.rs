@@ -2,8 +2,9 @@
 
 use crate::support::{
     connected_application, enter_active_session, failed_session_snapshot,
-    navigable_session_snapshot, rendered_application_buffer, rendered_application_rows,
-    rendered_application_rows_at, rendered_row, text_position, type_terminal_text,
+    navigable_session_snapshot, noncanonical_spelling, rendered_application_buffer,
+    rendered_application_rows, rendered_application_rows_at, rendered_row, text_position,
+    type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
@@ -21,7 +22,7 @@ use suru::{
 
 #[test]
 fn sessions_command_opens_a_loading_picker_for_the_current_workspace() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     type_terminal_text(&mut application, "/sessions");
 
@@ -45,9 +46,30 @@ fn sessions_command_opens_a_loading_picker_for_the_current_workspace() {
     assert!(picker.contains("Loading"));
 }
 
+/// The server canonicalizes the Workspace it narrows a listing by, so a
+/// client asking for "where I am" has to ask in the same reading — a launch
+/// spelling that differs from the canonical one would name a Workspace none
+/// of its own Sessions match.
+#[test]
+fn the_current_workspace_scope_asks_in_the_servers_reading_of_the_launch_directory() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(noncanonical_spelling(&workspace));
+    type_terminal_text(&mut application, "/sessions");
+
+    expect_session_list_request(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("select /sessions"),
+        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+    );
+}
+
 #[test]
 fn session_picker_orders_marks_focuses_and_wraps_live_sessions() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (current_id, _, _) = enter_active_session(&mut application, workspace.path());
     let newest_id = SessionId::new();
@@ -132,7 +154,7 @@ fn session_picker_orders_marks_focuses_and_wraps_live_sessions() {
 
 #[test]
 fn session_picker_requires_confirmation_and_removes_authoritatively_deleted_session() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     let selected_id = SessionId::new();
     let remaining_id = SessionId::new();
@@ -193,7 +215,7 @@ fn session_picker_requires_confirmation_and_removes_authoritatively_deleted_sess
 
 #[test]
 fn reconnect_catalog_removes_a_missed_current_session_deletion() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     let (current_id, _, _) = enter_active_session(&mut application, workspace.path());
     let remaining_id = SessionId::new();
@@ -245,7 +267,7 @@ fn reconnect_catalog_removes_a_missed_current_session_deletion() {
 
 #[test]
 fn session_attachment_failure_preserves_the_original_until_target_hydration() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (original_id, original_snapshot, _) =
         enter_active_session(&mut application, workspace.path());
@@ -390,7 +412,7 @@ fn session_attachment_failure_preserves_the_original_until_target_hydration() {
 
 #[test]
 fn session_picker_searches_titles_and_remembers_all_workspace_scope() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -515,7 +537,7 @@ fn session_picker_searches_titles_and_remembers_all_workspace_scope() {
 
 #[test]
 fn session_picker_switching_restores_each_transcript_viewport() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let first_id = SessionId::new();
     let first_snapshot = navigable_session_snapshot(first_id, workspace.path(), 8);
     let second_id = SessionId::new();
@@ -615,7 +637,7 @@ fn session_picker_switching_restores_each_transcript_viewport() {
 
 #[test]
 fn session_picker_stays_searchable_at_supported_small_terminal_sizes() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let request = expect_session_list_request(
         application
@@ -668,7 +690,7 @@ fn session_picker_stays_searchable_at_supported_small_terminal_sizes() {
 
 #[test]
 fn session_picker_scroll_window_keeps_the_current_session_visible() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let current_id = SessionId::new();
     application
@@ -725,7 +747,7 @@ fn session_picker_scroll_window_keeps_the_current_session_visible() {
 
 #[test]
 fn unreadable_session_picker_rows_remain_navigable_without_attachment() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let mut sessions = vec![session_summary(
         SessionId::new(),
@@ -775,7 +797,7 @@ fn unreadable_session_picker_rows_remain_navigable_without_attachment() {
 
 #[test]
 fn session_picker_reserves_required_metadata_before_truncating_long_titles() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let current_id = SessionId::new();
     let mut application = Application::new(workspace.path());
     let mut snapshot = failed_session_snapshot(
@@ -851,7 +873,7 @@ fn session_picker_reserves_required_metadata_before_truncating_long_titles() {
 
 #[test]
 fn session_picker_consumes_input_before_hidden_composer_actions() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (session_id, _, _) = enter_active_session(&mut application, workspace.path());
     application
@@ -894,7 +916,7 @@ fn session_picker_consumes_input_before_hidden_composer_actions() {
 
 #[test]
 fn session_picker_draws_an_emoji_beside_its_title_and_leaves_a_session_without_one_where_it_was() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let derived_id = SessionId::new();
     let underived_id = SessionId::new();
     let mut mixed = Application::new(workspace.path());
@@ -975,7 +997,7 @@ const SESSION_ROW_MARKER_WIDTH: u16 = 2;
 
 #[test]
 fn session_picker_search_matches_the_words_of_a_title_and_never_the_emoji_beside_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     open_session_picker_with(
         &mut application,
@@ -1021,7 +1043,7 @@ fn session_picker_search_matches_the_words_of_a_title_and_never_the_emoji_beside
 
 #[test]
 fn an_emoji_arriving_while_the_picker_is_open_lands_on_its_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let derived_id = SessionId::new();
     open_session_picker_with(
@@ -1086,7 +1108,7 @@ fn an_emoji_arriving_while_the_picker_is_open_lands_on_its_row() {
 
 #[test]
 fn an_emoji_leaves_an_all_workspaces_row_room_for_its_workspace_path() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     open_session_picker_with(
         &mut application,

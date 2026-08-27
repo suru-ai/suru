@@ -1,9 +1,9 @@
 //! Composer input: cursor placement, growth, editing bindings, and history.
 
 use crate::support::{
-    buffer_rows, enter_session, failed_session_snapshot, rendered_application_buffer,
+    WorkspaceDir, buffer_rows, enter_session, failed_session_snapshot, rendered_application_buffer,
     rendered_application_cursor_at, rendered_application_rows, rendered_application_rows_at,
-    text_position, type_terminal_text,
+    text_position, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
@@ -68,7 +68,7 @@ fn composer_cursor_tracks_empty_unicode_and_multiline_input() {
 
 #[test]
 fn skill_completion_replaces_only_the_query_binds_it_and_keeps_the_prompt_open() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let selection = AgentSelection {
         provider: ProviderId::new("codex"),
         model: ModelId::new("gpt-fixture"),
@@ -803,7 +803,7 @@ fn rejected_admission_restores_the_complete_skill_bearing_draft() {
 
 #[test]
 fn skill_completion_shows_live_catalog_states_and_retries_failed_discovery() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let selection = AgentSelection {
         provider: ProviderId::new("codex"),
         model: ModelId::new("gpt-fixture"),
@@ -1067,7 +1067,7 @@ fn composer_grows_to_one_third_of_the_terminal_then_scrolls_internally() {
 
 #[test]
 fn text_entered_while_the_first_session_is_created_becomes_its_draft() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -1114,7 +1114,7 @@ fn text_entered_while_the_first_session_is_created_becomes_its_draft() {
 
 #[test]
 fn multiline_history_is_boundary_aware_and_session_drafts_keep_their_cursor() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (first_session, first_snapshot) = enter_session(&mut application, workspace.path());
     application
@@ -1226,8 +1226,8 @@ fn prompt_block_height(rows: &[String]) -> usize {
 fn application_with_skills(
     skills: Vec<SkillDescriptor>,
     max_distinct_invocations: Option<u32>,
-) -> (tempfile::TempDir, Application) {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+) -> (WorkspaceDir, Application) {
+    let workspace = workspace_dir();
     let selection = AgentSelection {
         provider: ProviderId::new("codex"),
         model: ModelId::new("gpt-fixture"),

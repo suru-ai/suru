@@ -334,7 +334,11 @@ impl Default for TuiState {
 
 impl TuiState {
     pub(super) fn new(workspace: impl AsRef<Path>) -> Self {
-        let workspace = workspace.as_ref().to_owned();
+        // Taken as the one reading at launch, so a spelling reached through a
+        // symlink — or Windows's own `current_dir`, which never matches the
+        // canonical form — cannot narrow a current-Workspace scope to a
+        // Workspace none of this client's Sessions match.
+        let workspace = workspace_reading(workspace.as_ref());
         Self {
             identity: None,
             recovery: None,
@@ -415,7 +419,7 @@ impl TuiState {
             || self.workspace.clone(),
             |session| session.snapshot().session.workspace.path.clone(),
         );
-        let workspace = std::fs::canonicalize(&workspace).unwrap_or(workspace);
+        let workspace = workspace_reading(&workspace);
         Some(SkillCatalogRequest {
             provider: selection.provider.clone(),
             workspace: Workspace { path: workspace },
@@ -2951,6 +2955,16 @@ impl Application {
     pub(super) fn advance_spinner(&mut self) {
         self.state.spinner_frame = self.state.spinner_frame.wrapping_add(1);
     }
+}
+
+/// The one reading of a Workspace directory: the canonical path, which is how
+/// the server reads the Workspace it roots a Session at and the one it
+/// narrows a listing by, so the client and the server never hold two
+/// spellings of the same directory. A Workspace Suru cannot read that way is
+/// not a reason to refuse to work in it, so the path stands as given where
+/// canonicalizing fails.
+fn workspace_reading(workspace: &Path) -> PathBuf {
+    std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_owned())
 }
 
 /// Whether a terminal event is the reader acting rather than the terminal

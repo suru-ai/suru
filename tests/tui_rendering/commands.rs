@@ -2,7 +2,7 @@
 
 use crate::support::{
     buffer_rows, enter_active_session, failed_session_snapshot, rendered_application_buffer,
-    rendered_application_cursor_at, rendered_application_rows, type_terminal_text,
+    rendered_application_cursor_at, rendered_application_rows, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
@@ -13,7 +13,7 @@ use suru::{
 
 #[test]
 fn slash_autocomplete_invokes_new_session_from_a_description_match() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (_, _, _) = enter_active_session(&mut application, workspace.path());
 
@@ -41,7 +41,7 @@ fn slash_autocomplete_invokes_new_session_from_a_description_match() {
 
 #[test]
 fn slash_settle_sets_the_open_session_aside() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (session_id, _, _) = enter_active_session(&mut application, workspace.path());
 
@@ -303,7 +303,7 @@ fn slash_autocomplete_keeps_the_landing_composer_visible_at_minimum_size() {
 
 #[test]
 fn dismissed_alias_is_submitted_literally_before_turn_interruption() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (_, _, _) = enter_active_session(&mut application, workspace.path());
     type_terminal_text(&mut application, "/clear");
@@ -403,7 +403,7 @@ fn pasted_multiline_and_unmatched_slash_text_remain_literal_prompts() {
 
 #[test]
 fn autocomplete_navigation_and_tab_invoke_the_canonical_alias_target() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (_, _, _) = enter_active_session(&mut application, workspace.path());
     application
@@ -441,7 +441,7 @@ fn autocomplete_navigation_and_tab_invoke_the_canonical_alias_target() {
 
 #[test]
 fn autocomplete_selection_precedes_an_open_scoped_command_mode() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (_, _, _) = enter_active_session(&mut application, workspace.path());
     application
@@ -469,7 +469,7 @@ fn autocomplete_selection_precedes_an_open_scoped_command_mode() {
 
 #[test]
 fn autocomplete_tracks_the_active_composer_when_a_session_attaches() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(

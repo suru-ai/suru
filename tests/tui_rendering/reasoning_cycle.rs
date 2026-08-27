@@ -2,7 +2,7 @@
 
 use crate::support::{
     model_descriptor, rendered_application_rows, rendered_application_rows_at,
-    selected_session_snapshot, type_terminal_text,
+    selected_session_snapshot, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
@@ -238,7 +238,7 @@ fn reasoning_cycle_reports_unavailable_effort_without_mutation() {
 
 #[test]
 fn reasoning_cycle_without_a_cached_catalog_requests_models_and_reports() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(
@@ -264,7 +264,7 @@ fn reasoning_cycle_without_a_cached_catalog_requests_models_and_reports() {
 
 #[test]
 fn rapid_reasoning_cycles_coalesce_to_one_serialized_latest_selection() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let mut application = Application::new(workspace.path());
     application
@@ -362,7 +362,7 @@ fn rapid_reasoning_cycles_coalesce_to_one_serialized_latest_selection() {
 
 #[test]
 fn stale_selection_results_cannot_overwrite_newer_intent_or_roll_back() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let mut application = Application::new(workspace.path());
     application
@@ -465,7 +465,7 @@ fn stale_selection_results_cannot_overwrite_newer_intent_or_roll_back() {
 
 #[test]
 fn authoritative_updates_slide_beneath_the_optimistic_overlay_until_settled() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let mut application = Application::new(workspace.path());
     application

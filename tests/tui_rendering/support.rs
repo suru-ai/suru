@@ -20,6 +20,45 @@ use suru::{
 };
 use uuid::Uuid;
 
+/// A Workspace directory whose [`path`](Self::path) is the canonical reading
+/// — the one a launching client holds and the server roots Sessions at — so
+/// an assertion comparing it against either means the same on every platform.
+/// A raw tempdir path is canonical on Linux only by luck: macOS spells
+/// `/var/folders/…` for `/private/var/folders/…`, and Windows's canonical
+/// form carries a verbatim prefix no tempdir path does.
+pub struct WorkspaceDir {
+    /// Held only to keep the directory on disk for the fixture's lifetime.
+    _directory: tempfile::TempDir,
+    canonical: std::path::PathBuf,
+}
+
+impl WorkspaceDir {
+    pub fn path(&self) -> &std::path::Path {
+        &self.canonical
+    }
+}
+
+/// A Workspace directory for a rendering test, held canonical per
+/// [`WorkspaceDir`]. It lives as long as the binding, the way a tempdir does.
+pub fn workspace_dir() -> WorkspaceDir {
+    let directory = tempfile::tempdir().expect("create Workspace");
+    let canonical =
+        std::fs::canonicalize(directory.path()).expect("canonicalize the Workspace fixture");
+    WorkspaceDir {
+        _directory: directory,
+        canonical,
+    }
+}
+
+/// A spelling of `workspace` that is not its canonical reading on any
+/// platform — `..` survives `Path` comparison where `.` does not — the way a
+/// path reached through a symlink, or Windows's own `current_dir`, never
+/// matches what `fs::canonicalize` answers.
+pub fn noncanonical_spelling(workspace: &WorkspaceDir) -> std::path::PathBuf {
+    std::fs::create_dir_all(workspace.path().join("sub")).expect("create the spelling's waypoint");
+    workspace.path().join("sub").join("..")
+}
+
 pub fn rendered_rows(render: impl FnOnce(&mut Frame<'_>)) -> Vec<String> {
     rendered_rows_at(80, 15, render)
 }

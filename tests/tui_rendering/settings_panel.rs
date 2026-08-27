@@ -14,7 +14,7 @@ use ratatui::{
 use crate::support::{
     connected_application, model_descriptor, rendered_application_buffer,
     rendered_application_rows, rendered_application_rows_at, selected_session_snapshot,
-    text_position, type_terminal_text,
+    text_position, type_terminal_text, workspace_dir,
 };
 use suru::{
     managed_client::ManagedEvent,
@@ -294,7 +294,7 @@ fn styling(buffer: &Buffer, needle: &str) -> (Color, Color, Modifier) {
 
 #[test]
 fn the_leader_key_and_the_slash_command_both_open_the_panel_and_escape_closes_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
 
     open_panel(&mut application);
@@ -334,7 +334,7 @@ fn the_leader_key_and_the_slash_command_both_open_the_panel_and_escape_closes_it
 /// end of the bar is a dead end.
 #[test]
 fn the_tab_bar_names_both_tabs_and_left_and_right_switch_between_them_with_wrap() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
 
@@ -393,7 +393,7 @@ fn the_tab_bar_names_both_tabs_and_left_and_right_switch_between_them_with_wrap(
 /// ask Suru to look again after signing in outside it.
 #[test]
 fn clicking_a_tab_label_switches_to_that_tab() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
 
@@ -439,7 +439,7 @@ fn clicking_a_tab_label_switches_to_that_tab() {
 /// exactly where it was.
 #[test]
 fn clicking_a_row_selects_it_without_changing_a_value() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
     assert_eq!(
@@ -477,7 +477,7 @@ fn clicking_a_row_selects_it_without_changing_a_value() {
 /// Enter that reveals what the Provider carries.
 #[test]
 fn clicking_a_provider_row_neither_toggles_it_nor_expands_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
 
@@ -520,7 +520,7 @@ fn clicking_a_provider_row_neither_toggles_it_nor_expands_it() {
 /// screen outside the box are all surfaces the reader may click through.
 #[test]
 fn a_click_on_anything_but_a_tab_or_a_row_changes_nothing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
 
@@ -561,7 +561,7 @@ fn a_click_on_anything_but_a_tab_or_a_row_changes_nothing() {
 
 #[test]
 fn the_general_tab_lists_every_setting_that_configures_no_provider() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
         opening_at(FoldPosture::Expanded),
@@ -597,7 +597,7 @@ fn the_general_tab_lists_every_setting_that_configures_no_provider() {
 /// a Provider turned off must stay findable to be turned back on.
 #[test]
 fn the_providers_tab_lists_every_built_in_provider_by_display_name_whatever_its_enablement() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
         without_copilot(),
@@ -633,7 +633,7 @@ fn the_providers_tab_lists_every_built_in_provider_by_display_name_whatever_its_
 
 #[test]
 fn space_on_a_provider_row_toggles_that_providers_enablement() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
     focus_setting(&mut application, "provider.codex.enabled");
@@ -697,7 +697,7 @@ fn space_on_a_provider_row_toggles_that_providers_enablement() {
 /// leaving asks nothing.
 #[test]
 fn entering_the_providers_tab_reads_availability_every_time() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
 
     open_panel(&mut application);
@@ -737,7 +737,7 @@ fn entering_the_providers_tab_reads_availability_every_time() {
 /// unavailable is something they fix outside Suru.
 #[test]
 fn an_unavailable_provider_names_its_reason_and_the_headline_carries_the_message() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     let request = read_providers_tab(&mut application);
 
@@ -769,7 +769,7 @@ fn an_unavailable_provider_names_its_reason_and_the_headline_carries_the_message
 /// word, and a catalog that answered — however long ago — is worth none.
 #[test]
 fn a_failed_read_says_error_while_a_serving_catalog_says_nothing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     let request = read_providers_tab(&mut application);
 
@@ -819,7 +819,7 @@ fn a_failed_read_says_error_while_a_serving_catalog_says_nothing() {
 /// it runs and nothing once the answer is in.
 #[test]
 fn a_provider_shows_a_spinner_while_its_availability_is_being_read() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     let request = read_providers_tab(&mut application);
 
@@ -852,7 +852,7 @@ fn a_provider_shows_a_spinner_while_its_availability_is_being_read() {
 /// row reports the choice and nothing Suru would have had to look for.
 #[test]
 fn a_disabled_provider_is_never_read_and_makes_no_availability_claim() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
         without_codex(),
@@ -893,7 +893,7 @@ fn a_disabled_provider_is_never_read_and_makes_no_availability_claim() {
 /// that never came back is every asked-about Provider's failed read.
 #[test]
 fn a_listing_that_never_came_back_leaves_every_asked_about_provider_in_error() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
         without_codex(),
@@ -940,7 +940,7 @@ fn a_listing_that_never_came_back_leaves_every_asked_about_provider_in_error() {
 /// behind must not stand in for the one they are waiting on.
 #[test]
 fn an_answer_to_a_superseded_read_settles_nothing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     let abandoned = read_providers_tab(&mut application);
 
@@ -976,7 +976,7 @@ fn an_answer_to_a_superseded_read_settles_nothing() {
 /// the row reports that rather than waiting on an answer already given.
 #[test]
 fn a_provider_the_answer_passes_over_stops_waiting_and_says_so() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     let request = read_providers_tab(&mut application);
 
@@ -997,7 +997,7 @@ fn a_provider_the_answer_passes_over_stops_waiting_and_says_so() {
 /// place a Provider speaks.
 #[test]
 fn turning_a_provider_off_after_a_read_silences_its_row_and_the_headline() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     let request = read_providers_tab(&mut application);
     deliver_catalog(
@@ -1040,7 +1040,7 @@ fn turning_a_provider_off_after_a_read_silences_its_row_and_the_headline() {
 /// hides them again.
 #[test]
 fn enter_reveals_a_providers_further_settings_beneath_it_and_hides_them_again() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
     focus_setting(&mut application, "provider.codex.enabled");
@@ -1088,7 +1088,7 @@ fn enter_reveals_a_providers_further_settings_beneath_it_and_hides_them_again() 
 /// tab of their own.
 #[test]
 fn a_revealed_setting_navigates_cycles_and_resets_like_any_other_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
     focus_setting(&mut application, "provider.codex.enabled");
@@ -1165,7 +1165,7 @@ fn a_revealed_setting_navigates_cycles_and_resets_like_any_other_row() {
 /// would give the reader two rows for one value.
 #[test]
 fn a_providers_enablement_never_appears_inside_its_own_expansion() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
     focus_setting(&mut application, "provider.codex.enabled");
@@ -1191,7 +1191,7 @@ fn a_providers_enablement_never_appears_inside_its_own_expansion() {
 /// offers no affordance and Enter on it does nothing at all.
 #[test]
 fn a_provider_with_no_further_settings_offers_no_expansion() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
     assert!(
@@ -1222,7 +1222,7 @@ fn a_provider_with_no_further_settings_offers_no_expansion() {
 /// left open.
 #[test]
 fn every_provider_is_collapsed_each_time_the_panel_opens() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
     focus_setting(&mut application, "provider.codex.enabled");
@@ -1245,7 +1245,7 @@ fn every_provider_is_collapsed_each_time_the_panel_opens() {
 /// edits that apply when it is turned back on.
 #[test]
 fn a_disabled_provider_expands_and_its_settings_stay_editable() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
         without_codex(),
@@ -1277,7 +1277,7 @@ fn a_disabled_provider_expands_and_its_settings_stay_editable() {
 /// a reader makes mid-edit, so neither tab may forget where they were.
 #[test]
 fn each_tab_keeps_its_own_selected_row_while_the_panel_is_open() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
     focus_setting(&mut application, "transcript.reasoningVisibility");
@@ -1301,7 +1301,7 @@ fn each_tab_keeps_its_own_selected_row_while_the_panel_is_open() {
 
 #[test]
 fn reopening_the_panel_starts_at_the_first_tab_and_its_top_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
     press(&mut application, KeyCode::Right, KeyModifiers::NONE);
@@ -1324,7 +1324,7 @@ fn reopening_the_panel_starts_at_the_first_tab_and_its_top_row() {
 
 #[test]
 fn choosing_a_value_pins_it_and_the_row_follows_the_refreshed_snapshot() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
 
@@ -1355,7 +1355,7 @@ fn choosing_a_value_pins_it_and_the_row_follows_the_refreshed_snapshot() {
 
 #[test]
 fn session_content_width_row_spells_maxima_and_space_selects_fill() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
     focus_setting(&mut application, "session.contentWidth");
@@ -1390,7 +1390,7 @@ fn session_content_width_row_spells_maxima_and_space_selects_fill() {
 
 #[test]
 fn session_content_width_opens_a_numeric_editor_prefilled_from_the_active_maximum() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
         with_content_width(SessionContentWidth::Maximum(132)),
@@ -1413,7 +1413,7 @@ fn session_content_width_opens_a_numeric_editor_prefilled_from_the_active_maximu
 
 #[test]
 fn a_valid_numeric_edit_emits_a_typed_mutation_and_waits_for_the_refreshed_snapshot() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
         with_content_width(SessionContentWidth::Maximum(132)),
@@ -1455,7 +1455,7 @@ fn a_valid_numeric_edit_emits_a_typed_mutation_and_waits_for_the_refreshed_snaps
 /// named value, and the numeric editor chooses any of the rest.
 #[test]
 fn the_auto_settle_row_spells_its_threshold_and_space_turns_settling_off() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
     focus_setting(&mut application, "sidebar.autoSettle");
@@ -1496,7 +1496,7 @@ fn the_auto_settle_row_spells_its_threshold_and_space_turns_settling_off() {
 
 #[test]
 fn invalid_numeric_input_stays_open_with_the_settings_validation_explanation() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
     focus_setting(&mut application, "session.contentWidth");
@@ -1532,7 +1532,7 @@ fn invalid_numeric_input_stays_open_with_the_settings_validation_explanation() {
 
 #[test]
 fn fill_has_no_hidden_maximum_and_cancel_discards_the_numeric_edit() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
         with_content_width(SessionContentWidth::Maximum(132)),
@@ -1580,7 +1580,7 @@ fn fill_has_no_hidden_maximum_and_cancel_discards_the_numeric_edit() {
 
 #[test]
 fn numeric_editor_commands_can_be_invoked_semantically() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
     focus_setting(&mut application, "session.contentWidth");
@@ -1616,7 +1616,7 @@ fn numeric_editor_commands_can_be_invoked_semantically() {
 
 #[test]
 fn closing_the_settings_panel_also_closes_its_numeric_editor() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
     focus_setting(&mut application, "session.contentWidth");
@@ -1646,7 +1646,7 @@ fn closing_the_settings_panel_also_closes_its_numeric_editor() {
 
 #[test]
 fn a_numeric_editor_hidden_by_a_newer_overlay_accepts_no_input() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
     focus_setting(&mut application, "session.contentWidth");
@@ -1701,7 +1701,7 @@ fn a_numeric_editor_hidden_by_a_newer_overlay_accepts_no_input() {
 /// holding its last value wraps to the first rather than stopping.
 #[test]
 fn space_cycles_a_setting_forward_and_wraps_past_the_last_value() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
         EffectiveSettings {
@@ -1731,7 +1731,7 @@ fn space_cycles_a_setting_forward_and_wraps_past_the_last_value() {
 /// panel nor any value.
 #[test]
 fn enter_never_edits_a_value_and_opens_nothing_on_a_row_that_stands_for_nothing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
 
@@ -1777,7 +1777,7 @@ fn enter_never_edits_a_value_and_opens_nothing_on_a_row_that_stands_for_nothing(
 
 #[test]
 fn resetting_a_pinned_setting_unpins_it_and_the_row_returns_to_the_default() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
         opening_at(FoldPosture::Expanded),
@@ -1806,7 +1806,7 @@ fn resetting_a_pinned_setting_unpins_it_and_the_row_returns_to_the_default() {
 
 #[test]
 fn resetting_a_setting_unpins_it_whether_or_not_the_panel_thinks_it_is_pinned() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
 
@@ -1821,7 +1821,7 @@ fn resetting_a_setting_unpins_it_whether_or_not_the_panel_thinks_it_is_pinned() 
 
 #[test]
 fn an_edit_the_server_refuses_says_so_and_leaves_the_row_where_it_was() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     let request = read_providers_tab(&mut application);
     // The row the refusal is about is also one with something of its own to
@@ -1868,7 +1868,7 @@ fn an_edit_the_server_refuses_says_so_and_leaves_the_row_where_it_was() {
 /// the panel is not. None of them may reach a Setting the reader never opened.
 #[test]
 fn an_edit_command_invoked_while_the_panel_is_closed_touches_no_setting() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
 
     for command in [
@@ -1892,7 +1892,7 @@ fn an_edit_command_invoked_while_the_panel_is_closed_touches_no_setting() {
 /// stays where it was until the reader edits it from the keyboard.
 #[test]
 fn clicking_a_revealed_setting_focuses_it_like_any_other_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
     focus_setting(&mut application, "provider.codex.enabled");
@@ -1927,7 +1927,7 @@ fn clicking_a_revealed_setting_focuses_it_like_any_other_row() {
 /// the tab's row of the same number.
 #[test]
 fn a_click_lands_on_the_row_the_window_drew_there() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
     focus_setting(&mut application, "provider.claude.enabled");
@@ -1956,7 +1956,7 @@ fn a_click_lands_on_the_row_the_window_drew_there() {
 /// nothing rather than with where the panel last stood.
 #[test]
 fn a_click_at_a_terminal_too_small_to_draw_the_panel_changes_nothing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
     let rows = rendered_application_rows(&application);
@@ -1986,7 +1986,7 @@ fn a_click_at_a_terminal_too_small_to_draw_the_panel_changes_nothing() {
 /// cannot see and send Suru off to consult no Provider.
 #[test]
 fn a_pointer_command_invoked_while_the_panel_is_closed_changes_nothing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     let before = rendered_application_rows(&application);
 
@@ -2009,7 +2009,7 @@ fn a_pointer_command_invoked_while_the_panel_is_closed_changes_nothing() {
 
 #[test]
 fn the_open_panel_takes_the_keys_the_composer_would_otherwise_get() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
 
@@ -2119,7 +2119,7 @@ fn focused_model(application: &Application) -> String {
 /// reader chooses at the Model picker rather than types.
 #[test]
 fn the_title_derivation_row_cycles_its_named_values_and_spells_a_pinned_selection() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
     focus_setting(&mut application, "session.title.errand");
@@ -2165,7 +2165,7 @@ fn the_title_derivation_row_cycles_its_named_values_and_spells_a_pinned_selectio
 
 #[test]
 fn opening_the_title_derivation_row_pins_the_model_chosen_at_the_picker() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
     focus_setting(&mut application, "session.title.errand");
@@ -2241,7 +2241,7 @@ fn opening_the_title_derivation_row_pins_the_model_chosen_at_the_picker() {
 /// the frame where a Setting's pin is easiest to lose.
 #[test]
 fn a_catalog_landing_leaves_the_pinned_model_focused_rather_than_the_sessions() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
         deriving_titles_with(TitleErrand::Pinned(pinned_selection())),
@@ -2288,7 +2288,7 @@ fn a_catalog_landing_leaves_the_pinned_model_focused_rather_than_the_sessions() 
 /// exactly as the reader left it rather than closing it along with the picker.
 #[test]
 fn cancelling_the_picker_leaves_the_settings_panel_where_it_was() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
     focus_setting(&mut application, "session.title.errand");

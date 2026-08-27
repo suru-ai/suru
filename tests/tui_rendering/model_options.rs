@@ -2,7 +2,7 @@
 
 use crate::support::{
     model_descriptor, rendered_application_rows, rendered_application_rows_at,
-    selected_session_snapshot, type_terminal_text,
+    selected_session_snapshot, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
@@ -389,7 +389,7 @@ fn refreshed_descriptors_replace_a_cached_no_options_status() {
 
 #[test]
 fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let authoritative = AgentSelection {
         provider: ProviderId::new("codex"),
@@ -569,7 +569,7 @@ fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
 
 #[test]
 fn refreshed_options_keep_invalidated_choice_visible_and_disable_apply() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let current = AgentSelection {
         provider: ProviderId::new("codex"),

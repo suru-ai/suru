@@ -49,7 +49,7 @@ The view a client shows when no Session is open, carrying the Agent Selection a 
 _Avoid_: Home, launch view, start screen, welcome screen
 
 **Workspace**:
-The working context in which an agent operates, initially rooted at a local directory.
+The working context in which an agent operates, initially rooted at a local directory. There is one reading of that directory: the server canonicalizes the Workspace it roots a Session at and the one it narrows a listing by, and a client reads the directory it launches in — and any it is later pointed at — the same way, so the two never hold different spellings of the same place. A directory that cannot be read that way stands as given rather than refusing to start.
 _Avoid_: Project, working directory, location
 
 **Turn**:

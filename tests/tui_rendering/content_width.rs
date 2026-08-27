@@ -2,7 +2,7 @@
 
 use crate::support::{
     connected_application, enter_session, navigable_session_snapshot, rendered_application_rows_at,
-    rendered_row,
+    rendered_row, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -202,7 +202,7 @@ fn reflow_row_count(application: &Application) -> usize {
 
 #[test]
 fn a_custom_maximum_centers_the_session_composer() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (application, _) = session_with_width(workspace.path(), SessionContentWidth::Maximum(60));
 
     let rows = rendered_application_rows_at(&application, 120, 20);
@@ -211,7 +211,7 @@ fn a_custom_maximum_centers_the_session_composer() {
 
 #[test]
 fn default_and_fill_use_the_expected_session_content_column() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (defaulted, _) = session_with_width(workspace.path(), SessionContentWidth::Maximum(80));
     let (fill, _) = session_with_width(workspace.path(), SessionContentWidth::Fill);
 
@@ -229,7 +229,7 @@ fn default_and_fill_use_the_expected_session_content_column() {
 
 #[test]
 fn a_maximum_shrinks_below_fifty_when_the_terminal_is_narrow() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (application, _) = session_with_width(workspace.path(), SessionContentWidth::Maximum(80));
 
     assert_eq!(
@@ -241,7 +241,7 @@ fn a_maximum_shrinks_below_fifty_when_the_terminal_is_narrow() {
 
 #[test]
 fn session_surfaces_share_the_column_while_the_header_keeps_terminal_width() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (mut application, initial) =
         session_with_width(workspace.path(), SessionContentWidth::Maximum(60));
     let session_id = initial.session.id;
@@ -300,7 +300,7 @@ fn session_surfaces_share_the_column_while_the_header_keeps_terminal_width() {
 
 #[test]
 fn session_content_width_does_not_change_the_landing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
@@ -321,7 +321,7 @@ fn session_content_width_does_not_change_the_landing() {
 
 #[test]
 fn centered_column_gutters_do_not_toggle_transcript_folds() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application =
         session_with_foldable_command(workspace.path(), SessionContentWidth::Maximum(60));
 
@@ -348,7 +348,7 @@ fn centered_column_gutters_do_not_toggle_transcript_folds() {
 
 #[test]
 fn changing_width_reflows_an_open_sessions_composer() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (mut application, _) =
         session_with_width(workspace.path(), SessionContentWidth::Maximum(50));
     application
@@ -368,7 +368,7 @@ fn changing_width_reflows_an_open_sessions_composer() {
 
 #[test]
 fn changing_width_keeps_a_scrolled_reader_anchored_to_the_same_message_and_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut reflow_probe =
         session_with_reflowing_transcript(workspace.path(), SessionContentWidth::Maximum(50));
     let narrow_reflow_rows = reflow_row_count(&reflow_probe);
@@ -420,7 +420,7 @@ fn changing_width_keeps_a_scrolled_reader_anchored_to_the_same_message_and_row()
 
 #[test]
 fn changing_width_keeps_a_tail_following_reader_at_the_latest_message() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application =
         session_with_reflowing_transcript(workspace.path(), SessionContentWidth::Maximum(50));
     let maximum = rendered_application_rows_at(&application, 120, 20).join("\n");
@@ -436,7 +436,7 @@ fn changing_width_keeps_a_tail_following_reader_at_the_latest_message() {
 
 #[test]
 fn transcript_pointer_geometry_tracks_width_changes_and_terminal_resize() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application =
         session_with_foldable_command(workspace.path(), SessionContentWidth::Maximum(60));
 

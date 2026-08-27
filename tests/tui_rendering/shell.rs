@@ -5,7 +5,7 @@ use crate::{
     support::{
         connected_application, enter_session, failed_session_snapshot, fixture_instance_id,
         ready_health, rendered_application_rows, rendered_application_rows_at, rendered_rows,
-        type_terminal_text,
+        type_terminal_text, workspace_dir,
     },
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
@@ -29,6 +29,27 @@ use uuid::Uuid;
 
 fn rendered_state_rows(state: &TuiState) -> Vec<String> {
     rendered_rows(|frame| render(frame, state))
+}
+
+/// A client reads its launching Workspace the way the server reads one, and a
+/// directory that cannot be read that way is not a reason to refuse to start:
+/// the client stands on the path as given, and the Landing says so.
+#[test]
+fn a_launch_directory_that_cannot_be_canonicalized_still_starts_on_the_path_as_given() {
+    let root = tempfile::tempdir().expect("create fixture root");
+    let missing = root.path().join("missing");
+
+    let application = connected_application(&missing);
+
+    let landing = rendered_application_rows_at(&application, 100, 20).join("\n");
+    assert!(
+        landing.contains("What would you like to work on?"),
+        "the client starts on the Workspace it cannot read: {landing:?}"
+    );
+    assert!(
+        landing.contains(&format!("Workspace {}", missing.to_string_lossy())),
+        "and the footer says where, by the spelling the client was given: {landing:?}"
+    );
 }
 
 fn connected_state(instance_id: Uuid, pid: u32) -> TuiState {
@@ -87,7 +108,7 @@ fn headless_application_handles_terminal_and_managed_events_through_the_producti
 
 #[test]
 fn connected_application_uses_the_persisted_landing_agent_selection() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let selected = AgentSelection {
         provider: ProviderId::new("codex"),
         model: ModelId::new("gpt-remembered"),
@@ -115,7 +136,7 @@ fn connected_application_uses_the_persisted_landing_agent_selection() {
 async fn headless_application_creates_a_session_and_renders_its_first_turn_through_the_managed_client()
  {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let workspace = workspace_dir();
     let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "headless-session-test").expect("configure server"),
     )
@@ -324,7 +345,7 @@ fn connected_view_centers_the_landing_composer_and_shows_server_identity() {
 
 #[test]
 fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -382,7 +403,7 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
 
 #[test]
 fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut active_snapshot = failed_session_snapshot(
         SessionId::new(),
         PromptId::new(),
@@ -501,7 +522,7 @@ fn recovering_view_retains_the_landing_composer_and_last_server_identity() {
 
 #[test]
 fn reconnect_overlay_waits_for_the_grace_period_and_blocks_composer_input() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let instance_id = fixture_instance_id();
     let mut application = connected_application(workspace.path());
     application
@@ -616,7 +637,7 @@ fn fatal_protocol_error_is_rendered_visibly_with_the_last_known_state() {
 
 #[test]
 fn ended_session_subscription_requests_a_fresh_snapshot_for_reconciliation() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (session_id, _) = enter_session(&mut application, workspace.path());
 
@@ -637,7 +658,7 @@ fn ended_session_subscription_requests_a_fresh_snapshot_for_reconciliation() {
 #[tokio::test]
 async fn headless_slash_settle_sets_the_open_session_aside_on_a_real_server() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let workspace = workspace_dir();
     let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "headless-settle-test").expect("configure server"),
     )

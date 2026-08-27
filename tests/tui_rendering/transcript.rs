@@ -5,6 +5,7 @@ use crate::{
     support::{
         buffer_rows, connected_application, failed_session_snapshot, navigable_session_snapshot,
         rendered_application_buffer, rendered_application_rows_at, rendered_row, text_position,
+        workspace_dir,
     },
 };
 use crossterm::event::{
@@ -67,7 +68,7 @@ fn text_cell<'a>(buffer: &'a Buffer, needle: &str) -> &'a Cell {
 
 #[test]
 fn wrapped_transcript_lines_keep_source_and_list_indentation() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
@@ -127,7 +128,7 @@ async fn apply_next_session_event(
 
 #[test]
 fn terminal_input_capabilities_map_mouse_wheel_to_transcript_navigation() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(
@@ -165,7 +166,7 @@ fn terminal_input_capabilities_map_mouse_wheel_to_transcript_navigation() {
 
 #[test]
 fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
@@ -235,7 +236,7 @@ fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
 
 #[test]
 fn all_base_ansi_foregrounds_and_backgrounds_render_through_the_theme_palette() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
@@ -306,7 +307,7 @@ fn all_base_ansi_foregrounds_and_backgrounds_render_through_the_theme_palette() 
 
 #[test]
 fn escape_laden_transcript_stays_clean_after_scroll_and_session_switch() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let mut escaped = navigable_session_snapshot(SessionId::new(), workspace.path(), 8);
     let turn_id = escaped.turns[7].id;
@@ -366,7 +367,7 @@ fn escape_laden_transcript_stays_clean_after_scroll_and_session_switch() {
 
 #[test]
 fn activity_sgr_styles_patch_over_each_activity_base_style() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
@@ -447,7 +448,7 @@ fn activity_sgr_styles_patch_over_each_activity_base_style() {
 
 #[test]
 fn command_output_osc_8_hyperlinks_render_with_link_style() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
@@ -487,7 +488,7 @@ fn command_output_osc_8_hyperlinks_render_with_link_style() {
 #[tokio::test]
 async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_session_stream() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let workspace = workspace_dir();
     let server = spawn_with_failing_provider(
         ServerConfig::new(state_dir.path(), "headless-agent-stream-test")
             .expect("configure server"),
@@ -746,7 +747,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
 
 #[test]
 fn command_activities_render_active_successful_and_failed_states_at_responsive_widths() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let cases = [
         (ActivityStatus::Active, None, "⠋ cargo test", Color::Cyan),
         (
@@ -821,7 +822,7 @@ fn command_activities_render_active_successful_and_failed_states_at_responsive_w
 
 #[test]
 fn file_change_activities_render_active_successful_and_failed_states_at_responsive_widths() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let cases = [
         (
             ActivityStatus::Active,
@@ -904,7 +905,7 @@ fn file_change_activities_render_active_successful_and_failed_states_at_responsi
 
 #[test]
 fn streaming_command_updates_reuse_one_projected_transcript_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let mut snapshot = failed_session_snapshot(
         session_id,
@@ -977,7 +978,7 @@ fn streaming_command_updates_reuse_one_projected_transcript_row() {
 
 #[test]
 fn page_up_exposes_latest_and_end_resumes_following_the_transcript() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(
@@ -1045,7 +1046,7 @@ fn page_up_exposes_latest_and_end_resumes_following_the_transcript() {
 
 #[test]
 fn a_scrolled_message_anchor_survives_streaming_and_terminal_resize_per_client() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let mut snapshot = navigable_session_snapshot(session_id, workspace.path(), 8);
     snapshot.session.status = SessionStatus::Active;
@@ -1163,7 +1164,7 @@ fn a_scrolled_message_anchor_survives_streaming_and_terminal_resize_per_client()
 
 #[test]
 fn resize_that_reveals_the_whole_transcript_resumes_following() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(
@@ -1194,7 +1195,7 @@ fn resize_that_reveals_the_whole_transcript_resumes_following() {
 
 #[test]
 fn transcript_navigation_remains_correct_beyond_the_terminal_scroll_limit() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let prompt_id = PromptId::new();
     let content = format!("{}TAIL beyond u16", "x\n".repeat(65_700));
@@ -1235,7 +1236,7 @@ fn transcript_navigation_remains_correct_beyond_the_terminal_scroll_limit() {
 
 #[test]
 fn transcript_navigation_reaches_tail_of_one_oversized_wrapped_line() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let terminal_width = 28;
@@ -1281,7 +1282,7 @@ fn transcript_navigation_reaches_tail_of_one_oversized_wrapped_line() {
 
 #[test]
 fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_changes() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let snapshot = navigable_session_snapshot(session_id, workspace.path(), 8);
     let mut application = Application::new(workspace.path());
@@ -1493,7 +1494,7 @@ fn command_activity_session(
 
 #[test]
 fn an_expanded_command_wraps_beneath_its_text_and_nests_its_details() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (mut snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -1565,7 +1566,7 @@ fn press_leader_chord(application: &mut Application, key: char) {
 
 #[test]
 fn a_settled_command_folds_to_a_single_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -1595,7 +1596,7 @@ fn a_settled_command_folds_to_a_single_row() {
 
 #[test]
 fn a_folded_command_row_end_truncates_instead_of_wrapping() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (mut snapshot, activity_id) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -1631,7 +1632,7 @@ fn a_folded_command_row_end_truncates_instead_of_wrapping() {
 
 #[test]
 fn the_fold_marker_counts_logical_lines_so_it_reads_the_same_at_every_width() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -1658,7 +1659,7 @@ fn the_fold_marker_counts_logical_lines_so_it_reads_the_same_at_every_width() {
 
 #[test]
 fn long_output_lines_wrap_before_the_clamp_so_a_few_cannot_flood_the_fold() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let output = (1..=4)
         .map(|line| format!("line {line} {}", "x".repeat(200)))
         .collect::<Vec<_>>()
@@ -1690,7 +1691,7 @@ fn long_output_lines_wrap_before_the_clamp_so_a_few_cannot_flood_the_fold() {
 
 #[test]
 fn a_command_fold_opens_in_stages_and_folds_back_from_the_header() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -1758,7 +1759,7 @@ fn a_command_fold_opens_in_stages_and_folds_back_from_the_header() {
 
 #[test]
 fn a_failed_command_opens_to_its_peek_by_default() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (mut snapshot, activity_id) = command_activity_session(
         workspace.path(),
         ActivityStatus::Failed,
@@ -1793,7 +1794,7 @@ fn a_failed_command_opens_to_its_peek_by_default() {
 
 #[test]
 fn a_command_interrupted_without_being_watched_folds_to_its_single_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (mut snapshot, activity_id) = command_activity_session(
         workspace.path(),
         ActivityStatus::Failed,
@@ -1825,7 +1826,7 @@ fn a_command_interrupted_without_being_watched_folds_to_its_single_row() {
 
 #[test]
 fn a_folded_failed_row_keeps_its_exit_suffix_past_the_clamp() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (mut snapshot, activity_id) = command_activity_session(
         workspace.path(),
         ActivityStatus::Failed,
@@ -1867,7 +1868,7 @@ fn a_folded_failed_row_keeps_its_exit_suffix_past_the_clamp() {
 
 #[test]
 fn the_folded_row_hides_the_cwd_line_until_the_peek() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (mut snapshot, activity_id) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -1904,7 +1905,7 @@ fn the_folded_row_hides_the_cwd_line_until_the_peek() {
 
 #[test]
 fn a_peek_that_fits_everything_shows_no_marker_and_folds_back_from_its_header() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -1961,7 +1962,7 @@ fn a_peek_that_fits_everything_shows_no_marker_and_folds_back_from_its_header() 
 
 #[test]
 fn clicks_on_revealed_output_change_nothing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -2010,7 +2011,7 @@ fn clicks_on_revealed_output_change_nothing() {
 
 #[test]
 fn toggling_the_fold_posture_expands_every_entry_and_clears_per_entry_overrides() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -2128,7 +2129,7 @@ fn settings_with_reasoning(visibility: ReasoningVisibility) -> EffectiveSettings
 
 #[test]
 fn the_pinned_default_fold_posture_opens_a_fresh_session_view_expanded() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -2147,7 +2148,7 @@ fn the_pinned_default_fold_posture_opens_a_fresh_session_view_expanded() {
 
 #[test]
 fn the_folded_default_fold_posture_keeps_a_fresh_session_view_folded() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -2166,7 +2167,7 @@ fn the_folded_default_fold_posture_keeps_a_fresh_session_view_folded() {
 
 #[test]
 fn the_expanded_default_fold_posture_leaves_the_fold_toggle_flipping_as_before() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -2192,7 +2193,7 @@ fn the_expanded_default_fold_posture_leaves_the_fold_toggle_flipping_as_before()
 
 #[test]
 fn the_expanded_default_fold_posture_leaves_the_turn_fold_axis_alone() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = settled_turn_session(
         workspace.path(),
         "Run the workflow",
@@ -2218,7 +2219,7 @@ fn the_expanded_default_fold_posture_leaves_the_turn_fold_axis_alone() {
 
 #[test]
 fn error_and_status_activities_are_never_folded() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut snapshot = failed_session_snapshot(
         SessionId::new(),
         PromptId::new(),
@@ -2272,7 +2273,7 @@ fn error_and_status_activities_are_never_folded() {
 
 #[test]
 fn file_change_activities_fold_past_the_path_budget_and_expand_on_click() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut snapshot = failed_session_snapshot(
         SessionId::new(),
         PromptId::new(),
@@ -2355,7 +2356,7 @@ fn reasoning_activity_session(
 
 #[test]
 fn folded_reasoning_is_one_line_naming_its_title_and_how_long_it_took() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = reasoning_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -2405,7 +2406,7 @@ fn folded_reasoning_is_one_line_naming_its_title_and_how_long_it_took() {
 
 #[test]
 fn reasoning_still_running_heads_with_its_running_label_and_no_duration() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = reasoning_activity_session(
         workspace.path(),
         ActivityStatus::Active,
@@ -2435,7 +2436,7 @@ fn reasoning_still_running_heads_with_its_running_label_and_no_duration() {
 
 #[test]
 fn untitled_reasoning_heads_with_the_label_alone() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = reasoning_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -2458,7 +2459,7 @@ fn untitled_reasoning_heads_with_the_label_alone() {
 
 #[test]
 fn a_reasoning_block_that_settled_empty_renders_no_row_in_either_posture() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = reasoning_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -2504,7 +2505,7 @@ fn assert_reasoning_shows_nothing(rendered: &str, why: &str) {
 
 #[test]
 fn hidden_reasoning_shows_no_row_however_fully_the_provider_described_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = reasoning_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -2541,7 +2542,7 @@ fn hidden_reasoning_shows_no_row_however_fully_the_provider_described_it() {
 
 #[test]
 fn reasoning_stays_hidden_until_a_reader_asks_for_it_and_arrives_in_the_open_view() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = reasoning_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -2587,7 +2588,7 @@ fn reasoning_stays_hidden_until_a_reader_asks_for_it_and_arrives_in_the_open_vie
 
 #[test]
 fn a_reasoning_block_interrupted_before_it_said_anything_renders_no_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) =
         reasoning_activity_session(workspace.path(), ActivityStatus::Failed, None, "", None);
     let mut application = connected_application(workspace.path());
@@ -2608,7 +2609,7 @@ fn a_reasoning_block_interrupted_before_it_said_anything_renders_no_row() {
 
 #[test]
 fn an_interrupted_reasoning_block_that_said_something_keeps_its_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = reasoning_activity_session(
         workspace.path(),
         ActivityStatus::Failed,
@@ -2631,7 +2632,7 @@ fn an_interrupted_reasoning_block_that_said_something_keeps_its_row() {
 
 #[test]
 fn a_reasoning_block_whose_content_the_cap_dropped_keeps_its_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (mut snapshot, activity_id) = reasoning_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -2670,7 +2671,7 @@ fn a_reasoning_block_whose_content_the_cap_dropped_keeps_its_row() {
 
 #[test]
 fn a_live_reasoning_block_that_settles_empty_loses_the_row_it_was_streaming_in() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let (mut snapshot, activity_id) =
         reasoning_activity_session(workspace.path(), ActivityStatus::Active, None, "", None);
@@ -2709,7 +2710,7 @@ fn a_live_reasoning_block_that_settles_empty_loses_the_row_it_was_streaming_in()
 
 #[test]
 fn a_reasoning_block_the_provider_only_titled_still_renders_its_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = reasoning_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -2732,7 +2733,7 @@ fn a_reasoning_block_the_provider_only_titled_still_renders_its_row() {
 
 #[test]
 fn a_reasoning_block_still_running_renders_before_the_provider_describes_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) =
         reasoning_activity_session(workspace.path(), ActivityStatus::Active, None, "", None);
     let mut application = client_showing_reasoning(workspace.path());
@@ -2750,7 +2751,7 @@ fn a_reasoning_block_still_running_renders_before_the_provider_describes_it() {
 
 #[test]
 fn an_active_command_shows_a_live_tail_and_settles_into_its_folded_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (mut snapshot, activity_id) = command_activity_session(
         workspace.path(),
         ActivityStatus::Active,
@@ -2807,7 +2808,7 @@ fn an_active_command_shows_a_live_tail_and_settles_into_its_folded_row() {
 
 #[test]
 fn a_saturated_live_command_tail_keeps_its_height_as_the_latest_line_wraps() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let output = format!("{}\n{}", "Z".repeat(80), "Z".repeat(80));
     let (mut snapshot, activity_id) =
         command_activity_session(workspace.path(), ActivityStatus::Active, &output, false);
@@ -2869,7 +2870,7 @@ fn a_saturated_live_command_tail_keeps_its_height_as_the_latest_line_wraps() {
 
 #[test]
 fn interrupting_a_turn_lands_the_watched_command_in_its_peek() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (mut snapshot, activity_id) = command_activity_session(
         workspace.path(),
         ActivityStatus::Active,
@@ -2925,7 +2926,7 @@ fn interrupting_a_turn_lands_the_watched_command_in_its_peek() {
 
 #[test]
 fn expanding_a_capped_command_reveals_everything_stored_before_the_truncation_marker() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -2981,7 +2982,7 @@ fn expanding_a_capped_command_reveals_everything_stored_before_the_truncation_ma
 
 #[test]
 fn fold_state_stays_local_to_the_client_that_flipped_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -3018,7 +3019,7 @@ fn fold_state_stays_local_to_the_client_that_flipped_it() {
 
 #[test]
 fn clicking_an_entry_that_hides_nothing_records_no_fold_for_its_later_output() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (mut snapshot, activity_id) = command_activity_session(
         workspace.path(),
         ActivityStatus::Active,
@@ -3065,7 +3066,7 @@ fn clicking_an_entry_that_hides_nothing_records_no_fold_for_its_later_output() {
 
 #[test]
 fn clicks_do_not_reach_the_transcript_while_a_picker_covers_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let (snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Completed,
@@ -3355,7 +3356,7 @@ fn command_settles(
 
 #[test]
 fn a_run_of_successful_commands_collapses_to_one_group_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -3404,7 +3405,7 @@ fn a_run_of_successful_commands_collapses_to_one_group_row() {
 
 #[test]
 fn a_run_of_one_successful_command_renders_as_a_normal_command_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &[SUCCESSFUL_COMMAND]);
     let mut application = connected_application(workspace.path());
     application
@@ -3429,7 +3430,7 @@ fn a_run_of_one_successful_command_renders_as_a_normal_command_row() {
 
 #[test]
 fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let breakers: [(RunEntry, &str); 7] = [
         (
             RunEntry::AgentMessage("A breaking message"),
@@ -3503,7 +3504,7 @@ fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
 
 #[test]
 fn an_empty_reasoning_block_neither_breaks_a_command_run_nor_leaves_a_gap() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let with_empty_blocks = command_run_snapshot(
         session_id,
@@ -3553,7 +3554,7 @@ fn an_empty_reasoning_block_neither_breaks_a_command_run_nor_leaves_a_gap() {
 
 #[test]
 fn hidden_reasoning_neither_breaks_a_command_run_nor_leaves_a_gap() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let with_reasoning = command_run_snapshot(
         session_id,
@@ -3608,7 +3609,7 @@ fn hidden_reasoning_neither_breaks_a_command_run_nor_leaves_a_gap() {
 
 #[test]
 fn an_active_command_renders_live_outside_the_group_while_the_turn_runs() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut snapshot = live_command_run_snapshot(SessionId::new(), workspace.path());
     if let Activity::Command { output, .. } = &mut snapshot.activities[2] {
         *output = numbered_output(12);
@@ -3644,7 +3645,7 @@ fn an_active_command_renders_live_outside_the_group_while_the_turn_runs() {
 
 #[test]
 fn groups_have_no_size_cap() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let entries = std::iter::repeat_with(|| SUCCESSFUL_COMMAND)
         .take(40)
         .collect::<Vec<_>>();
@@ -3668,7 +3669,7 @@ fn groups_have_no_size_cap() {
 
 #[test]
 fn a_command_settling_successfully_is_absorbed_into_the_group_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let snapshot = live_command_run_snapshot(session_id, workspace.path());
     let running_id = snapshot.activities[2].id();
@@ -3704,7 +3705,7 @@ fn a_command_settling_successfully_is_absorbed_into_the_group_row() {
 
 #[test]
 fn a_command_settling_failed_stays_a_standalone_row_and_leaves_the_group_unchanged() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let snapshot = live_command_run_snapshot(session_id, workspace.path());
     let running_id = snapshot.activities[2].id();
@@ -3737,7 +3738,7 @@ fn a_command_settling_failed_stays_a_standalone_row_and_leaves_the_group_unchang
 
 #[test]
 fn an_interrupted_command_settles_as_a_standalone_failed_row_in_its_peek() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let mut snapshot = live_command_run_snapshot(session_id, workspace.path());
     if let Activity::Command { output, .. } = &mut snapshot.activities[2] {
@@ -3818,7 +3819,7 @@ fn prefixed_output(prefix: &str, lines: usize) -> String {
 
 #[test]
 fn clicking_a_collapsed_group_expands_it_into_indented_folded_members() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -3863,7 +3864,7 @@ fn clicking_a_collapsed_group_expands_it_into_indented_folded_members() {
 
 #[test]
 fn a_members_fold_toggles_independently_within_an_expanded_group() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -3923,7 +3924,7 @@ fn a_members_fold_toggles_independently_within_an_expanded_group() {
 
 #[test]
 fn a_members_fold_override_survives_collapse_and_re_expansion() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -3974,7 +3975,7 @@ fn a_members_fold_override_survives_collapse_and_re_expansion() {
 
 #[test]
 fn an_expanded_group_recollapses_only_from_its_header_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4021,7 +4022,7 @@ fn an_expanded_group_recollapses_only_from_its_header_row() {
 
 #[test]
 fn group_state_stays_local_to_the_client_that_flipped_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4057,7 +4058,7 @@ fn group_state_stays_local_to_the_client_that_flipped_it() {
 
 #[test]
 fn a_command_settling_successfully_is_absorbed_into_an_expanded_group() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let snapshot = live_command_run_snapshot(session_id, workspace.path());
     let running_id = snapshot.activities[2].id();
@@ -4107,7 +4108,7 @@ fn a_command_settling_successfully_is_absorbed_into_an_expanded_group() {
 
 #[test]
 fn toggling_the_group_posture_flips_every_group_and_clears_per_group_overrides() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4162,7 +4163,7 @@ fn toggling_the_group_posture_flips_every_group_and_clears_per_group_overrides()
 
 #[test]
 fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4282,7 +4283,7 @@ fn live_reasoning_run_snapshot(
 
 #[test]
 fn hidden_reasoning_leaves_a_live_run_nothing_to_stream_into() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = live_reasoning_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4312,7 +4313,7 @@ fn hidden_reasoning_leaves_a_live_run_nothing_to_stream_into() {
 
 #[test]
 fn a_run_of_settled_reasoning_blocks_collapses_to_one_thought_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &REASONING_RUN);
     let mut application = client_showing_reasoning(workspace.path());
     application
@@ -4357,7 +4358,7 @@ fn a_run_of_settled_reasoning_blocks_collapses_to_one_thought_row() {
 
 #[test]
 fn a_reasoning_group_marker_drops_the_description_when_its_latest_member_has_none() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4388,7 +4389,7 @@ fn a_reasoning_group_marker_drops_the_description_when_its_latest_member_has_non
 
 #[test]
 fn a_run_of_one_visible_reasoning_block_keeps_the_presentation_it_has_alone() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4416,7 +4417,7 @@ fn a_run_of_one_visible_reasoning_block_keeps_the_presentation_it_has_alone() {
 
 #[test]
 fn clicking_a_reasoning_group_opens_onto_every_members_prose_and_folds_back() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &REASONING_RUN);
     let mut application = client_showing_reasoning(workspace.path());
     application
@@ -4474,7 +4475,7 @@ fn clicking_a_reasoning_group_opens_onto_every_members_prose_and_folds_back() {
 
 #[test]
 fn clicking_an_expanded_reasoning_groups_prose_leaves_it_open() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &REASONING_RUN);
     let mut application = client_showing_reasoning(workspace.path());
     application
@@ -4502,7 +4503,7 @@ fn clicking_an_expanded_reasoning_groups_prose_leaves_it_open() {
 
 #[test]
 fn an_interrupted_reasoning_block_ends_the_run_and_stands_outside_the_group() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4543,7 +4544,7 @@ fn an_interrupted_reasoning_block_ends_the_run_and_stands_outside_the_group() {
 
 #[test]
 fn an_empty_reasoning_block_neither_joins_a_reasoning_group_nor_counts_toward_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4571,7 +4572,7 @@ fn an_empty_reasoning_block_neither_joins_a_reasoning_group_nor_counts_toward_it
 
 #[test]
 fn every_other_visible_entry_kind_ends_a_reasoning_run() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let breakers: [(RunEntry, &str); 6] = [
         (
             RunEntry::AgentMessage("A breaking message"),
@@ -4626,7 +4627,7 @@ fn every_other_visible_entry_kind_ends_a_reasoning_run() {
 
 #[test]
 fn a_reasoning_group_whose_members_were_never_timed_reports_no_duration() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4653,7 +4654,7 @@ fn a_reasoning_group_whose_members_were_never_timed_reports_no_duration() {
 
 #[test]
 fn an_expanded_reasoning_group_marks_the_member_whose_prose_the_cap_cut_short() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4695,7 +4696,7 @@ fn an_expanded_reasoning_group_marks_the_member_whose_prose_the_cap_cut_short() 
 
 #[test]
 fn a_streaming_reasoning_block_joins_the_group_as_its_live_thinking_row() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = live_reasoning_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4731,7 +4732,7 @@ fn a_streaming_reasoning_block_joins_the_group_as_its_live_thinking_row() {
 
 #[test]
 fn a_live_reasoning_row_holds_its_last_title_while_an_untitled_section_streams() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = live_reasoning_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4755,7 +4756,7 @@ fn a_live_reasoning_row_holds_its_last_title_while_an_untitled_section_streams()
 
 #[test]
 fn clicking_the_live_reasoning_row_reveals_the_streaming_prose_and_hides_it_again() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = live_reasoning_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -4809,7 +4810,7 @@ fn clicking_the_live_reasoning_row_reveals_the_streaming_prose_and_hides_it_agai
 
 #[test]
 fn a_live_reasoning_group_settles_into_its_thought_row_without_moving() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let snapshot = live_reasoning_run_snapshot(
         session_id,
@@ -4863,7 +4864,7 @@ fn a_live_reasoning_group_settles_into_its_thought_row_without_moving() {
 
 #[test]
 fn an_interrupted_streaming_block_leaves_the_group_it_was_living_in() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let snapshot = live_reasoning_run_snapshot(
         session_id,
@@ -4912,7 +4913,7 @@ fn an_interrupted_streaming_block_leaves_the_group_it_was_living_in() {
 
 #[test]
 fn interrupting_a_turn_keeps_the_live_reasoning_row_the_reader_had_opened() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let snapshot = live_reasoning_run_snapshot(
         session_id,
@@ -4979,7 +4980,7 @@ fn interrupting_a_turn_keeps_the_live_reasoning_row_the_reader_had_opened() {
 
 #[test]
 fn a_turn_fold_reveals_its_reasoning_group_in_the_state_the_reader_left_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -5043,7 +5044,7 @@ fn a_turn_fold_reveals_its_reasoning_group_in_the_state_the_reader_left_it() {
 
 #[test]
 fn a_settled_turn_renders_as_one_marker_between_its_prompt_and_its_answer() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = settled_turn_session(
         workspace.path(),
         "Run the workflow",
@@ -5155,7 +5156,7 @@ fn append_settled_turn(
 
 #[test]
 fn a_settled_turn_whose_only_work_was_empty_reasoning_shows_no_marker() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -5189,7 +5190,7 @@ fn a_settled_turn_whose_only_work_was_empty_reasoning_shows_no_marker() {
 
 #[test]
 fn a_settled_turn_loses_its_marker_only_when_hidden_reasoning_was_all_it_did() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let settled_turn_of = |entries: &[RunEntry]| {
         let mut snapshot = command_run_snapshot(SessionId::new(), workspace.path(), entries);
         snapshot.session.status = SessionStatus::Idle;
@@ -5244,7 +5245,7 @@ fn a_settled_turn_loses_its_marker_only_when_hidden_reasoning_was_all_it_did() {
 
 #[test]
 fn clicking_a_turn_fold_marker_opens_the_turn_and_folds_it_back() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = settled_turn_session(
         workspace.path(),
         "Run the workflow",
@@ -5312,7 +5313,7 @@ fn clicking_a_turn_fold_marker_opens_the_turn_and_folds_it_back() {
 
 #[test]
 fn toggling_the_turn_posture_flips_every_turn_fold_and_clears_per_turn_overrides() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut snapshot = settled_turn_session(
         workspace.path(),
         "Run the workflow",
@@ -5419,7 +5420,7 @@ fn newer_turn_begins(
 
 #[test]
 fn interrupting_a_turn_holds_its_fold_open_until_a_newer_turn_begins() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -5518,7 +5519,7 @@ fn interrupting_a_turn_holds_its_fold_open_until_a_newer_turn_begins() {
 
 #[test]
 fn a_queued_prompt_starting_in_the_settle_commit_refolds_the_interrupted_turn_at_once() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut snapshot = command_run_snapshot(
         SessionId::new(),
         workspace.path(),
@@ -5593,7 +5594,7 @@ fn a_queued_prompt_starting_in_the_settle_commit_refolds_the_interrupted_turn_at
 
 #[test]
 fn a_newer_turn_refolds_the_turn_the_reader_expanded_by_hand() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let snapshot = settled_turn_session(
         workspace.path(),
         "Run the workflow",
@@ -5637,7 +5638,7 @@ fn a_newer_turn_refolds_the_turn_the_reader_expanded_by_hand() {
 
 #[test]
 fn the_transcript_keeps_a_row_of_air_above_the_composer() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     let (session_id, _) = crate::support::enter_session(&mut application, workspace.path());
     application
@@ -5662,7 +5663,7 @@ fn the_transcript_keeps_a_row_of_air_above_the_composer() {
 
 #[test]
 fn the_transcript_keeps_its_margin_when_a_pending_panel_docks_below_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     let (session_id, _) = crate::support::enter_session(&mut application, workspace.path());
     let mut snapshot = navigable_session_snapshot(session_id, workspace.path(), 8);

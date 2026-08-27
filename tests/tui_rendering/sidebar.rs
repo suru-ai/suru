@@ -8,8 +8,9 @@ use std::{
 };
 
 use crate::support::{
-    connected_application, enter_session, failed_session_snapshot, rendered_application_buffer,
-    rendered_application_rows_at, rendered_row, type_terminal_text,
+    connected_application, enter_session, failed_session_snapshot, noncanonical_spelling,
+    rendered_application_buffer, rendered_application_rows_at, rendered_row, type_terminal_text,
+    workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -22,8 +23,7 @@ use suru::{
         SessionCatalogRevision, SessionCatalogSnapshot, SessionCreated, SessionDeleted, SessionId,
         SessionListItem, SessionSettlementChanged, SessionStatus, SessionSummary, SessionTimestamp,
         SessionTitleChanged, SessionWorkingChanged, SettingsSnapshot, SidebarScope,
-        SidebarSettings, SidebarVisibility,
-        UnreadableSessionSummary, Workspace,
+        SidebarSettings, SidebarVisibility, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -42,7 +42,7 @@ const WINDOWED: u16 = 13;
 
 #[test]
 fn the_sidebar_stands_beside_the_landing_and_the_main_view_takes_what_is_left() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(workspace.path(), Vec::new());
 
     let rows = rendered_application_rows_at(&application, WIDE, 20);
@@ -60,7 +60,7 @@ fn the_sidebar_stands_beside_the_landing_and_the_main_view_takes_what_is_left() 
 
 #[test]
 fn the_sidebar_stands_beside_an_open_session_too() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(workspace.path(), Vec::new());
     enter_session(&mut application, workspace.path());
 
@@ -79,7 +79,7 @@ fn the_sidebar_stands_beside_an_open_session_too() {
 
 #[test]
 fn an_active_row_is_three_lines_of_workspace_time_emoji_and_title() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
         vec![listed(
@@ -116,7 +116,7 @@ fn an_active_row_is_three_lines_of_workspace_time_emoji_and_title() {
 
 #[test]
 fn the_compact_time_reads_now_minutes_hours_and_days() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     // What a row reads is the question here, so nothing settles itself and
     // every Session keeps the active row the reading is drawn on.
     let application = sidebar_settling(
@@ -154,7 +154,7 @@ fn the_compact_time_reads_now_minutes_hours_and_days() {
 
 #[test]
 fn the_right_slot_says_working_and_how_long_while_the_latest_turn_is_unsettled() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
         vec![working(
@@ -180,7 +180,7 @@ fn the_right_slot_says_working_and_how_long_while_the_latest_turn_is_unsettled()
 
 #[test]
 fn the_right_slot_falls_back_to_the_compact_time_once_the_turn_settles() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     // The same Session on both readings: one with its latest Turn still
     // running, one with nothing running and five minutes since it last moved.
     let running = listed(
@@ -210,7 +210,7 @@ fn the_right_slot_falls_back_to_the_compact_time_once_the_turn_settles() {
 
 #[test]
 fn the_working_duration_reads_seconds_minutes_and_hours() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
         vec![
@@ -254,7 +254,7 @@ fn the_working_duration_reads_seconds_minutes_and_hours() {
 /// Working label is true rather than as-of-listing.
 #[test]
 fn a_turn_reported_on_the_catalog_stream_moves_the_working_label() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let mut application = sidebar_showing(
         workspace.path(),
@@ -297,7 +297,7 @@ fn a_turn_reported_on_the_catalog_stream_moves_the_working_label() {
 
 #[test]
 fn the_list_is_ordered_by_creation_and_activity_never_reorders_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     // The order of the active list is the question, so nothing settles itself
     // and the whole listing stays on it however long ago each Session moved.
     let application = sidebar_settling(
@@ -317,7 +317,7 @@ fn the_list_is_ordered_by_creation_and_activity_never_reorders_it() {
 
 #[test]
 fn ctrl_b_hides_the_sidebar_and_shows_it_again_without_touching_the_setting() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -355,7 +355,7 @@ fn ctrl_b_hides_the_sidebar_and_shows_it_again_without_touching_the_setting() {
 
 #[test]
 fn the_slash_command_toggles_the_same_sidebar_the_keybinding_does() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -379,7 +379,7 @@ fn the_slash_command_toggles_the_same_sidebar_the_keybinding_does() {
 
 #[test]
 fn a_sidebar_the_setting_hides_is_absent_until_the_reader_asks_for_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
 
     assert_eq!(
@@ -401,7 +401,7 @@ fn a_sidebar_the_setting_hides_is_absent_until_the_reader_asks_for_it() {
 
 #[test]
 fn a_later_settings_snapshot_leaves_the_readers_own_choice_alone() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(workspace.path(), Vec::new());
     press_toggle(&mut application);
 
@@ -415,7 +415,7 @@ fn a_later_settings_snapshot_leaves_the_readers_own_choice_alone() {
 
 #[test]
 fn a_terminal_too_narrow_for_both_keeps_the_main_view_and_forgets_nothing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -442,7 +442,7 @@ fn a_terminal_too_narrow_for_both_keeps_the_main_view_and_forgets_nothing() {
 
 #[test]
 fn the_landing_footer_is_spread_across_the_columns_the_sidebar_left() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(workspace.path(), Vec::new());
 
     let rows = rendered_application_rows_at(&application, WIDE, 20);
@@ -465,7 +465,7 @@ fn the_landing_footer_is_spread_across_the_columns_the_sidebar_left() {
 
 #[test]
 fn a_session_deleted_elsewhere_leaves_the_sidebar_it_was_listed_in() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     let request = expect_sidebar_listing(deliver_initial_visibility(
         &mut application,
@@ -503,7 +503,7 @@ fn a_session_deleted_elsewhere_leaves_the_sidebar_it_was_listed_in() {
 
 #[test]
 fn an_overlay_opens_over_the_main_view_and_never_over_the_sidebar() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -694,7 +694,7 @@ fn days_ago(days: u64) -> u64 {
 
 #[test]
 fn the_sidebar_survives_every_terminal_the_frame_will_draw() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
         vec![
@@ -737,7 +737,7 @@ fn the_sidebar_survives_every_terminal_the_frame_will_draw() {
 
 #[test]
 fn the_initial_visibility_setting_shows_the_sidebar_without_taking_the_keys() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -755,7 +755,7 @@ fn the_initial_visibility_setting_shows_the_sidebar_without_taking_the_keys() {
 
 #[test]
 fn opening_the_sidebar_takes_the_keys_from_the_composer() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -781,7 +781,7 @@ fn opening_the_sidebar_takes_the_keys_from_the_composer() {
 
 #[test]
 fn the_arrows_move_the_selection_and_wrap_past_the_ends() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
@@ -819,7 +819,7 @@ fn the_arrows_move_the_selection_and_wrap_past_the_ends() {
 
 #[test]
 fn the_column_windows_onto_the_selection_for_a_list_longer_than_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let sessions = (1..=6)
         .map(|index| {
             listed(
@@ -860,7 +860,7 @@ fn the_column_windows_onto_the_selection_for_a_list_longer_than_it() {
 
 #[test]
 fn enter_attaches_the_selected_session_in_place() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_focused(
         workspace.path(),
@@ -882,7 +882,7 @@ fn enter_attaches_the_selected_session_in_place() {
 
 #[test]
 fn the_attached_session_hands_the_keys_back_to_the_composer() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_focused(
         workspace.path(),
@@ -913,7 +913,7 @@ fn the_attached_session_hands_the_keys_back_to_the_composer() {
 
 #[test]
 fn esc_hands_the_keys_back_without_hiding_the_sidebar() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -947,7 +947,7 @@ fn esc_hands_the_keys_back_without_hiding_the_sidebar() {
 
 #[test]
 fn the_toggle_closes_the_sidebar_from_inside_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -971,7 +971,7 @@ fn the_toggle_closes_the_sidebar_from_inside_it() {
 
 #[test]
 fn an_open_overlay_keeps_the_keys_while_the_sidebar_holds_focus() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
@@ -1004,7 +1004,7 @@ fn an_open_overlay_keeps_the_keys_while_the_sidebar_holds_focus() {
 
 #[test]
 fn a_session_suru_cannot_read_is_not_attached() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![SessionListItem::Unreadable(UnreadableSessionSummary {
@@ -1027,7 +1027,7 @@ fn a_session_suru_cannot_read_is_not_attached() {
 
 #[test]
 fn a_terminal_too_narrow_to_draw_the_sidebar_leaves_the_keys_with_the_composer() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -1049,7 +1049,7 @@ fn a_terminal_too_narrow_to_draw_the_sidebar_leaves_the_keys_with_the_composer()
 /// not, on any account, to the composer that does not have the keys.
 #[test]
 fn a_paste_goes_to_the_search_box_rather_than_the_composer() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
@@ -1080,7 +1080,7 @@ fn a_paste_goes_to_the_search_box_rather_than_the_composer() {
 
 #[test]
 fn the_keys_after_the_toggle_reach_the_sidebar_before_the_next_frame() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     deliver_initial_visibility(&mut application, SidebarVisibility::Hidden);
     // A frame with no Sidebar on it, which is the state the toggle acts from.
@@ -1107,7 +1107,7 @@ fn the_keys_after_the_toggle_reach_the_sidebar_before_the_next_frame() {
 
 #[test]
 fn the_window_holds_still_while_the_selection_moves_inside_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let sessions = (1..=6)
         .map(|index| {
             listed(
@@ -1190,7 +1190,7 @@ fn selected_sidebar_text(application: &Application) -> String {
 
 #[test]
 fn a_settled_session_stands_below_the_divider_as_one_slim_line() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
         vec![
@@ -1244,7 +1244,7 @@ fn a_settled_session_stands_below_the_divider_as_one_slim_line() {
 
 #[test]
 fn the_settled_shelf_orders_by_when_the_work_ended() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     // Creation order and activity order both disagree with the order the work
     // ended in, so a shelf reading either would be caught out.
     let application = sidebar_showing(
@@ -1290,7 +1290,7 @@ fn the_settled_shelf_orders_by_when_the_work_ended() {
 
 #[test]
 fn a_session_settled_elsewhere_moves_shelves_and_comes_back_when_it_is_unsettled() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     let request = expect_sidebar_listing(deliver_initial_visibility(
         &mut application,
@@ -1339,7 +1339,7 @@ fn a_session_settled_elsewhere_moves_shelves_and_comes_back_when_it_is_unsettled
 
 #[test]
 fn a_listing_refreshed_with_a_settled_marker_moves_the_session_onto_the_shelf() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let set_apart = SessionId::new();
     let steady = SessionId::new();
     let listing = |settled: bool| {
@@ -1384,7 +1384,7 @@ fn a_listing_refreshed_with_a_settled_marker_moves_the_session_onto_the_shelf() 
 
 #[test]
 fn a_never_prompted_session_lists_as_active() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     // A Session made and then left alone: no Prompt, so nothing has moved it
     // since — which is why the idle it has been sitting in settles nothing.
     let application = sidebar_showing(
@@ -1413,7 +1413,7 @@ fn a_never_prompted_session_lists_as_active() {
 /// Sidebar reads its last activity against the threshold each time it lists.
 #[test]
 fn a_session_left_alone_past_the_threshold_settles_itself() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
         vec![
@@ -1436,7 +1436,7 @@ fn a_session_left_alone_past_the_threshold_settles_itself() {
 
 #[test]
 fn the_idle_setting_says_how_long_being_left_alone_has_to_be() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_settling(
         workspace.path(),
         AutoSettle::Idle(7),
@@ -1462,7 +1462,7 @@ fn the_idle_setting_says_how_long_being_left_alone_has_to_be() {
 
 #[test]
 fn turning_auto_settle_off_leaves_only_what_the_reader_settled_on_the_shelf() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_settling(
         workspace.path(),
         AutoSettle::Off,
@@ -1486,7 +1486,7 @@ fn turning_auto_settle_off_leaves_only_what_the_reader_settled_on_the_shelf() {
 
 #[test]
 fn a_session_the_reader_settled_stays_settled_however_recently_it_moved() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
         vec![settled(
@@ -1511,7 +1511,7 @@ fn a_session_the_reader_settled_stays_settled_however_recently_it_moved() {
 /// activity — the moment the idle it settled for began.
 #[test]
 fn a_session_that_settled_itself_stands_and_reads_by_its_last_activity() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
         vec![
@@ -1544,7 +1544,7 @@ fn a_session_that_settled_itself_stands_and_reads_by_its_last_activity() {
 /// read afresh on the next frame, so the shelves move without a new listing.
 #[test]
 fn moving_the_auto_settle_settings_reclassifies_the_sidebar_in_place() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
         vec![listed("Left alone", None, workspace.path(), 1, days_ago(5))],
@@ -1580,7 +1580,7 @@ fn moving_the_auto_settle_settings_reclassifies_the_sidebar_in_place() {
 /// derives cannot put back what the reader just took off the shelf.
 #[test]
 fn a_session_unsettled_after_a_long_idle_comes_back_to_the_active_list() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let set_apart = SessionId::new();
     let mut application = sidebar_showing(
         workspace.path(),
@@ -1624,7 +1624,7 @@ fn a_session_unsettled_after_a_long_idle_comes_back_to_the_active_list() {
 /// does the idle the Sidebar derives.
 #[test]
 fn a_session_suru_cannot_read_never_settles_however_long_it_has_sat() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
         vec![
@@ -1650,7 +1650,7 @@ fn a_session_suru_cannot_read_never_settles_however_long_it_has_sat() {
 
 #[test]
 fn the_arrows_walk_across_the_divider_onto_the_settled_shelf() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
@@ -1696,7 +1696,7 @@ fn the_arrows_walk_across_the_divider_onto_the_settled_shelf() {
 /// tail stands behind an affordance.
 #[test]
 fn the_settled_shelf_shows_ten_rows_and_offers_the_rest() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(workspace.path(), set_aside_shelf(workspace.path(), 12));
 
     let rows = rendered_application_rows_at(&application, WIDE, 20);
@@ -1725,7 +1725,7 @@ fn the_settled_shelf_shows_ten_rows_and_offers_the_rest() {
 
 #[test]
 fn the_affordance_shows_twenty_five_more_and_repeats_to_the_end_of_the_shelf() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), set_aside_shelf(workspace.path(), 40));
 
     // Past the top of the list is the selector's own line — the add-Workspace
@@ -1783,7 +1783,7 @@ fn the_affordance_shows_twenty_five_more_and_repeats_to_the_end_of_the_shelf() {
 /// body of work.
 #[test]
 fn a_sidebar_asking_for_its_sessions_afresh_opens_the_shelf_on_its_first_rows() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), set_aside_shelf(workspace.path(), 12));
     // Up off the list onto the selector's own line — the add-Workspace
     // affordance, then the selector — and up again onto the affordance at the
@@ -1954,7 +1954,7 @@ fn set_aside(session: SessionListItem, settled_at: u64) -> SessionListItem {
 /// searching, so the way to narrow a long list is always in view.
 #[test]
 fn the_search_box_stands_at_the_top_of_the_sidebar() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -1972,7 +1972,7 @@ fn the_search_box_stands_at_the_top_of_the_sidebar() {
 /// remember them.
 #[test]
 fn typing_narrows_the_sidebar_by_title_whatever_case_either_is_in() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
@@ -2003,7 +2003,7 @@ fn typing_narrows_the_sidebar_by_title_whatever_case_either_is_in() {
 /// rows standing they cannot see the reason for.
 #[test]
 fn the_query_has_to_run_whole_through_the_title() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![listed("Sidebar shell", None, workspace.path(), 1, now())],
@@ -2022,7 +2022,7 @@ fn the_query_has_to_run_whole_through_the_title() {
 /// shelf, so a query puts both shelves away and answers with one list.
 #[test]
 fn a_query_replaces_both_shelves_with_one_flat_list_in_shelf_order() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
@@ -2060,7 +2060,7 @@ fn a_query_replaces_both_shelves_with_one_flat_list_in_shelf_order() {
 /// A query is the reader narrowing it themselves, so every result stands.
 #[test]
 fn a_query_shows_every_result_rather_than_a_capped_shelf() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), set_aside_shelf(workspace.path(), 12));
 
     type_terminal_text(&mut application, "ended");
@@ -2078,7 +2078,7 @@ fn a_query_shows_every_result_rather_than_a_capped_shelf() {
 
 #[test]
 fn a_query_nothing_carries_says_so_rather_than_drawing_an_empty_column() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![listed("Sidebar shell", None, workspace.path(), 1, now())],
@@ -2099,7 +2099,7 @@ fn a_query_nothing_carries_says_so_rather_than_drawing_an_empty_column() {
 
 #[test]
 fn backspace_takes_the_query_back_a_letter_and_widens_the_results() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
@@ -2133,7 +2133,7 @@ fn backspace_takes_the_query_back_a_letter_and_widens_the_results() {
 /// Esc backs out one step at a time: the query first, and only then the keys.
 #[test]
 fn esc_clears_the_query_and_keeps_the_keys_in_the_sidebar() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
@@ -2173,7 +2173,7 @@ fn esc_clears_the_query_and_keeps_the_keys_in_the_sidebar() {
 
 #[test]
 fn enter_attaches_the_result_the_reader_is_on() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_focused(
         workspace.path(),
@@ -2201,7 +2201,7 @@ fn enter_attaches_the_result_the_reader_is_on() {
 /// not one the reader can land on.
 #[test]
 fn the_arrows_walk_the_results_and_wrap_within_them() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
@@ -2237,7 +2237,7 @@ fn the_arrows_walk_the_results_and_wrap_within_them() {
 /// asks for its Sessions afresh, and that look is over.
 #[test]
 fn a_sidebar_coming_back_into_view_opens_on_the_whole_list_again() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let sessions = vec![
         listed("Sidebar shell", None, workspace.path(), 2, now()),
         listed("Codex runtime", None, workspace.path(), 1, now()),
@@ -2267,7 +2267,7 @@ fn a_sidebar_coming_back_into_view_opens_on_the_whole_list_again() {
 /// carry the row the reader is on out of the results under them.
 #[test]
 fn a_result_retitled_elsewhere_out_of_the_query_takes_the_reader_with_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let moved = SessionId::new();
     let mut application = sidebar_focused(
         workspace.path(),
@@ -2308,7 +2308,7 @@ fn a_result_retitled_elsewhere_out_of_the_query_takes_the_reader_with_it() {
 /// beginning: a reader watches the letters they are typing.
 #[test]
 fn a_long_query_keeps_its_end_in_the_box() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -2328,7 +2328,7 @@ fn a_long_query_keeps_its_end_in_the_box() {
 /// matches anything, so the refusal is the only account the column gives.
 #[test]
 fn a_refused_listing_says_so_rather_than_blaming_the_query() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     deliver_initial_visibility(&mut application, SidebarVisibility::Hidden);
     let request = expect_sidebar_listing(press_toggle(&mut application));
@@ -2451,7 +2451,7 @@ fn two_listed(workspace: &Path, wanted: SessionId) -> Vec<SessionListItem> {
 /// and it opens the row it landed on rather than the row they were on.
 #[test]
 fn a_left_press_on_a_row_attaches_the_session_it_stands_on() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
 
@@ -2466,7 +2466,7 @@ fn a_left_press_on_a_row_attaches_the_session_it_stands_on() {
 /// brings up more of the shelf rather than opening anything.
 #[test]
 fn a_left_press_on_the_shelf_affordance_brings_up_more_of_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(workspace.path(), set_aside_shelf(workspace.path(), 12));
 
     assert_eq!(
@@ -2487,7 +2487,7 @@ fn a_left_press_on_the_shelf_affordance_brings_up_more_of_it() {
 /// and the main view beside the column all stand for no Session.
 #[test]
 fn a_left_press_off_the_rows_attaches_nothing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_showing(
         workspace.path(),
@@ -2526,7 +2526,7 @@ fn a_left_press_off_the_rows_attaches_nothing() {
 /// since squeezed out has drawn nothing, so it answers nothing.
 #[test]
 fn a_press_resolves_against_the_frame_in_force_rather_than_the_one_before_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
     let row = drawn_at(&application, "Wanted work");
@@ -2547,7 +2547,7 @@ fn a_press_resolves_against_the_frame_in_force_rather_than_the_one_before_it() {
 /// aside, and either way the Session can be taken away.
 #[test]
 fn a_right_press_on_an_active_row_offers_settle_and_delete() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
 
@@ -2563,7 +2563,7 @@ fn a_right_press_on_an_active_row_offers_settle_and_delete() {
 
 #[test]
 fn a_right_press_on_a_settled_row_offers_unsettle_and_delete() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
         vec![
@@ -2591,7 +2591,7 @@ fn a_right_press_on_a_settled_row_offers_unsettle_and_delete() {
 
 #[test]
 fn the_menu_sets_the_row_it_stands_on_aside() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
 
@@ -2613,7 +2613,7 @@ fn the_menu_sets_the_row_it_stands_on_aside() {
 
 #[test]
 fn the_menu_takes_a_settled_row_back_off_the_shelf() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let brought_back = SessionId::new();
     let mut application = sidebar_showing(
         workspace.path(),
@@ -2642,7 +2642,7 @@ fn the_menu_takes_a_settled_row_back_off_the_shelf() {
 /// away, so the item asks again before it acts.
 #[test]
 fn the_menu_asks_again_before_it_deletes() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
 
@@ -2674,7 +2674,7 @@ fn the_menu_asks_again_before_it_deletes() {
 /// menu is not also acting on whatever it was drawn over.
 #[test]
 fn a_press_outside_the_menu_puts_it_away_and_nothing_more() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
 
@@ -2693,7 +2693,7 @@ fn a_press_outside_the_menu_puts_it_away_and_nothing_more() {
 /// whether or not the Sidebar itself does.
 #[test]
 fn the_menu_answers_the_arrows_and_backs_out_on_esc() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
 
@@ -2737,7 +2737,7 @@ fn menu_is_drawn(application: &Application) -> bool {
 /// the menu, as they keep the focus, and both come back when it widens.
 #[test]
 fn a_terminal_too_narrow_for_the_sidebar_draws_no_menu_and_holds_no_keys() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
     let _ = open_menu_on(&mut application, "Wanted work");
@@ -2761,7 +2761,7 @@ fn a_terminal_too_narrow_for_the_sidebar_draws_no_menu_and_holds_no_keys() {
 /// asks for nothing rather than carrying the reader onto whatever it covers.
 #[test]
 fn a_right_press_inside_the_menu_leaves_it_where_it_is() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
 
@@ -2793,7 +2793,7 @@ const ALL_WORKSPACES: &str = "All Workspaces";
 /// about the work itself.
 #[test]
 fn the_selector_stands_under_the_search_box_and_says_what_is_in_scope() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -2813,7 +2813,7 @@ fn the_selector_stands_under_the_search_box_and_says_what_is_in_scope() {
 /// yet, because it is where the next Session will be.
 #[test]
 fn the_selector_lists_all_workspaces_first_then_the_workspaces_it_has_work_in() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
@@ -2836,11 +2836,66 @@ fn the_selector_lists_all_workspaces_first_then_the_workspaces_it_has_work_in() 
     );
 }
 
+/// The client and the server must never hold two spellings of the same
+/// directory: the selector's entries are read off the listing the server
+/// canonicalized, plus the Workspace the client itself runs in, and a launch
+/// spelling of its own would stand beside the server's as a second entry.
+#[test]
+fn the_selector_lists_one_entry_for_the_launch_workspace_however_it_was_spelled() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(
+        &noncanonical_spelling(&workspace),
+        vec![listed("Rooted here", None, workspace.path(), 1, now())],
+    );
+
+    open_selector(&mut application);
+
+    assert_eq!(
+        selector_entries(&application),
+        vec![ALL_WORKSPACES.to_owned(), workspace_name(workspace.path())],
+        "the Workspace the client runs in and the one the server lists its \
+         Sessions under are the same entry"
+    );
+}
+
+/// A directory reached through a symlink is the case the launch spelling
+/// actually differs in outside Windows: the server roots the Session at the
+/// canonical directory, and a client launched at the symlink must narrow to
+/// the same Workspace rather than to its own spelling of it.
+#[cfg(unix)]
+#[test]
+fn a_client_launched_through_a_symlink_narrows_to_the_workspace_the_server_reports() {
+    let root = tempfile::tempdir().expect("create fixture root");
+    let real = root.path().join("real");
+    std::fs::create_dir(&real).expect("create the Workspace directory");
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("reach the Workspace through a symlink");
+    let canonical = std::fs::canonicalize(&real).expect("canonicalize the Workspace fixture");
+
+    let application = sidebar_scoped(
+        &link,
+        SidebarScope::CurrentWorkspace,
+        vec![listed("Rooted here", None, &canonical, 1, now())],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        drawn_in_sidebar(&rows, "Rooted here"),
+        "narrowing to the current Workspace holds the work the server rooted \
+         at the directory the symlink reaches: {rows:?}"
+    );
+    assert_eq!(
+        selector_label(&rows),
+        format!("▸ {}", workspace_name(&canonical)),
+        "and the selector names the Workspace by the server's reading: {rows:?}"
+    );
+}
+
 /// Choosing an entry narrows the whole Sidebar to that Workspace: the active
 /// list, the settled shelf, and the results a query answers with.
 #[test]
 fn choosing_a_workspace_narrows_both_shelves() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), two_workspaces(workspace.path()));
 
     choose_workspace(&mut application, "notes");
@@ -2863,7 +2918,7 @@ fn choosing_a_workspace_narrows_both_shelves() {
 
 #[test]
 fn choosing_all_workspaces_widens_the_sidebar_again() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), two_workspaces(workspace.path()));
     choose_workspace(&mut application, "notes");
 
@@ -2882,7 +2937,7 @@ fn choosing_all_workspaces_widens_the_sidebar_again() {
 /// narrows what searching can turn up.
 #[test]
 fn a_query_answers_within_the_workspace_the_selector_is_narrowed_to() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), two_workspaces(workspace.path()));
     choose_workspace(&mut application, "notes");
 
@@ -2903,7 +2958,7 @@ fn a_query_answers_within_the_workspace_the_selector_is_narrowed_to() {
 /// selector is the reader's to move afterwards.
 #[test]
 fn the_initial_scope_setting_narrows_the_sidebar_a_tui_launches_with() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_scoped(
         workspace.path(),
         SidebarScope::CurrentWorkspace,
@@ -2926,7 +2981,7 @@ fn the_initial_scope_setting_narrows_the_sidebar_a_tui_launches_with() {
 /// snapshot carrying some other Setting's edit does not undo it.
 #[test]
 fn a_scope_the_reader_chose_is_ephemeral_and_survives_a_later_snapshot() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_scoped(
         workspace.path(),
         SidebarScope::CurrentWorkspace,
@@ -2959,7 +3014,7 @@ fn a_scope_the_reader_chose_is_ephemeral_and_survives_a_later_snapshot() {
 /// are the innermost of them.
 #[test]
 fn esc_closes_the_selector_before_it_gives_up_the_query() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), two_workspaces(workspace.path()));
     type_terminal_text(&mut application, "work");
     open_selector(&mut application);
@@ -2982,7 +3037,7 @@ fn esc_closes_the_selector_before_it_gives_up_the_query() {
 /// entries, and a press on one of them chooses it.
 #[test]
 fn a_press_on_the_selector_opens_it_and_a_press_on_an_entry_chooses_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(workspace.path(), two_workspaces(workspace.path()));
 
     assert_eq!(
@@ -3018,7 +3073,7 @@ fn a_press_on_the_selector_opens_it_and_a_press_on_an_entry_chooses_it() {
 /// above the list, so moving off the top of the list lands on it.
 #[test]
 fn the_arrows_reach_the_selector_above_the_list() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -3045,7 +3100,7 @@ fn the_arrows_reach_the_selector_above_the_list() {
 /// where work is, and a Session nobody can place is not work it can hide.
 #[test]
 fn a_session_suru_cannot_place_stands_however_narrow_the_scope() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut sessions = two_workspaces(workspace.path());
     sessions.push(SessionListItem::Unreadable(UnreadableSessionSummary {
         id: SessionId::new(),
@@ -3170,7 +3225,7 @@ const WORKSPACE_ENTRY: &str = "Workspace:";
 
 #[test]
 fn the_add_workspace_affordance_stands_beside_the_selector() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -3194,7 +3249,7 @@ fn the_add_workspace_affordance_stands_beside_the_selector() {
 /// open.
 #[test]
 fn the_affordance_opens_a_path_entry_in_place_of_the_list() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -3221,7 +3276,7 @@ fn the_affordance_opens_a_path_entry_in_place_of_the_list() {
 /// type into it, whether they asked with the pointer or with Enter.
 #[test]
 fn the_path_entry_takes_what_the_reader_types_rather_than_the_composer() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(workspace.path(), Vec::new());
     press_add_workspace(&mut application);
 
@@ -3245,7 +3300,7 @@ fn the_path_entry_takes_what_the_reader_types_rather_than_the_composer() {
 /// Workspace this client works in, and the selector narrows to it.
 #[test]
 fn a_directory_the_reader_names_becomes_the_workspace_the_selector_narrows_to() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let added = workspace.path().join("notes");
     std::fs::create_dir(&added).expect("create the directory the reader adds");
     let mut application = sidebar_showing(
@@ -3274,7 +3329,7 @@ fn a_directory_the_reader_names_becomes_the_workspace_the_selector_narrows_to() 
 /// is the whole reason for naming it.
 #[test]
 fn the_workspace_the_reader_added_roots_the_sessions_they_make_next() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let added = workspace.path().join("notes");
     std::fs::create_dir(&added).expect("create the directory the reader adds");
     let mut application = sidebar_showing(workspace.path(), Vec::new());
@@ -3306,7 +3361,7 @@ fn the_workspace_the_reader_added_roots_the_sessions_they_make_next() {
 /// the selector afterwards.
 #[test]
 fn the_workspace_the_reader_added_stands_among_the_selectors_entries() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let added = workspace.path().join("notes");
     std::fs::create_dir(&added).expect("create the directory the reader adds");
     let mut application = sidebar_showing(
@@ -3339,7 +3394,7 @@ fn the_workspace_the_reader_added_stands_among_the_selectors_entries() {
 /// Sidebar goes on answering for the Workspace it was answering for.
 #[test]
 fn a_path_naming_no_directory_is_refused_inline_and_moves_nothing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -3375,7 +3430,7 @@ fn a_path_naming_no_directory_is_refused_inline_and_moves_nothing() {
 /// a Workspace is rooted at a directory, and a file is not one.
 #[test]
 fn a_path_naming_a_file_is_refused_as_something_other_than_a_directory() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let file = workspace.path().join("notes.md");
     std::fs::write(&file, "not a directory").expect("write the file the reader names");
     let mut application = sidebar_showing(workspace.path(), Vec::new());
@@ -3392,7 +3447,7 @@ fn a_path_naming_a_file_is_refused_as_something_other_than_a_directory() {
 
 #[test]
 fn an_empty_path_is_refused_rather_than_taken() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(workspace.path(), Vec::new());
 
     add_workspace(&mut application, "");
@@ -3409,7 +3464,7 @@ fn an_empty_path_is_refused_rather_than_taken() {
 /// takes it away rather than leaving it standing over a path it never read.
 #[test]
 fn typing_after_a_refusal_takes_the_refusal_away() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(workspace.path(), Vec::new());
     add_workspace(&mut application, "");
 
@@ -3427,7 +3482,7 @@ fn typing_after_a_refusal_takes_the_refusal_away() {
 /// the innermost of them.
 #[test]
 fn esc_gives_up_the_path_entry_and_leaves_the_workspace_where_it_was() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let added = workspace.path().join("notes");
     std::fs::create_dir(&added).expect("create a directory the reader does not take");
     let mut application = sidebar_showing(
@@ -3454,7 +3509,7 @@ fn esc_gives_up_the_path_entry_and_leaves_the_workspace_where_it_was() {
 /// Sidebar is drivable from the keyboard alone.
 #[test]
 fn the_arrows_reach_the_affordance_beside_the_selector() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -3480,7 +3535,7 @@ fn the_arrows_reach_the_affordance_beside_the_selector() {
 /// which is the same reading on every platform.
 #[test]
 fn a_relative_path_is_read_from_the_workspace_the_client_is_in() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     std::fs::create_dir(workspace.path().join("notes")).expect("create the directory named");
     let mut application = sidebar_showing(workspace.path(), Vec::new());
 
@@ -3497,7 +3552,7 @@ fn a_relative_path_is_read_from_the_workspace_the_client_is_in() {
 /// in the composer, so the keys go back the moment the Workspace is taken.
 #[test]
 fn taking_a_workspace_hands_the_keys_back_to_the_composer() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let added = workspace.path().join("notes");
     std::fs::create_dir(&added).expect("create the directory the reader adds");
     let mut application = sidebar_showing(workspace.path(), Vec::new());
@@ -3519,7 +3574,7 @@ fn taking_a_workspace_hands_the_keys_back_to_the_composer() {
 /// directory would hide the very Sessions it had just rooted there.
 #[test]
 fn the_workspace_taken_is_the_directory_read_the_way_the_server_reads_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let added = workspace.path().join("notes");
     std::fs::create_dir(&added).expect("create the directory the reader adds");
     let canonical = std::fs::canonicalize(&added).expect("canonicalize it");
@@ -3575,7 +3630,7 @@ fn the_workspace_taken_is_the_directory_read_the_way_the_server_reads_it() {
 /// the same way, so the line that opened it goes on answering the pointer.
 #[test]
 fn a_press_on_the_line_that_opened_the_entry_gives_it_up() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
         vec![listed("Listed work", None, workspace.path(), 1, now())],
@@ -3603,7 +3658,7 @@ fn a_press_on_the_line_that_opened_the_entry_gives_it_up() {
 /// session picker narrows to "where I am" too, and where they are has moved.
 #[test]
 fn the_session_picker_narrows_to_the_workspace_the_reader_added() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let added = workspace.path().join("notes");
     std::fs::create_dir(&added).expect("create the directory the reader adds");
     let canonical = std::fs::canonicalize(&added).expect("canonicalize it");
@@ -3672,7 +3727,7 @@ fn add_workspace(application: &mut Application, path: &str) -> ApplicationTransi
 /// asking the server again for everything it does not say.
 #[test]
 fn every_catalog_change_asks_the_sidebar_for_the_listing_again() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let listed_session = SessionId::new();
     let mut application = sidebar_showing(
         workspace.path(),
@@ -3760,7 +3815,7 @@ fn every_catalog_change_asks_the_sidebar_for_the_listing_again() {
 
 #[test]
 fn a_session_made_elsewhere_arrives_in_the_sidebar() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let standing = listed_as(SessionId::new(), "Work already listed", workspace.path(), 1);
     let mut application = sidebar_showing(workspace.path(), vec![standing.clone()]);
 
@@ -3800,7 +3855,7 @@ fn a_session_made_elsewhere_arrives_in_the_sidebar() {
 /// retitled, set aside — comes back with the listing it asks for in answer.
 #[test]
 fn a_reconnection_brings_the_sidebar_the_work_it_missed() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let kept = SessionId::new();
     let mut application = sidebar_showing(
         workspace.path(),
@@ -3850,7 +3905,7 @@ fn a_reconnection_brings_the_sidebar_the_work_it_missed() {
 /// for it, and only the listing the Sidebar catches up with carries that.
 #[test]
 fn a_session_unsettled_elsewhere_comes_back_when_the_catch_up_lands() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let set_apart = SessionId::new();
     let mut application = sidebar_showing(
         workspace.path(),
@@ -3890,7 +3945,7 @@ fn a_session_unsettled_elsewhere_comes_back_when_the_catch_up_lands() {
 /// so it leaves everything they are in the middle of exactly where it is.
 #[test]
 fn a_catch_up_leaves_the_reader_on_the_row_they_were_on() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let newer = SessionId::new();
     let older = SessionId::new();
     let listing = |extra: Option<SessionId>| {
@@ -3928,7 +3983,7 @@ fn a_catch_up_leaves_the_reader_on_the_row_they_were_on() {
 
 #[test]
 fn a_catch_up_leaves_the_settled_shelf_as_deep_as_the_reader_walked_it() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), set_aside_shelf(workspace.path(), 12));
     // Up off the list onto the selector's own line — the add-Workspace
     // affordance, then the selector — and up again onto the affordance at the
@@ -3964,7 +4019,7 @@ fn a_catch_up_leaves_the_settled_shelf_as_deep_as_the_reader_walked_it() {
 
 #[test]
 fn a_catch_up_leaves_a_menu_the_reader_opened_standing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let wanted = SessionId::new();
     let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
     let _ = open_menu_on(&mut application, "Wanted work");
@@ -4010,7 +4065,7 @@ fn a_catch_up_leaves_a_menu_the_reader_opened_standing() {
 /// catalog moves. Opening it asks anyway, so nothing is missed by not asking.
 #[test]
 fn a_sidebar_the_reader_closed_asks_for_nothing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
         vec![listed_as(
@@ -4052,7 +4107,7 @@ fn a_sidebar_the_reader_closed_asks_for_nothing() {
 /// screen — and those must cost no frame at all.
 #[test]
 fn a_catch_up_answering_with_the_listing_already_drawn_costs_no_frame() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let set_apart = SessionId::new();
     let standing = listed_at(
         set_apart,
@@ -4093,7 +4148,7 @@ fn a_catch_up_answering_with_the_listing_already_drawn_costs_no_frame() {
 /// twice — and the reply to the one the Sidebar has moved past is a straggler.
 #[test]
 fn a_stale_listing_reply_lands_nowhere_and_costs_no_frame() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let standing = listed_as(SessionId::new(), "Listed work", workspace.path(), 1);
     let mut application = sidebar_showing(workspace.path(), vec![standing.clone()]);
 

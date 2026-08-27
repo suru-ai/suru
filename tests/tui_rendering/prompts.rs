@@ -2,7 +2,7 @@
 
 use crate::support::{
     FailedTurnFixture, enter_active_session, enter_session, rendered_application_rows,
-    type_terminal_text,
+    type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
@@ -18,7 +18,7 @@ use suru::{
 
 #[test]
 fn new_session_keybinding_defers_creation_until_the_next_prompt() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (_, old_snapshot, _) = enter_active_session(&mut application, workspace.path());
     application
@@ -87,7 +87,7 @@ fn new_session_keybinding_defers_creation_until_the_next_prompt() {
 
 #[test]
 fn new_session_releases_a_detached_prompt_after_its_admission_succeeds() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (_, _, _) = enter_active_session(&mut application, workspace.path());
     application
@@ -133,7 +133,7 @@ fn new_session_releases_a_detached_prompt_after_its_admission_succeeds() {
 
 #[test]
 fn provisional_steer_is_immediate_single_and_reconciles_in_place() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (session_id, initial_snapshot) = enter_session(&mut application, workspace.path());
 
@@ -190,7 +190,7 @@ fn provisional_steer_is_immediate_single_and_reconciles_in_place() {
 
 #[test]
 fn admitted_active_steer_stays_visible_while_the_composer_accepts_another_prompt() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (session_id, snapshot, _) = enter_active_session(&mut application, workspace.path());
 
@@ -245,7 +245,7 @@ fn admitted_active_steer_stays_visible_while_the_composer_accepts_another_prompt
 
 #[test]
 fn queued_prompt_docks_immediately_and_scoped_mode_preserves_the_draft() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (session_id, snapshot, _) = enter_active_session(&mut application, workspace.path());
 
@@ -365,7 +365,7 @@ fn queued_prompt_docks_immediately_and_scoped_mode_preserves_the_draft() {
 
 #[test]
 fn escape_confirmation_is_local_and_targets_the_observed_active_turn() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (expected_session_id, snapshot, active_turn_id) =
         enter_active_session(&mut application, workspace.path());
@@ -413,7 +413,7 @@ fn escape_confirmation_is_local_and_targets_the_observed_active_turn() {
 
 #[test]
 fn failed_admission_restores_stable_prompt_and_saves_intervening_input_to_history() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     enter_session(&mut application, workspace.path());
 
@@ -482,7 +482,7 @@ fn failed_admission_restores_stable_prompt_and_saves_intervening_input_to_histor
 
 #[test]
 fn authoritative_delivery_after_an_ambiguous_failure_removes_the_restored_retry() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let (session_id, snapshot) = enter_session(&mut application, workspace.path());
     application

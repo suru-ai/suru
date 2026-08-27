@@ -2,7 +2,7 @@
 
 use crate::support::{
     model_descriptor, rendered_application_rows, rendered_application_rows_at, rendered_row,
-    selected_session_snapshot, type_terminal_text,
+    selected_session_snapshot, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
@@ -514,7 +514,7 @@ fn model_picker_refresh_failure_preserves_the_visible_selection() {
 
 #[test]
 fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let authoritative = AgentSelection {
         provider: ProviderId::new("codex"),
@@ -759,7 +759,7 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
 
 #[test]
 fn landing_model_selection_and_new_session_inherit_complete_agent_selection() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
     let ApplicationTransition::ListModels(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
@@ -880,7 +880,7 @@ fn landing_model_selection_and_new_session_inherit_complete_agent_selection() {
 
 #[test]
 fn open_model_picker_refocuses_on_an_authoritative_multi_client_update() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let session_id = SessionId::new();
     let old = AgentSelection {
         provider: ProviderId::new("codex"),

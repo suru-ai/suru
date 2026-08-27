@@ -877,7 +877,7 @@ fn session_picker_row_text(row: SessionPickerRow<'_>, width: usize, now: u64) ->
             .saturating_sub(separator.width());
         if path_budget > 0 {
             metadata.push(truncate_from_left_to_width(
-                workspace.to_string_lossy().as_ref(),
+                &legible_workspace(workspace),
                 path_budget,
             ));
         }
@@ -1377,6 +1377,31 @@ fn sidebar_selector_line(
 /// It is drawn as the search box is — a label and what the reader has typed,
 /// held to its end so the part of a long path that says which directory it is
 /// stays in view — with what their last path was refused for beneath it.
+/// A Workspace path as a frame says it. On Windows the canonical form — the
+/// one the client launches with and the server roots Sessions at — is
+/// verbatim (`\\?\C:\…`, `\\?\UNC\server\share\…`), a prefix no reader types
+/// and no shell needs, so what is said drops it while the path everything
+/// compares stays canonical. Everywhere else the display is the path.
+fn legible_workspace(path: &Path) -> String {
+    let spelled = path.to_string_lossy();
+    if cfg!(windows)
+        && let Some(dropped) = verbatim_prefix_dropped(&spelled)
+    {
+        return dropped;
+    }
+    spelled.into_owned()
+}
+
+/// The spelling with Windows's verbatim prefix dropped, and `None` where it
+/// carries none. Split from [`legible_workspace`]'s platform gate so every
+/// platform's tests exercise the dropping itself.
+fn verbatim_prefix_dropped(spelled: &str) -> Option<String> {
+    if let Some(share) = spelled.strip_prefix(r"\\?\UNC\") {
+        return Some(format!(r"\\{share}"));
+    }
+    spelled.strip_prefix(r"\\?\").map(str::to_owned)
+}
+
 fn sidebar_workspace_entry_lines(
     entry: &SidebarWorkspaceEntryView<'_>,
     width: usize,
@@ -1635,7 +1660,10 @@ fn render_landing(
         .saturating_sub(horizontal_padding(area.width).saturating_mul(2));
     let agent = agent_selection_context(state, footer_detail);
     let context = if footer_detail.shows_secondary() {
-        format!("{agent} · Workspace {}", state.workspace.to_string_lossy())
+        format!(
+            "{agent} · Workspace {}",
+            legible_workspace(&state.workspace)
+        )
     } else {
         agent
     };
@@ -2061,7 +2089,7 @@ fn render_session_header(
         truncate_to_width(
             &format!(
                 " · Workspace {}",
-                snapshot.session.workspace.path.to_string_lossy()
+                legible_workspace(&snapshot.session.workspace.path)
             ),
             orientation_width,
         )
@@ -2568,6 +2596,7 @@ mod tests {
         slots::{Placement, RenderSlots, TestContribution},
         state::{Application, ApplicationEvent},
     };
+    use super::{legible_workspace, verbatim_prefix_dropped};
     use crate::{
         managed_client::{ManagedEvent, SessionEvent},
         protocol::{
@@ -2605,6 +2634,47 @@ mod tests {
             .chunks(buffer.area.width as usize)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect()
+    }
+
+    /// The canonical form a client and the server hold on Windows is verbatim,
+    /// and the prefix is display noise: no reader types it and no shell needs
+    /// it, so what a frame says drops it while the path everything compares
+    /// stays canonical.
+    #[test]
+    fn a_windows_verbatim_prefix_is_dropped_from_what_a_frame_says() {
+        assert_eq!(
+            verbatim_prefix_dropped(r"\\?\C:\Users\reader\suru"),
+            Some(r"C:\Users\reader\suru".to_owned()),
+            "a canonical drive path reads as the path a reader would type"
+        );
+        assert_eq!(
+            verbatim_prefix_dropped(r"\\?\UNC\server\share\suru"),
+            Some(r"\\server\share\suru".to_owned()),
+            "a canonical UNC path reads as the share a reader would type"
+        );
+        assert_eq!(
+            verbatim_prefix_dropped(r"C:\Users\reader\suru"),
+            None,
+            "a path with nothing to drop is left to read as it is"
+        );
+    }
+
+    /// Only Windows canonicalizes into verbatim form, so only there is the
+    /// prefix dropped: on every other platform a leading `\\?\` is just a
+    /// strange directory name, and the display is the path.
+    #[test]
+    fn a_workspace_reads_verbatim_everywhere_the_canonical_form_is_not() {
+        let spelled = if cfg!(windows) {
+            r"\\?\C:\Users\reader\suru"
+        } else {
+            "/home/reader/suru"
+        };
+        let expected = if cfg!(windows) {
+            r"C:\Users\reader\suru"
+        } else {
+            "/home/reader/suru"
+        };
+        assert_eq!(legible_workspace(std::path::Path::new(spelled)), expected);
     }
 
     #[test]

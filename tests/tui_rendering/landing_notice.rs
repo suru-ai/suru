@@ -8,7 +8,7 @@ use crossterm::event::{
 
 use crate::support::{
     connected_application, rendered_application_rows, rendered_application_rows_at,
-    type_terminal_text,
+    type_terminal_text, workspace_dir,
 };
 use suru::{
     managed_client::ManagedEvent,
@@ -90,7 +90,7 @@ fn mistyped_key() -> SettingsDiagnostic {
 
 #[test]
 fn a_syntax_broken_config_document_notices_the_failure_and_points_at_the_log() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = landing_showing(workspace.path(), vec![unreadable_document()]);
 
     let landing = rendered_application_rows(&application);
@@ -117,7 +117,7 @@ fn a_syntax_broken_config_document_notices_the_failure_and_points_at_the_log() {
 
 #[test]
 fn an_ignored_duplicate_config_document_notices_the_file_it_dropped() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = landing_showing(
         workspace.path(),
         vec![SettingsDiagnostic {
@@ -141,7 +141,7 @@ fn an_ignored_duplicate_config_document_notices_the_file_it_dropped() {
 
 #[test]
 fn per_key_ignores_are_counted_in_the_notice_summary() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = landing_showing(workspace.path(), vec![unknown_key(), mistyped_key()]);
 
     let notice = notice_row(&rendered_application_rows(&application));
@@ -161,7 +161,7 @@ fn per_key_ignores_are_counted_in_the_notice_summary() {
 
 #[test]
 fn a_file_level_failure_is_worded_ahead_of_the_keys_it_shares_the_notice_with() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = landing_showing(
         workspace.path(),
         vec![unknown_key(), unreadable_document(), mistyped_key()],
@@ -186,7 +186,7 @@ fn a_file_level_failure_is_worded_ahead_of_the_keys_it_shares_the_notice_with() 
 
 #[test]
 fn an_ignored_document_is_worded_ahead_of_a_document_merely_dropped() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = landing_showing(
         workspace.path(),
         vec![
@@ -215,7 +215,7 @@ fn an_ignored_document_is_worded_ahead_of_a_document_merely_dropped() {
 
 #[test]
 fn a_summary_too_long_for_the_terminal_gives_way_before_the_pointer_at_the_log_does() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = landing_showing(
         workspace.path(),
         vec![unreadable_document(), unknown_key(), mistyped_key()],
@@ -240,7 +240,7 @@ fn an_interaction_the_landing_makes_nothing_of_still_dismisses_the_notice() {
         modifiers: KeyModifiers::NONE,
     });
     for interaction in [unbound_key, click] {
-        let workspace = tempfile::tempdir().expect("create Workspace");
+        let workspace = workspace_dir();
         let mut application = landing_showing(workspace.path(), vec![unreadable_document()]);
 
         application
@@ -257,7 +257,7 @@ fn an_interaction_the_landing_makes_nothing_of_still_dismisses_the_notice() {
 
 #[test]
 fn the_terminal_resizing_around_the_reader_leaves_the_notice_standing() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = landing_showing(workspace.path(), vec![unreadable_document()]);
 
     application
@@ -273,7 +273,7 @@ fn the_terminal_resizing_around_the_reader_leaves_the_notice_standing() {
 
 #[test]
 fn a_clean_configuration_renders_no_notice() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let application = landing_showing(workspace.path(), Vec::new());
 
     let landing = rendered_application_rows(&application);
@@ -290,7 +290,7 @@ fn a_clean_configuration_renders_no_notice() {
 
 #[test]
 fn the_next_interaction_dismisses_the_notice_for_the_rest_of_the_run() {
-    let workspace = tempfile::tempdir().expect("create Workspace");
+    let workspace = workspace_dir();
     let mut application = landing_showing(workspace.path(), vec![unreadable_document()]);
     assert!(
         notice_row(&rendered_application_rows(&application)).contains("see the Log"),
