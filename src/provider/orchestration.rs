@@ -14,9 +14,10 @@ use tokio::{
 };
 
 use super::{
-    ProviderCommandStatus, ProviderError, ProviderEvent, ProviderEventStream,
-    ProviderFileChangeStatus, ProviderPrompt, ProviderRuntime, ProviderSession,
-    ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
+    AttributedProviderEvent, ProviderCommandStatus, ProviderError, ProviderEvent,
+    ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus, ProviderPrompt,
+    ProviderRuntime, ProviderSession, ProviderSessionRequest, ProviderSteerInput,
+    ProviderSubagentId, ProviderTurnInput,
 };
 use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
@@ -54,6 +55,12 @@ const MAX_STORED_MESSAGE_CHARS: usize = 512 * 1024;
 /// to any real block of Reasoning, and low enough that a Provider reasoning
 /// without end cannot grow one Activity without bound.
 const MAX_STORED_REASONING_CHARS: usize = 64 * 1024;
+
+/// The failure a routed Subagent Turn settles with when the Provider
+/// connection is torn down under it. The connection is those Turns' only
+/// event source, so none of them can complete once it is gone.
+const SUBAGENT_CONNECTION_LOST_MESSAGE: &str =
+    "Provider execution failed: the Provider Session ended before the Subagent's work completed.";
 
 #[derive(Clone)]
 pub(crate) struct ProviderOrchestrator {
@@ -231,9 +238,73 @@ impl ActiveProviderTurn {
     }
 }
 
+/// Where the connection's Subagent-attributed events land: for each Subagent
+/// the Provider has named, the Session that is that Subagent's own and the
+/// Turn state its stream projects into. Routes live and die with the Provider
+/// connection, because the identities are the connection's to mint — nothing
+/// establishes one yet, so every map here is empty until orchestration learns
+/// to open Subagent Sessions. An event attributed to a Subagent with no route
+/// lands nowhere.
+#[derive(Default)]
+struct SubagentRoutes {
+    routes: HashMap<ProviderSubagentId, SubagentRoute>,
+}
+
+struct SubagentRoute {
+    session_id: SessionId,
+    turn: ActiveProviderTurn,
+}
+
+impl SubagentRoutes {
+    /// Projects one Subagent-attributed event into the Session its route
+    /// names, through the same projection and commit path the owning Session's
+    /// events take. A Terminal projection settles the routed Turn, so the
+    /// route has nothing left to receive and is dropped.
+    fn project_event(
+        &mut self,
+        sessions: &SessionStore,
+        updates: &ProviderUpdateGate,
+        next_agent: &AgentIdentity,
+        subagent: &ProviderSubagentId,
+        event: ProviderEvent,
+    ) {
+        let Some(route) = self.routes.get_mut(subagent) else {
+            return;
+        };
+        let projection = project_provider_event(
+            sessions,
+            updates,
+            route.session_id,
+            &mut route.turn,
+            next_agent,
+            event,
+            QueuedPromptDisposition::LeavePending,
+        );
+        if matches!(projection, ProviderEventProjection::Terminal(_)) {
+            self.routes.remove(subagent);
+        }
+    }
+
+    /// Fails every routed Turn and forgets the routes. Called wherever the
+    /// Provider connection is torn down: the routes' Turn state is this
+    /// actor's only handle on those streams, and no more of their events can
+    /// arrive once the connection is gone.
+    fn fail_all(&mut self, sessions: &SessionStore, updates: &ProviderUpdateGate, message: &str) {
+        for (_, mut route) in self.routes.drain() {
+            fail_active_turn(
+                sessions,
+                updates,
+                route.session_id,
+                &mut route.turn,
+                message.to_owned(),
+            );
+        }
+    }
+}
+
 enum ProviderInput {
     Command(Option<ProviderCommand>),
-    Event(Option<Result<ProviderEvent, super::ProviderError>>),
+    Event(Option<Result<AttributedProviderEvent, super::ProviderError>>),
 }
 
 enum ProviderEventProjection {
@@ -620,6 +691,7 @@ async fn run_provider_session(
     } = context;
     let mut provider: Option<ConnectedProviderSession> = None;
     let mut active: Option<ActiveProviderTurn> = None;
+    let mut subagents = SubagentRoutes::default();
     let mut deferred_prompt_id = None;
     let provider_id = runtime.provider_id();
 
@@ -646,9 +718,26 @@ async fn run_provider_session(
             };
             let command = match input {
                 ProviderInput::Command(command) => command,
-                ProviderInput::Event(Some(Ok(_))) => continue,
+                ProviderInput::Event(Some(Ok(attributed))) => {
+                    // A Subagent's events land in its own Session whether or
+                    // not the owning Session has a Turn open; events the
+                    // connection sends about the owning Session itself have no
+                    // Turn to land in here and are discarded.
+                    if let AttributedProviderEvent {
+                        attribution: ProviderEventAttribution::Subagent(subagent),
+                        event,
+                    } = attributed
+                    {
+                        let identity = &provider
+                            .as_ref()
+                            .expect("Provider events arrive over a live connection")
+                            .identity;
+                        subagents.project_event(&sessions, &updates, identity, &subagent, event);
+                    }
+                    continue;
+                }
                 ProviderInput::Event(Some(Err(_)) | None) => {
-                    provider = None;
+                    lose_provider_connection(&mut provider, &mut subagents, &sessions, &updates);
                     continue;
                 }
             };
@@ -809,7 +898,7 @@ async fn run_provider_session(
                 let selection_rejected = error.is_selection_rejected();
                 project_turn_start_failure(&sessions, &updates, session_id, turn_id, &error);
                 if session_lost {
-                    provider = None;
+                    lose_provider_connection(&mut provider, &mut subagents, &sessions, &updates);
                 }
                 if !selection_rejected {
                     defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
@@ -963,7 +1052,12 @@ async fn run_provider_session(
                         let message = failure_message("Provider interruption failed", &error);
                         fail_active_turn(&sessions, &updates, session_id, current, message.clone());
                         active = None;
-                        provider = None;
+                        lose_provider_connection(
+                            &mut provider,
+                            &mut subagents,
+                            &sessions,
+                            &updates,
+                        );
                         defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                         let _ = response.send(Err(InterruptTurnError::ProviderFailure(message)));
                     }
@@ -974,7 +1068,20 @@ async fn run_provider_session(
                     continue;
                 };
                 match event {
-                    Some(Ok(event)) => {
+                    Some(Ok(AttributedProviderEvent {
+                        attribution: ProviderEventAttribution::Subagent(subagent),
+                        event,
+                    })) => {
+                        let identity = &provider
+                            .as_ref()
+                            .expect("Provider connection exists while its Turn is active")
+                            .identity;
+                        subagents.project_event(&sessions, &updates, identity, &subagent, event);
+                    }
+                    Some(Ok(AttributedProviderEvent {
+                        attribution: ProviderEventAttribution::OwningSession,
+                        event,
+                    })) => {
                         let selection_rejected =
                             matches!(event, ProviderEvent::AgentSelectionRejected { .. });
                         let identity = provider
@@ -1018,7 +1125,12 @@ async fn run_provider_session(
                                         &sessions, &updates, session_id, turn_id, &error,
                                     );
                                     if session_lost {
-                                        provider = None;
+                                        lose_provider_connection(
+                                            &mut provider,
+                                            &mut subagents,
+                                            &sessions,
+                                            &updates,
+                                        );
                                     }
                                     if !selection_rejected {
                                         defer_next_queued_prompt(
@@ -1055,7 +1167,12 @@ async fn run_provider_session(
                             failure_message("Provider execution failed", &error),
                         );
                         active = None;
-                        provider = None;
+                        lose_provider_connection(
+                            &mut provider,
+                            &mut subagents,
+                            &sessions,
+                            &updates,
+                        );
                         defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                     }
                     None => {
@@ -1068,7 +1185,12 @@ async fn run_provider_session(
                                 .to_owned(),
                         );
                         active = None;
-                        provider = None;
+                        lose_provider_connection(
+                            &mut provider,
+                            &mut subagents,
+                            &sessions,
+                            &updates,
+                        );
                         defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                     }
                 }
@@ -1092,10 +1214,24 @@ async fn run_provider_session(
                 .to_owned(),
         );
     }
+    subagents.fail_all(&sessions, &updates, SUBAGENT_CONNECTION_LOST_MESSAGE);
 
     if let Some(connected) = provider {
         let _ = timeout(Duration::from_secs(2), connected.session.shutdown()).await;
     }
+}
+
+/// Drops the Provider connection and fails every Turn routed over it, in one
+/// move so no teardown path can forget that the routes die with the
+/// connection they were minted on.
+fn lose_provider_connection(
+    provider: &mut Option<ConnectedProviderSession>,
+    subagents: &mut SubagentRoutes,
+    sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
+) {
+    *provider = None;
+    subagents.fail_all(sessions, updates, SUBAGENT_CONNECTION_LOST_MESSAGE);
 }
 
 /// Fails the Turn this actor was running, flushing the pending line each of its
@@ -1783,4 +1919,308 @@ fn finish_invalid_provider_event(
         .ok()
         .flatten();
     ProviderEventProjection::Terminal(next_turn)
+}
+
+/// The routing seam is proven here rather than at the wire, because nothing
+/// establishes a route yet: the Subagent lifecycle that will is its own
+/// feature, and these tests are the contract it builds on. The store, the
+/// commit, and the subscription are all real — only the route is placed by
+/// hand.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{
+        AgentId, AgentSelection, CreateSessionRequest, InitialPrompt, MessageRole, MessageStatus,
+        ModelId, SessionSnapshot, Workspace,
+    };
+    use crate::sessions::StoreOutcome;
+    use crate::storage::{StorageRepository, StorageWriter};
+
+    struct RoutedSessions {
+        sessions: SessionStore,
+        /// The Session whose Prompt started the work — the one every event
+        /// used to be assumed to belong to.
+        owning: SessionId,
+        /// Another Session entirely, standing where a Subagent's will.
+        routed: SessionId,
+        routed_turn: TurnId,
+        _writer: StorageWriter,
+        _data_dir: tempfile::TempDir,
+        _workspace: tempfile::TempDir,
+    }
+
+    async fn routed_sessions() -> RoutedSessions {
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let workspace = tempfile::tempdir().expect("create valid Workspace");
+        let repository = StorageRepository::open(data_dir.path())
+            .await
+            .expect("open Session repository");
+        let (writer, storage) = StorageWriter::spawn(repository, &[]);
+        let sessions = SessionStore::new(Default::default(), storage);
+        let owning = create_session(&sessions, workspace.path(), "The owning conversation");
+        let routed = create_session(&sessions, workspace.path(), "Delegated work");
+        let routed_prompt = routed.prompts[0].id;
+        let routed_id = routed.session.id;
+        let delivered = sessions
+            .deliver_prompt(routed_id, routed_prompt, None, DeliveredTurnStatus::Active)
+            .expect("deliver the routed Session's Prompt")
+            .expect("the routed Session has no other active Turn");
+        RoutedSessions {
+            sessions,
+            owning: owning.session.id,
+            routed: routed_id,
+            routed_turn: delivered.turn_id,
+            _writer: writer,
+            _data_dir: data_dir,
+            _workspace: workspace,
+        }
+    }
+
+    fn create_session(
+        sessions: &SessionStore,
+        workspace: &std::path::Path,
+        prompt: &str,
+    ) -> SessionSnapshot {
+        let created = sessions
+            .create(CreateSessionRequest {
+                agent_selection: None,
+                workspace: Workspace {
+                    path: workspace.to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: prompt.to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+            })
+            .expect("create Session");
+        let StoreOutcome::Created(snapshot) = created else {
+            panic!("a fresh Prompt creates a Session");
+        };
+        snapshot
+    }
+
+    fn provider_identity() -> AgentIdentity {
+        AgentIdentity {
+            agent: AgentId::new("controlled"),
+            selection: AgentSelection {
+                provider: ProviderId::new("controlled"),
+                model: ModelId::new("model"),
+                options: Vec::new(),
+            },
+        }
+    }
+
+    fn turn_state(turn_id: TurnId) -> ActiveProviderTurn {
+        ActiveProviderTurn {
+            turn_id,
+            streaming_message: None,
+            interruption_acknowledged: false,
+            command_activities: HashMap::new(),
+            file_change_activities: HashMap::new(),
+            reasoning_activities: HashMap::new(),
+        }
+    }
+
+    fn route_to(
+        routes: &mut SubagentRoutes,
+        subagent: &ProviderSubagentId,
+        fixture: &RoutedSessions,
+    ) {
+        routes.routes.insert(
+            subagent.clone(),
+            SubagentRoute {
+                session_id: fixture.routed,
+                turn: turn_state(fixture.routed_turn),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subagent_attributed_event_lands_in_the_session_its_route_names() {
+        let fixture = routed_sessions().await;
+        let updates = ProviderUpdateGate::new();
+        let identity = provider_identity();
+        let subagent = ProviderSubagentId::new("delegation-1");
+        let mut routes = SubagentRoutes::default();
+        route_to(&mut routes, &subagent, &fixture);
+        let owning_before = fixture
+            .sessions
+            .snapshot(fixture.owning)
+            .expect("owning Session exists")
+            .revision;
+        let mut feed = fixture
+            .sessions
+            .subscribe(fixture.routed)
+            .expect("routed Session exists");
+
+        for event in [
+            ProviderEvent::AgentMessageStarted,
+            ProviderEvent::AgentMessageDelta {
+                content: "Delegated hello".to_owned(),
+            },
+            ProviderEvent::AgentMessageCompleted,
+        ] {
+            routes.project_event(&fixture.sessions, &updates, &identity, &subagent, event);
+        }
+
+        let routed = fixture
+            .sessions
+            .snapshot(fixture.routed)
+            .expect("routed Session exists");
+        let message = routed
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Agent)
+            .expect("the routed Session carries the Subagent's Message");
+        assert_eq!(message.content, "Delegated hello");
+        assert_eq!(message.status, MessageStatus::Completed);
+        assert_eq!(message.turn_id, fixture.routed_turn);
+        assert!(
+            routed.revision > feed.snapshot.revision,
+            "the commit path advances the routed Session's revision"
+        );
+        let update = feed
+            .updates
+            .try_recv()
+            .expect("the routed Session's subscribers hear the commit");
+        assert_eq!(update.session_id, fixture.routed);
+        assert!(update.revision.immediately_follows(feed.snapshot.revision));
+        assert_eq!(
+            fixture
+                .sessions
+                .snapshot(fixture.owning)
+                .expect("owning Session exists")
+                .revision,
+            owning_before,
+            "nothing lands in the owning Session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subagent_terminal_event_settles_its_routed_turn_and_drops_the_route() {
+        let fixture = routed_sessions().await;
+        let updates = ProviderUpdateGate::new();
+        let identity = provider_identity();
+        let subagent = ProviderSubagentId::new("delegation-1");
+        let mut routes = SubagentRoutes::default();
+        route_to(&mut routes, &subagent, &fixture);
+
+        routes.project_event(
+            &fixture.sessions,
+            &updates,
+            &identity,
+            &subagent,
+            ProviderEvent::TurnCompleted,
+        );
+
+        let routed = fixture
+            .sessions
+            .snapshot(fixture.routed)
+            .expect("routed Session exists");
+        let turn = routed
+            .turns
+            .iter()
+            .find(|turn| turn.id == fixture.routed_turn)
+            .expect("the routed Turn exists");
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert!(
+            routes.routes.is_empty(),
+            "a settled route has nothing left to receive"
+        );
+
+        routes.project_event(
+            &fixture.sessions,
+            &updates,
+            &identity,
+            &subagent,
+            ProviderEvent::AgentMessageStarted,
+        );
+        assert_eq!(
+            fixture
+                .sessions
+                .snapshot(fixture.routed)
+                .expect("routed Session exists")
+                .revision,
+            routed.revision,
+            "an event for a dropped route lands nowhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_attributed_to_an_unknown_subagent_lands_nowhere() {
+        let fixture = routed_sessions().await;
+        let updates = ProviderUpdateGate::new();
+        let identity = provider_identity();
+        let mut routes = SubagentRoutes::default();
+        let owning_before = fixture
+            .sessions
+            .snapshot(fixture.owning)
+            .expect("owning Session exists")
+            .revision;
+        let routed_before = fixture
+            .sessions
+            .snapshot(fixture.routed)
+            .expect("routed Session exists")
+            .revision;
+
+        routes.project_event(
+            &fixture.sessions,
+            &updates,
+            &identity,
+            &ProviderSubagentId::new("never-announced"),
+            ProviderEvent::AgentMessageStarted,
+        );
+
+        assert_eq!(
+            fixture
+                .sessions
+                .snapshot(fixture.owning)
+                .expect("owning Session exists")
+                .revision,
+            owning_before
+        );
+        assert_eq!(
+            fixture
+                .sessions
+                .snapshot(fixture.routed)
+                .expect("routed Session exists")
+                .revision,
+            routed_before
+        );
+    }
+
+    #[tokio::test]
+    async fn tearing_down_the_connection_fails_every_routed_turn() {
+        let fixture = routed_sessions().await;
+        let updates = ProviderUpdateGate::new();
+        let subagent = ProviderSubagentId::new("delegation-1");
+        let mut routes = SubagentRoutes::default();
+        route_to(&mut routes, &subagent, &fixture);
+
+        routes.fail_all(
+            &fixture.sessions,
+            &updates,
+            SUBAGENT_CONNECTION_LOST_MESSAGE,
+        );
+
+        let routed = fixture
+            .sessions
+            .snapshot(fixture.routed)
+            .expect("routed Session exists");
+        let turn = routed
+            .turns
+            .iter()
+            .find(|turn| turn.id == fixture.routed_turn)
+            .expect("the routed Turn exists");
+        assert_eq!(turn.status, TurnStatus::Failed);
+        assert!(
+            routed.activities.iter().any(|activity| matches!(
+                activity,
+                Activity::Error { text, .. } if text == SUBAGENT_CONNECTION_LOST_MESSAGE
+            )),
+            "the routed Turn says why it failed"
+        );
+        assert!(routes.routes.is_empty());
+    }
 }

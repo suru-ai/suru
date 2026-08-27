@@ -113,7 +113,52 @@ pub(crate) fn humanized_wire_id(value: &str) -> String {
 pub type ProviderFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ProviderError>> + Send + 'a>>;
 pub type ProviderEventStream =
-    Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send>>;
+    Pin<Box<dyn Stream<Item = Result<AttributedProviderEvent, ProviderError>> + Send>>;
+
+/// One Provider event together with the attribution naming the Session it
+/// lands in. A Provider knows nothing of Suru Sessions, so the attribution
+/// speaks in the Provider's own terms — the conversation itself, or a Subagent
+/// it delegated to — and orchestration resolves it to a Session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttributedProviderEvent {
+    pub attribution: ProviderEventAttribution,
+    pub event: ProviderEvent,
+}
+
+impl From<ProviderEvent> for AttributedProviderEvent {
+    fn from(event: ProviderEvent) -> Self {
+        Self {
+            attribution: ProviderEventAttribution::OwningSession,
+            event,
+        }
+    }
+}
+
+/// Names the Session a Provider event lands in.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum ProviderEventAttribution {
+    /// The Session that owns the Provider connection — the conversation the
+    /// Provider was started for, and the attribution every event defaults to.
+    OwningSession,
+    /// A Subagent the conversation's agent delegated work to, named by the
+    /// Provider's own identity for the delegation. Orchestration resolves the
+    /// identity to that Subagent's own Session; an identity it holds no
+    /// Session for lands nowhere.
+    Subagent(ProviderSubagentId),
+}
+
+/// The Provider's own opaque identity for one Subagent it is running —
+/// Claude's spawning tool-use id, Codex's child thread id, Copilot's agent
+/// id. Like [`ProviderActivityId`], it is the Provider's to choose and only
+/// ever compared, never read.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ProviderSubagentId(String);
+
+impl ProviderSubagentId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderError {

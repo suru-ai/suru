@@ -11,9 +11,10 @@ use suru::protocol::{
     SkillPromptDelivery, Workspace,
 };
 use suru::provider::{
-    ProviderErrand, ProviderError, ProviderEvent, ProviderEventStream, ProviderFuture,
-    ProviderPrompt, ProviderRuntime, ProviderSession, ProviderSessionConnection,
-    ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
+    AttributedProviderEvent, ProviderErrand, ProviderError, ProviderEvent,
+    ProviderEventAttribution, ProviderEventStream, ProviderFuture, ProviderPrompt, ProviderRuntime,
+    ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
+    ProviderTurnInput,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -86,7 +87,7 @@ pub struct ControlledProviderSession {
 }
 
 type ControlledProviderEvent = (
-    Result<ProviderEvent, ProviderError>,
+    Result<AttributedProviderEvent, ProviderError>,
     Option<oneshot::Sender<()>>,
 );
 
@@ -401,17 +402,34 @@ impl ControlledProviderSession {
 
     pub fn emit(&self, event: ProviderEvent) {
         self.events
-            .send((Ok(event), None))
+            .send((Ok(event.into()), None))
             .expect("Provider event stream remains connected");
     }
 
-    pub async fn emit_and_wait_until_observed(&self, event: ProviderEvent) {
+    /// Emits one event carrying an explicit attribution, the way a Provider
+    /// names the Session an event lands in when it is not the owning one.
+    pub async fn emit_attributed_and_wait_until_observed(
+        &self,
+        attribution: ProviderEventAttribution,
+        event: ProviderEvent,
+    ) {
         let (observed, wait) = oneshot::channel();
         self.events
-            .send((Ok(event), Some(observed)))
+            .send((
+                Ok(AttributedProviderEvent { attribution, event }),
+                Some(observed),
+            ))
             .expect("Provider event stream remains connected");
         wait.await
             .expect("Provider actor observes the controlled event");
+    }
+
+    pub async fn emit_and_wait_until_observed(&self, event: ProviderEvent) {
+        self.emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::OwningSession,
+            event,
+        )
+        .await;
     }
 }
 
@@ -672,7 +690,7 @@ async fn run_errand_through_a_session(
         .await?;
     let mut reply = String::new();
     while let Some(event) = events.next().await {
-        match event? {
+        match event?.event {
             ProviderEvent::AgentMessageDelta { content } => reply.push_str(&content),
             ProviderEvent::TurnCompleted => break,
             _ => {}

@@ -20,8 +20,8 @@ use suru::{
         TranscriptItem, TurnStatus, Workspace,
     },
     provider::{
-        ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderFileChangeStatus,
-        ProviderSkillInvocation,
+        ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderEventAttribution,
+        ProviderFileChangeStatus, ProviderSkillInvocation, ProviderSubagentId,
     },
     server::{self, ServerConfig},
 };
@@ -2045,6 +2045,112 @@ async fn turn_liveness_is_announced_on_the_session_catalog_stream() {
     drop(provider_session);
     drop(feed);
     drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn events_attributed_to_an_unknown_subagent_leave_the_session_untouched() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "unknown-subagent-attribution-test")
+            .expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let client = reqwest::Client::new();
+    let descriptor = server.descriptor().clone();
+    let created = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Work while a stranger speaks".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+
+    let start = timeout(Duration::from_secs(1), provider.next_start())
+        .await
+        .expect("Provider startup begins");
+    let mut provider_session = start.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-attributed", "high", "fast"),
+    });
+    timeout(Duration::from_secs(1), provider_session.next_turn())
+        .await
+        .expect("initial Turn reaches Provider")
+        .succeed();
+
+    provider_session.emit(ProviderEvent::AgentMessageStarted);
+    // No route exists for this Subagent — orchestration has never been told of
+    // one — so each of these must land nowhere, terminal event included.
+    for event in [
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: "A stranger's narration".to_owned(),
+        },
+        ProviderEvent::CommandStarted {
+            activity_id: ProviderActivityId::new("strangers-command"),
+            command: "echo not mine".to_owned(),
+            cwd: None,
+        },
+        ProviderEvent::TurnCompleted,
+    ] {
+        provider_session
+            .emit_attributed_and_wait_until_observed(
+                ProviderEventAttribution::Subagent(ProviderSubagentId::new("never-announced")),
+                event,
+            )
+            .await;
+    }
+    provider_session.emit(ProviderEvent::AgentMessageDelta {
+        content: "Hello from the owning Session".to_owned(),
+    });
+    provider_session.emit(ProviderEvent::AgentMessageCompleted);
+    provider_session.emit(ProviderEvent::TurnCompleted);
+
+    let completed = read_session_at_least_revision(
+        &client,
+        &descriptor,
+        created.session.id,
+        SessionRevision(7),
+    )
+    .await;
+    assert_eq!(
+        completed.revision,
+        SessionRevision(7),
+        "only the owning Session's own events commit"
+    );
+    assert_eq!(completed.turns.len(), 1);
+    assert_eq!(completed.turns[0].status, TurnStatus::Completed);
+    assert!(
+        completed.activities.is_empty(),
+        "the stranger's command opens no Activity here"
+    );
+    assert_eq!(completed.messages.len(), 2);
+    assert_eq!(completed.messages[1].role, MessageRole::Agent);
+    assert_eq!(
+        completed.messages[1].content,
+        "Hello from the owning Session"
+    );
+
+    drop(provider_session);
     server.shutdown().await.expect("shut down server");
 }
 

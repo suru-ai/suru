@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
 };
 
-use futures_util::stream;
+use futures_util::{StreamExt as _, stream};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -31,7 +31,8 @@ use super::{
     },
 };
 use crate::provider::{
-    ProviderActivityId, ProviderCommandStatus, ProviderError, ProviderEvent, ProviderEventStream,
+    AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
+    ProviderEvent, ProviderEventStream,
 };
 
 /// The tool whose executions are Command Activity. Claude sends the command itself as the tool's
@@ -42,14 +43,17 @@ pub(super) fn provider_events(
     messages: mpsc::UnboundedReceiver<Result<Value, ProviderError>>,
     turn: Arc<TurnInFlight>,
 ) -> ProviderEventStream {
-    Box::pin(stream::unfold(
-        EventReceiver {
-            messages,
-            projection: ClaudeProjection::new(turn),
-            pending: VecDeque::new(),
-        },
-        next_provider_event,
-    ))
+    Box::pin(
+        stream::unfold(
+            EventReceiver {
+                messages,
+                projection: ClaudeProjection::new(turn),
+                pending: VecDeque::new(),
+            },
+            next_provider_event,
+        )
+        .map(|event| event.map(AttributedProviderEvent::from)),
+    )
 }
 
 struct EventReceiver {

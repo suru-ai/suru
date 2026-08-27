@@ -24,7 +24,7 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 
-use futures_util::stream;
+use futures_util::{StreamExt as _, stream};
 use github_copilot_sdk::{
     EventSubscription, SessionEvent,
     session_events::{
@@ -42,8 +42,8 @@ use super::{
     skills::CopilotSkills, tools::command_text, transport::CopilotConnection,
 };
 use crate::provider::{
-    ProviderActivityId, ProviderCommandStatus, ProviderError, ProviderEvent, ProviderEventStream,
-    concise_remote_message,
+    AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
+    ProviderEvent, ProviderEventStream, concise_remote_message,
     harness::SharedHarnessHandle,
     reasoning::{ReasoningSegment, ReasoningSummarySplitter},
 };
@@ -144,18 +144,21 @@ pub(super) fn provider_events(
         events_tx,
         drain.clone(),
     ));
-    Box::pin(stream::unfold(
-        CopilotEvents {
-            events: events_rx,
-            harness,
-            drain,
-            correlation,
-            skills,
-            pending: VecDeque::new(),
-            ended: false,
-        },
-        next_provider_event,
-    ))
+    Box::pin(
+        stream::unfold(
+            CopilotEvents {
+                events: events_rx,
+                harness,
+                drain,
+                correlation,
+                skills,
+                pending: VecDeque::new(),
+                ended: false,
+            },
+            next_provider_event,
+        )
+        .map(|event| event.map(AttributedProviderEvent::from)),
+    )
 }
 
 /// Moves Copilot's timeline off the SDK's bounded subscription as it arrives.

@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 
-use futures_util::stream;
+use futures_util::{StreamExt as _, stream};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -31,8 +31,8 @@ use crate::{
         ModelOptionSelection, ModelOptionValue,
     },
     provider::{
-        ProviderActivityId, ProviderCommandStatus, ProviderError, ProviderEvent,
-        ProviderEventStream, ProviderFileChangeStatus,
+        AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
+        ProviderEvent, ProviderEventStream, ProviderFileChangeStatus,
         harness::ProcessGuard,
         reasoning::{ReasoningSegment, ReasoningSummarySplitter},
     },
@@ -183,16 +183,19 @@ pub(super) fn provider_events(
     correlation: Arc<StdMutex<NativeCorrelation>>,
     skill_catalog_invalidations: tokio::sync::watch::Sender<u64>,
 ) -> ProviderEventStream {
-    Box::pin(stream::unfold(
-        GuardedEventReceiver {
-            receiver: notifications,
-            _process: process,
-            correlation,
-            skill_catalog_invalidations,
-            pending: VecDeque::new(),
-        },
-        next_provider_event,
-    ))
+    Box::pin(
+        stream::unfold(
+            GuardedEventReceiver {
+                receiver: notifications,
+                _process: process,
+                correlation,
+                skill_catalog_invalidations,
+                pending: VecDeque::new(),
+            },
+            next_provider_event,
+        )
+        .map(|event| event.map(AttributedProviderEvent::from)),
+    )
 }
 
 struct GuardedEventReceiver {
