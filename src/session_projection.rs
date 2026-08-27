@@ -80,10 +80,8 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 prompt.status = *status;
             }
             SessionChange::TurnAdded { turn } => {
-                if !next
-                    .prompts
-                    .iter()
-                    .any(|prompt| prompt.id == turn.prompt_id)
+                if let Some(prompt_id) = turn.prompt_id
+                    && !next.prompts.iter().any(|prompt| prompt.id == prompt_id)
                 {
                     bail!("Session update referenced an unknown Prompt");
                 }
@@ -228,6 +226,16 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                         || duration_ms.is_some()
                 ) {
                     bail!("Session update added a Reasoning Activity outside its initial state");
+                }
+                if matches!(
+                    activity,
+                    Activity::Subagent {
+                        status,
+                        duration_ms,
+                        ..
+                    } if *status != ActivityStatus::Active || duration_ms.is_some()
+                ) {
+                    bail!("Session update added a Subagent Activity outside its initial state");
                 }
                 next.activities.push(activity.clone());
                 next.transcript.push(TranscriptItem::Activity {
@@ -434,6 +442,46 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 *current_status = *status;
                 *current_duration_ms = *duration_ms;
             }
+            SessionChange::SubagentDescriptionChanged {
+                activity_id,
+                description,
+            } => {
+                let Some(Activity::Subagent {
+                    status,
+                    description: current_description,
+                    ..
+                }) = subagent_activity(next, activity_id)?
+                else {
+                    bail!("Session update described a different Activity kind");
+                };
+                if *status != ActivityStatus::Active {
+                    bail!("Session update described a terminal Subagent Activity");
+                }
+                *current_description = description.clone();
+            }
+            SessionChange::SubagentStatusChanged {
+                activity_id,
+                status,
+                duration_ms,
+            } => {
+                let Some(Activity::Subagent {
+                    status: current_status,
+                    duration_ms: current_duration_ms,
+                    ..
+                }) = subagent_activity(next, activity_id)?
+                else {
+                    bail!("Session update completed a different Activity kind");
+                };
+                if *current_status != ActivityStatus::Active
+                    || !matches!(status, ActivityStatus::Completed | ActivityStatus::Failed)
+                {
+                    bail!(
+                        "Session update contained an invalid Subagent Activity status transition"
+                    );
+                }
+                *current_status = *status;
+                *current_duration_ms = *duration_ms;
+            }
             SessionChange::TurnStatusChanged {
                 turn_id,
                 status,
@@ -472,6 +520,22 @@ fn reasoning_activity<'a>(
     Ok(matches!(activity, Activity::Reasoning { .. }).then_some(activity))
 }
 
+/// Resolves the Activity a Subagent change names, on the same terms as
+/// [`reasoning_activity`].
+fn subagent_activity<'a>(
+    snapshot: &'a mut SessionSnapshot,
+    activity_id: &ActivityId,
+) -> Result<Option<&'a mut Activity>> {
+    let Some(activity) = snapshot
+        .activities
+        .iter_mut()
+        .find(|activity| activity.id() == *activity_id)
+    else {
+        bail!("Session update referenced an unknown Activity");
+    };
+    Ok(matches!(activity, Activity::Subagent { .. }).then_some(activity))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -497,6 +561,7 @@ mod tests {
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,
+                parent: None,
             },
             revision: SessionRevision::INITIAL,
             prompts: vec![Prompt {
@@ -521,7 +586,7 @@ mod tests {
                 changes: vec![SessionChange::TurnAdded {
                     turn: Turn {
                         id: turn_id,
-                        prompt_id,
+                        prompt_id: Some(prompt_id),
                         agent: None,
                         status: TurnStatus::Active,
                         started_at: Some(SessionTimestamp(1_755_000_000_000)),

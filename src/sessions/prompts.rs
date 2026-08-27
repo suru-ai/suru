@@ -33,6 +33,9 @@ pub(crate) enum CreateSessionError {
 pub(crate) enum AdmitPromptError {
     EmptyPrompt,
     SessionNotFound,
+    /// The Session is a Subagent's, and a Subagent's Session is never offered
+    /// a Prompt: its conversation is the Provider's to drive.
+    SubagentSession,
     PromptConflict,
 }
 
@@ -182,6 +185,7 @@ impl SessionStore {
                 agent_selection: request.agent_selection.clone(),
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,
+                parent: None,
             },
             revision: SessionRevision::INITIAL,
             prompts: vec![prompt],
@@ -277,8 +281,12 @@ impl SessionStore {
             return Err(AdmitPromptError::PromptConflict);
         }
 
-        if !state.sessions.contains_key(&session_id) {
-            return Err(AdmitPromptError::SessionNotFound);
+        match state.sessions.get(&session_id) {
+            None => return Err(AdmitPromptError::SessionNotFound),
+            Some(record) if record.snapshot.session.parent.is_some() => {
+                return Err(AdmitPromptError::SubagentSession);
+            }
+            Some(_) => {}
         }
         let updated_at = state.next_timestamp();
         let record = state
@@ -828,7 +836,7 @@ pub(super) fn prepare_prompt_delivery(
         SessionChange::TurnAdded {
             turn: Turn {
                 id: turn_id,
-                prompt_id: prompt.id,
+                prompt_id: Some(prompt.id),
                 agent: agent.clone(),
                 status: turn_status,
                 // The commit that lands this delivery stamps both, and settles

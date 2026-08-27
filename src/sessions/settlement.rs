@@ -334,6 +334,17 @@ pub(super) fn settle_in_flight_changes(
                 // there is no duration to record.
                 duration_ms: None,
             }),
+            Activity::Subagent {
+                id,
+                status: ActivityStatus::Active,
+                ..
+            } => changes.push(SessionChange::SubagentStatusChanged {
+                activity_id: *id,
+                status: ActivityStatus::Failed,
+                // As with Reasoning: the Provider never reported this
+                // Subagent settling, so there is no duration to record.
+                duration_ms: None,
+            }),
             _ => {}
         }
     }
@@ -365,12 +376,13 @@ mod tests {
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Active,
+                parent: None,
             },
             revision: SessionRevision::INITIAL,
             prompts: Vec::new(),
             turns: vec![Turn {
                 id: turn_id,
-                prompt_id: PromptId::new(),
+                prompt_id: Some(PromptId::new()),
                 agent: None,
                 status: TurnStatus::Active,
                 started_at: None,

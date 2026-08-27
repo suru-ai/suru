@@ -185,7 +185,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
                 SessionChange::TurnAdded {
                     turn: Turn {
                         id: turn_id,
-                        prompt_id,
+                        prompt_id: Some(prompt_id),
                         agent: None,
                         status: TurnStatus::Active,
                         started_at: None,

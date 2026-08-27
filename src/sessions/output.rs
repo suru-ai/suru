@@ -161,7 +161,9 @@ fn agent_output_turn_id(
         | SessionChange::ReasoningTitleChanged { activity_id, .. }
         | SessionChange::ReasoningContentAppended { activity_id, .. }
         | SessionChange::ReasoningContentTruncated { activity_id }
-        | SessionChange::ReasoningStatusChanged { activity_id, .. } => snapshot
+        | SessionChange::ReasoningStatusChanged { activity_id, .. }
+        | SessionChange::SubagentDescriptionChanged { activity_id, .. }
+        | SessionChange::SubagentStatusChanged { activity_id, .. } => snapshot
             .activities
             .iter()
             .find(|activity| activity.id() == *activity_id)

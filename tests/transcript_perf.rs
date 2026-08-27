@@ -46,6 +46,7 @@ fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
+            parent: None,
         },
         revision: SessionRevision::INITIAL,
         prompts: Vec::new(),
@@ -70,7 +71,7 @@ fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
         });
         snapshot.turns.push(Turn {
             id: turn_id,
-            prompt_id,
+            prompt_id: Some(prompt_id),
             agent: None,
             status: TurnStatus::Completed,
             started_at: None,

@@ -657,6 +657,7 @@ fn listed(
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
+            parent: None,
         },
         title: title.to_owned(),
         emoji: emoji.map(str::to_owned),

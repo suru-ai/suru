@@ -35,7 +35,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20260826000000";
+const CURRENT_SCHEMA_VERSION: &str = "20260827010000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -51,6 +51,7 @@ diesel::table! {
         agent_selection_availability -> Text,
         status -> Text,
         revision -> BigInt,
+        parent_session_id -> Nullable<Text>,
     }
 }
 
@@ -83,7 +84,7 @@ diesel::table! {
     turns (id) {
         id -> Text,
         session_id -> Text,
-        prompt_id -> Text,
+        prompt_id -> Nullable<Text>,
         row_order -> BigInt,
         payload -> Text,
     }

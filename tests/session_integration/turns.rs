@@ -1565,7 +1565,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
     assert_eq!(startup_failure.revision, SessionRevision(2));
     assert!(startup_failure.changes.iter().any(|change| {
         matches!(change, SessionChange::TurnAdded { turn }
-            if turn.prompt_id == initial_prompt_id && turn.status == TurnStatus::Failed)
+            if turn.prompt_id == Some(initial_prompt_id) && turn.status == TurnStatus::Failed)
     }));
     assert!(
         startup_failure.changes.iter().any(|change| {

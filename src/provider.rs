@@ -400,6 +400,13 @@ pub enum ProviderFileChangeStatus {
     Failed,
 }
 
+/// How a Provider reported one of its Subagents settling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderSubagentStatus {
+    Completed,
+    Failed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderEvent {
     AgentSelectionChanged {
@@ -452,6 +459,27 @@ pub enum ProviderEvent {
     },
     ReasoningCompleted {
         activity_id: ProviderActivityId,
+    },
+    /// The Turn's Agent delegated work to a Subagent. The event lands in the
+    /// spawner's Session — the owning Session, or a Subagent's own for a
+    /// nested spawn — and orchestration answers it by opening the Subagent's
+    /// child Session and the row that stands for it.
+    SubagentStarted {
+        subagent_id: ProviderSubagentId,
+        name: String,
+        description: String,
+    },
+    /// The Provider revised what a working Subagent is doing.
+    SubagentUpdated {
+        subagent_id: ProviderSubagentId,
+        description: String,
+    },
+    /// The Provider reported a Subagent settling. This settles the Subagent's
+    /// row and its child Session's Turn together; events attributed to the
+    /// Subagent after it land nowhere.
+    SubagentCompleted {
+        subagent_id: ProviderSubagentId,
+        status: ProviderSubagentStatus,
     },
     TurnCompleted,
     TurnInterrupted,

@@ -528,6 +528,7 @@ mod tests {
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,
+                parent: None,
             },
             title: title.to_owned(),
             emoji: None,

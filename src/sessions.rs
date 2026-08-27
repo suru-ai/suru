@@ -29,6 +29,7 @@ mod prompts;
 mod selection;
 mod settled;
 mod settlement;
+mod subagents;
 mod title;
 
 pub(crate) use output::{
@@ -208,7 +209,11 @@ impl SessionStore {
             .expect("Session store lock is not poisoned");
         let mut session_ids = state
             .sessions
-            .keys()
+            .iter()
+            // A Subagent's child Session rides no catalog: every client lists
+            // what the catalog holds, and a child joins no listing.
+            .filter(|(_, record)| record.snapshot.session.parent.is_none())
+            .map(|(session_id, _)| session_id)
             .chain(state.unreadable_sessions.keys())
             .copied()
             .collect::<Vec<_>>();
@@ -308,14 +313,33 @@ impl SessionStore {
         {
             return Err(DeleteSessionError::SessionNotFound);
         }
-        self.storage
-            .deleted(session_id)
-            .map_err(|error| DeleteSessionError::Storage(error.to_string()))?;
-        state.sessions.remove(&session_id);
-        state.unreadable_sessions.remove(&session_id);
+        // A Session's Subagent subtree shares its deletion, walked deepest
+        // first so a failure partway leaves no child severed from the parent
+        // that is its only way in. Only the named Session is announced,
+        // because its children were never announced to begin with.
+        let mut doomed = vec![session_id];
+        let mut walk = 0;
+        while walk < doomed.len() {
+            let parent = doomed[walk];
+            doomed.extend(
+                state
+                    .sessions
+                    .iter()
+                    .filter(|(_, record)| record.snapshot.session.parent == Some(parent))
+                    .map(|(child_id, _)| *child_id),
+            );
+            walk += 1;
+        }
+        for doomed_id in doomed.iter().rev() {
+            self.storage
+                .deleted(*doomed_id)
+                .map_err(|error| DeleteSessionError::Storage(error.to_string()))?;
+            state.sessions.remove(doomed_id);
+            state.unreadable_sessions.remove(doomed_id);
+        }
         state
             .prompts
-            .retain(|_, owner| owner.session_id != session_id);
+            .retain(|_, owner| !doomed.contains(&owner.session_id));
         state.publish_catalog_change(SessionCatalogChange::Deleted { session_id });
         Ok(())
     }
@@ -339,6 +363,9 @@ impl SessionStore {
         let mut summaries = state
             .sessions
             .values()
+            // A Subagent's child Session joins no listing: it is reachable
+            // only through the row in its parent's Transcript.
+            .filter(|record| record.snapshot.session.parent.is_none())
             .map(|record| record.summary.clone())
             .filter(|summary| {
                 workspace

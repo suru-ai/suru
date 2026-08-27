@@ -55,8 +55,11 @@ impl SessionRecord {
         // only to the Session it has open while the Working label it draws is
         // for every Session it lists. Announced only when the reading flips:
         // a Turn moves the Session with every commit it streams, and none of
-        // those change what a listing says about when the work began.
-        if self.summary.working_since != was_working_since {
+        // those change what a listing says about when the work began. A
+        // Subagent's child Session announces nothing, because no listing
+        // holds a row its announcement could move.
+        if self.snapshot.session.parent.is_none() && self.summary.working_since != was_working_since
+        {
             self.catalog.publish(SessionCatalogChange::WorkingChanged {
                 session_id,
                 working_since: self.summary.working_since,

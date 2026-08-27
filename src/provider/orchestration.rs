@@ -17,7 +17,7 @@ use super::{
     AttributedProviderEvent, ProviderCommandStatus, ProviderError, ProviderEvent,
     ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus, ProviderPrompt,
     ProviderRuntime, ProviderSession, ProviderSessionRequest, ProviderSteerInput,
-    ProviderSubagentId, ProviderTurnInput,
+    ProviderSubagentId, ProviderSubagentStatus, ProviderTurnInput,
 };
 use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
@@ -61,6 +61,12 @@ const MAX_STORED_REASONING_CHARS: usize = 64 * 1024;
 /// event source, so none of them can complete once it is gone.
 const SUBAGENT_CONNECTION_LOST_MESSAGE: &str =
     "Provider execution failed: the Provider Session ended before the Subagent's work completed.";
+
+/// The failure a Subagent's child Turn settles with when the Provider reported
+/// the Subagent itself failing. The Provider's settle carries no prose, so the
+/// child's Transcript states the fact in Suru's own words.
+const SUBAGENT_FAILED_MESSAGE: &str =
+    "Provider execution failed: the Provider reported this Subagent failing.";
 
 #[derive(Clone)]
 pub(crate) struct ProviderOrchestrator {
@@ -186,6 +192,11 @@ struct ActiveProviderTurn {
     command_activities: HashMap<super::ProviderActivityId, ActiveProviderCommand>,
     file_change_activities: HashMap<super::ProviderActivityId, ActivityId>,
     reasoning_activities: HashMap<super::ProviderActivityId, ActiveProviderReasoning>,
+    /// The Subagents this Turn's Agent spawned and has not yet settled, keyed
+    /// by the identity the Provider minted for each. Subagent identities live
+    /// in their own namespace — the routes' — so these never pass through
+    /// [`Self::claims_activity`].
+    subagent_activities: HashMap<ProviderSubagentId, ActiveProviderSubagent>,
 }
 
 /// An Agent Message the Provider is still streaming. Its normalizer buffers no
@@ -215,7 +226,28 @@ struct ActiveProviderReasoning {
     normalizer: ProviderTextNormalizer,
 }
 
+/// A Subagent the Turn's Agent is still running. Suru times the delegation
+/// itself, the way it times a Reasoning block: `started` is the moment the
+/// spawn was admitted, and the elapsed time it yields is the duration the
+/// settled row reports.
+struct ActiveProviderSubagent {
+    id: ActivityId,
+    started: Instant,
+}
+
 impl ActiveProviderTurn {
+    fn new(turn_id: TurnId) -> Self {
+        Self {
+            turn_id,
+            streaming_message: None,
+            interruption_acknowledged: false,
+            command_activities: HashMap::new(),
+            file_change_activities: HashMap::new(),
+            reasoning_activities: HashMap::new(),
+            subagent_activities: HashMap::new(),
+        }
+    }
+
     /// Whether the Turn already has a stream open under this Provider Activity
     /// identity, whatever kind of stream it is. Identities are the Provider's
     /// to choose and are unique across kinds, so every stream that opens one
@@ -240,11 +272,11 @@ impl ActiveProviderTurn {
 
 /// Where the connection's Subagent-attributed events land: for each Subagent
 /// the Provider has named, the Session that is that Subagent's own and the
-/// Turn state its stream projects into. Routes live and die with the Provider
-/// connection, because the identities are the connection's to mint — nothing
-/// establishes one yet, so every map here is empty until orchestration learns
-/// to open Subagent Sessions. An event attributed to a Subagent with no route
-/// lands nowhere.
+/// Turn state its stream projects into. A spawn establishes a route along
+/// with the child Session it opens, and the Subagent's settle drops it.
+/// Routes live and die with the Provider connection, because the identities
+/// are the connection's to mint. An event attributed to a Subagent with no
+/// route lands nowhere.
 #[derive(Default)]
 struct SubagentRoutes {
     routes: HashMap<ProviderSubagentId, SubagentRoute>,
@@ -258,8 +290,10 @@ struct SubagentRoute {
 impl SubagentRoutes {
     /// Projects one Subagent-attributed event into the Session its route
     /// names, through the same projection and commit path the owning Session's
-    /// events take. A Terminal projection settles the routed Turn, so the
-    /// route has nothing left to receive and is dropped.
+    /// events take. The route is taken out while its event projects, because a
+    /// nested spawn inserts the grandchild's route into this same table mid-
+    /// projection. A Terminal projection settles the routed Turn, so the route
+    /// has nothing left to receive and stays out.
     fn project_event(
         &mut self,
         sessions: &SessionStore,
@@ -268,7 +302,7 @@ impl SubagentRoutes {
         subagent: &ProviderSubagentId,
         event: ProviderEvent,
     ) {
-        let Some(route) = self.routes.get_mut(subagent) else {
+        let Some(mut route) = self.routes.remove(subagent) else {
             return;
         };
         let projection = project_provider_event(
@@ -276,12 +310,13 @@ impl SubagentRoutes {
             updates,
             route.session_id,
             &mut route.turn,
+            self,
             next_agent,
             event,
             QueuedPromptDisposition::LeavePending,
         );
-        if matches!(projection, ProviderEventProjection::Terminal(_)) {
-            self.routes.remove(subagent);
+        if !matches!(projection, ProviderEventProjection::Terminal(_)) {
+            self.routes.insert(subagent.clone(), route);
         }
     }
 
@@ -905,14 +940,7 @@ async fn run_provider_session(
                 }
                 continue;
             }
-            active = Some(ActiveProviderTurn {
-                turn_id,
-                streaming_message: None,
-                interruption_acknowledged: false,
-                command_activities: HashMap::new(),
-                file_change_activities: HashMap::new(),
-                reasoning_activities: HashMap::new(),
-            });
+            active = Some(ActiveProviderTurn::new(turn_id));
             continue;
         }
 
@@ -1106,6 +1134,7 @@ async fn run_provider_session(
                             &updates,
                             session_id,
                             current,
+                            &mut subagents,
                             &identity,
                             event,
                             queued_prompt_disposition,
@@ -1140,14 +1169,7 @@ async fn run_provider_session(
                                         );
                                     }
                                 } else {
-                                    active = Some(ActiveProviderTurn {
-                                        turn_id,
-                                        streaming_message: None,
-                                        interruption_acknowledged: false,
-                                        command_activities: HashMap::new(),
-                                        file_change_activities: HashMap::new(),
-                                        reasoning_activities: HashMap::new(),
-                                    });
+                                    active = Some(ActiveProviderTurn::new(turn_id));
                                 }
                             } else if !selection_rejected {
                                 defer_next_queued_prompt(
@@ -1399,11 +1421,15 @@ fn skill_delivery_failure_message(error: SkillCatalogError) -> String {
     format!("Skill Invocation delivery failed: {cause}")
 }
 
+// One parameter per piece of actor state the event vocabulary reaches; the
+// owning Session and a Subagent route project through the identical list.
+#[allow(clippy::too_many_arguments)]
 fn project_provider_event(
     sessions: &SessionStore,
     updates: &ProviderUpdateGate,
     session_id: SessionId,
     active: &mut ActiveProviderTurn,
+    subagents: &mut SubagentRoutes,
     next_agent: &AgentIdentity,
     event: ProviderEvent,
     queued_prompt_disposition: QueuedPromptDisposition,
@@ -1783,11 +1809,140 @@ fn project_provider_event(
                         ProviderEventProjection::Continue
                     })
             }
+            ProviderEvent::SubagentStarted {
+                subagent_id,
+                name,
+                description,
+            } => {
+                if active.subagent_activities.contains_key(&subagent_id)
+                    || subagents.routes.contains_key(&subagent_id)
+                {
+                    Err(anyhow::anyhow!(
+                        "Provider reused an active Subagent identity"
+                    ))
+                } else {
+                    let name = normalize_provider_text(&name);
+                    let description = normalize_provider_text(&description);
+                    sessions
+                        .create_subagent(session_id, Some(next_agent.clone()), &name, &description)
+                        .and_then(|spawned| {
+                            let subagent_activity_id = ActivityId::new();
+                            sessions.publish_agent_output(
+                                session_id,
+                                SessionChange::ActivityAdded {
+                                    activity: Activity::Subagent {
+                                        id: subagent_activity_id,
+                                        turn_id: active.turn_id,
+                                        status: ActivityStatus::Active,
+                                        name,
+                                        description,
+                                        session_id: spawned.session_id,
+                                        duration_ms: None,
+                                    },
+                                },
+                            )?;
+                            active.subagent_activities.insert(
+                                subagent_id.clone(),
+                                ActiveProviderSubagent {
+                                    id: subagent_activity_id,
+                                    started: Instant::now(),
+                                },
+                            );
+                            subagents.routes.insert(
+                                subagent_id,
+                                SubagentRoute {
+                                    session_id: spawned.session_id,
+                                    turn: ActiveProviderTurn::new(spawned.turn_id),
+                                },
+                            );
+                            Ok(ProviderEventProjection::Continue)
+                        })
+                }
+            }
+            ProviderEvent::SubagentUpdated {
+                subagent_id,
+                description,
+            } => {
+                let Some(subagent) = active.subagent_activities.get(&subagent_id) else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        next_agent,
+                        "Provider updated a Subagent before spawning it",
+                    );
+                };
+                sessions
+                    .publish_agent_output(
+                        session_id,
+                        SessionChange::SubagentDescriptionChanged {
+                            activity_id: subagent.id,
+                            description: normalize_provider_text(&description),
+                        },
+                    )
+                    .map(|_| ProviderEventProjection::Continue)
+            }
+            ProviderEvent::SubagentCompleted {
+                subagent_id,
+                status,
+            } => {
+                let Some(subagent) = active.subagent_activities.remove(&subagent_id) else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        next_agent,
+                        "Provider settled a Subagent before spawning it",
+                    );
+                };
+                // The settle closes the child's Turn along with the row: the
+                // Provider's boundary for the Subagent is one signal, and no
+                // further event of the child's is owed once it has passed.
+                if let Some(mut route) = subagents.routes.remove(&subagent_id) {
+                    let outcome = match status {
+                        ProviderSubagentStatus::Completed => ProviderTurnOutcome::Completed,
+                        ProviderSubagentStatus::Failed => ProviderTurnOutcome::Failed {
+                            trailing_output: route.turn.take_trailing_output(),
+                            message: SUBAGENT_FAILED_MESSAGE.to_owned(),
+                        },
+                    };
+                    if let Err(error) = sessions.finish_provider_turn(
+                        route.session_id,
+                        route.turn.turn_id,
+                        next_agent.agent.clone(),
+                        outcome,
+                        QueuedPromptDisposition::LeavePending,
+                    ) {
+                        return finish_invalid_provider_event(
+                            sessions,
+                            session_id,
+                            active,
+                            next_agent,
+                            failure_message("Provider execution failed", &error),
+                        );
+                    }
+                }
+                let duration_ms = u64::try_from(subagent.started.elapsed().as_millis()).ok();
+                sessions
+                    .publish_agent_output(
+                        session_id,
+                        SessionChange::SubagentStatusChanged {
+                            activity_id: subagent.id,
+                            status: match status {
+                                ProviderSubagentStatus::Completed => ActivityStatus::Completed,
+                                ProviderSubagentStatus::Failed => ActivityStatus::Failed,
+                            },
+                            duration_ms,
+                        },
+                    )
+                    .map(|_| ProviderEventProjection::Continue)
+            }
             ProviderEvent::TurnCompleted => {
                 if active.streaming_message.is_some()
                     || !active.command_activities.is_empty()
                     || !active.file_change_activities.is_empty()
                     || !active.reasoning_activities.is_empty()
+                    || !active.subagent_activities.is_empty()
                 {
                     Err(anyhow::anyhow!(
                         "Provider completed the Turn before completing its streamed output"
@@ -1921,11 +2076,11 @@ fn finish_invalid_provider_event(
     ProviderEventProjection::Terminal(next_turn)
 }
 
-/// The routing seam is proven here rather than at the wire, because nothing
-/// establishes a route yet: the Subagent lifecycle that will is its own
-/// feature, and these tests are the contract it builds on. The store, the
-/// commit, and the subscription are all real — only the route is placed by
-/// hand.
+/// The routing seam is proven here on its own terms, apart from the spawn
+/// that establishes routes in production: these tests are the contract the
+/// Subagent lifecycle builds on, and the wire-driven suites prove that
+/// lifecycle end to end. The store, the commit, and the subscription are all
+/// real — only the route is placed by hand.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2012,14 +2167,7 @@ mod tests {
     }
 
     fn turn_state(turn_id: TurnId) -> ActiveProviderTurn {
-        ActiveProviderTurn {
-            turn_id,
-            streaming_message: None,
-            interruption_acknowledged: false,
-            command_activities: HashMap::new(),
-            file_change_activities: HashMap::new(),
-            reasoning_activities: HashMap::new(),
-        }
+        ActiveProviderTurn::new(turn_id)
     }
 
     fn route_to(

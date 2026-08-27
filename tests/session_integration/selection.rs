@@ -1235,7 +1235,7 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
     })
     .await
     .expect("repeated selection rejection is projected");
-    assert_eq!(failed_again.turns[1].prompt_id, first_retry_prompt_id);
+    assert_eq!(failed_again.turns[1].prompt_id, Some(first_retry_prompt_id));
     assert_eq!(
         failed_again.prompts[2].skill_invocations,
         vec![invocation.clone()]
@@ -1287,7 +1287,7 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
         .await
         .expect("read retried Session");
     assert_eq!(retried.turns.len(), 3);
-    assert_eq!(retried.turns[2].prompt_id, retry_prompt_id);
+    assert_eq!(retried.turns[2].prompt_id, Some(retry_prompt_id));
     assert_eq!(retried.turns[2].status, TurnStatus::Active);
     assert_eq!(
         retried.turns[2]

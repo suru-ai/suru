@@ -413,7 +413,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
                 SessionChange::TurnAdded {
                     turn: Turn {
                         id: turn_id,
-                        prompt_id,
+                        prompt_id: Some(prompt_id),
                         agent: None,
                         status: TurnStatus::Active,
                         started_at: None,
@@ -600,7 +600,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
                 SessionChange::TurnAdded {
                     turn: Turn {
                         id: turn_id,
-                        prompt_id,
+                        prompt_id: Some(prompt_id),
                         agent: None,
                         status: TurnStatus::Active,
                         started_at: None,
@@ -857,6 +857,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
+            parent: None,
         },
         revision: SessionRevision::INITIAL,
         prompts: vec![Prompt {
@@ -869,7 +870,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
         }],
         turns: vec![Turn {
             id: turn_id,
-            prompt_id,
+            prompt_id: Some(prompt_id),
             agent: None,
             status: TurnStatus::Failed,
             started_at: None,

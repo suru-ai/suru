@@ -555,7 +555,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                 SessionChange::TurnAdded {
                     turn: Turn {
                         id: turn_id,
-                        prompt_id,
+                        prompt_id: Some(prompt_id),
                         agent: None,
                         status: TurnStatus::Active,
                         started_at: None,
@@ -1388,7 +1388,7 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                     SessionChange::TurnAdded {
                         turn: Turn {
                             id: delivered_turn_id,
-                            prompt_id: request.prompt.id,
+                            prompt_id: Some(request.prompt.id),
                             agent: None,
                             status: TurnStatus::Active,
                             started_at: None,
@@ -2746,6 +2746,143 @@ fn a_reasoning_block_still_running_renders_before_the_provider_describes_it() {
         rows[rendered_row(&rows, "Thinking")].trim_end(),
         "    ⠋ Thinking",
         "a block that has not settled is live progress, so it keeps its row"
+    );
+}
+
+/// A Session whose single Activity is a Subagent row, so a test can drive one
+/// delegation's presentation without competing transcript content.
+fn subagent_activity_session(
+    workspace: &std::path::Path,
+    status: ActivityStatus,
+    description: &str,
+    duration_ms: Option<u64>,
+) -> (suru::protocol::SessionSnapshot, ActivityId) {
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Delegate the mapping",
+        workspace,
+    );
+    let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
+    let activity_id = snapshot.activities[0].id();
+    snapshot.activities[0] = Activity::Subagent {
+        id: activity_id,
+        turn_id,
+        status,
+        name: "Explore".to_owned(),
+        description: description.to_owned(),
+        session_id: SessionId::new(),
+        duration_ms,
+    };
+    (snapshot, activity_id)
+}
+
+#[test]
+fn subagent_rows_render_working_settled_and_failed_states() {
+    let workspace = workspace_dir();
+    let cases = [
+        (
+            ActivityStatus::Active,
+            None,
+            "⠋ Explore: Map the provider seams",
+            Color::Cyan,
+        ),
+        (
+            ActivityStatus::Completed,
+            Some(12_000),
+            "✓ Explore: Map the provider seams · 12s",
+            Color::DarkGray,
+        ),
+        (
+            ActivityStatus::Failed,
+            Some(3_000),
+            "× Explore: Map the provider seams · 3s",
+            Color::Red,
+        ),
+    ];
+
+    for (status, duration_ms, heading, color) in cases {
+        let (snapshot, _) = subagent_activity_session(
+            workspace.path(),
+            status,
+            "Map the provider seams",
+            duration_ms,
+        );
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach Session with a Subagent Activity");
+
+        let buffer = rendered_application_buffer(&application, 80, 22);
+        let text = buffer_rows(&buffer).join("\n");
+        assert!(
+            text.contains(heading),
+            "the Subagent row reads {heading:?}:\n{text}"
+        );
+        assert_eq!(text_cell(&buffer, heading).fg, color);
+    }
+}
+
+#[test]
+fn a_working_subagent_row_settles_in_place_when_its_outcome_arrives() {
+    let workspace = workspace_dir();
+    let (snapshot, activity_id) = subagent_activity_session(
+        workspace.path(),
+        ActivityStatus::Active,
+        "Map the provider seams",
+        None,
+    );
+    let session_id = snapshot.session.id;
+    let revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a working Subagent");
+
+    let working = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        working.contains("⠋ Explore: Map the provider seams"),
+        "a working Subagent wears the Marker's Spinner: {working}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![SessionChange::SubagentStatusChanged {
+                    activity_id,
+                    status: ActivityStatus::Completed,
+                    duration_ms: Some(72_000),
+                }],
+            },
+        )))
+        .expect("settle the Subagent");
+
+    let settled_rows = rendered_application_rows_at(&application, 80, 22);
+    assert_eq!(
+        settled_rows[rendered_row(&settled_rows, "Explore: Map the provider seams")].trim_end(),
+        "    ✓ Explore: Map the provider seams · 1m 12s",
+        "the settled row swaps its Spinner for the outcome glyph and states its duration"
+    );
+}
+
+#[test]
+fn a_subagent_asked_without_a_description_heads_with_its_name_alone() {
+    let workspace = workspace_dir();
+    let (snapshot, _) =
+        subagent_activity_session(workspace.path(), ActivityStatus::Active, "", None);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with an undescribed Subagent");
+
+    let rows = rendered_application_rows_at(&application, 80, 22);
+    assert_eq!(
+        rows[rendered_row(&rows, "⠋ Explore")].trim_end(),
+        "    ⠋ Explore",
+        "no separator trails a name with nothing to separate it from"
     );
 }
 
@@ -5116,7 +5253,7 @@ fn append_settled_turn(
     let turn_id = TurnId::new();
     snapshot.turns.push(Turn {
         id: turn_id,
-        prompt_id: PromptId::new(),
+        prompt_id: Some(PromptId::new()),
         agent: None,
         status: TurnStatus::Completed,
         started_at: None,
@@ -5396,7 +5533,7 @@ fn newer_turn_begins(
             SessionChange::TurnAdded {
                 turn: Turn {
                     id: turn_id,
-                    prompt_id,
+                    prompt_id: Some(prompt_id),
                     agent: None,
                     status: TurnStatus::Active,
                     started_at: None,

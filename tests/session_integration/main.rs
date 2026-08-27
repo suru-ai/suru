@@ -22,6 +22,7 @@ mod settlement;
 mod skills;
 mod storage;
 mod streams;
+mod subagents;
 mod support;
 mod titles;
 mod turns;

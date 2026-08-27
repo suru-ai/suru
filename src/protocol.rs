@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
@@ -1150,6 +1150,25 @@ pub enum Activity {
         /// settles and only when it settled by completing.
         duration_ms: Option<u64>,
     },
+    /// One Subagent the Turn's Agent delegated work to. This row is all its
+    /// spawner's Transcript carries of it: the Subagent's work lives in the
+    /// child Session the row names, never interleaved here.
+    Subagent {
+        id: ActivityId,
+        turn_id: TurnId,
+        status: ActivityStatus,
+        /// The Subagent's name — which kind of agent the Provider ran, as the
+        /// reader should meet it.
+        name: String,
+        /// What the Subagent was asked to do, as its spawn described it.
+        description: String,
+        /// The Subagent's own Session: a child of the Session this row is in,
+        /// and the way into everything the Subagent did.
+        session_id: SessionId,
+        /// How long the Subagent worked, known only once it settles and only
+        /// when the Provider's own settle reported the boundary.
+        duration_ms: Option<u64>,
+    },
 }
 
 impl Activity {
@@ -1159,7 +1178,8 @@ impl Activity {
             | Self::Error { id, .. }
             | Self::Command { id, .. }
             | Self::FileChange { id, .. }
-            | Self::Reasoning { id, .. } => *id,
+            | Self::Reasoning { id, .. }
+            | Self::Subagent { id, .. } => *id,
         }
     }
 
@@ -1169,7 +1189,8 @@ impl Activity {
             | Self::Error { turn_id, .. }
             | Self::Command { turn_id, .. }
             | Self::FileChange { turn_id, .. }
-            | Self::Reasoning { turn_id, .. } => *turn_id,
+            | Self::Reasoning { turn_id, .. }
+            | Self::Subagent { turn_id, .. } => *turn_id,
         }
     }
 
@@ -1180,7 +1201,8 @@ impl Activity {
             Self::Status { .. } | Self::Error { .. } => None,
             Self::Command { status, .. }
             | Self::FileChange { status, .. }
-            | Self::Reasoning { status, .. } => Some(*status),
+            | Self::Reasoning { status, .. }
+            | Self::Subagent { status, .. } => Some(*status),
         }
     }
 }
@@ -1193,6 +1215,12 @@ pub struct Session {
     pub agent_selection: Option<AgentSelection>,
     pub agent_selection_availability: ModelAvailability,
     pub status: SessionStatus,
+    /// The Session whose Turn spawned this one, present exactly when this is a
+    /// Subagent's Session. A child is reachable only through its parent: it
+    /// joins no Session listing, refuses Prompts, and is deleted along with
+    /// the parent it names.
+    #[serde(default)]
+    pub parent: Option<SessionId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1393,7 +1421,9 @@ pub struct Prompt {
 #[serde(deny_unknown_fields)]
 pub struct Turn {
     pub id: TurnId,
-    pub prompt_id: PromptId,
+    /// The Prompt whose delivery began this Turn, absent only on a Turn that
+    /// began without one — a Subagent Session's Turn, opened by its spawn.
+    pub prompt_id: Option<PromptId>,
     pub agent: Option<AgentIdentity>,
     pub status: TurnStatus,
     /// When the commit that delivered this Turn's opening Prompt landed, and
@@ -1540,6 +1570,15 @@ pub enum SessionChange {
         status: ActivityStatus,
         duration_ms: Option<u64>,
     },
+    SubagentDescriptionChanged {
+        activity_id: ActivityId,
+        description: String,
+    },
+    SubagentStatusChanged {
+        activity_id: ActivityId,
+        status: ActivityStatus,
+        duration_ms: Option<u64>,
+    },
     TurnStatusChanged {
         turn_id: TurnId,
         status: TurnStatus,
@@ -1599,6 +1638,7 @@ pub enum SessionErrorCode {
     EmptyPrompt,
     InvalidWorkspace,
     SessionNotFound,
+    SubagentSession,
     PromptConflict,
     PromptNotFound,
     PromptNotPending,

@@ -190,6 +190,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
             }),
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Active,
+            parent: None,
         },
         title: "Explain this workspace".to_owned(),
         emoji: Some("\u{1F5FA}\u{FE0F}".to_owned()),
@@ -212,6 +213,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         },
         "agent_selection_availability": "available",
         "status": "active",
+        "parent": null,
         "created_at": 1_755_497_600_000_u64,
         "updated_at": 1_755_497_600_321_u64
     });
@@ -264,6 +266,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             }),
             agent_selection_availability: ModelAvailability::Unavailable,
             status: SessionStatus::Idle,
+            parent: None,
         },
         revision: SessionRevision(7),
         prompts: vec![Prompt {
@@ -276,7 +279,9 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         }],
         turns: vec![Turn {
             id: TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d")),
-            prompt_id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
+            prompt_id: Some(PromptId::from_uuid(fixture_id(
+                "0198b27e-2a7e-7562-b80d-54aa50c360f9",
+            ))),
             agent: Some(AgentIdentity {
                 agent: AgentId::new("coding"),
                 selection: AgentSelection {
@@ -334,7 +339,8 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 }]
             },
             "agent_selection_availability": "unavailable",
-            "status": "idle"
+            "status": "idle",
+            "parent": null
         },
         "revision": 7,
         "prompts": [{
@@ -714,6 +720,96 @@ fn reasoning_activity_lifecycle_uses_typed_incremental_updates() {
     assert_eq!(
         serde_json::from_value::<[SessionUpdate; 5]>(expected)
             .expect("decode Reasoning Activity updates"),
+        updates
+    );
+}
+
+#[test]
+fn subagent_activity_lifecycle_uses_typed_incremental_updates() {
+    let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));
+    let activity_id = ActivityId::from_uuid(fixture_id("0198b27e-345a-700e-ae3b-d971c57fbe87"));
+    let child_session_id = SessionId::from_uuid(fixture_id("0198b27e-4f11-7d80-a4de-3f2a6f6b3a01"));
+    let updates = [
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(8),
+            changes: vec![SessionChange::ActivityAdded {
+                activity: Activity::Subagent {
+                    id: activity_id,
+                    turn_id,
+                    status: ActivityStatus::Active,
+                    name: "Explore".to_owned(),
+                    description: "Map the provider seams".to_owned(),
+                    session_id: child_session_id,
+                    duration_ms: None,
+                },
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(9),
+            changes: vec![SessionChange::SubagentDescriptionChanged {
+                activity_id,
+                description: "Reading the orchestration actor".to_owned(),
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(10),
+            changes: vec![SessionChange::SubagentStatusChanged {
+                activity_id,
+                status: ActivityStatus::Completed,
+                duration_ms: Some(72_000),
+            }],
+        },
+    ];
+    let expected = json!([
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 8,
+            "changes": [{
+                "type": "activity_added",
+                "activity": {
+                    "id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                    "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+                    "kind": "subagent",
+                    "status": "active",
+                    "name": "Explore",
+                    "description": "Map the provider seams",
+                    "session_id": "0198b27e-4f11-7d80-a4de-3f2a6f6b3a01",
+                    "duration_ms": null
+                }
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 9,
+            "changes": [{
+                "type": "subagent_description_changed",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "description": "Reading the orchestration actor"
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 10,
+            "changes": [{
+                "type": "subagent_status_changed",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "status": "completed",
+                "duration_ms": 72000
+            }]
+        }
+    ]);
+
+    assert_eq!(
+        serde_json::to_value(&updates).expect("encode Subagent Activity updates"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<[SessionUpdate; 3]>(expected)
+            .expect("decode Subagent Activity updates"),
         updates
     );
 }

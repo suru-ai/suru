@@ -1170,6 +1170,7 @@ fn session_summary(
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status,
+            parent: None,
         },
         title: title.to_owned(),
         emoji: None,

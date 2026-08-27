@@ -1878,6 +1878,18 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
                 }
             }
         }
+        Activity::Subagent {
+            status,
+            name,
+            description,
+            duration_ms,
+            ..
+        } => {
+            (*status as u8).hash(&mut hasher);
+            name.hash(&mut hasher);
+            description.hash(&mut hasher);
+            duration_ms.hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -2053,6 +2065,23 @@ fn render_activity(
                 theme,
             )
         }),
+        Activity::Subagent {
+            status,
+            name,
+            description,
+            duration_ms,
+            ..
+        } => {
+            push_subagent_activity(
+                projection.lines,
+                *status,
+                name,
+                description,
+                *duration_ms,
+                theme,
+            );
+            None
+        }
     }
 }
 
@@ -2718,6 +2747,39 @@ fn push_reasoning_activity(
     }
     lines.append(&mut body);
     UnitAnchor::binary(header_source_lines, false)
+}
+
+/// Projects a Subagent Activity: the one row its spawner's Transcript carries
+/// of the delegation. Its Marker leads — a Spinner while the Subagent works,
+/// its outcome glyph once it settles — then the Subagent's name, what it was
+/// asked to do, and its duration once the settle reported one. There is
+/// nothing to fold, because the Subagent's work lives in the child Session
+/// the row stands for rather than behind it.
+fn push_subagent_activity(
+    lines: &mut Vec<Line<'static>>,
+    status: crate::protocol::ActivityStatus,
+    name: &str,
+    description: &str,
+    duration_ms: Option<u64>,
+    theme: &Theme,
+) {
+    use crate::protocol::ActivityStatus;
+
+    let (marker, style) = match status {
+        ActivityStatus::Active => (spinner::MARKER, theme.accent.primary),
+        ActivityStatus::Completed => ("✓ ", theme.text.subdued),
+        ActivityStatus::Failed => ("× ", theme.feedback.error),
+    };
+    let mut header = name.to_owned();
+    if !description.trim().is_empty() {
+        header.push_str(": ");
+        header.push_str(description);
+    }
+    if let Some(duration_ms) = duration_ms {
+        header.push_str(" · ");
+        header.push_str(&humanized_duration(duration_ms));
+    }
+    push_prefixed_lines(lines, &format!("  {marker}"), &header, style);
 }
 
 /// Re-styles a rendered Markdown line as subdued prose in the Activity gutter.
@@ -4360,6 +4422,7 @@ mod tests {
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,
+                parent: None,
             },
             revision: SessionRevision::INITIAL,
             prompts: Vec::new(),
@@ -4580,7 +4643,8 @@ mod tests {
             | Activity::Error { turn_id: id, .. }
             | Activity::Command { turn_id: id, .. }
             | Activity::FileChange { turn_id: id, .. }
-            | Activity::Reasoning { turn_id: id, .. } => *id = turn_id,
+            | Activity::Reasoning { turn_id: id, .. }
+            | Activity::Subagent { turn_id: id, .. } => *id = turn_id,
         }
     }
 
@@ -4602,7 +4666,7 @@ mod tests {
             }
             snapshot.turns.push(Turn {
                 id: turn_id,
-                prompt_id: PromptId::new(),
+                prompt_id: Some(PromptId::new()),
                 agent: None,
                 status,
                 started_at: None,

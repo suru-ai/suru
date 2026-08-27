@@ -371,7 +371,7 @@ async fn scripted_codex_delivers_the_authoritative_queue_once_in_admission_order
     .await;
     assert_eq!(first_queued_turn.session.status, SessionStatus::Active);
     assert_eq!(first_queued_turn.turns[0].status, TurnStatus::Completed);
-    assert_eq!(first_queued_turn.turns[1].prompt_id, first.id);
+    assert_eq!(first_queued_turn.turns[1].prompt_id, Some(first.id));
     assert_eq!(first_queued_turn.messages.len(), 2);
     assert_eq!(first_queued_turn.messages[1].content, first.text);
     assert_eq!(
@@ -402,7 +402,7 @@ async fn scripted_codex_delivers_the_authoritative_queue_once_in_admission_order
     .await;
     assert_eq!(second_queued_turn.session.status, SessionStatus::Active);
     assert_eq!(second_queued_turn.turns[1].status, TurnStatus::Completed);
-    assert_eq!(second_queued_turn.turns[2].prompt_id, second.id);
+    assert_eq!(second_queued_turn.turns[2].prompt_id, Some(second.id));
     assert_eq!(second_queued_turn.messages.len(), 3);
     assert_eq!(second_queued_turn.messages[2].content, second.text);
 
@@ -715,7 +715,7 @@ async fn scripted_codex_handles_pending_steers_before_starting_the_queued_turn()
         .await;
     assert_eq!(continued.session.status, SessionStatus::Active);
     assert_eq!(continued.turns[0].status, TurnStatus::Completed);
-    assert_eq!(continued.turns[1].prompt_id, queued.id);
+    assert_eq!(continued.turns[1].prompt_id, Some(queued.id));
     assert_eq!(continued.messages.len(), 3);
     assert_eq!(continued.messages[0].content, "Begin the steering fixture");
     assert_eq!(continued.messages[1].content, steer.text);

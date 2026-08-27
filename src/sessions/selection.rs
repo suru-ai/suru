@@ -277,12 +277,15 @@ impl SessionStore {
             if turn.status != TurnStatus::Active {
                 return Err(anyhow!("Selection rejection referenced a terminal Turn"));
             }
+            let prompt_id = turn
+                .prompt_id
+                .ok_or_else(|| anyhow!("Selection rejection referenced a Turn without a Prompt"))?;
             let prompt = record
                 .snapshot
                 .prompts
                 .iter()
-                .find(|prompt| prompt.id == turn.prompt_id)
-                .expect("every Turn retains its originating Prompt");
+                .find(|prompt| prompt.id == prompt_id)
+                .expect("every Prompt-begun Turn retains its originating Prompt");
             let mark_unavailable = turn.agent.as_ref().is_some_and(|agent| {
                 record.snapshot.session.agent_selection.as_ref() == Some(&agent.selection)
             });

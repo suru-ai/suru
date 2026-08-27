@@ -230,7 +230,7 @@ pub fn enter_active_session(
     });
     snapshot.turns.push(Turn {
         id: turn_id,
-        prompt_id,
+        prompt_id: Some(prompt_id),
         agent: None,
         status: TurnStatus::Active,
         started_at: None,
@@ -271,6 +271,7 @@ pub fn failed_session_snapshot(
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
+            parent: None,
         },
         revision: SessionRevision::INITIAL,
         prompts: vec![delivered.prompt],
@@ -313,6 +314,7 @@ pub fn selected_session_snapshot(
             agent_selection: Some(selection),
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
+            parent: None,
         },
         revision: SessionRevision::INITIAL,
         prompts: Vec::new(),
@@ -337,6 +339,7 @@ pub fn navigable_session_snapshot(
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
+            parent: None,
         },
         revision: SessionRevision::INITIAL,
         prompts: Vec::new(),
@@ -360,7 +363,7 @@ pub fn navigable_session_snapshot(
         });
         snapshot.turns.push(Turn {
             id: turn_id,
-            prompt_id,
+            prompt_id: Some(prompt_id),
             agent: None,
             status: TurnStatus::Completed,
             started_at: None,
@@ -421,7 +424,7 @@ impl FailedTurnFixture {
             },
             turn: Turn {
                 id: turn_id,
-                prompt_id,
+                prompt_id: Some(prompt_id),
                 agent: None,
                 status: TurnStatus::Failed,
                 started_at: None,

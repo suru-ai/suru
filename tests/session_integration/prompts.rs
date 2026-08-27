@@ -82,7 +82,7 @@ async fn authenticated_creation_returns_pending_before_async_provider_failure() 
     .await;
     assert_eq!(failed.prompts[0].status, PromptStatus::Delivered);
     assert_eq!(failed.turns.len(), 1);
-    assert_eq!(failed.turns[0].prompt_id, prompt_id);
+    assert_eq!(failed.turns[0].prompt_id, Some(prompt_id));
     assert_eq!(failed.turns[0].status, TurnStatus::Failed);
     assert_eq!(failed.messages.len(), 1);
     assert_eq!(failed.messages[0].role, MessageRole::User);
@@ -337,7 +337,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         .changes
         .iter()
         .find_map(|change| match change {
-            SessionChange::TurnAdded { turn } if turn.prompt_id == prompt_id => Some(turn.id),
+            SessionChange::TurnAdded { turn } if turn.prompt_id == Some(prompt_id) => Some(turn.id),
             _ => None,
         })
         .expect("delivered steer creates a Turn");
@@ -513,7 +513,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                 SessionChange::TurnAdded {
                     turn: Turn {
                         id: active_turn_id,
-                        prompt_id: active_prompt_id,
+                        prompt_id: Some(active_prompt_id),
                         agent: None,
                         status: TurnStatus::Active,
                         started_at: None,
@@ -563,7 +563,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                     SessionChange::TurnAdded {
                         turn: Turn {
                             id: TurnId::new(),
-                            prompt_id: rejected_prompt_id,
+                            prompt_id: Some(rejected_prompt_id),
                             agent: None,
                             status: TurnStatus::Active,
                             started_at: None,
@@ -910,7 +910,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
     );
     assert_eq!(current.session.status, SessionStatus::Active);
     assert_eq!(current.turns.len(), 2);
-    assert_eq!(current.turns[1].prompt_id, after_interrupt.id);
+    assert_eq!(current.turns[1].prompt_id, Some(after_interrupt.id));
     assert_eq!(current.turns[1].status, TurnStatus::Active);
     assert_eq!(
         current

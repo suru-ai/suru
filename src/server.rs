@@ -1208,6 +1208,11 @@ async fn admit_prompt(
             SessionErrorCode::SessionNotFound,
             "Session does not exist on this server instance",
         ),
+        Err(AdmitPromptError::SubagentSession) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::SubagentSession,
+            "A Subagent's Session refuses Prompts",
+        ),
         Err(AdmitPromptError::PromptConflict) => prompt_conflict_response(),
     }
 }

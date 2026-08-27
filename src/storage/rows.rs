@@ -63,6 +63,7 @@ pub(super) struct SessionRow {
     agent_selection_availability: String,
     status: String,
     revision: i64,
+    parent_session_id: Option<String>,
 }
 
 #[derive(Insertable, Queryable, Selectable)]
@@ -80,7 +81,7 @@ pub(super) struct PromptRow {
 pub(super) struct TurnRow {
     id: String,
     session_id: String,
-    prompt_id: String,
+    prompt_id: Option<String>,
     row_order: i64,
     payload: String,
 }
@@ -283,6 +284,7 @@ impl SessionRow {
             )?,
             status: encode(session_id, "Session status", &summary.session.status)?,
             revision: u64_to_i64(session_id, "revision", revision.0)?,
+            parent_session_id: summary.session.parent.map(|parent| parent.to_string()),
         })
     }
 
@@ -309,6 +311,11 @@ impl SessionRow {
                     &self.agent_selection_availability,
                 )?,
                 status: decode(&session_id, "Session status", &self.status)?,
+                parent: self
+                    .parent_session_id
+                    .as_deref()
+                    .map(|parent| parse_id(parent, "parent Session ID", SessionId::from_uuid))
+                    .transpose()?,
             },
             title: self.title,
             emoji: self.emoji,
@@ -388,7 +395,7 @@ impl TurnRow {
         Ok(Self {
             id: turn.id.to_string(),
             session_id: position.stored_session_id.to_owned(),
-            prompt_id: turn.prompt_id.to_string(),
+            prompt_id: turn.prompt_id.map(|prompt_id| prompt_id.to_string()),
             row_order: usize_to_i64(position.session_id, "Turn row order", position.row_order)?,
             payload: encode(
                 position.session_id,
@@ -408,7 +415,11 @@ impl TurnRow {
         let payload: StoredTurnPayload = decode(&session_id, "Turn payload", &self.payload)?;
         Ok(Turn {
             id: parse_id(&self.id, "Turn ID", TurnId::from_uuid)?,
-            prompt_id: parse_id(&self.prompt_id, "Turn Prompt ID", PromptId::from_uuid)?,
+            prompt_id: self
+                .prompt_id
+                .as_deref()
+                .map(|prompt_id| parse_id(prompt_id, "Turn Prompt ID", PromptId::from_uuid))
+                .transpose()?,
             agent: payload.agent.map(AgentIdentity::from),
             status: payload.status,
             started_at: payload.started_at,
@@ -700,6 +711,13 @@ enum StoredActivityPayload {
         content_truncated: bool,
         duration_ms: Option<u64>,
     },
+    Subagent {
+        status: ActivityStatus,
+        name: String,
+        description: String,
+        session_id: SessionId,
+        duration_ms: Option<u64>,
+    },
 }
 
 impl StoredActivityPayload {
@@ -745,6 +763,21 @@ impl StoredActivityPayload {
                 content_truncated,
                 duration_ms,
             },
+            Self::Subagent {
+                status,
+                name,
+                description,
+                session_id,
+                duration_ms,
+            } => Activity::Subagent {
+                id,
+                turn_id,
+                status,
+                name,
+                description,
+                session_id,
+                duration_ms,
+            },
         }
     }
 }
@@ -788,6 +821,20 @@ impl From<Activity> for StoredActivityPayload {
                 title,
                 content,
                 content_truncated,
+                duration_ms,
+            },
+            Activity::Subagent {
+                status,
+                name,
+                description,
+                session_id,
+                duration_ms,
+                ..
+            } => Self::Subagent {
+                status,
+                name,
+                description,
+                session_id,
                 duration_ms,
             },
         }
