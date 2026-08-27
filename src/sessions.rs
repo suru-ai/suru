@@ -104,6 +104,10 @@ pub(crate) enum ListSessionsError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DeleteSessionError {
     SessionNotFound,
+    /// The Session is a Subagent's, whose deletion is its parent's alone:
+    /// deleting it directly would leave the parent's Transcript row naming a
+    /// Session that no longer exists.
+    SubagentSession,
     Storage(String),
 }
 
@@ -212,7 +216,7 @@ impl SessionStore {
             .iter()
             // A Subagent's child Session rides no catalog: every client lists
             // what the catalog holds, and a child joins no listing.
-            .filter(|(_, record)| record.snapshot.session.parent.is_none())
+            .filter(|(_, record)| !record.snapshot.session.is_subagent())
             .map(|(session_id, _)| session_id)
             .chain(state.unreadable_sessions.keys())
             .copied()
@@ -308,10 +312,14 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        if !state.sessions.contains_key(&session_id)
-            && !state.unreadable_sessions.contains_key(&session_id)
-        {
-            return Err(DeleteSessionError::SessionNotFound);
+        match state.sessions.get(&session_id) {
+            None if !state.unreadable_sessions.contains_key(&session_id) => {
+                return Err(DeleteSessionError::SessionNotFound);
+            }
+            Some(record) if record.snapshot.session.is_subagent() => {
+                return Err(DeleteSessionError::SubagentSession);
+            }
+            _ => {}
         }
         // A Session's Subagent subtree shares its deletion, walked deepest
         // first so a failure partway leaves no child severed from the parent
@@ -365,7 +373,7 @@ impl SessionStore {
             .values()
             // A Subagent's child Session joins no listing: it is reachable
             // only through the row in its parent's Transcript.
-            .filter(|record| record.snapshot.session.parent.is_none())
+            .filter(|record| !record.snapshot.session.is_subagent())
             .map(|record| record.summary.clone())
             .filter(|summary| {
                 workspace

@@ -58,8 +58,7 @@ impl SessionRecord {
         // those change what a listing says about when the work began. A
         // Subagent's child Session announces nothing, because no listing
         // holds a row its announcement could move.
-        if self.snapshot.session.parent.is_none() && self.summary.working_since != was_working_since
-        {
+        if !self.snapshot.session.is_subagent() && self.summary.working_since != was_working_since {
             self.catalog.publish(SessionCatalogChange::WorkingChanged {
                 session_id,
                 working_since: self.summary.working_since,

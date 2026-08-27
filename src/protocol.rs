@@ -1165,8 +1165,9 @@ pub enum Activity {
         /// The Subagent's own Session: a child of the Session this row is in,
         /// and the way into everything the Subagent did.
         session_id: SessionId,
-        /// How long the Subagent worked, known only once it settles and only
-        /// when the Provider's own settle reported the boundary.
+        /// How long the Subagent worked, timed by Suru from its spawn. Known
+        /// only once it settles, and absent on a row anything other than the
+        /// Provider's own settle event closed.
         duration_ms: Option<u64>,
     },
 }
@@ -1221,6 +1222,16 @@ pub struct Session {
     /// the parent it names.
     #[serde(default)]
     pub parent: Option<SessionId>,
+}
+
+impl Session {
+    /// Whether this is a Subagent's Session — a child of the Session whose
+    /// Turn spawned it. Every property of being one keys off this single
+    /// reading: excluded from listings and the catalog, refusing Prompts, and
+    /// deleted with its parent.
+    pub const fn is_subagent(&self) -> bool {
+        self.parent.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1421,8 +1432,8 @@ pub struct Prompt {
 #[serde(deny_unknown_fields)]
 pub struct Turn {
     pub id: TurnId,
-    /// The Prompt whose delivery began this Turn, absent only on a Turn that
-    /// began without one — a Subagent Session's Turn, opened by its spawn.
+    /// The Prompt whose delivery began this Turn, absent on a Turn no Prompt
+    /// began — today a Subagent Session's Turn, opened by its spawn.
     pub prompt_id: Option<PromptId>,
     pub agent: Option<AgentIdentity>,
     pub status: TurnStatus,

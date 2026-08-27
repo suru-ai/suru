@@ -283,7 +283,7 @@ impl SessionStore {
 
         match state.sessions.get(&session_id) {
             None => return Err(AdmitPromptError::SessionNotFound),
-            Some(record) if record.snapshot.session.parent.is_some() => {
+            Some(record) if record.snapshot.session.is_subagent() => {
                 return Err(AdmitPromptError::SubagentSession);
             }
             Some(_) => {}

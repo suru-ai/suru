@@ -879,6 +879,69 @@ async fn deleting_a_session_deletes_its_subagent_subtree_for_good() {
 }
 
 #[tokio::test]
+async fn a_child_session_cannot_be_deleted_out_from_under_its_parents_row() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-child-delete-test").await;
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: ProviderSubagentId::new("task-1"),
+            name: "Explore".to_owned(),
+            description: "Map the provider seams".to_owned(),
+        })
+        .await;
+    let parent = read_session_at_least_revision(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        SessionRevision(4),
+    )
+    .await;
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&parent)
+    else {
+        unreachable!()
+    };
+
+    let refused = fixture
+        .client
+        .delete(format!(
+            "{}/v1/sessions/{child_id}",
+            fixture.server.descriptor().base_url
+        ))
+        .bearer_auth(&fixture.server.descriptor().token)
+        .send()
+        .await
+        .expect("attempt to delete child Session");
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    let error = refused
+        .json::<SessionError>()
+        .await
+        .expect("decode refusal");
+    assert_eq!(error.code, SessionErrorCode::SubagentSession);
+
+    let child = fixture
+        .client
+        .get(format!(
+            "{}/v1/sessions/{child_id}",
+            fixture.server.descriptor().base_url
+        ))
+        .bearer_auth(&fixture.server.descriptor().token)
+        .send()
+        .await
+        .expect("read child Session")
+        .error_for_status()
+        .expect("the parent's row still reaches its child");
+    drop(child);
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn a_restart_restores_child_sessions_and_the_rows_that_reach_them() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config =

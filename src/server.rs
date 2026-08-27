@@ -1427,6 +1427,11 @@ async fn delete_session(
             SessionErrorCode::SessionNotFound,
             "Session does not exist on this server instance",
         ),
+        Err(DeleteSessionError::SubagentSession) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::SubagentSession,
+            "A Subagent's Session is deleted with its parent",
+        ),
         Err(DeleteSessionError::Storage(_)) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

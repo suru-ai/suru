@@ -1938,6 +1938,12 @@ fn project_provider_event(
                     .map(|_| ProviderEventProjection::Continue)
             }
             ProviderEvent::TurnCompleted => {
+                // Subagents count as streamed output here for now, even though
+                // ADR 0015 settles a Turn at the Provider's boundary with
+                // Subagents still working: until Session liveness and
+                // Continuations carry work past a settled Turn, letting one
+                // outlive its Turn would strand its settle with nowhere to
+                // land. That work lifts Subagents out of this guard.
                 if active.streaming_message.is_some()
                     || !active.command_activities.is_empty()
                     || !active.file_change_activities.is_empty()
