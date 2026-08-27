@@ -54,7 +54,9 @@ impl SessionCatalogPublisher {
                 .expect("Session catalog revision space is not exhausted"),
         );
         let revision = channel.revision;
-        let _ = channel.updates.send(SessionCatalogUpdate { revision, change });
+        let _ = channel
+            .updates
+            .send(SessionCatalogUpdate { revision, change });
     }
 
     /// The revision in force and a receiver opened at it, taken together so a

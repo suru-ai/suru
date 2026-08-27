@@ -57,11 +57,10 @@ impl SessionRecord {
         // a Turn moves the Session with every commit it streams, and none of
         // those change what a listing says about when the work began.
         if self.summary.working_since != was_working_since {
-            self.catalog
-                .publish(SessionCatalogChange::WorkingChanged {
-                    session_id,
-                    working_since: self.summary.working_since,
-                });
+            self.catalog.publish(SessionCatalogChange::WorkingChanged {
+                session_id,
+                working_since: self.summary.working_since,
+            });
         }
         Ok(update)
     }

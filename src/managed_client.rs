@@ -19,9 +19,9 @@ use crate::{
         ModelCatalog, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
         SessionCreated, SessionDeleted, SessionError, SessionId, SessionListItem,
         SessionSettlementChanged, SessionSnapshot, SessionSummary, SessionTitleChanged,
-        SessionWorkingChanged,
-        SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
-        SkillCatalogRequest, Turn, TurnId, UpdateAgentSelectionRequest,
+        SessionWorkingChanged, SettingMutation, SettingsSnapshot, SettleSessionRequest,
+        ShutdownReason, SkillCatalog, SkillCatalogRequest, Turn, TurnId,
+        UpdateAgentSelectionRequest,
     },
 };
 

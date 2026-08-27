@@ -11,9 +11,9 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
         AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId,
-        RuntimeDescriptor, SessionCatalogChange, SessionError,
-        SessionErrorCode, SessionId, SessionListItem, SessionSettlementChanged, SessionSummary,
-        SessionTimestamp, SettleSessionRequest, Workspace,
+        RuntimeDescriptor, SessionCatalogChange, SessionError, SessionErrorCode, SessionId,
+        SessionListItem, SessionSettlementChanged, SessionSummary, SessionTimestamp,
+        SettleSessionRequest, Workspace,
     },
     server::ServerConfig,
 };

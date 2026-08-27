@@ -16,9 +16,8 @@ use suru::{
         CreateSessionRequest, FileChange, InitialPrompt, MessageRole, MessageStatus, ModelId,
         PromptDelivery, PromptId, PromptStatus, ProviderId, SessionCatalogChange, SessionChange,
         SessionError, SessionErrorCode, SessionId, SessionListItem, SessionRevision,
-        SessionSnapshot,
-        SessionStatus, SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan, TranscriptItem,
-        TurnStatus, Workspace,
+        SessionSnapshot, SessionStatus, SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan,
+        TranscriptItem, TurnStatus, Workspace,
     },
     provider::{
         ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderFileChangeStatus,

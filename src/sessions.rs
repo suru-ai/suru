@@ -14,9 +14,9 @@ use tokio::sync::broadcast;
 
 use crate::protocol::{
     AgentSelection, AgentSelectionOperationId, PromptId, PromptOrder, ProviderId,
-    SessionCatalogChange, SessionCatalogSnapshot, SessionCatalogUpdate,
-    SessionId, SessionListItem, SessionSnapshot, SessionSummary, SessionTimestamp, SessionUpdate,
-    TurnId, UnreadableSessionSummary,
+    SessionCatalogChange, SessionCatalogSnapshot, SessionCatalogUpdate, SessionId, SessionListItem,
+    SessionSnapshot, SessionSummary, SessionTimestamp, SessionUpdate, TurnId,
+    UnreadableSessionSummary,
 };
 use crate::provider::ProviderResumeState;
 use crate::storage::{PersistedSession, RestoredSessions, StorageSink, StoredResumeState};
