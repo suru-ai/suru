@@ -140,11 +140,11 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
         && !state.sidebar.menu_is_open()
         && state.composer_focused()
         && matches!(state.command_mode, CommandMode::Composer)
-        // A Subagent's Session draws no composer, so there is nowhere for a
-        // caret to invite typing.
-        && state.open_subagent_parent().is_none()
+        // The frame may have drawn no composer at all — a Subagent's Session
+        // stands one down — and then there is no caret to place.
+        && let Some(cursor) = composer.cursor
     {
-        frame.set_cursor_position(composer.cursor);
+        frame.set_cursor_position(cursor);
     }
 }
 
@@ -943,7 +943,10 @@ fn relative_update_time_compact(updated_at: SessionTimestamp, now: u64) -> Strin
 #[derive(Clone, Copy, Debug)]
 struct RenderedComposer {
     area: Rect,
-    cursor: Position,
+    /// Where the composer's caret sits, and `None` where no composer was
+    /// drawn — a Subagent's Session offers nowhere to type, so no caret may
+    /// invite it.
+    cursor: Option<Position>,
 }
 
 fn render_composer_completion(
@@ -1739,7 +1742,7 @@ fn render_landing(
         row = row.saturating_add(1);
     }
     let composer_area = Rect::new(panel.x, row, panel.width, composer_height);
-    let cursor = render_composer(
+    let cursor = Some(render_composer(
         frame,
         composer_area,
         ComposerContent {
@@ -1750,7 +1753,7 @@ fn render_landing(
         state.composer_border_style(theme),
         detail,
         theme,
-    );
+    ));
 
     render_slot(
         frame,
@@ -2076,9 +2079,9 @@ fn render_session(
             )),
             composer_area,
         );
-        Position::new(composer_area.x, composer_area.y)
+        None
     } else {
-        render_composer(
+        Some(render_composer(
             frame,
             composer_area,
             ComposerContent {
@@ -2089,7 +2092,7 @@ fn render_session(
             state.composer_border_style(theme),
             content_detail,
             theme,
-        )
+        ))
     };
     render_slot(frame, footer_area, footer, theme);
     RenderedComposer {
