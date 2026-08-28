@@ -226,14 +226,12 @@ impl SessionStore {
             },
         );
         let persisted_summary = summary.clone();
-        let catalog = state.catalog.clone();
         state.sessions.insert(
             session_id,
             SessionRecord {
                 snapshot: snapshot.clone(),
                 summary,
                 updates,
-                catalog,
                 next_prompt_order: PromptOrder(2),
                 steer_targets: HashMap::new(),
                 selection_operations: HashMap::new(),
@@ -288,7 +286,6 @@ impl SessionStore {
             }
             Some(_) => {}
         }
-        let updated_at = state.next_timestamp();
         let record = state
             .sessions
             .get_mut(&session_id)
@@ -300,12 +297,23 @@ impl SessionStore {
                 .checked_add(1)
                 .expect("Prompt admission order space is not exhausted"),
         );
-        let (disposition, steer_target) = match (
-            active_turn_id(&record.snapshot)
-                .expect("stored Sessions preserve the one-active-Turn invariant"),
-            request.delivery,
-        ) {
+        let active_turn = active_turn_id(&record.snapshot)
+            .expect("stored Sessions preserve the one-active-Turn invariant");
+        // A Continuation is settled by the next delivered Prompt rather than
+        // steered, so a Prompt admitted while one runs begins a Turn of its
+        // own instead of joining it.
+        let active_continuation = active_turn.is_some_and(|turn_id| {
+            record
+                .snapshot
+                .turns
+                .iter()
+                .any(|turn| turn.id == turn_id && turn.prompt_id.is_none())
+        });
+        let (disposition, steer_target) = match (active_turn, request.delivery) {
             (None, _) => (PromptAdmissionDisposition::StartImmediately, None),
+            (Some(_), PromptDelivery::Steer) if active_continuation => {
+                (PromptAdmissionDisposition::StartImmediately, None)
+            }
             (Some(turn_id), PromptDelivery::Steer) => {
                 (PromptAdmissionDisposition::SteerActive, Some(turn_id))
             }
@@ -323,16 +331,19 @@ impl SessionStore {
         // marker goes before the commit, so the summary that commit persists is
         // the active one and the announcement follows the Prompt it belongs to.
         let reactivation = record.reactivate(session_id);
-        record
+        state
             .commit(
                 &self.storage,
                 session_id,
                 vec![SessionChange::PromptAdded {
                     prompt: prompt.clone(),
                 }],
-                updated_at,
             )
             .expect("admission changes preserve Session invariants");
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
         record.next_prompt_order = next_prompt_order;
         if let Some(turn_id) = steer_target {
             record.steer_targets.insert(prompt.id, turn_id);
@@ -394,7 +405,6 @@ impl SessionStore {
             });
             (prompt.clone(), agent)
         };
-        let updated_at = state.next_timestamp();
         let (turn_status, failure_message) = match delivered_turn_status {
             DeliveredTurnStatus::Active => (TurnStatus::Active, None),
             DeliveredTurnStatus::Failed { message } => (TurnStatus::Failed, Some(message)),
@@ -409,11 +419,11 @@ impl SessionStore {
                 },
             });
         }
+        state.commit(&self.storage, session_id, changes)?;
         let record = state
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        record.commit(&self.storage, session_id, changes, updated_at)?;
         record.steer_targets.remove(&prompt_id);
         if record.selection_retry_prompt == Some(prompt_id) {
             record.selection_retry_prompt = None;
@@ -465,14 +475,13 @@ impl SessionStore {
             }
             prompt.clone()
         };
-        let updated_at = state.next_timestamp();
+        let mut changes = Vec::with_capacity(2);
+        append_steer_delivery_changes(&mut changes, &prompt, turn_id);
+        state.commit(&self.storage, session_id, changes)?;
         let record = state
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        let mut changes = Vec::with_capacity(2);
-        append_steer_delivery_changes(&mut changes, &prompt, turn_id);
-        record.commit(&self.storage, session_id, changes, updated_at)?;
         record.steer_targets.remove(&prompt_id);
         let mut delivered = prompt;
         delivered.status = PromptStatus::Delivered;
@@ -499,12 +508,7 @@ impl SessionStore {
                 return Ok(None);
             }
         }
-        let updated_at = state.next_timestamp();
-        let record = state
-            .sessions
-            .get_mut(&session_id)
-            .expect("Session existence was checked while holding the store lock");
-        let update = record.commit(
+        let update = state.commit(
             &self.storage,
             session_id,
             vec![SessionChange::ActivityAdded {
@@ -514,9 +518,13 @@ impl SessionStore {
                     text: message,
                 },
             }],
-            updated_at,
         )?;
-        record.steer_targets.remove(&prompt_id);
+        state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock")
+            .steer_targets
+            .remove(&prompt_id);
         Ok(Some(update))
     }
 
@@ -546,12 +554,7 @@ impl SessionStore {
             };
             prompt.clone()
         };
-        let updated_at = state.next_timestamp();
-        let record = state
-            .sessions
-            .get_mut(&session_id)
-            .expect("Session existence was checked while holding the store lock");
-        let update = record.commit(
+        let update = state.commit(
             &self.storage,
             session_id,
             vec![
@@ -578,9 +581,13 @@ impl SessionStore {
                     },
                 },
             ],
-            updated_at,
         )?;
-        record.steer_targets.remove(&prompt_id);
+        state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock")
+            .steer_targets
+            .remove(&prompt_id);
         Ok(Some(update))
     }
 
@@ -618,11 +625,6 @@ impl SessionStore {
             return Ok(delivered);
         }
 
-        let updated_at = state.next_timestamp();
-        let record = state
-            .sessions
-            .get_mut(&session_id)
-            .expect("Session existence was checked while holding the store lock");
         let mut changes = Vec::with_capacity(delivered.len() * 2);
         for prompt in &delivered {
             changes.extend([
@@ -643,7 +645,7 @@ impl SessionStore {
                 },
             ]);
         }
-        record.commit(&self.storage, session_id, changes, updated_at)?;
+        state.commit(&self.storage, session_id, changes)?;
         Ok(delivered
             .into_iter()
             .map(|mut prompt| {
@@ -682,13 +684,8 @@ impl SessionStore {
             }
             prompt
         };
-        let updated_at = state.next_timestamp();
-        let record = state
-            .sessions
-            .get_mut(&session_id)
-            .expect("Session existence was checked while holding the store lock");
         prompt.delivery = PromptDelivery::Steer;
-        record
+        state
             .commit(
                 &self.storage,
                 session_id,
@@ -696,7 +693,6 @@ impl SessionStore {
                     prompt_id,
                     delivery: PromptDelivery::Steer,
                 }],
-                updated_at,
             )
             .expect("Prompt promotion preserves Session invariants");
         Ok(prompt)
@@ -727,12 +723,7 @@ impl SessionStore {
         if prompt.status != PromptStatus::Pending || prompt.delivery != PromptDelivery::Queue {
             return Err(PromptMutationError::PromptNotPending);
         }
-        let updated_at = state.next_timestamp();
-        let record = state
-            .sessions
-            .get_mut(&session_id)
-            .expect("Session existence was checked while holding the store lock");
-        record
+        state
             .commit(
                 &self.storage,
                 session_id,
@@ -740,9 +731,12 @@ impl SessionStore {
                     prompt_id,
                     status: PromptStatus::Cancelled,
                 }],
-                updated_at,
             )
             .expect("Prompt cancellation preserves Session invariants");
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
         if record.selection_retry_prompt == Some(prompt_id) {
             record.selection_retry_prompt = None;
         }

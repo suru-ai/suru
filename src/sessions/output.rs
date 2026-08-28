@@ -5,8 +5,8 @@ use anyhow::anyhow;
 
 use crate::ansi::NormalizedText;
 use crate::protocol::{
-    Activity, ActivityId, MessageId, MessageRole, SessionChange, SessionId, SessionSnapshot,
-    SessionUpdate, TurnId, TurnStatus,
+    Activity, ActivityId, ActivityStatus, MessageId, MessageRole, SessionChange, SessionId,
+    SessionSnapshot, SessionUpdate, TurnId, TurnStatus,
 };
 
 use super::SessionStore;
@@ -47,24 +47,43 @@ impl SessionStore {
                 });
             }
             for change in &changes {
-                let turn_id = agent_output_turn_id(&record.snapshot, change)?;
-                let turn = record
-                    .snapshot
-                    .turns
-                    .iter()
-                    .find(|turn| turn.id == turn_id)
-                    .ok_or_else(|| anyhow!("Agent output referenced an unknown Turn"))?;
-                if turn.status != TurnStatus::Active {
-                    return Err(anyhow!("Agent output referenced a terminal Turn"));
+                match change {
+                    // A Subagent row outlives its Turn's settle (ADR 0015), so
+                    // its own lifecycle is gated on the row still being open
+                    // rather than on the Turn it was spawned under.
+                    SessionChange::SubagentDescriptionChanged { activity_id, .. }
+                    | SessionChange::SubagentStatusChanged { activity_id, .. } => {
+                        let activity = record
+                            .snapshot
+                            .activities
+                            .iter()
+                            .find(|activity| activity.id() == *activity_id)
+                            .ok_or_else(|| anyhow!("Agent output referenced an unknown Activity"))?;
+                        let Activity::Subagent { status, .. } = activity else {
+                            return Err(anyhow!(
+                                "Subagent output referenced an Activity of another kind"
+                            ));
+                        };
+                        if *status != ActivityStatus::Active {
+                            return Err(anyhow!("Agent output referenced a settled Subagent"));
+                        }
+                    }
+                    change => {
+                        let turn_id = agent_output_turn_id(&record.snapshot, change)?;
+                        let turn = record
+                            .snapshot
+                            .turns
+                            .iter()
+                            .find(|turn| turn.id == turn_id)
+                            .ok_or_else(|| anyhow!("Agent output referenced an unknown Turn"))?;
+                        if turn.status != TurnStatus::Active {
+                            return Err(anyhow!("Agent output referenced a terminal Turn"));
+                        }
+                    }
                 }
             }
         }
-        let updated_at = state.next_timestamp();
-        let record = state
-            .sessions
-            .get_mut(&session_id)
-            .expect("Session existence was checked while holding the store lock");
-        record.commit(&self.storage, session_id, changes, updated_at)
+        state.commit(&self.storage, session_id, changes)
     }
 }
 
@@ -161,9 +180,7 @@ fn agent_output_turn_id(
         | SessionChange::ReasoningTitleChanged { activity_id, .. }
         | SessionChange::ReasoningContentAppended { activity_id, .. }
         | SessionChange::ReasoningContentTruncated { activity_id }
-        | SessionChange::ReasoningStatusChanged { activity_id, .. }
-        | SessionChange::SubagentDescriptionChanged { activity_id, .. }
-        | SessionChange::SubagentStatusChanged { activity_id, .. } => snapshot
+        | SessionChange::ReasoningStatusChanged { activity_id, .. } => snapshot
             .activities
             .iter()
             .find(|activity| activity.id() == *activity_id)

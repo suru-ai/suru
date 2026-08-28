@@ -91,14 +91,12 @@ impl SessionStore {
         };
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
         let persisted_summary = summary.clone();
-        let catalog = state.catalog.clone();
         state.sessions.insert(
             session_id,
             SessionRecord {
                 snapshot: snapshot.clone(),
                 summary,
                 updates,
-                catalog,
                 next_prompt_order: PromptOrder(1),
                 steer_targets: HashMap::new(),
                 selection_operations: HashMap::new(),
@@ -107,6 +105,9 @@ impl SessionStore {
             },
         );
         self.storage.created(persisted_summary, snapshot);
+        // The child begins working the moment it exists, which the listed
+        // root's Working reading has to carry.
+        state.reconcile_working(session_id);
         Ok(SpawnedSubagentSession {
             session_id,
             turn_id,

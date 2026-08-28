@@ -137,12 +137,7 @@ impl SessionStore {
                 },
             });
         }
-        let updated_at = state.next_timestamp();
-        let record = state
-            .sessions
-            .get_mut(&session_id)
-            .expect("Session existence was checked while holding the store lock");
-        let update = record.commit(&self.storage, session_id, changes, updated_at)?;
+        let update = state.commit(&self.storage, session_id, changes)?;
         Ok(Some(update))
     }
 
@@ -166,16 +161,10 @@ impl SessionStore {
         {
             return Ok(None);
         }
-        let updated_at = state.next_timestamp();
-        let record = state
-            .sessions
-            .get_mut(&session_id)
-            .expect("Session existence was checked while holding the store lock");
-        let update = record.commit(
+        let update = state.commit(
             &self.storage,
             session_id,
             vec![SessionChange::AgentSelectionChanged { selection }],
-            updated_at,
         )?;
         Ok(Some(update))
     }
@@ -216,13 +205,7 @@ impl SessionStore {
             record.snapshot.session.agent_selection.as_ref() != Some(&request.selection);
         let availability_changed =
             record.snapshot.session.agent_selection_availability != ModelAvailability::Available;
-        let changed = selection_changed || availability_changed;
-        let updated_at = changed.then(|| state.next_timestamp());
-        let record = state
-            .sessions
-            .get_mut(&session_id)
-            .expect("Session existence was checked while holding the store lock");
-        if changed {
+        if selection_changed || availability_changed {
             let mut changes = Vec::with_capacity(2);
             if selection_changed {
                 changes.push(SessionChange::AgentSelectionChanged {
@@ -234,15 +217,14 @@ impl SessionStore {
                     availability: ModelAvailability::Available,
                 });
             }
-            record
-                .commit(
-                    &self.storage,
-                    session_id,
-                    changes,
-                    updated_at.expect("changed selection has a timestamp"),
-                )
+            state
+                .commit(&self.storage, session_id, changes)
                 .expect("Agent Selection commands preserve Session invariants");
         }
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock");
         record
             .selection_operations
             .insert(request.operation_id, request.selection.clone());
@@ -326,16 +308,12 @@ impl SessionStore {
         changes.push(SessionChange::PromptAdded {
             prompt: restored.clone(),
         });
-        let updated_at = state.next_timestamp();
-        let update = {
-            let record = state
-                .sessions
-                .get_mut(&session_id)
-                .expect("Session existence was checked while holding the store lock");
-            let update = record.commit(&self.storage, session_id, changes, updated_at)?;
-            record.selection_retry_prompt = Some(restored.id);
-            update
-        };
+        let update = state.commit(&self.storage, session_id, changes)?;
+        state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session existence was checked while holding the store lock")
+            .selection_retry_prompt = Some(restored.id);
         state.prompts.insert(
             restored.id,
             PromptOwner {

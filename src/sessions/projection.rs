@@ -11,7 +11,7 @@ use crate::protocol::{
 use crate::session_projection::apply_update;
 use crate::storage::StorageSink;
 
-use super::{SessionRecord, SessionStore};
+use super::{SessionRecord, SessionStore, SessionStoreState};
 
 impl SessionStore {
     /// Commits `changes` to the Session as one revision, without the Agent
@@ -25,15 +25,91 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        if !state.sessions.contains_key(&session_id) {
-            return Err(anyhow!("Session does not exist on this server instance"));
-        }
-        let updated_at = state.next_timestamp();
-        let stored = state
+        state.commit(&self.storage, session_id, changes)
+    }
+}
+
+impl SessionStoreState {
+    /// Commits `changes` to one Session and then re-derives the Working
+    /// reading above it. Every commit goes through here rather than reaching
+    /// [`SessionRecord::commit`] directly, because a commit anywhere in a
+    /// Subagent subtree — a child's Turn settling, a spawn opening one — can
+    /// flip what the listed root's row says about live work, and only the
+    /// state can see across Sessions.
+    pub(super) fn commit(
+        &mut self,
+        storage: &StorageSink,
+        session_id: SessionId,
+        changes: Vec<SessionChange>,
+    ) -> anyhow::Result<SessionUpdate> {
+        let updated_at = self.next_timestamp();
+        let record = self
             .sessions
             .get_mut(&session_id)
-            .expect("Session existence was checked while holding the store lock");
-        stored.commit(&self.storage, session_id, changes, updated_at)
+            .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+        let update = record.commit(storage, session_id, changes, updated_at)?;
+        self.reconcile_working(session_id);
+        Ok(update)
+    }
+
+    /// Re-derives [`crate::protocol::SessionSummary::working_since`] for the
+    /// Session and every ancestor up to its listed root, and announces the
+    /// root's reading when it flipped. Each summary carries its whole
+    /// subtree's reading — the latest Turn, or any working Subagent below —
+    /// so a listing keeps saying Working while Subagents outlive the Turn
+    /// that spawned them (ADR 0015). Only the root announces, because a
+    /// Subagent's child Session rides no catalog stream.
+    pub(super) fn reconcile_working(&mut self, session_id: SessionId) {
+        let mut current = session_id;
+        loop {
+            let reading = self.subtree_working_since(current);
+            let Some(record) = self.sessions.get_mut(&current) else {
+                return;
+            };
+            let flipped = record.summary.working_since != reading;
+            record.summary.working_since = reading;
+            let parent = record.snapshot.session.parent;
+            match parent {
+                Some(parent) if self.sessions.contains_key(&parent) => current = parent,
+                None => {
+                    if flipped {
+                        self.publish_catalog_change(SessionCatalogChange::WorkingChanged {
+                            session_id: current,
+                            working_since: reading,
+                        });
+                    }
+                    return;
+                }
+                // A child severed from its parent joins no listing, so there
+                // is no row its reading could move.
+                Some(_) => return,
+            }
+        }
+    }
+
+    /// When live work below this Session began: the earliest moment any
+    /// still-working Turn in its subtree started — its own latest Turn, or a
+    /// Subagent's at any depth — and `None` when everything has settled.
+    fn subtree_working_since(&self, session_id: SessionId) -> Option<SessionTimestamp> {
+        let mut walk = vec![session_id];
+        let mut earliest: Option<SessionTimestamp> = None;
+        let mut visit = 0;
+        while visit < walk.len() {
+            let current = walk[visit];
+            if let Some(record) = self.sessions.get(&current)
+                && let Some(since) = record.snapshot.working_since()
+            {
+                earliest = Some(earliest.map_or(since, |held| held.min(since)));
+            }
+            walk.extend(
+                self.sessions
+                    .iter()
+                    .filter(|(_, record)| record.snapshot.session.parent == Some(current))
+                    .map(|(child_id, _)| *child_id),
+            );
+            visit += 1;
+        }
+        earliest
     }
 }
 
@@ -46,24 +122,10 @@ impl SessionRecord {
         updated_at: SessionTimestamp,
     ) -> anyhow::Result<SessionUpdate> {
         stamp_turn_timing(&mut changes, updated_at);
-        let was_working_since = self.summary.working_since;
         let update = self.publish(session_id, changes)?;
         self.summary.updated_at = updated_at;
         storage.updated(self.summary.clone(), &update)?;
         let _ = self.updates.send(update.clone());
-        // Turn liveness rides the catalog stream, because a client subscribes
-        // only to the Session it has open while the Working label it draws is
-        // for every Session it lists. Announced only when the reading flips:
-        // a Turn moves the Session with every commit it streams, and none of
-        // those change what a listing says about when the work began. A
-        // Subagent's child Session announces nothing, because no listing
-        // holds a row its announcement could move.
-        if !self.snapshot.session.is_subagent() && self.summary.working_since != was_working_since {
-            self.catalog.publish(SessionCatalogChange::WorkingChanged {
-                session_id,
-                working_since: self.summary.working_since,
-            });
-        }
         Ok(update)
     }
 
@@ -118,9 +180,10 @@ impl SessionRecord {
             .retain(|_, turn_id| !terminal_turns.contains(turn_id));
         self.snapshot = next;
         self.summary.session = self.snapshot.session.clone();
-        // Taken off the snapshot the commit just settled, so what a listing
-        // says about live work is the same reading the transcript would give.
-        self.summary.working_since = self.snapshot.working_since();
+        // `summary.working_since` is deliberately left alone here: it carries
+        // the whole subtree's reading, which only the state can derive, so
+        // [`SessionStoreState::reconcile_working`] maintains it after every
+        // commit.
         Ok(update)
     }
 }

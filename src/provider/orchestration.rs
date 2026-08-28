@@ -187,16 +187,16 @@ struct ProviderSessionContext {
 
 struct ActiveProviderTurn {
     turn_id: TurnId,
+    /// Whether this Turn is a Continuation — the one kind of Turn no Prompt
+    /// began, opened by this actor for output that arrived after the previous
+    /// Turn settled. The next delivered Prompt settles it rather than
+    /// steering it, which is the one place the flag is consulted.
+    continuation: bool,
     streaming_message: Option<ActiveProviderMessage>,
     interruption_acknowledged: bool,
     command_activities: HashMap<super::ProviderActivityId, ActiveProviderCommand>,
     file_change_activities: HashMap<super::ProviderActivityId, ActivityId>,
     reasoning_activities: HashMap<super::ProviderActivityId, ActiveProviderReasoning>,
-    /// The Subagents this Turn's Agent spawned and has not yet settled, keyed
-    /// by the identity the Provider minted for each. Subagent identities live
-    /// in their own namespace — the routes' — so these never pass through
-    /// [`Self::claims_activity`].
-    subagent_activities: HashMap<ProviderSubagentId, ActiveProviderSubagent>,
 }
 
 /// An Agent Message the Provider is still streaming. Its normalizer buffers no
@@ -226,25 +226,23 @@ struct ActiveProviderReasoning {
     normalizer: ProviderTextNormalizer,
 }
 
-/// A Subagent the Turn's Agent is still running. Suru times the delegation
-/// itself, the way it times a Reasoning block: `started` is the moment the
-/// spawn was admitted, and the elapsed time it yields is the duration the
-/// settled row reports.
-struct ActiveProviderSubagent {
-    id: ActivityId,
-    started: Instant,
-}
-
 impl ActiveProviderTurn {
     fn new(turn_id: TurnId) -> Self {
         Self {
             turn_id,
+            continuation: false,
             streaming_message: None,
             interruption_acknowledged: false,
             command_activities: HashMap::new(),
             file_change_activities: HashMap::new(),
             reasoning_activities: HashMap::new(),
-            subagent_activities: HashMap::new(),
+        }
+    }
+
+    fn new_continuation(turn_id: TurnId) -> Self {
+        Self {
+            continuation: true,
+            ..Self::new(turn_id)
         }
     }
 
@@ -277,14 +275,32 @@ impl ActiveProviderTurn {
 /// Routes live and die with the Provider connection, because the identities
 /// are the connection's to mint. An event attributed to a Subagent with no
 /// route lands nowhere.
+///
+/// The rows live beside the routes rather than inside any Turn's state,
+/// because a Subagent may outlive the Turn that spawned it (ADR 0015): its
+/// row must still be reachable when the Provider settles it after that Turn
+/// has.
 #[derive(Default)]
 struct SubagentRoutes {
     routes: HashMap<ProviderSubagentId, SubagentRoute>,
+    rows: HashMap<ProviderSubagentId, SubagentRow>,
 }
 
 struct SubagentRoute {
     session_id: SessionId,
     turn: ActiveProviderTurn,
+}
+
+/// One Subagent's row in its spawner's Transcript. Suru times the delegation
+/// itself, the way it times a Reasoning block: `started` is the moment the
+/// spawn was admitted, and the elapsed time it yields is the duration the
+/// settled row reports.
+struct SubagentRow {
+    /// The Session whose Transcript holds the row — the Subagent's spawner,
+    /// which for a nested Subagent is itself a child Session.
+    owner_session_id: SessionId,
+    activity_id: ActivityId,
+    started: Instant,
 }
 
 impl SubagentRoutes {
@@ -320,10 +336,11 @@ impl SubagentRoutes {
         }
     }
 
-    /// Fails every routed Turn and forgets the routes. Called wherever the
-    /// Provider connection is torn down: the routes' Turn state is this
-    /// actor's only handle on those streams, and no more of their events can
-    /// arrive once the connection is gone.
+    /// Fails every routed Turn and open row, and forgets both. Called
+    /// wherever the Provider connection is torn down: the routes' Turn state
+    /// is this actor's only handle on those streams, and no more of their
+    /// events — the settles the rows were owed included — can arrive once the
+    /// connection is gone.
     fn fail_all(&mut self, sessions: &SessionStore, updates: &ProviderUpdateGate, message: &str) {
         for (_, mut route) in self.routes.drain() {
             fail_active_turn(
@@ -334,6 +351,92 @@ impl SubagentRoutes {
                 message.to_owned(),
             );
         }
+        for (_, row) in self.rows.drain() {
+            let _ = updates.apply(|| {
+                sessions.publish_agent_output(
+                    row.owner_session_id,
+                    SessionChange::SubagentStatusChanged {
+                        activity_id: row.activity_id,
+                        status: ActivityStatus::Failed,
+                        // The Provider never reported this Subagent settling,
+                        // so there is no duration to record.
+                        duration_ms: None,
+                    },
+                )
+            });
+        }
+    }
+
+    /// Applies a Provider's description update to the row it names, or `None`
+    /// when no open row carries the identity — the caller decides whether an
+    /// unknown identity is an invalid event or a late echo to discard.
+    fn update_row(
+        &self,
+        sessions: &SessionStore,
+        subagent: &ProviderSubagentId,
+        description: &str,
+    ) -> Option<anyhow::Result<()>> {
+        let row = self.rows.get(subagent)?;
+        Some(
+            sessions
+                .publish_agent_output(
+                    row.owner_session_id,
+                    SessionChange::SubagentDescriptionChanged {
+                        activity_id: row.activity_id,
+                        description: normalize_provider_text(description),
+                    },
+                )
+                .map(|_| ()),
+        )
+    }
+
+    /// Settles one Subagent on the Provider's own settle signal: the child's
+    /// Turn closes along with the row, because the Provider's boundary for
+    /// the Subagent is one signal and no further event of the child's is owed
+    /// once it has passed. Returns `None` when no open row carries the
+    /// identity, on the same terms as [`Self::update_row`].
+    fn settle_subagent(
+        &mut self,
+        sessions: &SessionStore,
+        next_agent: &AgentIdentity,
+        subagent: &ProviderSubagentId,
+        status: ProviderSubagentStatus,
+    ) -> Option<anyhow::Result<()>> {
+        let row = self.rows.remove(subagent)?;
+        let route = self.routes.remove(subagent);
+        Some((|| {
+            if let Some(mut route) = route {
+                let outcome = match status {
+                    ProviderSubagentStatus::Completed => ProviderTurnOutcome::Completed {
+                        trailing_output: route.turn.take_trailing_output(),
+                    },
+                    ProviderSubagentStatus::Failed => ProviderTurnOutcome::Failed {
+                        trailing_output: route.turn.take_trailing_output(),
+                        message: SUBAGENT_FAILED_MESSAGE.to_owned(),
+                    },
+                };
+                sessions.finish_provider_turn(
+                    route.session_id,
+                    route.turn.turn_id,
+                    next_agent.agent.clone(),
+                    outcome,
+                    QueuedPromptDisposition::LeavePending,
+                )?;
+            }
+            let duration_ms = u64::try_from(row.started.elapsed().as_millis()).ok();
+            sessions.publish_agent_output(
+                row.owner_session_id,
+                SessionChange::SubagentStatusChanged {
+                    activity_id: row.activity_id,
+                    status: match status {
+                        ProviderSubagentStatus::Completed => ActivityStatus::Completed,
+                        ProviderSubagentStatus::Failed => ActivityStatus::Failed,
+                    },
+                    duration_ms,
+                },
+            )?;
+            Ok(())
+        })())
     }
 }
 
@@ -754,20 +857,93 @@ async fn run_provider_session(
             let command = match input {
                 ProviderInput::Command(command) => command,
                 ProviderInput::Event(Some(Ok(attributed))) => {
-                    // A Subagent's events land in its own Session whether or
-                    // not the owning Session has a Turn open; events the
-                    // connection sends about the owning Session itself have no
-                    // Turn to land in here and are discarded.
-                    if let AttributedProviderEvent {
-                        attribution: ProviderEventAttribution::Subagent(subagent),
-                        event,
-                    } = attributed
-                    {
-                        let identity = &provider
-                            .as_ref()
-                            .expect("Provider events arrive over a live connection")
-                            .identity;
-                        subagents.project_event(&sessions, &updates, identity, &subagent, event);
+                    let identity = provider
+                        .as_ref()
+                        .expect("Provider events arrive over a live connection")
+                        .identity
+                        .clone();
+                    match attributed {
+                        // A Subagent's events land in its own Session whether
+                        // or not the owning Session has a Turn open.
+                        AttributedProviderEvent {
+                            attribution: ProviderEventAttribution::Subagent(subagent),
+                            event,
+                        } => {
+                            subagents
+                                .project_event(&sessions, &updates, &identity, &subagent, event);
+                        }
+                        AttributedProviderEvent {
+                            attribution: ProviderEventAttribution::OwningSession,
+                            event,
+                        } => match event {
+                            // With no Turn active there is nothing for a
+                            // terminal or selection event to land on.
+                            ProviderEvent::TurnCompleted
+                            | ProviderEvent::TurnInterrupted
+                            | ProviderEvent::TurnFailed { .. }
+                            | ProviderEvent::AgentSelectionChanged { .. }
+                            | ProviderEvent::AgentSelectionRejected { .. } => {}
+                            // A Subagent's own lifecycle addresses its row,
+                            // which outlives the Turn that spawned it; an
+                            // identity no row carries lands nowhere, like any
+                            // other unrouted Subagent event.
+                            ProviderEvent::SubagentUpdated {
+                                subagent_id,
+                                description,
+                            } => {
+                                let _ = updates.apply(|| {
+                                    subagents.update_row(&sessions, &subagent_id, &description)
+                                });
+                            }
+                            ProviderEvent::SubagentCompleted {
+                                subagent_id,
+                                status,
+                            } => {
+                                let _ = updates.apply(|| {
+                                    subagents.settle_subagent(
+                                        &sessions,
+                                        &identity,
+                                        &subagent_id,
+                                        status,
+                                    )
+                                });
+                            }
+                            // Anything else is late output. Owed to Subagents
+                            // still working past their Turn's settle, it
+                            // begins a Continuation (ADR 0015); with no
+                            // Subagent outstanding nothing more was owed, and
+                            // stray output — an interrupted Turn's trailing
+                            // stream, say — is discarded as it always was.
+                            event => {
+                                if subagents.rows.is_empty() && subagents.routes.is_empty() {
+                                    continue;
+                                }
+                                let Some(begun) = updates.apply(|| {
+                                    sessions
+                                        .begin_continuation(session_id, Some(identity.clone()))
+                                }) else {
+                                    break;
+                                };
+                                let Ok(turn_id) = begun else {
+                                    continue;
+                                };
+                                let mut continuation =
+                                    ActiveProviderTurn::new_continuation(turn_id);
+                                let projection = project_provider_event(
+                                    &sessions,
+                                    &updates,
+                                    session_id,
+                                    &mut continuation,
+                                    &mut subagents,
+                                    &identity,
+                                    event,
+                                    QueuedPromptDisposition::LeavePending,
+                                );
+                                if !matches!(projection, ProviderEventProjection::Terminal(_)) {
+                                    active = Some(continuation);
+                                }
+                            }
+                        },
                     }
                     continue;
                 }
@@ -965,9 +1141,36 @@ async fn run_provider_session(
         };
         match input {
             ProviderInput::Command(None) => break,
-            ProviderInput::Command(Some(ProviderCommand::StartPrompt { .. })) => {
-                // Prompts admitted while startup was still pending can already be queued here.
-                // Keep them pending until queued delivery and steering gain their own orchestration.
+            ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id })) => {
+                let current = active
+                    .as_mut()
+                    .expect("Provider input is handled while a Turn is active");
+                if current.continuation {
+                    // The next delivered Prompt settles a stale Continuation
+                    // rather than steering it (ADR 0015): close it out as
+                    // worked, then deliver the Prompt as its own Turn.
+                    let identity = provider
+                        .as_ref()
+                        .expect("Provider connection exists while its Turn is active")
+                        .identity
+                        .clone();
+                    let trailing_output = current.take_trailing_output();
+                    let Some(_) = updates.apply(|| {
+                        sessions.finish_provider_turn(
+                            session_id,
+                            current.turn_id,
+                            identity.agent,
+                            ProviderTurnOutcome::Completed { trailing_output },
+                            QueuedPromptDisposition::LeavePending,
+                        )
+                    }) else {
+                        break;
+                    };
+                    active = None;
+                    deferred_prompt_id = Some(prompt_id);
+                }
+                // Otherwise the Prompt was admitted while a real Turn ran and
+                // stays pending until that Turn's settle delivers the queue.
             }
             ProviderInput::Command(Some(ProviderCommand::SteerPrompt)) => {
                 let current = active
@@ -1814,7 +2017,7 @@ fn project_provider_event(
                 name,
                 description,
             } => {
-                if active.subagent_activities.contains_key(&subagent_id)
+                if subagents.rows.contains_key(&subagent_id)
                     || subagents.routes.contains_key(&subagent_id)
                 {
                     Err(anyhow::anyhow!(
@@ -1841,10 +2044,11 @@ fn project_provider_event(
                                     },
                                 },
                             )?;
-                            active.subagent_activities.insert(
+                            subagents.rows.insert(
                                 subagent_id.clone(),
-                                ActiveProviderSubagent {
-                                    id: subagent_activity_id,
+                                SubagentRow {
+                                    owner_session_id: session_id,
+                                    activity_id: subagent_activity_id,
                                     started: Instant::now(),
                                 },
                             );
@@ -1862,8 +2066,8 @@ fn project_provider_event(
             ProviderEvent::SubagentUpdated {
                 subagent_id,
                 description,
-            } => {
-                let Some(subagent) = active.subagent_activities.get(&subagent_id) else {
+            } => match subagents.update_row(sessions, &subagent_id, &description) {
+                None => {
                     return fail_invalid_provider_event(
                         sessions,
                         session_id,
@@ -1871,22 +2075,14 @@ fn project_provider_event(
                         next_agent,
                         "Provider updated a Subagent before spawning it",
                     );
-                };
-                sessions
-                    .publish_agent_output(
-                        session_id,
-                        SessionChange::SubagentDescriptionChanged {
-                            activity_id: subagent.id,
-                            description: normalize_provider_text(&description),
-                        },
-                    )
-                    .map(|_| ProviderEventProjection::Continue)
-            }
+                }
+                Some(updated) => updated.map(|()| ProviderEventProjection::Continue),
+            },
             ProviderEvent::SubagentCompleted {
                 subagent_id,
                 status,
-            } => {
-                let Some(subagent) = active.subagent_activities.remove(&subagent_id) else {
+            } => match subagents.settle_subagent(sessions, next_agent, &subagent_id, status) {
+                None => {
                     return fail_invalid_provider_event(
                         sessions,
                         session_id,
@@ -1894,61 +2090,18 @@ fn project_provider_event(
                         next_agent,
                         "Provider settled a Subagent before spawning it",
                     );
-                };
-                // The settle closes the child's Turn along with the row: the
-                // Provider's boundary for the Subagent is one signal, and no
-                // further event of the child's is owed once it has passed.
-                if let Some(mut route) = subagents.routes.remove(&subagent_id) {
-                    let outcome = match status {
-                        ProviderSubagentStatus::Completed => ProviderTurnOutcome::Completed,
-                        ProviderSubagentStatus::Failed => ProviderTurnOutcome::Failed {
-                            trailing_output: route.turn.take_trailing_output(),
-                            message: SUBAGENT_FAILED_MESSAGE.to_owned(),
-                        },
-                    };
-                    if let Err(error) = sessions.finish_provider_turn(
-                        route.session_id,
-                        route.turn.turn_id,
-                        next_agent.agent.clone(),
-                        outcome,
-                        QueuedPromptDisposition::LeavePending,
-                    ) {
-                        return finish_invalid_provider_event(
-                            sessions,
-                            session_id,
-                            active,
-                            next_agent,
-                            failure_message("Provider execution failed", &error),
-                        );
-                    }
                 }
-                let duration_ms = u64::try_from(subagent.started.elapsed().as_millis()).ok();
-                sessions
-                    .publish_agent_output(
-                        session_id,
-                        SessionChange::SubagentStatusChanged {
-                            activity_id: subagent.id,
-                            status: match status {
-                                ProviderSubagentStatus::Completed => ActivityStatus::Completed,
-                                ProviderSubagentStatus::Failed => ActivityStatus::Failed,
-                            },
-                            duration_ms,
-                        },
-                    )
-                    .map(|_| ProviderEventProjection::Continue)
-            }
+                Some(settled) => settled.map(|()| ProviderEventProjection::Continue),
+            },
             ProviderEvent::TurnCompleted => {
-                // Subagents count as streamed output here for now, even though
-                // ADR 0015 settles a Turn at the Provider's boundary with
-                // Subagents still working: until Session liveness and
-                // Continuations carry work past a settled Turn, letting one
-                // outlive its Turn would strand its settle with nowhere to
-                // land. That work lifts Subagents out of this guard.
+                // A Subagent still working holds nothing open here: the Turn
+                // settles at the Provider's own boundary (ADR 0015), and the
+                // rows and routes live on at the connection until each
+                // Subagent's own settle arrives.
                 if active.streaming_message.is_some()
                     || !active.command_activities.is_empty()
                     || !active.file_change_activities.is_empty()
                     || !active.reasoning_activities.is_empty()
-                    || !active.subagent_activities.is_empty()
                 {
                     Err(anyhow::anyhow!(
                         "Provider completed the Turn before completing its streamed output"
@@ -1959,7 +2112,9 @@ fn project_provider_event(
                             session_id,
                             active.turn_id,
                             next_agent.agent.clone(),
-                            ProviderTurnOutcome::Completed,
+                            ProviderTurnOutcome::Completed {
+                                trailing_output: TrailingCommandOutput::new(),
+                            },
                             queued_prompt_disposition,
                         )
                         .map(ProviderEventProjection::Terminal)

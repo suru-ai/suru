@@ -75,10 +75,6 @@ struct SessionRecord {
     snapshot: SessionSnapshot,
     summary: SessionSummary,
     updates: broadcast::Sender<SessionUpdate>,
-    /// The catalog's one publisher, held here because a commit is where a
-    /// Turn's liveness is derived and a commit cannot reach the store state
-    /// that announces everything else.
-    catalog: SessionCatalogPublisher,
     next_prompt_order: PromptOrder,
     steer_targets: HashMap<PromptId, TurnId>,
     selection_operations: HashMap<AgentSelectionOperationId, AgentSelection>,
@@ -169,7 +165,6 @@ impl SessionStore {
                     snapshot,
                     summary,
                     updates,
-                    catalog: catalog.clone(),
                     next_prompt_order,
                     steer_targets: HashMap::new(),
                     selection_operations: HashMap::new(),
@@ -182,14 +177,27 @@ impl SessionStore {
             .into_iter()
             .map(|summary| (summary.id, summary))
             .collect();
+        let mut state = SessionStoreState {
+            sessions,
+            unreadable_sessions,
+            prompts,
+            last_timestamp,
+            catalog,
+        };
+        // A restored summary carries only its own Session's reading, while a
+        // listing's Working derives from the whole Subagent subtree, so each
+        // root's reading is re-derived before anything can list it.
+        let roots = state
+            .sessions
+            .iter()
+            .filter(|(_, record)| record.snapshot.session.parent.is_none())
+            .map(|(session_id, _)| *session_id)
+            .collect::<Vec<_>>();
+        for root in roots {
+            state.reconcile_working(root);
+        }
         Self {
-            state: Arc::new(Mutex::new(SessionStoreState {
-                sessions,
-                unreadable_sessions,
-                prompts,
-                last_timestamp,
-                catalog,
-            })),
+            state: Arc::new(Mutex::new(state)),
             storage,
         }
     }

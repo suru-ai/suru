@@ -30,7 +30,13 @@ pub(crate) enum InterruptTurnError {
 }
 
 pub(crate) enum ProviderTurnOutcome {
-    Completed,
+    Completed {
+        /// A Turn the Provider completes has no command stream open, but a
+        /// Continuation settled early by the next Prompt — or a Subagent's
+        /// Turn settled by the Provider's own settle signal — may, and its
+        /// normalizers' pending lines still deserve storing.
+        trailing_output: TrailingCommandOutput,
+    },
     Failed {
         trailing_output: TrailingCommandOutput,
         message: String,
@@ -94,12 +100,51 @@ impl SessionStore {
                 settled_at: None,
             },
         ]);
-        let updated_at = state.next_timestamp();
-        let record = state
-            .sessions
-            .get_mut(&session_id)
-            .expect("Session existence was checked while holding the store lock");
-        record.commit(&self.storage, session_id, changes, updated_at)
+        state.commit(&self.storage, session_id, changes)
+    }
+
+    /// Begins a Continuation: the one kind of Turn that starts without a
+    /// Prompt, begun by Suru itself when Provider output arrives while no Turn
+    /// is active — owed to an earlier Turn's Subagents still working past its
+    /// settle (ADR 0015). It settles like any Turn, so nothing else about
+    /// settlement knows it exists.
+    pub(crate) fn begin_continuation(
+        &self,
+        session_id: SessionId,
+        agent: Option<AgentIdentity>,
+    ) -> anyhow::Result<TurnId> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        {
+            let record = state
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+            if active_turn_id(&record.snapshot)?.is_some() {
+                return Err(anyhow!(
+                    "A Continuation cannot begin while a Turn is active"
+                ));
+            }
+        }
+        let turn_id = TurnId::new();
+        state.commit(
+            &self.storage,
+            session_id,
+            vec![SessionChange::TurnAdded {
+                turn: Turn {
+                    id: turn_id,
+                    prompt_id: None,
+                    agent,
+                    status: TurnStatus::Active,
+                    // The commit that lands this Turn stamps when it began.
+                    started_at: None,
+                    settled_at: None,
+                },
+            }],
+        )?;
+        Ok(turn_id)
     }
 
     pub(crate) fn finish_provider_turn(
@@ -115,8 +160,8 @@ impl SessionStore {
             .lock()
             .expect("Session store lock is not poisoned");
         let (trailing_output, failure_message, status) = match outcome {
-            ProviderTurnOutcome::Completed => {
-                (TrailingCommandOutput::new(), None, TurnStatus::Completed)
+            ProviderTurnOutcome::Completed { trailing_output } => {
+                (trailing_output, None, TurnStatus::Completed)
             }
             ProviderTurnOutcome::Failed {
                 trailing_output,
@@ -142,20 +187,26 @@ impl SessionStore {
                 if salvaged.is_empty() {
                     return Ok(None);
                 }
-                let updated_at = state.next_timestamp();
-                let record = state
-                    .sessions
-                    .get_mut(&session_id)
-                    .expect("Session existence was checked while holding the store lock");
-                record.commit(&self.storage, session_id, salvaged, updated_at)?;
+                state.commit(&self.storage, session_id, salvaged)?;
                 return Ok(None);
             }
+            // A settling Continuation sweeps no steers across its boundary: a
+            // Steer Prompt pending while one ran was admitted to begin a Turn
+            // of its own — Continuations are settled by the next delivered
+            // Prompt, never steered — and folding it into this settle would
+            // swallow the Turn it is owed.
+            let settling_continuation = record
+                .snapshot
+                .turns
+                .iter()
+                .any(|turn| turn.id == turn_id && turn.prompt_id.is_none());
             let mut pending_steers = record
                 .snapshot
                 .prompts
                 .iter()
                 .filter(|prompt| {
-                    prompt.status == PromptStatus::Pending
+                    !settling_continuation
+                        && prompt.status == PromptStatus::Pending
                         && prompt.delivery == PromptDelivery::Steer
                 })
                 .cloned()
@@ -227,12 +278,11 @@ impl SessionStore {
             (None, _) | (Some(_), _) => None,
         };
 
-        let updated_at = state.next_timestamp();
+        state.commit(&self.storage, session_id, changes)?;
         let record = state
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        record.commit(&self.storage, session_id, changes, updated_at)?;
         for prompt in pending_steers {
             record.steer_targets.remove(&prompt.id);
         }
@@ -273,9 +323,11 @@ impl SessionStore {
 /// Active fails, every command first storing the trailing output its normalizer
 /// flushed. Reading the in-flight set from the Session's own snapshot rather
 /// than from the caller keeps every settle path equivalent, including the ones
-/// that never reach the Provider actor holding that Turn. A Turn that completes
-/// normally has nothing in flight — a Provider that leaves a stream open is
-/// refused its completion — so this settles nothing on that path.
+/// that never reach the Provider actor holding that Turn. A Turn the Provider
+/// completes has nothing in flight — a Provider that leaves a stream open is
+/// refused its completion — so this settles nothing on that path; a
+/// Continuation settled early by the next delivered Prompt is the completion
+/// that can still find streams open.
 pub(super) fn settle_in_flight_changes(
     snapshot: &SessionSnapshot,
     turn_id: TurnId,
@@ -334,17 +386,11 @@ pub(super) fn settle_in_flight_changes(
                 // there is no duration to record.
                 duration_ms: None,
             }),
-            Activity::Subagent {
-                id,
-                status: ActivityStatus::Active,
-                ..
-            } => changes.push(SessionChange::SubagentStatusChanged {
-                activity_id: *id,
-                status: ActivityStatus::Failed,
-                // As with Reasoning: the Provider never reported this
-                // Subagent settling, so there is no duration to record.
-                duration_ms: None,
-            }),
+            // A Subagent row is deliberately left standing: a Subagent may
+            // outlive the Turn that spawned it (ADR 0015), so its row settles
+            // only on the Provider's own settle signal — or when the
+            // connection carrying it is torn down, which the orchestrator
+            // settles route by route.
             _ => {}
         }
     }

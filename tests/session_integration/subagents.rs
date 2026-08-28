@@ -3,100 +3,25 @@
 //! and never the parent, and a settle closes the row and the child's Turn.
 
 use crate::{
-    provider_support::{ControlledProvider, ControlledProviderSession},
-    support::{controlled_selection, read_session_at_least_revision},
+    provider_support::ControlledProvider,
+    support::{
+        open_catalog_stream_with_snapshot, read_session_at_least_revision, the_subagent_row,
+        working_turn,
+    },
 };
 use axum::http::StatusCode;
 use suru::{
     protocol::{
-        Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, CreateSessionRequest,
-        InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionCatalogChange, SessionError,
-        SessionErrorCode, SessionListItem, SessionRevision, SessionSnapshot, TurnStatus, Workspace,
+        Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, MessageRole, PromptDelivery,
+        PromptId, SessionCatalogChange, SessionError, SessionErrorCode, SessionListItem,
+        SessionRevision, SessionSnapshot, TurnStatus,
     },
     provider::{
         ProviderActivityId, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
         ProviderSubagentStatus,
     },
-    server::{self, RunningServer, ServerConfig},
+    server::{self, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
-
-/// A Session whose first Turn is running against the controlled Provider —
-/// the state every Subagent test starts from, because only a working Turn's
-/// Agent can spawn one.
-struct WorkingTurn {
-    server: RunningServer,
-    provider_session: ControlledProviderSession,
-    session_id: suru::protocol::SessionId,
-    client: reqwest::Client,
-}
-
-async fn working_turn(state_dir: &std::path::Path, channel: &str) -> WorkingTurn {
-    let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let (runtime, mut provider) = ControlledProvider::new();
-    let server = server::spawn_with_provider(
-        ServerConfig::new(state_dir, channel).expect("configure server"),
-        runtime,
-    )
-    .await
-    .expect("spawn server");
-    let client = reqwest::Client::new();
-    let descriptor = server.descriptor().clone();
-    let created = client
-        .post(format!("{}/v1/sessions", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .json(&CreateSessionRequest {
-            agent_selection: None,
-            workspace: Workspace {
-                path: workspace.path().to_owned(),
-            },
-            prompt: InitialPrompt {
-                id: PromptId::new(),
-                text: "Delegate the mapping".to_owned(),
-                skill_invocations: Vec::new(),
-            },
-        })
-        .send()
-        .await
-        .expect("create Session")
-        .error_for_status()
-        .expect("Session creation succeeds")
-        .json::<SessionSnapshot>()
-        .await
-        .expect("decode created Session");
-    let start = timeout(Duration::from_secs(1), provider.next_start())
-        .await
-        .expect("Provider startup begins");
-    let mut provider_session = start.succeed(AgentIdentity {
-        agent: AgentId::new("controlled-agent"),
-        selection: controlled_selection("gpt-subagent", "high", "fast"),
-    });
-    timeout(Duration::from_secs(1), provider_session.next_turn())
-        .await
-        .expect("initial Turn reaches Provider")
-        .succeed();
-    WorkingTurn {
-        server,
-        provider_session,
-        session_id: created.session.id,
-        client,
-    }
-}
-
-/// The one Subagent Activity a snapshot holds, failing the test when the
-/// Transcript carries none or more than one.
-fn the_subagent_row(snapshot: &SessionSnapshot) -> &Activity {
-    let mut rows = snapshot
-        .activities
-        .iter()
-        .filter(|activity| matches!(activity, Activity::Subagent { .. }));
-    let row = rows.next().expect("the Transcript holds a Subagent row");
-    assert!(
-        rows.next().is_none(),
-        "the Transcript holds exactly one Subagent row"
-    );
-    row
-}
 
 #[tokio::test]
 async fn a_spawn_opens_a_subagent_row_in_the_parent_and_a_child_session_with_a_parent_link() {
@@ -581,47 +506,6 @@ async fn a_child_session_refuses_prompts() {
 
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");
-}
-
-/// Opens the Session catalog SSE stream and decodes its leading snapshot, so a
-/// test can read what the catalog says it holds before any change arrives.
-async fn open_catalog_stream_with_snapshot(
-    descriptor: &suru::protocol::RuntimeDescriptor,
-) -> (
-    Vec<suru::protocol::SessionId>,
-    impl futures_util::Stream<Item = suru::protocol::SessionCatalogUpdate> + Unpin + use<>,
-) {
-    use eventsource_stream::Eventsource;
-    use futures_util::StreamExt;
-
-    let response = reqwest::Client::new()
-        .get(format!("{}/v1/session-events", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("open the Session catalog stream")
-        .error_for_status()
-        .expect("the catalog stream authenticates");
-    let mut events = Box::pin(response.bytes_stream().eventsource());
-    let snapshot = loop {
-        let event = timeout(Duration::from_secs(5), events.next())
-            .await
-            .expect("the catalog snapshot arrives")
-            .expect("the catalog stream stays open")
-            .expect("the catalog stream stays readable");
-        if event.event == suru::protocol::SESSION_CATALOG_SNAPSHOT_EVENT {
-            break serde_json::from_str::<suru::protocol::SessionCatalogSnapshot>(&event.data)
-                .expect("decode the catalog snapshot");
-        }
-    };
-    let updates = events.filter_map(|event| async move {
-        let event = event.expect("the catalog stream stays open");
-        (event.event == suru::protocol::SESSION_CATALOG_UPDATED_EVENT).then(|| {
-            serde_json::from_str::<suru::protocol::SessionCatalogUpdate>(&event.data)
-                .expect("decode a catalog update")
-        })
-    });
-    (snapshot.session_ids, Box::pin(updates))
 }
 
 #[tokio::test]
