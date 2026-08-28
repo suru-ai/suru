@@ -239,13 +239,41 @@ pub(super) struct ResultMessage {
 }
 
 /// A `system` message: the CLI's own bookkeeping alongside the conversation. Only the task
-/// lifecycle is decoded, because the background work the agent spawns is what an interrupt has to
-/// stop before it stops the loop.
+/// lifecycle is decoded: the background work the agent spawns is what an interrupt has to stop
+/// before it stops the loop, and a task running an agent is a Subagent, whose start, description
+/// changes, and settle the projection presents.
 #[derive(Deserialize)]
 pub(super) struct SystemMessage {
     pub(super) subtype: String,
     #[serde(default)]
     pub(super) task_id: Option<String>,
+    /// The tool use that spawned the task, on `task_started`. It is the identity every chunk the
+    /// subagent streams carries as `parent_tool_use_id`, which is what makes it the Subagent's.
+    #[serde(default)]
+    pub(super) tool_use_id: Option<String>,
+    /// What the task was asked to do, on `task_started` and repeated on `task_progress`.
+    #[serde(default)]
+    pub(super) task_type: Option<String>,
+    #[serde(default)]
+    pub(super) subagent_type: Option<String>,
+    #[serde(default)]
+    pub(super) description: Option<String>,
+    /// How the task ended, on `task_notification` — `completed`, or whatever failing or being
+    /// stopped reads as.
+    #[serde(default)]
+    pub(super) status: Option<String>,
+    /// What changed about a running task, on `task_updated`.
+    #[serde(default)]
+    pub(super) patch: Option<TaskPatch>,
+}
+
+/// The revision a `task_updated` carries. Only the description is decoded: every way a task ends
+/// arrives as its own `task_notification`, so status transitions carry nothing the projection
+/// presents.
+#[derive(Deserialize)]
+pub(super) struct TaskPatch {
+    #[serde(default)]
+    pub(super) description: Option<String>,
 }
 
 /// The CLI's answer to one control request, correlated back by `request_id`.

@@ -304,6 +304,66 @@ async fn late_output_owed_to_a_subagent_begins_a_continuation_that_settles_like_
 }
 
 #[tokio::test]
+async fn output_following_the_last_subagents_settle_still_begins_a_continuation() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "settle-then-output-test").await;
+    let subagent = ProviderSubagentId::new("task-1");
+    spawn_subagent(&fixture, &subagent).await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+
+    // The settle lands first: on some wires — Claude's above all — the Provider reports the
+    // Subagent's end before its loop wakes to deliver the outcome.
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
+            subagent_id: subagent,
+            status: ProviderSubagentStatus::Completed,
+        })
+        .await;
+    for event in [
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: "Delegation done.".to_owned(),
+        },
+        ProviderEvent::AgentMessageCompleted,
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the provoked output lands in a settled Continuation",
+        |snapshot| {
+            snapshot
+                .turns
+                .get(1)
+                .is_some_and(|turn| turn.status != TurnStatus::Active)
+        },
+    )
+    .await;
+    assert_eq!(parent.turns.len(), 2, "the late output began one new Turn");
+    assert_eq!(parent.turns[1].prompt_id, None);
+    assert_eq!(parent.turns[1].status, TurnStatus::Completed);
+    assert_eq!(parent.messages[1].content, "Delegation done.");
+    assert_eq!(
+        parent.messages[1].turn_id, parent.turns[1].id,
+        "the provoked Message belongs to the Continuation"
+    );
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn the_next_delivered_prompt_settles_a_stale_continuation() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut fixture = working_turn(state_dir.path(), "stale-continuation-test").await;

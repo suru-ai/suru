@@ -830,6 +830,12 @@ async fn run_provider_session(
     let mut provider: Option<ConnectedProviderSession> = None;
     let mut active: Option<ActiveProviderTurn> = None;
     let mut subagents = SubagentRoutes::default();
+    // Whether the last Subagent to settle did so with no Turn active. The output its completion
+    // provokes arrives only after its settle on some Providers' wires — Claude notifies the
+    // task's end before its loop wakes to deliver the outcome — so the settle itself leaves a
+    // Continuation owed. Any Turn beginning clears it, because from then on that output has a
+    // Turn to land in.
+    let mut continuation_owed = false;
     let mut deferred_prompt_id = None;
     let provider_id = runtime.provider_id();
 
@@ -899,7 +905,7 @@ async fn run_provider_session(
                                 subagent_id,
                                 status,
                             } => {
-                                let _ = updates.apply(|| {
+                                let settled = updates.apply(|| {
                                     subagents.settle_subagent(
                                         &sessions,
                                         &identity,
@@ -907,15 +913,22 @@ async fn run_provider_session(
                                         status,
                                     )
                                 });
+                                if matches!(settled, Some(Some(_))) {
+                                    continuation_owed = true;
+                                }
                             }
                             // Anything else is late output. Owed to Subagents
-                            // still working past their Turn's settle, it
-                            // begins a Continuation (ADR 0015); with no
-                            // Subagent outstanding nothing more was owed, and
-                            // stray output — an interrupted Turn's trailing
-                            // stream, say — is discarded as it always was.
+                            // still working past their Turn's settle — or to
+                            // one that just settled, whose provoked output
+                            // follows its settle — it begins a Continuation
+                            // (ADR 0015); with nothing owed, stray output —
+                            // an interrupted Turn's trailing stream, say — is
+                            // discarded as it always was.
                             event => {
-                                if subagents.rows.is_empty() && subagents.routes.is_empty() {
+                                if !continuation_owed
+                                    && subagents.rows.is_empty()
+                                    && subagents.routes.is_empty()
+                                {
                                     continue;
                                 }
                                 let Some(begun) = updates.apply(|| {
@@ -938,6 +951,7 @@ async fn run_provider_session(
                                     event,
                                     QueuedPromptDisposition::LeavePending,
                                 );
+                                continuation_owed = false;
                                 if !matches!(projection, ProviderEventProjection::Terminal(_)) {
                                     active = Some(continuation);
                                 }
@@ -1116,6 +1130,7 @@ async fn run_provider_session(
                 continue;
             }
             active = Some(ActiveProviderTurn::new(turn_id));
+            continuation_owed = false;
             continue;
         }
 
@@ -1372,6 +1387,7 @@ async fn run_provider_session(
                                     }
                                 } else {
                                     active = Some(ActiveProviderTurn::new(turn_id));
+                                    continuation_owed = false;
                                 }
                             } else if !selection_rejected {
                                 defer_next_queued_prompt(

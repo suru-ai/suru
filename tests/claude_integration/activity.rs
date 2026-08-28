@@ -1,6 +1,6 @@
 //! What Claude does while it works, in the Transcript: thinking streaming as Reasoning Activity
-//! split at its headings, Bash executions recorded as Command Activity settled by their tool
-//! results, and a subagent fan-out contributing tool work without narration.
+//! split at its headings, and Bash executions recorded as Command Activity settled by their tool
+//! results. A subagent's work is its own Session's — see `subagents`.
 
 use std::sync::Arc;
 
@@ -69,35 +69,6 @@ const WRAPPED_COMMANDS_TURN: &str = r#"      emit '{"type":"stream_event","event
       emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_odd","content":"src\n","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":700,"num_turns":1,"result":"Ran.","session_id":"prov-session"}'
-"#;
-
-/// A fan-out: the conversation spawns a subagent through the Task tool, the scripted binary
-/// forwards the subagent's own narration, thinking, and Bash tool use attributed by
-/// `parent_tool_use_id`, and the conversation answers once the subagent reports back.
-const SUBAGENT_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_1","name":"Task","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"prompt\":\"scout the workspace\"}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"covert subagent narration"}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"**Covert plan**\n\nLook around quietly."}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_sub","name":"Bash","input":{}}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"rg -l TODO\"}"}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":2},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sub","content":"src/main.rs\n","is_error":false}]},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"task_1","content":"Found one file.","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"One TODO file."}},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":2100,"num_turns":1,"result":"One TODO file.","session_id":"prov-session"}'
 "#;
 
 /// A Turn the CLI ends while a command still awaits its tool result.
@@ -338,47 +309,6 @@ async fn launcher_plumbing_is_stripped_and_unrecognized_shapes_stay_verbatim() {
     assert_eq!(
         command, "zsh -x ls",
         "a shape the stripping does not recognize is recorded verbatim"
-    );
-}
-
-#[tokio::test]
-async fn subagent_narration_stays_out_of_the_transcript_while_its_tool_uses_appear() {
-    let settled = worked_session("claude-subagent", SUBAGENT_TURN, "Scout for TODOs").await;
-
-    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
-    let agent = agent_messages(&settled);
-    let [message] = agent.as_slice() else {
-        panic!(
-            "only the conversation's own Message reaches the Transcript, got {:?}",
-            settled.messages
-        );
-    };
-    assert_eq!(message.content, "One TODO file.");
-    let [command] = settled.activities.as_slice() else {
-        panic!(
-            "the subagent's Bash execution is the Turn's one Activity, got {:?}",
-            settled.activities
-        );
-    };
-    let Activity::Command {
-        status,
-        command,
-        output,
-        ..
-    } = command
-    else {
-        panic!("the subagent's Bash execution is a Command Activity, got {command:?}");
-    };
-    assert_eq!(*status, ActivityStatus::Completed);
-    assert_eq!(command, "rg -l TODO");
-    assert_eq!(output, "src/main.rs\n");
-    assert!(
-        !settled
-            .activities
-            .iter()
-            .any(|activity| matches!(activity, Activity::Reasoning { .. })),
-        "the subagent's thinking never becomes Reasoning Activity: {:?}",
-        settled.activities
     );
 }
 

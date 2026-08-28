@@ -1,22 +1,32 @@
-//! Projection of a Claude Session's conversation messages into Provider events.
+//! Projection of a Claude Session's conversation messages into attributed Provider events.
 //!
 //! The CLI streams a Turn as partial-message chunks — Anthropic streaming events riding in
-//! `stream_event` envelopes — and ends it with one `result` message. Text blocks the conversation
-//! itself owns become the agent Message; thinking blocks become Reasoning Activity, split so each
-//! heading begins a new block; the Bash tool's executions become Command Activity, settled by the
-//! tool results the loop echoes back as user messages. Chunks owned by a subagent contribute only
-//! their tool uses — their narration is the subagent's own conversation, not this Transcript.
-//! Every block kind this slice does not present is passed over rather than failed, because the
-//! wire grows freely (ADR 0010). A `result` Settles the Turn as completed, interrupted, or failed —
-//! except where a steer's own result is still to come, since the CLI answers every message queued
-//! into a running loop with a result while Suru keeps them all inside the Turn the steer joined.
+//! `stream_event` envelopes — and ends each stretch of its loop with one `result` message. The
+//! wire carries several conversations at once: the loop's own, and one for every subagent the
+//! agent spawns through the Task tool, whose chunks ride under the spawning tool use's id as
+//! `parent_tool_use_id`. Each conversation projects the same way — text blocks become the agent
+//! Message, thinking blocks become Reasoning Activity split at their headings, the Bash tool's
+//! executions become Command Activity settled by the tool results the loop echoes back — and each
+//! event leaves here attributed to the conversation that produced it, so orchestration lands a
+//! subagent's work in the Subagent's own child Session rather than the parent's Transcript.
+//!
+//! The task lifecycle the CLI reports beside the conversations is where Subagents begin and end:
+//! `task_started` for an agent task opens the Subagent under the spawning tool use's identity,
+//! `task_progress` and `task_updated` revise what it is doing, and `task_notification` settles it.
+//! A `result` Settles the Turn as completed, interrupted, or failed — except where a steer's own
+//! result is still to come, since the CLI answers every message queued into a running loop with a
+//! result while Suru keeps them all inside the Turn the steer joined. The result speaks only for
+//! the loop's own conversation: a subagent's streams live past it, which is what lets a Subagent
+//! outlive the Turn (ADR 0015), and the stretch the loop later runs to deliver its outcome ends
+//! with a result of its own. Every block kind this slice does not present is passed over rather
+//! than failed, because the wire grows freely (ADR 0010).
 
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
 };
 
-use futures_util::{StreamExt as _, stream};
+use futures_util::stream;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -26,45 +36,56 @@ use super::{
     thinking::{ThinkingEvent, ThinkingSplitter},
     turn_in_flight::TurnInFlight,
     wire::{
-        ContentBlock, EchoedUserContent, EchoedUserMessage, ResultMessage, StreamEvent,
-        StreamEventMessage, SystemMessage,
+        ContentBlock, EchoedUserContent, EchoedUserMessage, ResultMessage, StreamEventMessage,
+        SystemMessage,
     },
 };
 use crate::provider::{
     AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
-    ProviderEvent, ProviderEventStream,
+    ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderSubagentId,
+    ProviderSubagentStatus,
 };
 
 /// The tool whose executions are Command Activity. Claude sends the command itself as the tool's
 /// `command` input, so stripping applies only if recognizable launcher plumbing ever appears.
 const COMMAND_TOOL: &str = "Bash";
 
+/// The tool that spawns a subagent. Its tool-use id is what the CLI names as a task's
+/// `tool_use_id` and what the subagent's every chunk rides under as `parent_tool_use_id`.
+const TASK_TOOL: &str = "Task";
+
+/// The task type the CLI reports for a task running an agent — a Subagent. Every other type
+/// (`local_bash` above all) is background work with no conversation of its own, already in the
+/// Transcript as the Command Activity that spawned it.
+const SUBAGENT_TASK_TYPE: &str = "local_agent";
+
+/// How a task's `task_notification` reports it finishing well; anything else — failed, stopped —
+/// settles the Subagent as failed.
+const TASK_COMPLETED_STATUS: &str = "completed";
+
 pub(super) fn provider_events(
     messages: mpsc::UnboundedReceiver<Result<Value, ProviderError>>,
     turn: Arc<TurnInFlight>,
 ) -> ProviderEventStream {
-    Box::pin(
-        stream::unfold(
-            EventReceiver {
-                messages,
-                projection: ClaudeProjection::new(turn),
-                pending: VecDeque::new(),
-            },
-            next_provider_event,
-        )
-        .map(|event| event.map(AttributedProviderEvent::from)),
-    )
+    Box::pin(stream::unfold(
+        EventReceiver {
+            messages,
+            projection: ClaudeProjection::new(turn),
+            pending: VecDeque::new(),
+        },
+        next_provider_event,
+    ))
 }
 
 struct EventReceiver {
     messages: mpsc::UnboundedReceiver<Result<Value, ProviderError>>,
     projection: ClaudeProjection,
-    pending: VecDeque<Result<ProviderEvent, ProviderError>>,
+    pending: VecDeque<Result<AttributedProviderEvent, ProviderError>>,
 }
 
 async fn next_provider_event(
     mut events: EventReceiver,
-) -> Option<(Result<ProviderEvent, ProviderError>, EventReceiver)> {
+) -> Option<(Result<AttributedProviderEvent, ProviderError>, EventReceiver)> {
     loop {
         if let Some(event) = events.pending.pop_front() {
             return Some((event, events));
@@ -80,9 +101,26 @@ async fn next_provider_event(
     }
 }
 
-/// A streaming `tool_use` block, keyed while open by the conversation that owns it and the block
-/// index it streams under — subagents stream concurrently, each numbering its own blocks.
-type ToolBlockKey = (Option<String>, u64);
+/// Which conversation on the wire produced a message: the loop's own, or the subagent's whose
+/// spawning tool use `parent_tool_use_id` names.
+type ConversationKey = Option<String>;
+
+/// The loop's own conversation, whose events land in the owning Session.
+const OWNING_CONVERSATION: ConversationKey = None;
+
+/// The attribution one conversation's events land under: the owning Session for the loop's own,
+/// and the Subagent the spawning tool use names for everything streamed on its behalf.
+fn attributed(owner: &ConversationKey, event: ProviderEvent) -> AttributedProviderEvent {
+    AttributedProviderEvent {
+        attribution: match owner {
+            None => ProviderEventAttribution::OwningSession,
+            Some(subagent) => {
+                ProviderEventAttribution::Subagent(ProviderSubagentId::new(subagent.clone()))
+            }
+        },
+        event,
+    }
+}
 
 /// A `tool_use` block between its start and stop: the input streams in `input_json_delta`
 /// increments beside whatever the start already carried.
@@ -93,22 +131,55 @@ struct OpenToolUse {
     opening_input: Option<Value>,
 }
 
-/// The thinking block the conversation itself has open, and the Reasoning block its split is
-/// currently filling.
+/// The thinking block a conversation has open, and the Reasoning block its split is currently
+/// filling.
 struct OpenThinking {
     index: u64,
     activity: ProviderActivityId,
     splitter: ThinkingSplitter,
 }
 
-/// What the projection remembers between conversation messages: the streaming text block that is
-/// the agent Message currently open, the thinking block feeding Reasoning Activity, the tool-use
-/// blocks still streaming their input, and the commands running until a tool result settles them.
-struct ClaudeProjection {
+/// What the projection remembers about one conversation between its chunks: the streaming text
+/// block that is its agent Message currently open, the thinking block feeding its Reasoning
+/// Activity, and the tool-use blocks still streaming their input, keyed by the block index each
+/// numbers within its own conversation.
+#[derive(Default)]
+struct ConversationInFlight {
     open_text_block: Option<u64>,
     open_thinking: Option<OpenThinking>,
-    open_tools: BTreeMap<ToolBlockKey, OpenToolUse>,
-    running_commands: BTreeMap<String, ProviderActivityId>,
+    open_tools: BTreeMap<u64, OpenToolUse>,
+}
+
+/// A command running until a tool result settles it, remembering the conversation that ran it —
+/// which is where its output and settle land.
+struct RunningCommand {
+    owner: ConversationKey,
+    activity: ProviderActivityId,
+}
+
+/// One task the CLI is running an agent for: the identity its Subagent's events are attributed
+/// by, the conversation that spawned it — whose Session the Subagent's row and lifecycle land
+/// in — and the description its row currently reads, kept so progress ticks repeating it
+/// unchanged publish nothing.
+struct SubagentTask {
+    subagent: String,
+    spawner: ConversationKey,
+    description: String,
+}
+
+/// What the projection remembers between conversation messages, across every conversation the
+/// wire carries at once.
+struct ClaudeProjection {
+    conversations: BTreeMap<ConversationKey, ConversationInFlight>,
+    /// The commands whose tool results are still to be echoed back, by tool-use id — the CLI's
+    /// ids are unique across conversations, so one table serves them all.
+    running_commands: BTreeMap<String, RunningCommand>,
+    /// The Task tool uses that have streamed, by tool-use id, each remembering the conversation
+    /// that ran it. A `task_started` naming one of them is a spawn out of that conversation —
+    /// which is how a subagent's own spawns recurse one level down.
+    spawn_tools: BTreeMap<String, ConversationKey>,
+    /// The agent tasks running as Subagents, by the task id the rest of the lifecycle names.
+    subagent_tasks: BTreeMap<String, SubagentTask>,
     reasoning_blocks: u64,
     /// What the Session reads back out of the conversation: whether the Turn it started is still
     /// running, and the background work it must stop before interrupting.
@@ -118,182 +189,267 @@ struct ClaudeProjection {
 impl ClaudeProjection {
     fn new(turn: Arc<TurnInFlight>) -> Self {
         Self {
-            open_text_block: None,
-            open_thinking: None,
-            open_tools: BTreeMap::new(),
+            conversations: BTreeMap::new(),
             running_commands: BTreeMap::new(),
+            spawn_tools: BTreeMap::new(),
+            subagent_tasks: BTreeMap::new(),
             reasoning_blocks: 0,
             turn,
         }
     }
 
-    fn project(&mut self, message: Value) -> Result<Vec<ProviderEvent>, ProviderError> {
+    fn project(&mut self, message: Value) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
         match message.get("type").and_then(Value::as_str) {
             Some("stream_event") => self.project_stream_event(message),
             Some("user") => Ok(self.project_tool_results(message)),
             Some("result") => self.project_result(message),
-            Some("system") => {
-                self.project_task_lifecycle(message);
-                Ok(Vec::new())
-            }
+            Some("system") => Ok(self.project_task_lifecycle(message)),
             // Full-message snapshots of what already streamed, and everything else the CLI says
             // about itself — nothing this projection presents.
             _ => Ok(Vec::new()),
         }
     }
 
-    /// The task lifecycle the CLI reports beside the conversation. None of it is Transcript
-    /// material: it is the roster of background work an interrupt stops before it stops the loop,
-    /// kept from the tasks' own start and settle rather than from the roster snapshot the CLI also
-    /// sends, because that snapshot covers only work already in the background — a subagent still
-    /// running in the foreground of the Turn is exactly what an interrupt alone would leave behind.
-    fn project_task_lifecycle(&mut self, message: Value) {
+    /// The task lifecycle the CLI reports beside the conversations. Every task joins the roster
+    /// of background work an interrupt stops before it stops the loop — kept from the tasks' own
+    /// start and settle rather than from the roster snapshot the CLI also sends, because that
+    /// snapshot covers only work already in the background, and a subagent still running in the
+    /// foreground of the Turn is exactly what an interrupt alone would leave behind. A task
+    /// running an agent is more: a Subagent, opened, revised, and settled in the conversation
+    /// that spawned it.
+    fn project_task_lifecycle(&mut self, message: Value) -> Vec<AttributedProviderEvent> {
         let Ok(message) = serde_json::from_value::<SystemMessage>(message) else {
-            return;
-        };
-        let Some(task_id) = message.task_id else {
-            return;
+            return Vec::new();
         };
         match message.subtype.as_str() {
-            "task_started" => self.turn.task_started(task_id),
+            "task_started" => self.project_task_started(message),
+            "task_progress" => self.project_task_description(message.task_id, message.description),
+            "task_updated" => self.project_task_description(
+                message.task_id,
+                message.patch.and_then(|patch| patch.description),
+            ),
             // However a task ends — finished, failed, or stopped — the CLI notifies, so the
-            // notification alone is enough to take it off the roster.
-            "task_notification" => self.turn.task_settled(&task_id),
-            _ => {}
+            // notification alone is enough to settle it.
+            "task_notification" => self.project_task_settled(message),
+            _ => Vec::new(),
         }
+    }
+
+    fn project_task_started(&mut self, message: SystemMessage) -> Vec<AttributedProviderEvent> {
+        let Some(task_id) = message.task_id else {
+            return Vec::new();
+        };
+        self.turn.task_started(task_id.clone());
+        if message.task_type.as_deref() != Some(SUBAGENT_TASK_TYPE)
+            || self.subagent_tasks.contains_key(&task_id)
+        {
+            return Vec::new();
+        }
+        // The spawning tool use's id is the identity the subagent's every chunk rides under. A
+        // start that names none leaves the task id standing in, so the Subagent's row and settle
+        // still reach the Transcript even though no chunk can ever be attributed to it.
+        let subagent = message.tool_use_id.unwrap_or_else(|| task_id.clone());
+        let spawner = self
+            .spawn_tools
+            .remove(&subagent)
+            .unwrap_or(OWNING_CONVERSATION);
+        let description = message.description.unwrap_or_default();
+        let name = message.subagent_type.unwrap_or_else(|| TASK_TOOL.to_owned());
+        self.subagent_tasks.insert(
+            task_id,
+            SubagentTask {
+                subagent: subagent.clone(),
+                spawner: spawner.clone(),
+                description: description.clone(),
+            },
+        );
+        vec![attributed(
+            &spawner,
+            ProviderEvent::SubagentStarted {
+                subagent_id: ProviderSubagentId::new(subagent),
+                name,
+                description,
+            },
+        )]
+    }
+
+    /// A revised description for a running Subagent. Tasks that are not Subagents, tasks never
+    /// started, and ticks repeating the description unchanged all publish nothing.
+    fn project_task_description(
+        &mut self,
+        task_id: Option<String>,
+        description: Option<String>,
+    ) -> Vec<AttributedProviderEvent> {
+        let Some((task_id, description)) = task_id.zip(description) else {
+            return Vec::new();
+        };
+        let Some(task) = self.subagent_tasks.get_mut(&task_id) else {
+            return Vec::new();
+        };
+        if task.description == description {
+            return Vec::new();
+        }
+        task.description = description.clone();
+        vec![attributed(
+            &task.spawner.clone(),
+            ProviderEvent::SubagentUpdated {
+                subagent_id: ProviderSubagentId::new(task.subagent.clone()),
+                description,
+            },
+        )]
+    }
+
+    fn project_task_settled(&mut self, message: SystemMessage) -> Vec<AttributedProviderEvent> {
+        let Some(task_id) = message.task_id else {
+            return Vec::new();
+        };
+        self.turn.task_settled(&task_id);
+        let Some(task) = self.subagent_tasks.remove(&task_id) else {
+            return Vec::new();
+        };
+        // The settle is the last of the Subagent's events: whatever its streams leave open, the
+        // settle closes in the child Session, and nothing more of the conversation's can land.
+        self.conversations.remove(&Some(task.subagent.clone()));
+        self.running_commands
+            .retain(|_, command| command.owner.as_deref() != Some(task.subagent.as_str()));
+        let status = if message
+            .status
+            .as_deref()
+            .is_none_or(|status| status == TASK_COMPLETED_STATUS)
+        {
+            ProviderSubagentStatus::Completed
+        } else {
+            ProviderSubagentStatus::Failed
+        };
+        vec![attributed(
+            &task.spawner,
+            ProviderEvent::SubagentCompleted {
+                subagent_id: ProviderSubagentId::new(task.subagent),
+                status,
+            },
+        )]
     }
 
     fn project_stream_event(
         &mut self,
         message: Value,
-    ) -> Result<Vec<ProviderEvent>, ProviderError> {
+    ) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
         let message: StreamEventMessage = serde_json::from_value(message).map_err(|error| {
             claude_error(format!(
                 "Claude Code CLI sent a malformed stream event: {error}"
             ))
         })?;
-        // A subagent's narration is its own conversation, not this one's Transcript — but its
-        // tool uses are work the Turn did, so those flow on into Activity.
-        if let Some(parent) = message.parent_tool_use_id {
-            return Ok(self.project_subagent_event(parent, message.event));
-        }
+        let owner = message.parent_tool_use_id;
         let event = message.event;
+        // The conversation steps out of the table while its chunk projects, so the projection's
+        // shared state — the commands and spawns other conversations feed too — stays reachable.
+        let mut conversation = self.conversations.remove(&owner).unwrap_or_default();
         let mut projected = Vec::new();
         match event.kind.as_str() {
             "content_block_start" => {
-                let Some(block) = event.content_block else {
-                    return Ok(Vec::new());
-                };
-                // Blocks stream strictly one at a time, so a start while a text or thinking
-                // block is open means its stop was lost; settle what is open rather than
-                // interleaving two.
-                if self.open_text_block.take().is_some() {
-                    projected.push(ProviderEvent::AgentMessageCompleted);
-                }
-                self.settle_open_thinking(&mut projected);
-                match block.kind.as_str() {
-                    "text" => {
-                        self.open_text_block = event.index;
-                        projected.push(ProviderEvent::AgentMessageStarted);
-                        if let Some(text) = block.text.filter(|text| !text.is_empty()) {
-                            projected.push(ProviderEvent::AgentMessageDelta { content: text });
-                        }
+                if let Some(block) = event.content_block {
+                    // Blocks stream strictly one at a time within a conversation, so a start
+                    // while its text or thinking block is open means a stop was lost; settle
+                    // what is open rather than interleaving two.
+                    if conversation.open_text_block.take().is_some() {
+                        projected.push(ProviderEvent::AgentMessageCompleted);
                     }
-                    "thinking" => {
-                        if let Some(index) = event.index {
-                            self.open_thinking(index, block.thinking, &mut projected);
+                    self.settle_open_thinking(&mut conversation, &mut projected);
+                    match block.kind.as_str() {
+                        "text" => {
+                            conversation.open_text_block = event.index;
+                            projected.push(ProviderEvent::AgentMessageStarted);
+                            if let Some(text) = block.text.filter(|text| !text.is_empty()) {
+                                projected.push(ProviderEvent::AgentMessageDelta { content: text });
+                            }
                         }
+                        "thinking" => {
+                            if let Some(index) = event.index {
+                                self.open_thinking(
+                                    &mut conversation,
+                                    index,
+                                    block.thinking,
+                                    &mut projected,
+                                );
+                            }
+                        }
+                        "tool_use" => {
+                            self.open_tool_use(&owner, &mut conversation, event.index, block)
+                        }
+                        _ => {}
                     }
-                    "tool_use" => self.open_tool_use(None, event.index, block),
-                    _ => {}
                 }
             }
             "content_block_delta" => {
-                let Some(index) = event.index else {
-                    return Ok(Vec::new());
-                };
-                let Some(delta) = event.delta else {
-                    return Ok(Vec::new());
-                };
-                if self.open_text_block == Some(index) && delta.kind == "text_delta" {
-                    projected.push(ProviderEvent::AgentMessageDelta {
-                        content: delta.text.unwrap_or_default(),
-                    });
-                } else if let Some(thinking) = self
-                    .open_thinking
-                    .as_mut()
-                    .filter(|open| open.index == index && delta.kind == "thinking_delta")
-                {
-                    let split = thinking.splitter.push(&delta.thinking.unwrap_or_default());
-                    Self::project_thinking_split(
-                        &mut self.reasoning_blocks,
-                        thinking,
-                        split,
-                        &mut projected,
-                    );
-                } else if delta.kind == "input_json_delta"
-                    && let Some(tool) = self.open_tools.get_mut(&(None, index))
-                {
-                    tool.streamed_input
-                        .push_str(&delta.partial_json.unwrap_or_default());
+                if let Some((index, delta)) = event.index.zip(event.delta) {
+                    if conversation.open_text_block == Some(index) && delta.kind == "text_delta" {
+                        projected.push(ProviderEvent::AgentMessageDelta {
+                            content: delta.text.unwrap_or_default(),
+                        });
+                    } else if let Some(thinking) = conversation
+                        .open_thinking
+                        .as_mut()
+                        .filter(|open| open.index == index && delta.kind == "thinking_delta")
+                    {
+                        let split = thinking.splitter.push(&delta.thinking.unwrap_or_default());
+                        Self::project_thinking_split(
+                            &mut self.reasoning_blocks,
+                            thinking,
+                            split,
+                            &mut projected,
+                        );
+                    } else if delta.kind == "input_json_delta"
+                        && let Some(tool) = conversation.open_tools.get_mut(&index)
+                    {
+                        tool.streamed_input
+                            .push_str(&delta.partial_json.unwrap_or_default());
+                    }
                 }
             }
-            "content_block_stop" if event.index.is_some() => {
-                if self.open_text_block == event.index {
-                    self.open_text_block = None;
-                    projected.push(ProviderEvent::AgentMessageCompleted);
-                } else if self
-                    .open_thinking
-                    .as_ref()
-                    .is_some_and(|open| Some(open.index) == event.index)
-                {
-                    self.settle_open_thinking(&mut projected);
-                } else {
-                    self.close_tool_use((None, event.index.unwrap_or_default()), &mut projected);
+            "content_block_stop" => {
+                if let Some(index) = event.index {
+                    if conversation.open_text_block == Some(index) {
+                        conversation.open_text_block = None;
+                        projected.push(ProviderEvent::AgentMessageCompleted);
+                    } else if conversation
+                        .open_thinking
+                        .as_ref()
+                        .is_some_and(|open| open.index == index)
+                    {
+                        self.settle_open_thinking(&mut conversation, &mut projected);
+                    } else {
+                        self.close_tool_use(&owner, &mut conversation, index, &mut projected);
+                    }
                 }
             }
             // Message boundaries carry nothing the Transcript presents.
             _ => {}
         }
-        Ok(projected)
+        self.conversations.insert(owner.clone(), conversation);
+        Ok(projected
+            .into_iter()
+            .map(|event| attributed(&owner, event))
+            .collect())
     }
 
-    /// A subagent-owned streaming event: text and thinking are dropped, tool-use blocks flow so
-    /// the subagent's work still reaches the Transcript as Activity.
-    fn project_subagent_event(&mut self, parent: String, event: StreamEvent) -> Vec<ProviderEvent> {
-        let mut projected = Vec::new();
-        match event.kind.as_str() {
-            "content_block_start" => {
-                if let Some(block) = event.content_block.filter(|block| block.kind == "tool_use") {
-                    self.open_tool_use(Some(parent), event.index, block);
-                }
-            }
-            "content_block_delta" => {
-                if let Some((index, delta)) = event.index.zip(event.delta)
-                    && delta.kind == "input_json_delta"
-                    && let Some(tool) = self.open_tools.get_mut(&(Some(parent), index))
-                {
-                    tool.streamed_input
-                        .push_str(&delta.partial_json.unwrap_or_default());
-                }
-            }
-            "content_block_stop" => {
-                if let Some(index) = event.index {
-                    self.close_tool_use((Some(parent), index), &mut projected);
-                }
-            }
-            _ => {}
-        }
-        projected
-    }
-
-    /// Starts tracking a `tool_use` block whose input is about to stream.
-    fn open_tool_use(&mut self, parent: Option<String>, index: Option<u64>, block: ContentBlock) {
+    /// Starts tracking a `tool_use` block whose input is about to stream. A Task tool use is
+    /// remembered as a spawn, so the task the CLI starts for it opens its Subagent in the
+    /// conversation that ran the tool.
+    fn open_tool_use(
+        &mut self,
+        owner: &ConversationKey,
+        conversation: &mut ConversationInFlight,
+        index: Option<u64>,
+        block: ContentBlock,
+    ) {
         let (Some(index), Some(id), Some(name)) = (index, block.id, block.name) else {
             return;
         };
-        self.open_tools.insert(
-            (parent, index),
+        if name == TASK_TOOL {
+            self.spawn_tools.insert(id.clone(), owner.clone());
+        }
+        conversation.open_tools.insert(
+            index,
             OpenToolUse {
                 id,
                 name,
@@ -303,11 +459,17 @@ impl ClaudeProjection {
         );
     }
 
-    /// Closes a `tool_use` block: a completed Bash tool use becomes a running Command Activity,
-    /// recording the bare command. Any other tool, and input in no shape this projection reads,
-    /// is passed over.
-    fn close_tool_use(&mut self, key: ToolBlockKey, projected: &mut Vec<ProviderEvent>) {
-        let Some(tool) = self.open_tools.remove(&key) else {
+    /// Closes a `tool_use` block: a completed Bash tool use becomes a running Command Activity in
+    /// the conversation that ran it, recording the bare command. Any other tool, and input in no
+    /// shape this projection reads, is passed over.
+    fn close_tool_use(
+        &mut self,
+        owner: &ConversationKey,
+        conversation: &mut ConversationInFlight,
+        index: u64,
+        projected: &mut Vec<ProviderEvent>,
+    ) {
+        let Some(tool) = conversation.open_tools.remove(&index) else {
             return;
         };
         if tool.name != COMMAND_TOOL {
@@ -324,12 +486,19 @@ impl ClaudeProjection {
             command: strip_launcher_wrapper(command.to_owned()),
             cwd: None,
         });
-        self.running_commands.insert(tool.id, activity_id);
+        self.running_commands.insert(
+            tool.id,
+            RunningCommand {
+                owner: owner.clone(),
+                activity: activity_id,
+            },
+        );
     }
 
-    /// The tool results a `user` message echoes back, settling the commands they report on. A
-    /// user message in any other shape is not the projection's to present.
-    fn project_tool_results(&mut self, message: Value) -> Vec<ProviderEvent> {
+    /// The tool results a `user` message echoes back, settling the commands they report on in
+    /// whichever conversation ran each. A user message in any other shape is not the projection's
+    /// to present.
+    fn project_tool_results(&mut self, message: Value) -> Vec<AttributedProviderEvent> {
         let Ok(message) = serde_json::from_value::<EchoedUserMessage>(message) else {
             return Vec::new();
         };
@@ -341,7 +510,7 @@ impl ClaudeProjection {
             if block.kind != "tool_result" {
                 continue;
             }
-            let Some(activity_id) = block
+            let Some(command) = block
                 .tool_use_id
                 .and_then(|id| self.running_commands.remove(&id))
             else {
@@ -349,27 +518,34 @@ impl ClaudeProjection {
             };
             let output = tool_result_text(&block.content);
             if !output.is_empty() {
-                projected.push(ProviderEvent::CommandOutputDelta {
-                    activity_id: activity_id.clone(),
-                    content: output,
-                });
+                projected.push(attributed(
+                    &command.owner,
+                    ProviderEvent::CommandOutputDelta {
+                        activity_id: command.activity.clone(),
+                        content: output,
+                    },
+                ));
             }
-            projected.push(ProviderEvent::CommandCompleted {
-                activity_id,
-                status: if block.is_error {
-                    ProviderCommandStatus::Failed
-                } else {
-                    ProviderCommandStatus::Completed
+            projected.push(attributed(
+                &command.owner,
+                ProviderEvent::CommandCompleted {
+                    activity_id: command.activity,
+                    status: if block.is_error {
+                        ProviderCommandStatus::Failed
+                    } else {
+                        ProviderCommandStatus::Completed
+                    },
+                    exit_status: None,
                 },
-                exit_status: None,
-            });
+            ));
         }
         projected
     }
 
-    /// Opens the conversation's thinking block and the first Reasoning block of its split.
+    /// Opens a conversation's thinking block and the first Reasoning block of its split.
     fn open_thinking(
         &mut self,
+        conversation: &mut ConversationInFlight,
         index: u64,
         opening: Option<String>,
         projected: &mut Vec<ProviderEvent>,
@@ -392,12 +568,16 @@ impl ClaudeProjection {
                 projected,
             );
         }
-        self.open_thinking = Some(thinking);
+        conversation.open_thinking = Some(thinking);
     }
 
-    /// Settles the open thinking block, releasing whatever its split still withholds.
-    fn settle_open_thinking(&mut self, projected: &mut Vec<ProviderEvent>) {
-        let Some(mut thinking) = self.open_thinking.take() else {
+    /// Settles a conversation's open thinking block, releasing whatever its split still withholds.
+    fn settle_open_thinking(
+        &mut self,
+        conversation: &mut ConversationInFlight,
+        projected: &mut Vec<ProviderEvent>,
+    ) {
+        let Some(mut thinking) = conversation.open_thinking.take() else {
             return;
         };
         let split = thinking.splitter.finish();
@@ -444,25 +624,40 @@ impl ClaudeProjection {
         }
     }
 
-    fn project_result(&mut self, message: Value) -> Result<Vec<ProviderEvent>, ProviderError> {
+    fn project_result(&mut self, message: Value) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
         let result: ResultMessage = serde_json::from_value(message).map_err(|error| {
             claude_error(format!(
                 "Claude Code CLI sent a malformed result message: {error}"
             ))
         })?;
         let mut projected = Vec::new();
-        // A result while blocks are still streaming is the CLI failing mid-stream; what did
-        // stream stays in the Transcript, settled.
-        self.settle_open_thinking(&mut projected);
-        if self.open_text_block.take().is_some() {
+        // A result is a boundary of the loop's own conversation alone: its subagents stream on
+        // past it (ADR 0015). A result while the loop's blocks are still streaming is the CLI
+        // failing mid-stream; what did stream stays in the Transcript, settled.
+        let mut owning = self
+            .conversations
+            .remove(&OWNING_CONVERSATION)
+            .unwrap_or_default();
+        self.settle_open_thinking(&mut owning, &mut projected);
+        if owning.open_text_block.take().is_some() {
             projected.push(ProviderEvent::AgentMessageCompleted);
         }
-        // A command whose tool result never came back has no outcome to match, so it settles
-        // as failed rather than holding the Turn open.
-        self.open_tools.clear();
-        for (_, activity_id) in std::mem::take(&mut self.running_commands) {
+        // A command of the loop's own whose tool result never came back has no outcome to match,
+        // so it settles as failed rather than holding the Turn open. A subagent's commands are
+        // owed nothing by this result and keep running.
+        let unanswered = self
+            .running_commands
+            .iter()
+            .filter(|(_, command)| command.owner.is_none())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in unanswered {
+            let command = self
+                .running_commands
+                .remove(&id)
+                .expect("an unanswered command was just listed from the table");
             projected.push(ProviderEvent::CommandCompleted {
-                activity_id,
+                activity_id: command.activity,
                 status: ProviderCommandStatus::Failed,
                 exit_status: None,
             });
@@ -473,8 +668,10 @@ impl ClaudeProjection {
         } else if result.subtype == "success" && !result.is_error {
             // A steered Turn is answered stretch by stretch: the CLI ends every user message
             // queued into the loop with a result of its own, and only the last one Settles the
-            // Turn that holds them all.
-            if self.turn.result_settles_turn() {
+            // Turn that holds them all. A result no Turn waited on at all ends a stretch the
+            // loop ran on its own — waking to deliver a Subagent's outcome — and completing it
+            // is what settles the Continuation that output began, or nothing where none is open.
+            if self.turn.result_settles_turn() || !self.turn.is_running() {
                 projected.push(ProviderEvent::TurnCompleted);
             }
         } else {
@@ -483,7 +680,10 @@ impl ClaudeProjection {
                 message: super::result_failure_message("Turn", &result),
             });
         }
-        Ok(projected)
+        Ok(projected
+            .into_iter()
+            .map(|event| attributed(&OWNING_CONVERSATION, event))
+            .collect())
     }
 }
 
@@ -499,8 +699,9 @@ fn was_interrupted(result: &ResultMessage) -> bool {
     )
 }
 
-/// The next Reasoning block's identity. Blocks are numbered across the Session, in a namespace
-/// apart from the tool-use ids commands are named by.
+/// The next Reasoning block's identity. Blocks are numbered across the Session — one namespace
+/// for every conversation, since each block lands in a Session of its own anyway — apart from the
+/// tool-use ids commands are named by.
 fn next_reasoning_activity(reasoning_blocks: &mut u64) -> ProviderActivityId {
     let activity = ProviderActivityId::new(format!("reasoning:{reasoning_blocks}"));
     *reasoning_blocks += 1;
