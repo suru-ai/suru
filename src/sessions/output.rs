@@ -58,7 +58,9 @@ impl SessionStore {
                             .activities
                             .iter()
                             .find(|activity| activity.id() == *activity_id)
-                            .ok_or_else(|| anyhow!("Agent output referenced an unknown Activity"))?;
+                            .ok_or_else(|| {
+                                anyhow!("Agent output referenced an unknown Activity")
+                            })?;
                         let Activity::Subagent { status, .. } = activity else {
                             return Err(anyhow!(
                                 "Subagent output referenced an Activity of another kind"

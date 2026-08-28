@@ -284,6 +284,13 @@ impl ActiveProviderTurn {
 struct SubagentRoutes {
     routes: HashMap<ProviderSubagentId, SubagentRoute>,
     rows: HashMap<ProviderSubagentId, SubagentRow>,
+    /// Whether a Subagent has settled since a Turn last began. The output a
+    /// completion provokes can arrive only after the settle — Claude notifies
+    /// a task's end before its loop wakes to deliver the outcome — so every
+    /// settle leaves a Continuation owed to whatever that output turns out to
+    /// be. Any Turn beginning clears it, because from then on such output has
+    /// a Turn to land in.
+    late_settle_owes_continuation: bool,
 }
 
 struct SubagentRoute {
@@ -304,6 +311,13 @@ struct SubagentRow {
 }
 
 impl SubagentRoutes {
+    /// Whether output arriving with no Turn active is owed a Continuation
+    /// rather than being stray: some Subagent is still working, or one just
+    /// settled and its provoked output is still to come.
+    fn owes_continuation(&self) -> bool {
+        self.late_settle_owes_continuation || !self.rows.is_empty() || !self.routes.is_empty()
+    }
+
     /// Projects one Subagent-attributed event into the Session its route
     /// names, through the same projection and commit path the owning Session's
     /// events take. The route is taken out while its event projects, because a
@@ -404,6 +418,7 @@ impl SubagentRoutes {
     ) -> Option<anyhow::Result<()>> {
         let row = self.rows.remove(subagent)?;
         let route = self.routes.remove(subagent);
+        self.late_settle_owes_continuation = true;
         Some((|| {
             if let Some(mut route) = route {
                 let outcome = match status {
@@ -830,12 +845,6 @@ async fn run_provider_session(
     let mut provider: Option<ConnectedProviderSession> = None;
     let mut active: Option<ActiveProviderTurn> = None;
     let mut subagents = SubagentRoutes::default();
-    // Whether the last Subagent to settle did so with no Turn active. The output its completion
-    // provokes arrives only after its settle on some Providers' wires — Claude notifies the
-    // task's end before its loop wakes to deliver the outcome — so the settle itself leaves a
-    // Continuation owed. Any Turn beginning clears it, because from then on that output has a
-    // Turn to land in.
-    let mut continuation_owed = false;
     let mut deferred_prompt_id = None;
     let provider_id = runtime.provider_id();
 
@@ -905,7 +914,7 @@ async fn run_provider_session(
                                 subagent_id,
                                 status,
                             } => {
-                                let settled = updates.apply(|| {
+                                let _ = updates.apply(|| {
                                     subagents.settle_subagent(
                                         &sessions,
                                         &identity,
@@ -913,9 +922,6 @@ async fn run_provider_session(
                                         status,
                                     )
                                 });
-                                if matches!(settled, Some(Some(_))) {
-                                    continuation_owed = true;
-                                }
                             }
                             // Anything else is late output. Owed to Subagents
                             // still working past their Turn's settle — or to
@@ -925,10 +931,7 @@ async fn run_provider_session(
                             // an interrupted Turn's trailing stream, say — is
                             // discarded as it always was.
                             event => {
-                                if !continuation_owed
-                                    && subagents.rows.is_empty()
-                                    && subagents.routes.is_empty()
-                                {
+                                if !subagents.owes_continuation() {
                                     continue;
                                 }
                                 let Some(begun) = updates.apply(|| {
@@ -951,7 +954,7 @@ async fn run_provider_session(
                                     event,
                                     QueuedPromptDisposition::LeavePending,
                                 );
-                                continuation_owed = false;
+                                subagents.late_settle_owes_continuation = false;
                                 if !matches!(projection, ProviderEventProjection::Terminal(_)) {
                                     active = Some(continuation);
                                 }
@@ -1130,7 +1133,7 @@ async fn run_provider_session(
                 continue;
             }
             active = Some(ActiveProviderTurn::new(turn_id));
-            continuation_owed = false;
+            subagents.late_settle_owes_continuation = false;
             continue;
         }
 
@@ -1387,7 +1390,7 @@ async fn run_provider_session(
                                     }
                                 } else {
                                     active = Some(ActiveProviderTurn::new(turn_id));
-                                    continuation_owed = false;
+                                    subagents.late_settle_owes_continuation = false;
                                 }
                             } else if !selection_rejected {
                                 defer_next_queued_prompt(

@@ -3,19 +3,10 @@
 //! outliving the Turn keeps running, its late output streams into a Continuation, and nested
 //! spawns recurse one level down.
 
-use std::sync::Arc;
-
 use crate::support::{
-    ScriptedClaude, agent_messages, connect, conversation_fixture, session_where, settled_session,
+    agent_messages, conversation_fixture, opened_session, session_where, settled_session,
 };
-use suru::{
-    protocol::{
-        Activity, ActivityStatus, CreateSessionRequest, InitialPrompt, PromptId, SessionId,
-        SessionSnapshot, TurnStatus, Workspace,
-    },
-    provider::ClaudeRuntime,
-    server::{self, RunningServer, ServerConfig},
-};
+use suru::protocol::{Activity, ActivityStatus, SessionSnapshot, TurnStatus};
 
 /// A fan-out running in the foreground of the Turn: the conversation spawns a subagent through
 /// the Task tool, the CLI reports the task starting with the spawning tool use's identity, the
@@ -69,50 +60,13 @@ fn the_subagent_row(snapshot: &SessionSnapshot) -> &Activity {
     row
 }
 
-/// A server hosting the scripted Claude, a connected client, and the Session `prompt` opened.
-async fn opened_session(
-    claude: &ScriptedClaude,
-    name: &'static str,
-    prompt: &str,
-) -> (
-    RunningServer,
-    suru::managed_client::ManagedClient,
-    SessionId,
-    tempfile::TempDir,
-    tempfile::TempDir,
-) {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn_with_provider(
-        ServerConfig::new(state_dir.path(), name).expect("configure server"),
-        Arc::new(ClaudeRuntime::new(claude.executable())),
-    )
-    .await
-    .expect("spawn server");
-    let client = connect(state_dir.path(), name).await;
-    let created = client
-        .create_session(CreateSessionRequest {
-            agent_selection: None,
-            workspace: Workspace {
-                path: workspace.path().to_owned(),
-            },
-            prompt: InitialPrompt {
-                id: PromptId::new(),
-                text: prompt.to_owned(),
-                skill_invocations: Vec::new(),
-            },
-        })
-        .await
-        .expect("create Session");
-    (server, client, created.session.id, state_dir, workspace)
-}
-
 #[tokio::test]
 async fn a_task_spawn_opens_the_row_and_the_child_session_that_holds_the_subagents_work() {
     let claude = conversation_fixture(FAN_OUT_TURN);
-    let (server, client, session_id, _state_dir, _workspace) =
-        opened_session(&claude, "claude-subagent-fan-out", "Scout for TODOs").await;
-    let settled = settled_session(&client, session_id, 0).await;
+    let opened = opened_session(&claude, "claude-subagent-fan-out", "Scout for TODOs").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let settled = settled_session(client, session_id, 0).await;
 
     assert_eq!(settled.turns[0].status, TurnStatus::Completed);
     let [message] = agent_messages(&settled)[..] else {
@@ -147,7 +101,7 @@ async fn a_task_spawn_opens_the_row_and_the_child_session_that_holds_the_subagen
         settled.activities
     );
 
-    let child = settled_session(&client, *child_id, 0).await;
+    let child = settled_session(client, *child_id, 0).await;
     assert_eq!(
         child.session.parent,
         Some(session_id),
@@ -192,7 +146,11 @@ async fn a_task_spawn_opens_the_row_and_the_child_session_that_holds_the_subagen
     assert_eq!(command, "rg -l TODO");
     assert_eq!(output, "src/main.rs\n");
 
-    server.shutdown().await.expect("shut the server down");
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
 }
 
 /// A Turn whose subagent outlives it: the spawn and the subagent's Bash execution stream, the
@@ -222,9 +180,15 @@ const OUTLIVING_TURN: &str = r#"      emit '{"type":"stream_event","event":{"typ
 #[tokio::test]
 async fn a_subagent_outliving_the_turn_keeps_running_and_its_late_output_begins_a_continuation() {
     let claude = conversation_fixture(OUTLIVING_TURN);
-    let (server, client, session_id, _state_dir, _workspace) =
-        opened_session(&claude, "claude-subagent-outlives", "Audit the dependencies").await;
-    let settled = settled_session(&client, session_id, 0).await;
+    let opened = opened_session(
+        &claude,
+        "claude-subagent-outlives",
+        "Audit the dependencies",
+    )
+    .await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let settled = settled_session(client, session_id, 0).await;
 
     // The Turn settled at the CLI's own boundary while the subagent works on.
     assert_eq!(settled.turns[0].status, TurnStatus::Completed);
@@ -247,7 +211,7 @@ async fn a_subagent_outliving_the_turn_keeps_running_and_its_late_output_begins_
         .await
         .expect("subscribe to the child Session");
     let child = session_where(
-        &client,
+        client,
         &mut child_feed,
         child_id,
         "the subagent's command reaches the child's Transcript",
@@ -267,14 +231,9 @@ async fn a_subagent_outliving_the_turn_keeps_running_and_its_late_output_begins_
     );
 
     claude.release();
-    let child = settled_session(&client, child_id, 0).await;
+    let child = settled_session(client, child_id, 0).await;
     assert_eq!(child.turns[0].status, TurnStatus::Completed);
-    let [
-        Activity::Command {
-            status, output, ..
-        },
-    ] = child.activities.as_slice()
-    else {
+    let [Activity::Command { status, output, .. }] = child.activities.as_slice() else {
         panic!(
             "the subagent's execution settles in the child, got {:?}",
             child.activities
@@ -285,7 +244,7 @@ async fn a_subagent_outliving_the_turn_keeps_running_and_its_late_output_begins_
 
     // The output the subagent's completion provoked streams into a Continuation: a second Turn
     // no Prompt began, settled at the CLI's next boundary.
-    let with_continuation = settled_session(&client, session_id, 1).await;
+    let with_continuation = settled_session(client, session_id, 1).await;
     assert_eq!(with_continuation.turns.len(), 2);
     let continuation = &with_continuation.turns[1];
     assert_eq!(
@@ -321,7 +280,11 @@ async fn a_subagent_outliving_the_turn_keeps_running_and_its_late_output_begins_
     );
     assert!(duration_ms.is_some());
 
-    server.shutdown().await.expect("shut the server down");
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
 }
 
 /// A spawn inside a spawn: the subagent runs its own Task tool use, the grandchild narrates under
@@ -350,9 +313,10 @@ const NESTED_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":
 #[tokio::test]
 async fn a_subagent_spawning_a_subagent_records_the_grandchild_one_level_down() {
     let claude = conversation_fixture(NESTED_TURN);
-    let (server, client, session_id, _state_dir, _workspace) =
-        opened_session(&claude, "claude-subagent-nested", "Plan the refactor").await;
-    let settled = settled_session(&client, session_id, 0).await;
+    let opened = opened_session(&claude, "claude-subagent-nested", "Plan the refactor").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let settled = settled_session(client, session_id, 0).await;
 
     assert_eq!(settled.turns[0].status, TurnStatus::Completed);
     let Activity::Subagent {
@@ -367,7 +331,7 @@ async fn a_subagent_spawning_a_subagent_records_the_grandchild_one_level_down() 
     assert_eq!(*status, ActivityStatus::Completed);
     assert_eq!(name, "Plan");
 
-    let child = settled_session(&client, *child_id, 0).await;
+    let child = settled_session(client, *child_id, 0).await;
     assert_eq!(child.session.parent, Some(session_id));
     assert_eq!(child.turns[0].status, TurnStatus::Completed);
     assert_eq!(agent_messages(&child)[0].content, "Refactor in two steps.");
@@ -385,7 +349,7 @@ async fn a_subagent_spawning_a_subagent_records_the_grandchild_one_level_down() 
     assert_eq!(name, "Explore");
     assert_eq!(description, "Map the callers");
 
-    let grandchild = settled_session(&client, *grandchild_id, 0).await;
+    let grandchild = settled_session(client, *grandchild_id, 0).await;
     assert_eq!(
         grandchild.session.parent,
         Some(*child_id),
@@ -394,5 +358,72 @@ async fn a_subagent_spawning_a_subagent_records_the_grandchild_one_level_down() 
     assert_eq!(grandchild.turns[0].status, TurnStatus::Completed);
     assert_eq!(agent_messages(&grandchild)[0].content, "Twelve call sites.");
 
-    server.shutdown().await.expect("shut the server down");
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+/// A spawner stopped out from under its child: the outer task's notification arrives while the
+/// inner still runs — the wire promises no inside-out order — and the inner's own settle follows.
+const OUTER_SETTLES_FIRST_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_outer","name":"Task","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"agent-outer","tool_use_id":"task_outer","description":"Plan the refactor","task_type":"local_agent","subagent_type":"Plan","session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_inner","name":"Task","input":{}}},"parent_tool_use_id":"task_outer","session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":"task_outer","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"agent-inner","tool_use_id":"task_inner","description":"Map the callers","task_type":"local_agent","subagent_type":"Explore","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"agent-outer","status":"killed","session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Twelve call sites."}},"parent_tool_use_id":"task_inner","session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":"task_inner","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"agent-inner","status":"completed","session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"task_outer","content":"Stopped.","is_error":true}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":300,"num_turns":1,"result":"The planner was stopped.","session_id":"prov-session"}'
+"#;
+
+#[tokio::test]
+async fn an_outer_settle_does_not_orphan_the_inner_subagent_it_leaves_running() {
+    let claude = conversation_fixture(OUTER_SETTLES_FIRST_TURN);
+    let opened = opened_session(&claude, "claude-subagent-outer-first", "Plan the refactor").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let settled = settled_session(client, session_id, 0).await;
+
+    let Activity::Subagent {
+        status,
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&settled)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Failed,
+        "a stopped task settles its row as failed"
+    );
+
+    let child = settled_session(client, *child_id, 0).await;
+    let Activity::Subagent {
+        status,
+        session_id: grandchild_id,
+        ..
+    } = the_subagent_row(&child)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Completed,
+        "the inner settle still reaches its row after the spawner's own"
+    );
+    let grandchild = settled_session(client, *grandchild_id, 0).await;
+    assert_eq!(grandchild.turns[0].status, TurnStatus::Completed);
+    assert_eq!(agent_messages(&grandchild)[0].content, "Twelve call sites.");
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
 }

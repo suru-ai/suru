@@ -718,6 +718,54 @@ pub fn conversation_fixture(timeline: &str) -> ScriptedClaude {
     ScriptedClaude::new(&conversation_arms(timeline))
 }
 
+/// A server hosting the scripted Claude, a client connected past its initial state, and the
+/// Session `prompt` opened, with the directories the Session lives in held for the fixture's
+/// lifetime. `name` is the client channel, so each test needs its own.
+pub struct OpenedSession {
+    pub server: RunningServer,
+    pub client: ManagedClient,
+    pub session_id: SessionId,
+    _state_dir: tempfile::TempDir,
+    _workspace: tempfile::TempDir,
+}
+
+pub async fn opened_session(
+    claude: &ScriptedClaude,
+    name: &'static str,
+    prompt: &str,
+) -> OpenedSession {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), name).expect("configure server"),
+        std::sync::Arc::new(ClaudeRuntime::new(claude.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let client = connect(state_dir.path(), name).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: prompt.to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    OpenedSession {
+        server,
+        client,
+        session_id: created.session.id,
+        _state_dir: state_dir,
+        _workspace: workspace,
+    }
+}
+
 /// The agent Messages in `snapshot`, in Transcript order — the Prompt's own Message is a Message
 /// too, and it is never what a Provider produced.
 pub fn agent_messages(snapshot: &SessionSnapshot) -> Vec<&Message> {

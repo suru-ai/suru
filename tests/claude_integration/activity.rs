@@ -2,17 +2,8 @@
 //! split at its headings, and Bash executions recorded as Command Activity settled by their tool
 //! results. A subagent's work is its own Session's — see `subagents`.
 
-use std::sync::Arc;
-
-use crate::support::{agent_messages, connect, conversation_fixture, settled_session};
-use suru::{
-    protocol::{
-        Activity, ActivityStatus, CreateSessionRequest, InitialPrompt, PromptId, SessionSnapshot,
-        TranscriptItem, TurnStatus, Workspace,
-    },
-    provider::ClaudeRuntime,
-    server::{self, ServerConfig},
-};
+use crate::support::{agent_messages, conversation_fixture, opened_session, settled_session};
+use suru::protocol::{Activity, ActivityStatus, SessionSnapshot, TranscriptItem, TurnStatus};
 
 /// A Turn that thinks under a heading, runs one Bash command that succeeds and one that fails,
 /// and answers. The commands exercise both input shapes the wire streams: input built up from
@@ -96,33 +87,13 @@ fn oversized_output_turn() -> String {
 /// The Session the Prompt `text` opened, once its first Turn has settled.
 async fn worked_session(name: &'static str, timeline: &str, text: &str) -> SessionSnapshot {
     let claude = conversation_fixture(timeline);
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn_with_provider(
-        ServerConfig::new(state_dir.path(), name).expect("configure server"),
-        Arc::new(ClaudeRuntime::new(claude.executable())),
-    )
-    .await
-    .expect("spawn server");
-    let client = connect(state_dir.path(), name).await;
-
-    let created = client
-        .create_session(CreateSessionRequest {
-            agent_selection: None,
-            workspace: Workspace {
-                path: workspace.path().to_owned(),
-            },
-            prompt: InitialPrompt {
-                id: PromptId::new(),
-                text: text.to_owned(),
-                skill_invocations: Vec::new(),
-            },
-        })
+    let opened = opened_session(&claude, name, text).await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+    opened
+        .server
+        .shutdown()
         .await
-        .expect("create Session");
-    let settled = settled_session(&client, created.session.id, 0).await;
-
-    server.shutdown().await.expect("shut the server down");
+        .expect("shut the server down");
     settled
 }
 

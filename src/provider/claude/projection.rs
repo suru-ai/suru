@@ -85,7 +85,10 @@ struct EventReceiver {
 
 async fn next_provider_event(
     mut events: EventReceiver,
-) -> Option<(Result<AttributedProviderEvent, ProviderError>, EventReceiver)> {
+) -> Option<(
+    Result<AttributedProviderEvent, ProviderError>,
+    EventReceiver,
+)> {
     loop {
         if let Some(event) = events.pending.pop_front() {
             return Some((event, events));
@@ -158,12 +161,10 @@ struct RunningCommand {
 }
 
 /// One task the CLI is running an agent for: the identity its Subagent's events are attributed
-/// by, the conversation that spawned it — whose Session the Subagent's row and lifecycle land
-/// in — and the description its row currently reads, kept so progress ticks repeating it
+/// by, and the description its row currently reads, kept so progress ticks repeating it
 /// unchanged publish nothing.
 struct SubagentTask {
     subagent: String,
-    spawner: ConversationKey,
     description: String,
 }
 
@@ -215,8 +216,8 @@ impl ClaudeProjection {
     /// start and settle rather than from the roster snapshot the CLI also sends, because that
     /// snapshot covers only work already in the background, and a subagent still running in the
     /// foreground of the Turn is exactly what an interrupt alone would leave behind. A task
-    /// running an agent is more: a Subagent, opened, revised, and settled in the conversation
-    /// that spawned it.
+    /// running an agent is more: a Subagent, opened in the conversation that spawned it and
+    /// revised and settled under its own identity.
     fn project_task_lifecycle(&mut self, message: Value) -> Vec<AttributedProviderEvent> {
         let Ok(message) = serde_json::from_value::<SystemMessage>(message) else {
             return Vec::new();
@@ -254,15 +255,20 @@ impl ClaudeProjection {
             .remove(&subagent)
             .unwrap_or(OWNING_CONVERSATION);
         let description = message.description.unwrap_or_default();
-        let name = message.subagent_type.unwrap_or_else(|| TASK_TOOL.to_owned());
+        let name = message
+            .subagent_type
+            .unwrap_or_else(|| TASK_TOOL.to_owned());
         self.subagent_tasks.insert(
             task_id,
             SubagentTask {
                 subagent: subagent.clone(),
-                spawner: spawner.clone(),
                 description: description.clone(),
             },
         );
+        // The spawn alone is attributed to the spawning conversation, because it is what decides
+        // which Session the child hangs under. The rest of the lifecycle addresses the row by
+        // the Subagent's own identity and rides the owning conversation, so a nested Subagent's
+        // settle still lands after its spawner's own — order the wire does not promise.
         vec![attributed(
             &spawner,
             ProviderEvent::SubagentStarted {
@@ -291,7 +297,7 @@ impl ClaudeProjection {
         }
         task.description = description.clone();
         vec![attributed(
-            &task.spawner.clone(),
+            &OWNING_CONVERSATION,
             ProviderEvent::SubagentUpdated {
                 subagent_id: ProviderSubagentId::new(task.subagent.clone()),
                 description,
@@ -322,7 +328,7 @@ impl ClaudeProjection {
             ProviderSubagentStatus::Failed
         };
         vec![attributed(
-            &task.spawner,
+            &OWNING_CONVERSATION,
             ProviderEvent::SubagentCompleted {
                 subagent_id: ProviderSubagentId::new(task.subagent),
                 status,
@@ -624,7 +630,10 @@ impl ClaudeProjection {
         }
     }
 
-    fn project_result(&mut self, message: Value) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    fn project_result(
+        &mut self,
+        message: Value,
+    ) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
         let result: ResultMessage = serde_json::from_value(message).map_err(|error| {
             claude_error(format!(
                 "Claude Code CLI sent a malformed result message: {error}"
