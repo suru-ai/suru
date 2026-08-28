@@ -111,7 +111,7 @@ impl SessionStore {
     pub(crate) fn begin_continuation(
         &self,
         session_id: SessionId,
-        agent: Option<AgentIdentity>,
+        agent: AgentIdentity,
     ) -> anyhow::Result<TurnId> {
         let mut state = self
             .state
@@ -136,7 +136,7 @@ impl SessionStore {
                 turn: Turn {
                     id: turn_id,
                     prompt_id: None,
-                    agent,
+                    agent: Some(agent),
                     status: TurnStatus::Active,
                     // The commit that lands this Turn stamps when it began.
                     started_at: None,
@@ -199,7 +199,7 @@ impl SessionStore {
                 .snapshot
                 .turns
                 .iter()
-                .any(|turn| turn.id == turn_id && turn.prompt_id.is_none());
+                .any(|turn| turn.id == turn_id && turn.is_continuation());
             let mut pending_steers = record
                 .snapshot
                 .prompts

@@ -307,7 +307,7 @@ impl SessionStore {
                 .snapshot
                 .turns
                 .iter()
-                .any(|turn| turn.id == turn_id && turn.prompt_id.is_none())
+                .any(|turn| turn.id == turn_id && turn.is_continuation())
         });
         let (disposition, steer_target) = match (active_turn, request.delivery) {
             (None, _) => (PromptAdmissionDisposition::StartImmediately, None),

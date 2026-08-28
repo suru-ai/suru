@@ -919,8 +919,7 @@ async fn run_provider_session(
                                     continue;
                                 }
                                 let Some(begun) = updates.apply(|| {
-                                    sessions
-                                        .begin_continuation(session_id, Some(identity.clone()))
+                                    sessions.begin_continuation(session_id, identity.clone())
                                 }) else {
                                     break;
                                 };

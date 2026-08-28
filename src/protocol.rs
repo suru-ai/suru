@@ -1433,7 +1433,8 @@ pub struct Prompt {
 pub struct Turn {
     pub id: TurnId,
     /// The Prompt whose delivery began this Turn, absent on a Turn no Prompt
-    /// began — today a Subagent Session's Turn, opened by its spawn.
+    /// began — a Continuation, or a Subagent Session's Turn opened by its
+    /// spawn.
     pub prompt_id: Option<PromptId>,
     pub agent: Option<AgentIdentity>,
     pub status: TurnStatus,
@@ -1443,6 +1444,17 @@ pub struct Turn {
     /// worked only when it knows.
     pub started_at: Option<SessionTimestamp>,
     pub settled_at: Option<SessionTimestamp>,
+}
+
+impl Turn {
+    /// Whether this Turn is a Continuation: the one kind of Turn that begins
+    /// without a Prompt. Named once here so every place that treats
+    /// Continuations apart — admission, the steer sweep — asks the same
+    /// question. A Subagent Session's Turn also carries no Prompt, but those
+    /// Sessions take no Prompts at all, so the question never arises there.
+    pub const fn is_continuation(&self) -> bool {
+        self.prompt_id.is_none()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

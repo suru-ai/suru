@@ -4721,6 +4721,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_settled_continuation_folds_to_a_marker_and_its_answer_like_any_turn() {
+        let mut first = vec![Entry::Message(user_message("run the tests"))];
+        first.extend(hidden_work());
+        first.push(Entry::Message(agent_message("All green.")));
+        let mut continuation = hidden_work();
+        continuation.push(Entry::Message(agent_message("Late findings.")));
+        let (mut snapshot, _) = turn_snapshot(vec![
+            (TurnStatus::Completed, first),
+            (TurnStatus::Completed, continuation),
+        ]);
+        // A Continuation is the one kind of Turn without a Prompt or an
+        // opening user Message; its entries still fold behind its marker.
+        snapshot.turns[1].prompt_id = None;
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(
+            rows,
+            [
+                "┃ run the tests",
+                "",
+                "  ✓ Worked",
+                "",
+                "  All green.",
+                "",
+                "  ✓ Worked",
+                "",
+                "  Late findings.",
+            ],
+            "a Continuation reads as marker and answer, with no user Message before it"
+        );
+    }
+
     /// Stamps every Turn in a snapshot as having begun and settled a span
     /// apart, so a Turn Fold test states the duration it is about rather than
     /// two wall-clock timestamps.
