@@ -4,7 +4,7 @@
 //! mappings between those native shapes and Suru's own protocol types. Modules above this one
 //! work in Suru terms and never touch raw JSON.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -230,6 +230,13 @@ impl From<NativeModel> for ModelDescriptor {
 }
 
 // Thread lifecycle.
+
+/// Codex cannot ask the user anything through Suru, so every thread — the
+/// Session's own and each attached collab child — starts pre-approved with the
+/// sandbox open. One declaration, so a policy change reaches every site that
+/// speaks for a thread.
+pub(super) const THREAD_APPROVAL_POLICY: &str = "never";
+pub(super) const THREAD_SANDBOX: &str = "danger-full-access";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -503,8 +510,87 @@ pub(super) enum NativeItem {
         #[serde(default)]
         summary: Vec<String>,
     },
+    /// A collab tool call the thread's agent made — the multi-agent suite's
+    /// spawns, waits, and closes. The completed item names the call's receiver
+    /// threads and Codex's latest view of each receiver's lifecycle.
+    #[serde(rename_all = "camelCase")]
+    CollabAgentToolCall {
+        tool: NativeCollabTool,
+        status: NativeCollabCallStatus,
+        #[serde(default)]
+        receiver_thread_ids: Vec<String>,
+        #[serde(default)]
+        prompt: Option<String>,
+        #[serde(default)]
+        agents_states: BTreeMap<String, NativeCollabAgentState>,
+    },
+    /// One step of a spawned agent's lifecycle, reported on its spawner's
+    /// thread — how Codex's newer multi-agent routing announces a child
+    /// thread beginning, being spoken to, and ending.
+    #[serde(rename_all = "camelCase")]
+    SubAgentActivity {
+        kind: NativeSubagentActivityKind,
+        agent_thread_id: String,
+        agent_path: String,
+    },
     #[serde(other)]
     Unknown,
+}
+
+/// The collab tools whose calls Suru reads something from; the rest of the
+/// suite decodes as [`NativeCollabTool::Other`] and is passed over.
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum NativeCollabTool {
+    SpawnAgent,
+    SendInput,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum NativeCollabCallStatus {
+    InProgress,
+    Completed,
+    Failed,
+    Interrupted,
+    /// A status this build does not know. Read as "not completed" rather than
+    /// failing the Session, because the wire grows freely.
+    #[serde(other)]
+    Other,
+}
+
+/// Codex's last known lifecycle state for one spawned agent, carried on the
+/// collab calls that observe it.
+#[derive(Clone, Deserialize)]
+pub(super) struct NativeCollabAgentState {
+    pub(super) status: NativeCollabAgentStatus,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum NativeCollabAgentStatus {
+    PendingInit,
+    Running,
+    Interrupted,
+    Completed,
+    Errored,
+    Shutdown,
+    NotFound,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum NativeSubagentActivityKind {
+    Started,
+    Interacted,
+    Interrupted,
+    Completed,
+    #[serde(other)]
+    Other,
 }
 
 /// One step of an item Codex is streaming: which item, and the text it added.
@@ -772,6 +858,28 @@ pub(super) enum NativeNotification {
         thread_id: String,
         turn_id: String,
         outcome: NativeTurnOutcome,
+    },
+    /// A collab tool call completing on `thread_id` — a spawn naming the child
+    /// threads it opened, or any later call carrying Codex's view of the
+    /// spawned agents' lifecycles. The call's own start says nothing Suru
+    /// presents, so only the completion is decoded.
+    CollabCallCompleted {
+        thread_id: String,
+        tool: NativeCollabTool,
+        status: NativeCollabCallStatus,
+        receiver_thread_ids: Vec<String>,
+        prompt: Option<String>,
+        agents_states: BTreeMap<String, NativeCollabAgentState>,
+    },
+    /// One step of a spawned agent's lifecycle, reported on the spawner
+    /// `thread_id`. The turn it rides under is deliberately not carried: a
+    /// child's completion may arrive after the spawner's turn completed, and
+    /// is expected then rather than stale.
+    SubagentActivity {
+        thread_id: String,
+        kind: NativeSubagentActivityKind,
+        agent_thread_id: String,
+        agent_path: String,
     },
 }
 

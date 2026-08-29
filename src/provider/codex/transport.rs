@@ -473,7 +473,11 @@ fn decode_notification(
                         item_id: id,
                     }))
                 }
-                NativeItem::Unknown => Ok(None),
+                // Collab calls and subagent activity read whole from the
+                // completed item, so their starts carry nothing further.
+                NativeItem::CollabAgentToolCall { .. }
+                | NativeItem::SubAgentActivity { .. }
+                | NativeItem::Unknown => Ok(None),
             }
         }
         "item/agentMessage/delta" => {
@@ -566,6 +570,30 @@ fn decode_notification(
                         summary,
                     }))
                 }
+                NativeItem::CollabAgentToolCall {
+                    tool,
+                    status,
+                    receiver_thread_ids,
+                    prompt,
+                    agents_states,
+                } => Ok(Some(NativeNotification::CollabCallCompleted {
+                    thread_id: params.thread_id,
+                    tool,
+                    status,
+                    receiver_thread_ids,
+                    prompt,
+                    agents_states,
+                })),
+                NativeItem::SubAgentActivity {
+                    kind,
+                    agent_thread_id,
+                    agent_path,
+                } => Ok(Some(NativeNotification::SubagentActivity {
+                    thread_id: params.thread_id,
+                    kind,
+                    agent_thread_id,
+                    agent_path,
+                })),
                 NativeItem::Unknown => Ok(None),
             }
         }

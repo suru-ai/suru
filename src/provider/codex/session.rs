@@ -22,13 +22,14 @@ use serde::{Deserialize, Serialize};
 use super::{
     DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
     codex_error, codex_error_context,
-    projection::{NativeCorrelation, provider_events},
+    projection::{ChildThreadAttachment, NativeCorrelation, provider_events},
     skills::CodexSkills,
     transport::{CodexConnection, JsonRpcTransport},
     wire::{
-        ModelListParams, NativeField, NativeModelList, ThreadConnectionResult, ThreadResumeParams,
-        ThreadStartParams, TurnInterruptParams, TurnStartParams, TurnStartResult, TurnSteerParams,
-        TurnSteerResult, lower_reasoning_summary, lower_turn_options,
+        ModelListParams, NativeField, NativeModelList, THREAD_APPROVAL_POLICY, THREAD_SANDBOX,
+        ThreadConnectionResult, ThreadResumeParams, ThreadStartParams, TurnInterruptParams,
+        TurnStartParams, TurnStartResult, TurnSteerParams, TurnSteerResult,
+        lower_reasoning_summary, lower_turn_options,
     },
 };
 use crate::{
@@ -329,8 +330,8 @@ async fn start_codex_thread(
                 &ThreadResumeParams {
                     thread_id: thread_id.as_str(),
                     cwd,
-                    approval_policy: "never",
-                    sandbox: "danger-full-access",
+                    approval_policy: THREAD_APPROVAL_POLICY,
+                    sandbox: THREAD_SANDBOX,
                 },
             )
             .await
@@ -342,8 +343,8 @@ async fn start_codex_thread(
                 "thread/start",
                 &ThreadStartParams {
                     cwd,
-                    approval_policy: "never",
-                    sandbox: "danger-full-access",
+                    approval_policy: THREAD_APPROVAL_POLICY,
+                    sandbox: THREAD_SANDBOX,
                     ephemeral: false,
                 },
             )
@@ -405,6 +406,10 @@ async fn start_codex_thread(
     )));
     let turn_start_changed = Arc::new(Notify::new());
     let skill_catalog_invalidations = context.skill_catalog_invalidations.clone();
+    let attachment = ChildThreadAttachment {
+        transport: transport.clone(),
+        cwd: cwd.to_owned(),
+    };
     let session = Arc::new(CodexSession {
         thread_id: started.thread.id,
         context,
@@ -419,6 +424,7 @@ async fn start_codex_thread(
         process,
         correlation,
         skill_catalog_invalidations,
+        attachment,
     );
     Ok(ProviderSessionConnection::new(
         AgentIdentity {

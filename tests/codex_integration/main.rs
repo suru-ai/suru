@@ -21,5 +21,6 @@ mod process;
 mod shutdown;
 mod skills;
 mod steering;
+mod subagents;
 mod support;
 mod turns;

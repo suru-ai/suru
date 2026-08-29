@@ -1,18 +1,24 @@
-//! Projection of Codex's native notifications onto Suru's Provider events.
+//! Projection of Codex's native notifications onto attributed Provider events.
 //!
 //! [`NativeCorrelation`] is the running state this projection needs: which native Turn is active
-//! and which Messages, commands, file changes, and native Reasoning items are still open within it.
-//! Notifications that belong to a Turn Suru is no longer tracking are dropped, notifications that
-//! contradict the recorded state fail the Session, and everything else becomes the Provider events
-//! a Session consumes.
+//! on the Session's own thread, the Messages, commands, file changes, and native Reasoning items
+//! each followed thread still has open, and the collab child threads the agent has spawned. A
+//! spawn item on a followed thread opens its child as a Subagent — the event pump then attaches
+//! the child thread so its own items stream over this connection too — and every item projects
+//! under the attribution of the thread that produced it, which is how a child's work lands in its
+//! Subagent's Session rather than the parent's Transcript, and how a child's own spawns recurse.
+//! Subagent lifecycle items are read regardless of the active Turn, because Codex documents a
+//! child's completion arriving after the parent turn's own (ADR 0015). Notifications that belong
+//! to no thread Suru follows are dropped, notifications that contradict the recorded state fail
+//! the Session, and everything else becomes the Provider events a Session consumes.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex as StdMutex},
 };
 
-use futures_util::{StreamExt as _, stream};
+use futures_util::stream;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -20,9 +26,12 @@ use super::super::shell_wrapper::strip_launcher_wrapper;
 use super::{
     DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
     codex_error,
+    transport::JsonRpcTransport,
     wire::{
+        NativeCollabAgentState, NativeCollabAgentStatus, NativeCollabCallStatus, NativeCollabTool,
         NativeCommandStatus, NativeField, NativeFileChange, NativeFileChangeStatus,
-        NativeNotification, NativeTurnFailureKind, NativeTurnOutcome,
+        NativeNotification, NativeSubagentActivityKind, NativeTurnFailureKind, NativeTurnOutcome,
+        THREAD_APPROVAL_POLICY, THREAD_SANDBOX, ThreadResumeParams,
     },
 };
 use crate::{
@@ -32,22 +41,52 @@ use crate::{
     },
     provider::{
         AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
-        ProviderEvent, ProviderEventStream, ProviderFileChangeStatus,
+        ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus,
+        ProviderSubagentId, ProviderSubagentStatus,
         harness::ProcessGuard,
         reasoning::{ReasoningSegment, ReasoningSummarySplitter},
     },
 };
 
-/// Everything the projection must remember between notifications for one Codex thread.
+/// What a Subagent's row calls the agent when Codex's wire names no kind for
+/// it, as on the collab shape whose spawn calls carry only a prompt.
+const GENERIC_SUBAGENT_NAME: &str = "Agent";
+
+/// Everything the projection must remember between notifications for one Codex connection.
 pub(super) struct NativeCorrelation {
     thread_id: String,
     turn_starting: bool,
     active_turn_id: Option<String>,
     active_selection: Option<AgentSelection>,
+    /// The streaming items open on the Session's own thread.
+    root: ThreadInFlight,
+    /// The spawned child threads Suru follows, by thread id — the identity
+    /// each one's Subagent is known by.
+    children: HashMap<String, AttachedChild>,
+    /// Child threads whose Subagents settled. A spawn item repeating one of
+    /// them re-opens nothing, because the settle already closed its Session.
+    settled_children: HashSet<String>,
+    /// Child threads spawned but not yet attached; the event pump drains this
+    /// and requests each thread's stream.
+    pending_attaches: Vec<String>,
+}
+
+/// The streaming items one followed thread has open.
+#[derive(Default)]
+struct ThreadInFlight {
     active_agent_message: Option<ActiveNativeAgentMessage>,
     active_commands: HashMap<String, ActiveNativeCommand>,
     active_file_changes: HashMap<String, ActiveNativeFileChange>,
     active_reasoning: HashMap<String, ActiveNativeReasoning>,
+}
+
+/// One spawned child thread Suru follows: the items it has open, and the
+/// description its row currently reads — kept so a collab call repeating it
+/// unchanged publishes nothing.
+#[derive(Default)]
+struct AttachedChild {
+    in_flight: ThreadInFlight,
+    description: String,
 }
 
 struct ActiveNativeAgentMessage {
@@ -110,10 +149,10 @@ impl NativeCorrelation {
             turn_starting: false,
             active_turn_id: None,
             active_selection: None,
-            active_agent_message: None,
-            active_commands: HashMap::new(),
-            active_file_changes: HashMap::new(),
-            active_reasoning: HashMap::new(),
+            root: ThreadInFlight::default(),
+            children: HashMap::new(),
+            settled_children: HashSet::new(),
+            pending_attaches: Vec::new(),
         }
     }
 
@@ -149,10 +188,7 @@ impl NativeCorrelation {
             Ok(turn_id) if self.active_turn_id.is_none() => {
                 self.active_turn_id = Some(turn_id);
                 self.active_selection = Some(selection);
-                self.active_agent_message = None;
-                self.active_commands.clear();
-                self.active_file_changes.clear();
-                self.active_reasoning.clear();
+                self.root = ThreadInFlight::default();
                 Ok(())
             }
             Ok(_) => Err(codex_error(
@@ -166,14 +202,168 @@ impl NativeCorrelation {
         self.thread_id == thread_id && self.active_turn_id.as_deref() == Some(turn_id)
     }
 
+    /// Settles the native Turn on the Session's own thread. The children
+    /// deliberately survive: a Subagent may outlive the Turn that spawned it
+    /// (ADR 0015), and its thread keeps streaming until its own settle.
     fn settle_turn(&mut self) {
         self.active_turn_id = None;
         self.active_selection = None;
-        self.active_agent_message = None;
-        self.active_commands.clear();
-        self.active_file_changes.clear();
-        self.active_reasoning.clear();
+        self.root = ThreadInFlight::default();
     }
+
+    /// The child threads spawned since last drained, for the pump to attach.
+    pub(super) fn take_pending_attaches(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_attaches)
+    }
+
+    /// The thread one streamed item's step lands in, with the attribution its
+    /// events carry: the Session's own thread while the turn the step names is
+    /// the active one, or a followed child thread under its Subagent's
+    /// identity. A child's steps are not gated on its turn ids, because the
+    /// child's whole run is one Subagent's stream however many native turns
+    /// Codex runs it as. Anything else has nowhere to land and is dropped.
+    fn item_thread(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Option<(&mut ThreadInFlight, ProviderEventAttribution)> {
+        if self.thread_id == thread_id {
+            if self.active_turn_id.as_deref() == Some(turn_id) {
+                return Some((&mut self.root, ProviderEventAttribution::OwningSession));
+            }
+            return None;
+        }
+        self.children.get_mut(thread_id).map(|child| {
+            (
+                &mut child.in_flight,
+                ProviderEventAttribution::Subagent(ProviderSubagentId::new(thread_id)),
+            )
+        })
+    }
+
+    /// The attribution a Subagent lifecycle item on `thread_id` rides under,
+    /// if that is a thread Suru follows. Deliberately not gated on the active
+    /// Turn: the lifecycle speaks for threads rather than turns, and a child's
+    /// completion may arrive after the turn that spawned it completed.
+    fn spawner_attribution(&self, thread_id: &str) -> Option<ProviderEventAttribution> {
+        if self.thread_id == thread_id {
+            Some(ProviderEventAttribution::OwningSession)
+        } else if self.children.contains_key(thread_id) {
+            Some(ProviderEventAttribution::Subagent(ProviderSubagentId::new(
+                thread_id,
+            )))
+        } else {
+            None
+        }
+    }
+
+    /// Opens one spawned child thread as a Subagent: follows the thread,
+    /// queues its attach, and announces the spawn in the conversation that ran
+    /// it — which is what decides the Session its child hangs under, and how a
+    /// child's own spawns recurse one level down. A spawn repeating a thread
+    /// already followed or already settled opens nothing.
+    fn spawn_child(
+        &mut self,
+        spawner: ProviderEventAttribution,
+        child_thread_id: String,
+        name: String,
+        description: String,
+    ) -> Vec<AttributedProviderEvent> {
+        if child_thread_id == self.thread_id
+            || self.children.contains_key(&child_thread_id)
+            || self.settled_children.contains(&child_thread_id)
+        {
+            return Vec::new();
+        }
+        self.children.insert(
+            child_thread_id.clone(),
+            AttachedChild {
+                in_flight: ThreadInFlight::default(),
+                description: description.clone(),
+            },
+        );
+        self.pending_attaches.push(child_thread_id.clone());
+        vec![AttributedProviderEvent {
+            attribution: spawner,
+            event: ProviderEvent::SubagentStarted {
+                subagent_id: ProviderSubagentId::new(child_thread_id),
+                name,
+                description,
+            },
+        }]
+    }
+
+    /// Revises what a followed child's row says it is doing. Threads not
+    /// followed, and calls repeating the description unchanged, publish
+    /// nothing.
+    fn revise_child_description(
+        &mut self,
+        child_thread_id: &str,
+        description: &str,
+    ) -> Vec<AttributedProviderEvent> {
+        let Some(child) = self.children.get_mut(child_thread_id) else {
+            return Vec::new();
+        };
+        if child.description == description {
+            return Vec::new();
+        }
+        child.description = description.to_owned();
+        vec![AttributedProviderEvent {
+            attribution: ProviderEventAttribution::OwningSession,
+            event: ProviderEvent::SubagentUpdated {
+                subagent_id: ProviderSubagentId::new(child_thread_id),
+                description: description.to_owned(),
+            },
+        }]
+    }
+
+    /// Settles one Subagent, dropping its thread from the followed set: the
+    /// settle closes the row and the child Session together, and nothing more
+    /// of the thread's can land after it. Like the spawn's counterparts on the
+    /// other Providers, the settle addresses the row by the Subagent's own
+    /// identity and rides the owning conversation, so a nested Subagent's
+    /// settle still lands after its spawner's own — order the wire does not
+    /// promise.
+    fn settle_child(
+        &mut self,
+        child_thread_id: &str,
+        status: ProviderSubagentStatus,
+    ) -> Vec<AttributedProviderEvent> {
+        if self.children.remove(child_thread_id).is_none() {
+            return Vec::new();
+        }
+        self.settled_children.insert(child_thread_id.to_owned());
+        vec![AttributedProviderEvent {
+            attribution: ProviderEventAttribution::OwningSession,
+            event: ProviderEvent::SubagentCompleted {
+                subagent_id: ProviderSubagentId::new(child_thread_id),
+                status,
+            },
+        }]
+    }
+}
+
+/// One thread's item-step events, each attributed to that thread's Session.
+fn attributed(
+    attribution: &ProviderEventAttribution,
+    events: Vec<ProviderEvent>,
+) -> Vec<AttributedProviderEvent> {
+    events
+        .into_iter()
+        .map(|event| AttributedProviderEvent {
+            attribution: attribution.clone(),
+            event,
+        })
+        .collect()
+}
+
+/// The events of the Session's own conversation, which every non-item
+/// notification speaks for.
+fn owning(events: Vec<ProviderEvent>) -> Vec<AttributedProviderEvent> {
+    events
+        .into_iter()
+        .map(AttributedProviderEvent::from)
+        .collect()
 }
 
 /// Streams the Provider events projected from `notifications`, holding the process open meanwhile.
@@ -182,20 +372,53 @@ pub(super) fn provider_events(
     process: Arc<ProcessGuard>,
     correlation: Arc<StdMutex<NativeCorrelation>>,
     skill_catalog_invalidations: tokio::sync::watch::Sender<u64>,
+    attachment: ChildThreadAttachment,
 ) -> ProviderEventStream {
-    Box::pin(
-        stream::unfold(
-            GuardedEventReceiver {
-                receiver: notifications,
-                _process: process,
-                correlation,
-                skill_catalog_invalidations,
-                pending: VecDeque::new(),
-            },
-            next_provider_event,
-        )
-        .map(|event| event.map(AttributedProviderEvent::from)),
-    )
+    Box::pin(stream::unfold(
+        GuardedEventReceiver {
+            receiver: notifications,
+            _process: process,
+            correlation,
+            skill_catalog_invalidations,
+            attachment,
+            pending: VecDeque::new(),
+        },
+        next_provider_event,
+    ))
+}
+
+/// What the event pump needs to attach a spawned child thread: the transport
+/// the Session speaks over, and the working directory its threads run under.
+pub(super) struct ChildThreadAttachment {
+    pub(super) transport: JsonRpcTransport,
+    pub(super) cwd: String,
+}
+
+impl ChildThreadAttachment {
+    /// Requests the child thread's stream, so its items reach this connection.
+    /// The resumed thread's own lineage — the parent it declares — is not
+    /// re-checked: the spawn item on the parent's stream already named the
+    /// relationship, and it is the spawner's account Suru follows.
+    /// Fire-and-forget: a child Codex will not hand over leaves its Subagent's
+    /// Session sparse — settled by the lifecycle items the spawner's thread
+    /// still carries — rather than failing the parent's.
+    fn attach(&self, thread_id: String) {
+        let transport = self.transport.clone();
+        let cwd = self.cwd.clone();
+        tokio::spawn(async move {
+            let _ = transport
+                .request(
+                    "thread/resume",
+                    &ThreadResumeParams {
+                        thread_id: &thread_id,
+                        cwd: &cwd,
+                        approval_policy: THREAD_APPROVAL_POLICY,
+                        sandbox: THREAD_SANDBOX,
+                    },
+                )
+                .await;
+        });
+    }
 }
 
 struct GuardedEventReceiver {
@@ -203,12 +426,16 @@ struct GuardedEventReceiver {
     _process: Arc<ProcessGuard>,
     correlation: Arc<StdMutex<NativeCorrelation>>,
     skill_catalog_invalidations: tokio::sync::watch::Sender<u64>,
-    pending: VecDeque<Result<ProviderEvent, ProviderError>>,
+    attachment: ChildThreadAttachment,
+    pending: VecDeque<Result<AttributedProviderEvent, ProviderError>>,
 }
 
 async fn next_provider_event(
     mut events: GuardedEventReceiver,
-) -> Option<(Result<ProviderEvent, ProviderError>, GuardedEventReceiver)> {
+) -> Option<(
+    Result<AttributedProviderEvent, ProviderError>,
+    GuardedEventReceiver,
+)> {
     loop {
         if let Some(event) = events.pending.pop_front() {
             return Some((event, events));
@@ -225,13 +452,17 @@ async fn next_provider_event(
                         });
                     continue;
                 }
-                let projected = {
+                let (projected, attaches) = {
                     let mut correlation = events
                         .correlation
                         .lock()
                         .expect("Codex native correlation lock is not poisoned");
-                    project_native_notification(&mut correlation, native)
+                    let projected = project_native_notification(&mut correlation, native);
+                    (projected, correlation.take_pending_attaches())
                 };
+                for thread_id in attaches {
+                    events.attachment.attach(thread_id);
+                }
                 match projected {
                     Ok(projected) => events.pending.extend(projected.into_iter().map(Ok)),
                     Err(error) => events.pending.push_back(Err(error)),
@@ -244,7 +475,7 @@ async fn next_provider_event(
 fn project_native_notification(
     correlation: &mut NativeCorrelation,
     notification: NativeNotification,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
     match notification {
         NativeNotification::SkillsChanged => Ok(Vec::new()),
         NativeNotification::AgentSelectionChanged {
@@ -252,7 +483,8 @@ fn project_native_notification(
             model,
             effort,
             service_tier,
-        } => project_agent_selection_changed(correlation, &thread_id, model, effort, service_tier),
+        } => project_agent_selection_changed(correlation, &thread_id, model, effort, service_tier)
+            .map(owning),
         NativeNotification::AgentMessageStarted {
             thread_id,
             turn_id,
@@ -378,8 +610,136 @@ fn project_native_notification(
             thread_id,
             turn_id,
             outcome,
-        } => project_turn_completed(correlation, &thread_id, &turn_id, outcome),
+        } => project_turn_completed(correlation, &thread_id, &turn_id, outcome).map(owning),
+        NativeNotification::CollabCallCompleted {
+            thread_id,
+            tool,
+            status,
+            receiver_thread_ids,
+            prompt,
+            agents_states,
+        } => Ok(project_collab_call_completed(
+            correlation,
+            &thread_id,
+            tool,
+            status,
+            receiver_thread_ids,
+            prompt,
+            agents_states,
+        )),
+        NativeNotification::SubagentActivity {
+            thread_id,
+            kind,
+            agent_thread_id,
+            agent_path,
+        } => Ok(project_subagent_activity(
+            correlation,
+            &thread_id,
+            kind,
+            agent_thread_id,
+            &agent_path,
+        )),
     }
+}
+
+/// One step of a spawned agent's lifecycle, as the spawner's thread reports
+/// it: a start opens the agent's thread as a Subagent, and the terminal kinds
+/// settle it. Interactions revise nothing the row shows.
+fn project_subagent_activity(
+    correlation: &mut NativeCorrelation,
+    thread_id: &str,
+    kind: NativeSubagentActivityKind,
+    agent_thread_id: String,
+    agent_path: &str,
+) -> Vec<AttributedProviderEvent> {
+    let Some(spawner) = correlation.spawner_attribution(thread_id) else {
+        return Vec::new();
+    };
+    match kind {
+        NativeSubagentActivityKind::Started => correlation.spawn_child(
+            spawner,
+            agent_thread_id,
+            subagent_name_from_path(agent_path),
+            String::new(),
+        ),
+        NativeSubagentActivityKind::Completed => {
+            correlation.settle_child(&agent_thread_id, ProviderSubagentStatus::Completed)
+        }
+        NativeSubagentActivityKind::Interrupted => {
+            correlation.settle_child(&agent_thread_id, ProviderSubagentStatus::Failed)
+        }
+        NativeSubagentActivityKind::Interacted | NativeSubagentActivityKind::Other => Vec::new(),
+    }
+}
+
+/// A collab tool call completing on a followed thread. A completed spawn opens
+/// its receiver threads as Subagents, described by the prompt the call handed
+/// them; a completed send revises what its receivers' rows say they are doing;
+/// and whatever the call was, the terminal lifecycle states it observed settle
+/// the Subagents they name — which is how a wait learns of a child finishing.
+fn project_collab_call_completed(
+    correlation: &mut NativeCorrelation,
+    thread_id: &str,
+    tool: NativeCollabTool,
+    status: NativeCollabCallStatus,
+    receiver_thread_ids: Vec<String>,
+    prompt: Option<String>,
+    agents_states: BTreeMap<String, NativeCollabAgentState>,
+) -> Vec<AttributedProviderEvent> {
+    let Some(spawner) = correlation.spawner_attribution(thread_id) else {
+        return Vec::new();
+    };
+    let mut projected = Vec::new();
+    if status == NativeCollabCallStatus::Completed {
+        match tool {
+            NativeCollabTool::SpawnAgent => {
+                let description = prompt.clone().unwrap_or_default();
+                for receiver in &receiver_thread_ids {
+                    projected.extend(correlation.spawn_child(
+                        spawner.clone(),
+                        receiver.clone(),
+                        GENERIC_SUBAGENT_NAME.to_owned(),
+                        description.clone(),
+                    ));
+                }
+            }
+            NativeCollabTool::SendInput => {
+                if let Some(prompt) = prompt.as_ref().filter(|prompt| !prompt.is_empty()) {
+                    for receiver in &receiver_thread_ids {
+                        projected.extend(correlation.revise_child_description(receiver, prompt));
+                    }
+                }
+            }
+            NativeCollabTool::Other => {}
+        }
+    }
+    for (child_thread_id, state) in &agents_states {
+        let settled = match state.status {
+            NativeCollabAgentStatus::Completed | NativeCollabAgentStatus::Shutdown => {
+                ProviderSubagentStatus::Completed
+            }
+            NativeCollabAgentStatus::Errored
+            | NativeCollabAgentStatus::Interrupted
+            | NativeCollabAgentStatus::NotFound => ProviderSubagentStatus::Failed,
+            NativeCollabAgentStatus::PendingInit
+            | NativeCollabAgentStatus::Running
+            | NativeCollabAgentStatus::Other => continue,
+        };
+        projected.extend(correlation.settle_child(child_thread_id, settled));
+    }
+    projected
+}
+
+/// The Subagent's name off Codex's agent path — the path's last segment, the
+/// way `/root/auditor` names an auditor. The path is Codex's own logical
+/// agent-tree address with a wire-defined `/` separator, not a filesystem
+/// path, so splitting on `/` holds on every platform.
+fn subagent_name_from_path(agent_path: &str) -> String {
+    agent_path
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(GENERIC_SUBAGENT_NAME)
+        .to_owned()
 }
 
 fn project_reasoning_started(
@@ -387,21 +747,24 @@ fn project_reasoning_started(
     thread_id: &str,
     turn_id: &str,
     item_id: String,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    if !correlation.is_active_turn(thread_id, turn_id) {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Ok(Vec::new());
-    }
-    if correlation.active_reasoning.contains_key(&item_id) {
+    };
+    if thread.active_reasoning.contains_key(&item_id) {
         return Err(codex_error(
             "Codex reused an active Reasoning item identity",
         ));
     }
-    correlation
+    thread
         .active_reasoning
         .insert(item_id.clone(), ActiveNativeReasoning::new());
-    Ok(vec![ProviderEvent::ReasoningStarted {
-        activity_id: reasoning_section_activity_id(&item_id, 0),
-    }])
+    Ok(attributed(
+        &attribution,
+        vec![ProviderEvent::ReasoningStarted {
+            activity_id: reasoning_section_activity_id(&item_id, 0),
+        }],
+    ))
 }
 
 fn project_reasoning_delta(
@@ -411,22 +774,22 @@ fn project_reasoning_delta(
     item_id: String,
     delta: &str,
     summary_index: usize,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    if !correlation.is_active_turn(thread_id, turn_id) {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Ok(Vec::new());
-    }
-    let Some(reasoning) = correlation.active_reasoning.get_mut(&item_id) else {
+    };
+    let Some(reasoning) = thread.active_reasoning.get_mut(&item_id) else {
         return Ok(Vec::new());
     };
     let mut projected = open_reasoning_section(&item_id, reasoning, summary_index);
     if summary_index < reasoning.open_section {
         // The block this section streamed into settled when Codex moved past
         // it, and a settled block takes no more content.
-        return Ok(projected);
+        return Ok(attributed(&attribution, projected));
     }
     let segment = reasoning.push_delta(delta);
     projected.extend(reasoning_segment_events(&item_id, summary_index, segment));
-    Ok(projected)
+    Ok(attributed(&attribution, projected))
 }
 
 /// Projects the break between two Reasoning summary sections as the settling of
@@ -442,14 +805,17 @@ fn project_reasoning_section_break(
     turn_id: &str,
     item_id: String,
     summary_index: usize,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    if !correlation.is_active_turn(thread_id, turn_id) {
-        return Ok(Vec::new());
-    }
-    let Some(reasoning) = correlation.active_reasoning.get_mut(&item_id) else {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Ok(Vec::new());
     };
-    Ok(open_reasoning_section(&item_id, reasoning, summary_index))
+    let Some(reasoning) = thread.active_reasoning.get_mut(&item_id) else {
+        return Ok(Vec::new());
+    };
+    Ok(attributed(
+        &attribution,
+        open_reasoning_section(&item_id, reasoning, summary_index),
+    ))
 }
 
 /// Moves the item on to the summary section Codex is reporting on, settling the
@@ -480,15 +846,15 @@ fn project_reasoning_completed(
     turn_id: &str,
     item_id: String,
     summary: Vec<String>,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    if !correlation.is_active_turn(thread_id, turn_id) {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Ok(Vec::new());
-    }
+    };
     // Reasoning is the account of the work rather than the work, so nothing
     // about it fails a Turn: losing the Turn over a Reasoning summary would cost
     // the reader the answer it led to. A completion for a block Suru never saw
     // start has nowhere to land, and is dropped the way a stray delta is.
-    let Some(mut reasoning) = correlation.active_reasoning.remove(&item_id) else {
+    let Some(mut reasoning) = thread.active_reasoning.remove(&item_id) else {
         return Ok(Vec::new());
     };
     // Codex repeats every section of the summary here, and only streams them
@@ -530,7 +896,7 @@ fn project_reasoning_completed(
         ));
         projected.extend(settle_reasoning_section(&item_id, section, &mut splitter));
     }
-    Ok(projected)
+    Ok(attributed(&attribution, projected))
 }
 
 /// Names the Activity one summary section of a Reasoning item projects onto.
@@ -627,20 +993,23 @@ fn project_agent_message_started(
     thread_id: &str,
     turn_id: &str,
     item_id: String,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    if !correlation.is_active_turn(thread_id, turn_id) {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Ok(Vec::new());
-    }
-    if correlation.active_agent_message.is_some() {
+    };
+    if thread.active_agent_message.is_some() {
         return Err(codex_error(
             "Codex started a second Agent Message before completing the first",
         ));
     }
-    correlation.active_agent_message = Some(ActiveNativeAgentMessage {
+    thread.active_agent_message = Some(ActiveNativeAgentMessage {
         item_id,
         streamed_text: String::new(),
     });
-    Ok(vec![ProviderEvent::AgentMessageStarted])
+    Ok(attributed(
+        &attribution,
+        vec![ProviderEvent::AgentMessageStarted],
+    ))
 }
 
 fn project_agent_message_delta(
@@ -649,11 +1018,11 @@ fn project_agent_message_delta(
     turn_id: &str,
     item_id: &str,
     delta: String,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    if !correlation.is_active_turn(thread_id, turn_id) {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Ok(Vec::new());
-    }
-    let Some(message) = correlation.active_agent_message.as_mut() else {
+    };
+    let Some(message) = thread.active_agent_message.as_mut() else {
         return Err(codex_error(
             "Codex sent Agent Message content before starting the Message",
         ));
@@ -662,7 +1031,10 @@ fn project_agent_message_delta(
         return Ok(Vec::new());
     }
     message.streamed_text.push_str(&delta);
-    Ok(vec![ProviderEvent::AgentMessageDelta { content: delta }])
+    Ok(attributed(
+        &attribution,
+        vec![ProviderEvent::AgentMessageDelta { content: delta }],
+    ))
 }
 
 fn project_agent_message_completed(
@@ -671,11 +1043,11 @@ fn project_agent_message_completed(
     turn_id: &str,
     item_id: &str,
     text: &str,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    if !correlation.is_active_turn(thread_id, turn_id) {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Ok(Vec::new());
-    }
-    let Some(message) = correlation.active_agent_message.as_ref() else {
+    };
+    let Some(message) = thread.active_agent_message.as_ref() else {
         return Err(codex_error(
             "Codex completed an Agent Message before starting it",
         ));
@@ -695,8 +1067,8 @@ fn project_agent_message_completed(
         });
     }
     projected.push(ProviderEvent::AgentMessageCompleted);
-    correlation.active_agent_message = None;
-    Ok(projected)
+    thread.active_agent_message = None;
+    Ok(attributed(&attribution, projected))
 }
 
 fn project_command_started(
@@ -707,29 +1079,32 @@ fn project_command_started(
     command: String,
     cwd: Option<PathBuf>,
     status: NativeCommandStatus,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    if !correlation.is_active_turn(thread_id, turn_id) {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Ok(Vec::new());
-    }
+    };
     if !matches!(status, NativeCommandStatus::InProgress) {
         return Err(codex_error(
             "Codex started a command outside its active state",
         ));
     }
-    if correlation.active_commands.contains_key(&item_id) {
+    if thread.active_commands.contains_key(&item_id) {
         return Err(codex_error("Codex reused an active command item identity"));
     }
-    correlation.active_commands.insert(
+    thread.active_commands.insert(
         item_id.clone(),
         ActiveNativeCommand {
             streamed_output: String::new(),
         },
     );
-    Ok(vec![ProviderEvent::CommandStarted {
-        activity_id: ProviderActivityId::new(item_id),
-        command: strip_launcher_wrapper(command),
-        cwd,
-    }])
+    Ok(attributed(
+        &attribution,
+        vec![ProviderEvent::CommandStarted {
+            activity_id: ProviderActivityId::new(item_id),
+            command: strip_launcher_wrapper(command),
+            cwd,
+        }],
+    ))
 }
 
 fn project_command_output_delta(
@@ -738,18 +1113,21 @@ fn project_command_output_delta(
     turn_id: &str,
     item_id: String,
     delta: String,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    if !correlation.is_active_turn(thread_id, turn_id) {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Ok(Vec::new());
-    }
-    let Some(command) = correlation.active_commands.get_mut(&item_id) else {
+    };
+    let Some(command) = thread.active_commands.get_mut(&item_id) else {
         return Ok(Vec::new());
     };
     command.streamed_output.push_str(&delta);
-    Ok(vec![ProviderEvent::CommandOutputDelta {
-        activity_id: ProviderActivityId::new(item_id),
-        content: delta,
-    }])
+    Ok(attributed(
+        &attribution,
+        vec![ProviderEvent::CommandOutputDelta {
+            activity_id: ProviderActivityId::new(item_id),
+            content: delta,
+        }],
+    ))
 }
 
 fn project_command_completed(
@@ -760,11 +1138,11 @@ fn project_command_completed(
     aggregated_output: Option<String>,
     exit_status: Option<i32>,
     status: NativeCommandStatus,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    if !correlation.is_active_turn(thread_id, turn_id) {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Ok(Vec::new());
-    }
-    let Some(command) = correlation.active_commands.get(&item_id) else {
+    };
+    let Some(command) = thread.active_commands.get(&item_id) else {
         return Err(codex_error(
             "Codex completed a command before starting the Activity",
         ));
@@ -789,7 +1167,7 @@ fn project_command_completed(
             ));
         }
     };
-    correlation.active_commands.remove(&item_id);
+    thread.active_commands.remove(&item_id);
     let activity_id = ProviderActivityId::new(item_id);
     let mut projected = Vec::with_capacity(if remaining.is_empty() { 1 } else { 2 });
     if !remaining.is_empty() {
@@ -803,7 +1181,7 @@ fn project_command_completed(
         status,
         exit_status,
     });
-    Ok(projected)
+    Ok(attributed(&attribution, projected))
 }
 
 fn project_file_change_started(
@@ -813,17 +1191,17 @@ fn project_file_change_started(
     item_id: String,
     changes: Vec<NativeFileChange>,
     status: NativeFileChangeStatus,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    if !correlation.is_active_turn(thread_id, turn_id) {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Ok(Vec::new());
-    }
+    };
     if !matches!(status, NativeFileChangeStatus::InProgress) {
         return Err(codex_error(
             "Codex started file changes outside their active state",
         ));
     }
-    if correlation.active_commands.contains_key(&item_id)
-        || correlation.active_file_changes.contains_key(&item_id)
+    if thread.active_commands.contains_key(&item_id)
+        || thread.active_file_changes.contains_key(&item_id)
     {
         return Err(codex_error(
             "Codex reused an active file-change item identity",
@@ -833,16 +1211,19 @@ fn project_file_change_started(
         .into_iter()
         .map(FileChange::from)
         .collect::<Vec<_>>();
-    correlation.active_file_changes.insert(
+    thread.active_file_changes.insert(
         item_id.clone(),
         ActiveNativeFileChange {
             changes: changes.clone(),
         },
     );
-    Ok(vec![ProviderEvent::FileChangeStarted {
-        activity_id: ProviderActivityId::new(item_id),
-        changes,
-    }])
+    Ok(attributed(
+        &attribution,
+        vec![ProviderEvent::FileChangeStarted {
+            activity_id: ProviderActivityId::new(item_id),
+            changes,
+        }],
+    ))
 }
 
 fn project_file_change_updated(
@@ -851,11 +1232,11 @@ fn project_file_change_updated(
     turn_id: &str,
     item_id: String,
     changes: Vec<NativeFileChange>,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    if !correlation.is_active_turn(thread_id, turn_id) {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Ok(Vec::new());
-    }
-    let Some(file_change) = correlation.active_file_changes.get_mut(&item_id) else {
+    };
+    let Some(file_change) = thread.active_file_changes.get_mut(&item_id) else {
         return Ok(Vec::new());
     };
     let changes = changes
@@ -863,10 +1244,13 @@ fn project_file_change_updated(
         .map(FileChange::from)
         .collect::<Vec<_>>();
     file_change.changes.clone_from(&changes);
-    Ok(vec![ProviderEvent::FileChangeUpdated {
-        activity_id: ProviderActivityId::new(item_id),
-        changes,
-    }])
+    Ok(attributed(
+        &attribution,
+        vec![ProviderEvent::FileChangeUpdated {
+            activity_id: ProviderActivityId::new(item_id),
+            changes,
+        }],
+    ))
 }
 
 fn project_file_change_completed(
@@ -876,11 +1260,11 @@ fn project_file_change_completed(
     item_id: String,
     changes: Vec<NativeFileChange>,
     status: NativeFileChangeStatus,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    if !correlation.is_active_turn(thread_id, turn_id) {
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Ok(Vec::new());
-    }
-    let Some(file_change) = correlation.active_file_changes.get(&item_id) else {
+    };
+    let Some(file_change) = thread.active_file_changes.get(&item_id) else {
         return Err(codex_error(
             "Codex completed file changes before starting the Activity",
         ));
@@ -901,7 +1285,7 @@ fn project_file_change_completed(
             ));
         }
     };
-    correlation.active_file_changes.remove(&item_id);
+    thread.active_file_changes.remove(&item_id);
     let activity_id = ProviderActivityId::new(item_id);
     let mut projected = Vec::with_capacity(if changes_changed { 2 } else { 1 });
     if changes_changed {
@@ -914,7 +1298,7 @@ fn project_file_change_completed(
         activity_id,
         status,
     });
-    Ok(projected)
+    Ok(attributed(&attribution, projected))
 }
 
 fn project_turn_completed(
@@ -1063,10 +1447,12 @@ mod tests {
         ModelOptionValue, ProviderId,
     };
 
+    use crate::provider::{AttributedProviderEvent, ProviderSubagentId, ProviderSubagentStatus};
+
     use super::{
-        NativeCommandStatus, NativeCorrelation, NativeNotification, NativeTurnFailureKind,
-        ProviderActivityId, ProviderEvent, is_native_selection_rejection,
-        project_native_notification,
+        NativeCommandStatus, NativeCorrelation, NativeNotification, NativeSubagentActivityKind,
+        NativeTurnFailureKind, ProviderActivityId, ProviderEvent, ProviderEventAttribution,
+        is_native_selection_rejection, project_native_notification,
     };
 
     const THREAD: &str = "thread-fixture";
@@ -1093,7 +1479,18 @@ mod tests {
         correlation: &mut NativeCorrelation,
         notification: NativeNotification,
     ) -> Vec<ProviderEvent> {
-        project_native_notification(correlation, notification).expect("project the notification")
+        project_native_notification(correlation, notification)
+            .expect("project the notification")
+            .into_iter()
+            .map(|attributed| {
+                assert_eq!(
+                    attributed.attribution,
+                    ProviderEventAttribution::OwningSession,
+                    "the root turn's events ride the owning Session"
+                );
+                attributed.event
+            })
+            .collect()
     }
 
     fn started() -> NativeNotification {
@@ -1475,6 +1872,129 @@ mod tests {
             ),
             Vec::new()
         );
+    }
+
+    const CHILD_THREAD: &str = "child-thread-fixture";
+
+    fn child_activity(kind: NativeSubagentActivityKind) -> NativeNotification {
+        NativeNotification::SubagentActivity {
+            thread_id: THREAD.to_owned(),
+            kind,
+            agent_thread_id: CHILD_THREAD.to_owned(),
+            agent_path: "/root/scout".to_owned(),
+        }
+    }
+
+    fn project_attributed(
+        correlation: &mut NativeCorrelation,
+        notification: NativeNotification,
+    ) -> Vec<AttributedProviderEvent> {
+        project_native_notification(correlation, notification).expect("project the notification")
+    }
+
+    #[test]
+    fn a_spawned_childs_items_ride_its_subagent_attribution_whatever_turn_they_name() {
+        let mut correlation = reasoning_turn();
+
+        let spawned = project_attributed(
+            &mut correlation,
+            child_activity(NativeSubagentActivityKind::Started),
+        );
+        assert_eq!(
+            spawned,
+            vec![AttributedProviderEvent {
+                attribution: ProviderEventAttribution::OwningSession,
+                event: ProviderEvent::SubagentStarted {
+                    subagent_id: ProviderSubagentId::new(CHILD_THREAD),
+                    name: "scout".to_owned(),
+                    description: String::new(),
+                },
+            }],
+            "the spawn rides the spawning conversation, named off the agent path"
+        );
+        assert_eq!(
+            correlation.take_pending_attaches(),
+            [CHILD_THREAD],
+            "the spawn queues the child thread for attachment"
+        );
+
+        // The child's items land under its Subagent whatever turn ids the
+        // child's own native turns carry.
+        let child_message = project_attributed(
+            &mut correlation,
+            NativeNotification::AgentMessageStarted {
+                thread_id: CHILD_THREAD.to_owned(),
+                turn_id: "a-turn-suru-never-heard-of".to_owned(),
+                item_id: ITEM.to_owned(),
+            },
+        );
+        assert_eq!(
+            child_message,
+            vec![AttributedProviderEvent {
+                attribution: ProviderEventAttribution::Subagent(ProviderSubagentId::new(
+                    CHILD_THREAD
+                )),
+                event: ProviderEvent::AgentMessageStarted,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_spawn_repeating_a_settled_child_reopens_nothing() {
+        let mut correlation = reasoning_turn();
+        project_attributed(
+            &mut correlation,
+            child_activity(NativeSubagentActivityKind::Started),
+        );
+
+        let settled = project_attributed(
+            &mut correlation,
+            child_activity(NativeSubagentActivityKind::Completed),
+        );
+        assert_eq!(
+            settled,
+            vec![AttributedProviderEvent {
+                attribution: ProviderEventAttribution::OwningSession,
+                event: ProviderEvent::SubagentCompleted {
+                    subagent_id: ProviderSubagentId::new(CHILD_THREAD),
+                    status: ProviderSubagentStatus::Completed,
+                },
+            }]
+        );
+
+        correlation.take_pending_attaches();
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                child_activity(NativeSubagentActivityKind::Started),
+            ),
+            Vec::new(),
+            "the settle already closed the child's Session"
+        );
+        assert_eq!(
+            correlation.take_pending_attaches(),
+            Vec::<String>::new(),
+            "a spawn that opens nothing attaches nothing"
+        );
+    }
+
+    #[test]
+    fn lifecycle_items_on_a_thread_suru_does_not_follow_are_dropped() {
+        let mut correlation = reasoning_turn();
+
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                NativeNotification::SubagentActivity {
+                    thread_id: "thread-elsewhere".to_owned(),
+                    kind: NativeSubagentActivityKind::Started,
+                    agent_thread_id: CHILD_THREAD.to_owned(),
+                    agent_path: "/root/scout".to_owned(),
+                },
+            ),
+            Vec::new()
+        );
+        assert_eq!(correlation.take_pending_attaches(), Vec::<String>::new());
     }
 
     #[test]
