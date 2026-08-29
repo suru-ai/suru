@@ -29,7 +29,8 @@ use crate::{
     errands::ErrandRunner,
     model_catalog::ModelCatalogService,
     protocol::{
-        AgentSelection, ProviderId, SessionCatalogChange, SessionId, SettingsSnapshot, TitleErrand,
+        AgentSelection, Prompt, ProviderId, SessionCatalogChange, SessionId, SettingsSnapshot,
+        SkillInvocation, TitleErrand,
     },
     provider::ProviderErrand,
 };
@@ -145,7 +146,7 @@ impl TitleDerivation {
         session_id: SessionId,
         workspace: std::path::PathBuf,
         provider: Option<ProviderId>,
-        prompt: &str,
+        prompt: &Prompt,
     ) {
         let Some(errand_at) = self.errand_at(session_id, provider) else {
             return;
@@ -155,7 +156,7 @@ impl TitleDerivation {
         let Some(derived_from) = self.sessions.title(session_id) else {
             return;
         };
-        let prompt = errand_prompt(prompt);
+        let prompt = errand_prompt(&prompt.text, &prompt.skill_invocations);
         let errands = self.errands.clone();
         let models = self.models.clone();
         let sessions = self.sessions.clone();
@@ -290,7 +291,22 @@ impl SessionStore {
 
 /// The Prompt one Title Errand carries: what to write, and the first Prompt to
 /// write it about.
-fn errand_prompt(prompt: &str) -> String {
+fn errand_prompt(prompt: &str, skill_invocations: &[SkillInvocation]) -> String {
+    let mut prompt = prompt.to_owned();
+    let mut marker_starts = skill_invocations
+        .iter()
+        .map(|invocation| invocation.marker.start as usize)
+        .filter(|start| prompt.as_bytes().get(*start) == Some(&b'$'))
+        .collect::<Vec<_>>();
+    marker_starts.sort_unstable();
+    marker_starts.dedup();
+    for start in marker_starts.into_iter().rev() {
+        // Admission already proved this byte begins a bound `$skill-name`.
+        // Removing only its sigil keeps the Skill's visible name useful to the
+        // title writer without letting a Provider interpret it as an invocation.
+        prompt.remove(start);
+    }
+
     let mut characters = prompt.chars();
     let opening = characters
         .by_ref()
@@ -533,7 +549,7 @@ mod tests {
     #[test]
     fn an_errand_carries_only_the_opening_of_a_long_prompt() {
         let prompt = "x".repeat(MAX_ERRAND_PROMPT_CHARS + 500);
-        let carried = errand_prompt(&prompt);
+        let carried = errand_prompt(&prompt, &[]);
         assert!(carried.contains(&"x".repeat(MAX_ERRAND_PROMPT_CHARS)));
         assert!(!carried.contains(&"x".repeat(MAX_ERRAND_PROMPT_CHARS + 1)));
     }

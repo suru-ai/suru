@@ -9,14 +9,17 @@
 //! arrives, or fails to, at the far end.
 
 use crate::{
-    server_support::{assert_no_title_reaches, next_derived_title, receive_initial_state},
+    server_support::{
+        assert_no_title_reaches, next_derived_title, next_skill_catalog, receive_initial_state,
+    },
     support::{ScriptedCodex, assert_process_exited},
 };
 use std::sync::Arc;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        CreateSessionRequest, InitialPrompt, PromptId, SessionId, SessionTitleChanged, Workspace,
+        CreateSessionRequest, InitialPrompt, PromptId, ProviderId, SessionId, SessionTitleChanged,
+        SkillCatalogRequest, SkillCatalogStatus, SkillInvocation, SkillMarkerSpan, Workspace,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig, ServerTimings},
@@ -76,6 +79,14 @@ if [ "$1" = "exec" ]; then
 /// itself, so a fixture that fails or never answers is written the same way one
 /// that succeeds is.
 fn scripted_codex(catalog: &str, errand: &str) -> ScriptedCodex {
+    scripted_codex_with_app_server_arms(catalog, errand, "")
+}
+
+fn scripted_codex_with_app_server_arms(
+    catalog: &str,
+    errand: &str,
+    additional_arms: &str,
+) -> ScriptedCodex {
     ScriptedCodex::new_running_errands(&format!(
         r#"{ERRAND_SCRIPT_PREFIX}{errand}
 fi
@@ -88,6 +99,7 @@ while IFS= read -r line; do
     *'"method":"model/list"'*)
       printf '%s\n' '{{"id":2,"result":{catalog}}}'
       ;;
+{additional_arms}
     *'"method":"thread/start"'*)
       printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"native-thread"}},"model":"{DEFAULT_MODEL}"}}}}'
       ;;
@@ -260,6 +272,90 @@ async fn codex_derives_a_title_through_its_own_one_shot_mode() {
             "Fix reasoning group flicker".to_owned(),
             Some("\u{1F41B}".to_owned())
         )
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A Skill selected for the user's first Prompt belongs only to that Prompt.
+/// The Title Errand still needs the Skill's visible name to understand the
+/// request, but handing Codex its `$` marker would make `codex exec` select the
+/// Skill again from the Workspace and run its instructions instead of the
+/// small, schema-constrained Errand Suru asked for.
+#[tokio::test]
+async fn a_bound_skill_marker_is_plain_text_in_a_codex_title_errand() {
+    const PROMPT: &str = "$implement fix $titles";
+
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let canonical_workspace =
+        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+    let workspace_json =
+        serde_json::to_string(&canonical_workspace).expect("encode Workspace path");
+    let skill_arm = format!(
+        r#"    *'"method":"skills/list"'*)
+      printf '%s\n' '{{"id":2,"result":{{"data":[{{"cwd":{workspace_json},"skills":[{{"name":"implement","description":"Implement the requested work","path":"/private/codex/skills/implement/SKILL.md","scope":"repo","enabled":true}}],"errors":[]}}]}}}}'
+      ;;"#
+    );
+    let codex = scripted_codex_with_app_server_arms(
+        CATALOG_WITH_ERRAND_MODEL,
+        r#"  printf '%s' '{"title":"Fix automatic titles","emoji":"🏷️"}' > "$answer"
+  exit 0"#,
+        &skill_arm,
+    );
+    let (server, mut client, _state_dir) =
+        running_server(&codex, "codex-skill-title-errand", ServerTimings::default()).await;
+
+    let loading = client
+        .list_skills(SkillCatalogRequest {
+            provider: ProviderId::new("codex"),
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+        })
+        .await
+        .expect("list Codex Skills");
+    assert!(matches!(loading.status, SkillCatalogStatus::Loading));
+    let catalog = next_skill_catalog(&mut client).await;
+    let skill = catalog.skills.first().expect("Codex offers implement");
+    let invocation = SkillInvocation {
+        skill_id: skill.id.clone(),
+        name: skill.name.clone(),
+        scope: skill.scope.clone(),
+        marker: SkillMarkerSpan { start: 0, end: 10 },
+    };
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: PROMPT.to_owned(),
+                skill_invocations: vec![invocation.clone()],
+            },
+        })
+        .await
+        .expect("create Codex Skill Session");
+    assert_eq!(created.prompts[0].text, PROMPT);
+    assert_eq!(created.prompts[0].skill_invocations, [invocation]);
+
+    codex.wait_for_errand().await;
+    assert!(
+        codex
+            .errand_prompt()
+            .ends_with("The request:\nimplement fix $titles"),
+        "a bound Skill is described without reinvoking it: {:?}",
+        codex.errand_prompt()
+    );
+    assert_eq!(
+        next_derived_title(&mut client).await,
+        SessionTitleChanged {
+            session_id: created.session.id,
+            title: "Fix automatic titles".to_owned(),
+            emoji: Some("🏷️".to_owned()),
+        }
     );
 
     server.shutdown().await.expect("shut down server");

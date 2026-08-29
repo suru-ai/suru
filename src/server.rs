@@ -1022,7 +1022,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
                     .agent_selection
                     .as_ref()
                     .map(|selection| selection.provider.clone()),
-                &snapshot.prompts[0].text,
+                &snapshot.prompts[0],
             );
             (StatusCode::CREATED, Json(snapshot)).into_response()
         }
