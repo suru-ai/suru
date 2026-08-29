@@ -11,9 +11,11 @@
 //!
 //! The `subagent.*` lifecycle is where Subagents begin and end: `subagent.started` opens the
 //! Subagent under the instance identity its work is attributed with, and `subagent.completed` or
-//! `subagent.failed` — addressed by the spawning tool call — settles it. Main-conversation events
-//! that arrive outside a Turn Suru is running are dropped, events that contradict the recorded
-//! state fail the Session, and everything else becomes the Provider events a Session consumes.
+//! `subagent.failed` — addressed by the spawning tool call — settles it. The spawning tool
+//! execution itself projects no Command row while the Subagent row answers for the delegation
+//! ([`SPAWN_TOOL`]). Main-conversation events that arrive outside a Turn Suru is running are
+//! dropped, events that contradict the recorded state fail the Session, and everything else
+//! becomes the Provider events a Session consumes.
 //!
 //! Only the agent Message is strict about that: a Message the Transcript shows the reader as the
 //! answer must be the answer. Reasoning and Tool work report on how the answer was reached, so a
@@ -34,7 +36,7 @@
 //! idle is owed nothing and is swallowed rather than read against the Prompt's own Turn.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex as StdMutex},
 };
 
@@ -79,6 +81,10 @@ pub(super) struct CopilotCorrelation {
     /// The Subagent each spawning tool call opened: `subagent.completed` and `subagent.failed`
     /// name the spawn's tool call rather than the instance their own envelope names.
     spawns: HashMap<String, String>,
+    /// Every spawning tool call whose `subagent.started` has arrived, kept past the Subagent's
+    /// settle: the Subagent row answers for the delegation, so the spawn's own execution stays
+    /// withheld however late it is reported — before its `subagent.started` or after the settle.
+    delegations: HashSet<String>,
     /// Whether a Subagent has settled since a Turn last began. The output a completion provokes
     /// arrives only after the settle, so every settle leaves a Continuation owed to whatever
     /// that output turns out to be; a Turn beginning clears it, because from then on such
@@ -137,11 +143,21 @@ struct ActiveMessage {
     streamed: String,
 }
 
+/// The tool that spawns a Subagent. Its execution is not work of its own: the Subagent row its
+/// `subagent.started` opens is the delegation's representation, so the execution's Command row is
+/// withheld rather than showing the reader the same delegation twice.
+const SPAWN_TOOL: &str = "task";
+
 /// A Command Copilot is still running, and the output it has streamed so far — against which the
 /// completed execution's repeat of it is reconciled.
 #[derive(Default)]
 struct ActiveCommand {
     streamed_output: String,
+    /// The Command header a [`SPAWN_TOOL`] execution would have opened with, held back while the
+    /// Subagent row answers for the delegation. A spawn that never opens its Subagent has no row
+    /// answering for it, so the withheld Command surfaces when the execution settles or the
+    /// conversation stops — a failed delegation stays visible.
+    withheld_spawn: Option<String>,
 }
 
 /// A Reasoning block Copilot still has open: the text it has streamed so far — against
@@ -161,6 +177,7 @@ impl CopilotCorrelation {
             stale_stretches: 0,
             subagents: HashMap::new(),
             spawns: HashMap::new(),
+            delegations: HashSet::new(),
             late_settle_owes_continuation: false,
         }
     }
@@ -415,10 +432,12 @@ fn project_session_event(
         let Some(streams) = correlation.subagents.get_mut(&subagent) else {
             return Ok(Vec::new());
         };
-        return Ok(project_conversation_event(streams, &event)?
-            .into_iter()
-            .map(|projected| attributed(Some(&subagent), projected))
-            .collect());
+        return Ok(
+            project_conversation_event(streams, &mut correlation.delegations, &event)?
+                .into_iter()
+                .map(|projected| attributed(Some(&subagent), projected))
+                .collect(),
+        );
     }
     match event.parsed_type() {
         // A transient error is one Copilot's own loop recovers from by retrying, so it is not the
@@ -441,13 +460,23 @@ fn project_session_event(
         // above — opens a Continuation stretch for what it carries; everything else on the
         // timeline is passed over rather than opening a stretch it would put nothing in.
         event_type if is_conversation_content(&event_type) => {
-            let Some(streams) = correlation.open_main_streams() else {
+            if correlation.open_main_streams().is_none() {
                 return Ok(Vec::new());
-            };
-            Ok(project_conversation_event(streams, &event)?
+            }
+            let turn = correlation
+                .turn
+                .as_mut()
+                .expect("the main conversation's streams live inside its Turn");
+            Ok(
+                project_conversation_event(
+                    &mut turn.streams,
+                    &mut correlation.delegations,
+                    &event,
+                )?
                 .into_iter()
                 .map(|projected| attributed(None, projected))
-                .collect())
+                .collect(),
+            )
         }
         _ => Ok(Vec::new()),
     }
@@ -469,9 +498,12 @@ fn is_conversation_content(event_type: &SessionEventType) -> bool {
 }
 
 /// Projects one conversation's content event — the main agent's inside its Turn, or a Subagent's
-/// for as long as it runs — onto the Provider events that carry it.
+/// for as long as it runs — onto the Provider events that carry it. `delegations` is the roster
+/// of spawning tool calls whose Subagent row already answers for them, which is what tells a
+/// withheld spawn's settle apart from a delegation that never happened.
 fn project_conversation_event(
     streams: &mut ConversationStreams,
+    delegations: &mut HashSet<String>,
     event: &SessionEvent,
 ) -> Result<Vec<ProviderEvent>, ProviderError> {
     match event.parsed_type() {
@@ -481,7 +513,11 @@ fn project_conversation_event(
         }
         SessionEventType::AssistantMessageDelta => {
             let delta: AssistantMessageDeltaData = decode(event)?;
-            project_message_delta(streams, &delta.message_id, delta.delta_content)
+            Ok(project_message_delta(
+                streams,
+                &delta.message_id,
+                delta.delta_content,
+            ))
         }
         SessionEventType::AssistantMessage => {
             let message: AssistantMessageData = decode(event)?;
@@ -497,10 +533,12 @@ fn project_conversation_event(
                 project_command_output(streams, &output.tool_call_id, output.partial_output)
             },
         )),
-        SessionEventType::ToolExecutionComplete => Ok(reported(event)
-            .map_or_else(Vec::new, |completed: ToolExecutionCompleteData| {
-                project_command_completed(streams, &completed)
-            })),
+        SessionEventType::ToolExecutionComplete => Ok(reported(event).map_or_else(
+            Vec::new,
+            |completed: ToolExecutionCompleteData| {
+                project_command_completed(streams, delegations, &completed)
+            },
+        )),
         SessionEventType::AssistantReasoningDelta => Ok(reported(event).map_or_else(
             Vec::new,
             |delta: AssistantReasoningDeltaData| {
@@ -544,6 +582,7 @@ impl CopilotCorrelation {
             .insert(subagent.clone(), ConversationStreams::default());
         self.spawns
             .insert(started.tool_call_id.clone(), subagent.clone());
+        self.delegations.insert(started.tool_call_id.clone());
         // Copilot's display name is the readable one, but a spawn made through its task tool
         // writes the invocation's description there, leaving the configured name the stable one.
         let name = if started.agent_display_name.is_empty() {
@@ -583,10 +622,11 @@ impl CopilotCorrelation {
             return Vec::new();
         };
         let mut streams = self.subagents.remove(&subagent).unwrap_or_default();
-        let mut projected: Vec<AttributedProviderEvent> = settle_open_streams(&mut streams)
-            .into_iter()
-            .map(|event| attributed(Some(&subagent), event))
-            .collect();
+        let mut projected: Vec<AttributedProviderEvent> =
+            settle_open_streams(&mut streams, &self.delegations)
+                .into_iter()
+                .map(|event| attributed(Some(&subagent), event))
+                .collect();
         // The output this completion provokes arrives only after the settle, so the settle
         // leaves a Continuation owed to it (ADR 0015).
         self.late_settle_owes_continuation = true;
@@ -634,7 +674,7 @@ impl CopilotCorrelation {
         };
         // A loop that stops mid-Message or mid-block leaves both settled rather than running
         // forever.
-        let mut projected = settle_open_streams(&mut turn.streams);
+        let mut projected = settle_open_streams(&mut turn.streams, &self.delegations);
         projected.push(match (turn.failure, aborted) {
             (Some(message), _) => ProviderEvent::TurnFailed { message },
             (None, true) => ProviderEvent::TurnInterrupted,
@@ -660,21 +700,35 @@ fn project_message_started(
     Ok(vec![ProviderEvent::AgentMessageStarted])
 }
 
+/// Streams the next of the agent Message into the Transcript, opening the Message on the first
+/// delta when Copilot never started it: a Subagent's Message streams with no start of its own,
+/// announcing itself by being written into the way a Reasoning block does. The main
+/// conversation's Messages do get starts, but a delta is Transcript content either way, so every
+/// conversation opens on whichever of the two arrives first rather than losing the Turn to a
+/// missing announcement.
 fn project_message_delta(
     streams: &mut ConversationStreams,
     message_id: &str,
     delta: String,
-) -> Result<Vec<ProviderEvent>, ProviderError> {
-    let Some(message) = streams.message.as_mut() else {
-        return Err(copilot_error(
-            "Copilot sent agent Message content before starting the Message",
-        ));
-    };
+) -> Vec<ProviderEvent> {
+    let mut projected = Vec::with_capacity(2);
+    if streams.message.is_none() {
+        streams.message = Some(ActiveMessage {
+            message_id: message_id.to_owned(),
+            streamed: String::new(),
+        });
+        projected.push(ProviderEvent::AgentMessageStarted);
+    }
+    let message = streams
+        .message
+        .as_mut()
+        .expect("the Message is open, having been opened just now when it was not");
     if message.message_id != message_id {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     message.streamed.push_str(&delta);
-    Ok(vec![ProviderEvent::AgentMessageDelta { content: delta }])
+    projected.push(ProviderEvent::AgentMessageDelta { content: delta });
+    projected
 }
 
 /// Completes the streaming Message, or stands in for one Copilot never streamed: a Model call that
@@ -723,22 +777,35 @@ fn command_activity_id(tool_call_id: &str) -> ProviderActivityId {
     ProviderActivityId::new(format!("command:{tool_call_id}"))
 }
 
-/// Opens the Command a Tool execution is recorded as. Copilot reports no working directory of its
-/// own for one: every Tool runs in the Session's Workspace, which the Session already carries.
+/// Opens the Command a Tool execution is recorded as — withheld for a spawn tool, whose
+/// delegation the Subagent row represents. Copilot reports no working directory of its own for
+/// one: every Tool runs in the Session's Workspace, which the Session already carries.
 fn project_command_started(
     streams: &mut ConversationStreams,
     started: &ToolExecutionStartData,
 ) -> Vec<ProviderEvent> {
-    if streams
-        .commands
-        .insert(started.tool_call_id.clone(), ActiveCommand::default())
-        .is_some()
-    {
+    if streams.commands.contains_key(&started.tool_call_id) {
+        // A repeated start reports nothing new: the first record keeps its streamed output and
+        // its withheld header.
         return Vec::new();
     }
+    let command = command_text(started);
+    if started.tool_name == SPAWN_TOOL {
+        streams.commands.insert(
+            started.tool_call_id.clone(),
+            ActiveCommand {
+                withheld_spawn: Some(command),
+                ..ActiveCommand::default()
+            },
+        );
+        return Vec::new();
+    }
+    streams
+        .commands
+        .insert(started.tool_call_id.clone(), ActiveCommand::default());
     vec![ProviderEvent::CommandStarted {
         activity_id: command_activity_id(&started.tool_call_id),
-        command: command_text(started),
+        command,
         cwd: None,
     }]
 }
@@ -753,6 +820,9 @@ fn project_command_output(
         return Vec::new();
     };
     command.streamed_output.push_str(&output);
+    if command.withheld_spawn.is_some() {
+        return Vec::new();
+    }
     vec![ProviderEvent::CommandOutputDelta {
         activity_id: command_activity_id(tool_call_id),
         content: output,
@@ -763,13 +833,59 @@ fn project_command_output(
 /// stream had not already reached.
 fn project_command_completed(
     streams: &mut ConversationStreams,
+    delegations: &mut HashSet<String>,
     completed: &ToolExecutionCompleteData,
 ) -> Vec<ProviderEvent> {
     let Some(command) = streams.commands.remove(&completed.tool_call_id) else {
         return Vec::new();
     };
+    if let Some(withheld) = command.withheld_spawn {
+        if delegations.remove(&completed.tool_call_id) {
+            return Vec::new();
+        }
+        // The spawn never opened its Subagent, so no row answers for the delegation: the
+        // withheld Command surfaces here, carrying what the execution reported went wrong.
+        let mut projected = surface_withheld_spawn(
+            &completed.tool_call_id,
+            withheld,
+            command.streamed_output.clone(),
+        );
+        projected.extend(settle_command_events(completed, &command.streamed_output));
+        return projected;
+    }
+    settle_command_events(completed, &command.streamed_output)
+}
+
+/// Opens the Command a withheld spawn would have been, now that no Subagent row will answer for
+/// the delegation, replaying the output the withholding kept back.
+fn surface_withheld_spawn(
+    tool_call_id: &str,
+    command: String,
+    streamed_output: String,
+) -> Vec<ProviderEvent> {
+    let activity_id = command_activity_id(tool_call_id);
+    let mut projected = vec![ProviderEvent::CommandStarted {
+        activity_id: activity_id.clone(),
+        command,
+        cwd: None,
+    }];
+    if !streamed_output.is_empty() {
+        projected.push(ProviderEvent::CommandOutputDelta {
+            activity_id,
+            content: streamed_output,
+        });
+    }
+    projected
+}
+
+/// Settles a Command on what its Tool execution came to, carrying whatever of its output the
+/// stream had not already reached.
+fn settle_command_events(
+    completed: &ToolExecutionCompleteData,
+    streamed_output: &str,
+) -> Vec<ProviderEvent> {
     let mut projected = Vec::with_capacity(2);
-    if let Some(trailing) = trailing_output(completed, &command.streamed_output) {
+    if let Some(trailing) = trailing_output(completed, streamed_output) {
         projected.push(ProviderEvent::CommandOutputDelta {
             activity_id: command_activity_id(&completed.tool_call_id),
             content: trailing,
@@ -906,12 +1022,17 @@ fn settle_reasoning(reasoning_id: &str, block: &mut ActiveReasoning) -> Vec<Prov
     projected
 }
 
-/// Settles everything a stopped conversation left open: its Reasoning blocks, and the Message it
-/// was still streaming. The Session store settles a Turn's open Activities from its own snapshot,
-/// but only the split here knows the title it is still withholding, which would otherwise go with
-/// the block. Open Commands are left to the store: their outcome is Copilot's to report, not ours
-/// to invent.
-fn settle_open_streams(streams: &mut ConversationStreams) -> Vec<ProviderEvent> {
+/// Settles everything a stopped conversation left open: its Reasoning blocks, the Message it was
+/// still streaming, and any withheld spawn no Subagent row ever answered for — surfaced here,
+/// because a Command the store never saw is one the store cannot settle, and the delegation would
+/// otherwise vanish with the conversation. Open Commands are otherwise left to the store — their
+/// outcome is Copilot's to report, not ours to invent — which settles a Turn's open Activities
+/// from its own snapshot; only the split here knows the title it is still withholding, which
+/// would otherwise go with the block.
+fn settle_open_streams(
+    streams: &mut ConversationStreams,
+    delegations: &HashSet<String>,
+) -> Vec<ProviderEvent> {
     let mut projected = Vec::new();
     for mut block in std::mem::take(&mut streams.reasoning) {
         let reasoning_id = std::mem::take(&mut block.reasoning_id);
@@ -919,6 +1040,19 @@ fn settle_open_streams(streams: &mut ConversationStreams) -> Vec<ProviderEvent> 
     }
     if streams.message.take().is_some() {
         projected.push(ProviderEvent::AgentMessageCompleted);
+    }
+    for (tool_call_id, command) in &mut streams.commands {
+        if let Some(withheld) = command
+            .withheld_spawn
+            .take()
+            .filter(|_| !delegations.contains(tool_call_id))
+        {
+            projected.extend(surface_withheld_spawn(
+                tool_call_id,
+                withheld,
+                std::mem::take(&mut command.streamed_output),
+            ));
+        }
     }
     projected
 }
@@ -1091,6 +1225,58 @@ mod tests {
                 },
                 ProviderEvent::AgentMessageCompleted,
             ]
+        );
+    }
+
+    #[test]
+    fn a_message_copilot_never_started_opens_on_its_first_delta() {
+        // Copilot streams a Subagent's Message without ever starting it: the deltas simply
+        // begin, the way a Reasoning block announces itself by being reasoned into.
+        let mut correlation = with_subagent();
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                agent_event(
+                    "agent-1",
+                    "assistant.message_delta",
+                    json!({ "messageId": "sub-m1", "deltaContent": "Scouting" }),
+                ),
+            ),
+            [
+                AttributedProviderEvent {
+                    attribution: subagent("agent-1"),
+                    event: ProviderEvent::AgentMessageStarted,
+                },
+                AttributedProviderEvent {
+                    attribution: subagent("agent-1"),
+                    event: ProviderEvent::AgentMessageDelta {
+                        content: "Scouting".to_owned()
+                    },
+                },
+            ]
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                agent_event(
+                    "agent-1",
+                    "assistant.message",
+                    json!({ "messageId": "sub-m1", "content": "Scouting the workspace." }),
+                ),
+            ),
+            [
+                AttributedProviderEvent {
+                    attribution: subagent("agent-1"),
+                    event: ProviderEvent::AgentMessageDelta {
+                        content: " the workspace.".to_owned()
+                    },
+                },
+                AttributedProviderEvent {
+                    attribution: subagent("agent-1"),
+                    event: ProviderEvent::AgentMessageCompleted,
+                },
+            ],
+            "the completed Message reconciles against the stream the delta opened"
         );
     }
 
@@ -1811,6 +1997,155 @@ mod tests {
             project(&mut correlation, "session.idle", json!({})),
             [ProviderEvent::TurnCompleted],
             "the Prompt's own Turn settles on its own idle"
+        );
+    }
+
+    #[test]
+    fn a_spawn_tool_execution_is_represented_by_the_subagent_row_alone() {
+        let mut correlation = in_turn();
+        assert!(
+            project(
+                &mut correlation,
+                "tool.execution_start",
+                json!({
+                    "toolCallId": "t-spawn",
+                    "toolName": "task",
+                    "arguments": { "agent_type": "explore", "prompt": "Scout the workspace" },
+                }),
+            )
+            .is_empty(),
+            "the spawning tool call opens no Command row of its own"
+        );
+        assert!(
+            matches!(
+                project_attributed(&mut correlation, spawn_started("agent-1", "t-spawn"))
+                    .as_slice(),
+                [AttributedProviderEvent {
+                    event: ProviderEvent::SubagentStarted { .. },
+                    ..
+                }]
+            ),
+            "the Subagent row is the delegation's whole representation"
+        );
+        assert!(
+            project(
+                &mut correlation,
+                "tool.execution_complete",
+                json!({ "toolCallId": "t-spawn", "success": true, "result": { "content": "done" } }),
+            )
+            .is_empty(),
+            "the spawn's completion settles nothing: the Subagent lifecycle already did"
+        );
+    }
+
+    #[test]
+    fn a_spawn_execution_reported_after_its_subagent_opened_stays_withheld() {
+        // The runtime's own delegation may report `subagent.started` before — or without — the
+        // spawning tool call ever surfacing as an execution.
+        let mut correlation = in_turn();
+        project_attributed(&mut correlation, spawn_started("agent-1", "t-spawn"));
+        assert!(
+            project(
+                &mut correlation,
+                "tool.execution_start",
+                json!({ "toolCallId": "t-spawn", "toolName": "task", "arguments": {} }),
+            )
+            .is_empty(),
+        );
+
+        assert!(
+            project(
+                &mut correlation,
+                "tool.execution_complete",
+                json!({ "toolCallId": "t-spawn", "success": true, "result": { "content": "done" } }),
+            )
+            .is_empty(),
+            "the Subagent row already answers for the delegation, whichever event opened it first"
+        );
+    }
+
+    #[test]
+    fn a_spawn_that_never_opened_its_subagent_surfaces_as_the_command_it_was() {
+        let mut correlation = in_turn();
+        project(
+            &mut correlation,
+            "tool.execution_start",
+            json!({
+                "toolCallId": "t-spawn",
+                "toolName": "task",
+                "arguments": { "agent_type": "no-such-agent" },
+            }),
+        );
+
+        assert_eq!(
+            project(
+                &mut correlation,
+                "tool.execution_complete",
+                json!({
+                    "toolCallId": "t-spawn",
+                    "success": false,
+                    "error": { "message": "unknown agent type" },
+                }),
+            ),
+            [
+                ProviderEvent::CommandStarted {
+                    activity_id: command_activity_id("t-spawn"),
+                    command: r#"task {"agent_type":"no-such-agent"}"#.to_owned(),
+                    cwd: None,
+                },
+                ProviderEvent::CommandOutputDelta {
+                    activity_id: command_activity_id("t-spawn"),
+                    content: "unknown agent type".to_owned(),
+                },
+                ProviderEvent::CommandCompleted {
+                    activity_id: command_activity_id("t-spawn"),
+                    status: ProviderCommandStatus::Failed,
+                    exit_status: None,
+                },
+            ],
+            "with no Subagent row answering for the delegation, the failed spawn stays visible"
+        );
+    }
+
+    #[test]
+    fn a_repeated_spawn_execution_start_does_not_forget_the_delegation() {
+        let mut correlation = in_turn();
+        let start = json!({ "toolCallId": "t-spawn", "toolName": "task", "arguments": {} });
+        project(&mut correlation, "tool.execution_start", start.clone());
+        project_attributed(&mut correlation, spawn_started("agent-1", "t-spawn"));
+        assert!(project(&mut correlation, "tool.execution_start", start).is_empty());
+
+        assert!(
+            project(
+                &mut correlation,
+                "tool.execution_complete",
+                json!({ "toolCallId": "t-spawn", "success": true, "result": { "content": "done" } }),
+            )
+            .is_empty(),
+            "a repeated start neither reopens the Command nor un-delegates the spawn"
+        );
+    }
+
+    #[test]
+    fn a_withheld_spawn_still_open_at_the_turns_settle_surfaces_for_the_store_to_settle() {
+        let mut correlation = in_turn();
+        project(
+            &mut correlation,
+            "tool.execution_start",
+            json!({ "toolCallId": "t-spawn", "toolName": "task", "arguments": { "agent_type": "explore" } }),
+        );
+
+        assert_eq!(
+            project(&mut correlation, "session.idle", json!({})),
+            [
+                ProviderEvent::CommandStarted {
+                    activity_id: command_activity_id("t-spawn"),
+                    command: r#"task {"agent_type":"explore"}"#.to_owned(),
+                    cwd: None,
+                },
+                ProviderEvent::TurnCompleted,
+            ],
+            "a delegation no Subagent row ever answered for does not vanish with the Turn"
         );
     }
 
