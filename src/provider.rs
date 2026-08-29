@@ -14,9 +14,10 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::protocol::{
-    AgentIdentity, AgentSelection, EffectiveSettings, FileChange, ModelDescriptor, ModelOptionKind,
-    ModelOptionRole, ProviderId, ProviderUnavailability, SkillCatalog, SkillCatalogCapabilities,
-    SkillCatalogStatus, SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, Workspace,
+    AgentIdentity, AgentSelection, Cost, EffectiveSettings, FileChange, ModelDescriptor,
+    ModelOptionKind, ModelOptionRole, ProviderId, ProviderUnavailability, SkillCatalog,
+    SkillCatalogCapabilities, SkillCatalogStatus, SkillId, SkillInvocation, SkillMarkerSpan,
+    SkillPromptDelivery, Usage, Workspace,
 };
 
 mod claude;
@@ -517,6 +518,13 @@ pub enum ProviderEvent {
     SubagentCompleted {
         subagent_id: ProviderSubagentId,
         status: ProviderSubagentStatus,
+    },
+    /// The Provider's latest complete reading of the active Turn. Each absent
+    /// field remains absent through the protocol; a stated Cost is frozen by
+    /// the Session store with a Reported Basis.
+    Usage {
+        usage: Usage,
+        reported_cost: Option<Cost>,
     },
     TurnCompleted,
     TurnInterrupted,

@@ -109,6 +109,9 @@ fn child_with_working_subagent(
             status: TurnStatus::Active,
             started_at: None,
             settled_at: None,
+            usage: None,
+            cost: None,
+            cost_basis: None,
         }],
         messages: vec![Message {
             id: message_id,

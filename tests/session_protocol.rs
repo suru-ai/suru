@@ -3,20 +3,51 @@ use std::path::PathBuf;
 use serde_json::json;
 use suru::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-    AgentSelection, AgentSelectionOperationId, CreateSessionRequest, FileChange, InitialPrompt,
-    Message, MessageId, MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId,
-    ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
-    ModelOptionRole, ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId,
-    PromptOrder, PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode,
-    SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-    SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus,
-    SkillDescriptor, SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery,
-    TranscriptItem, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
+    AgentSelection, AgentSelectionOperationId, Cost, CostBasis, CreateSessionRequest, FileChange,
+    InitialPrompt, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
+    ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor,
+    ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
+    Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session,
+    SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
+    SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog,
+    SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId,
+    SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, TranscriptItem, Turn, TurnId,
+    TurnStatus, UpdateAgentSelectionRequest, Usage, Workspace,
 };
 use uuid::Uuid;
 
 fn fixture_id(value: &str) -> Uuid {
     Uuid::parse_str(value).expect("parse fixture identity")
+}
+
+#[test]
+fn a_reported_zero_cost_is_known_while_an_unattributed_cost_is_rejected() {
+    let zero = Cost::from_usd(0.0).expect("a Provider may report a free Turn");
+    assert!(zero.is_zero());
+    assert_eq!(
+        serde_json::to_value(zero).expect("encode zero Cost"),
+        json!(0.0)
+    );
+    assert_eq!(
+        serde_json::from_value::<Cost>(json!(0.0)).expect("decode zero Cost"),
+        zero
+    );
+
+    let invalid_turn = json!({
+        "id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+        "prompt_id": null,
+        "agent": null,
+        "status": "completed",
+        "started_at": null,
+        "settled_at": null,
+        "usage": null,
+        "cost": 0.0,
+        "cost_basis": null
+    });
+    assert!(
+        serde_json::from_value::<Turn>(invalid_turn).is_err(),
+        "Cost and Cost Basis enter the protocol as one invariant"
+    );
 }
 
 #[test]
@@ -298,6 +329,17 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             status: TurnStatus::Failed,
             started_at: Some(SessionTimestamp(1_755_000_000_000)),
             settled_at: Some(SessionTimestamp(1_755_000_004_200)),
+            usage: Some(Usage {
+                fresh_input_tokens: Some(1_200),
+                cache_read_tokens: Some(300),
+                cache_write_tokens: Some(400),
+                output_tokens: Some(900),
+                reasoning_tokens: None,
+                native_meter: None,
+                model_context_window: Some(200_000),
+            }),
+            cost: Cost::from_usd(0.03),
+            cost_basis: Some(CostBasis::Reported),
         }],
         messages: vec![Message {
             id: MessageId::from_uuid(fixture_id("0198b27e-310d-763a-9825-51cc8b2bef81")),
@@ -367,7 +409,18 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             },
             "status": "failed",
             "started_at": 1_755_000_000_000_u64,
-            "settled_at": 1_755_000_004_200_u64
+            "settled_at": 1_755_000_004_200_u64,
+            "usage": {
+                "fresh_input_tokens": 1_200,
+                "cache_read_tokens": 300,
+                "cache_write_tokens": 400,
+                "output_tokens": 900,
+                "reasoning_tokens": null,
+                "native_meter": null,
+                "model_context_window": 200_000
+            },
+            "cost": 0.03,
+            "cost_basis": "reported"
         }],
         "messages": [{
             "id": "0198b27e-310d-763a-9825-51cc8b2bef81",
@@ -1116,6 +1169,16 @@ fn session_delta_status_and_error_contracts_use_stable_provider_neutral_shapes()
                 prompt_id,
                 status: PromptStatus::Delivered,
             },
+            SessionChange::TurnUsageChanged {
+                turn_id,
+                usage: Usage {
+                    fresh_input_tokens: Some(1_200),
+                    output_tokens: Some(900),
+                    ..Usage::default()
+                },
+                cost: Cost::from_usd(0.03),
+                cost_basis: Some(CostBasis::Reported),
+            },
             SessionChange::TurnStatusChanged {
                 turn_id,
                 status: TurnStatus::Completed,
@@ -1141,6 +1204,21 @@ fn session_delta_status_and_error_contracts_use_stable_provider_neutral_shapes()
                     "type": "prompt_status_changed",
                     "prompt_id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
                     "status": "delivered"
+                },
+                {
+                    "type": "turn_usage_changed",
+                    "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+                    "usage": {
+                        "fresh_input_tokens": 1_200,
+                        "cache_read_tokens": null,
+                        "cache_write_tokens": null,
+                        "output_tokens": 900,
+                        "reasoning_tokens": null,
+                        "native_meter": null,
+                        "model_context_window": null
+                    },
+                    "cost": 0.03,
+                    "cost_basis": "reported"
                 },
                 {
                     "type": "turn_status_changed",

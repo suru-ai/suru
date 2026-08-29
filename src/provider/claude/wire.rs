@@ -253,6 +253,24 @@ pub(super) struct ResultMessage {
     /// not honor the schema it was given.
     #[serde(default)]
     pub(super) structured_output: Option<Value>,
+    /// The terminal loop result's disjoint Anthropic usage. Each field stays
+    /// optional so a CLI that omits one does not turn that omission into zero.
+    #[serde(default)]
+    pub(super) usage: Option<ResultUsage>,
+    #[serde(default)]
+    pub(super) total_cost_usd: Option<f64>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ResultUsage {
+    #[serde(default)]
+    pub(super) input_tokens: Option<f64>,
+    #[serde(default)]
+    pub(super) cache_read_input_tokens: Option<f64>,
+    #[serde(default)]
+    pub(super) cache_creation_input_tokens: Option<f64>,
+    #[serde(default)]
+    pub(super) output_tokens: Option<f64>,
 }
 
 /// A `system` message: the CLI's own bookkeeping alongside the conversation. Only the task

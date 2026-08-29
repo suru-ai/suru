@@ -11,17 +11,18 @@ use ratatui::{Terminal, backend::TestBackend, style::Color};
 use suru::{
     managed_client::SessionEvent,
     protocol::{
-        Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelectionOperationId,
-        CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId, SessionError,
+        Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelectionOperationId, Cost,
+        CostBasis, CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId, SessionError,
         SessionErrorCode, SessionId, SessionListItem, SessionRevision, SessionSnapshot,
         SessionStatus, SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan, TurnStatus,
-        UpdateAgentSelectionRequest, Workspace,
+        UpdateAgentSelectionRequest, Usage, Workspace,
     },
     provider::{ProviderActivityId, ProviderCommandStatus, ProviderEvent},
     server::{self, ServerConfig},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
 use tokio::time::{Duration, timeout};
+use uuid::Uuid;
 
 fn readable_session_summaries(items: Vec<SessionListItem>) -> Vec<SessionSummary> {
     items
@@ -983,6 +984,125 @@ async fn turn_timing_survives_a_restart_and_a_session_stored_before_it_stays_rea
         .shutdown()
         .await
         .expect("stop replacement server");
+}
+
+#[tokio::test]
+async fn turn_usage_survives_a_restart() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "turn-usage-storage-test")
+        .expect("configure original server")
+        .with_data_dir(data_dir.path());
+    let (original_runtime, mut original_provider) = ControlledProvider::new();
+    let original = server::spawn_with_provider(config.clone(), original_runtime)
+        .await
+        .expect("spawn original server");
+    let descriptor = original.descriptor().clone();
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Persist this Turn's Usage".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+
+    let mut provider_session = timeout(Duration::from_secs(1), original_provider.next_start())
+        .await
+        .expect("Provider startup begins")
+        .succeed(AgentIdentity {
+            agent: AgentId::new("controlled-agent"),
+            selection: controlled_selection("gpt-metered", "high", "fast"),
+        });
+    timeout(Duration::from_secs(1), provider_session.next_turn())
+        .await
+        .expect("initial Turn reaches Provider")
+        .succeed();
+    provider_session.emit(ProviderEvent::Usage {
+        usage: Usage {
+            fresh_input_tokens: Some(4_000),
+            cache_read_tokens: Some(800),
+            cache_write_tokens: Some(200),
+            output_tokens: Some(190),
+            reasoning_tokens: Some(10),
+            native_meter: None,
+            model_context_window: Some(200_000),
+        },
+        reported_cost: Cost::from_usd(0.03),
+    });
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    let completed = read_session_at_least_revision(
+        &client,
+        &descriptor,
+        created.session.id,
+        SessionRevision(5),
+    )
+    .await;
+    assert_eq!(completed.turns[0].cost_basis, Some(CostBasis::Reported));
+    drop(provider_session);
+    original.shutdown().await.expect("stop original server");
+
+    let (restart_runtime, _restart_provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(config.clone(), restart_runtime)
+        .await
+        .expect("spawn restarted server");
+    let reopened = read_persisted_session(restarted.descriptor(), created.session.id).await;
+    assert_eq!(
+        reopened.turns, completed.turns,
+        "Turn Usage and frozen Cost survive a restart"
+    );
+    restarted.shutdown().await.expect("stop restarted server");
+}
+
+#[tokio::test]
+async fn a_session_stored_before_turn_usage_stays_readable_through_the_server_api() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let config = ServerConfig::new(state_dir.path(), "legacy-turn-usage-storage-test")
+        .expect("configure fixture server")
+        .with_data_dir(data_dir.path());
+    std::fs::create_dir_all(config.data_dir()).expect("create fixture data directory");
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/pre_usage_session.db"
+        ),
+        config.data_dir().join("suru.db"),
+    )
+    .expect("copy the pre-Usage database fixture");
+    let (runtime, _provider) = ControlledProvider::new();
+    let running = server::spawn_with_provider(config, runtime)
+        .await
+        .expect("spawn server over the pre-Usage database fixture");
+    let session_id = SessionId::from_uuid(
+        Uuid::parse_str("0198b27e-26ec-7c4c-a83b-a83a4787453f")
+            .expect("fixture Session ID is valid"),
+    );
+
+    let restored = read_persisted_session(running.descriptor(), session_id).await;
+
+    assert_eq!(restored.turns.len(), 1);
+    assert_eq!(restored.turns[0].status, TurnStatus::Completed);
+    assert_eq!(restored.turns[0].usage, None);
+    assert_eq!(restored.turns[0].cost, None);
+    assert_eq!(restored.turns[0].cost_basis, None);
+    running.shutdown().await.expect("stop fixture server");
 }
 
 #[tokio::test]

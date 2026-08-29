@@ -13,12 +13,12 @@ use uuid::Uuid;
 
 use crate::{
     protocol::{
-        Activity, ActivityId, ActivityStatus, AgentId, AgentIdentity, AgentSelection, FileChange,
-        Message, MessageId, MessageRole, MessageStatus, ModelId, ModelOptionChoiceId,
-        ModelOptionId, ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId,
-        PromptOrder, PromptStatus, ProviderId, Session, SessionId, SessionRevision, SessionSummary,
-        SessionTimestamp, SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus,
-        UnreadableSessionSummary, Workspace,
+        Activity, ActivityId, ActivityStatus, AgentId, AgentIdentity, AgentSelection, Cost,
+        CostBasis, FileChange, Message, MessageId, MessageRole, MessageStatus, ModelId,
+        ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue, Prompt,
+        PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session, SessionId,
+        SessionRevision, SessionSummary, SessionTimestamp, SkillInvocation, TranscriptItem, Turn,
+        TurnId, TurnStatus, UnreadableSessionSummary, Usage, Workspace,
     },
     provider::ProviderResumeState,
 };
@@ -405,6 +405,9 @@ impl TurnRow {
                     status: turn.status,
                     started_at: turn.started_at,
                     settled_at: turn.settled_at,
+                    usage: turn.usage,
+                    cost: turn.cost,
+                    cost_basis: turn.cost_basis,
                 },
             )?,
         })
@@ -413,7 +416,7 @@ impl TurnRow {
     pub(super) fn into_turn(self) -> Result<Turn, StorageError> {
         let session_id = self.session_id;
         let payload: StoredTurnPayload = decode(&session_id, "Turn payload", &self.payload)?;
-        Ok(Turn {
+        let turn = Turn {
             id: parse_id(&self.id, "Turn ID", TurnId::from_uuid)?,
             prompt_id: self
                 .prompt_id
@@ -424,7 +427,17 @@ impl TurnRow {
             status: payload.status,
             started_at: payload.started_at,
             settled_at: payload.settled_at,
-        })
+            usage: payload.usage,
+            cost: payload.cost,
+            cost_basis: payload.cost_basis,
+        };
+        if !turn.has_valid_cost_attribution() {
+            return Err(StorageError::InvalidSession {
+                session_id,
+                message: "Turn payload has a Cost without exactly one Cost Basis".to_owned(),
+            });
+        }
+        Ok(turn)
     }
 }
 
@@ -671,6 +684,14 @@ struct StoredTurnPayload {
     started_at: Option<SessionTimestamp>,
     #[serde(default)]
     settled_at: Option<SessionTimestamp>,
+    /// Absent in every Turn stored before usage tracking; defaulted fields
+    /// keep those payloads readable without a schema migration.
+    #[serde(default)]
+    usage: Option<Usage>,
+    #[serde(default)]
+    cost: Option<Cost>,
+    #[serde(default)]
+    cost_basis: Option<CostBasis>,
 }
 
 #[derive(Deserialize, Serialize)]

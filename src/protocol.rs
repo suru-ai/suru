@@ -4,10 +4,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 26;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
@@ -1505,8 +1505,113 @@ pub struct Prompt {
     pub status: PromptStatus,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// The disjoint measurements a Provider reported for one Turn. An absent
+/// field means the Provider did not state it; a reported zero remains
+/// `Some(0)`, so absence is never fabricated into a number.
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct Usage {
+    pub fresh_input_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    /// A Provider-native usage figure retained for a future Provider-specific
+    /// surface. Its unit belongs to that Provider and is deliberately not
+    /// interpreted as dollars here.
+    pub native_meter: Option<u64>,
+    pub model_context_window: Option<u64>,
+}
+
+impl Usage {
+    /// The compact figure shown to a reader: fresh input plus output and the
+    /// reasoning within it. Cache traffic stays in the stored breakdown but
+    /// does not inflate the displayed count.
+    pub fn blended_tokens(&self) -> Option<u64> {
+        [
+            self.fresh_input_tokens,
+            self.output_tokens,
+            self.reasoning_tokens,
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(u64::saturating_add)
+    }
+}
+
+/// A non-negative dollar figure stored in billionths of one USD. The integer
+/// representation keeps protocol equality and persistence exact while
+/// retaining more precision than a compact surface can display.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Cost(u64);
+
+impl Cost {
+    const NANO_USD_PER_USD: f64 = 1_000_000_000.0;
+
+    /// Admits a Provider's native USD figure, rejecting unknown, non-finite,
+    /// negative, and unrepresentable values at the Provider boundary. A
+    /// reported zero remains distinct from an absent, unknown Cost.
+    pub fn from_usd(usd: f64) -> Option<Self> {
+        if !usd.is_finite() || usd < 0.0 || usd > u64::MAX as f64 / Self::NANO_USD_PER_USD {
+            return None;
+        }
+        Some(Self::from_nano_usd(
+            (usd * Self::NANO_USD_PER_USD).round() as u64
+        ))
+    }
+
+    pub const fn from_nano_usd(nano_usd: u64) -> Self {
+        Self(nano_usd)
+    }
+
+    pub const fn nano_usd(self) -> u64 {
+        self.0
+    }
+
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(Self)
+    }
+
+    pub fn as_usd(self) -> f64 {
+        self.nano_usd() as f64 / Self::NANO_USD_PER_USD
+    }
+}
+
+impl Serialize for Cost {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_f64(self.as_usd())
+    }
+}
+
+impl<'de> Deserialize<'de> for Cost {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let usd = f64::deserialize(deserializer)?;
+        Self::from_usd(usd)
+            .ok_or_else(|| D::Error::custom("Cost must be a non-negative USD figure"))
+    }
+}
+
+/// Who computed a stored Cost. This is independent of whether an account's
+/// billing arrangement made the Turn marginally chargeable.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostBasis {
+    Reported,
+    Estimated,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "TurnWire")]
 pub struct Turn {
     pub id: TurnId,
     /// The Prompt whose delivery began this Turn, absent on a Turn no Prompt
@@ -1521,9 +1626,55 @@ pub struct Turn {
     /// worked only when it knows.
     pub started_at: Option<SessionTimestamp>,
     pub settled_at: Option<SessionTimestamp>,
+    /// Absent on Turns stored before usage recording and on Turns whose
+    /// Provider never reported a measurement.
+    pub usage: Option<Usage>,
+    /// Frozen when Usage is recorded; absent when no reliable dollar figure
+    /// was available. A reported zero is known and distinct from absence.
+    pub cost: Option<Cost>,
+    pub cost_basis: Option<CostBasis>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnWire {
+    id: TurnId,
+    prompt_id: Option<PromptId>,
+    agent: Option<AgentIdentity>,
+    status: TurnStatus,
+    started_at: Option<SessionTimestamp>,
+    settled_at: Option<SessionTimestamp>,
+    usage: Option<Usage>,
+    cost: Option<Cost>,
+    cost_basis: Option<CostBasis>,
+}
+
+impl TryFrom<TurnWire> for Turn {
+    type Error = &'static str;
+
+    fn try_from(turn: TurnWire) -> Result<Self, Self::Error> {
+        if turn.cost.is_some() != turn.cost_basis.is_some() {
+            return Err("a Turn Cost requires exactly one Cost Basis");
+        }
+        Ok(Self {
+            id: turn.id,
+            prompt_id: turn.prompt_id,
+            agent: turn.agent,
+            status: turn.status,
+            started_at: turn.started_at,
+            settled_at: turn.settled_at,
+            usage: turn.usage,
+            cost: turn.cost,
+            cost_basis: turn.cost_basis,
+        })
+    }
 }
 
 impl Turn {
+    pub const fn has_valid_cost_attribution(&self) -> bool {
+        self.cost.is_some() == self.cost_basis.is_some()
+    }
+
     /// Whether this Turn is a Continuation: the one kind of Turn that begins
     /// without a Prompt. Named once here so every place that treats
     /// Continuations apart — admission, the steer sweep — asks the same
@@ -1617,6 +1768,12 @@ pub enum SessionChange {
     TurnAgentChanged {
         turn_id: TurnId,
         agent: AgentIdentity,
+    },
+    TurnUsageChanged {
+        turn_id: TurnId,
+        usage: Usage,
+        cost: Option<Cost>,
+        cost_basis: Option<CostBasis>,
     },
     MessageAdded {
         message: Message,

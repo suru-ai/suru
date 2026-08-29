@@ -235,6 +235,9 @@ pub fn enter_active_session(
         status: TurnStatus::Active,
         started_at: None,
         settled_at: None,
+        usage: None,
+        cost: None,
+        cost_basis: None,
     });
     snapshot.messages.push(Message {
         id: message_id,
@@ -368,6 +371,9 @@ pub fn navigable_session_snapshot(
             status: TurnStatus::Completed,
             started_at: None,
             settled_at: None,
+            usage: None,
+            cost: None,
+            cost_basis: None,
         });
         snapshot.messages.extend([
             Message {
@@ -429,6 +435,9 @@ impl FailedTurnFixture {
                 status: TurnStatus::Failed,
                 started_at: None,
                 settled_at: None,
+                usage: None,
+                cost: None,
+                cost_basis: None,
             },
             message: Message {
                 id: MessageId::new(),

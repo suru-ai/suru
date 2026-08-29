@@ -21,9 +21,9 @@ use super::{
 };
 use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, AgentIdentity, Message, MessageId, MessageRole,
-    MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
-    SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery, TurnId,
+    Activity, ActivityId, ActivityStatus, AgentIdentity, CostBasis, Message, MessageId,
+    MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
+    ProviderId, SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery, TurnId,
 };
 use crate::sessions::{
     DeliveredTurn, DeliveredTurnStatus, InterruptSessionError, InterruptTarget,
@@ -2431,6 +2431,20 @@ fn project_provider_event(
                 }
                 Some(settled) => settled.map(|()| ProviderEventProjection::Continue),
             },
+            ProviderEvent::Usage {
+                usage,
+                reported_cost,
+            } => sessions
+                .publish_agent_output(
+                    session_id,
+                    SessionChange::TurnUsageChanged {
+                        turn_id: active.turn_id,
+                        usage,
+                        cost: reported_cost,
+                        cost_basis: reported_cost.map(|_| CostBasis::Reported),
+                    },
+                )
+                .map(|_| ProviderEventProjection::Continue),
             ProviderEvent::TurnCompleted => {
                 // A Subagent still working holds nothing open here: the Turn
                 // settles at the Provider's own boundary (ADR 0015), and the

@@ -43,6 +43,7 @@ use super::{
         ResultMessage, StreamEventMessage, SystemMessage,
     },
 };
+use crate::protocol::{Cost, Usage};
 use crate::provider::{
     AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
     ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderSubagentId,
@@ -167,6 +168,40 @@ struct RunningCommand {
     activity: ProviderActivityId,
 }
 
+/// Metering reported stretch by stretch for the one Suru Turn currently in
+/// flight. Claude ends every steered prompt with its own result, while Suru
+/// deliberately keeps those stretches in one Turn, so the Provider boundary
+/// must publish the cumulative reading each time.
+struct ClaudeTurnMetering {
+    usage: Usage,
+    reported_cost: Option<Cost>,
+}
+
+impl ClaudeTurnMetering {
+    fn add(&mut self, usage: Usage, reported_cost: Option<Cost>) {
+        self.usage.fresh_input_tokens =
+            add_reported_counts(self.usage.fresh_input_tokens, usage.fresh_input_tokens);
+        self.usage.cache_read_tokens =
+            add_reported_counts(self.usage.cache_read_tokens, usage.cache_read_tokens);
+        self.usage.cache_write_tokens =
+            add_reported_counts(self.usage.cache_write_tokens, usage.cache_write_tokens);
+        self.usage.output_tokens =
+            add_reported_counts(self.usage.output_tokens, usage.output_tokens);
+        self.usage.reasoning_tokens =
+            add_reported_counts(self.usage.reasoning_tokens, usage.reasoning_tokens);
+        self.usage.native_meter = add_reported_counts(self.usage.native_meter, usage.native_meter);
+        self.usage.model_context_window = self
+            .usage
+            .model_context_window
+            .zip(usage.model_context_window)
+            .map(|(current, next)| current.max(next));
+        self.reported_cost = self
+            .reported_cost
+            .zip(reported_cost)
+            .and_then(|(current, next)| current.checked_add(next));
+    }
+}
+
 /// One task the CLI is running an agent for: the identity its Subagent's events are attributed
 /// by, and the description its row currently reads, kept so progress ticks repeating it
 /// unchanged publish nothing.
@@ -189,6 +224,7 @@ struct ClaudeProjection {
     /// The agent tasks running as Subagents, by the task id the rest of the lifecycle names.
     subagent_tasks: BTreeMap<String, SubagentTask>,
     reasoning_blocks: u64,
+    turn_metering: Option<ClaudeTurnMetering>,
     /// What the Session reads back out of the conversation: whether the Turn it started is still
     /// running, and the background work it must stop before interrupting.
     turn: Arc<TurnInFlight>,
@@ -202,6 +238,7 @@ impl ClaudeProjection {
             spawn_tools: BTreeMap::new(),
             subagent_tasks: BTreeMap::new(),
             reasoning_blocks: 0,
+            turn_metering: None,
             turn,
         }
     }
@@ -753,9 +790,39 @@ impl ClaudeProjection {
                 ..ConversationInFlight::default()
             },
         );
+        if let Some(usage) = result.usage.as_ref() {
+            let usage = Usage {
+                fresh_input_tokens: reported_token_count(usage.input_tokens),
+                cache_read_tokens: reported_token_count(usage.cache_read_input_tokens),
+                cache_write_tokens: reported_token_count(usage.cache_creation_input_tokens),
+                output_tokens: reported_token_count(usage.output_tokens),
+                reasoning_tokens: None,
+                native_meter: None,
+                model_context_window: None,
+            };
+            let reported_cost = result.total_cost_usd.and_then(Cost::from_usd);
+            if let Some(metering) = self.turn_metering.as_mut() {
+                metering.add(usage, reported_cost);
+            } else {
+                self.turn_metering = Some(ClaudeTurnMetering {
+                    usage,
+                    reported_cost,
+                });
+            }
+            let metering = self
+                .turn_metering
+                .as_ref()
+                .expect("Claude Turn metering was just initialized");
+            projected.push(ProviderEvent::Usage {
+                usage: metering.usage.clone(),
+                reported_cost: metering.reported_cost,
+            });
+        }
+        let turn_settled;
         if was_interrupted(&result) {
             self.turn.abandon_turn();
             projected.push(ProviderEvent::TurnInterrupted);
+            turn_settled = true;
         } else if result.subtype == "success" && !result.is_error {
             // A steered Turn is answered stretch by stretch: the CLI ends every user message
             // queued into the loop with a result of its own, and only the last one Settles the
@@ -764,18 +831,44 @@ impl ClaudeProjection {
             // is what settles the Continuation that output began, or nothing where none is open.
             if self.turn.result_settles_turn() || !self.turn.is_running() {
                 projected.push(ProviderEvent::TurnCompleted);
+                turn_settled = true;
+            } else {
+                turn_settled = false;
             }
         } else {
             self.turn.abandon_turn();
             projected.push(ProviderEvent::TurnFailed {
                 message: super::result_failure_message("Turn", &result),
             });
+            turn_settled = true;
+        }
+        if turn_settled {
+            self.turn_metering = None;
         }
         Ok(projected
             .into_iter()
             .map(|event| attributed(&OWNING_CONVERSATION, event))
             .collect())
     }
+}
+
+/// Reads an integer token count without letting a malformed negative,
+/// fractional, non-finite, or unrepresentable Provider number become a
+/// fabricated zero.
+fn reported_token_count(value: Option<f64>) -> Option<u64> {
+    value
+        .filter(|value| {
+            value.is_finite() && *value >= 0.0 && value.fract() == 0.0 && *value <= u64::MAX as f64
+        })
+        .map(|value| value as u64)
+}
+
+/// A cumulative field remains reported only when every stretch reported it;
+/// omission never silently becomes a fabricated zero.
+fn add_reported_counts(current: Option<u64>, next: Option<u64>) -> Option<u64> {
+    current
+        .zip(next)
+        .map(|(current, next)| current.saturating_add(next))
 }
 
 /// Whether a result is a Turn the user stopped. The CLI reports an interrupted loop as an unerrored

@@ -837,6 +837,9 @@ pub(super) fn prepare_prompt_delivery(
                 // the Turn in the same breath when it arrives already settled.
                 started_at: None,
                 settled_at: None,
+                usage: None,
+                cost: None,
+                cost_basis: None,
             },
         },
         SessionChange::MessageAdded {

@@ -69,6 +69,9 @@ impl SessionStore {
                 // the child's creation and no commit delivers its Turn.
                 started_at: Some(timestamp),
                 settled_at: None,
+                usage: None,
+                cost: None,
+                cost_basis: None,
             }],
             messages: Vec::new(),
             activities: Vec::new(),

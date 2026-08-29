@@ -29,12 +29,12 @@ use suru::{
         ManagedClient, ManagedClientConfig, ManagedEvent, SessionEvent, SessionSubscription,
     },
     protocol::{
-        Activity, ActivityId, ActivityStatus, CommandAutoExpand, CreateSessionRequest,
-        EffectiveSettings, FileChange, FoldPosture, InitialPrompt, Message, MessageId, MessageRole,
-        MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
-        ReasoningVisibility, SessionChange, SessionId, SessionRevision, SessionStatus,
-        SessionUpdate, SettingsSnapshot, TranscriptItem, TranscriptSettings, Turn, TurnId,
-        TurnStatus, Workspace,
+        Activity, ActivityId, ActivityStatus, CommandAutoExpand, Cost, CostBasis,
+        CreateSessionRequest, EffectiveSettings, FileChange, FoldPosture, InitialPrompt, Message,
+        MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder,
+        PromptStatus, ReasoningVisibility, SessionChange, SessionId, SessionRevision,
+        SessionStatus, SessionTimestamp, SessionUpdate, SettingsSnapshot, TranscriptItem,
+        TranscriptSettings, Turn, TurnId, TurnStatus, Usage, Workspace,
     },
     server::{AgentOutput, ServerConfig},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId},
@@ -567,6 +567,9 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                         status: TurnStatus::Active,
                         started_at: None,
                         settled_at: None,
+                        usage: None,
+                        cost: None,
+                        cost_basis: None,
                     },
                 },
                 SessionChange::MessageAdded {
@@ -1464,6 +1467,9 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                             status: TurnStatus::Active,
                             started_at: None,
                             settled_at: None,
+                            usage: None,
+                            cost: None,
+                            cost_basis: None,
                         },
                     },
                     SessionChange::MessageAdded {
@@ -5585,6 +5591,55 @@ fn settled_turn_session(
     snapshot
 }
 
+#[test]
+fn a_settled_turn_fold_marker_renders_duration_blended_tokens_and_cost() {
+    let workspace = workspace_dir();
+    let mut snapshot = settled_turn_session(
+        workspace.path(),
+        "Measure the workflow",
+        "The workflow is measured.",
+    );
+    snapshot.turns[0].started_at = Some(SessionTimestamp(1_755_000_000_000));
+    snapshot.turns[0].settled_at = Some(SessionTimestamp(1_755_000_012_000));
+    let mut duration_only = connected_application(workspace.path());
+    duration_only
+        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .expect("attach a settled Turn without Usage");
+    let duration_only_rows = rendered_application_rows_at(&duration_only, 80, 24).join("\n");
+    assert!(
+        duration_only_rows.contains("✓ Worked for 12s"),
+        "a Turn without Usage retains its duration marker: {duration_only_rows}"
+    );
+    assert!(!duration_only_rows.contains("tokens"));
+
+    snapshot.turns[0].usage = Some(Usage {
+        fresh_input_tokens: Some(1_200),
+        cache_read_tokens: Some(8_000),
+        cache_write_tokens: Some(400),
+        output_tokens: Some(900),
+        reasoning_tokens: Some(2_100),
+        native_meter: None,
+        model_context_window: Some(200_000),
+    });
+    snapshot.turns[0].cost = Cost::from_usd(0.03);
+    snapshot.turns[0].cost_basis = Some(CostBasis::Reported);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a measured settled Turn");
+
+    let rows = rendered_application_rows_at(&application, 80, 24).join("\n");
+
+    assert!(
+        rows.contains("✓ Worked for 12s · 4.2K tokens · $0.03"),
+        "the marker renders the Turn's compact Usage and frozen Cost: {rows}"
+    );
+    assert!(
+        !rows.contains("12.2K tokens"),
+        "cache traffic stays out of the blended count: {rows}"
+    );
+}
+
 /// Appends a second settled Turn to `snapshot`, so a test can watch what one
 /// Turn Fold does to the Turns around it.
 fn append_settled_turn(
@@ -5601,6 +5656,9 @@ fn append_settled_turn(
         status: TurnStatus::Completed,
         started_at: None,
         settled_at: None,
+        usage: None,
+        cost: None,
+        cost_basis: None,
     });
     for (role, content) in [(MessageRole::User, prompt), (MessageRole::Agent, answer)] {
         let message = Message {
@@ -5919,6 +5977,9 @@ fn newer_turn_begins(
                     status: TurnStatus::Active,
                     started_at: None,
                     settled_at: None,
+                    usage: None,
+                    cost: None,
+                    cost_basis: None,
                 },
             },
             SessionChange::MessageAdded {

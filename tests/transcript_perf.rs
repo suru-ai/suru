@@ -76,6 +76,9 @@ fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
             status: TurnStatus::Completed,
             started_at: None,
             settled_at: None,
+            usage: None,
+            cost: None,
+            cost_basis: None,
         });
         snapshot.messages.extend([
             Message {

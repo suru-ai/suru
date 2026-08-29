@@ -162,6 +162,7 @@ fn agent_output_turn_id(
     change: &SessionChange,
 ) -> anyhow::Result<TurnId> {
     match change {
+        SessionChange::TurnUsageChanged { turn_id, .. } => Ok(*turn_id),
         SessionChange::MessageAdded { message } if message.role == MessageRole::Agent => {
             Ok(message.turn_id)
         }

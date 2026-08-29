@@ -43,7 +43,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     ansi::{AnsiScanner, FragmentRole, sgr_parameter_code, sgr_parameters},
     protocol::{
-        Activity, ActivityId, FileChange, FoldPosture, InitialPrompt, Message, MessageId,
+        Activity, ActivityId, Cost, FileChange, FoldPosture, InitialPrompt, Message, MessageId,
         MessageRole, PromptId, ReasoningVisibility, SessionId, SessionRevision, SessionSnapshot,
         SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus, skill_marker_matches,
     },
@@ -804,14 +804,15 @@ impl RenderUnit<'_> {
                 true.hash(&mut hasher);
                 hasher.finish()
             }
-            // A Turn Fold's marker says how the Turn settled and how long it
-            // took, and answers a click by how its fold stands, so those three
-            // are the whole of its rendering input; which Turn it stands for is
-            // already its key.
+            // A Turn Fold's marker says how the Turn settled, how long it
+            // took, and the Usage and Cost it recorded; its fingerprint names
+            // every one so a newer Session revision cannot reuse stale lines.
             Self::TurnFold(marker) => {
                 let mut hasher = std::hash::DefaultHasher::new();
                 (marker.outcome as u64).hash(&mut hasher);
                 marker.duration_ms.hash(&mut hasher);
+                marker.blended_tokens.hash(&mut hasher);
+                marker.cost.hash(&mut hasher);
                 marker.folded.hash(&mut hasher);
                 hasher.finish()
             }
@@ -1062,6 +1063,8 @@ struct TurnMarker {
     /// How long the Turn ran, or `None` when it is missing either of its
     /// timestamps — which is every Turn stored before Suru recorded them.
     duration_ms: Option<u64>,
+    blended_tokens: Option<u64>,
+    cost: Option<Cost>,
     folded: bool,
 }
 
@@ -1073,6 +1076,11 @@ impl TurnMarker {
             turn_id: turn.id,
             outcome,
             duration_ms: turn_duration_ms(turn),
+            blended_tokens: turn
+                .usage
+                .as_ref()
+                .and_then(crate::protocol::Usage::blended_tokens),
+            cost: turn.cost.filter(|cost| !cost.is_zero()),
             folded,
         })
     }
@@ -1082,11 +1090,71 @@ impl TurnMarker {
     /// still says how it ended, just not how long it took.
     fn label(self) -> String {
         let (word, preposition) = self.outcome.phrasing();
-        self.duration_ms.map_or_else(
+        let mut label = self.duration_ms.map_or_else(
             || word.to_owned(),
             |duration_ms| format!("{word} {preposition} {}", humanized_duration(duration_ms)),
-        )
+        );
+        if let Some(tokens) = self.blended_tokens {
+            label.push_str(&format!(" · {} tokens", compact_count(tokens)));
+        }
+        if let Some(cost) = self.cost {
+            label.push_str(&format!(" · {}", compact_cost(cost)));
+        }
+        label
     }
+}
+
+fn compact_count(value: u64) -> String {
+    if value < 1_000 {
+        return value.to_string();
+    }
+    let (divisor, suffix) = if value >= 1_000_000_000_000 {
+        (1_000_000_000_000.0, "T")
+    } else if value >= 1_000_000_000 {
+        (1_000_000_000.0, "B")
+    } else if value >= 1_000_000 {
+        (1_000_000.0, "M")
+    } else {
+        (1_000.0, "K")
+    };
+    let scaled = value as f64 / divisor;
+    let precision = if scaled < 10.0 {
+        2
+    } else if scaled < 100.0 {
+        1
+    } else {
+        0
+    };
+    format!(
+        "{}{suffix}",
+        trim_fractional_zeros(format!("{scaled:.precision$}"))
+    )
+}
+
+fn compact_cost(cost: Cost) -> String {
+    let usd = cost.as_usd();
+    let precision = if usd >= 0.01 {
+        2
+    } else if usd >= 0.001 {
+        3
+    } else if usd >= 0.0001 {
+        4
+    } else {
+        return "<$0.0001".to_owned();
+    };
+    format!("${}", trim_fractional_zeros(format!("{usd:.precision$}")))
+}
+
+fn trim_fractional_zeros(mut value: String) -> String {
+    if value.contains('.') {
+        while value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
+        }
+    }
+    value
 }
 
 /// How long a Turn ran: the span between the commit that delivered its opening
@@ -3918,10 +3986,10 @@ mod tests {
 
     use crate::{
         protocol::{
-            Activity, ActivityId, ActivityStatus, FileChange, Message, MessageId, MessageRole,
-            MessageStatus, ModelAvailability, PromptId, ReasoningVisibility, Session,
+            Activity, ActivityId, ActivityStatus, Cost, FileChange, Message, MessageId,
+            MessageRole, MessageStatus, ModelAvailability, PromptId, ReasoningVisibility, Session,
             SessionRevision, SessionSnapshot, SessionStatus, SessionTimestamp, TranscriptItem,
-            Turn, TurnId, TurnStatus, Workspace,
+            Turn, TurnId, TurnStatus, Usage, Workspace,
         },
         theme::Theme,
     };
@@ -4911,6 +4979,9 @@ mod tests {
                 status,
                 started_at: None,
                 settled_at: None,
+                usage: None,
+                cost: None,
+                cost_basis: None,
             });
             snapshot.messages.append(&mut turn.messages);
             snapshot.activities.append(&mut turn.activities);
@@ -5021,6 +5092,57 @@ mod tests {
                 "the marker states how long a {status:?} Turn worked"
             );
         }
+    }
+
+    #[test]
+    fn a_turn_fold_marker_says_the_turns_blended_tokens_and_cost_when_known() {
+        let mut entries = vec![Entry::Message(user_message("measure this work"))];
+        entries.extend(hidden_work());
+        let (mut snapshot, _) = turn_snapshot(vec![(TurnStatus::Completed, entries)]);
+        stamp_turn_durations(&mut snapshot, 12_000);
+        snapshot.turns[0].usage = Some(Usage {
+            fresh_input_tokens: Some(1_200),
+            cache_read_tokens: Some(8_000),
+            cache_write_tokens: Some(400),
+            output_tokens: Some(900),
+            reasoning_tokens: Some(2_100),
+            native_meter: None,
+            model_context_window: None,
+        });
+        snapshot.turns[0].cost = Cost::from_usd(0.03);
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(
+            rows,
+            [
+                "┃ measure this work",
+                "",
+                "  ✓ Worked for 12s · 4.2K tokens · $0.03",
+            ],
+            "the compact token figure excludes cache traffic while Cost stays frozen"
+        );
+    }
+
+    #[test]
+    fn a_turn_fold_marker_hides_a_reported_zero_cost() {
+        let mut entries = vec![Entry::Message(user_message("measure free work"))];
+        entries.extend(hidden_work());
+        let (mut snapshot, _) = turn_snapshot(vec![(TurnStatus::Completed, entries)]);
+        stamp_turn_durations(&mut snapshot, 12_000);
+        snapshot.turns[0].cost = Cost::from_usd(0.0);
+
+        let rows = projected_rows(
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        assert_eq!(rows, ["┃ measure free work", "", "  ✓ Worked for 12s"]);
     }
 
     #[test]
@@ -5453,6 +5575,38 @@ mod tests {
             expanded_rows > folded_rows,
             "the Turn Fold state is a rendering input, so flipping it alone must rebuild the \
              view: {folded_rows} rows folded, {expanded_rows} rows expanded"
+        );
+    }
+
+    #[test]
+    fn the_transcript_cache_rebuilds_a_turn_marker_when_usage_changes() {
+        let mut entries = vec![Entry::Message(user_message("run the tests"))];
+        entries.extend(hidden_work());
+        let (mut snapshot, _) = turn_snapshot(vec![(TurnStatus::Completed, entries)]);
+        stamp_turn_durations(&mut snapshot, 12_000);
+        let cache = TranscriptCache::default();
+        let folds = TranscriptFolds::default();
+        let groups = TranscriptGroups::default();
+        let turns = TranscriptTurnFolds::default();
+
+        let before = projected_view_through(&cache, &snapshot, &folds, &groups, &turns);
+        let before_rows = row_text(&before.window(0, before.row_count()).lines);
+        drop(before);
+
+        snapshot.revision = SessionRevision(snapshot.revision.0 + 1);
+        snapshot.turns[0].usage = Some(Usage {
+            fresh_input_tokens: Some(4_000),
+            output_tokens: Some(200),
+            ..Usage::default()
+        });
+        snapshot.turns[0].cost = Cost::from_usd(0.03);
+        let after = projected_view_through(&cache, &snapshot, &folds, &groups, &turns);
+        let after_rows = row_text(&after.window(0, after.row_count()).lines);
+
+        assert_eq!(before_rows[2], "  ✓ Worked for 12s");
+        assert_eq!(
+            after_rows[2], "  ✓ Worked for 12s · 4.2K tokens · $0.03",
+            "the marker unit's cache key includes every newly rendered field"
         );
     }
 

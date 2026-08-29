@@ -86,6 +86,9 @@ fn child_session_snapshot(
             status: TurnStatus::Active,
             started_at: None,
             settled_at: None,
+            usage: None,
+            cost: None,
+            cost_basis: None,
         }],
         messages: vec![Message {
             id: message_id,

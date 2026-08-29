@@ -80,6 +80,9 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 prompt.status = *status;
             }
             SessionChange::TurnAdded { turn } => {
+                if !turn.has_valid_cost_attribution() {
+                    bail!("Session update added a Turn with a Cost lacking exactly one Cost Basis");
+                }
                 if let Some(prompt_id) = turn.prompt_id
                     && !next.prompts.iter().any(|prompt| prompt.id == prompt_id)
                 {
@@ -106,6 +109,25 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update changed the Provider identity of an active Turn");
                 }
                 turn.agent = Some(agent.clone());
+            }
+            SessionChange::TurnUsageChanged {
+                turn_id,
+                usage,
+                cost,
+                cost_basis,
+            } => {
+                let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {
+                    bail!("Session update referenced an unknown Turn");
+                };
+                if turn.status != TurnStatus::Active {
+                    bail!("Session update recorded Usage on a terminal Turn");
+                }
+                if cost.is_some() != cost_basis.is_some() {
+                    bail!("Session update recorded a Cost without exactly one Cost Basis");
+                }
+                turn.usage = Some(usage.clone());
+                turn.cost = *cost;
+                turn.cost_basis = *cost_basis;
             }
             SessionChange::MessageAdded { message } => {
                 if !next.turns.iter().any(|turn| turn.id == message.turn_id) {
@@ -546,14 +568,14 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::protocol::{
-        ModelAvailability, Prompt, PromptId, PromptOrder, Session, SessionId, SessionRevision,
-        SessionStatus, SessionTimestamp, Turn, TurnId, Workspace,
+        Cost, CostBasis, ModelAvailability, Prompt, PromptId, PromptOrder, Session, SessionId,
+        SessionRevision, SessionStatus, SessionTimestamp, Turn, TurnId, Usage, Workspace,
     };
 
     use super::*;
 
     #[test]
-    fn a_client_reads_turn_timing_off_the_changes_the_server_committed() {
+    fn a_client_reads_turn_timing_and_usage_off_the_changes_the_server_committed() {
         let session_id = SessionId::new();
         let prompt_id = PromptId::new();
         let turn_id = TurnId::new();
@@ -596,6 +618,9 @@ mod tests {
                         status: TurnStatus::Active,
                         started_at: Some(SessionTimestamp(1_755_000_000_000)),
                         settled_at: None,
+                        usage: None,
+                        cost: None,
+                        cost_basis: None,
                     },
                 }],
             },
@@ -612,6 +637,34 @@ mod tests {
             &SessionUpdate {
                 session_id,
                 revision: SessionRevision(3),
+                changes: vec![SessionChange::TurnUsageChanged {
+                    turn_id,
+                    usage: Usage {
+                        fresh_input_tokens: Some(1_200),
+                        output_tokens: Some(900),
+                        ..Usage::default()
+                    },
+                    cost: Cost::from_usd(0.03),
+                    cost_basis: Some(CostBasis::Reported),
+                }],
+            },
+        )
+        .expect("the Provider's Usage lands on the active Turn");
+        assert_eq!(
+            snapshot.turns[0]
+                .usage
+                .as_ref()
+                .and_then(Usage::blended_tokens),
+            Some(2_100)
+        );
+        assert_eq!(snapshot.turns[0].cost, Cost::from_usd(0.03));
+        assert_eq!(snapshot.turns[0].cost_basis, Some(CostBasis::Reported));
+
+        apply_update(
+            &mut snapshot,
+            &SessionUpdate {
+                session_id,
+                revision: SessionRevision(4),
                 changes: vec![SessionChange::TurnStatusChanged {
                     turn_id,
                     status: TurnStatus::Completed,

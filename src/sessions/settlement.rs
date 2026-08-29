@@ -160,6 +160,9 @@ impl SessionStore {
                     // The commit that lands this Turn stamps when it began.
                     started_at: None,
                     settled_at: None,
+                    usage: None,
+                    cost: None,
+                    cost_basis: None,
                 },
             }],
         )?;
@@ -465,6 +468,9 @@ mod tests {
                 status: TurnStatus::Active,
                 started_at: None,
                 settled_at: None,
+                usage: None,
+                cost: None,
+                cost_basis: None,
             }],
             transcript: messages
                 .iter()

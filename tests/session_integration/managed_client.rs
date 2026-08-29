@@ -418,6 +418,9 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
                         status: TurnStatus::Active,
                         started_at: None,
                         settled_at: None,
+                        usage: None,
+                        cost: None,
+                        cost_basis: None,
                     },
                 },
                 SessionChange::MessageAdded {
@@ -605,6 +608,9 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
                         status: TurnStatus::Active,
                         started_at: None,
                         settled_at: None,
+                        usage: None,
+                        cost: None,
+                        cost_basis: None,
                     },
                 },
                 SessionChange::MessageAdded {
@@ -875,6 +881,9 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             status: TurnStatus::Failed,
             started_at: None,
             settled_at: None,
+            usage: None,
+            cost: None,
+            cost_basis: None,
         }],
         messages: vec![Message {
             id: message_id,

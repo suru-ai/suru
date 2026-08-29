@@ -11,9 +11,9 @@ use crate::support::{
 use serde_json::Value;
 use suru::{
     protocol::{
-        Activity, AgentSelection, CreateSessionRequest, InitialPrompt, MessageStatus, ModelId,
-        ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue, PromptId,
-        PromptStatus, ProviderId, TurnStatus, Workspace,
+        Activity, AgentSelection, Cost, CostBasis, CreateSessionRequest, InitialPrompt,
+        MessageStatus, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
+        ModelOptionValue, PromptId, PromptStatus, ProviderId, TurnStatus, Usage, Workspace,
     },
     provider::ClaudeRuntime,
     server::{self, ServerConfig},
@@ -37,6 +37,15 @@ const STREAMED_MESSAGE: &str = r#"      emit '{"type":"system","subtype":"init",
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":1,"result":"Hello from Claude","session_id":"prov-session"}'
 "#;
 
+const REPORTED_USAGE: &str = r#"      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":1,"result":"Measured","session_id":"prov-session","usage":{"input_tokens":1200,"cache_read_input_tokens":300,"cache_creation_input_tokens":400,"output_tokens":900},"total_cost_usd":0.03}'
+"#;
+
+const USAGE_WITHOUT_COST: &str = r#"      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":1,"result":"Measured","session_id":"prov-session","usage":{"input_tokens":20,"output_tokens":5}}'
+"#;
+
+const USAGE_WITH_ZERO_COST: &str = r#"      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":1,"result":"Measured","session_id":"prov-session","usage":{"input_tokens":20,"output_tokens":5},"total_cost_usd":0}'
+"#;
+
 fn selection(model: &str, effort: &str) -> AgentSelection {
     AgentSelection {
         provider: ProviderId::new("claude"),
@@ -48,6 +57,135 @@ fn selection(model: &str, effort: &str) -> AgentSelection {
             },
         }],
     }
+}
+
+#[tokio::test]
+async fn a_terminal_result_records_claudes_usage_and_reported_cost_on_the_turn() {
+    let claude = conversation_fixture(REPORTED_USAGE);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "claude-reported-usage").expect("configure server"),
+        Arc::new(ClaudeRuntime::new(claude.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let client = connect(state_dir.path(), "claude-reported-usage").await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Measure this Turn".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+
+    let settled = settled_session(&client, created.session.id, 0).await;
+    let turn = &settled.turns[0];
+    assert_eq!(
+        turn.usage,
+        Some(Usage {
+            fresh_input_tokens: Some(1_200),
+            cache_read_tokens: Some(300),
+            cache_write_tokens: Some(400),
+            output_tokens: Some(900),
+            reasoning_tokens: None,
+            native_meter: None,
+            model_context_window: None,
+        })
+    );
+    assert_eq!(turn.cost, Cost::from_usd(0.03));
+    assert_eq!(turn.cost_basis, Some(CostBasis::Reported));
+
+    server.shutdown().await.expect("shut the server down");
+    claude.wait_for_exit().await;
+}
+
+#[tokio::test]
+async fn a_terminal_result_without_cost_records_tokens_without_fabricating_zero_cost() {
+    let claude = conversation_fixture(USAGE_WITHOUT_COST);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "claude-usage-without-cost").expect("configure server"),
+        Arc::new(ClaudeRuntime::new(claude.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let client = connect(state_dir.path(), "claude-usage-without-cost").await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Measure tokens only".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+
+    let settled = settled_session(&client, created.session.id, 0).await;
+    let turn = &settled.turns[0];
+    assert_eq!(
+        turn.usage,
+        Some(Usage {
+            fresh_input_tokens: Some(20),
+            output_tokens: Some(5),
+            ..Usage::default()
+        })
+    );
+    assert_eq!(turn.cost, None);
+    assert_eq!(turn.cost_basis, None);
+
+    server.shutdown().await.expect("shut the server down");
+    claude.wait_for_exit().await;
+}
+
+#[tokio::test]
+async fn a_terminal_result_reporting_zero_cost_keeps_it_distinct_from_unknown() {
+    let claude = conversation_fixture(USAGE_WITH_ZERO_COST);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "claude-usage-with-zero-cost")
+            .expect("configure server"),
+        Arc::new(ClaudeRuntime::new(claude.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let client = connect(state_dir.path(), "claude-usage-with-zero-cost").await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Measure a free Turn".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+
+    let settled = settled_session(&client, created.session.id, 0).await;
+    let turn = &settled.turns[0];
+    assert_eq!(turn.cost, Cost::from_usd(0.0));
+    assert_eq!(turn.cost_basis, Some(CostBasis::Reported));
+
+    server.shutdown().await.expect("shut the server down");
+    claude.wait_for_exit().await;
 }
 
 #[tokio::test]
