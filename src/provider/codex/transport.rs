@@ -29,11 +29,11 @@ use super::{
     codex_error, codex_error_context, concise_remote_message,
     wire::{
         ClientError, ClientErrorResponse, ClientInfo, ClientNotification, ClientRequest,
-        FileChangeUpdatedParams, IncomingMessage, InitializeCapabilities, InitializeParams,
-        ItemDeltaParams, ItemNotificationParams, NativeCodexErrorInfo, NativeItem,
-        NativeNotification, NativeTurnFailureKind, NativeTurnOutcome, NativeTurnStatus,
-        ReasoningSectionBreakParams, ReasoningSummaryDeltaParams, RequestId,
-        ThreadSettingsUpdatedParams, TurnCompletedParams,
+        CompletedNativeAgentMessage, FileChangeUpdatedParams, IncomingMessage,
+        InitializeCapabilities, InitializeParams, ItemDeltaParams, ItemNotificationParams,
+        NativeCodexErrorInfo, NativeItem, NativeNotification, NativeTurnFailureKind,
+        NativeTurnOutcome, NativeTurnStatus, ReasoningSectionBreakParams,
+        ReasoningSummaryDeltaParams, RequestId, ThreadSettingsUpdatedParams, TurnCompletedParams,
     },
 };
 use crate::provider::{
@@ -613,6 +613,12 @@ fn decode_notification(
         }
         "turn/completed" => {
             let params: TurnCompletedParams = decode_notification_params(method, params)?;
+            let final_agent_message = params.turn.items.into_iter().rev().find_map(|item| {
+                let NativeItem::AgentMessage { id, text } = item else {
+                    return None;
+                };
+                Some(CompletedNativeAgentMessage { item_id: id, text })
+            });
             let outcome = match params.turn.status {
                 NativeTurnStatus::Completed => NativeTurnOutcome::Completed,
                 NativeTurnStatus::Interrupted => NativeTurnOutcome::Interrupted,
@@ -649,6 +655,7 @@ fn decode_notification(
                 thread_id: params.thread_id,
                 turn_id: params.turn.id,
                 outcome,
+                final_agent_message,
             }))
         }
         _ => Ok(None),

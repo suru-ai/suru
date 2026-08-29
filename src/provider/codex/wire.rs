@@ -699,6 +699,8 @@ pub(super) struct CompletedNativeTurn {
     pub(super) id: String,
     pub(super) status: NativeTurnStatus,
     pub(super) error: Option<NativeTurnError>,
+    #[serde(default)]
+    pub(super) items: Vec<NativeItem>,
 }
 
 #[derive(Deserialize)]
@@ -761,6 +763,14 @@ where
 }
 
 // Decoded notifications.
+
+/// The final Agent Message repeated in a successful `turn/completed`
+/// notification. Codex carries it as a summary fallback for clients that did
+/// not observe the canonical item completion.
+pub(super) struct CompletedNativeAgentMessage {
+    pub(super) item_id: String,
+    pub(super) text: String,
+}
 
 /// A Codex notification Suru understands, decoded out of its wire params.
 pub(super) enum NativeNotification {
@@ -858,6 +868,7 @@ pub(super) enum NativeNotification {
         thread_id: String,
         turn_id: String,
         outcome: NativeTurnOutcome,
+        final_agent_message: Option<CompletedNativeAgentMessage>,
     },
     /// A collab tool call completing on `thread_id` — a spawn naming the child
     /// threads it opened, or any later call carrying Codex's view of the

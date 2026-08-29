@@ -1005,6 +1005,29 @@ async fn scripted_codex_uses_completed_agent_text_when_no_deltas_arrive() {
     .await;
 }
 
+#[tokio::test]
+async fn scripted_codex_uses_the_turns_final_message_when_item_completion_is_missing() {
+    let final_message_fallback = SCRIPTED_CODEX
+        .replace(
+            "      printf '%s\\n' '{\"method\":\"item/completed\",\"params\":{\"threadId\":\"native-thread\",\"turnId\":\"native-turn\",\"item\":{\"type\":\"agentMessage\",\"id\":\"native-message\",\"text\":\"Hello from Codex\"},\"futureField\":true}}'\n",
+            "",
+        )
+        .replace(
+            "      printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"native-thread\",\"turn\":{\"id\":\"native-turn\",\"status\":\"completed\",\"items\":[],\"futureField\":true},\"futureField\":true}}'",
+            "      printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"native-thread\",\"turn\":{\"id\":\"native-turn\",\"status\":\"completed\",\"items\":[{\"type\":\"agentMessage\",\"id\":\"native-message\",\"text\":\"Hello from Codex\"}],\"futureField\":true},\"futureField\":true}}'",
+        );
+
+    run_terminal_fixture(
+        &final_message_fallback,
+        "codex-scripted-final-message-fallback",
+        TurnStatus::Completed,
+        None,
+        ActivityStatus::Completed,
+        Some(0),
+    )
+    .await;
+}
+
 async fn run_terminal_fixture(
     script: &str,
     channel: &str,

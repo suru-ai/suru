@@ -639,7 +639,15 @@ fn project_native_notification(
             thread_id,
             turn_id,
             outcome,
-        } => project_turn_completed(correlation, &thread_id, &turn_id, outcome).map(owning),
+            final_agent_message,
+        } => project_turn_completed(
+            correlation,
+            &thread_id,
+            &turn_id,
+            outcome,
+            final_agent_message,
+        )
+        .map(owning),
         NativeNotification::CollabCallCompleted {
             thread_id,
             tool,
@@ -1342,9 +1350,27 @@ fn project_turn_completed(
     thread_id: &str,
     turn_id: &str,
     outcome: NativeTurnOutcome,
+    final_agent_message: Option<super::wire::CompletedNativeAgentMessage>,
 ) -> Result<Vec<ProviderEvent>, ProviderError> {
     if !correlation.is_active_turn(thread_id, turn_id) {
         return Ok(Vec::new());
+    }
+    let mut events = Vec::new();
+    if matches!(&outcome, NativeTurnOutcome::Completed)
+        && correlation.root.active_agent_message.is_some()
+        && let Some(final_agent_message) = final_agent_message
+    {
+        events.extend(
+            project_agent_message_completed(
+                correlation,
+                thread_id,
+                turn_id,
+                &final_agent_message.item_id,
+                &final_agent_message.text,
+            )?
+            .into_iter()
+            .map(|attributed| attributed.event),
+        );
     }
     let selection_rejected = match (&outcome, &correlation.active_selection) {
         (NativeTurnOutcome::Failed { message, kind }, Some(selection)) => {
@@ -1353,14 +1379,15 @@ fn project_turn_completed(
         _ => false,
     };
     correlation.settle_turn();
-    Ok(vec![match outcome {
+    events.push(match outcome {
         NativeTurnOutcome::Completed => ProviderEvent::TurnCompleted,
         NativeTurnOutcome::Interrupted => ProviderEvent::TurnInterrupted,
         NativeTurnOutcome::Failed { message, .. } if selection_rejected => {
             ProviderEvent::AgentSelectionRejected { message }
         }
         NativeTurnOutcome::Failed { message, .. } => ProviderEvent::TurnFailed { message },
-    }])
+    });
+    Ok(events)
 }
 
 /// Decides whether a failed native Turn was Codex refusing the Agent Selection it was given.
