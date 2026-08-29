@@ -17,6 +17,7 @@ mod sidebar;
 mod slots;
 mod spinner;
 mod state;
+mod subagent_picker;
 mod transcript;
 
 pub use commands::{NumericDigit, SemanticCommandId};

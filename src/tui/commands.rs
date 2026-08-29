@@ -44,6 +44,7 @@ pub enum SemanticCommandId {
     SettingsNumericDeleteBackward,
     SettingsNumericApply,
     SettingsNumericCancel,
+    SubagentList,
     SubagentOpen,
     SubagentLeave,
     TranscriptFoldsToggle,
@@ -205,6 +206,7 @@ impl SemanticCommandId {
             Self::SettingsNumericDeleteBackward => "settings.numeric.delete-backward",
             Self::SettingsNumericApply => "settings.numeric.apply",
             Self::SettingsNumericCancel => "settings.numeric.cancel",
+            Self::SubagentList => "subagent.list",
             Self::SubagentOpen => "subagent.open",
             Self::SubagentLeave => "subagent.leave",
             Self::TranscriptFoldsToggle => "transcript.folds.toggle",
@@ -619,6 +621,17 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::SettingsClose,
         title: "Close Settings",
         description: "Leave the settings panel",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SubagentList,
+        title: "Browse Subagents",
+        description: "Open the Subagent Picker over the open Session's working Subagents",
+        // The picker opens from the down arrow's one free meaning — Down with
+        // no caret movement or history walk left to make — which only the
+        // surface holding the key can tell, so no direct binding or slash
+        // stands here.
         slash: None,
         keybinding: None,
     },

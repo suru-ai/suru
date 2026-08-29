@@ -43,6 +43,7 @@ use super::{
     },
     spinner,
     state::{CommandId, CommandMode, QueuedPrompt, TranscriptViewport, TuiState},
+    subagent_picker::working_subagents,
     transcript::TranscriptDisclosure,
 };
 
@@ -93,6 +94,9 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     // The Sidebar's own frame record, given up for the same reason: whether it
     // has the keys depends on whether the frame had the columns to draw it.
     state.sidebar.forget_frame();
+    // The Subagent Picker's rows are pointable, so its record of where they
+    // were drawn starts over with the frame as well.
+    state.subagent_picker.forget_frame();
     if terminal_is_too_small(frame.area()) {
         render_terminal_too_small(frame, &theme);
         return;
@@ -105,6 +109,12 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     };
     if state.composer_completion.is_visible() && !state.reconnect_overlay_visible {
         render_composer_completion(frame, state, composer.area, &theme);
+    }
+    // The Subagent Picker docks over the composer the way the completion list
+    // does: it belongs to the composer's place on screen, not to the main
+    // view's center.
+    if state.subagent_picker.is_open() && !state.reconnect_overlay_visible {
+        render_subagent_picker(frame, state, composer.area, &theme);
     }
     // The Sidebar's own context menu, drawn over the column and whatever of
     // the main view it runs into, because it stands in front of the row it was
@@ -138,6 +148,7 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
         && !state.model_options.is_open()
         && !state.settings_panel.is_open()
         && !state.sidebar.menu_is_open()
+        && !state.subagent_picker.is_open()
         && state.composer_focused()
         && matches!(state.command_mode, CommandMode::Composer)
         // The frame may have drawn no composer at all — a Subagent's Session
@@ -1043,6 +1054,109 @@ fn render_composer_completion(
         )
     } else {
         Paragraph::new(rows).style(theme.surface.overlay)
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+/// Draws the Subagent Picker docked over the composer, as the completion list
+/// docks: bordered while the rows above the composer allow it, borderless when
+/// they are scarce. The working Subagents stand as the tree they spawned in,
+/// the Spinner ticking on every entry, and each row's place is recorded as it
+/// lands so the pointer answers exactly what is on screen.
+fn render_subagent_picker(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    composer_area: Rect,
+    theme: &Theme,
+) {
+    let Some(snapshot) = state.session.as_ref().map(SessionProjection::snapshot) else {
+        return;
+    };
+    let entries = working_subagents(snapshot);
+    if entries.is_empty() {
+        return;
+    }
+    let selected = state.subagent_picker.selected();
+    let width = composer_area.width.clamp(1, 72);
+    let room_above = composer_area.y.saturating_sub(frame.area().y);
+    let bordered = room_above >= 3;
+    // One footer line naming the keys, kept only while every entry fits
+    // beside it: the rows are what the picker is for.
+    let desired_rows = (entries.len() as u16).saturating_add(1);
+    let height = if bordered {
+        desired_rows.saturating_add(2).min(room_above)
+    } else {
+        desired_rows.min(room_above.max(1))
+    };
+    let content_height = usize::from(height.saturating_sub(if bordered { 2 } else { 0 }));
+    let shows_footer = content_height > entries.len();
+    let row_capacity = content_height
+        .saturating_sub(usize::from(shows_footer))
+        .max(1);
+    let x = composer_area
+        .x
+        .saturating_add(composer_area.width.saturating_sub(width) / 2);
+    let y = composer_area.y.saturating_sub(height).max(frame.area().y);
+    let area = Rect::new(x, y, width, height);
+    let content_width = width.saturating_sub(if bordered { 2 } else { 0 });
+    let content_x = x.saturating_add(u16::from(bordered));
+    let content_y = y.saturating_add(u16::from(bordered));
+    // The window slides to keep the entry the reader is on in view when the
+    // tree outgrows the rows above the composer.
+    let selected_index = entries
+        .iter()
+        .position(|entry| Some(entry.session_id) == selected)
+        .unwrap_or(0);
+    let start = selected_index
+        .saturating_add(1)
+        .saturating_sub(row_capacity);
+    let mut lines = Vec::with_capacity(content_height);
+    for (index, entry) in entries.iter().enumerate().skip(start).take(row_capacity) {
+        let guide = if index + 1 == entries.len() {
+            "└"
+        } else {
+            "├"
+        };
+        let content = truncate_to_width(
+            &format!(
+                "{guide} {} {}: {}",
+                spinner::frame(state.spinner_frame),
+                entry.name,
+                entry.description
+            ),
+            usize::from(content_width),
+        );
+        state.subagent_picker.record_row(
+            content_y.saturating_add(lines.len() as u16),
+            content_x..content_x.saturating_add(content_width),
+            entry.session_id,
+        );
+        lines.push(Line::styled(
+            content,
+            if Some(entry.session_id) == selected {
+                theme.selection.focused
+            } else {
+                theme.text.primary
+            },
+        ));
+    }
+    if shows_footer {
+        lines.push(Line::styled(
+            truncate_to_width("Enter open · Esc close", usize::from(content_width)),
+            theme.text.subdued,
+        ));
+    }
+    let paragraph = if bordered {
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Subagents ")
+                .border_style(theme.border.default)
+                .style(theme.surface.overlay),
+        )
+    } else {
+        Paragraph::new(lines).style(theme.surface.overlay)
     };
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);

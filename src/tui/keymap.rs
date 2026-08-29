@@ -79,6 +79,14 @@ pub(super) fn command_for_subagent_view_event(event: InputEvent) -> Option<Comma
                 (KeyCode::Esc, KeyModifiers::NONE) => {
                     Some(CommandId::InvokeSemantic(SemanticCommandId::SubagentLeave))
                 }
+                // Down has no composer to serve here, so it carries its one
+                // remaining meaning: browsing the Subagents this Session has
+                // working, which is how a reader walks a subtree level by
+                // level. With nothing to browse the command leaves the view
+                // put, so the key stays as inert as it was.
+                (KeyCode::Down, KeyModifiers::NONE) => {
+                    Some(CommandId::InvokeSemantic(SemanticCommandId::SubagentList))
+                }
                 (KeyCode::PageUp, KeyModifiers::NONE) => Some(CommandId::ScrollTranscriptPageUp),
                 (KeyCode::PageDown, KeyModifiers::NONE) => {
                     Some(CommandId::ScrollTranscriptPageDown)
@@ -91,6 +99,35 @@ pub(super) fn command_for_subagent_view_event(event: InputEvent) -> Option<Comma
                 _ => None,
             }
         }
+        _ => None,
+    }
+}
+
+/// The Subagent Picker is the newest thing on screen while it is up, so it
+/// has the keys: the arrows walk its entries, Enter opens the Session of the
+/// one the reader is on, and Esc puts the picker away leaving everything
+/// beneath it exactly as it was. A letter typed at it reaches nothing — the
+/// picker offers the working Subagents, not a search — and the mouse answers
+/// as it does everywhere else, because a press outside the picker is how a
+/// reader dismisses one.
+pub(super) fn command_for_subagent_picker_event(event: InputEvent) -> Option<CommandId> {
+    let key = match event {
+        InputEvent::Key(key) => key,
+        event @ InputEvent::Mouse(_) => return command_for_terminal_event(event),
+        _ => return None,
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            Some(CommandId::SelectPreviousSubagent)
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            Some(CommandId::SelectNextSubagent)
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => Some(CommandId::OpenSelectedSubagent),
+        (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::CloseSubagentPicker),
         _ => None,
     }
 }

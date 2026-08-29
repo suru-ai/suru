@@ -171,6 +171,16 @@ impl ComposerMemory {
         self.composer_mut(key).history_next();
     }
 
+    /// Whether Down would do nothing in this composer: the caret already rests
+    /// on the last line and no history walk is in progress. That one free
+    /// meaning is the only one another surface may take, so caret movement and
+    /// history navigation always keep theirs.
+    pub(super) fn down_is_inert(&self, key: ComposerKey) -> bool {
+        self.composers
+            .get(&key)
+            .is_none_or(ComposerState::down_is_inert)
+    }
+
     pub(super) fn clear(&mut self, key: ComposerKey) {
         self.composer_mut(key).clear();
     }
@@ -472,6 +482,10 @@ impl ComposerState {
         self.text.clone_from(&self.history[position]);
         self.skill_bindings.clear();
         self.cursor = self.text.len();
+    }
+
+    fn down_is_inert(&self) -> bool {
+        self.line_end() == self.text.len() && self.history_position.is_none()
     }
 
     fn history_next(&mut self) {

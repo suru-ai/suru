@@ -34,7 +34,8 @@ use super::{
         command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
         command_for_numeric_editor_event, command_for_queued_prompt_event,
         command_for_session_picker_event, command_for_settings_panel_event,
-        command_for_sidebar_event, command_for_sidebar_menu_event, command_for_subagent_view_event,
+        command_for_sidebar_event, command_for_sidebar_menu_event,
+        command_for_subagent_picker_event, command_for_subagent_view_event,
         command_for_terminal_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
@@ -45,6 +46,7 @@ use super::{
     settings_panel::{AvailabilityRead, SettingsPanel},
     sidebar::{Sidebar, SidebarActivation, SidebarPress},
     slots::RenderSlots,
+    subagent_picker::{SubagentPicker, working_subagents},
     transcript::{
         FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups,
         TranscriptTurnFolds, UnitKey, UnitStart,
@@ -277,6 +279,7 @@ pub struct TuiState {
     pub(super) model_options: ModelOptions,
     pub(super) model_picker: ModelPicker,
     pub(super) session_picker: SessionPicker,
+    pub(super) subagent_picker: SubagentPicker,
     pub(super) sidebar: Sidebar,
     pub(super) settings_panel: SettingsPanel,
 }
@@ -375,6 +378,7 @@ impl TuiState {
             model_options: ModelOptions::default(),
             model_picker: ModelPicker::default(),
             session_picker: SessionPicker::new(workspace.clone()),
+            subagent_picker: SubagentPicker::default(),
             sidebar: Sidebar::new(workspace),
             settings_panel: SettingsPanel::default(),
         }
@@ -733,6 +737,7 @@ impl TuiState {
         self.reconcile_failed_submissions();
         self.reconcile_pending_steers();
         self.reconcile_command_mode();
+        self.reconcile_subagent_picker();
         Ok(())
     }
 
@@ -747,6 +752,12 @@ impl TuiState {
     }
 
     fn hydrate_session(&mut self, snapshot: SessionSnapshot) {
+        // The picker browses the Session that was open, so a swap to another
+        // one takes it away rather than leaving it standing over rows it
+        // never offered.
+        if self.session.as_ref().map(SessionProjection::session_id) != Some(snapshot.session.id) {
+            self.subagent_picker.close();
+        }
         self.ensure_interaction(snapshot.session.id);
         self.submission_error = None;
         self.session = Some(SessionProjection::new(snapshot));
@@ -770,6 +781,48 @@ impl TuiState {
         self.session
             .as_ref()
             .and_then(|session| session.snapshot().session.parent)
+    }
+
+    /// The child Sessions of the open Session's working Subagents, in the
+    /// order they spawned — the entries the Subagent Picker browses.
+    fn working_subagent_ids(&self) -> Vec<SessionId> {
+        self.session.as_ref().map_or_else(Vec::new, |session| {
+            working_subagents(session.snapshot())
+                .iter()
+                .map(|subagent| subagent.session_id)
+                .collect()
+        })
+    }
+
+    /// Opens the Subagent Picker over the open Session's working Subagents.
+    /// With nothing to browse the ask leaves the view put, which is what
+    /// keeps the key carrying it inert.
+    pub(super) fn open_subagent_picker(&mut self) {
+        let working = self.working_subagent_ids();
+        self.subagent_picker.open_over(&working);
+    }
+
+    fn move_subagent_selection(&mut self, distance: isize) {
+        let working = self.working_subagent_ids();
+        self.subagent_picker.move_selection(&working, distance);
+    }
+
+    /// The Subagent the picker stands on, provided it is still working — the
+    /// only kind of entry the picker offers to open.
+    fn selected_working_subagent(&self) -> Option<SessionId> {
+        let selected = self.subagent_picker.selected()?;
+        self.working_subagent_ids()
+            .contains(&selected)
+            .then_some(selected)
+    }
+
+    fn reconcile_subagent_picker(&mut self) {
+        let working = self.working_subagent_ids();
+        self.subagent_picker.reconcile(&working);
+    }
+
+    fn composer_down_is_inert(&self) -> bool {
+        self.composers.down_is_inert(self.composer_key())
     }
 
     pub(super) fn agent_selection(&self) -> Option<&AgentSelection> {
@@ -1449,6 +1502,10 @@ pub enum CommandId {
     PageNextModels,
     SelectModel,
     CloseModelPicker,
+    SelectPreviousSubagent,
+    SelectNextSubagent,
+    OpenSelectedSubagent,
+    CloseSubagentPicker,
     /// Where in the settings panel the reader pointed, which the panel resolves
     /// against the geometry the frame in force drew.
     FocusSettingsPanelAt {
@@ -1695,6 +1752,10 @@ impl Application {
             | CommandId::PageNextModels
             | CommandId::SelectModel
             | CommandId::CloseModelPicker) => self.handle_model_picker_command(command),
+            command @ (CommandId::SelectPreviousSubagent
+            | CommandId::SelectNextSubagent
+            | CommandId::OpenSelectedSubagent
+            | CommandId::CloseSubagentPicker) => self.handle_subagent_picker_command(command),
             CommandId::FocusSettingsPanelAt { column, screen_row } => {
                 let read =
                     self.state
@@ -1768,9 +1829,19 @@ impl Application {
             CommandId::HistoryPrevious => self
                 .state
                 .restore_composer_history(|composers, key| composers.history_previous(key)),
-            CommandId::HistoryNext => self
-                .state
-                .restore_composer_history(|composers, key| composers.history_next(key)),
+            // Down serves the composer first — caret movement within the
+            // draft, then the history walk — and the Subagent Picker takes
+            // exactly the key's one free meaning: Down at rest, which today
+            // does nothing. With nothing to browse the open ask leaves the
+            // view put, so the key stays as inert as it was.
+            CommandId::HistoryNext => {
+                if self.state.composer_down_is_inert() {
+                    self.state.open_subagent_picker();
+                } else {
+                    self.state
+                        .restore_composer_history(|composers, key| composers.history_next(key));
+                }
+            }
             _ => {}
         }
         if may_retry_skills && let Some(request) = self.state.skill_catalog_retry_request() {
@@ -1808,6 +1879,20 @@ impl Application {
     /// order they were drawn: the Sidebar owns the columns it drew, and a
     /// press it does not claim falls through to the Transcript beside it.
     fn handle_press(&mut self, position: Position) -> Result<ApplicationTransition> {
+        // The Subagent Picker stands over everything below while it is up, so
+        // it answers first: a press on one of its rows opens the Subagent the
+        // row names — the same command Enter invokes — and a press anywhere
+        // else puts the picker away, as it does for the Sidebar's menu.
+        if self.state.subagent_picker.is_open() {
+            let pressed = self.state.subagent_picker.hit(position);
+            self.state.subagent_picker.close();
+            return match pressed {
+                Some(session_id) => {
+                    self.invoke_semantic(SemanticCommandId::SubagentOpen.on_session(session_id))
+                }
+                None => Ok(ApplicationTransition::Continue),
+            };
+        }
         let press = self.state.sidebar.press_at(position);
         if press != SidebarPress::Elsewhere {
             return self.answer_sidebar_press(press);
@@ -1826,6 +1911,28 @@ impl Application {
             SidebarPress::Invoke(invocation) => self.invoke_semantic(invocation),
             SidebarPress::Answered | SidebarPress::Elsewhere => Ok(ApplicationTransition::Continue),
         }
+    }
+
+    /// Handles the Subagent Picker's commands; any other command leaves the
+    /// picker alone.
+    fn handle_subagent_picker_command(
+        &mut self,
+        command: CommandId,
+    ) -> Result<ApplicationTransition> {
+        match command {
+            CommandId::SelectPreviousSubagent => self.state.move_subagent_selection(-1),
+            CommandId::SelectNextSubagent => self.state.move_subagent_selection(1),
+            CommandId::CloseSubagentPicker => self.state.subagent_picker.close(),
+            CommandId::OpenSelectedSubagent => {
+                if let Some(session_id) = self.state.selected_working_subagent() {
+                    self.state.subagent_picker.close();
+                    return self
+                        .invoke_semantic(SemanticCommandId::SubagentOpen.on_session(session_id));
+                }
+            }
+            _ => {}
+        }
+        Ok(ApplicationTransition::Continue)
     }
 
     /// Handles composer completion commands; any other command leaves the
@@ -2453,6 +2560,13 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::Continue)
             }
+            // The picker opens only while the open Session has working
+            // Subagents, so with nothing to browse the invocation leaves the
+            // view put and the key that carried it stays inert.
+            SemanticCommandId::SubagentList => {
+                self.state.open_subagent_picker();
+                Ok(ApplicationTransition::Continue)
+            }
             // The child Session is the command's subject, so an invocation
             // that names none has nothing to open and leaves the view put.
             SemanticCommandId::SubagentOpen => Ok(match invocation.subject {
@@ -2924,6 +3038,13 @@ impl Application {
         // out of it without reaching for the mouse again.
         if self.state.sidebar.menu_is_open() {
             return command_for_sidebar_menu_event(event);
+        }
+        // The Subagent Picker docks over the composer and is the newest
+        // surface while it is up, so it outranks the composer's own surfaces
+        // and the Subagent view's reading keys — Escape must close the picker
+        // before it can mean anything else.
+        if self.state.subagent_picker.is_open() {
+            return command_for_subagent_picker_event(event);
         }
         // The Sidebar comes after every overlay and before the composer's own
         // surfaces: it stands beside the main view rather than over it, so an
