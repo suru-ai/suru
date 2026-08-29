@@ -4,7 +4,7 @@
 //! refresh after the user fixes it outside Suru.
 
 use crate::support::{
-    CLAUDE_MODELS, CLAUDE_VERSION_FLOOR, SIGNED_IN_ACCOUNT, SIGNED_OUT_ACCOUNT, ScriptedClaude,
+    CLAUDE_MODELS, CLAUDE_SUGGESTED_VERSION, SIGNED_IN_ACCOUNT, SIGNED_OUT_ACCOUNT, ScriptedClaude,
     after_probe, claude_catalog, connect, crashing_list_models_arm, hosting, hosting_runtime,
     initialize_arm, list_models_arm, probe_arms, settled_session, signed_out_initialize_arm,
     silent_version_arm, unknown_version_request_arm, upgradable_version_arm, version_arm,
@@ -77,7 +77,7 @@ async fn a_missing_claude_binary_is_reported_as_not_installed_until_it_is_instal
 }
 
 #[tokio::test]
-async fn a_cli_below_the_version_floor_is_reported_as_incompatible_until_it_is_upgraded() {
+async fn a_cli_below_the_suggested_version_warns_without_withholding_models() {
     let claude = ScriptedClaude::new(&format!(
         "{}{}{}",
         upgradable_version_arm(),
@@ -90,25 +90,32 @@ async fn a_cli_below_the_version_floor_is_reported_as_incompatible_until_it_is_u
     let catalog = client
         .list_models()
         .await
-        .expect("a CLI Suru cannot drive is an answer, not a crash");
-    let (reason, message) = condition(&claude_catalog(&catalog).status);
-    assert_eq!(reason, ProviderUnavailability::IncompatibleVersion);
+        .expect("a readable older CLI is an answer, not a crash");
+    let claude_models = claude_catalog(&catalog);
+    let ProviderCatalogStatus::Warning { message } = &claude_models.status else {
+        panic!(
+            "the older Claude CLI reports advisory guidance, got {:?}",
+            claude_models.status
+        );
+    };
     assert!(
-        message.contains("2.1.236") && message.contains(CLAUDE_VERSION_FLOOR),
-        "the condition names the version the CLI reported and the floor it is under, got: {message}"
+        message.contains("Claude Code CLI 2.1.236")
+            && message.contains("may have compatibility issues")
+            && message.contains(CLAUDE_SUGGESTED_VERSION),
+        "the warning names the reported and suggested versions, got: {message}"
     );
     assert_eq!(
         claude.control_subtypes(),
-        ["get_binary_version"],
-        "a CLI Suru cannot drive is never asked anything else"
+        after_probe(["list_models"]),
+        "a readable older CLI is still checked for sign-in and asked for its Models"
     );
     assert!(
-        claude_catalog(&catalog).models.is_empty(),
-        "an unusable Provider offers no Model for a Session to be started on"
+        !claude_models.models.is_empty(),
+        "the compatibility warning does not disable Claude"
     );
 
-    // No TTL is injected, so the refresh clearing the condition is also what shows an unusable
-    // verdict is never kept: the recovery is the refresh itself, with nothing to wait out.
+    // No TTL is injected: the refresh clearing the warning shows advisory verdicts are not kept,
+    // so updating the CLI needs no restart and nothing to wait out.
     claude.upgrade();
     assert_the_refresh_clears_the_condition(&client).await;
 
@@ -180,7 +187,7 @@ async fn a_cli_that_answers_nothing_at_all_fails_rather_than_naming_a_condition(
 async fn a_cli_no_one_is_signed_in_to_is_reported_as_such_until_the_user_signs_in() {
     let claude = ScriptedClaude::new(&format!(
         "{}{}{}",
-        version_arm(CLAUDE_VERSION_FLOOR),
+        version_arm(CLAUDE_SUGGESTED_VERSION),
         signed_out_initialize_arm(),
         list_models_arm(CLAUDE_MODELS),
     ));
@@ -322,7 +329,7 @@ async fn a_verdict_older_than_the_injected_ttl_is_probed_again() {
 async fn a_turn_reaching_an_unavailable_claude_fails_with_the_condition_leading_the_message() {
     let claude = ScriptedClaude::new(&format!(
         "{}{}{}",
-        version_arm(CLAUDE_VERSION_FLOOR),
+        version_arm(CLAUDE_SUGGESTED_VERSION),
         initialize_arm(SIGNED_OUT_ACCOUNT),
         list_models_arm(CLAUDE_MODELS),
     ));

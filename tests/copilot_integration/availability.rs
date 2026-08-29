@@ -88,7 +88,7 @@ async fn a_cli_holding_no_credentials_is_reported_as_not_signed_in_until_the_use
     );
     assert_eq!(
         copilot.methods(),
-        ["connect", "account.getCurrentAuth"],
+        ["connect", "status.get", "account.getCurrentAuth"],
         "the sign-in state is asked of the CLI at discovery time, \
          and a signed-out CLI is never asked for Models"
     );

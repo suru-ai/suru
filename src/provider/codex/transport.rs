@@ -42,17 +42,14 @@ use crate::provider::{
         HarnessLink, HarnessSpec, ProcessGuard, ProcessRegistry, ProcessStdio,
         spawn_harness_process, supervise_harness_process,
     },
+    version::SuggestedCliVersion,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UNSUPPORTED_INTERACTION_ERROR_CODE: i64 = -32000;
 const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
-const CODEX_WARNING_VERSION: CodexVersion = CodexVersion {
-    major: 0,
-    minor: 150,
-    patch: 1,
-    prerelease: false,
-};
+const CODEX_SUGGESTED_VERSION: SuggestedCliVersion =
+    SuggestedCliVersion::new("Codex CLI", 0, 150, 1);
 
 type PendingResponse = oneshot::Sender<Result<Value, ProviderError>>;
 
@@ -72,48 +69,10 @@ pub(super) struct CodexConnection {
     pub(super) warning: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CodexVersion {
-    major: u64,
-    minor: u64,
-    patch: u64,
-    prerelease: bool,
-}
-
-impl CodexVersion {
-    fn parse(reported: &str) -> Option<Self> {
-        let (core, suffix) = reported
-            .split_once(['-', '+'])
-            .map_or((reported, None), |(core, suffix)| (core, Some(suffix)));
-        let mut parts = core.split('.');
-        let version = Self {
-            major: parts.next()?.parse().ok()?,
-            minor: parts.next()?.parse().ok()?,
-            patch: parts.next()?.parse().ok()?,
-            prerelease: reported.contains('-'),
-        };
-        (parts.next().is_none() && suffix.is_none_or(|suffix| !suffix.is_empty()))
-            .then_some(version)
-    }
-
-    fn is_below(self, floor: Self) -> bool {
-        (self.major, self.minor, self.patch) < (floor.major, floor.minor, floor.patch)
-            || ((self.major, self.minor, self.patch) == (floor.major, floor.minor, floor.patch)
-                && self.prerelease
-                && !floor.prerelease)
-    }
-}
-
 fn codex_version_warning(initialize: &Value) -> Option<String> {
     let user_agent = initialize.get("userAgent")?.as_str()?;
     let reported = user_agent.split_whitespace().next()?.rsplit_once('/')?.1;
-    let version = CodexVersion::parse(reported)?;
-    version.is_below(CODEX_WARNING_VERSION).then(|| {
-        format!(
-            "Codex CLI {reported} may have compatibility issues; update to \
-             Codex CLI 0.150.1 or newer"
-        )
-    })
+    CODEX_SUGGESTED_VERSION.warning_for(reported).ok().flatten()
 }
 
 #[derive(Clone)]

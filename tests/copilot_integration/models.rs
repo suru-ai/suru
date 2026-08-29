@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use crate::{
     provider_support::ControlledProvider,
-    support::{ScriptedCopilot, connect, connect_arm, copilot_catalog, hosting, signed_in_arm},
+    support::{
+        ScriptedCopilot, connect, connect_arm, connect_arm_with_version, copilot_catalog, hosting,
+        models_arm, signed_in_arm,
+    },
 };
 use suru::{
     protocol::{
@@ -31,6 +34,35 @@ const COPILOT_MODELS: &str = concat!(
     r#"{"id":"blocked-fixture","name":"Blocked Fixture","capabilities":{},"#,
     r#""policy":{"state":"disabled"}}]"#,
 );
+
+#[tokio::test]
+async fn a_cli_below_the_suggested_version_warns_without_withholding_models() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}",
+        connect_arm_with_version("1.0.79"),
+        signed_in_arm(),
+        models_arm(COPILOT_MODELS),
+    ));
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let (server, client) = hosting(&copilot, "copilot-old-cli-warning", state_dir.path()).await;
+
+    let catalog = client.list_models().await.expect("discover Copilot Models");
+    let copilot_models = copilot_catalog(&catalog);
+    assert!(
+        !copilot_models.models.is_empty(),
+        "the warning is non-blocking"
+    );
+    assert!(matches!(
+        &copilot_models.status,
+        ProviderCatalogStatus::Warning { message }
+            if message.contains("Copilot CLI 1.0.79")
+                && message.contains("may have compatibility issues")
+                && message.contains("1.0.80 or newer")
+    ));
+
+    server.shutdown().await.expect("shut the server down");
+    copilot.wait_for_exit().await;
+}
 
 fn model<'a>(catalog: &'a ProviderModelCatalog, id: &str) -> &'a ModelDescriptor {
     catalog
@@ -177,6 +209,7 @@ async fn discovery_and_refresh_share_one_stdio_server_process() {
         copilot.methods(),
         [
             "connect",
+            "status.get",
             "account.getCurrentAuth",
             "models.list",
             "account.getCurrentAuth",

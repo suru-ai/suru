@@ -106,7 +106,11 @@ impl ProviderRuntime for CopilotRuntime {
                 }
                 listed = handle.connection().list_models() => listed?,
             };
-            Ok(ProviderModelDiscovery::new(model_descriptors(listed)))
+            let discovery = ProviderModelDiscovery::new(model_descriptors(listed));
+            Ok(match handle.connection().compatibility_warning() {
+                Some(warning) => discovery.with_warning(warning),
+                None => discovery,
+            })
         })
     }
 

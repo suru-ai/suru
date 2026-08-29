@@ -75,12 +75,24 @@ while IFS= read -r header; do
 /// Answers the protocol-version handshake with the version this SDK build speaks, so the fixture
 /// stays compatible when the SDK is upgraded.
 pub fn connect_arm() -> String {
+    connect_arm_with_version(COPILOT_SUGGESTED_VERSION)
+}
+
+/// The Copilot CLI version this build suggests, matching the live CLI it was verified against.
+pub const COPILOT_SUGGESTED_VERSION: &str = "1.0.80";
+
+/// Answers both startup version requests with a compatible protocol and `version` as the CLI
+/// package version.
+pub fn connect_arm_with_version(version: &str) -> String {
     format!(
         r#"    *'"method":"connect"'*)
-      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"ok":true,"protocolVersion":{},"version":"0.0.0-fixture"}}}}'
+      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"ok":true,"protocolVersion":{protocol},"version":"{version}"}}}}'
+      ;;
+    *'"method":"status.get"'*)
+      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"version":"{version}","protocolVersion":{protocol}}}}}'
       ;;
 "#,
-        github_copilot_sdk::SDK_PROTOCOL_VERSION
+        protocol = github_copilot_sdk::SDK_PROTOCOL_VERSION,
     )
 }
 
@@ -97,9 +109,13 @@ pub fn upgradable_connect_arm() -> String {
         reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"ok":true,"protocolVersion":{drifted},"version":"9.9.9-fixture"}}}}'
       fi
       ;;
+    *'"method":"status.get"'*)
+      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"version":"{suggested}","protocolVersion":{compatible}}}}}'
+      ;;
 "#,
         compatible = github_copilot_sdk::SDK_PROTOCOL_VERSION,
         drifted = github_copilot_sdk::SDK_PROTOCOL_VERSION + 1_000,
+        suggested = COPILOT_SUGGESTED_VERSION,
     )
 }
 

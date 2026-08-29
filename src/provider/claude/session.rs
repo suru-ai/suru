@@ -196,7 +196,8 @@ async fn default_selection(
     const CONTEXT: &str = "Claude Session startup failed";
     let models = usable_claude_models(executable, processes, availability, control_request_timeout)
         .await
-        .map_err(|error| claude_error_context(CONTEXT, error))?;
+        .map_err(|error| claude_error_context(CONTEXT, error))?
+        .models;
     models
         .iter()
         .find(|descriptor| descriptor.is_default)

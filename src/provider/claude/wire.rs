@@ -33,7 +33,7 @@ impl<'a> ControlRequestEnvelope<'a> {
 pub(super) enum ControlRequest {
     ListModels,
     /// Asks the CLI which version it is, which is what the availability probe checks against the
-    /// version floor ADR 0010 pins.
+    /// suggested version ADR 0010 pins.
     GetBinaryVersion,
     /// Opens the session handshake without starting anything: the CLI answers with what it would
     /// run the conversation under, the account it holds credentials for among it. The probe sends
@@ -49,7 +49,7 @@ pub(super) enum ControlRequest {
         /// asks for that: a steer already queued would otherwise survive the interrupt and be
         /// answered afterwards — work the user has just asked to stop, on a Turn that has Settled.
         /// The CLI advertises this as the `interrupt_cancel_queued_v1` capability on its init
-        /// message, which ADR 0010's version floor carries.
+        /// message, which ADR 0010's suggested version carries.
         cancel_queued: bool,
     },
     /// Stops one of the background tasks the agent spawned, named by the id the CLI reported it

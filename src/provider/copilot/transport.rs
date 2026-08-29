@@ -10,7 +10,7 @@ use std::{
     io,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     task::{Context, Poll},
 };
 
@@ -29,8 +29,12 @@ use crate::{
     provider::{
         ProviderError, ProviderFuture,
         harness::{HarnessConnector, HarnessInvalidator, HarnessLink, ProcessStdio},
+        version::SuggestedCliVersion,
     },
 };
+
+const COPILOT_SUGGESTED_VERSION: SuggestedCliVersion =
+    SuggestedCliVersion::new("Copilot CLI", 1, 0, 80);
 
 /// Builds the Copilot client over each freshly launched harness process.
 pub(super) struct CopilotConnector {
@@ -66,6 +70,7 @@ impl HarnessConnector for CopilotConnector {
             ending: Arc::new(StdMutex::new(None)),
             invalidator,
             event_drain,
+            warning: Arc::new(OnceLock::new()),
         })
     }
 
@@ -84,7 +89,23 @@ impl HarnessConnector for CopilotConnector {
                         return version_drift(&error);
                     }
                     connection.failure("Copilot CLI server handshake failed", error)
-                })
+                })?;
+            // `status.get` is advisory rather than part of the protocol handshake. A CLI old
+            // enough not to answer it remains governed by the SDK's hard protocol check above;
+            // Suru simply has no package-version guidance to add.
+            let warning = connection
+                .client
+                .get_status()
+                .await
+                .ok()
+                .and_then(|status| {
+                    COPILOT_SUGGESTED_VERSION
+                        .warning_for(&status.version)
+                        .ok()
+                        .flatten()
+                });
+            let _ = connection.warning.set(warning);
+            Ok(())
         })
     }
 }
@@ -126,6 +147,8 @@ pub(super) struct CopilotConnection {
     ending: Arc<StdMutex<Option<ConnectionEnd>>>,
     invalidator: HarnessInvalidator,
     event_drain: CopilotEventDrain,
+    /// Non-blocking package-version guidance learned once when this process handshakes.
+    warning: Arc<OnceLock<Option<String>>>,
 }
 
 /// Why this connection stopped serving requests, once it has.
@@ -138,6 +161,10 @@ enum ConnectionEnd {
 }
 
 impl CopilotConnection {
+    pub(super) fn compatibility_warning(&self) -> Option<String> {
+        self.warning.get().cloned().flatten()
+    }
+
     /// The Models Copilot offers the signed-in user right now.
     ///
     /// The Models are that user's, so a discovery asks the CLI about its credentials before it asks

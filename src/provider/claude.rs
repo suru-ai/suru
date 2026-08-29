@@ -18,12 +18,11 @@
 //! take the product's name. Text below names the Claude Code CLI only where it factually refers to
 //! the binary being driven.
 //!
-//! Three conditions leave Claude unusable until the user fixes them outside Suru, and each reaches
-//! a Model discovery — and so a Turn's Session startup — as its own typed reason rather than as a
-//! failure: a CLI that is not installed, which the harness machinery reports for every Provider
-//! alike; one below ADR 0010's version floor (2.1.237, the version the wire behavior is verified
-//! against); and one no user is signed in to. The last two are what [`availability`] probes for,
-//! and a catalog refresh re-running all three checks is the whole of the recovery.
+//! A CLI that is not installed or has no signed-in user reaches Model discovery — and so a Turn's
+//! Session startup — as its own typed reason rather than as a failure. [`availability`] also asks
+//! the CLI for its version: one below the verified 2.1.237 suggestion remains usable with advisory
+//! guidance, while a CLI too old to answer the probe is incompatible. A catalog refresh re-runs
+//! conditions that need the user to fix something outside Suru.
 
 mod availability;
 mod catalog;

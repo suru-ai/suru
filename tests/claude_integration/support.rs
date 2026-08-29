@@ -94,15 +94,15 @@ const SCRIPT_LOOP: &str = r#"while IFS= read -r line; do
   case "$line" in
 "#;
 
-/// The version the fixture reports when nothing has downgraded it: the floor itself, which is the
-/// version Suru's wire behavior is verified against.
-pub const CLAUDE_VERSION_FLOOR: &str = "2.1.237";
+/// The version the fixture reports when nothing has downgraded it: the suggestion itself, which is
+/// the version Suru's wire behavior is verified against.
+pub const CLAUDE_SUGGESTED_VERSION: &str = "2.1.237";
 
-/// A version below the floor, standing in for a CLI too old for Suru to drive.
-pub const CLAUDE_VERSION_BELOW_FLOOR: &str = "2.1.236";
+/// A readable version below the suggestion, which remains usable with guidance.
+pub const CLAUDE_VERSION_BELOW_SUGGESTION: &str = "2.1.236";
 
-/// A version above the floor, standing in for the CLI the user updates to.
-pub const CLAUDE_VERSION_ABOVE_FLOOR: &str = "2.2.0";
+/// A version above the suggestion, standing in for the CLI the user updates to.
+pub const CLAUDE_VERSION_ABOVE_SUGGESTION: &str = "2.2.0";
 
 /// What the CLI reports about the account once a user is signed in to it.
 pub const SIGNED_IN_ACCOUNT: &str = concat!(
@@ -124,8 +124,8 @@ pub fn version_arm(version: &str) -> String {
     )
 }
 
-/// The same arm for a CLI below the version floor — until [`ScriptedClaude::upgrade`] leaves the
-/// marker that makes it report a version above the floor, which is the user updating their CLI
+/// The same arm for a CLI below the suggestion — until [`ScriptedClaude::upgrade`] leaves the
+/// marker that makes it report a version above it, which is the user updating their CLI
 /// while Suru is running.
 pub fn upgradable_version_arm() -> String {
     format!(
@@ -137,8 +137,8 @@ pub fn upgradable_version_arm() -> String {
       fi
       ;;
 "#,
-        new = CLAUDE_VERSION_ABOVE_FLOOR,
-        old = CLAUDE_VERSION_BELOW_FLOOR,
+        new = CLAUDE_VERSION_ABOVE_SUGGESTION,
+        old = CLAUDE_VERSION_BELOW_SUGGESTION,
     )
 }
 
@@ -207,7 +207,7 @@ pub fn after_probe<const N: usize>(subtypes: [&str; N]) -> Vec<String> {
 pub fn probe_arms() -> String {
     format!(
         "{}{}",
-        version_arm(CLAUDE_VERSION_FLOOR),
+        version_arm(CLAUDE_SUGGESTED_VERSION),
         initialize_arm(SIGNED_IN_ACCOUNT)
     )
 }
@@ -428,7 +428,7 @@ impl ScriptedClaude {
         std::fs::write(&self.signed_in, b"signed in").expect("sign the scripted Claude in");
     }
 
-    /// Moves the fixture above the version floor, which is what [`upgradable_version_arm`] reports
+    /// Moves the fixture above the suggested version, which is what [`upgradable_version_arm`] reports
     /// from here on — the user updating their CLI while Suru runs.
     pub fn upgrade(&self) {
         std::fs::write(&self.upgraded, b"upgraded").expect("upgrade the scripted Claude");

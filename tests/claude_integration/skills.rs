@@ -3,7 +3,7 @@
 use crate::{
     server_support::next_skill_catalog,
     support::{
-        CLAUDE_MODELS, CLAUDE_VERSION_FLOOR, ScriptedClaude, hosting, list_models_arm,
+        CLAUDE_MODELS, CLAUDE_SUGGESTED_VERSION, ScriptedClaude, hosting, list_models_arm,
         session_where, settled_session, user_turn_arm, version_arm,
     },
 };
@@ -37,7 +37,7 @@ fn skill_catalog_arms_with_commands(skills: &str, commands: &str) -> String {
       printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"skills":__SKILLS__}}}}}}'
       ;;
 "#,
-        version_arm(CLAUDE_VERSION_FLOOR),
+        version_arm(CLAUDE_SUGGESTED_VERSION),
         list_models_arm(CLAUDE_MODELS),
     )
     .replace("__COMMANDS__", commands)

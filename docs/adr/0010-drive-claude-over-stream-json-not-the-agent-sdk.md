@@ -4,4 +4,4 @@ The Claude Provider speaks the Claude Code CLI's stream-json protocol directly â
 
 ## Consequences
 
-The stream-json control protocol is an SDK implementation detail, not a documented public surface, so protocol drift is ours to absorb: the Provider pins a minimum CLI version, verified at the availability probe and surfaced as `IncompatibleVersion`, and the floor moves only when we have tested against the newer wire.
+The stream-json control protocol is an SDK implementation detail, not a documented public surface, so protocol drift is ours to absorb. The Provider pins a suggested CLI version verified by its integration fixtures. A readable older version remains available with compatibility guidance; a CLI too old to answer the version probe is surfaced as `IncompatibleVersion`. The suggestion moves only when we have tested against the newer wire.

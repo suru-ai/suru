@@ -26,6 +26,7 @@ pub(crate) mod harness;
 mod orchestration;
 mod reasoning;
 mod shell_wrapper;
+mod version;
 
 pub use claude::ClaudeRuntime;
 pub use codex::CodexRuntime;

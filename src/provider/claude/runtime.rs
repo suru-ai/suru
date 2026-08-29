@@ -121,9 +121,7 @@ impl ProviderRuntime for ClaudeRuntime {
         let availability = self.availability.clone();
         let request_timeout = self.control_request_timeout;
         Box::pin(async move {
-            usable_claude_models(executable, processes, availability, request_timeout)
-                .await
-                .map(ProviderModelDiscovery::new)
+            usable_claude_models(executable, processes, availability, request_timeout).await
         })
     }
 
@@ -205,11 +203,16 @@ pub(super) async fn usable_claude_models(
     processes: ProcessRegistry,
     availability: ClaudeAvailability,
     request_timeout: Duration,
-) -> Result<Vec<ModelDescriptor>, ProviderError> {
-    availability
+) -> Result<ProviderModelDiscovery, ProviderError> {
+    let warning = availability
         .verify(&executable, &processes, request_timeout)
         .await?;
-    discover_claude_models(executable, processes, request_timeout).await
+    let models = discover_claude_models(executable, processes, request_timeout).await?;
+    let discovery = ProviderModelDiscovery::new(models);
+    Ok(match warning {
+        Some(warning) => discovery.with_warning(warning),
+        None => discovery,
+    })
 }
 
 async fn discover_claude_models(
