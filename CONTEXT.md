@@ -64,6 +64,18 @@ _Avoid_: Synthetic turn, background turn, ghost turn
 The transition of a Turn or Activity into a terminal state — completed, failed, or interrupted — after which it accepts no further Provider output. A Session Settles in its own, reversible sense: set aside as done for now, by the user's say-so or on its own after long enough idle, and active again the moment it is prompted or the user unsettles it. Only the say-so is stored, as a marker stamped with the moment it was set. Settling on its own — **auto-settle**, governed by one Setting holding either how long being left alone has to be or the word that suspends it — is instead derived wherever Sessions are listed, from the Session's last activity: nothing is written down for it, no clock fires for it, and moving that Setting reclassifies every Session at once. Neither a Session nothing has moved since it was made nor one Suru cannot read auto-settles: the first has set nothing aside and the second has no activity Suru can see. Unsettling moves a Session's last activity to the moment the user reached for it, so auto-settle cannot put back what they just took off the shelf. Wherever Sessions are listed by liveness, the settled ones stand apart from the active ones.
 _Avoid_: Finish, close, resolve; archive (for a settled Session)
 
+**Usage**:
+The record of the tokens a Turn consumed, kept in five parts — fresh input, cache reads, cache writes, output, and the reasoning within that output — with any part a Provider does not report simply absent, never guessed at zero. A Turn records its Usage the way it records when it began and Settled, and a failed or interrupted Turn keeps whatever Usage it accrued, because Usage answers what a Session has consumed rather than what it got for it. A Session's Usage is the sum over its Turns' Usage, and the total a surface shows for a Session includes its Subagent subtree, while each child Session keeps its own.
+_Avoid_: Token count, consumption, spend
+
+**Cost**:
+The dollar figure attached to a Turn's Usage, fixed when that Usage is recorded and never restated against later prices, so a historical Cost stays a fact about the past. A Cost the Provider states itself outranks one Suru estimates from a rate table, and where neither exists the Cost is absent — shown as nothing rather than as zero, so free and unknown never blur. Cost is the API-equivalent figure even where a subscription means nothing marginal was billed; its Cost Basis says where the number came from.
+_Avoid_: Price (that is a rate), spend, billing
+
+**Cost Basis**:
+Where a Cost came from: **Reported** when the Provider itself stated the figure, **Estimated** when Suru computed it from a rate table. Basis records who computed the number rather than whether money changed hands — a Reported Cost under a subscription may still have billed nothing.
+_Avoid_: Cost source, cost type
+
 **Prompt**:
 User input submitted for delivery to an agent. A delivered Prompt becomes either the user Message that begins a Turn or a later user Message that steers its active Turn.
 _Avoid_: Request, draft, message
