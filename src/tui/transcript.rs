@@ -204,6 +204,15 @@ pub(super) enum FoldStep {
     Expanded,
 }
 
+/// The disclosure grammar and rendered state a projected unit reports to
+/// pointer handling. Binary units need to distinguish a genuinely open
+/// header from a folded row that happens to have nothing to hide.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum FoldDisclosure {
+    Binary { folded: bool },
+    Staged(FoldStep),
+}
+
 /// One client's Fold state for one Session's Transcript: the posture the view
 /// leans to, plus the step the reader put each entry at. Like every disclosure
 /// axis this is presentation only, so it never reaches the Session, never
@@ -211,7 +220,19 @@ pub(super) enum FoldStep {
 #[derive(Clone, Debug, Default)]
 pub(super) struct TranscriptFolds {
     posture: DisclosurePosture,
-    overrides: HashMap<ActivityId, FoldStep>,
+    overrides: HashMap<ActivityId, FoldOverride>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FoldOverride {
+    step: FoldStep,
+    source: FoldOverrideSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FoldOverrideSource {
+    Persistent,
+    Automatic,
 }
 
 impl TranscriptFolds {
@@ -231,8 +252,8 @@ impl TranscriptFolds {
     /// entry is — a failed command opens to its Peek where a successful one
     /// folds away.
     pub(super) fn resolve(&self, activity_id: ActivityId, default: FoldStep) -> FoldStep {
-        if let Some(step) = self.overrides.get(&activity_id) {
-            return *step;
+        if let Some(fold_override) = self.overrides.get(&activity_id) {
+            return fold_override.step;
         }
         match self.posture {
             DisclosurePosture::Closed => default,
@@ -240,8 +261,19 @@ impl TranscriptFolds {
         }
     }
 
+    /// An Active Command always enters on its one-line shape. The posture is
+    /// for stored entries opening with a Session view; only a per-Activity
+    /// override can disclose work that is still running.
+    fn resolve_active_command(&self, activity_id: ActivityId) -> FoldStep {
+        self.overrides
+            .get(&activity_id)
+            .map(|fold_override| fold_override.step)
+            .unwrap_or(FoldStep::Folded)
+    }
+
     /// The binary reading entries without a Peek use: anything short of
     /// `Expanded` is folded.
+    #[cfg(test)]
     pub(super) fn is_folded(&self, activity_id: ActivityId) -> bool {
         self.resolve(activity_id, FoldStep::Folded) != FoldStep::Expanded
     }
@@ -258,7 +290,45 @@ impl TranscriptFolds {
     }
 
     pub(super) fn set_step(&mut self, activity_id: ActivityId, step: FoldStep) {
-        self.overrides.insert(activity_id, step);
+        self.overrides.insert(
+            activity_id,
+            FoldOverride {
+                step,
+                source: FoldOverrideSource::Persistent,
+            },
+        );
+    }
+
+    /// Whether an automatic live-tail promotion may claim this Activity. Any
+    /// persistent per-Activity override wins; the general opening posture does
+    /// not, because every Active Command begins Folded independently of it.
+    pub(super) fn can_auto_promote(&self, activity_id: ActivityId) -> bool {
+        !self.overrides.contains_key(&activity_id)
+    }
+
+    pub(super) fn auto_promote(&mut self, activity_id: ActivityId) {
+        if self.can_auto_promote(activity_id) {
+            self.overrides.insert(
+                activity_id,
+                FoldOverride {
+                    step: FoldStep::Peek,
+                    source: FoldOverrideSource::Automatic,
+                },
+            );
+        }
+    }
+
+    /// Drops presentation overrides whose Active Command has settled. A
+    /// persistent Fold step carries its provenance beside the step, so it
+    /// survives the same status transition.
+    pub(super) fn retain_automatic_promotions(&mut self, active: &HashSet<ActivityId>) {
+        self.overrides.retain(|activity_id, fold_override| {
+            fold_override.source != FoldOverrideSource::Automatic || active.contains(activity_id)
+        });
+    }
+
+    pub(super) fn clear_automatic_promotions(&mut self) {
+        self.retain_automatic_promotions(&HashSet::new());
     }
 
     pub(super) fn expand(&mut self, activity_id: ActivityId) {
@@ -275,10 +345,10 @@ impl TranscriptFolds {
         (self.posture as u8).hash(&mut hasher);
         self.overrides.len().hash(&mut hasher);
         let mut digest = 0u64;
-        for (id, step) in &self.overrides {
+        for (id, fold_override) in &self.overrides {
             let mut entry = std::hash::DefaultHasher::new();
             id.hash(&mut entry);
-            (*step as u8).hash(&mut entry);
+            (fold_override.step as u8).hash(&mut entry);
             digest ^= entry.finish();
         }
         digest.hash(&mut hasher);
@@ -436,10 +506,9 @@ pub(super) struct UnitStart {
     /// Whether the unit as drawn is holding content back, so a click only
     /// toggles a Fold that is really there.
     pub(super) hides_content: bool,
-    /// The step a staged Fold was drawn at, present only for units speaking
-    /// the staged grammar (settled commands), so a click knows which step
-    /// comes next without re-deriving the projection.
-    pub(super) step: Option<FoldStep>,
+    /// The Fold grammar and state that were actually drawn, so a click does
+    /// not have to re-derive presentation from the client's opening posture.
+    pub(super) fold: FoldDisclosure,
     /// The row the unit's fold marker was drawn on, the click target that
     /// opens a Peek the rest of the way.
     pub(super) marker_row: Option<usize>,
@@ -798,8 +867,7 @@ impl RenderUnit<'_> {
         if let (Self::TurnMember(unit), Self::TurnMember(previous)) = (self, previous) {
             return unit.heads_the_group(previous);
         }
-        matches!(self, Self::GroupMember(_))
-            && matches!(previous, Self::Group { expanded: true, .. })
+        matches!(self, Self::GroupMember(_)) && matches!(previous, Self::Group { .. })
     }
 
     /// Projects the unit's lines, reporting the anchor a click acts on when
@@ -1308,18 +1376,30 @@ impl TurnFolding {
 /// finding every place that quietly assumed another.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum GroupableKind {
-    /// Commands, which join a run only once they settle successfully.
+    /// Commands, whose successful members form the stable Group header and
+    /// whose trailing Active member grows beneath it while still running.
     Command,
     /// Reasoning blocks, which join a run from the moment they start.
     Reasoning,
 }
 
+const fn successful_command_joins_group(activity: &Activity) -> bool {
+    matches!(
+        activity,
+        Activity::Command {
+            status: crate::protocol::ActivityStatus::Completed,
+            exit_status: Some(0),
+            ..
+        }
+    )
+}
+
 impl GroupableKind {
     /// The kind of run an Activity extends, or `None` when it groups with
-    /// nothing and so ends whatever run it follows. A command joins only once
-    /// it settles Completed with exit status 0, so a failed, interrupted, or
-    /// still-running one — anything worth scanning for — never hides behind a
-    /// Group row. A Reasoning block joins from the moment it starts, so the
+    /// nothing and so ends whatever run it follows. A successful command
+    /// contributes to the Group header; an Active command extends that same
+    /// run but remains visible beneath it. Failed and interrupted commands end
+    /// the run. A Reasoning block joins from the moment it starts, so the
     /// Group forms live and the run a reader is watching is the same row it
     /// reads afterwards; only a block a Turn interrupted stands outside,
     /// ending the run, because a Group row only ever summarizes thinking that
@@ -1328,12 +1408,18 @@ impl GroupableKind {
     const fn joined_by(activity: &Activity) -> Option<Self> {
         use crate::protocol::ActivityStatus;
 
+        if successful_command_joins_group(activity)
+            || matches!(
+                activity,
+                Activity::Command {
+                    status: ActivityStatus::Active,
+                    ..
+                }
+            )
+        {
+            return Some(Self::Command);
+        }
         match activity {
-            Activity::Command {
-                status: ActivityStatus::Completed,
-                exit_status: Some(0),
-                ..
-            } => Some(Self::Command),
             Activity::Reasoning {
                 status: ActivityStatus::Completed | ActivityStatus::Active,
                 ..
@@ -1343,10 +1429,11 @@ impl GroupableKind {
     }
 
     /// The line of a Group's header carrying a Spinner in its Marker cell, or
-    /// `None` when the Group stands for no work in progress. A command joins
-    /// only once it has settled, so a command Group never speaks for live
-    /// work; a Reasoning Group does whenever its latest member is still
-    /// thinking, and its Marker leads the first line of its header.
+    /// `None` when the Group stands for no work in progress. A command Group
+    /// header speaks only for settled successes, so its Active member owns the
+    /// live Spinner beneath it; a Reasoning Group does whenever its latest
+    /// member is still thinking, and its Marker leads the first line of its
+    /// header.
     fn header_spinner_line(self, members: &[&Activity]) -> Option<usize> {
         match self {
             Self::Command => None,
@@ -1362,7 +1449,10 @@ impl GroupableKind {
     fn member_fingerprint(self, member: &Activity) -> u64 {
         let mut hasher = std::hash::DefaultHasher::new();
         match self {
-            Self::Command => member.id().hash(&mut hasher),
+            Self::Command => {
+                member.id().hash(&mut hasher);
+                member.status().map(|status| status as u8).hash(&mut hasher);
+            }
             // A Reasoning Group's header leads with the latest member's title
             // and sums every member's duration, its wording turns on whether
             // that member is still thinking, and its expansion draws each
@@ -1495,14 +1585,29 @@ fn close_run<'a>(
         return;
     };
     let mut closed = Vec::new();
-    if members.len() < 2 {
+    let grouped_members = match kind {
+        GroupableKind::Command => members
+            .iter()
+            .filter(|activity| successful_command_joins_group(activity))
+            .count(),
+        GroupableKind::Reasoning => members.len(),
+    };
+    if grouped_members < 2 {
         closed.extend(members.into_iter().map(RenderUnit::Activity));
     } else if groups.is_collapsed(members[0].id()) {
         closed.push(RenderUnit::Group {
             kind,
-            members,
+            members: members.clone(),
             expanded: false,
         });
+        if kind == GroupableKind::Command {
+            closed.extend(
+                members
+                    .into_iter()
+                    .filter(|activity| !successful_command_joins_group(activity))
+                    .map(RenderUnit::GroupMember),
+            );
+        }
     } else {
         let expansion = kind.expansion_units(&members);
         closed.push(RenderUnit::Group {
@@ -1588,7 +1693,7 @@ struct UnitView {
 struct LaidOutAnchor {
     header_lines: usize,
     hides_content: bool,
-    step: Option<FoldStep>,
+    fold: FoldDisclosure,
     /// Index of the fold-marker line among the unit's laid-out lines.
     marker_line: Option<usize>,
 }
@@ -1663,7 +1768,7 @@ fn rebuild(
                 header_rows: unit.rows_per_line[..anchor.header_lines].iter().sum(),
                 row_count: row_count - unit_start_row,
                 hides_content: anchor.hides_content,
-                step: anchor.step,
+                fold: anchor.fold,
                 marker_row: anchor
                     .marker_line
                     .map(|line| unit_start_row + unit.rows_per_line[..line].iter().sum::<usize>()),
@@ -1761,7 +1866,7 @@ fn reuse_or_render(
         anchor: rendered_anchor.map(|anchor| LaidOutAnchor {
             header_lines,
             hides_content: anchor.hides_content,
-            step: anchor.step,
+            fold: anchor.fold,
             marker_line,
         }),
     }
@@ -1775,9 +1880,8 @@ fn reuse_or_render(
 struct UnitAnchor {
     header_source_lines: usize,
     hides_content: bool,
-    /// The step a staged Fold was drawn at; `None` for units whose Fold is
-    /// binary, which includes a still-streaming command.
-    step: Option<FoldStep>,
+    /// The Fold grammar and state the unit drew.
+    fold: FoldDisclosure,
     /// Index of the fold-marker source line within the unit's lines.
     marker_source_line: Option<usize>,
 }
@@ -1788,7 +1892,9 @@ impl UnitAnchor {
         Self {
             header_source_lines,
             hides_content,
-            step: None,
+            fold: FoldDisclosure::Binary {
+                folded: hides_content,
+            },
             marker_source_line: None,
         }
     }
@@ -1831,7 +1937,13 @@ fn default_fold_step(activity: &Activity) -> FoldStep {
 
 /// The step an Activity presents at under the client's Fold state.
 fn resolved_fold_step(folds: &TranscriptFolds, activity: &Activity) -> FoldStep {
-    folds.resolve(activity.id(), default_fold_step(activity))
+    match activity {
+        Activity::Command {
+            status: crate::protocol::ActivityStatus::Active,
+            ..
+        } => folds.resolve_active_command(activity.id()),
+        _ => folds.resolve(activity.id(), default_fold_step(activity)),
+    }
 }
 
 /// Identifies an Activity's rendered form. The Fold step joins the content
@@ -2106,7 +2218,15 @@ fn render_group(
     theme: &Theme,
 ) -> UnitAnchor {
     match kind {
-        GroupableKind::Command => render_command_group(lines, members.len(), expanded, theme),
+        GroupableKind::Command => render_command_group(
+            lines,
+            members
+                .iter()
+                .filter(|activity| successful_command_joins_group(activity))
+                .count(),
+            expanded,
+            theme,
+        ),
         GroupableKind::Reasoning => render_reasoning_group(lines, members, expanded, theme),
     }
 }
@@ -2379,8 +2499,8 @@ fn push_command_activity(
             theme,
         );
     }
-    if status != ActivityStatus::Active && step == FoldStep::Folded {
-        return push_folded_command_row(
+    if step == FoldStep::Folded {
+        let mut anchor = push_folded_command_row(
             projection.lines,
             &format!("  {marker}"),
             command,
@@ -2389,12 +2509,18 @@ fn push_command_activity(
             width,
             cwd.is_some() || !output.is_empty() || output_truncated,
         );
+        if status == ActivityStatus::Active {
+            // Active commands use the same binary click grammar whether they
+            // are still on this one-line shape or showing live output.
+            anchor.fold = FoldDisclosure::Binary { folded: true };
+        }
+        return anchor;
     }
     let tail_rows = match (status, step) {
         (_, FoldStep::Expanded) => None,
         (ActivityStatus::Active, _) => Some(LIVE_COMMAND_TAIL_ROWS),
         (_, FoldStep::Peek) => Some(FOLDED_COMMAND_OUTPUT_ROWS),
-        (_, FoldStep::Folded) => unreachable!("a settled folded command returned above"),
+        (_, FoldStep::Folded) => unreachable!("a folded command returned above"),
     };
     let command = format!("{command}{exit_suffix}");
     let header_start = projection.lines.len();
@@ -2441,9 +2567,15 @@ fn push_command_activity(
     UnitAnchor {
         header_source_lines,
         hides_content,
-        // A still-streaming command's tail is not a step the reader chose, so
-        // it keeps the binary grammar: one click opens the whole stream.
-        step: (status != ActivityStatus::Active).then_some(step),
+        // A still-streaming command's tail is not a staged Fold the reader
+        // chose, so one click still opens the whole stream.
+        fold: if status == ActivityStatus::Active {
+            FoldDisclosure::Binary {
+                folded: step != FoldStep::Expanded,
+            }
+        } else {
+            FoldDisclosure::Staged(step)
+        },
         marker_source_line,
     }
 }
@@ -2488,7 +2620,7 @@ fn push_folded_command_row(
     UnitAnchor {
         header_source_lines: 1,
         hides_content: hides_more || clamped,
-        step: Some(FoldStep::Folded),
+        fold: FoldDisclosure::Staged(FoldStep::Folded),
         marker_source_line: None,
     }
 }
@@ -5521,15 +5653,18 @@ mod tests {
         };
         *status = ActivityStatus::Active;
         *exit_status = None;
+        let running_id = running.id();
         let snapshot = transcript_snapshot(vec![
             Entry::Activity(command("cargo check", "")),
             Entry::Activity(running),
         ]);
         let cache = TranscriptCache::default();
+        let mut folds = TranscriptFolds::default();
+        folds.expand(running_id);
         let view = projected_view_through(
             &cache,
             &snapshot,
-            &TranscriptFolds::default(),
+            &folds,
             &TranscriptGroups::default(),
             &TranscriptTurnFolds::default(),
         );

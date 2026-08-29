@@ -8,9 +8,9 @@ use std::path::Path;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        AgentSelection, AutoSettle, FoldPosture, ModelId, ProviderId, ReasoningSummaryDetail,
-        ReasoningVisibility, SessionContentWidth, SettingMutation, SettingsDiagnosticSeverity,
-        SettingsSnapshot, SidebarScope, SidebarVisibility, TitleErrand,
+        AgentSelection, AutoSettle, CommandAutoExpand, FoldPosture, ModelId, ProviderId,
+        ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
+        SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility, TitleErrand,
     },
     server::{self, ServerConfig},
 };
@@ -128,6 +128,45 @@ async fn showing_reasoning_pins_from_a_document_and_resets_to_the_hidden_default
         "unpinning it lets the built-in default resume"
     );
     assert_eq!(answered.pinned, [] as [String; 0]);
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn command_auto_expansion_pins_a_millisecond_delay_and_resets_to_off() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{ "transcript": { "commandAutoExpand": 275 } }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-command-auto-expand")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (client, opening) = attach(state_dir.path(), "settings-command-auto-expand").await;
+    assert_eq!(
+        opening.settings.transcript.command_auto_expand,
+        CommandAutoExpand::AfterMillis(275)
+    );
+    assert_eq!(opening.pinned, ["transcript.commandAutoExpand"]);
+    assert_eq!(opening.diagnostics, []);
+
+    let reset = client
+        .mutate_setting(SettingMutation::TranscriptCommandAutoExpand { value: None })
+        .await
+        .expect("reset Command auto-expansion");
+    assert_eq!(
+        reset.settings.transcript.command_auto_expand,
+        CommandAutoExpand::Off
+    );
+    assert_eq!(reset.pinned, [] as [String; 0]);
 
     drop(client);
     server.shutdown().await.expect("shut down server");

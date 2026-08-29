@@ -606,11 +606,73 @@ pub enum ReasoningVisibility {
     Shown,
 }
 
+/// Whether a running Command grows from its one-line row into a live output
+/// tail on its own. `Off` keeps disclosure entirely in the reader's hands;
+/// `AfterMillis` promotes a command that has remained Active for that long.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandAutoExpand {
+    Off,
+    AfterMillis(u64),
+}
+
+impl CommandAutoExpand {
+    /// The threshold offered when a reader opens the numeric surface from the
+    /// off state, so enabling the behavior begins at a useful latency.
+    pub const DEFAULT_MILLIS: u64 = 500;
+
+    pub const fn after_millis(self) -> Option<u64> {
+        match self {
+            Self::Off => None,
+            Self::AfterMillis(milliseconds) => Some(milliseconds),
+        }
+    }
+}
+
+impl Default for CommandAutoExpand {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum CommandAutoExpandDocument {
+    Enabled(bool),
+    AfterMillis(u64),
+}
+
+impl Serialize for CommandAutoExpand {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => CommandAutoExpandDocument::Enabled(false),
+            Self::AfterMillis(milliseconds) => {
+                CommandAutoExpandDocument::AfterMillis(*milliseconds)
+            }
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandAutoExpand {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match CommandAutoExpandDocument::deserialize(deserializer)? {
+            CommandAutoExpandDocument::Enabled(false) => Ok(Self::Off),
+            CommandAutoExpandDocument::Enabled(true) => Err(serde::de::Error::custom(
+                "true does not specify when Commands should expand",
+            )),
+            CommandAutoExpandDocument::AfterMillis(milliseconds) => {
+                Ok(Self::AfterMillis(milliseconds))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TranscriptSettings {
     pub default_fold_posture: FoldPosture,
     pub reasoning_visibility: ReasoningVisibility,
+    pub command_auto_expand: CommandAutoExpand,
 }
 
 /// Which Agent Selection derives a Session's Title, which is also whether Suru
@@ -962,6 +1024,9 @@ pub enum SettingMutation {
     },
     TranscriptReasoningVisibility {
         value: Option<ReasoningVisibility>,
+    },
+    TranscriptCommandAutoExpand {
+        value: Option<CommandAutoExpand>,
     },
     SessionContentWidth {
         value: Option<SessionContentWidth>,

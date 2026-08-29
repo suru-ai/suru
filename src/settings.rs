@@ -30,9 +30,10 @@ use jsonc_parser::{
 use serde_json::Value;
 
 use crate::protocol::{
-    AgentSelection, AutoSettle, EffectiveSettings, FoldPosture, ProviderId, ReasoningSummaryDetail,
-    ReasoningVisibility, SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
-    SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility, TitleErrand,
+    AgentSelection, AutoSettle, CommandAutoExpand, EffectiveSettings, FoldPosture, ProviderId,
+    ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
+    SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope,
+    SidebarVisibility, TitleErrand,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -44,6 +45,7 @@ pub const FALLBACK_CONFIG_FILE: &str = "suru.json";
 // mutations that edit it can never drift apart.
 const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
 const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
+const TRANSCRIPT_COMMAND_AUTO_EXPAND: &str = "transcript.commandAutoExpand";
 const SESSION_CONTENT_WIDTH: &str = "session.contentWidth";
 // Keyed per purpose rather than Errand-wide, so a compaction Errand arriving
 // later gets its own key and turning Titles off can never silently disable
@@ -221,6 +223,27 @@ const SESSION_CONTENT_WIDTH_NUMERIC: NumericSettingChoice = NumericSettingChoice
     },
 );
 
+fn spell_command_auto_expand(milliseconds: u64) -> String {
+    format!("{milliseconds}ms")
+}
+
+fn validate_command_auto_expand(value: &str) -> Result<u64, &'static str> {
+    value.parse::<u64>().map_err(|_| "a whole number")
+}
+
+const COMMAND_AUTO_EXPAND_NUMERIC: NumericSettingChoice = NumericSettingChoice::new(
+    "Delay in milliseconds",
+    |settings| match settings.transcript.command_auto_expand {
+        CommandAutoExpand::Off => CommandAutoExpand::DEFAULT_MILLIS,
+        CommandAutoExpand::AfterMillis(milliseconds) => milliseconds,
+    },
+    validate_command_auto_expand,
+    spell_command_auto_expand,
+    |milliseconds| SettingMutation::TranscriptCommandAutoExpand {
+        value: Some(CommandAutoExpand::AfterMillis(milliseconds)),
+    },
+);
+
 fn spell_auto_settle_idle_days(days: u64) -> String {
     if days == 1 {
         "1 day".to_owned()
@@ -391,6 +414,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::TranscriptReasoningVisibility { value } => {
             *value == Some(settings.transcript.reasoning_visibility)
         }
+        SettingMutation::TranscriptCommandAutoExpand { value } => {
+            *value == Some(settings.transcript.command_auto_expand)
+        }
         SettingMutation::SessionContentWidth { value } => {
             *value == Some(settings.session.content_width)
         }
@@ -478,6 +504,38 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |visibility| {
                 settings.transcript.reasoning_visibility = visibility;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: TRANSCRIPT_COMMAND_AUTO_EXPAND,
+        label: "Command auto-expansion",
+        description: "When an Active Command grows into its live output tail",
+        group: SettingGroup::General,
+        scope: SettingScope::Client,
+        values: SettingValues::Open {
+            named: &[SettingChoice {
+                // This is the named off choice. A SettingChoice shows the
+                // Config Document spelling, which is the boolean `false` the
+                // Setting accepts rather than a second string spelling.
+                value: "false",
+                pin: SettingMutation::TranscriptCommandAutoExpand {
+                    value: Some(CommandAutoExpand::Off),
+                },
+            }],
+            accepts: "a whole number of milliseconds",
+            spell: |settings| match settings.transcript.command_auto_expand {
+                CommandAutoExpand::Off => "false".to_owned(),
+                CommandAutoExpand::AfterMillis(milliseconds) => {
+                    COMMAND_AUTO_EXPAND_NUMERIC.spell(milliseconds)
+                }
+            },
+            chosen_at: Some(SettingChoiceSurface::Numeric(COMMAND_AUTO_EXPAND_NUMERIC)),
+        },
+        reset: SettingMutation::TranscriptCommandAutoExpand { value: None },
+        apply: |settings, value| {
+            apply_value(value, |command_auto_expand| {
+                settings.transcript.command_auto_expand = command_auto_expand;
             })
         },
     },
@@ -918,6 +976,9 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         }
         SettingMutation::TranscriptReasoningVisibility { value } => {
             (TRANSCRIPT_REASONING_VISIBILITY, pinned(value))
+        }
+        SettingMutation::TranscriptCommandAutoExpand { value } => {
+            (TRANSCRIPT_COMMAND_AUTO_EXPAND, pinned(value))
         }
         SettingMutation::SessionContentWidth { value } => (SESSION_CONTENT_WIDTH, pinned(value)),
         SettingMutation::SessionTitleErrand { value } => (SESSION_TITLE_ERRAND, pinned(value)),
@@ -1435,6 +1496,7 @@ mod tests {
             vec![
                 "one of \"folded\" or \"expanded\"".to_owned(),
                 "one of \"hidden\" or \"shown\"".to_owned(),
+                "one of false or a whole number of milliseconds".to_owned(),
                 "one of \"fill\" or an integer of at least 50".to_owned(),
                 // A Setting the schema can only partly enumerate names what it
                 // can and describes the rest, in the same breath.
@@ -1461,6 +1523,33 @@ mod tests {
             OPEN_STAND_IN.expected(),
             "one of \"folded\" or a posture Suru worked out for itself"
         );
+    }
+
+    #[test]
+    fn command_auto_expansion_opens_at_five_hundred_milliseconds_and_pins_the_delay() {
+        let descriptor = SCHEMA
+            .iter()
+            .find(|descriptor| descriptor.key == TRANSCRIPT_COMMAND_AUTO_EXPAND)
+            .expect("the Command auto-expansion Setting is defined");
+        let Some(SettingChoiceSurface::Numeric(choice)) = descriptor.chosen_at() else {
+            panic!("the auto-expansion delay is chosen at the numeric editor");
+        };
+        let mut settings = EffectiveSettings::default();
+
+        assert_eq!(descriptor.spelling(&settings).as_deref(), Some("false"));
+        assert_eq!(
+            choice.seed(&settings),
+            CommandAutoExpand::DEFAULT_MILLIS.to_string(),
+            "enabling auto-expansion starts at the suggested 500ms delay"
+        );
+
+        let mutation = choice.accept("275").expect("a millisecond delay is valid");
+        assert!((descriptor.apply)(&mut settings, &pinned_value(&mutation)));
+        assert_eq!(
+            settings.transcript.command_auto_expand,
+            CommandAutoExpand::AfterMillis(275)
+        );
+        assert_eq!(descriptor.spelling(&settings).as_deref(), Some("275ms"));
     }
 
     /// The reading a surface draws a Setting by: a named choice while it is on

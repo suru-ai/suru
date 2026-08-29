@@ -3,8 +3,10 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{Result, anyhow};
@@ -14,12 +16,12 @@ use ratatui::{Frame, layout::Position, style::Style};
 use crate::{
     managed_client::{ManagedEvent, RecoveryStatus, SessionEvent, SessionProjection},
     protocol::{
-        Activity, ActivityStatus, AdmitPromptRequest, AgentSelection, AgentSelectionOperationId,
-        CreateSessionRequest, EffectiveSettings, FoldPosture, InitialPrompt, MessageId,
-        ModelCatalog, PromptDelivery, PromptId, PromptStatus, ServerIdentity, SessionChange,
-        SessionId, SessionListItem, SessionSnapshot, SessionStatus, SettingMutation,
-        SettingsSnapshot, ShutdownReason, SkillCatalog, SkillCatalogRequest, TurnId, TurnStatus,
-        UpdateAgentSelectionRequest, Workspace,
+        Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentSelection,
+        AgentSelectionOperationId, CreateSessionRequest, EffectiveSettings, FoldPosture,
+        InitialPrompt, MessageId, ModelCatalog, PromptDelivery, PromptId, PromptStatus,
+        ServerIdentity, SessionChange, SessionId, SessionListItem, SessionSnapshot, SessionStatus,
+        SettingMutation, SettingsSnapshot, ShutdownReason, SkillCatalog, SkillCatalogRequest,
+        TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
@@ -49,13 +51,34 @@ use super::{
     slots::RenderSlots,
     subagent_picker::{SubagentPicker, working_subagents},
     transcript::{
-        FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups,
+        FoldDisclosure, FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups,
         TranscriptTurnFolds, UnitKey, UnitStart,
     },
 };
 
 /// Rows scrolled per mouse wheel tick, matching common terminal conventions.
 const WHEEL_SCROLL_ROWS: usize = 3;
+
+#[derive(Clone)]
+struct PresentationClock(Arc<dyn Fn() -> Instant + Send + Sync>);
+
+impl PresentationClock {
+    fn now(&self) -> Instant {
+        (self.0)()
+    }
+}
+
+impl Default for PresentationClock {
+    fn default() -> Self {
+        Self(Arc::new(Instant::now))
+    }
+}
+
+impl std::fmt::Debug for PresentationClock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PresentationClock(..)")
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionListScope {
@@ -257,6 +280,11 @@ pub struct TuiState {
     /// Which Spinner frame is showing, advanced by the run loop's tick and
     /// read only at draw time — never by the transcript projection (ADR 0009).
     pub(super) spinner_frame: usize,
+    /// When each visible Active Command first appeared to this client. Time
+    /// stays out of transcript projection; the spinner tick reads these ages
+    /// and writes Fold overrides only when a threshold is crossed.
+    active_commands_started_at: HashMap<ActivityId, Instant>,
+    presentation_clock: PresentationClock,
     pub(super) submission_error: Option<String>,
     pub(super) session: Option<SessionProjection>,
     landing_agent_selection: Option<AgentSelection>,
@@ -361,6 +389,8 @@ impl TuiState {
             transcript_cache: TranscriptCache::default(),
             transcript_generation: 0,
             spinner_frame: 0,
+            active_commands_started_at: HashMap::new(),
+            presentation_clock: PresentationClock::default(),
             submission_error: None,
             session: None,
             landing_agent_selection: None,
@@ -622,6 +652,17 @@ impl TuiState {
         // and moves what the reader is looking at.
         self.settings = snapshot.settings;
         self.pinned_settings = snapshot.pinned;
+        if self
+            .settings
+            .transcript
+            .command_auto_expand
+            .after_millis()
+            .is_none()
+        {
+            for interaction in self.session_interactions.values() {
+                interaction.folds.borrow_mut().clear_automatic_promotions();
+            }
+        }
         // The Sidebar's own Settings are the ones that act on arrival rather
         // than on the next view opened, because the frame they govern is
         // already on screen.
@@ -729,6 +770,7 @@ impl TuiState {
                 session.apply(update)?;
             }
         }
+        self.reconcile_active_command_starts();
         if selection_changed {
             self.confirmed_agent_selection = None;
             let current = self.agent_selection().cloned();
@@ -767,6 +809,63 @@ impl TuiState {
         self.session = Some(SessionProjection::new(snapshot));
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.sync_composer_completion();
+    }
+
+    /// Records the first client-side sighting of every Active Command and
+    /// forgets clocks for Commands that settled or left the visible Session.
+    fn reconcile_active_command_starts(&mut self) {
+        let active = self
+            .session
+            .as_ref()
+            .into_iter()
+            .flat_map(|session| &session.snapshot().activities)
+            .filter_map(|activity| match activity {
+                Activity::Command {
+                    id,
+                    status: ActivityStatus::Active,
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        self.active_commands_started_at
+            .retain(|activity_id, _| active.contains(activity_id));
+        let now = self.presentation_clock.now();
+        for activity_id in active.iter().copied() {
+            self.active_commands_started_at
+                .entry(activity_id)
+                .or_insert(now);
+        }
+        if let Some(interaction) = self.current_interaction() {
+            interaction
+                .folds
+                .borrow_mut()
+                .retain_automatic_promotions(&active);
+        }
+    }
+
+    fn promote_aged_commands(&mut self) {
+        let Some(threshold_ms) = self.settings.transcript.command_auto_expand.after_millis() else {
+            return;
+        };
+        let now = self.presentation_clock.now();
+        let ready = self
+            .active_commands_started_at
+            .iter()
+            .filter_map(|(activity_id, started_at)| {
+                (now.saturating_duration_since(*started_at).as_millis() >= u128::from(threshold_ms))
+                    .then_some(*activity_id)
+            })
+            .collect::<Vec<_>>();
+        let Some(interaction) = self.current_interaction() else {
+            return;
+        };
+        let mut folds = interaction.folds.borrow_mut();
+        for activity_id in ready {
+            // Peek is the existing live-tail presentation for an Active
+            // Command; Expanded remains reserved for manual disclosure.
+            folds.auto_promote(activity_id);
+        }
     }
 
     fn composer_key(&self) -> ComposerKey {
@@ -1014,28 +1113,28 @@ impl TuiState {
         match start.key {
             UnitKey::Activity(activity_id) => {
                 let mut folds = interaction.folds.borrow_mut();
-                match start.step {
-                    Some(FoldStep::Folded) => {
+                match start.fold {
+                    FoldDisclosure::Staged(FoldStep::Folded) => {
                         if start.hides_content {
                             folds.set_step(activity_id, FoldStep::Peek);
                         }
                     }
-                    Some(FoldStep::Peek) => {
+                    FoldDisclosure::Staged(FoldStep::Peek) => {
                         if start.marker_row == Some(row) {
                             folds.set_step(activity_id, FoldStep::Expanded);
                         } else if start.is_header(row) {
                             folds.set_step(activity_id, FoldStep::Folded);
                         }
                     }
-                    Some(FoldStep::Expanded) => {
+                    FoldDisclosure::Staged(FoldStep::Expanded) => {
                         if start.is_header(row) {
                             folds.set_step(activity_id, FoldStep::Folded);
                         }
                     }
-                    None => {
+                    FoldDisclosure::Binary { folded } => {
                         if start.hides_content {
                             folds.expand(activity_id);
-                        } else if start.is_header(row) && !folds.is_folded(activity_id) {
+                        } else if start.is_header(row) && !folded {
                             folds.fold(activity_id);
                         }
                     }
@@ -1405,6 +1504,9 @@ impl Default for Application {
 #[derive(Debug)]
 pub enum ApplicationEvent {
     Command(CommandId),
+    /// The run loop's presentation-only wakeup. Kept as an event so headless
+    /// rendering tests can drive latency behavior through the same boundary.
+    SpinnerTick,
     ReconnectGraceElapsed,
     Managed(ManagedEvent),
     Session(SessionEvent),
@@ -1600,9 +1702,24 @@ impl Application {
         }
     }
 
+    /// Injects the clock used by presentation latency. Production uses the
+    /// monotonic system clock; tests can advance a deterministic clock without
+    /// waiting out the configured delay.
+    pub fn with_presentation_clock(
+        mut self,
+        clock: impl Fn() -> Instant + Send + Sync + 'static,
+    ) -> Self {
+        self.state.presentation_clock = PresentationClock(Arc::new(clock));
+        self
+    }
+
     pub fn handle_event(&mut self, event: ApplicationEvent) -> Result<ApplicationTransition> {
         match event {
             ApplicationEvent::Command(command) => self.handle_command(command),
+            ApplicationEvent::SpinnerTick => {
+                self.advance_spinner();
+                Ok(ApplicationTransition::Continue)
+            }
             ApplicationEvent::ReconnectGraceElapsed => Ok(self.elapse_reconnect_grace()),
             ApplicationEvent::Managed(event) => self.handle_managed_event(event),
             ApplicationEvent::Session(event) => {
@@ -3169,6 +3286,7 @@ impl Application {
     /// Advances the Spinner one frame. Called from the run loop's tick, which
     /// only exists while [`Self::wants_spinner`] holds.
     pub(super) fn advance_spinner(&mut self) {
+        self.state.promote_aged_commands();
         self.state.spinner_frame = self.state.spinner_frame.wrapping_add(1);
     }
 }

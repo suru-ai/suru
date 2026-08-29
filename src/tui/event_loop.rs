@@ -611,7 +611,11 @@ impl RunLoop {
 
     fn advance_spinner(&mut self) -> ControlFlow<Exit> {
         self.needs_redraw = true;
-        self.application.advance_spinner();
+        let transition = self
+            .application
+            .handle_event(ApplicationEvent::SpinnerTick)
+            .expect("a presentation tick is infallible");
+        debug_assert_eq!(transition, ApplicationTransition::Continue);
         self.spinner_tick = Some(Box::pin(tokio::time::sleep(spinner::TICK_PERIOD)));
         ControlFlow::Continue(())
     }

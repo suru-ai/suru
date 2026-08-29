@@ -17,17 +17,24 @@ use ratatui::{
     buffer::{Buffer, Cell},
     style::{Color, Modifier},
 };
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use suru::{
     managed_client::{
         ManagedClient, ManagedClientConfig, ManagedEvent, SessionEvent, SessionSubscription,
     },
     protocol::{
-        Activity, ActivityId, ActivityStatus, CreateSessionRequest, EffectiveSettings, FileChange,
-        FoldPosture, InitialPrompt, Message, MessageId, MessageRole, MessageStatus, Prompt,
-        PromptDelivery, PromptId, PromptOrder, PromptStatus, ReasoningVisibility, SessionChange,
-        SessionId, SessionRevision, SessionStatus, SessionUpdate, SettingsSnapshot, TranscriptItem,
-        TranscriptSettings, Turn, TurnId, TurnStatus, Workspace,
+        Activity, ActivityId, ActivityStatus, CommandAutoExpand, CreateSessionRequest,
+        EffectiveSettings, FileChange, FoldPosture, InitialPrompt, Message, MessageId, MessageRole,
+        MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
+        ReasoningVisibility, SessionChange, SessionId, SessionRevision, SessionStatus,
+        SessionUpdate, SettingsSnapshot, TranscriptItem, TranscriptSettings, Turn, TurnId,
+        TurnStatus, Workspace,
     },
     server::{AgentOutput, ServerConfig},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId},
@@ -789,6 +796,12 @@ fn command_activities_render_active_successful_and_failed_states_at_responsive_w
             .handle_event(ApplicationEvent::SessionAttached(snapshot))
             .expect("attach Session with command Activity");
         press_leader_chord(&mut application, 'f');
+        if status == ActivityStatus::Active {
+            let folded = rendered_application_rows_at(&application, 43, 18);
+            application
+                .handle_terminal_event(left_click_at(rendered_row(&folded, heading) as u16))
+                .expect("open the active command whose details this matrix exercises");
+        }
 
         let desktop = rendered_application_buffer(&application, 100, 22);
         let desktop_text = buffer_rows(&desktop).join("\n");
@@ -904,7 +917,7 @@ fn file_change_activities_render_active_successful_and_failed_states_at_responsi
 }
 
 #[test]
-fn streaming_command_updates_reuse_one_projected_transcript_row() {
+fn streaming_command_updates_reuse_one_folded_projected_transcript_row() {
     let workspace = workspace_dir();
     let session_id = SessionId::new();
     let mut snapshot = failed_session_snapshot(
@@ -952,7 +965,10 @@ fn streaming_command_updates_reuse_one_projected_transcript_row() {
     }
     let streamed = rendered_application_rows_at(&application, 80, 18).join("\n");
     assert_eq!(streamed.matches("⠋ cargo test").count(), 1);
-    assert_eq!(streamed.matches("running tests").count(), 1);
+    assert!(
+        !streamed.contains("running tests"),
+        "streaming output stays behind the command's one projected row: {streamed}"
+    );
 
     application
         .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
@@ -2090,6 +2106,7 @@ fn session_opened_at(
             transcript: TranscriptSettings {
                 default_fold_posture: posture,
                 reasoning_visibility: ReasoningVisibility::Shown,
+                ..TranscriptSettings::default()
             },
             ..EffectiveSettings::default()
         },
@@ -2895,7 +2912,7 @@ fn a_subagent_asked_without_a_description_heads_with_its_name_alone() {
 }
 
 #[test]
-fn an_active_command_shows_a_live_tail_and_settles_into_its_folded_row() {
+fn an_active_command_starts_folded_and_settles_in_place() {
     let workspace = workspace_dir();
     let (mut snapshot, activity_id) = command_activity_session(
         workspace.path(),
@@ -2914,16 +2931,12 @@ fn an_active_command_shows_a_live_tail_and_settles_into_its_folded_row() {
 
     let streaming = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
-        streaming.contains("output line 12") && streaming.contains("output line 10"),
-        "a streaming command shows the tail it is writing now: {streaming}"
+        streaming.contains("⠋ cargo test"),
+        "a streaming command starts in its one-line shape: {streaming}"
     );
     assert!(
-        !streaming.contains("output line 3") && !streaming.contains("output line 9"),
-        "a live tail keeps no head: {streaming}"
-    );
-    assert!(
-        streaming.contains("… +9 lines"),
-        "the live tail says how much it hides: {streaming}"
+        !streaming.contains("output line") && !streaming.contains("… +"),
+        "the default keeps a streaming command's output folded: {streaming}"
     );
 
     application
@@ -2952,6 +2965,134 @@ fn an_active_command_shows_a_live_tail_and_settles_into_its_folded_row() {
 }
 
 #[test]
+fn an_active_command_starts_folded_then_auto_promotes_under_the_expanded_opening_posture() {
+    let workspace = workspace_dir();
+    let (mut snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Active,
+        &numbered_output(12),
+        false,
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+
+    let mut application = session_opened_under(
+        workspace.path(),
+        EffectiveSettings {
+            transcript: TranscriptSettings {
+                default_fold_posture: FoldPosture::Expanded,
+                command_auto_expand: CommandAutoExpand::AfterMillis(0),
+                ..TranscriptSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &[
+            "transcript.defaultFoldPosture",
+            "transcript.commandAutoExpand",
+        ],
+        snapshot,
+    );
+    let rendered = rendered_application_rows_at(&application, 60, 24).join("\n");
+
+    assert!(rendered.contains("⠋ cargo test"), "{rendered}");
+    assert!(
+        !rendered.contains("output line") && !rendered.contains("… +"),
+        "every Active command begins Folded, independently of the settled-entry posture: {rendered}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::SpinnerTick)
+        .expect("cross the zero-millisecond auto-expansion threshold");
+    let promoted = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        promoted.contains("… +9 lines") && promoted.contains("output line 12"),
+        "the numeric auto-expansion Setting still promotes under the expanded posture: {promoted}"
+    );
+}
+
+#[test]
+fn an_active_command_is_promoted_to_its_live_tail_after_the_configured_latency() {
+    let workspace = workspace_dir();
+    let (mut snapshot, activity_id) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Active,
+        &numbered_output(12),
+        false,
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    let session_id = snapshot.session.id;
+    let revision = snapshot.revision;
+    let elapsed_ms = Arc::new(AtomicU64::new(0));
+    let observed_elapsed_ms = Arc::clone(&elapsed_ms);
+    let origin = Instant::now();
+    let mut application = Application::new(workspace.path()).with_presentation_clock(move || {
+        origin + Duration::from_millis(observed_elapsed_ms.load(Ordering::Relaxed))
+    });
+    deliver_settings(
+        &mut application,
+        EffectiveSettings {
+            transcript: TranscriptSettings {
+                command_auto_expand: CommandAutoExpand::AfterMillis(500),
+                ..TranscriptSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &["transcript.commandAutoExpand"],
+    );
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a streaming command");
+
+    elapsed_ms.store(499, Ordering::Relaxed);
+    application
+        .handle_event(ApplicationEvent::SpinnerTick)
+        .expect("advance the presentation tick before the threshold");
+    let before = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        !before.contains("output line") && !before.contains("… +"),
+        "the command stays Folded before the configured latency: {before}"
+    );
+
+    elapsed_ms.store(500, Ordering::Relaxed);
+    application
+        .handle_event(ApplicationEvent::SpinnerTick)
+        .expect("advance the presentation tick at the threshold");
+    let promoted = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        promoted.contains("… +9 lines")
+            && promoted.contains("output line 10")
+            && promoted.contains("output line 12"),
+        "the command grows into the three-row live-tail view at the threshold: {promoted}"
+    );
+    assert!(
+        !promoted.contains("output line 9"),
+        "promotion reveals the tail rather than the whole stream: {promoted}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![SessionChange::CommandStatusChanged {
+                    activity_id,
+                    status: ActivityStatus::Completed,
+                    exit_status: Some(0),
+                }],
+            },
+        )))
+        .expect("settle the promoted command");
+    let settled = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        settled.contains("✓ cargo test")
+            && !settled.contains("output line")
+            && !settled.contains("… +"),
+        "an automatic promotion ends with the command and success folds at once: {settled}"
+    );
+}
+
+#[test]
 fn a_saturated_live_command_tail_keeps_its_height_as_the_latest_line_wraps() {
     let workspace = workspace_dir();
     let output = format!("{}\n{}", "Z".repeat(80), "Z".repeat(80));
@@ -2962,9 +3103,23 @@ fn a_saturated_live_command_tail_keeps_its_height_as_the_latest_line_wraps() {
     snapshot.session.status = SessionStatus::Active;
     snapshot.turns[0].status = TurnStatus::Active;
     let mut application = connected_application(workspace.path());
+    deliver_settings(
+        &mut application,
+        EffectiveSettings {
+            transcript: TranscriptSettings {
+                command_auto_expand: CommandAutoExpand::AfterMillis(0),
+                ..TranscriptSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &["transcript.commandAutoExpand"],
+    );
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with wrapping streaming output");
+    application
+        .handle_event(ApplicationEvent::SpinnerTick)
+        .expect("promote the command into its live tail");
 
     let live_tail_height = |application: &Application| {
         rendered_application_rows_at(application, 60, 24)
@@ -3030,10 +3185,17 @@ fn interrupting_a_turn_lands_the_watched_command_in_its_peek() {
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a streaming command");
+    let folded_rows = rendered_application_rows_at(&application, 60, 24);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&folded_rows, "⠋ cargo test") as u16
+        ))
+        .expect("open the running command by hand");
     assert!(
         rendered_application_rows_at(&application, 60, 24)
             .join("\n")
-            .contains("… +9 lines")
+            .contains("output line 1"),
+        "manual disclosure reveals the command the reader is watching"
     );
 
     for _ in 0..2 {
@@ -3165,12 +3327,8 @@ fn fold_state_stays_local_to_the_client_that_flipped_it() {
 #[test]
 fn clicking_an_entry_that_hides_nothing_records_no_fold_for_its_later_output() {
     let workspace = workspace_dir();
-    let (mut snapshot, activity_id) = command_activity_session(
-        workspace.path(),
-        ActivityStatus::Active,
-        &numbered_output(2),
-        false,
-    );
+    let (mut snapshot, activity_id) =
+        command_activity_session(workspace.path(), ActivityStatus::Active, "", false);
     let session_id = snapshot.session.id;
     snapshot.session.status = SessionStatus::Active;
     snapshot.turns[0].status = TurnStatus::Active;
@@ -3181,8 +3339,8 @@ fn clicking_an_entry_that_hides_nothing_records_no_fold_for_its_later_output() {
         .expect("attach a Session whose command has hidden nothing yet");
     let rows = rendered_application_rows_at(&application, 60, 24);
     assert!(
-        !rows.join("\n").contains("… +"),
-        "the fixture starts with nothing folded"
+        !rows.join("\n").contains("output line") && !rows.join("\n").contains("… +"),
+        "the fixture starts with no content to hide"
     );
 
     application
@@ -3196,7 +3354,7 @@ fn clicking_an_entry_that_hides_nothing_records_no_fold_for_its_later_output() {
                 revision: SessionRevision(revision.0 + 1),
                 changes: vec![SessionChange::CommandOutputAppended {
                     activity_id,
-                    content: format!("\n{}", numbered_output(12)),
+                    content: numbered_output(12),
                 }],
             },
         )))
@@ -3204,8 +3362,61 @@ fn clicking_an_entry_that_hides_nothing_records_no_fold_for_its_later_output() {
 
     let grown = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
-        grown.contains("… +"),
-        "a click on an entry with nothing to hide leaves the posture in charge: {grown}"
+        !grown.contains("output line") && !grown.contains("… +"),
+        "a click on an entry with nothing to hide leaves the default Fold in charge: {grown}"
+    );
+}
+
+#[test]
+fn clicking_an_empty_active_row_under_the_expanded_posture_does_not_block_auto_promotion() {
+    let workspace = workspace_dir();
+    let (mut snapshot, activity_id) =
+        command_activity_session(workspace.path(), ActivityStatus::Active, "", false);
+    let session_id = snapshot.session.id;
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    let revision = snapshot.revision;
+    let mut application = session_opened_under(
+        workspace.path(),
+        EffectiveSettings {
+            transcript: TranscriptSettings {
+                default_fold_posture: FoldPosture::Expanded,
+                command_auto_expand: CommandAutoExpand::AfterMillis(0),
+                ..TranscriptSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &[
+            "transcript.defaultFoldPosture",
+            "transcript.commandAutoExpand",
+        ],
+        snapshot,
+    );
+    let empty = rendered_application_rows_at(&application, 60, 24);
+
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&empty, "⠋ cargo test") as u16))
+        .expect("click the empty Active row");
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![SessionChange::CommandOutputAppended {
+                    activity_id,
+                    content: numbered_output(12),
+                }],
+            },
+        )))
+        .expect("stream output after the empty-row click");
+    application
+        .handle_event(ApplicationEvent::SpinnerTick)
+        .expect("cross the zero-millisecond auto-expansion threshold");
+
+    let promoted = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        promoted.contains("… +9 lines") && promoted.contains("output line 12"),
+        "an empty-row click records no manual Fold and leaves automatic promotion free: {promoted}"
     );
 }
 
@@ -3557,7 +3768,8 @@ fn a_run_of_one_successful_command_renders_as_a_normal_command_row() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with one successful command");
 
-    let rendered = rendered_application_rows_at(&application, 80, 18).join("\n");
+    let rows = rendered_application_rows_at(&application, 80, 18);
+    let rendered = rows.join("\n");
 
     assert!(
         rendered.contains("✓ command 1"),
@@ -3753,7 +3965,7 @@ fn hidden_reasoning_neither_breaks_a_command_run_nor_leaves_a_gap() {
 }
 
 #[test]
-fn an_active_command_renders_live_outside_the_group_while_the_turn_runs() {
+fn an_active_command_grows_beneath_the_existing_group_while_the_turn_runs() {
     let workspace = workspace_dir();
     let mut snapshot = live_command_run_snapshot(SessionId::new(), workspace.path());
     if let Activity::Command { output, .. } = &mut snapshot.activities[2] {
@@ -3764,7 +3976,8 @@ fn an_active_command_renders_live_outside_the_group_while_the_turn_runs() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a running command after a run");
 
-    let rendered = rendered_application_rows_at(&application, 80, 18).join("\n");
+    let rows = rendered_application_rows_at(&application, 80, 18);
+    let rendered = rows.join("\n");
 
     assert!(
         rendered.contains("✓ Ran 2 commands"),
@@ -3776,15 +3989,16 @@ fn an_active_command_renders_live_outside_the_group_while_the_turn_runs() {
     );
     assert!(
         rendered.contains("⠋ command 3"),
-        "the running command stays visible outside the Group: {rendered}"
+        "the running command stays visible beneath the Group: {rendered}"
+    );
+    let running = &rows[rendered_row(&rows, "⠋ command 3")];
+    assert!(
+        running.starts_with("      ⠋ command 3"),
+        "the live member sits in the Group's member gutter: {running:?}"
     );
     assert!(
-        rendered.contains("output line 12") && rendered.contains("… +9 lines"),
-        "the running command keeps its live-tail presentation: {rendered}"
-    );
-    assert!(
-        !rendered.contains("output line 3"),
-        "a live tail keeps no head: {rendered}"
+        !rendered.contains("output line") && !rendered.contains("… +"),
+        "the live member starts Folded under the default Setting: {rendered}"
     );
 }
 
@@ -4221,8 +4435,8 @@ fn a_command_settling_successfully_is_absorbed_into_an_expanded_group() {
     let expanded_rows = rendered_application_rows_at(&application, 80, 30);
     let running = &expanded_rows[rendered_row(&expanded_rows, "⠋ command 3")];
     assert!(
-        running.starts_with("    ⠋ command 3"),
-        "the running command stays outside the Group, in the standalone column: {running:?}"
+        running.starts_with("      ⠋ command 3"),
+        "the running command is already a member of the expanded Group: {running:?}"
     );
 
     application
