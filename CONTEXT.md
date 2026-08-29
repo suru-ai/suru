@@ -112,6 +112,10 @@ _Avoid_: Chain of thought, and — outside a Transcript's own wording — thinki
 The Activity recording one command a Provider ran while working a Turn. Its command text is the command as a reader should see it: each Provider strips its own launcher plumbing — such as the shell wrapper it launches scripts through — before the Activity is recorded, so the stored text is the command itself, never the machinery around it. A command that arrives in a shape the Provider doesn't recognize as its own plumbing is recorded verbatim.
 _Avoid_: Shell invocation, exec
 
+**File Change**:
+The Activity recording one Provider-reported operation over one or more files in the Workspace.
+_Avoid_: Patch, file edit
+
 **Transcript**:
 The ordered, user-visible history of a Session: its Messages and Activities in presentation order.
 _Avoid_: History, log, conversation
@@ -145,7 +149,7 @@ The single-marker presentation a client's Transcript gives a settled Turn, hidin
 _Avoid_: Turn collapse, worked row
 
 **Marker**:
-The leading cell of an Activity's header row in a Transcript: a Spinner while the Activity is Active, the Activity's outcome glyph once it Settles. One cell with one contract, shared by every Activity kind that shows liveness. Distinct from a fold marker or truncation marker, which are whole rows.
+The leading cell of an Activity row in a Transcript: a Spinner while the Activity is Active, the Activity's outcome glyph once it Settles. Every row belonging to a multi-row File Change repeats the Activity's Marker so those peer rows keep one visual shape. Distinct from a fold marker or truncation marker, which are whole rows.
 _Avoid_: Status icon, prefix glyph
 
 **Spinner**:

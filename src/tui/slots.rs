@@ -342,7 +342,7 @@ fn slot_text_width(items: &[SlotText]) -> usize {
     items.iter().map(|item| item.text.width()).sum()
 }
 
-fn truncate_slot_text(items: Vec<SlotText>, width: usize) -> Vec<SlotText> {
+pub(super) fn truncate_slot_text(items: Vec<SlotText>, width: usize) -> Vec<SlotText> {
     if slot_text_width(&items) <= width {
         return items;
     }

@@ -839,22 +839,37 @@ fn file_change_activities_render_active_successful_and_failed_states_at_responsi
     let cases = [
         (
             ActivityStatus::Active,
-            "⠋ Applying file changes",
+            [
+                "⠋ Renaming src/a.rs → src/b.rs",
+                "⠋ Creating tests/new.rs",
+                "⠋ Deleting old.rs",
+                "⠋ Editing src/lib.rs",
+            ],
             Color::Cyan,
         ),
         (
             ActivityStatus::Completed,
-            "✓ Applied file changes",
+            [
+                "✓ Renamed src/a.rs → src/b.rs",
+                "✓ Created tests/new.rs",
+                "✓ Deleted old.rs",
+                "✓ Edited src/lib.rs",
+            ],
             Color::Green,
         ),
         (
             ActivityStatus::Failed,
-            "× Failed to apply file changes",
+            [
+                "× Failed to rename src/a.rs → src/b.rs",
+                "× Failed to create tests/new.rs",
+                "× Failed to delete old.rs",
+                "× Failed to edit src/lib.rs",
+            ],
             Color::Red,
         ),
     ];
 
-    for (status, heading, color) in cases {
+    for (status, rows, color) in cases {
         let mut snapshot = failed_session_snapshot(
             SessionId::new(),
             PromptId::new(),
@@ -879,6 +894,10 @@ fn file_change_activities_render_active_successful_and_failed_states_at_responsi
                 FileChange::Delete {
                     path: "old.rs".into(),
                 },
+                FileChange::Update {
+                    path: "src/lib.rs".into(),
+                    moved_to: None,
+                },
             ],
         };
         let mut application = connected_application(workspace.path());
@@ -888,32 +907,68 @@ fn file_change_activities_render_active_successful_and_failed_states_at_responsi
 
         let desktop = rendered_application_buffer(&application, 100, 22);
         let desktop_text = buffer_rows(&desktop).join("\n");
-        for expected in [
-            heading,
-            "R src/a.rs → src/b.rs",
-            "A tests/new.rs",
-            "D old.rs",
-        ] {
+        for expected in rows {
             assert!(
                 desktop_text.contains(expected),
                 "desktop file-change Activity omitted {expected:?}:\n{desktop_text}"
             );
+            let action = expected
+                .split_once(' ')
+                .and_then(|(_, rest)| rest.split_once(' '))
+                .map_or(expected, |(action, _)| action);
+            assert_eq!(text_cell(&desktop, action).fg, color);
         }
-        assert_eq!(text_cell(&desktop, heading).fg, color);
+        assert_eq!(text_cell(&desktop, "src/a.rs").fg, Color::DarkGray);
 
         let compact = rendered_application_rows_at(&application, 43, 18).join("\n");
-        for expected in [
-            heading,
-            "R src/a.rs → src/b.rs",
-            "A tests/new.rs",
-            "D old.rs",
-        ] {
+        for expected in rows {
             assert!(
                 compact.contains(expected),
                 "compact file-change Activity omitted {expected:?}:\n{compact}"
             );
         }
     }
+}
+
+#[test]
+fn a_long_file_change_row_end_truncates_instead_of_wrapping() {
+    let workspace = workspace_dir();
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Edit the deeply nested file",
+        workspace.path(),
+    );
+    let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
+    snapshot.activities[0] = Activity::FileChange {
+        id: snapshot.activities[0].id(),
+        turn_id,
+        status: ActivityStatus::Completed,
+        changes: vec![FileChange::Update {
+            path: "src/this/is/a/very/long/path/to/a/file/whose/name/does/not/fit.rs".into(),
+            moved_to: None,
+        }],
+    };
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with an overlong File Change row");
+
+    let rows = rendered_application_rows_at(&application, 43, 18);
+    let row = rows
+        .iter()
+        .find(|row| row.contains("✓ Edited"))
+        .expect("the compact File Change row renders");
+
+    assert!(
+        row.trim_end().ends_with('…'),
+        "the compact row ends in an ellipsis instead of wrapping: {row}"
+    );
+    assert!(
+        !rows.join("\n").contains("does/not/fit.rs"),
+        "the clipped path tail never wraps onto another row: {rows:?}"
+    );
 }
 
 #[test]
@@ -2317,11 +2372,11 @@ fn file_change_activities_fold_past_the_path_budget_and_expand_on_click() {
     let folded_rows = rendered_application_rows_at(&application, 60, 24);
     let folded = folded_rows.join("\n");
     assert!(
-        folded.contains("A src/file4.rs"),
+        folded.contains("✓ Created src/file4.rs"),
         "the budget lists four paths: {folded}"
     );
     assert!(
-        !folded.contains("A src/file5.rs"),
+        !folded.contains("✓ Created src/file5.rs"),
         "paths past the budget are folded away: {folded}"
     );
     assert!(
@@ -2335,7 +2390,7 @@ fn file_change_activities_fold_past_the_path_budget_and_expand_on_click() {
     let expanded = rendered_application_rows_at(&application, 60, 24).join("\n");
     for change in 1..=7 {
         assert!(
-            expanded.contains(&format!("A src/file{change}.rs")),
+            expanded.contains(&format!("✓ Created src/file{change}.rs")),
             "expanding lists every stored path: {expanded}"
         );
     }
@@ -3805,7 +3860,7 @@ fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
             )),
             "Thought: Weighing options",
         ),
-        (RunEntry::FileChange, "✓ Applied file changes"),
+        (RunEntry::FileChange, "✓ Created src/new.rs"),
         (
             RunEntry::Status("Agent Selection changed"),
             "Agent Selection changed",
@@ -4942,7 +4997,7 @@ fn every_other_visible_entry_kind_ends_a_reasoning_run() {
             "A breaking user message",
         ),
         (SUCCESSFUL_COMMAND, "✓ command 1"),
-        (RunEntry::FileChange, "✓ Applied file changes"),
+        (RunEntry::FileChange, "✓ Created src/new.rs"),
         (
             RunEntry::Status("Agent Selection changed"),
             "Agent Selection changed",
@@ -5543,6 +5598,44 @@ fn a_settled_turn_whose_only_work_was_empty_reasoning_shows_no_marker() {
         assert!(
             rows.contains(kept),
             "the Turn's Prompt and its answer still render, but {kept:?} is missing: {rows}"
+        );
+    }
+}
+
+#[test]
+fn a_settled_turn_whose_only_work_was_an_empty_file_change_shows_no_marker() {
+    let workspace = workspace_dir();
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Change the file"),
+            RunEntry::FileChange,
+            RunEntry::AgentMessage("There was nothing to change."),
+        ],
+    );
+    snapshot.session.status = SessionStatus::Idle;
+    snapshot.turns[0].status = TurnStatus::Completed;
+    let Activity::FileChange { changes, .. } = &mut snapshot.activities[0] else {
+        panic!("the fixture carries a File Change");
+    };
+    changes.clear();
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose settled Turn changed no files");
+
+    let rows = rendered_application_rows_at(&application, 80, 24).join("\n");
+
+    assert!(
+        !rows.contains("Worked"),
+        "a Turn Fold covering an empty File Change has nothing to disclose, so no marker \
+         stands for it: {rows}"
+    );
+    for kept in ["Change the file", "There was nothing to change."] {
+        assert!(
+            rows.contains(kept),
+            "the Turn's Prompt and answer still render, but {kept:?} is missing: {rows}"
         );
     }
 }

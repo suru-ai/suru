@@ -50,8 +50,11 @@ use crate::{
     theme::Theme,
 };
 
-use super::markdown;
-use super::spinner;
+use super::{
+    markdown,
+    slots::{SlotText, truncate_slot_text},
+    spinner,
+};
 
 /// Source lines wrapping to more rows than this are split. The cap serves two
 /// bounds: ratatui's u16-based scroll arithmetic stays in range, and the draw
@@ -681,7 +684,7 @@ impl TranscriptView {
                 .enumerate()
                 .skip(skip)
             {
-                if unit.spinner_line == Some(index) {
+                if unit.spinner_lines.binary_search(&index).is_ok() {
                     spinner_lines.push(lines.len());
                 }
                 lines.push(line.clone());
@@ -818,18 +821,20 @@ impl RenderUnit<'_> {
         }
     }
 
-    /// The unit-local line carrying a Spinner in its Marker cell, so the
+    /// The unit-local lines carrying a Spinner in their Marker cells, so the
     /// draw-time overlay (ADR 0009) knows where to patch the current frame.
-    /// An Active Activity animates, its Marker leading its first line; a Group
-    /// animates only if its kind's header ever stands for live work.
-    fn spinner_line(&self) -> Option<usize> {
+    /// Most Active Activities animate their first line; a File Change repeats
+    /// its Marker on every visible file row.
+    fn spinner_lines(&self, folds: &TranscriptFolds) -> Vec<usize> {
         match self {
             Self::Activity(activity) | Self::GroupMember(activity) => {
-                (activity.status() == Some(crate::protocol::ActivityStatus::Active)).then_some(0)
+                activity_spinner_lines(activity, folds)
             }
-            Self::Group { kind, members, .. } => kind.header_spinner_line(members),
-            Self::TurnMember(unit) => unit.spinner_line(),
-            Self::Message(_) | Self::TurnFold(_) | Self::Provisional(_) => None,
+            Self::Group { kind, members, .. } => {
+                kind.header_spinner_line(members).into_iter().collect()
+            }
+            Self::TurnMember(unit) => unit.spinner_lines(folds),
+            Self::Message(_) | Self::TurnFold(_) | Self::Provisional(_) => Vec::new(),
         }
     }
 
@@ -933,6 +938,23 @@ impl RenderUnit<'_> {
                 None
             }
         }
+    }
+}
+
+fn activity_spinner_lines(activity: &Activity, folds: &TranscriptFolds) -> Vec<usize> {
+    if activity.status() != Some(crate::protocol::ActivityStatus::Active) {
+        return Vec::new();
+    }
+    match activity {
+        Activity::FileChange { changes, .. } => {
+            let listed = if resolved_fold_step(folds, activity) == FoldStep::Expanded {
+                changes.len()
+            } else {
+                changes.len().min(FOLDED_FILE_CHANGE_PATHS)
+            };
+            (0..listed).collect()
+        }
+        _ => vec![0],
     }
 }
 
@@ -1182,8 +1204,13 @@ impl<'a> TranscriptContent<'a> {
 /// first delta — that an agent is thinking is itself progress worth a row —
 /// and neither is one whose content the cap cut away, because content the
 /// reader cannot see still happened and its truncation marker says so.
+///
+/// A File Change with no paths is absent on the same terms: there is no file
+/// row to draw while it streams and no work for a settled Turn Fold to stand
+/// for if it never receives one.
 fn transcript_shows_nothing(activity: &Activity, visibility: ReasoningVisibility) -> bool {
     match activity {
+        Activity::FileChange { changes, .. } => changes.is_empty(),
         Activity::Reasoning { .. } if visibility == ReasoningVisibility::Hidden => true,
         Activity::Reasoning {
             status,
@@ -1678,10 +1705,10 @@ struct UnitView {
     /// separator as that first line so a window opening mid-unit lands by
     /// simple subtraction.
     start_line: usize,
-    /// The unit-local line whose Marker cell carries a Spinner, recorded so
-    /// the draw-time overlay (ADR 0009) can patch the current frame in
-    /// without the projection ever depending on it.
-    spinner_line: Option<usize>,
+    /// The unit-local lines whose Marker cells carry Spinners, recorded so the
+    /// draw-time overlay (ADR 0009) can patch the current frame without the
+    /// projection ever depending on it.
+    spinner_lines: Vec<usize>,
     message_id: Option<MessageId>,
     anchor: Option<LaidOutAnchor>,
 }
@@ -1861,7 +1888,7 @@ fn reuse_or_render(
         source_lines,
         leading_separator: false,
         start_line: 0,
-        spinner_line: unit.spinner_line(),
+        spinner_lines: unit.spinner_lines(folds),
         message_id: unit.message_id(),
         anchor: rendered_anchor.map(|anchor| LaidOutAnchor {
             header_lines,
@@ -2180,6 +2207,7 @@ fn render_activity(
             changes,
             step != FoldStep::Expanded,
             theme,
+            width,
         )),
         Activity::Reasoning { .. } => ReasoningActivity::of(activity).map(|reasoning| {
             push_reasoning_activity(
@@ -2703,57 +2731,114 @@ fn push_truncation_marker(
     ));
 }
 
-/// Projects a FileChange Activity. A folded entry lists the first few paths
-/// and reports the rest through the same fold marker and the same per-entry
-/// Fold state a command Activity uses, which is what makes those generic
-/// rather than specific to command output.
+struct FileChangeActions {
+    create: &'static str,
+    delete: &'static str,
+    rename: &'static str,
+    edit: &'static str,
+}
+
+/// Projects a FileChange Activity as one compact row per changed file. A
+/// folded entry lists the first few rows and reports the rest through the same
+/// fold marker and the same per-entry Fold state a command Activity uses,
+/// which is what makes those generic rather than specific to command output.
 fn push_file_change_activity(
     lines: &mut Vec<Line<'static>>,
     status: crate::protocol::ActivityStatus,
     changes: &[FileChange],
     folded: bool,
     theme: &Theme,
+    width: u16,
 ) -> UnitAnchor {
     use crate::protocol::ActivityStatus;
 
-    let (marker, label, style) = match status {
+    let (marker, style, actions) = match status {
         ActivityStatus::Active => (
             spinner::MARKER,
-            "Applying file changes",
             theme.accent.primary,
+            FileChangeActions {
+                create: "Creating",
+                delete: "Deleting",
+                rename: "Renaming",
+                edit: "Editing",
+            },
         ),
-        ActivityStatus::Completed => ("✓ ", "Applied file changes", theme.feedback.success),
-        ActivityStatus::Failed | ActivityStatus::Interrupted => {
-            ("× ", "Failed to apply file changes", theme.feedback.error)
-        }
+        ActivityStatus::Completed => (
+            "✓ ",
+            theme.feedback.success,
+            FileChangeActions {
+                create: "Created",
+                delete: "Deleted",
+                rename: "Renamed",
+                edit: "Edited",
+            },
+        ),
+        ActivityStatus::Failed | ActivityStatus::Interrupted => (
+            "× ",
+            theme.feedback.error,
+            FileChangeActions {
+                create: "Failed to create",
+                delete: "Failed to delete",
+                rename: "Failed to rename",
+                edit: "Failed to edit",
+            },
+        ),
     };
     let header_start = lines.len();
-    push_prefixed_lines(lines, &format!("  {marker}"), label, style);
-    let header_source_lines = lines.len() - header_start;
     let listed = if folded {
         changes.len().min(FOLDED_FILE_CHANGE_PATHS)
     } else {
         changes.len()
     };
     for change in &changes[..listed] {
-        let summary = match change {
-            FileChange::Add { path } => format!("A {}", path.to_string_lossy()),
-            FileChange::Delete { path } => format!("D {}", path.to_string_lossy()),
+        let (action, path) = match change {
+            FileChange::Add { path } => (actions.create, path.to_string_lossy().into_owned()),
+            FileChange::Delete { path } => (actions.delete, path.to_string_lossy().into_owned()),
             FileChange::Update {
                 path,
                 moved_to: Some(moved_to),
-            } => format!(
-                "R {} → {}",
-                path.to_string_lossy(),
-                moved_to.to_string_lossy()
+            } => (
+                actions.rename,
+                format!(
+                    "{} → {}",
+                    path.to_string_lossy(),
+                    moved_to.to_string_lossy()
+                ),
             ),
             FileChange::Update {
                 path,
                 moved_to: None,
-            } => format!("M {}", path.to_string_lossy()),
+            } => (actions.edit, path.to_string_lossy().into_owned()),
         };
-        push_prefixed_lines(lines, OUTPUT_INDENT, &summary, theme.text.subdued);
+        let lead = format!("  {marker}{action} ");
+        let path = sanitize_content(&path).replace('\n', " ");
+        let marker_lead_width = format!("  {marker}").width();
+        let row_width = usize::from(width);
+        let row = if row_width == 0 {
+            Vec::new()
+        } else if row_width < marker_lead_width {
+            let mut compact = marker.trim_end().to_owned();
+            if row_width > 1 {
+                compact.push_str(&" ".repeat(row_width.saturating_sub(2)));
+                compact.push('…');
+            }
+            vec![SlotText::new(compact, style)]
+        } else {
+            truncate_slot_text(
+                vec![
+                    SlotText::new(lead, style),
+                    SlotText::new(path, theme.text.subdued),
+                ],
+                row_width,
+            )
+        };
+        lines.push(Line::from(
+            row.into_iter()
+                .map(|item| Span::styled(item.text, item.style))
+                .collect::<Vec<_>>(),
+        ));
     }
+    let header_source_lines = lines.len() - header_start;
     let hidden = changes.len() - listed;
     if hidden > 0 {
         lines.push(fold_marker_line(hidden, "more", OUTPUT_INDENT, theme));
@@ -3827,13 +3912,14 @@ mod tests {
         style::{Color, Modifier, Style},
         text::{Line, Span},
     };
+    use unicode_width::UnicodeWidthStr;
 
     use crate::{
         protocol::{
-            Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus,
-            ModelAvailability, PromptId, ReasoningVisibility, Session, SessionRevision,
-            SessionSnapshot, SessionStatus, SessionTimestamp, TranscriptItem, Turn, TurnId,
-            TurnStatus, Workspace,
+            Activity, ActivityId, ActivityStatus, FileChange, Message, MessageId, MessageRole,
+            MessageStatus, ModelAvailability, PromptId, ReasoningVisibility, Session,
+            SessionRevision, SessionSnapshot, SessionStatus, SessionTimestamp, TranscriptItem,
+            Turn, TurnId, TurnStatus, Workspace,
         },
         theme::Theme,
     };
@@ -5686,6 +5772,84 @@ mod tests {
             past_it.spinner_lines.is_empty(),
             "a window opening past the Marker records nothing to patch"
         );
+    }
+
+    #[test]
+    fn an_active_file_change_records_every_visible_row_for_spinner_animation() {
+        let activity = Activity::FileChange {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Active,
+            changes: (1..=5)
+                .map(|index| FileChange::Add {
+                    path: format!("src/file{index}.rs").into(),
+                })
+                .collect(),
+        };
+        let snapshot = transcript_snapshot(vec![Entry::Activity(activity)]);
+        let cache = TranscriptCache::default();
+        let view = projected_view(
+            &cache,
+            &snapshot,
+            &TranscriptFolds::default(),
+            &TranscriptGroups::default(),
+        );
+
+        let window = view.window(0, view.row_count());
+        assert_eq!(
+            window.spinner_lines.len(),
+            4,
+            "each of the four visible folded file rows repeats the Activity Spinner"
+        );
+        for spinner_line in window.spinner_lines {
+            let row = rendered_text(&window.lines[spinner_line]);
+            assert!(
+                row.contains(super::spinner::MARKER) && row.contains("Creating src/file"),
+                "every recorded row carries the repeated live Marker and action: {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_change_row_clamps_its_action_and_path_together_at_any_width() {
+        let activity = Activity::FileChange {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Failed,
+            changes: vec![FileChange::Update {
+                path: "src/old.rs".into(),
+                moved_to: Some("src/new.rs".into()),
+            }],
+        };
+        for width in [1, 2, 3, 10] {
+            let mut lines = Vec::new();
+            let mut links = Vec::new();
+            render_activity(
+                &mut lines,
+                &mut links,
+                &activity,
+                FoldStep::Folded,
+                &Theme::system(),
+                width,
+            );
+
+            assert_eq!(lines.len(), 1, "one File Change stays one source line");
+            let row = rendered_text(&lines[0]);
+            assert!(
+                row.width() <= usize::from(width),
+                "the complete row, including its action, respects width {width}: {row}"
+            );
+            assert!(
+                row.contains('×'),
+                "truncation never consumes the Activity Marker at width {width}: {row}"
+            );
+            if width > 1 {
+                assert!(
+                    row.ends_with('…'),
+                    "a clipped File Change reports the missing tail at width {width}: {row}"
+                );
+            }
+        }
     }
 
     #[test]
