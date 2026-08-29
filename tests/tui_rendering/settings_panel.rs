@@ -765,6 +765,48 @@ fn an_unavailable_provider_names_its_reason_and_the_headline_carries_the_message
     );
 }
 
+/// A compatibility warning is guidance rather than Availability: the Provider
+/// remains enabled, while its row names the warning and the focused headline
+/// explains the action that clears it.
+#[test]
+fn a_provider_compatibility_warning_is_shown_without_disabling_the_provider() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let request = read_providers_tab(&mut application);
+    let message = "Codex CLI 0.149.0 may have compatibility issues; update to \
+                   Codex CLI 0.150.1 or newer";
+
+    deliver_catalog(
+        &mut application,
+        request,
+        &[
+            (
+                "codex",
+                ProviderCatalogStatus::Warning {
+                    message: message.to_owned(),
+                },
+            ),
+            ("copilot", ProviderCatalogStatus::Fresh),
+            ("claude", ProviderCatalogStatus::Fresh),
+        ],
+    );
+
+    let codex = row(&application, "Codex");
+    assert!(
+        codex.contains("warning"),
+        "the row names the warning: {codex:?}"
+    );
+    assert!(
+        !codex.contains("disabled") && !codex.contains("incompatible version"),
+        "the warning does not claim the Provider is unavailable: {codex:?}"
+    );
+    let panel = rendered_application_rows(&application).join("\n");
+    assert!(
+        panel.contains("compatibility issues") && panel.contains("update"),
+        "the focused headline explains the compatibility warning: {panel}"
+    );
+}
+
 /// The row says only what the reader can act on: a read that failed is worth a
 /// word, and a catalog that answered — however long ago — is worth none.
 #[test]

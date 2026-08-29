@@ -62,6 +62,19 @@ while IFS= read -r line; do
 done
 "#;
 
+const OUTDATED_CODEX_MODEL_CATALOG: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"suru/0.149.0 (Linux 6; x86_64) codex_cli_rs/0.149.0"}}'
+      ;;
+    *'"method":"model/list"'*)
+      printf '%s\n' '{"id":2,"result":{"data":[{"id":"gpt-fixture","displayName":"GPT Fixture","description":"Fixture model","hidden":false,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","serviceTiers":[],"defaultServiceTier":null,"isDefault":true}],"nextCursor":null}}'
+      ;;
+  esac
+done
+"#;
+
 const SELECTED_MODEL_REJECTION: &str = r#"#!/bin/sh
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
@@ -305,6 +318,40 @@ async fn codex_model_catalog_is_paginated_normalized_and_kept_across_refresh_fai
         request.get("method").and_then(Value::as_str) == Some("model/list")
             && request["params"]["cursor"] == Value::String("opaque-page-2".to_owned())
     }));
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn an_outdated_codex_cli_warns_without_withholding_its_models() {
+    let codex = ScriptedCodex::new(OUTDATED_CODEX_MODEL_CATALOG);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "outdated-codex-model-catalog")
+            .expect("configure server"),
+        Arc::new(CodexRuntime::new(codex.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "outdated-codex-model-catalog")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+
+    let catalog = client.list_models().await.expect("request Model catalog");
+    let codex = &catalog.providers[0];
+    assert_eq!(codex.models.len(), 1, "the warning is non-blocking");
+    assert!(matches!(
+        &codex.status,
+        ProviderCatalogStatus::Warning { message }
+            if message.contains("0.149.0")
+                && message.contains("0.150.1 or newer")
+                && message.contains("may have compatibility issues")
+    ));
+
     drop(client);
     server.shutdown().await.expect("shut down server");
 }

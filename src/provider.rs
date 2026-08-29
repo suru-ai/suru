@@ -32,6 +32,29 @@ pub use codex::CodexRuntime;
 pub use copilot::CopilotRuntime;
 pub(crate) use orchestration::{ProviderOrchestrator, ProviderUpdateGate};
 
+/// What one successful Provider catalog discovery found. Models are the
+/// selectable inventory every Provider supplies; `warning` is a non-blocking
+/// compatibility condition the Provider wants surfaced alongside that
+/// inventory without making it unavailable.
+pub struct ProviderModelDiscovery {
+    pub models: Vec<ModelDescriptor>,
+    pub warning: Option<String>,
+}
+
+impl ProviderModelDiscovery {
+    pub fn new(models: Vec<ModelDescriptor>) -> Self {
+        Self {
+            models,
+            warning: None,
+        }
+    }
+
+    pub fn with_warning(mut self, warning: impl Into<String>) -> Self {
+        self.warning = Some(warning.into());
+        self
+    }
+}
+
 /// One built-in Provider as a surface listing Providers reads it: which
 /// Provider it is, and what its runtime calls it.
 pub struct BuiltInProvider {
@@ -513,7 +536,7 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     /// cannot ship without one.
     fn display_name(&self) -> &str;
 
-    fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>>;
+    fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery>;
 
     /// Offers the effective user-invocable Skill Catalog for exactly one
     /// Workspace. Discovery and native identifiers remain inside the Provider;

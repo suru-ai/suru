@@ -129,8 +129,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        protocol::{AgentSelection, ModelDescriptor, ModelId, ProviderId},
-        provider::{ProviderFuture, ProviderSessionConnection, ProviderSessionRequest},
+        protocol::{AgentSelection, ModelId, ProviderId},
+        provider::{
+            ProviderFuture, ProviderModelDiscovery, ProviderSessionConnection,
+            ProviderSessionRequest,
+        },
     };
 
     /// The Provider these tests route to. A real Provider id, because
@@ -153,8 +156,8 @@ mod tests {
             "Silent"
         }
 
-        fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
-            Box::pin(async { Ok(Vec::new()) })
+        fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
+            Box::pin(async { Ok(ProviderModelDiscovery::new(Vec::new())) })
         }
 
         fn start_session(

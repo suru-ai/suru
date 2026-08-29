@@ -16,12 +16,12 @@ use super::{
 };
 use crate::{
     protocol::{
-        AgentSelection, ModelDescriptor, ModelId, ModelOptionChoiceId, ModelOptionId,
-        ModelOptionSelection, ModelOptionValue, ProviderId, ProviderUnavailability, SkillCatalog,
+        AgentSelection, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
+        ModelOptionValue, ProviderId, ProviderUnavailability, SkillCatalog,
     },
     provider::{
-        ProviderErrand, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
-        ProviderSessionRequest,
+        ProviderErrand, ProviderFuture, ProviderModelDiscovery, ProviderRuntime,
+        ProviderSessionConnection, ProviderSessionRequest,
         harness::{HarnessSpec, SharedHarness},
         resolve_executable,
     },
@@ -93,7 +93,7 @@ impl ProviderRuntime for CopilotRuntime {
         "Copilot"
     }
 
-    fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
+    fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
         Box::pin(async move {
             // Launches the shared process if this is the first demand, or the first since a crash.
             let handle = self.harness.demand().await?;
@@ -106,7 +106,7 @@ impl ProviderRuntime for CopilotRuntime {
                 }
                 listed = handle.connection().list_models() => listed?,
             };
-            Ok(model_descriptors(listed))
+            Ok(ProviderModelDiscovery::new(model_descriptors(listed)))
         })
     }
 

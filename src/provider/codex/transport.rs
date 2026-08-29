@@ -47,6 +47,12 @@ use crate::provider::{
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UNSUPPORTED_INTERACTION_ERROR_CODE: i64 = -32000;
 const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
+const CODEX_WARNING_VERSION: CodexVersion = CodexVersion {
+    major: 0,
+    minor: 150,
+    patch: 1,
+    prerelease: false,
+};
 
 type PendingResponse = oneshot::Sender<Result<Value, ProviderError>>;
 
@@ -61,6 +67,53 @@ pub(super) struct CodexConnection {
     pub(super) transport: JsonRpcTransport,
     pub(super) notifications: mpsc::UnboundedReceiver<Result<NativeNotification, ProviderError>>,
     pub(super) process: Arc<ProcessGuard>,
+    /// A non-blocking compatibility condition learned from the handshake.
+    /// Sessions do not need it; Model discovery carries it to Provider views.
+    pub(super) warning: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CodexVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    prerelease: bool,
+}
+
+impl CodexVersion {
+    fn parse(reported: &str) -> Option<Self> {
+        let (core, suffix) = reported
+            .split_once(['-', '+'])
+            .map_or((reported, None), |(core, suffix)| (core, Some(suffix)));
+        let mut parts = core.split('.');
+        let version = Self {
+            major: parts.next()?.parse().ok()?,
+            minor: parts.next()?.parse().ok()?,
+            patch: parts.next()?.parse().ok()?,
+            prerelease: reported.contains('-'),
+        };
+        (parts.next().is_none() && suffix.is_none_or(|suffix| !suffix.is_empty()))
+            .then_some(version)
+    }
+
+    fn is_below(self, floor: Self) -> bool {
+        (self.major, self.minor, self.patch) < (floor.major, floor.minor, floor.patch)
+            || ((self.major, self.minor, self.patch) == (floor.major, floor.minor, floor.patch)
+                && self.prerelease
+                && !floor.prerelease)
+    }
+}
+
+fn codex_version_warning(initialize: &Value) -> Option<String> {
+    let user_agent = initialize.get("userAgent")?.as_str()?;
+    let reported = user_agent.split_whitespace().next()?.rsplit_once('/')?.1;
+    let version = CodexVersion::parse(reported)?;
+    version.is_below(CODEX_WARNING_VERSION).then(|| {
+        format!(
+            "Codex CLI {reported} may have compatibility issues; update to \
+             Codex CLI 0.150.1 or newer"
+        )
+    })
 }
 
 #[derive(Clone)]
@@ -104,7 +157,7 @@ impl JsonRpcTransport {
             next_id: Arc::new(AtomicI64::new(1)),
             _process: process.clone(),
         };
-        transport
+        let initialize = transport
             .request(
                 "initialize",
                 &InitializeParams {
@@ -120,6 +173,7 @@ impl JsonRpcTransport {
             )
             .await
             .map_err(|error| codex_error_context("Codex initialization failed", error))?;
+        let warning = codex_version_warning(&initialize);
         transport
             .notify("initialized")
             .await
@@ -129,6 +183,7 @@ impl JsonRpcTransport {
             transport,
             notifications,
             process,
+            warning,
         })
     }
 
@@ -684,5 +739,47 @@ fn finish_transport(state: &TransportState, error: ProviderError, publish_error:
     }
     if publish_error {
         let _ = state.events.send(Err(error));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::codex_version_warning;
+
+    fn warning_for(version: &str) -> Option<String> {
+        codex_version_warning(&json!({
+            "userAgent": format!("suru/{version} (Linux 6; x86_64) codex_cli_rs/0.1")
+        }))
+    }
+
+    #[test]
+    fn codex_versions_below_0_150_1_warn_about_compatibility() {
+        for version in ["0.149.0", "0.150.0", "0.150.1-alpha.1"] {
+            let warning = warning_for(version)
+                .unwrap_or_else(|| panic!("Codex CLI {version} should carry the warning"));
+            assert!(warning.contains(version));
+            assert!(warning.contains("0.150.1 or newer"));
+            assert!(warning.contains("may have compatibility issues"));
+        }
+    }
+
+    #[test]
+    fn codex_versions_at_or_above_0_150_1_carry_no_warning() {
+        for version in ["0.150.1", "0.150.1+build.7", "0.151.0", "1.0.0"] {
+            assert_eq!(warning_for(version), None, "Codex CLI {version}");
+        }
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_codex_version_invents_no_warning() {
+        for initialize in [
+            json!({}),
+            json!({"userAgent": "codex"}),
+            json!({"userAgent": "suru/not-a-version"}),
+        ] {
+            assert_eq!(codex_version_warning(&initialize), None);
+        }
     }
 }

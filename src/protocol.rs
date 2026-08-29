@@ -312,6 +312,12 @@ impl ProviderUnavailability {
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderCatalogStatus {
     Fresh,
+    /// The Provider remains usable, but its environment has a compatibility
+    /// condition worth fixing. Models stay selectable; this is guidance, not
+    /// Provider Unavailability.
+    Warning {
+        message: String,
+    },
     Refreshing,
     Stale {
         message: String,

@@ -34,14 +34,14 @@ use super::{
 };
 use crate::{
     protocol::{
-        AgentId, AgentIdentity, AgentSelection, EffectiveSettings, ModelDescriptor, ModelId,
-        ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue, ProviderId,
-        ReasoningSummaryDetail, SkillCatalog,
+        AgentId, AgentIdentity, AgentSelection, EffectiveSettings, ModelId, ModelOptionChoiceId,
+        ModelOptionId, ModelOptionSelection, ModelOptionValue, ProviderId, ReasoningSummaryDetail,
+        SkillCatalog,
     },
     provider::{
-        ProviderErrand, ProviderError, ProviderFuture, ProviderPrompt, ProviderResumeState,
-        ProviderRuntime, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
-        ProviderSteerInput, ProviderSubagentId, ProviderTurnInput,
+        ProviderErrand, ProviderError, ProviderFuture, ProviderModelDiscovery, ProviderPrompt,
+        ProviderResumeState, ProviderRuntime, ProviderSession, ProviderSessionConnection,
+        ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId, ProviderTurnInput,
         harness::{ProcessGuard, ProcessRegistry},
         resolve_executable,
     },
@@ -146,7 +146,7 @@ impl ProviderRuntime for CodexRuntime {
         true
     }
 
-    fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
+    fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
         Box::pin(async move { discover_codex_models(executable, processes).await })
@@ -230,11 +230,12 @@ impl ProviderRuntime for CodexRuntime {
 async fn discover_codex_models(
     executable: OsString,
     processes: ProcessRegistry,
-) -> Result<Vec<ModelDescriptor>, ProviderError> {
+) -> Result<ProviderModelDiscovery, ProviderError> {
     let CodexConnection {
         transport,
         notifications: _notifications,
         process,
+        warning,
     } = JsonRpcTransport::launch(&executable, processes).await?;
     let mut cursor = None;
     let mut seen_cursors = std::collections::HashSet::new();
@@ -275,7 +276,10 @@ async fn discover_codex_models(
     }
     transport.close().await;
     process.wait_until_stopped().await?;
-    Ok(models)
+    Ok(match warning {
+        Some(warning) => ProviderModelDiscovery::new(models).with_warning(warning),
+        None => ProviderModelDiscovery::new(models),
+    })
 }
 
 /// The interruption-related timeouts a [`CodexRuntime`] hands each Session.
@@ -317,6 +321,7 @@ async fn start_codex_thread(
         transport,
         notifications,
         process,
+        warning: _,
     } = connection;
     let cwd = request
         .workspace

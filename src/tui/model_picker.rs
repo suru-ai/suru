@@ -695,6 +695,7 @@ fn provider_condition(status: &ProviderCatalogStatus) -> Option<ProviderConditio
         // A Provider the user turned off puts nothing in the list — not even a
         // reason, because Suru never looked for one.
         ProviderCatalogStatus::Fresh
+        | ProviderCatalogStatus::Warning { .. }
         | ProviderCatalogStatus::Refreshing
         | ProviderCatalogStatus::Disabled => None,
     }

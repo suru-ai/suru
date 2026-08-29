@@ -23,8 +23,9 @@ use super::{
 use crate::{
     protocol::{AgentSelection, ModelDescriptor, ProviderId, SkillCatalog},
     provider::{
-        ProviderErrand, ProviderError, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
-        ProviderSessionRequest, harness::ProcessRegistry, resolve_executable,
+        ProviderErrand, ProviderError, ProviderFuture, ProviderModelDiscovery, ProviderRuntime,
+        ProviderSessionConnection, ProviderSessionRequest, harness::ProcessRegistry,
+        resolve_executable,
     },
 };
 
@@ -114,13 +115,15 @@ impl ProviderRuntime for ClaudeRuntime {
         true
     }
 
-    fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
+    fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
         let availability = self.availability.clone();
         let request_timeout = self.control_request_timeout;
         Box::pin(async move {
-            usable_claude_models(executable, processes, availability, request_timeout).await
+            usable_claude_models(executable, processes, availability, request_timeout)
+                .await
+                .map(ProviderModelDiscovery::new)
         })
     }
 

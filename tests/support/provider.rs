@@ -12,9 +12,9 @@ use suru::protocol::{
 };
 use suru::provider::{
     AttributedProviderEvent, ProviderErrand, ProviderError, ProviderEvent,
-    ProviderEventAttribution, ProviderEventStream, ProviderFuture, ProviderPrompt, ProviderRuntime,
-    ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
-    ProviderSubagentId, ProviderTurnInput,
+    ProviderEventAttribution, ProviderEventStream, ProviderFuture, ProviderModelDiscovery,
+    ProviderPrompt, ProviderRuntime, ProviderSession, ProviderSessionConnection,
+    ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId, ProviderTurnInput,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -592,7 +592,7 @@ impl ProviderRuntime for ControlledProviderRuntime {
         self.subagent_stop_offered.load(Ordering::SeqCst)
     }
 
-    fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
+    fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
         self.discoveries.fetch_add(1, Ordering::SeqCst);
         let models = self
             .models
@@ -610,7 +610,7 @@ impl ProviderRuntime for ControlledProviderRuntime {
                     reason,
                     format!("the {provider} CLI is {}", reason.label()),
                 )),
-                None => Ok(models),
+                None => Ok(ProviderModelDiscovery::new(models)),
             }
         })
     }

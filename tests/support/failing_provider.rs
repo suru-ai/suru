@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use suru::{
     protocol::{
-        AgentSelection, ModelDescriptor, ProviderId, SkillCatalog, SkillCatalogCapabilities,
-        SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery, Workspace,
+        AgentSelection, ProviderId, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus,
+        SkillDescriptor, SkillId, SkillPromptDelivery, Workspace,
     },
     provider::{
-        ProviderErrand, ProviderError, ProviderFuture, ProviderRuntime, ProviderSessionConnection,
-        ProviderSessionRequest,
+        ProviderErrand, ProviderError, ProviderFuture, ProviderModelDiscovery, ProviderRuntime,
+        ProviderSessionConnection, ProviderSessionRequest,
     },
     server::{self, ServerConfig},
 };
@@ -23,7 +23,7 @@ impl ProviderRuntime for FailingProviderRuntime {
         "failing"
     }
 
-    fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
+    fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
         Box::pin(async { Err(ProviderError::new("Model discovery is unavailable.")) })
     }
 

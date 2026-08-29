@@ -289,6 +289,8 @@ pub(super) enum RowAvailability {
     Quiet,
     /// Being read right now, which is live work and so wears a Spinner.
     Reading,
+    /// Usable, with a compatibility condition worth fixing.
+    Warning,
     /// Unusable until the reader fixes this outside Suru.
     Unavailable(ProviderUnavailability),
     /// The read itself failed, which is Suru's problem to report rather than a
@@ -553,6 +555,9 @@ impl SettingsPanel {
                 // A refresh the server armed is this read still running, so
                 // the row keeps its Spinner until the settled answer lands.
                 ProviderCatalogStatus::Refreshing => (RowAvailability::Reading, None),
+                ProviderCatalogStatus::Warning { message } => {
+                    (RowAvailability::Warning, Some(message.clone()))
+                }
                 ProviderCatalogStatus::Unavailable { reason, message } => {
                     (RowAvailability::Unavailable(*reason), Some(message.clone()))
                 }

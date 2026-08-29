@@ -548,6 +548,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
             RowAvailability::Reading => {
                 format!(" · {}", spinner::frame(state.spinner_frame))
             }
+            RowAvailability::Warning => " · warning".to_owned(),
             RowAvailability::Unavailable(reason) => format!(" · {}", reason.label()),
             RowAvailability::Failed => " · error".to_owned(),
         };

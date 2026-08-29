@@ -32,6 +32,7 @@ struct ProviderCatalog {
 #[derive(Default)]
 struct CatalogState {
     models: Option<Vec<ModelDescriptor>>,
+    warning: Option<String>,
     failure: Option<CatalogFailure>,
     refreshing: bool,
 }
@@ -334,23 +335,28 @@ impl ProviderCatalog {
     }
 
     async fn discover(&self) {
-        let result = self.runtime.list_models().await.and_then(|models| {
-            validate_models(&models)?;
-            if models.iter().any(|model| model.provider != self.provider) {
+        let result = self.runtime.list_models().await.and_then(|discovery| {
+            validate_models(&discovery.models)?;
+            if discovery
+                .models
+                .iter()
+                .any(|model| model.provider != self.provider)
+            {
                 return Err(ProviderError::new(format!(
                     "Provider `{}` returned a Model owned by another Provider",
                     self.provider
                 )));
             }
-            Ok(models)
+            Ok(discovery)
         });
         let mut state = self
             .state
             .lock()
             .expect("Model catalog lock is not poisoned");
         match result {
-            Ok(models) => {
-                state.models = Some(models);
+            Ok(discovery) => {
+                state.models = Some(discovery.models);
+                state.warning = discovery.warning;
                 state.failure = None;
             }
             Err(error) => {
@@ -481,7 +487,12 @@ fn catalog_status(state: &CatalogState) -> ProviderCatalogStatus {
         (Some(_), Some(failure), false) => ProviderCatalogStatus::Stale {
             message: failure.message.clone(),
         },
-        (Some(_), None, false) => ProviderCatalogStatus::Fresh,
+        (Some(_), None, false) => match &state.warning {
+            Some(message) => ProviderCatalogStatus::Warning {
+                message: message.clone(),
+            },
+            None => ProviderCatalogStatus::Fresh,
+        },
         (None, Some(failure), false) => ProviderCatalogStatus::Failed {
             message: failure.message.clone(),
         },
@@ -502,7 +513,10 @@ mod tests {
             ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
             ModelOptionSelection, ModelOptionValue,
         },
-        provider::{ProviderFuture, ProviderSessionConnection, ProviderSessionRequest},
+        provider::{
+            ProviderFuture, ProviderModelDiscovery, ProviderSessionConnection,
+            ProviderSessionRequest,
+        },
     };
 
     /// Serves one good catalog, then fails every later refresh.
@@ -527,11 +541,11 @@ mod tests {
             "Stub"
         }
 
-        fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
+        fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 if call == 0 {
-                    return Ok(vec![ModelDescriptor {
+                    return Ok(ProviderModelDiscovery::new(vec![ModelDescriptor {
                         provider: ProviderId::new("stub"),
                         id: ModelId::new("stub-model"),
                         display_name: "Stub".to_owned(),
@@ -539,7 +553,7 @@ mod tests {
                         is_default: true,
                         availability: ModelAvailability::Available,
                         options: Vec::new(),
-                    }]);
+                    }]));
                 }
                 Err(ProviderError::new("temporary catalog outage"))
             })
