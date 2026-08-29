@@ -53,6 +53,12 @@ event() {
   reply '{"jsonrpc":"2.0","method":"session.event","params":{"sessionId":"'"$sid"'","event":{"id":"'"$1"'","timestamp":"2026-01-01T00:00:00Z","type":"'"$2"'","data":'"$3"'}}}'
 }
 
+# The same entry stamped with a sub-agent's envelope attribution: `agent_event <id> <agentId>
+# <type> <data-object>`, the shape the CLI gives every event a sub-agent originates.
+agent_event() {
+  reply '{"jsonrpc":"2.0","method":"session.event","params":{"sessionId":"'"$sid"'","event":{"id":"'"$1"'","timestamp":"2026-01-01T00:00:00Z","agentId":"'"$2"'","type":"'"$3"'","data":'"$4"'}}}'
+}
+
 while IFS= read -r header; do
   case "$header" in
     Content-Length:*) ;;

@@ -92,6 +92,9 @@ pub(super) async fn start_copilot_session(
                 .with_client_name(COPILOT_CLIENT_NAME)
                 .with_working_directory(request.workspace)
                 .with_streaming(true)
+                // Pinned rather than left to the CLI's default: a Subagent's deltas are its
+                // child Session's whole Transcript.
+                .with_include_sub_agent_streaming_events(true)
                 .with_enable_config_discovery(true)
                 .with_enable_skills(true)
                 .approve_all_permissions();
@@ -112,6 +115,9 @@ pub(super) async fn start_copilot_session(
                 .with_client_name(COPILOT_CLIENT_NAME)
                 .with_working_directory(request.workspace)
                 .with_streaming(true)
+                // Pinned rather than left to the CLI's default: a Subagent's deltas are its
+                // child Session's whole Transcript.
+                .with_include_sub_agent_streaming_events(true)
                 .with_enable_config_discovery(true)
                 .with_enable_skills(true)
                 .approve_all_permissions();

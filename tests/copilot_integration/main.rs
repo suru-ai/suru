@@ -25,5 +25,6 @@ mod models;
 mod resume;
 mod skills;
 mod steering;
+mod subagents;
 mod support;
 mod turns;
