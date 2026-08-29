@@ -3,12 +3,15 @@
 //! The CLI streams a Turn as partial-message chunks — Anthropic streaming events riding in
 //! `stream_event` envelopes — and ends each stretch of its loop with one `result` message. The
 //! wire carries several conversations at once: the loop's own, and one for every subagent the
-//! agent spawns through the Task tool, whose chunks ride under the spawning tool use's id as
-//! `parent_tool_use_id`. Each conversation projects the same way — text blocks become the agent
-//! Message, thinking blocks become Reasoning Activity split at their headings, the Bash tool's
-//! executions become Command Activity settled by the tool results the loop echoes back — and each
-//! event leaves here attributed to the conversation that produced it, so orchestration lands a
-//! subagent's work in the Subagent's own child Session rather than the parent's Transcript.
+//! agent spawns through the Task tool, attributed to the spawning tool use's id as
+//! `parent_tool_use_id`. Only the loop's own conversation streams; a subagent's arrives solely as
+//! the full `assistant` snapshots that restate the loop's chunks after the fact, so each
+//! conversation is presented from whichever account is all it gets. Both project the same way —
+//! text blocks become the agent Message, thinking blocks become Reasoning Activity split at their
+//! headings, the Bash tool's executions become Command Activity settled by the tool results the
+//! loop echoes back — and each event leaves here attributed to the conversation that produced it,
+//! so orchestration lands a subagent's work in the Subagent's own child Session rather than the
+//! parent's Transcript.
 //!
 //! The task lifecycle the CLI reports beside the conversations is where Subagents begin and end:
 //! `task_started` for an agent task opens the Subagent under the spawning tool use's identity,
@@ -36,8 +39,8 @@ use super::{
     thinking::{ThinkingEvent, ThinkingSplitter},
     turn_in_flight::TurnInFlight,
     wire::{
-        ContentBlock, EchoedUserContent, EchoedUserMessage, ResultMessage, StreamEventMessage,
-        SystemMessage,
+        AssistantMessageSnapshot, ContentBlock, EchoedUserContent, EchoedUserMessage,
+        ResultMessage, StreamEventMessage, SystemMessage,
     },
 };
 use crate::provider::{
@@ -151,6 +154,10 @@ struct ConversationInFlight {
     open_text_block: Option<u64>,
     open_thinking: Option<OpenThinking>,
     open_tools: BTreeMap<u64, OpenToolUse>,
+    /// Whether any chunk has streamed for this conversation. A conversation that streams is
+    /// presented from its chunks, so its full-message snapshots restate what already projected
+    /// and are passed over; one that never streams is presented from the snapshots alone.
+    streamed: bool,
 }
 
 /// A command running until a tool result settles it, remembering the conversation that ran it —
@@ -202,11 +209,11 @@ impl ClaudeProjection {
     fn project(&mut self, message: Value) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
         match message.get("type").and_then(Value::as_str) {
             Some("stream_event") => self.project_stream_event(message),
+            Some("assistant") => Ok(self.project_assistant_snapshot(message)),
             Some("user") => Ok(self.project_tool_results(message)),
             Some("result") => self.project_result(message),
             Some("system") => Ok(self.project_task_lifecycle(message)),
-            // Full-message snapshots of what already streamed, and everything else the CLI says
-            // about itself — nothing this projection presents.
+            // Everything else the CLI says about itself — nothing this projection presents.
             _ => Ok(Vec::new()),
         }
     }
@@ -352,6 +359,7 @@ impl ClaudeProjection {
         // The conversation steps out of the table while its chunk projects, so the projection's
         // shared state — the commands and spawns other conversations feed too — stays reachable.
         let mut conversation = self.conversations.remove(&owner).unwrap_or_default();
+        conversation.streamed = true;
         let mut projected = Vec::new();
         match event.kind.as_str() {
             "content_block_start" => {
@@ -438,6 +446,64 @@ impl ClaudeProjection {
             .into_iter()
             .map(|event| attributed(&owner, event))
             .collect())
+    }
+
+    /// A full-message snapshot of an assistant message. A conversation that streamed is already
+    /// in the Transcript chunk by chunk, so its snapshots are passed over. A subagent's
+    /// conversation never streams — verified against 2.1.237, which attributes no `stream_event`
+    /// to a parent tool use — so its snapshots are all the wire carries of it, and each block
+    /// projects as a settled whole: text as the agent Message, thinking as Reasoning split at its
+    /// headings, and tool uses through the same open/close pair the streaming path takes, which
+    /// is what records a Task block as a spawn and a Bash block as a Command awaiting its result.
+    fn project_assistant_snapshot(&mut self, message: Value) -> Vec<AttributedProviderEvent> {
+        let Ok(message) = serde_json::from_value::<AssistantMessageSnapshot>(message) else {
+            return Vec::new();
+        };
+        let owner: ConversationKey = message.parent_tool_use_id;
+        let held = self.conversations.remove(&owner);
+        let known = held.is_some();
+        let mut conversation = held.unwrap_or_default();
+        let mut projected = Vec::new();
+        if !conversation.streamed {
+            for (index, block) in message.message.content.into_iter().enumerate() {
+                let index = index as u64;
+                match block.kind.as_str() {
+                    "text" => {
+                        if let Some(text) = block.text.filter(|text| !text.is_empty()) {
+                            projected.push(ProviderEvent::AgentMessageStarted);
+                            projected.push(ProviderEvent::AgentMessageDelta { content: text });
+                            projected.push(ProviderEvent::AgentMessageCompleted);
+                        }
+                    }
+                    "thinking" => {
+                        if block.thinking.as_deref().is_some_and(|text| !text.is_empty()) {
+                            self.open_thinking(
+                                &mut conversation,
+                                index,
+                                block.thinking,
+                                &mut projected,
+                            );
+                            self.settle_open_thinking(&mut conversation, &mut projected);
+                        }
+                    }
+                    "tool_use" => {
+                        self.open_tool_use(&owner, &mut conversation, Some(index), block);
+                        self.close_tool_use(&owner, &mut conversation, index, &mut projected);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // A snapshot's blocks arrive settled, so they leave nothing open behind: a conversation
+        // the table did not already hold has nothing to remember, and reinserting one would
+        // recreate entries for subagents whose settle already cleared them.
+        if known {
+            self.conversations.insert(owner.clone(), conversation);
+        }
+        projected
+            .into_iter()
+            .map(|event| attributed(&owner, event))
+            .collect()
     }
 
     /// Starts tracking a `tool_use` block whose input is about to stream. A Task tool use is
@@ -673,6 +739,16 @@ impl ClaudeProjection {
                 exit_status: None,
             });
         }
+        // The result ends a stretch, not the wire's account of the loop: that the loop's own
+        // conversation streams is what keeps its snapshots passed over, so the flag outlives the
+        // blocks the settle just closed.
+        self.conversations.insert(
+            OWNING_CONVERSATION,
+            ConversationInFlight {
+                streamed: owning.streamed,
+                ..ConversationInFlight::default()
+            },
+        );
         if was_interrupted(&result) {
             self.turn.abandon_turn();
             projected.push(ProviderEvent::TurnInterrupted);

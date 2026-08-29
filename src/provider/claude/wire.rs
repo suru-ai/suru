@@ -172,6 +172,23 @@ pub(super) struct ContentDelta {
     pub(super) partial_json: Option<String>,
 }
 
+/// A full-message snapshot of one assistant conversation message. The loop's own conversation
+/// streams in `stream_event` chunks and its snapshots restate them, but a subagent's conversation
+/// never streams — its snapshots, attributed by `parent_tool_use_id`, are the wire's only account
+/// of its work.
+#[derive(Deserialize)]
+pub(super) struct AssistantMessageSnapshot {
+    pub(super) message: AssistantMessageBody,
+    #[serde(default)]
+    pub(super) parent_tool_use_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct AssistantMessageBody {
+    #[serde(default)]
+    pub(super) content: Vec<ContentBlock>,
+}
+
 /// A conversation message the loop echoes back with the `user` role: tool results on their way
 /// into the next model call. Decoded only as far as the tool results the projection presents.
 #[derive(Deserialize)]

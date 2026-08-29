@@ -1,7 +1,12 @@
 //! Claude's task lifecycle as Subagents: a Task spawn opens the inline row and the child Session,
-//! every `parent_tool_use_id`-attributed event lands in the child's Transcript, a subagent
+//! every `parent_tool_use_id`-attributed message lands in the child's Transcript, a subagent
 //! outliving the Turn keeps running, its late output streams into a Continuation, and nested
 //! spawns recurse one level down.
+//!
+//! The fixtures mirror the live 2.1.237 CLI: only the loop's own conversation streams in
+//! `stream_event` chunks (with full `assistant` snapshots restating them), while a subagent's
+//! conversation arrives as those snapshots alone — full messages carrying `parent_tool_use_id`,
+//! never chunks.
 
 use crate::support::{
     CLAUDE_MODELS, ScriptedClaude, after_probe, agent_messages, conversation_fixture,
@@ -12,25 +17,17 @@ use suru::protocol::{Activity, ActivityStatus, SessionSnapshot, TurnStatus};
 
 /// A fan-out running in the foreground of the Turn: the conversation spawns a subagent through
 /// the Task tool, the CLI reports the task starting with the spawning tool use's identity, the
-/// subagent narrates, thinks, and runs Bash — every chunk attributed by `parent_tool_use_id` —
-/// and the CLI notifies the task settling before the conversation answers.
+/// subagent narrates, thinks, and runs Bash — arriving as full snapshots attributed by
+/// `parent_tool_use_id` — and the CLI notifies the task settling before the conversation answers.
+/// The loop's own answer streams with its snapshot restating it beside the chunks.
 const FAN_OUT_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_1","name":"Task","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"description\":\"Scout the workspace\",\"prompt\":\"scout the workspace\",\"subagent_type\":\"Explore\"}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_started","task_id":"agent-task-1","tool_use_id":"task_1","description":"Scout the workspace","task_type":"local_agent","subagent_type":"Explore","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Scouting the workspace now."}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"**Scouting plan**\n\nLook for TODO markers."}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_sub","name":"Bash","input":{}}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"rg -l TODO\"}"}},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":2},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Scouting the workspace now."}]},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"**Scouting plan**\n\nLook for TODO markers.","signature":"sig"},{"type":"tool_use","id":"toolu_sub","name":"Bash","input":{"command":"rg -l TODO"}}]},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sub","content":"src/main.rs\n","is_error":false}]},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_notification","task_id":"agent-task-1","status":"completed","summary":"Found one file.","session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"task_1","content":"Found one file.","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
@@ -39,6 +36,7 @@ const FAN_OUT_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type"
       emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"One TODO file."}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"One TODO file."}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":2100,"num_turns":1,"result":"One TODO file.","session_id":"prov-session"}'
 "#;
 
@@ -164,8 +162,7 @@ const OUTLIVING_TURN: &str = r#"      emit '{"type":"stream_event","event":{"typ
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_started","task_id":"agent-task-bg","tool_use_id":"task_bg","description":"Audit dependencies","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_audit","name":"Bash","input":{"command":"cargo audit"}}},"parent_tool_use_id":"task_bg","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":"task_bg","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_audit","name":"Bash","input":{"command":"cargo audit"}}]},"parent_tool_use_id":"task_bg","session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":400,"num_turns":1,"result":"Kicked off the audit.","session_id":"prov-session"}'
       while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_audit","content":"0 vulnerabilities\n","is_error":false}]},"parent_tool_use_id":"task_bg","session_id":"prov-session"}'
@@ -176,6 +173,7 @@ const OUTLIVING_TURN: &str = r#"      emit '{"type":"stream_event","event":{"typ
       emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The audit found nothing."}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The audit found nothing."}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":80,"num_turns":1,"result":"The audit found nothing.","session_id":"prov-session"}'
 "#;
 
@@ -296,15 +294,12 @@ const NESTED_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_started","task_id":"agent-outer","tool_use_id":"task_outer","description":"Plan the refactor","task_type":"local_agent","subagent_type":"Plan","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_inner","name":"Task","input":{}}},"parent_tool_use_id":"task_outer","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":"task_outer","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"task_inner","name":"Task","input":{}}]},"parent_tool_use_id":"task_outer","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_started","task_id":"agent-inner","tool_use_id":"task_inner","description":"Map the callers","task_type":"local_agent","subagent_type":"Explore","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Twelve call sites."}},"parent_tool_use_id":"task_inner","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":"task_inner","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Twelve call sites."}]},"parent_tool_use_id":"task_inner","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_notification","task_id":"agent-inner","status":"completed","summary":"Mapped.","session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"task_inner","content":"Twelve call sites.","is_error":false}]},"parent_tool_use_id":"task_outer","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":"Refactor in two steps."}},"parent_tool_use_id":"task_outer","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":"task_outer","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Refactor in two steps."}]},"parent_tool_use_id":"task_outer","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_notification","task_id":"agent-outer","status":"completed","summary":"Planned.","session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"task_outer","content":"Refactor in two steps.","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Here is the plan."}},"parent_tool_use_id":null,"session_id":"prov-session"}'
@@ -372,12 +367,10 @@ async fn a_subagent_spawning_a_subagent_records_the_grandchild_one_level_down() 
 const OUTER_SETTLES_FIRST_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_outer","name":"Task","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_started","task_id":"agent-outer","tool_use_id":"task_outer","description":"Plan the refactor","task_type":"local_agent","subagent_type":"Plan","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_inner","name":"Task","input":{}}},"parent_tool_use_id":"task_outer","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":"task_outer","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"task_inner","name":"Task","input":{}}]},"parent_tool_use_id":"task_outer","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_started","task_id":"agent-inner","tool_use_id":"task_inner","description":"Map the callers","task_type":"local_agent","subagent_type":"Explore","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_notification","task_id":"agent-outer","status":"killed","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Twelve call sites."}},"parent_tool_use_id":"task_inner","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":"task_inner","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Twelve call sites."}]},"parent_tool_use_id":"task_inner","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_notification","task_id":"agent-inner","status":"completed","session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"task_outer","content":"Stopped.","is_error":true}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":300,"num_turns":1,"result":"The planner was stopped.","session_id":"prov-session"}'
