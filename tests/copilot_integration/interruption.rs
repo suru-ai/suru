@@ -37,16 +37,10 @@ async fn an_interrupt_settles_the_turn_and_everything_it_left_running() {
     )
     .await;
 
-    let acknowledged = live
-        .client
-        .interrupt_turn(live.session_id, live.turn_id)
+    live.client
+        .interrupt_session(live.session_id)
         .await
         .expect("Copilot acknowledges the interrupt");
-    assert_eq!(
-        acknowledged.status,
-        TurnStatus::Active,
-        "the Turn settles on the loop stopping, not on the acknowledgement"
-    );
 
     let interrupted = live
         .wait_for("the interrupted Turn settles", |snapshot| {
@@ -135,7 +129,7 @@ async fn an_interrupt_copilot_never_answers_fails_the_turn_within_the_injected_t
 
     let error = timeout(
         Duration::from_secs(2),
-        live.client.interrupt_turn(live.session_id, live.turn_id),
+        live.client.interrupt_session(live.session_id),
     )
     .await
     .expect("an interrupt Copilot never answers gives up on its own")

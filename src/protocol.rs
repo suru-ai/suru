@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
@@ -1085,6 +1085,11 @@ pub enum ActivityStatus {
     Active,
     Completed,
     Failed,
+    /// Settled because the user asked the work to stop — an interrupted
+    /// Session or a Subagent stopped on its own — rather than because it
+    /// finished or went wrong. Only Subagent Activities settle this way:
+    /// every other kind is closed by its Turn's own settle.
+    Interrupted,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1166,8 +1171,9 @@ pub enum Activity {
         /// and the way into everything the Subagent did.
         session_id: SessionId,
         /// How long the Subagent worked, timed by Suru from its spawn. Known
-        /// only once it settles, and absent on a row anything other than the
-        /// Provider's own settle event closed.
+        /// only once it settles — by the Provider's own settle event or by a
+        /// stop the user asked for — and absent on a row that a lost Provider
+        /// connection closed, there being no moment the work truly ended.
         duration_ms: Option<u64>,
     },
 }
@@ -1665,9 +1671,12 @@ pub enum SessionErrorCode {
     PromptConflict,
     PromptNotFound,
     PromptNotPending,
-    TurnNotFound,
-    TurnNotActive,
-    TurnInterruptionFailed,
+    /// An interrupt found nothing running: no active Turn, and no working
+    /// Subagent anywhere below the Session.
+    NothingToInterrupt,
+    InterruptionFailed,
+    /// A per-Subagent stop named a Subagent whose Provider offers none.
+    SubagentStopUnsupported,
     AgentSelectionOperationConflict,
     AgentSelectionProviderConflict,
     InvalidSkillInvocation,

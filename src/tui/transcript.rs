@@ -2357,7 +2357,7 @@ fn push_command_activity(
     let (marker, style) = match status {
         ActivityStatus::Active => (spinner::MARKER, theme.accent.primary),
         ActivityStatus::Completed => ("✓ ", theme.feedback.success),
-        ActivityStatus::Failed => ("× ", theme.feedback.error),
+        ActivityStatus::Failed | ActivityStatus::Interrupted => ("× ", theme.feedback.error),
     };
     let exit_suffix = match (status, exit_status) {
         (ActivityStatus::Failed, Some(exit_status)) => format!(" (exit {exit_status})"),
@@ -2591,7 +2591,9 @@ fn push_file_change_activity(
             theme.accent.primary,
         ),
         ActivityStatus::Completed => ("✓ ", "Applied file changes", theme.feedback.success),
-        ActivityStatus::Failed => ("× ", "Failed to apply file changes", theme.feedback.error),
+        ActivityStatus::Failed | ActivityStatus::Interrupted => {
+            ("× ", "Failed to apply file changes", theme.feedback.error)
+        }
     };
     let header_start = lines.len();
     push_prefixed_lines(lines, &format!("  {marker}"), label, style);
@@ -2681,7 +2683,9 @@ fn reasoning_marker(
             theme.accent.primary,
         ),
         ActivityStatus::Completed => ("✓ ", REASONING_COMPLETED_LABEL, theme.text.subdued),
-        ActivityStatus::Failed => ("× ", REASONING_FAILED_LABEL, theme.feedback.error),
+        ActivityStatus::Failed | ActivityStatus::Interrupted => {
+            ("× ", REASONING_FAILED_LABEL, theme.feedback.error)
+        }
     }
 }
 
@@ -2778,6 +2782,9 @@ fn push_subagent_activity(
         ActivityStatus::Active => (spinner::MARKER, theme.accent.primary),
         ActivityStatus::Completed => ("✓ ", theme.text.subdued),
         ActivityStatus::Failed => ("× ", theme.feedback.error),
+        // Stopped on request: the same face an interrupted Turn wears, so a
+        // stop reads as a stop rather than as the Subagent going wrong.
+        ActivityStatus::Interrupted => ("× ", theme.feedback.warning),
     };
     let mut header = name.to_owned();
     if !description.trim().is_empty() {

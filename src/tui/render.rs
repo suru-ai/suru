@@ -1150,8 +1150,15 @@ fn render_subagent_picker(
         ));
     }
     if shows_footer {
+        // The stop key stands in the footer only where the Provider offers
+        // the stop, so the picker never names a key that would do nothing.
+        let footer = if state.subagent_stop_offered() {
+            "Enter open · x stop · Esc close"
+        } else {
+            "Enter open · Esc close"
+        };
         lines.push(Line::styled(
-            truncate_to_width("Enter open · Esc close", usize::from(content_width)),
+            truncate_to_width(footer, usize::from(content_width)),
             theme.text.subdued,
         ));
     }
@@ -1933,27 +1940,30 @@ fn render_session(
         session_id,
         width: content_width,
     });
-    let status = match snapshot.session.status {
-        SessionStatus::Idle => "idle".to_owned(),
+    // The Session is still working — and still interruptible — while
+    // Subagents outlive its settled Turn (ADR 0015), so the status line reads
+    // from that wider truth rather than from the Turn alone.
+    let working =
+        snapshot.session.status == SessionStatus::Active || !working_subagents(snapshot).is_empty();
+    let status = if !working {
+        "idle".to_owned()
+    } else if subagent_view {
         // Escape leaves a Subagent's Session instead of interrupting it, so
         // its status offers no interrupt gesture to mislead with.
-        SessionStatus::Active if subagent_view => {
-            format!("{} active", spinner::frame(state.spinner_frame))
-        }
-        SessionStatus::Active => {
-            let interrupt = binding_label(&CommandId::RequestInterrupt);
-            let glyph = spinner::frame(state.spinner_frame);
-            if matches!(
-                state.command_mode,
-                CommandMode::InterruptConfirmation { .. }
-            ) {
-                format!("{glyph} active · {interrupt} again to interrupt")
-            } else {
-                format!("{glyph} active · {interrupt} interrupt")
-            }
+        format!("{} active", spinner::frame(state.spinner_frame))
+    } else {
+        let interrupt = binding_label(&CommandId::RequestInterrupt);
+        let glyph = spinner::frame(state.spinner_frame);
+        if matches!(
+            state.command_mode,
+            CommandMode::InterruptConfirmation { .. }
+        ) {
+            format!("{glyph} active · {interrupt} again to interrupt")
+        } else {
+            format!("{glyph} active · {interrupt} interrupt")
         }
     };
-    let activity_style = if snapshot.session.status == SessionStatus::Active {
+    let activity_style = if working {
         theme.feedback.warning
     } else {
         theme.text.subdued

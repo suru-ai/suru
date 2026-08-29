@@ -20,8 +20,7 @@ use crate::{
         SessionCreated, SessionDeleted, SessionError, SessionId, SessionListItem,
         SessionSettlementChanged, SessionSnapshot, SessionSummary, SessionTitleChanged,
         SessionWorkingChanged, SettingMutation, SettingsSnapshot, SettleSessionRequest,
-        ShutdownReason, SkillCatalog, SkillCatalogRequest, Turn, TurnId,
-        UpdateAgentSelectionRequest,
+        ShutdownReason, SkillCatalog, SkillCatalogRequest, UpdateAgentSelectionRequest,
     },
 };
 
@@ -340,10 +339,11 @@ impl ManagedClient {
             .await
     }
 
-    pub async fn interrupt_turn(&self, session_id: SessionId, turn_id: TurnId) -> Result<Turn> {
-        self.session_commands()
-            .interrupt_turn(session_id, turn_id)
-            .await
+    /// Stops what the Session is doing: its active Turn along with the
+    /// Subagents it spawned, or — with no Turn active — its working Subagents
+    /// alone. Interrupting a Subagent's own Session stops that one Subagent.
+    pub async fn interrupt_session(&self, session_id: SessionId) -> Result<()> {
+        self.session_commands().interrupt_session(session_id).await
     }
 
     pub async fn read_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
@@ -526,16 +526,29 @@ impl SessionCommandClient {
         .await
     }
 
-    pub(crate) async fn interrupt_turn(
-        &self,
-        session_id: SessionId,
-        turn_id: TurnId,
-    ) -> Result<Turn> {
-        self.post_session_command_without_body(
-            &format!("/v1/sessions/{session_id}/turns/{turn_id}/interrupt"),
-            "Turn interruption",
+    pub(crate) async fn interrupt_session(&self, session_id: SessionId) -> Result<()> {
+        self.post_session_command_without_response(
+            &format!("/v1/sessions/{session_id}/interrupt"),
+            "Session interruption",
         )
         .await
+    }
+
+    /// Posts a body-less command whose success answers with no body either.
+    async fn post_session_command_without_response(
+        &self,
+        path: &str,
+        operation: &str,
+    ) -> Result<()> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(format!("{}{path}", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .with_context(|| format!("send {operation} command"))?;
+        decode_empty_api_response(response, operation).await
     }
 
     async fn post_session_command<RequestBody, ResponseBody>(

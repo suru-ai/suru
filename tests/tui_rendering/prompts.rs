@@ -367,7 +367,7 @@ fn queued_prompt_docks_immediately_and_scoped_mode_preserves_the_draft() {
 fn escape_confirmation_is_local_and_targets_the_observed_active_turn() {
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
-    let (expected_session_id, snapshot, active_turn_id) =
+    let (expected_session_id, snapshot, _active_turn_id) =
         enter_active_session(&mut application, workspace.path());
     let mut observer = Application::new(workspace.path());
     observer
@@ -395,20 +395,16 @@ fn escape_confirmation_is_local_and_targets_the_observed_active_turn() {
         "interruption confirmation must remain client-local"
     );
 
-    let ApplicationTransition::InterruptTurn {
-        session_id,
-        turn_id,
-    } = application
+    let ApplicationTransition::InterruptSession { session_id } = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::Esc,
             KeyModifiers::NONE,
         )))
         .expect("confirm interruption")
     else {
-        panic!("the second Esc should issue a targeted interruption");
+        panic!("the second Esc should issue the Session's interruption");
     };
     assert_eq!(session_id, expected_session_id);
-    assert_eq!(turn_id, active_turn_id);
 }
 
 #[test]

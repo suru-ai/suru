@@ -102,16 +102,14 @@ async fn scripted_codex_interrupt_acknowledges_before_trailing_output_and_termin
     let turn_id = active.turns[0].id;
     assert_eq!(active.turns[0].status, TurnStatus::Active);
 
-    let acknowledged = client
-        .interrupt_turn(created.session.id, turn_id)
+    client
+        .interrupt_session(created.session.id)
         .await
         .expect("Codex acknowledges interruption");
-    assert_eq!(acknowledged.status, TurnStatus::Active);
-    let retried = client
-        .interrupt_turn(created.session.id, turn_id)
+    client
+        .interrupt_session(created.session.id)
         .await
         .expect("retry acknowledged interruption");
-    assert_eq!(retried.status, TurnStatus::Active);
 
     let after_acknowledgement = client
         .read_session(created.session.id)
@@ -262,10 +260,11 @@ async fn assert_interruption_failure(script: &str, channel: &str, expected_error
         .read_session(created.session.id)
         .await
         .expect("read active Session");
+    assert_eq!(active.turns[0].status, TurnStatus::Active);
 
     let error = timeout(
         Duration::from_secs(2),
-        client.interrupt_turn(created.session.id, active.turns[0].id),
+        client.interrupt_session(created.session.id),
     )
     .await
     .unwrap_or_else(|_| panic!("{channel} interruption command must not hang"))

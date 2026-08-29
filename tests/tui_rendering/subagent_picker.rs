@@ -566,3 +566,117 @@ fn a_subagent_session_browses_its_own_working_subagents() {
         "Enter steps into the grandchild's Session"
     );
 }
+
+/// The fixture Session pinned to `provider`, whose declared capabilities are
+/// what the picker's stop affordance keys off.
+fn select_provider(snapshot: &mut SessionSnapshot, provider: &str) {
+    snapshot.session.agent_selection = Some(suru::protocol::AgentSelection {
+        provider: suru::protocol::ProviderId::new(provider),
+        model: suru::protocol::ModelId::new("fixture-model"),
+        options: Vec::new(),
+    });
+}
+
+#[test]
+fn x_stops_the_chosen_subagent_at_once_where_the_provider_allows() {
+    let workspace = workspace_dir();
+    let (mut snapshot, spawned) = parent_with_working_subagents(
+        workspace.path(),
+        &[
+            ("Explore", "Map the provider seams"),
+            ("Plan", "Design the picker"),
+        ],
+    );
+    select_provider(&mut snapshot, "claude");
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with working Subagents");
+    press_key(&mut application, KeyCode::Down);
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("Enter open · x stop · Esc close"),
+        "the footer offers the stop where the Provider allows it: {text}"
+    );
+
+    // One press stops the Subagent the reader is on — no confirmation,
+    // because interrupting never asks.
+    assert_eq!(
+        press_key(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::InterruptSession {
+            session_id: spawned[0].child_id
+        },
+        "the stop interrupts the chosen Subagent's own Session"
+    );
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("├ ⠋ Explore") && text.contains("└ ⠋ Plan"),
+        "the picker stays up, so the reader watches the row settle out: {text}"
+    );
+}
+
+#[test]
+fn x_stays_inert_and_unadvertised_where_the_provider_offers_no_stop() {
+    let workspace = workspace_dir();
+    let (mut snapshot, _) =
+        parent_with_working_subagents(workspace.path(), &[("Researcher", "Scout the workspace")]);
+    select_provider(&mut snapshot, "copilot");
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Copilot Session with a working Subagent");
+    press_key(&mut application, KeyCode::Down);
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("Enter open · Esc close") && !text.contains("x stop"),
+        "the footer never names a key that would do nothing: {text}"
+    );
+
+    assert_eq!(
+        press_key(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::Continue,
+        "Copilot offers no per-Subagent stop in this cut"
+    );
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("└ ⠋ Researcher"),
+        "the inert key leaves the picker standing: {text}"
+    );
+}
+
+#[test]
+fn escape_interrupts_the_session_when_only_subagents_keep_it_working() {
+    let workspace = workspace_dir();
+    let (mut snapshot, _) =
+        parent_with_working_subagents(workspace.path(), &[("Explore", "Map the provider seams")]);
+    // The Turn settled at the Provider's boundary; the Subagent alone keeps
+    // the Session Working (ADR 0015).
+    snapshot.session.status = SessionStatus::Idle;
+    snapshot.turns[0].status = TurnStatus::Completed;
+    let session_id = snapshot.session.id;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Subagent outlived its Turn");
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("Esc interrupt"),
+        "the status line keeps offering the interrupt while Subagents work: {text}"
+    );
+
+    assert_eq!(
+        press_key(&mut application, KeyCode::Esc),
+        ApplicationTransition::Continue,
+        "the first Esc arms the gesture locally"
+    );
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("Esc again to interrupt"),
+        "the armed gesture says what the next press does: {text}"
+    );
+    assert_eq!(
+        press_key(&mut application, KeyCode::Esc),
+        ApplicationTransition::InterruptSession { session_id },
+        "the second Esc interrupts the Session even with no Turn active"
+    );
+}

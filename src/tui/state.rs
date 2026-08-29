@@ -21,6 +21,7 @@ use crate::{
         SettingsSnapshot, ShutdownReason, SkillCatalog, SkillCatalogRequest, TurnId, TurnStatus,
         UpdateAgentSelectionRequest, Workspace,
     },
+    provider::built_in_providers,
     settings::SettingChoiceSurface,
     theme::Theme,
 };
@@ -326,7 +327,10 @@ pub(super) enum CommandMode {
         selected: PromptId,
     },
     InterruptConfirmation {
-        turn_id: TurnId,
+        /// The active Turn the interrupt will reach, kept so the reader's
+        /// place in it survives the settle — or `None` when only working
+        /// Subagents keep the Session going and the interrupt is theirs.
+        turn_id: Option<TurnId>,
     },
 }
 
@@ -819,6 +823,21 @@ impl TuiState {
     fn reconcile_subagent_picker(&mut self) {
         let working = self.working_subagent_ids();
         self.subagent_picker.reconcile(&working);
+    }
+
+    /// Whether the open Session's Provider offers stopping one working
+    /// Subagent on its own — the affordance the Subagent Picker's rows carry.
+    /// Read off the Session's own settled Selection, because the Subagents on
+    /// offer run under it whatever Selection edit may be pending.
+    pub(super) fn subagent_stop_offered(&self) -> bool {
+        self.session
+            .as_ref()
+            .and_then(|session| session.snapshot().session.agent_selection.as_ref())
+            .is_some_and(|selection| {
+                built_in_providers().iter().any(|provider| {
+                    provider.id == selection.provider && provider.supports_subagent_stop
+                })
+            })
     }
 
     fn composer_down_is_inert(&self) -> bool {
@@ -1316,10 +1335,17 @@ impl TuiState {
                     });
                 }
             }
-            CommandMode::InterruptConfirmation { turn_id }
-                if self.active_turn_id() != Some(turn_id) =>
-            {
-                self.command_mode = CommandMode::Composer;
+            CommandMode::InterruptConfirmation { turn_id } => {
+                // The confirmation stands only while what it would stop is
+                // still running: the Turn it named, or — for the interrupt
+                // owed to Subagents alone — any Subagent still working.
+                let still_running = match turn_id {
+                    Some(turn_id) => self.active_turn_id() == Some(turn_id),
+                    None => !self.working_subagent_ids().is_empty(),
+                };
+                if !still_running {
+                    self.command_mode = CommandMode::Composer;
+                }
             }
             _ => {}
         }
@@ -1505,6 +1531,7 @@ pub enum CommandId {
     SelectPreviousSubagent,
     SelectNextSubagent,
     OpenSelectedSubagent,
+    StopSelectedSubagent,
     CloseSubagentPicker,
     /// Where in the settings panel the reader pointed, which the panel resolves
     /// against the geometry the frame in force drew.
@@ -1545,9 +1572,11 @@ pub enum ApplicationTransition {
         session_id: SessionId,
         prompt_id: PromptId,
     },
-    InterruptTurn {
+    /// Stop what a Session is doing — its active Turn and the Subagents it
+    /// spawned, or the Subagents alone once the Turn has settled. Naming a
+    /// Subagent's own Session stops that one Subagent.
+    InterruptSession {
         session_id: SessionId,
-        turn_id: TurnId,
     },
     SubscribeSession(SessionId),
     AttachSession(SessionId),
@@ -1755,6 +1784,7 @@ impl Application {
             command @ (CommandId::SelectPreviousSubagent
             | CommandId::SelectNextSubagent
             | CommandId::OpenSelectedSubagent
+            | CommandId::StopSelectedSubagent
             | CommandId::CloseSubagentPicker) => self.handle_subagent_picker_command(command),
             CommandId::FocusSettingsPanelAt { column, screen_row } => {
                 let read =
@@ -1928,6 +1958,18 @@ impl Application {
                     self.state.subagent_picker.close();
                     return self
                         .invoke_semantic(SemanticCommandId::SubagentOpen.on_session(session_id));
+                }
+            }
+            CommandId::StopSelectedSubagent => {
+                // The picker stays up: the row the stop lands on settles out
+                // of it live, and the reader keeps their place among the
+                // Subagents still working. No confirmation — interrupting
+                // never asks.
+                if self.state.subagent_stop_offered()
+                    && let Some(session_id) = self.state.selected_working_subagent()
+                {
+                    return self
+                        .invoke_semantic(SemanticCommandId::SubagentStop.on_session(session_id));
                 }
             }
             _ => {}
@@ -2175,7 +2217,11 @@ impl Application {
                 });
             }
             CommandId::RequestInterrupt => {
-                if let Some(turn_id) = self.state.active_turn_id() {
+                // The gesture reaches whatever is running: the active Turn,
+                // or — with none — the Subagents that outlived it. With
+                // neither there is nothing to stop and the key stays inert.
+                let turn_id = self.state.active_turn_id();
+                if turn_id.is_some() || !self.state.working_subagent_ids().is_empty() {
                     self.state.command_mode = CommandMode::InterruptConfirmation { turn_id };
                 }
             }
@@ -2239,11 +2285,10 @@ impl Application {
             return ApplicationTransition::Continue;
         };
         self.state.command_mode = CommandMode::Composer;
-        self.state.keep_interrupted_turn_open(turn_id);
-        ApplicationTransition::InterruptTurn {
-            session_id,
-            turn_id,
+        if let Some(turn_id) = turn_id {
+            self.state.keep_interrupted_turn_open(turn_id);
         }
+        ApplicationTransition::InterruptSession { session_id }
     }
 
     fn submit_prompt(&mut self, delivery: PromptDelivery) -> ApplicationTransition {
@@ -2569,6 +2614,14 @@ impl Application {
             SemanticCommandId::SubagentOpen => Ok(match invocation.subject {
                 SemanticSubject::Session(session_id) => {
                     ApplicationTransition::AttachSession(session_id)
+                }
+                SemanticSubject::View | SemanticSubject::Turn(_) => ApplicationTransition::Continue,
+            }),
+            // Stopping a Subagent is interrupting its child Session, on the
+            // same subject terms as opening one.
+            SemanticCommandId::SubagentStop => Ok(match invocation.subject {
+                SemanticSubject::Session(session_id) => {
+                    ApplicationTransition::InterruptSession { session_id }
                 }
                 SemanticSubject::View | SemanticSubject::Turn(_) => ApplicationTransition::Continue,
             }),

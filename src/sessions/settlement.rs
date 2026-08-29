@@ -22,11 +22,30 @@ use super::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum InterruptTurnError {
+pub(crate) enum InterruptSessionError {
     SessionNotFound,
-    TurnNotFound,
-    TurnNotActive,
+    /// Nothing below the Session is running: no active Turn, and no working
+    /// Subagent anywhere in its subtree.
+    NothingToInterrupt,
+    /// The interrupt named a Subagent's Session whose Provider offers no
+    /// per-Subagent stop.
+    SubagentStopUnsupported,
     ProviderFailure(String),
+}
+
+/// What one interrupt of a Session should reach, resolved by the store so
+/// every caller asks the same question of the same snapshot.
+pub(crate) enum InterruptTarget {
+    /// The Session's active Turn. The Provider stops the Turn's background
+    /// work — its Subagents included — before the loop, in the established
+    /// ordering.
+    Turn(Turn),
+    /// No Turn is active, but Subagents below the Session still work; the
+    /// interrupt stops them all.
+    Subagents,
+    /// The Session is a Subagent's own, so the interrupt stops that one
+    /// Subagent — through the Provider connection its root ancestor owns.
+    Subagent { root: SessionId },
 }
 
 pub(crate) enum ProviderTurnOutcome {
@@ -292,29 +311,42 @@ impl SessionStore {
     pub(crate) fn interrupt_target(
         &self,
         session_id: SessionId,
-        turn_id: TurnId,
-    ) -> Result<Turn, InterruptTurnError> {
+    ) -> Result<InterruptTarget, InterruptSessionError> {
         let state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let turn = state
+        let record = state
             .sessions
             .get(&session_id)
-            .ok_or(InterruptTurnError::SessionNotFound)?
+            .ok_or(InterruptSessionError::SessionNotFound)?;
+        if record.snapshot.session.parent.is_some() {
+            // The walk stops where the chain leaves the store: a Subagent
+            // severed from its lineage has no actor left to reach, and the
+            // caller finds nothing to stop under whatever Session the walk
+            // ends on.
+            let mut root = session_id;
+            while let Some(parent) = state
+                .sessions
+                .get(&root)
+                .and_then(|record| record.snapshot.session.parent)
+            {
+                root = parent;
+            }
+            return Ok(InterruptTarget::Subagent { root });
+        }
+        if let Some(turn) = record
             .snapshot
             .turns
             .iter()
-            .find(|turn| turn.id == turn_id)
-            .ok_or(InterruptTurnError::TurnNotFound)?
-            .clone();
-        if turn.status == TurnStatus::Interrupted {
-            return Ok(turn);
+            .find(|turn| turn.status == TurnStatus::Active)
+        {
+            return Ok(InterruptTarget::Turn(turn.clone()));
         }
-        if turn.status != TurnStatus::Active {
-            return Err(InterruptTurnError::TurnNotActive);
+        if state.subtree_working_since(session_id).is_some() {
+            return Ok(InterruptTarget::Subagents);
         }
-        Ok(turn)
+        Err(InterruptSessionError::NothingToInterrupt)
     }
 }
 

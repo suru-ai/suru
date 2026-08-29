@@ -860,12 +860,10 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
     };
     assert_eq!(before_interrupt.session.status, SessionStatus::Active);
 
-    let (acknowledged, ()) =
-        tokio::join!(first.interrupt_turn(session_id, active_turn_id), async {
-            provider_session.next_interrupt().await.succeed();
-        });
-    let acknowledged = acknowledged.expect("Provider acknowledges interruption");
-    assert_eq!(acknowledged.status, TurnStatus::Active);
+    let (acknowledged, ()) = tokio::join!(first.interrupt_session(session_id), async {
+        provider_session.next_interrupt().await.succeed();
+    });
+    acknowledged.expect("Provider acknowledges interruption");
     let during_interruption = second
         .read_session(session_id)
         .await

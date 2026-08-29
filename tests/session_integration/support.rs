@@ -1,6 +1,8 @@
 //! Fixtures shared by more than one area of the session protocol tests.
 
-use crate::provider_support::{ControlledProvider, ControlledProviderSession};
+use crate::provider_support::{
+    ControlledProvider, ControlledProviderRuntime, ControlledProviderSession,
+};
 use suru::{
     managed_client::{ManagedClient, SessionEvent},
     protocol::{
@@ -168,6 +170,9 @@ pub async fn read_session_at_least_revision(
 pub struct WorkingTurn {
     pub server: RunningServer,
     pub provider_session: ControlledProviderSession,
+    /// The hosted runtime double itself, so a test can flip what the Provider
+    /// declares — the per-Subagent stop capability today — mid-scenario.
+    pub runtime: std::sync::Arc<ControlledProviderRuntime>,
     pub session_id: SessionId,
     pub client: reqwest::Client,
 }
@@ -177,7 +182,7 @@ pub async fn working_turn(state_dir: &std::path::Path, channel: &str) -> Working
     let (runtime, mut provider) = ControlledProvider::new();
     let server = server::spawn_with_provider(
         ServerConfig::new(state_dir, channel).expect("configure server"),
-        runtime,
+        runtime.clone(),
     )
     .await
     .expect("spawn server");
@@ -219,6 +224,7 @@ pub async fn working_turn(state_dir: &std::path::Path, channel: &str) -> Working
     WorkingTurn {
         server,
         provider_session,
+        runtime,
         session_id: created.session.id,
         client,
     }

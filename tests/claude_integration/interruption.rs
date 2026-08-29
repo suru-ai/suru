@@ -55,16 +55,10 @@ async fn an_interrupt_stops_the_background_work_first_and_settles_the_turn_as_in
     )
     .await;
 
-    let acknowledged = live
-        .client
-        .interrupt_turn(live.session_id, live.turn_id)
+    live.client
+        .interrupt_session(live.session_id)
         .await
         .expect("Claude acknowledges the interrupt");
-    assert_eq!(
-        acknowledged.status,
-        TurnStatus::Active,
-        "the Turn settles on the CLI's terminal result, not on the acknowledgement"
-    );
 
     let interrupted = live
         .wait_for("the interrupted Turn settles", |snapshot| {
@@ -158,7 +152,7 @@ async fn an_interrupt_with_no_background_work_asks_the_cli_to_stop_nothing() {
     .await;
 
     live.client
-        .interrupt_turn(live.session_id, live.turn_id)
+        .interrupt_session(live.session_id)
         .await
         .expect("Claude acknowledges the interrupt");
     let interrupted = live
@@ -241,7 +235,7 @@ async fn an_interrupted_turn_takes_its_steer_with_it_and_keeps_nothing_that_land
     .await;
 
     live.client
-        .interrupt_turn(live.session_id, live.turn_id)
+        .interrupt_session(live.session_id)
         .await
         .expect("Claude acknowledges the interrupt");
     live.wait_for("the interrupted Turn settles", |snapshot| {
@@ -316,7 +310,7 @@ async fn an_interrupt_the_cli_never_answers_fails_the_turn_within_the_injected_t
 
     let error = timeout(
         Duration::from_secs(2),
-        live.client.interrupt_turn(live.session_id, live.turn_id),
+        live.client.interrupt_session(live.session_id),
     )
     .await
     .expect("an interrupt the CLI never answers gives up on its own")

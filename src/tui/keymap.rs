@@ -104,11 +104,12 @@ pub(super) fn command_for_subagent_view_event(event: InputEvent) -> Option<Comma
 
 /// The Subagent Picker is the newest thing on screen while it is up, so it
 /// has the keys: the arrows walk its entries, Enter opens the Session of the
-/// one the reader is on, and Esc puts the picker away leaving everything
-/// beneath it exactly as it was. A letter typed at it reaches nothing — the
-/// picker offers the working Subagents, not a search — and the mouse answers
-/// as it does everywhere else, because a press outside the picker is how a
-/// reader dismisses one.
+/// one the reader is on, `x` stops it where the Provider allows — at once,
+/// because interrupting never asks — and Esc puts the picker away leaving
+/// everything beneath it exactly as it was. Any other letter typed at it
+/// reaches nothing — the picker offers the working Subagents, not a search —
+/// and the mouse answers as it does everywhere else, because a press outside
+/// the picker is how a reader dismisses one.
 pub(super) fn command_for_subagent_picker_event(event: InputEvent) -> Option<CommandId> {
     let key = match event {
         InputEvent::Key(key) => key,
@@ -126,6 +127,7 @@ pub(super) fn command_for_subagent_picker_event(event: InputEvent) -> Option<Com
             Some(CommandId::SelectNextSubagent)
         }
         (KeyCode::Enter, KeyModifiers::NONE) => Some(CommandId::OpenSelectedSubagent),
+        (KeyCode::Char('x'), KeyModifiers::NONE) => Some(CommandId::StopSelectedSubagent),
         (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::CloseSubagentPicker),
         _ => None,
     }

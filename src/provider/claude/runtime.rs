@@ -109,6 +109,11 @@ impl ProviderRuntime for ClaudeRuntime {
         "Claude"
     }
 
+    // The CLI stops one task by id, which is exactly a per-Subagent stop.
+    fn supports_subagent_stop(&self) -> bool {
+        true
+    }
+
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();

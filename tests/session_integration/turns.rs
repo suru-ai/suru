@@ -922,7 +922,7 @@ async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
         .read_session(session_id)
         .await
         .expect("read delivered initial Prompt");
-    let active_turn_id = active.turns[0].id;
+    let _active_turn_id = active.turns[0].id;
     let mut observer = client
         .attach_session(session_id)
         .await
@@ -954,10 +954,9 @@ async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
         provider_session.emit(event);
     }
 
-    let (acknowledged, ()) =
-        tokio::join!(client.interrupt_turn(session_id, active_turn_id), async {
-            provider_session.next_interrupt().await.succeed();
-        });
+    let (acknowledged, ()) = tokio::join!(client.interrupt_session(session_id), async {
+        provider_session.next_interrupt().await.succeed();
+    });
     acknowledged.expect("Provider acknowledges interruption");
     provider_session.emit(ProviderEvent::TurnInterrupted);
     timeout(Duration::from_secs(1), async {
@@ -1197,7 +1196,6 @@ async fn interrupting_a_turn_without_a_provider_actor_settles_its_in_flight_comm
     })
     .await
     .expect("the command Activity reaches the Session");
-    let turn_id = running.turns[0].id;
     let command_activity_id = running.activities[0].id();
     original.shutdown().await.expect("stop original server");
 
@@ -1232,7 +1230,7 @@ async fn interrupting_a_turn_without_a_provider_actor_settles_its_in_flight_comm
 
     let refused = http
         .post(format!(
-            "{}/v1/sessions/{session_id}/turns/{turn_id}/interrupt",
+            "{}/v1/sessions/{session_id}/interrupt",
             replacement_descriptor.base_url
         ))
         .bearer_auth(&replacement_descriptor.token)
@@ -1246,7 +1244,7 @@ async fn interrupting_a_turn_without_a_provider_actor_settles_its_in_flight_comm
             .await
             .expect("decode interruption failure")
             .code,
-        SessionErrorCode::TurnInterruptionFailed
+        SessionErrorCode::InterruptionFailed
     );
 
     let interrupted = http

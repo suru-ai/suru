@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use crate::support::{
-    ScriptedCopilot, agent_messages, connect, conversation_fixture, session_where, settled_session,
+    ScriptedCopilot, abort_arm, agent_messages, connect, conversation_arms, conversation_fixture,
+    send_arm, session_where, settled_session,
 };
 use suru::{
     managed_client::ManagedClient,
@@ -359,6 +360,138 @@ async fn a_failed_subagent_settles_its_row_and_its_child_turn_as_failed() {
         agent_messages(&child)[0].content,
         "Partway through.",
         "what the sub-agent did before failing stays in the child's Transcript"
+    );
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+/// A Turn that hands work to a sub-agent and goes idle at once, leaving only the delegation
+/// running.
+const SUBAGENT_OUTLIVES_THE_TURN: &str = r#"      event e1 assistant.message '{"messageId":"m1","content":"Kicked off the audit."}'
+      agent_event e2 agent-1 subagent.started '{"toolCallId":"t-spawn","agentName":"auditor","agentDisplayName":"Auditor","agentDescription":"Audit the dependencies"}'
+      event e3 session.idle '{}'
+"#;
+
+#[tokio::test]
+async fn interrupting_with_no_turn_active_aborts_the_loop_and_settles_the_subagent_as_stopped() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}",
+        conversation_arms(),
+        send_arm(SUBAGENT_OUTLIVES_THE_TURN),
+        abort_arm(""),
+    ));
+    let opened = opened_session(&copilot, "copilot-idle-interrupt-subagents", "Audit").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let settled = settled_session(client, session_id, 0).await;
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let Activity::Subagent {
+        status,
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&settled)
+    else {
+        unreachable!()
+    };
+    assert_eq!(*status, ActivityStatus::Active);
+    let child_id = *child_id;
+
+    client
+        .interrupt_session(session_id)
+        .await
+        .expect("the interrupt works with no Turn active");
+
+    let mut feed = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    session_where(
+        client,
+        &mut feed,
+        session_id,
+        "the stopped Subagent's row settles",
+        |snapshot| {
+            matches!(
+                the_subagent_row(snapshot),
+                Activity::Subagent {
+                    status: ActivityStatus::Interrupted,
+                    ..
+                }
+            )
+        },
+    )
+    .await;
+    let child = settled_session(client, child_id, 0).await;
+    assert_eq!(
+        child.turns[0].status,
+        TurnStatus::Interrupted,
+        "the stop settles the child's Turn, which is what clears Working"
+    );
+    assert!(
+        copilot
+            .methods()
+            .iter()
+            .any(|method| method == "session.abort"),
+        "with no per-sub-agent stop, stopping the delegations is the whole-loop abort"
+    );
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_per_subagent_stop_is_refused_and_leaves_the_delegation_running() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}",
+        conversation_arms(),
+        send_arm(SUBAGENT_OUTLIVES_THE_TURN),
+    ));
+    let opened = opened_session(&copilot, "copilot-subagent-stop-refused", "Audit").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let settled = settled_session(client, session_id, 0).await;
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&settled)
+    else {
+        unreachable!()
+    };
+
+    let refused = client
+        .interrupt_session(*child_id)
+        .await
+        .expect_err("Copilot offers no per-Subagent stop in this cut");
+    assert!(
+        refused.to_string().contains("no per-Subagent stop"),
+        "the refusal says why, got: {refused:#}"
+    );
+
+    let unchanged = client
+        .read_session(session_id)
+        .await
+        .expect("read the Session after the refusal");
+    let Activity::Subagent { status, .. } = the_subagent_row(&unchanged) else {
+        unreachable!()
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Active,
+        "a refused stop stops nothing"
+    );
+    assert!(
+        !copilot
+            .methods()
+            .iter()
+            .any(|method| method == "session.abort"),
+        "the refusal never reaches the CLI: one Subagent is not the whole loop"
     );
 
     opened

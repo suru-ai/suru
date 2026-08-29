@@ -473,7 +473,12 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update completed a different Activity kind");
                 };
                 if *current_status != ActivityStatus::Active
-                    || !matches!(status, ActivityStatus::Completed | ActivityStatus::Failed)
+                    || !matches!(
+                        status,
+                        ActivityStatus::Completed
+                            | ActivityStatus::Failed
+                            | ActivityStatus::Interrupted
+                    )
                 {
                     bail!(
                         "Session update contained an invalid Subagent Activity status transition"

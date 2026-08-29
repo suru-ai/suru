@@ -46,7 +46,7 @@ use crate::provider::{
 use crate::runtime::protect_current_user_file;
 use crate::sessions::{
     AdmitPromptError, AgentSelectionMutationError, CreateSessionError, DeleteSessionError,
-    InterruptTurnError, ListSessionsError, PromptAdmissionDisposition, PromptMutationError,
+    InterruptSessionError, ListSessionsError, PromptAdmissionDisposition, PromptMutationError,
     SessionCatalogFeed, SessionFeed, SessionStore, SettleSessionError, StoreOutcome,
     TitleDerivation,
 };
@@ -534,8 +534,8 @@ pub async fn spawn_with_providers_and_timings(
             post(cancel_prompt),
         )
         .route(
-            "/v1/sessions/{session_id}/turns/{turn_id}/interrupt",
-            post(interrupt_turn),
+            "/v1/sessions/{session_id}/interrupt",
+            post(interrupt_session),
         )
         .route("/v1/sessions/{session_id}/events", get(session_events))
         .route("/v1/server/stop", post(stop_server))
@@ -1310,34 +1310,34 @@ fn prompt_mutation_response(
     }
 }
 
-async fn interrupt_turn(
+async fn interrupt_session(
     State(state): State<AppState>,
-    AxumPath((session_id, turn_id)): AxumPath<(SessionId, TurnId)>,
+    AxumPath(session_id): AxumPath<SessionId>,
     headers: HeaderMap,
 ) -> Response {
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match state.providers.interrupt_turn(session_id, turn_id).await {
-        Ok(turn) => Json(turn).into_response(),
-        Err(InterruptTurnError::SessionNotFound) => session_error_response(
+    match state.providers.interrupt_session(session_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(InterruptSessionError::SessionNotFound) => session_error_response(
             StatusCode::NOT_FOUND,
             SessionErrorCode::SessionNotFound,
             "Session does not exist on this server instance",
         ),
-        Err(InterruptTurnError::TurnNotFound) => session_error_response(
-            StatusCode::NOT_FOUND,
-            SessionErrorCode::TurnNotFound,
-            "Turn does not exist in this Session",
-        ),
-        Err(InterruptTurnError::TurnNotActive) => session_error_response(
+        Err(InterruptSessionError::NothingToInterrupt) => session_error_response(
             StatusCode::CONFLICT,
-            SessionErrorCode::TurnNotActive,
-            "Turn is no longer active",
+            SessionErrorCode::NothingToInterrupt,
+            "Session has no active Turn and no working Subagent",
         ),
-        Err(InterruptTurnError::ProviderFailure(message)) => session_error_response(
+        Err(InterruptSessionError::SubagentStopUnsupported) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::SubagentStopUnsupported,
+            "Provider offers no per-Subagent stop",
+        ),
+        Err(InterruptSessionError::ProviderFailure(message)) => session_error_response(
             StatusCode::BAD_GATEWAY,
-            SessionErrorCode::TurnInterruptionFailed,
+            SessionErrorCode::InterruptionFailed,
             message,
         ),
     }

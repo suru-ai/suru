@@ -1485,7 +1485,7 @@ fn command_activity_session(
         output: output.to_owned(),
         output_truncated,
         exit_status: match status {
-            ActivityStatus::Active => None,
+            ActivityStatus::Active | ActivityStatus::Interrupted => None,
             ActivityStatus::Completed | ActivityStatus::Failed => Some(0),
         },
     };
@@ -2779,7 +2779,7 @@ fn subagent_activity_session(
 }
 
 #[test]
-fn subagent_rows_render_working_settled_and_failed_states() {
+fn subagent_rows_render_working_settled_failed_and_stopped_states() {
     let workspace = workspace_dir();
     let cases = [
         (
@@ -2799,6 +2799,14 @@ fn subagent_rows_render_working_settled_and_failed_states() {
             Some(3_000),
             "× Explore: Map the provider seams · 3s",
             Color::Red,
+        ),
+        // Stopped on request wears the interrupted Turn's own face, so a stop
+        // reads as a stop rather than as the Subagent going wrong.
+        (
+            ActivityStatus::Interrupted,
+            Some(8_000),
+            "× Explore: Map the provider seams · 8s",
+            Color::Yellow,
         ),
     ];
 

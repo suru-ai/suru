@@ -20,7 +20,7 @@ use crate::{
     protocol::{
         AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
         ModelCatalog, PromptId, SessionId, SessionListItem, SessionSnapshot, SettingMutation,
-        SettingsSnapshot, SkillCatalog, SkillCatalogRequest, TurnId, UpdateAgentSelectionRequest,
+        SettingsSnapshot, SkillCatalog, SkillCatalogRequest, UpdateAgentSelectionRequest,
     },
 };
 use anyhow::{Result, anyhow};
@@ -453,13 +453,9 @@ impl RunLoop {
                 session_id,
                 prompt_id,
             }),
-            ApplicationTransition::InterruptTurn {
-                session_id,
-                turn_id,
-            } => self.spawn_operation(SessionOperation::InterruptTurn {
-                session_id,
-                turn_id,
-            }),
+            ApplicationTransition::InterruptSession { session_id } => {
+                self.spawn_operation(SessionOperation::InterruptSession { session_id });
+            }
             ApplicationTransition::DeleteSession(session_id) => {
                 self.spawn_operation(SessionOperation::DeleteSession { session_id });
             }
@@ -577,7 +573,7 @@ impl RunLoop {
             | ApplicationTransition::AdmitPrompt { .. }
             | ApplicationTransition::PromotePrompt { .. }
             | ApplicationTransition::CancelPrompt { .. }
-            | ApplicationTransition::InterruptTurn { .. }
+            | ApplicationTransition::InterruptSession { .. }
             | ApplicationTransition::SubscribeSession(_)
             | ApplicationTransition::AttachSession(_)
             | ApplicationTransition::ListModels(_)
@@ -1185,9 +1181,8 @@ enum SessionOperation {
         session_id: SessionId,
         prompt_id: PromptId,
     },
-    InterruptTurn {
+    InterruptSession {
         session_id: SessionId,
-        turn_id: TurnId,
     },
 }
 
@@ -1231,15 +1226,9 @@ impl SessionOperation {
                     .await
                     .map(|_| ()),
             ),
-            Self::InterruptTurn {
-                session_id,
-                turn_id,
-            } => operation_result(
-                commands
-                    .interrupt_turn(session_id, turn_id)
-                    .await
-                    .map(|_| ()),
-            ),
+            Self::InterruptSession { session_id } => {
+                operation_result(commands.interrupt_session(session_id).await)
+            }
         }
     }
 }

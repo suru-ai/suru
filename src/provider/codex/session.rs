@@ -41,7 +41,7 @@ use crate::{
     provider::{
         ProviderErrand, ProviderError, ProviderFuture, ProviderPrompt, ProviderResumeState,
         ProviderRuntime, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
-        ProviderSteerInput, ProviderTurnInput,
+        ProviderSteerInput, ProviderSubagentId, ProviderTurnInput,
         harness::{ProcessGuard, ProcessRegistry},
         resolve_executable,
     },
@@ -138,6 +138,12 @@ impl ProviderRuntime for CodexRuntime {
 
     fn display_name(&self) -> &str {
         "Codex"
+    }
+
+    // A collab child is a thread of its own, and `turn/interrupt` addresses
+    // any thread — which is exactly a per-Subagent stop.
+    fn supports_subagent_stop(&self) -> bool {
+        true
     }
 
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
@@ -451,6 +457,40 @@ struct CodexSession {
     shutdown_started: AtomicBool,
 }
 
+impl CodexSession {
+    /// Interrupts every followed child thread's latest turn. The interrupts go
+    /// out together and each is bounded by the interrupt's own timeout; one
+    /// Codex refuses or never answers is passed over, because stopping the
+    /// rest matters more than any single child — the same terms Claude stops
+    /// its background tasks on. A child whose stream has named no turn yet is
+    /// skipped, there being no turn a `turn/interrupt` could address.
+    async fn interrupt_children(&self) {
+        let targets = self
+            .correlation
+            .lock()
+            .expect("Codex native correlation lock is not poisoned")
+            .child_interrupt_targets();
+        let interrupts = targets.into_iter().filter_map(|(thread_id, turn_id)| {
+            let turn_id = turn_id?;
+            let transport = self.transport.clone();
+            let bound = self.context.timeouts.interrupt_request;
+            Some(async move {
+                let _ = transport
+                    .request_with_timeout(
+                        "turn/interrupt",
+                        &TurnInterruptParams {
+                            thread_id: &thread_id,
+                            turn_id: &turn_id,
+                        },
+                        bound,
+                    )
+                    .await;
+            })
+        });
+        futures_util::future::join_all(interrupts).await;
+    }
+}
+
 impl ProviderSession for CodexSession {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
@@ -535,6 +575,10 @@ impl ProviderSession for CodexSession {
                 .expect("Codex native correlation lock is not poisoned")
                 .active_turn_id()
                 .ok_or_else(|| codex_error("Codex has no active Turn to interrupt"))?;
+            // The interrupt ends the Session's own turn and leaves the child
+            // threads it spawned running, so the children go first — the
+            // established ordering every Provider keeps.
+            self.interrupt_children().await;
             self.transport
                 .request_with_timeout(
                     "turn/interrupt",
@@ -546,6 +590,50 @@ impl ProviderSession for CodexSession {
                 )
                 .await
                 .map_err(|error| codex_error_context("Codex Turn interruption failed", error))?;
+            Ok(())
+        })
+    }
+
+    fn stop_subagents(&self) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            self.interrupt_children().await;
+            Ok(())
+        })
+    }
+
+    fn stop_subagent(&self, subagent_id: ProviderSubagentId) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            let target = self
+                .correlation
+                .lock()
+                .expect("Codex native correlation lock is not poisoned")
+                .child_interrupt_target(subagent_id.as_str());
+            // A thread no longer followed has settled and has nothing left to
+            // stop, and stopping nothing succeeds.
+            let Some((thread_id, turn_id)) = target else {
+                return Ok(());
+            };
+            // A followed child whose stream has named no turn yet leaves
+            // nothing a `turn/interrupt` could address — but it is still
+            // running. Succeeding here would settle its row while the child
+            // works on, so the stop refuses instead: the record stays
+            // truthful, and a retry once the child streams finds a turn.
+            let Some(turn_id) = turn_id else {
+                return Err(codex_error(
+                    "Codex Subagent stop failed: the Subagent has not begun a turn to interrupt yet",
+                ));
+            };
+            self.transport
+                .request_with_timeout(
+                    "turn/interrupt",
+                    &TurnInterruptParams {
+                        thread_id: &thread_id,
+                        turn_id: &turn_id,
+                    },
+                    self.context.timeouts.interrupt_request,
+                )
+                .await
+                .map_err(|error| codex_error_context("Codex Subagent stop failed", error))?;
             Ok(())
         })
     }

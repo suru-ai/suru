@@ -1,6 +1,6 @@
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use futures_util::{StreamExt, stream};
@@ -14,7 +14,7 @@ use suru::provider::{
     AttributedProviderEvent, ProviderErrand, ProviderError, ProviderEvent,
     ProviderEventAttribution, ProviderEventStream, ProviderFuture, ProviderPrompt, ProviderRuntime,
     ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
-    ProviderTurnInput,
+    ProviderSubagentId, ProviderTurnInput,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -53,6 +53,10 @@ pub struct ControlledProviderRuntime {
     skill_catalog_error: Arc<Mutex<Option<String>>>,
     skill_discovery_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     skill_catalog_invalidations: watch::Sender<u64>,
+    /// Whether this Provider declares the per-Subagent stop capability. On by
+    /// default, so the neutral suite exercises the capable path; a test proves
+    /// the refusal by withdrawing it.
+    subagent_stop_offered: Arc<AtomicBool>,
     starts: mpsc::UnboundedSender<StartRequest>,
     errands: mpsc::UnboundedSender<ErrandRequest>,
     /// Where a session-shaped Errand's startup goes. It is kept apart from
@@ -83,6 +87,8 @@ pub struct ControlledProviderSession {
     turns: mpsc::UnboundedReceiver<TurnStart>,
     steers: mpsc::UnboundedReceiver<TurnSteer>,
     interruptions: mpsc::UnboundedReceiver<TurnInterrupt>,
+    subagents_stops: mpsc::UnboundedReceiver<SubagentsStop>,
+    subagent_stops: mpsc::UnboundedReceiver<SubagentStop>,
     events: mpsc::UnboundedSender<ControlledProviderEvent>,
 }
 
@@ -107,10 +113,25 @@ pub struct TurnInterrupt {
     response: oneshot::Sender<Result<(), ProviderError>>,
 }
 
+/// One stop-every-Subagent request — the interrupt that arrives with no Turn
+/// active — held until the test answers it.
+pub struct SubagentsStop {
+    response: oneshot::Sender<Result<(), ProviderError>>,
+}
+
+/// One per-Subagent stop request, remembering the identity it named, held
+/// until the test answers it.
+pub struct SubagentStop {
+    subagent_id: ProviderSubagentId,
+    response: oneshot::Sender<Result<(), ProviderError>>,
+}
+
 struct ControlledSessionHandle {
     turns: mpsc::UnboundedSender<TurnStart>,
     steers: mpsc::UnboundedSender<TurnSteer>,
     interruptions: mpsc::UnboundedSender<TurnInterrupt>,
+    subagents_stops: mpsc::UnboundedSender<SubagentsStop>,
+    subagent_stops: mpsc::UnboundedSender<SubagentStop>,
 }
 
 impl ControlledProvider {
@@ -142,6 +163,7 @@ impl ControlledProvider {
                 skill_catalog_error: Arc::new(Mutex::new(None)),
                 skill_discovery_gate: Arc::new(Mutex::new(None)),
                 skill_catalog_invalidations,
+                subagent_stop_offered: Arc::new(AtomicBool::new(true)),
                 starts: starts_tx,
                 errands: errands_tx,
                 errand_starts: errand_starts_tx,
@@ -195,6 +217,12 @@ impl ControlledProvider {
 }
 
 impl ControlledProviderRuntime {
+    /// Withdraws the per-Subagent stop capability, standing in for a Provider
+    /// — Copilot today — that offers none.
+    pub fn withdraw_subagent_stop(&self) {
+        self.subagent_stop_offered.store(false, Ordering::SeqCst);
+    }
+
     pub fn offer_skills(&self, catalog: SkillCatalog) {
         *self
             .skill_catalog
@@ -334,6 +362,8 @@ impl StartRequest {
         let (turns_tx, turns_rx) = mpsc::unbounded_channel();
         let (steers_tx, steers_rx) = mpsc::unbounded_channel();
         let (interruptions_tx, interruptions_rx) = mpsc::unbounded_channel();
+        let (subagents_stops_tx, subagents_stops_rx) = mpsc::unbounded_channel();
+        let (subagent_stops_tx, subagent_stops_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ControlledProviderEvent>();
         let events: ProviderEventStream = Box::pin(stream::unfold(events_rx, |mut events| async {
             events.recv().await.map(|(event, observed)| {
@@ -351,6 +381,8 @@ impl StartRequest {
                     turns: turns_tx,
                     steers: steers_tx,
                     interruptions: interruptions_tx,
+                    subagents_stops: subagents_stops_tx,
+                    subagent_stops: subagent_stops_tx,
                 }),
                 events,
             )))
@@ -359,6 +391,8 @@ impl StartRequest {
             turns: turns_rx,
             steers: steers_rx,
             interruptions: interruptions_rx,
+            subagents_stops: subagents_stops_rx,
+            subagent_stops: subagent_stops_rx,
             events: events_tx,
         }
     }
@@ -398,6 +432,27 @@ impl ControlledProviderSession {
             .recv()
             .await
             .expect("Provider Session remains connected")
+    }
+
+    pub async fn next_subagents_stop(&mut self) -> SubagentsStop {
+        self.subagents_stops
+            .recv()
+            .await
+            .expect("Provider Session remains connected")
+    }
+
+    pub async fn next_subagent_stop(&mut self) -> SubagentStop {
+        self.subagent_stops
+            .recv()
+            .await
+            .expect("Provider Session remains connected")
+    }
+
+    /// The per-Subagent stop already asked for, without waiting for one. A
+    /// test that must show a Provider was *never* asked to stop a Subagent
+    /// reads the absence here rather than waiting out a timeout.
+    pub fn try_next_subagent_stop(&mut self) -> Option<SubagentStop> {
+        self.subagent_stops.try_recv().ok()
     }
 
     pub fn emit(&self, event: ProviderEvent) {
@@ -495,6 +550,33 @@ impl TurnInterrupt {
     }
 }
 
+impl SubagentsStop {
+    pub fn succeed(self) {
+        self.response
+            .send(Ok(()))
+            .unwrap_or_else(|_| panic!("Provider Subagent stop response remains connected"));
+    }
+}
+
+impl SubagentStop {
+    /// The Provider identity the stop named, as the test minted it.
+    pub fn subagent(&self) -> &str {
+        self.subagent_id.as_str()
+    }
+
+    pub fn succeed(self) {
+        self.response
+            .send(Ok(()))
+            .unwrap_or_else(|_| panic!("Provider Subagent stop response remains connected"));
+    }
+
+    pub fn fail(self, message: impl Into<String>) {
+        self.response
+            .send(Err(ProviderError::new(message)))
+            .unwrap_or_else(|_| panic!("Provider Subagent stop response remains connected"));
+    }
+}
+
 impl ProviderRuntime for ControlledProviderRuntime {
     fn provider_id(&self) -> ProviderId {
         self.provider.clone()
@@ -504,6 +586,10 @@ impl ProviderRuntime for ControlledProviderRuntime {
     // one vocabulary per double.
     fn display_name(&self) -> &str {
         self.provider.as_str()
+    }
+
+    fn supports_subagent_stop(&self) -> bool {
+        self.subagent_stop_offered.load(Ordering::SeqCst)
     }
 
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelDescriptor>> {
@@ -763,6 +849,37 @@ impl ProviderSession for ControlledSessionHandle {
             response_rx
                 .await
                 .map_err(|_| ProviderError::new("test Provider interruption was abandoned"))?
+        })
+    }
+
+    fn stop_subagents(&self) -> ProviderFuture<'_, ()> {
+        let stops = self.subagents_stops.clone();
+        Box::pin(async move {
+            let (response_tx, response_rx) = oneshot::channel();
+            stops
+                .send(SubagentsStop {
+                    response: response_tx,
+                })
+                .map_err(|_| ProviderError::new("test Provider Session disconnected"))?;
+            response_rx
+                .await
+                .map_err(|_| ProviderError::new("test Provider Subagent stop was abandoned"))?
+        })
+    }
+
+    fn stop_subagent(&self, subagent_id: ProviderSubagentId) -> ProviderFuture<'_, ()> {
+        let stops = self.subagent_stops.clone();
+        Box::pin(async move {
+            let (response_tx, response_rx) = oneshot::channel();
+            stops
+                .send(SubagentStop {
+                    subagent_id,
+                    response: response_tx,
+                })
+                .map_err(|_| ProviderError::new("test Provider Session disconnected"))?;
+            response_rx
+                .await
+                .map_err(|_| ProviderError::new("test Provider Subagent stop was abandoned"))?
         })
     }
 

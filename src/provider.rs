@@ -37,6 +37,10 @@ pub(crate) use orchestration::{ProviderOrchestrator, ProviderUpdateGate};
 pub struct BuiltInProvider {
     pub id: ProviderId,
     pub display_name: String,
+    /// Whether one of this Provider's working Subagents can be stopped on its
+    /// own. Read off the runtime's own declaration, so the surface offering
+    /// the stop and the server honoring it can never disagree.
+    pub supports_subagent_stop: bool,
 }
 
 /// The Provider runtimes a production server hosts, in the fixed built-in
@@ -63,6 +67,7 @@ pub fn built_in_providers() -> &'static [BuiltInProvider] {
             .map(|runtime| BuiltInProvider {
                 id: runtime.provider_id(),
                 display_name: runtime.display_name().to_owned(),
+                supports_subagent_stop: runtime.supports_subagent_stop(),
             })
             .collect()
     })
@@ -149,14 +154,19 @@ pub enum ProviderEventAttribution {
 
 /// The Provider's own opaque identity for one Subagent it is running —
 /// Claude's spawning tool-use id, Codex's child thread id, Copilot's agent
-/// id. Like [`ProviderActivityId`], it is the Provider's to choose and only
-/// ever compared, never read.
+/// id. Like [`ProviderActivityId`], it is the Provider's to choose:
+/// orchestration only ever compares it, and only the Provider that minted it
+/// reads it back, as a stop request hands it the identity to resolve.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ProviderSubagentId(String);
 
 impl ProviderSubagentId {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -405,6 +415,9 @@ pub enum ProviderFileChangeStatus {
 pub enum ProviderSubagentStatus {
     Completed,
     Failed,
+    /// The Subagent was stopped rather than finishing or failing — by a stop
+    /// Suru asked for, or by one the Provider ran on its own account.
+    Interrupted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -589,6 +602,14 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     /// not defaulted, so a new Provider has to answer the second one.
     fn errand_selection(&self) -> Option<AgentSelection>;
 
+    /// Whether this Provider can stop one working Subagent on its own,
+    /// leaving the rest of the Session running. Defaulted to `false` so a
+    /// Provider without the capability offers nothing, and every surface that
+    /// would offer the stop reads this one declaration.
+    fn supports_subagent_stop(&self) -> bool {
+        false
+    }
+
     /// Stops in-progress Session startups and releases runtime-owned resources.
     fn shutdown(&self) -> ProviderFuture<'_, ()>;
 
@@ -663,7 +684,30 @@ pub trait ProviderSession: Send + Sync + 'static {
 
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()>;
 
+    /// Interrupts the running Turn. A Provider stops the background work the
+    /// Turn spawned — its Subagents included — before it stops the loop, the
+    /// established ordering, because an interrupt alone leaves that work
+    /// running.
     fn interrupt_turn(&self) -> ProviderFuture<'_, ()>;
+
+    /// Stops every Subagent still working under this connection, for the
+    /// interrupt that arrives after the Turn settled and finds only Subagents
+    /// running. Required rather than defaulted, so a new Provider has to
+    /// decide what stopping its late-running delegations means.
+    fn stop_subagents(&self) -> ProviderFuture<'_, ()>;
+
+    /// Stops the one working Subagent the identity names, leaving everything
+    /// else running. Defaulted to a refusal to match the runtime's
+    /// [`ProviderRuntime::supports_subagent_stop`] default; a runtime that
+    /// declares the capability overrides this with its native stop.
+    fn stop_subagent(&self, subagent_id: ProviderSubagentId) -> ProviderFuture<'_, ()> {
+        let _ = subagent_id;
+        Box::pin(async {
+            Err(ProviderError::new(
+                "This Provider offers no per-Subagent stop",
+            ))
+        })
+    }
 
     /// Stops accepting Provider work and releases the Session's resources within a bounded time.
     fn shutdown(&self) -> ProviderFuture<'_, ()>;

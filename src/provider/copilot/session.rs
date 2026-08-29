@@ -468,6 +468,24 @@ impl ProviderSession for CopilotSession {
         })
     }
 
+    fn stop_subagents(&self) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            // Copilot addresses no single subagent, so stopping the Session's
+            // late-running delegations is the same whole-loop abort an
+            // interrupt is — with the Turn already settled, the loop holds
+            // nothing else to lose. Deliberately not gated on a running Turn,
+            // because this is exactly the stop that arrives after one.
+            const CONTEXT: &str = "Copilot Subagent stop failed";
+            let aborted = until_crash(&self.handle, CONTEXT, self.native.abort());
+            match timeout(self.interrupt_request_timeout, aborted).await {
+                Ok(aborted) => aborted,
+                Err(_elapsed) => Err(copilot_error(format!(
+                    "{CONTEXT}: {COPILOT_HARNESS_NAME} timed out handling `session.abort`"
+                ))),
+            }
+        })
+    }
+
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             // The harness process is the runtime's and hosts every other Copilot Session, so a

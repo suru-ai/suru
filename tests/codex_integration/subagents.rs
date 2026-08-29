@@ -421,3 +421,272 @@ async fn a_childs_own_spawn_records_the_grandchild_one_level_down() {
 
     opened.server.shutdown().await.expect("shut down server");
 }
+
+/// A collab child in flight while the parent's turn stays open: the spawn's activity item
+/// streams, the attached child names its turn by streaming an item of its own, and the
+/// conversation waits for the interrupt — which must reach the child's turn before the root's.
+const CHILD_IN_FLIGHT_CODEX: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/auditor"}}}'
+      ;;
+    *'"method":"thread/resume"'*)
+      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"cargo audit","cwd":"/fixture/work","status":"inProgress"}}}'
+      ;;
+    *'"method":"turn/interrupt"'*'"threadId":"child-thread"'*)
+      printf '%s\n' '{"id":5,"result":{}}'
+      ;;
+    *'"method":"turn/interrupt"'*'"threadId":"root-thread"'*)
+      printf '%s\n' '{"id":6,"result":{}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"interrupted","items":[]}}}'
+      ;;
+"#;
+
+#[tokio::test]
+async fn interrupting_a_turn_interrupts_the_child_thread_before_the_root() {
+    let fixture = ScriptedCodex::new_multiprocess(CHILD_IN_FLIGHT_CODEX);
+    let opened = opened_session(&fixture, "codex-interrupt-reaches-children", "Audit").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let spawned = session_where(client, session_id, "the Subagent's row opens", |snapshot| {
+        matches!(snapshot.activities.first(), Some(Activity::Subagent { .. }))
+    })
+    .await;
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&spawned)
+    else {
+        unreachable!()
+    };
+    let child_id = *child_id;
+    // The child's own item must have streamed, because it is what names the
+    // turn the stop will address.
+    session_where(
+        client,
+        child_id,
+        "the child's command reaches its Session",
+        |snapshot| !snapshot.activities.is_empty(),
+    )
+    .await;
+
+    client
+        .interrupt_session(session_id)
+        .await
+        .expect("Codex acknowledges the interrupt");
+    let interrupted = settled_session(client, session_id, 0).await;
+
+    assert_eq!(interrupted.turns[0].status, TurnStatus::Interrupted);
+    let Activity::Subagent {
+        status,
+        duration_ms,
+        ..
+    } = the_subagent_row(&interrupted)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Interrupted,
+        "the stopped Subagent's row settles as stopped"
+    );
+    assert!(duration_ms.is_some());
+    let child = settled_session(client, child_id, 0).await;
+    assert_eq!(child.turns[0].status, TurnStatus::Interrupted);
+
+    let interrupts = fixture
+        .requests()
+        .into_iter()
+        .filter(|request| request.get("method").and_then(Value::as_str) == Some("turn/interrupt"))
+        .collect::<Vec<_>>();
+    let [child_interrupt, root_interrupt] = interrupts.as_slice() else {
+        panic!("the child's interrupt and the root's both go out, got {interrupts:?}");
+    };
+    assert_eq!(
+        child_interrupt["params"]["threadId"], "child-thread",
+        "the child thread is interrupted before the loop — the established ordering"
+    );
+    assert_eq!(child_interrupt["params"]["turnId"], "child-turn");
+    assert_eq!(root_interrupt["params"]["threadId"], "root-thread");
+    assert_eq!(root_interrupt["params"]["turnId"], "root-turn");
+
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+/// A collab child outliving the parent's completed turn, its own turn named by the item it
+/// streamed, waiting for a stop.
+const OUTLIVING_CHILD_TO_STOP_CODEX: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/auditor"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed","items":[]}}}'
+      ;;
+    *'"method":"thread/resume"'*)
+      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"cargo audit","cwd":"/fixture/work","status":"inProgress"}}}'
+      ;;
+    *'"method":"turn/interrupt"'*)
+      printf '%s\n' '{"id":5,"result":{}}'
+      ;;
+"#;
+
+/// Drives the two stops that reach only the child thread: the whole-Session interrupt with no
+/// Turn active, and the Picker row's per-Subagent stop. They differ only in the Session the
+/// interrupt names, so one scenario proves both.
+async fn assert_idle_stop_reaches_only_the_child(name: &'static str, stop_the_child: bool) {
+    let fixture = ScriptedCodex::new_multiprocess(OUTLIVING_CHILD_TO_STOP_CODEX);
+    let opened = opened_session(&fixture, name, "Audit").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let settled = settled_session(client, session_id, 0).await;
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&settled)
+    else {
+        unreachable!()
+    };
+    let child_id = *child_id;
+    session_where(
+        client,
+        child_id,
+        "the child's command reaches its Session",
+        |snapshot| !snapshot.activities.is_empty(),
+    )
+    .await;
+
+    let target = if stop_the_child { child_id } else { session_id };
+    client
+        .interrupt_session(target)
+        .await
+        .expect("the stop is acknowledged");
+
+    let stopped = session_where(
+        client,
+        session_id,
+        "the stopped Subagent's row settles",
+        |snapshot| {
+            matches!(
+                the_subagent_row(snapshot),
+                Activity::Subagent {
+                    status: ActivityStatus::Interrupted,
+                    ..
+                }
+            )
+        },
+    )
+    .await;
+    assert_eq!(
+        stopped.turns[0].status,
+        TurnStatus::Completed,
+        "the parent's settled Turn is not re-touched by the stop"
+    );
+    let child = settled_session(client, child_id, 0).await;
+    assert_eq!(child.turns[0].status, TurnStatus::Interrupted);
+
+    let interrupts = fixture
+        .requests()
+        .into_iter()
+        .filter(|request| request.get("method").and_then(Value::as_str) == Some("turn/interrupt"))
+        .collect::<Vec<_>>();
+    let [interrupt] = interrupts.as_slice() else {
+        panic!("exactly the child's interrupt goes out, got {interrupts:?}");
+    };
+    assert_eq!(
+        interrupt["params"]["threadId"], "child-thread",
+        "no root turn is running, so nothing but the child is addressed"
+    );
+    assert_eq!(interrupt["params"]["turnId"], "child-turn");
+
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn interrupting_with_no_turn_active_interrupts_the_outliving_child_thread() {
+    assert_idle_stop_reaches_only_the_child("codex-idle-interrupt-children", false).await;
+}
+
+#[tokio::test]
+async fn stopping_one_subagent_by_its_session_interrupts_its_thread_alone() {
+    assert_idle_stop_reaches_only_the_child("codex-stop-one-subagent", true).await;
+}
+
+/// A collab child followed but silent: its thread is attached, yet no item of
+/// its has streamed, so no turn of its is known to interrupt.
+const SILENT_CHILD_CODEX: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/auditor"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed","items":[]}}}'
+      ;;
+    *'"method":"thread/resume"'*)
+      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
+      ;;
+"#;
+
+#[tokio::test]
+async fn stopping_a_child_that_has_named_no_turn_yet_refuses_rather_than_lying() {
+    let fixture = ScriptedCodex::new_multiprocess(SILENT_CHILD_CODEX);
+    let opened = opened_session(&fixture, "codex-stop-turnless-child", "Audit").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let settled = settled_session(client, session_id, 0).await;
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&settled)
+    else {
+        unreachable!()
+    };
+
+    let refused = client
+        .interrupt_session(*child_id)
+        .await
+        .expect_err("a child with no turn to interrupt cannot be stopped yet");
+    assert!(
+        refused.to_string().contains("has not begun a turn"),
+        "the refusal says why the stop found nothing to address, got: {refused:#}"
+    );
+
+    let unchanged = client
+        .read_session(session_id)
+        .await
+        .expect("read the Session after the refusal");
+    let Activity::Subagent { status, .. } = the_subagent_row(&unchanged) else {
+        unreachable!()
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Active,
+        "a refused stop settles nothing: the record stays truthful"
+    );
+    assert!(
+        !fixture
+            .requests()
+            .into_iter()
+            .any(|request| request.get("method").and_then(Value::as_str) == Some("turn/interrupt")),
+        "no turn is known, so no interrupt goes out"
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
+}

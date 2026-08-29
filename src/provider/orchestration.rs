@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Display,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
@@ -23,12 +23,13 @@ use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AgentIdentity, Message, MessageId, MessageRole,
     MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
-    SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery, TurnId, TurnStatus,
+    SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery, TurnId,
 };
 use crate::sessions::{
-    DeliveredTurn, DeliveredTurnStatus, InterruptTurnError, ProviderTurnOutcome,
-    QueuedPromptDisposition, SessionStore, TrailingCommandOutput, command_output_changes,
-    earliest_pending_prompt, message_content_changes, reasoning_content_changes,
+    DeliveredTurn, DeliveredTurnStatus, InterruptSessionError, InterruptTarget,
+    ProviderTurnOutcome, QueuedPromptDisposition, SessionStore, TrailingCommandOutput,
+    command_output_changes, earliest_pending_prompt, message_content_changes,
+    reasoning_content_changes,
 };
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 
@@ -164,9 +165,17 @@ enum ProviderCommand {
         prompt_id: PromptId,
     },
     SteerPrompt,
-    InterruptTurn {
-        turn_id: TurnId,
-        response: oneshot::Sender<Result<crate::protocol::Turn, InterruptTurnError>>,
+    /// Stop the Session's work, whatever it is: the active Turn — the
+    /// Provider stops its background work first, in the established ordering
+    /// — or, with no Turn running, every Subagent still working.
+    InterruptSession {
+        response: oneshot::Sender<Result<(), InterruptSessionError>>,
+    },
+    /// Stop the one working Subagent whose child Session is `target`, leaving
+    /// everything else running.
+    StopSubagent {
+        target: SessionId,
+        response: oneshot::Sender<Result<(), InterruptSessionError>>,
     },
 }
 
@@ -284,6 +293,12 @@ impl ActiveProviderTurn {
 struct SubagentRoutes {
     routes: HashMap<ProviderSubagentId, SubagentRoute>,
     rows: HashMap<ProviderSubagentId, SubagentRow>,
+    /// The Subagents Suru itself settled by stopping them. Their rows and
+    /// routes are gone, but the Provider was not the one to close them, so
+    /// its own account of their end — the settle it still owes, the progress
+    /// it had in flight — can trail in afterwards and must read as a late
+    /// echo to discard rather than as an event it never spawned.
+    stopped: HashSet<ProviderSubagentId>,
     /// Whether a Subagent has settled since a Turn last began. The output a
     /// completion provokes can arrive only after the settle — Claude notifies
     /// a task's end before its loop wakes to deliver the outcome — so every
@@ -381,6 +396,92 @@ impl SubagentRoutes {
         }
     }
 
+    /// Whether Suru itself stopped this Subagent, which is what makes the
+    /// Provider's later events for it late echoes rather than events it never
+    /// spawned.
+    fn was_stopped(&self, subagent: &ProviderSubagentId) -> bool {
+        self.stopped.contains(subagent)
+    }
+
+    /// The working Subagent whose child Session is `target`, resolved for a
+    /// stop request that names the Session rather than the Provider's own
+    /// identity. `None` once the Subagent has settled — there is nothing left
+    /// to stop.
+    fn subagent_for_session(&self, target: SessionId) -> Option<ProviderSubagentId> {
+        self.routes
+            .iter()
+            .find(|(_, route)| route.session_id == target)
+            .map(|(subagent, _)| subagent.clone())
+    }
+
+    /// Settles one stopped Subagent — and every Subagent below it, since
+    /// stopping a delegation stops whatever it delegated in turn — as
+    /// Interrupted: the child's Turn closes with the stop, the row records
+    /// the duration Suru timed, and the identities join the stopped set so
+    /// the Provider's trailing account of them is discarded.
+    fn settle_stopped(
+        &mut self,
+        sessions: &SessionStore,
+        updates: &ProviderUpdateGate,
+        next_agent: &AgentIdentity,
+        subagent: &ProviderSubagentId,
+    ) {
+        let mut targets = vec![subagent.clone()];
+        while let Some(subagent) = targets.pop() {
+            let Some(row) = self.rows.remove(&subagent) else {
+                continue;
+            };
+            let route = self.routes.remove(&subagent);
+            self.stopped.insert(subagent);
+            if let Some(mut route) = route {
+                targets.extend(
+                    self.rows
+                        .iter()
+                        .filter(|(_, held)| held.owner_session_id == route.session_id)
+                        .map(|(descendant, _)| descendant.clone()),
+                );
+                let trailing_output = route.turn.take_trailing_output();
+                let _ = updates.apply(|| {
+                    sessions.finish_provider_turn(
+                        route.session_id,
+                        route.turn.turn_id,
+                        next_agent.agent.clone(),
+                        ProviderTurnOutcome::Interrupted { trailing_output },
+                        QueuedPromptDisposition::LeavePending,
+                    )
+                });
+            }
+            let duration_ms = u64::try_from(row.started.elapsed().as_millis()).ok();
+            let _ = updates.apply(|| {
+                sessions.publish_agent_output(
+                    row.owner_session_id,
+                    SessionChange::SubagentStatusChanged {
+                        activity_id: row.activity_id,
+                        status: ActivityStatus::Interrupted,
+                        duration_ms,
+                    },
+                )
+            });
+        }
+    }
+
+    /// Settles every working Subagent as stopped, for the interrupt that
+    /// reaches them all. Whatever output a settle was still owed is owed no
+    /// longer — an interrupted stream's trailing output is discarded, as it
+    /// always was — so this also stands down the Continuation.
+    fn stop_all(
+        &mut self,
+        sessions: &SessionStore,
+        updates: &ProviderUpdateGate,
+        next_agent: &AgentIdentity,
+    ) {
+        let working = self.rows.keys().cloned().collect::<Vec<_>>();
+        for subagent in working {
+            self.settle_stopped(sessions, updates, next_agent, &subagent);
+        }
+        self.late_settle_owes_continuation = false;
+    }
+
     /// Applies a Provider's description update to the row it names, or `None`
     /// when no open row carries the identity — the caller decides whether an
     /// unknown identity is an invalid event or a late echo to discard.
@@ -429,6 +530,9 @@ impl SubagentRoutes {
                         trailing_output: route.turn.take_trailing_output(),
                         message: SUBAGENT_FAILED_MESSAGE.to_owned(),
                     },
+                    ProviderSubagentStatus::Interrupted => ProviderTurnOutcome::Interrupted {
+                        trailing_output: route.turn.take_trailing_output(),
+                    },
                 };
                 sessions.finish_provider_turn(
                     route.session_id,
@@ -446,6 +550,7 @@ impl SubagentRoutes {
                     status: match status {
                         ProviderSubagentStatus::Completed => ActivityStatus::Completed,
                         ProviderSubagentStatus::Failed => ActivityStatus::Failed,
+                        ProviderSubagentStatus::Interrupted => ActivityStatus::Interrupted,
                     },
                     duration_ms,
                 },
@@ -700,49 +805,67 @@ impl ProviderOrchestrator {
             .map_err(|_| anyhow::anyhow!("Session Provider actor stopped unexpectedly"))
     }
 
-    pub(crate) async fn interrupt_turn(
+    /// Stops what a Session is doing, whatever that is: the active Turn along
+    /// with the Subagents it spawned, or — with no Turn running — the
+    /// Subagents alone. Interrupting a Subagent's own Session stops that one
+    /// Subagent, through the Provider connection its root ancestor owns.
+    pub(crate) async fn interrupt_session(
         &self,
         session_id: SessionId,
-        turn_id: TurnId,
-    ) -> Result<crate::protocol::Turn, InterruptTurnError> {
-        let target = self.sessions.interrupt_target(session_id, turn_id)?;
-        if target.status == TurnStatus::Interrupted {
-            return Ok(target);
+    ) -> Result<(), InterruptSessionError> {
+        let actor_commands = |actor_id: SessionId| {
+            self.actors
+                .lock()
+                .expect("Provider actor registry lock is not poisoned")
+                .entries
+                .get(&actor_id)
+                .map(|actor| actor.commands.clone())
+        };
+        match self.sessions.interrupt_target(session_id)? {
+            InterruptTarget::Turn(turn) => {
+                let actor = actor_commands(session_id).ok_or_else(|| {
+                    self.fail_unavailable_interruption(
+                        session_id,
+                        turn.id,
+                        "Provider interruption failed: the Session has no Provider actor.",
+                    )
+                })?;
+                let (response_tx, response_rx) = oneshot::channel();
+                actor
+                    .send(ProviderCommand::InterruptSession {
+                        response: response_tx,
+                    })
+                    .map_err(|_| {
+                        self.fail_unavailable_interruption(
+                            session_id,
+                            turn.id,
+                            "Provider interruption failed: the Provider Session stopped unexpectedly.",
+                        )
+                    })?;
+                response_rx.await.map_err(|_| {
+                    self.fail_unavailable_interruption(
+                        session_id,
+                        turn.id,
+                        "Provider interruption failed: the Provider Session stopped unexpectedly.",
+                    )
+                })?
+            }
+            InterruptTarget::Subagents => {
+                ask_actor_or_find_nothing_running(actor_commands(session_id), |response| {
+                    ProviderCommand::InterruptSession { response }
+                })
+                .await
+            }
+            InterruptTarget::Subagent { root } => {
+                ask_actor_or_find_nothing_running(actor_commands(root), |response| {
+                    ProviderCommand::StopSubagent {
+                        target: session_id,
+                        response,
+                    }
+                })
+                .await
+            }
         }
-        let actor = self
-            .actors
-            .lock()
-            .expect("Provider actor registry lock is not poisoned")
-            .entries
-            .get(&session_id)
-            .map(|actor| actor.commands.clone())
-            .ok_or_else(|| {
-                self.fail_unavailable_interruption(
-                    session_id,
-                    turn_id,
-                    "Provider interruption failed: the Session has no Provider actor.",
-                )
-            })?;
-        let (response_tx, response_rx) = oneshot::channel();
-        actor
-            .send(ProviderCommand::InterruptTurn {
-                turn_id,
-                response: response_tx,
-            })
-            .map_err(|_| {
-                self.fail_unavailable_interruption(
-                    session_id,
-                    turn_id,
-                    "Provider interruption failed: the Provider Session stopped unexpectedly.",
-                )
-            })?;
-        response_rx.await.map_err(|_| {
-            self.fail_unavailable_interruption(
-                session_id,
-                turn_id,
-                "Provider interruption failed: the Provider Session stopped unexpectedly.",
-            )
-        })?
     }
 
     /// Fails a Turn whose Provider actor could not be reached, settling whatever
@@ -755,7 +878,7 @@ impl ProviderOrchestrator {
         session_id: SessionId,
         turn_id: TurnId,
         message: &str,
-    ) -> InterruptTurnError {
+    ) -> InterruptSessionError {
         let _ = self.updates.apply(|| {
             self.sessions.fail_turn(
                 session_id,
@@ -764,7 +887,7 @@ impl ProviderOrchestrator {
                 message.to_owned(),
             )
         });
-        InterruptTurnError::ProviderFailure(message.to_owned())
+        InterruptSessionError::ProviderFailure(message.to_owned())
     }
 
     pub(crate) async fn close_session(&self, session_id: SessionId) {
@@ -971,9 +1094,64 @@ async fn run_provider_session(
             let Some(command) = command else { break };
             let prompt_id = match command {
                 ProviderCommand::StartPrompt { prompt_id } => prompt_id,
-                ProviderCommand::InterruptTurn { turn_id, response } => {
-                    let result = sessions.interrupt_target(session_id, turn_id);
-                    let _ = response.send(result);
+                ProviderCommand::InterruptSession { response } => {
+                    // With no Turn active, the interrupt reaches the
+                    // Subagents that outlived it (ADR 0015). Nothing still
+                    // working answers success, because the work the caller
+                    // meant to stop is already over.
+                    if subagents.routes.is_empty() && subagents.rows.is_empty() {
+                        let _ = response.send(Ok(()));
+                        continue;
+                    }
+                    let connected = provider
+                        .as_ref()
+                        .expect("routed Subagents ride a live Provider connection");
+                    let provider_session = connected.session.clone();
+                    let identity = connected.identity.clone();
+                    let stopped = tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => {
+                            let _ = response.send(Err(InterruptSessionError::ProviderFailure(
+                                "Provider interruption failed: the Provider Session is shutting down."
+                                    .to_owned(),
+                            )));
+                            break 'actor;
+                        }
+                        stopped = provider_session.stop_subagents() => stopped,
+                    };
+                    match stopped {
+                        Ok(()) => {
+                            subagents.stop_all(&sessions, &updates, &identity);
+                            let _ = response.send(Ok(()));
+                        }
+                        Err(error) => {
+                            let message = failure_message("Provider interruption failed", &error);
+                            lose_provider_connection(
+                                &mut provider,
+                                &mut subagents,
+                                &sessions,
+                                &updates,
+                            );
+                            let _ =
+                                response.send(Err(InterruptSessionError::ProviderFailure(message)));
+                        }
+                    }
+                    continue;
+                }
+                ProviderCommand::StopSubagent { target, response } => {
+                    let _ = response.send(
+                        stop_one_subagent(
+                            &runtime,
+                            provider
+                                .as_ref()
+                                .map(|c| (c.session.clone(), c.identity.clone())),
+                            &mut subagents,
+                            &sessions,
+                            &updates,
+                            target,
+                        )
+                        .await,
+                    );
                     continue;
                 }
                 ProviderCommand::SteerPrompt => continue,
@@ -1251,30 +1429,85 @@ async fn run_provider_session(
                     }
                 }
             }
-            ProviderInput::Command(Some(ProviderCommand::InterruptTurn { turn_id, response })) => {
-                let target = match sessions.interrupt_target(session_id, turn_id) {
-                    Ok(target) => target,
-                    Err(error) => {
-                        let _ = response.send(Err(error));
-                        continue;
-                    }
-                };
-                if target.status == TurnStatus::Interrupted {
-                    let _ = response.send(Ok(target));
-                    continue;
-                }
+            ProviderInput::Command(Some(ProviderCommand::InterruptSession { response })) => {
                 let current = active
                     .as_mut()
                     .expect("Provider input is handled while a Turn is active");
-                if current.turn_id != turn_id {
-                    let _ = response.send(Err(InterruptTurnError::ProviderFailure(
-                        "Provider interruption failed: the Provider owns a different active Turn."
-                            .to_owned(),
-                    )));
+                if current.interruption_acknowledged {
+                    let _ = response.send(Ok(()));
                     continue;
                 }
-                if current.interruption_acknowledged {
-                    let _ = response.send(Ok(target));
+                let identity = provider
+                    .as_ref()
+                    .expect("Provider connection exists while its Turn is active")
+                    .identity
+                    .clone();
+                if current.continuation {
+                    // A Continuation runs no Provider loop of its own — it is
+                    // the Turn Suru opened for the output its Subagents still
+                    // owed. Interrupting it stops those Subagents, and the
+                    // Continuation settles as interrupted here rather than on
+                    // a terminal event no loop will send.
+                    let stopped = tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => {
+                            let _ = response.send(Err(InterruptSessionError::ProviderFailure(
+                                "Provider interruption failed: the Provider Session is shutting down."
+                                    .to_owned(),
+                            )));
+                            break 'actor;
+                        }
+                        stopped = provider_session.stop_subagents() => stopped,
+                    };
+                    match stopped {
+                        Ok(()) => {
+                            subagents.stop_all(&sessions, &updates, &identity);
+                            let trailing_output = current.take_trailing_output();
+                            let settled = updates.apply(|| {
+                                sessions.finish_provider_turn(
+                                    session_id,
+                                    current.turn_id,
+                                    identity.agent,
+                                    ProviderTurnOutcome::Interrupted { trailing_output },
+                                    QueuedPromptDisposition::LeavePending,
+                                )
+                            });
+                            active = None;
+                            let _ = response.send(Ok(()));
+                            if settled.is_none() {
+                                break;
+                            }
+                            defer_next_queued_prompt(
+                                &mut deferred_prompt_id,
+                                &sessions,
+                                session_id,
+                            );
+                        }
+                        Err(error) => {
+                            let message = failure_message("Provider interruption failed", &error);
+                            fail_active_turn(
+                                &sessions,
+                                &updates,
+                                session_id,
+                                current,
+                                message.clone(),
+                            );
+                            active = None;
+                            lose_provider_connection(
+                                &mut provider,
+                                &mut subagents,
+                                &sessions,
+                                &updates,
+                            );
+                            defer_next_queued_prompt(
+                                &mut deferred_prompt_id,
+                                &sessions,
+                                session_id,
+                            );
+                            let _ =
+                                response.send(Err(InterruptSessionError::ProviderFailure(message)));
+                        }
+                    }
                     continue;
                 }
                 let interrupted = tokio::select! {
@@ -1283,7 +1516,7 @@ async fn run_provider_session(
                     // failure rather than inventing one that would race this actor's
                     // settling of the Turn on its way out.
                     _ = shutdown.wait() => {
-                        let _ = response.send(Err(InterruptTurnError::ProviderFailure(
+                        let _ = response.send(Err(InterruptSessionError::ProviderFailure(
                             "Provider interruption failed: the Provider Session is shutting down."
                                 .to_owned(),
                         )));
@@ -1294,7 +1527,13 @@ async fn run_provider_session(
                 match interrupted {
                     Ok(()) => {
                         current.interruption_acknowledged = true;
-                        let _ = response.send(Ok(target));
+                        // The Provider stopped the Turn's background work
+                        // ahead of the loop — the established ordering — so
+                        // the Subagents settle as stopped now, rather than
+                        // waiting on notifications an ended loop may never
+                        // deliver.
+                        subagents.stop_all(&sessions, &updates, &identity);
+                        let _ = response.send(Ok(()));
                     }
                     Err(error) => {
                         let message = failure_message("Provider interruption failed", &error);
@@ -1307,9 +1546,24 @@ async fn run_provider_session(
                             &updates,
                         );
                         defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
-                        let _ = response.send(Err(InterruptTurnError::ProviderFailure(message)));
+                        let _ = response.send(Err(InterruptSessionError::ProviderFailure(message)));
                     }
                 }
+            }
+            ProviderInput::Command(Some(ProviderCommand::StopSubagent { target, response })) => {
+                let _ = response.send(
+                    stop_one_subagent(
+                        &runtime,
+                        provider
+                            .as_ref()
+                            .map(|c| (c.session.clone(), c.identity.clone())),
+                        &mut subagents,
+                        &sessions,
+                        &updates,
+                        target,
+                    )
+                    .await,
+                );
             }
             ProviderInput::Event(event) => {
                 let Some(current) = active.as_mut() else {
@@ -1461,6 +1715,60 @@ async fn run_provider_session(
 
     if let Some(connected) = provider {
         let _ = timeout(Duration::from_secs(2), connected.session.shutdown()).await;
+    }
+}
+
+/// Delivers one stop-shaped command to a Session's actor and awaits its
+/// answer. These stops target only Subagents, which live and die with their
+/// actor's connection: no actor left — or one that stopped before answering —
+/// means nothing is still running, and stopping nothing is success.
+async fn ask_actor_or_find_nothing_running(
+    actor: Option<mpsc::UnboundedSender<ProviderCommand>>,
+    command: impl FnOnce(oneshot::Sender<Result<(), InterruptSessionError>>) -> ProviderCommand,
+) -> Result<(), InterruptSessionError> {
+    let Some(actor) = actor else {
+        return Ok(());
+    };
+    let (response_tx, response_rx) = oneshot::channel();
+    if actor.send(command(response_tx)).is_err() {
+        return Ok(());
+    }
+    response_rx.await.unwrap_or(Ok(()))
+}
+
+/// Answers one per-Subagent stop request: resolves the Subagent whose child
+/// Session was named, asks the Provider to stop it, and settles it — with
+/// whatever it delegated in turn — as stopped. A Subagent already settled
+/// leaves nothing to stop, and stopping nothing succeeds. The Provider call
+/// is bounded by the Provider's own interrupt timeout, so this holds the
+/// actor no longer than an interrupt would; a stop the Provider refuses
+/// leaves everything running and reports the refusal, because one Subagent
+/// the Provider would not stop is no reason to tear the Session down.
+async fn stop_one_subagent(
+    runtime: &Arc<dyn ProviderRuntime>,
+    connection: Option<(Arc<dyn ProviderSession>, AgentIdentity)>,
+    subagents: &mut SubagentRoutes,
+    sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
+    target: SessionId,
+) -> Result<(), InterruptSessionError> {
+    if !runtime.supports_subagent_stop() {
+        return Err(InterruptSessionError::SubagentStopUnsupported);
+    }
+    let Some(subagent) = subagents.subagent_for_session(target) else {
+        return Ok(());
+    };
+    let (provider_session, identity) =
+        connection.expect("routed Subagents ride a live Provider connection");
+    match provider_session.stop_subagent(subagent.clone()).await {
+        Ok(()) => {
+            subagents.settle_stopped(sessions, updates, &identity, &subagent);
+            Ok(())
+        }
+        Err(error) => Err(InterruptSessionError::ProviderFailure(failure_message(
+            "Provider Subagent stop failed",
+            &error,
+        ))),
     }
 }
 
@@ -2085,6 +2393,12 @@ fn project_provider_event(
                 subagent_id,
                 description,
             } => match subagents.update_row(sessions, &subagent_id, &description) {
+                // A Subagent Suru stopped can still trail the Provider's
+                // account of it; that is a late echo to discard, not an
+                // update to a Subagent never spawned.
+                None if subagents.was_stopped(&subagent_id) => {
+                    Ok(ProviderEventProjection::Continue)
+                }
                 None => {
                     return fail_invalid_provider_event(
                         sessions,
@@ -2100,6 +2414,12 @@ fn project_provider_event(
                 subagent_id,
                 status,
             } => match subagents.settle_subagent(sessions, next_agent, &subagent_id, status) {
+                // The settle a stopped Subagent still owed arrives as a late
+                // echo: Suru already settled the row, so there is nothing
+                // left for the Provider's own account to close.
+                None if subagents.was_stopped(&subagent_id) => {
+                    Ok(ProviderEventProjection::Continue)
+                }
                 None => {
                     return fail_invalid_provider_event(
                         sessions,
@@ -2265,7 +2585,7 @@ mod tests {
     use super::*;
     use crate::protocol::{
         AgentId, AgentSelection, CreateSessionRequest, InitialPrompt, MessageRole, MessageStatus,
-        ModelId, SessionSnapshot, Workspace,
+        ModelId, SessionSnapshot, TurnStatus, Workspace,
     };
     use crate::sessions::StoreOutcome;
     use crate::storage::{StorageRepository, StorageWriter};

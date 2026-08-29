@@ -49,7 +49,8 @@ use crate::{
     protocol::{AgentId, AgentIdentity, AgentSelection, ModelDescriptor},
     provider::{
         ProviderError, ProviderFuture, ProviderResumeState, ProviderSession,
-        ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
+        ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
+        ProviderTurnInput,
         harness::{ProcessGuard, ProcessRegistry},
     },
 };
@@ -414,6 +415,55 @@ impl ProviderSession for ClaudeSession {
                     self.turn.abandon_turn();
                     claude_error_context(CONTEXT, failure.into_error())
                 })
+        })
+    }
+
+    fn stop_subagents(&self) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            // Deliberately not gated on a running Turn: this is the interrupt
+            // that arrives after the Turn settled, when the roster holds
+            // exactly the work that outlived it. No child process means
+            // nothing is running, and nothing to stop is success.
+            let transport = {
+                let slot = self.child.lock().await;
+                slot.running.as_ref().map(|child| child.transport.clone())
+            };
+            if let Some(transport) = transport {
+                self.stop_background_tasks(&transport).await;
+            }
+            Ok(())
+        })
+    }
+
+    fn stop_subagent(&self, subagent_id: ProviderSubagentId) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            const CONTEXT: &str = "Claude Subagent stop failed";
+            let transport = {
+                let slot = self.child.lock().await;
+                slot.running.as_ref().map(|child| child.transport.clone())
+            };
+            // A Subagent off the roster — settled, or running on a process no
+            // longer there — has nothing left to stop, and stopping nothing
+            // succeeds; the caller settles the row either way.
+            let Some(transport) = transport else {
+                return Ok(());
+            };
+            let Some(task_id) = self.turn.subagent_task(subagent_id.as_str()) else {
+                return Ok(());
+            };
+            transport
+                .control_request(
+                    &ControlRequest::StopTask {
+                        task_id: task_id.clone(),
+                    },
+                    self.interrupt_request_timeout,
+                )
+                .await
+                .map_err(|failure| claude_error_context(CONTEXT, failure.into_error()))?;
+            // Acknowledged means off the CLI's roster: its own notification
+            // can lose the race with what the caller does next.
+            self.turn.task_settled(&task_id);
+            Ok(())
         })
     }
 

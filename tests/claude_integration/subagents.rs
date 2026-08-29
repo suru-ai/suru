@@ -4,7 +4,9 @@
 //! spawns recurse one level down.
 
 use crate::support::{
-    agent_messages, conversation_fixture, opened_session, session_where, settled_session,
+    CLAUDE_MODELS, ScriptedClaude, after_probe, agent_messages, conversation_fixture,
+    discovery_arms, interrupt_arm, opened_session, session_where, settled_session, stop_task_arm,
+    user_turn_arm,
 };
 use suru::protocol::{Activity, ActivityStatus, SessionSnapshot, TurnStatus};
 
@@ -420,6 +422,294 @@ async fn an_outer_settle_does_not_orphan_the_inner_subagent_it_leaves_running() 
     let grandchild = settled_session(client, *grandchild_id, 0).await;
     assert_eq!(grandchild.turns[0].status, TurnStatus::Completed);
     assert_eq!(agent_messages(&grandchild)[0].content, "Twelve call sites.");
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+/// A Turn holding a Subagent in flight and never answering on its own: the spawn streams, and the
+/// conversation stays open until an interrupt ends it.
+const SUBAGENT_IN_FLIGHT: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_1","name":"Task","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"agent-task-1","tool_use_id":"task_1","description":"Scout the workspace","task_type":"local_agent","subagent_type":"Explore","session_id":"prov-session"}'
+"#;
+
+/// What the CLI writes once the interrupt has stopped its loop.
+const INTERRUPTED_RESULT: &str = r#"      emit '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":11,"num_turns":1,"result":"","terminal_reason":"aborted_streaming","session_id":"prov-session"}'
+"#;
+
+/// The one control request of `subtype` the fixture captured.
+fn request_named(claude: &ScriptedClaude, subtype: &str) -> serde_json::Value {
+    claude
+        .requests()
+        .into_iter()
+        .find(|request| request.pointer("/request/subtype") == Some(&subtype.into()))
+        .unwrap_or_else(|| panic!("a `{subtype}` control request reaches the CLI"))
+}
+
+#[tokio::test]
+async fn interrupting_a_turn_stops_its_working_subagent_before_the_loop() {
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(SUBAGENT_IN_FLIGHT),
+        stop_task_arm(),
+        interrupt_arm(INTERRUPTED_RESULT),
+    ));
+    let opened = opened_session(&claude, "claude-interrupt-reaches-subagents", "Fan out").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let mut feed = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    let spawned = session_where(
+        client,
+        &mut feed,
+        session_id,
+        "the Subagent's row reaches the Transcript",
+        |snapshot| matches!(snapshot.activities.first(), Some(Activity::Subagent { .. })),
+    )
+    .await;
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&spawned)
+    else {
+        unreachable!()
+    };
+    let child_id = *child_id;
+
+    client
+        .interrupt_session(session_id)
+        .await
+        .expect("Claude acknowledges the interrupt");
+    let interrupted = settled_session(client, session_id, 0).await;
+
+    assert_eq!(interrupted.turns[0].status, TurnStatus::Interrupted);
+    let Activity::Subagent {
+        status,
+        duration_ms,
+        ..
+    } = the_subagent_row(&interrupted)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Interrupted,
+        "the stopped Subagent's row settles as stopped, not failed"
+    );
+    assert!(
+        duration_ms.is_some(),
+        "the stop is a real settle, so the row states how long the delegation ran"
+    );
+    let child = settled_session(client, child_id, 0).await;
+    assert_eq!(child.turns[0].status, TurnStatus::Interrupted);
+
+    assert_eq!(
+        claude.control_subtypes(),
+        after_probe(["list_models", "stop_task", "interrupt"]),
+        "the Subagent is stopped before the loop is, in the established ordering"
+    );
+    assert_eq!(
+        request_named(&claude, "stop_task").pointer("/request/task_id"),
+        Some(&"agent-task-1".into()),
+        "the stop names the task running the Subagent"
+    );
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+/// A Turn that spawns a Subagent and completes at once, leaving only the Subagent working; the
+/// conversation then stays open until the interrupt's stop reaches it.
+const SUBAGENT_OUTLIVES_THE_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_bg","name":"Task","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"agent-task-bg","tool_use_id":"task_bg","description":"Audit dependencies","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":400,"num_turns":1,"result":"Kicked off the audit.","session_id":"prov-session"}'
+"#;
+
+#[tokio::test]
+async fn interrupting_with_no_turn_active_stops_the_outliving_subagent_without_an_interrupt() {
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(SUBAGENT_OUTLIVES_THE_TURN),
+        stop_task_arm(),
+    ));
+    let opened = opened_session(&claude, "claude-idle-interrupt-subagents", "Audit").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let settled = settled_session(client, session_id, 0).await;
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let Activity::Subagent {
+        status,
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&settled)
+    else {
+        unreachable!()
+    };
+    assert_eq!(*status, ActivityStatus::Active);
+    let child_id = *child_id;
+
+    client
+        .interrupt_session(session_id)
+        .await
+        .expect("the interrupt works with no Turn active");
+
+    let mut feed = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    let stopped = session_where(
+        client,
+        &mut feed,
+        session_id,
+        "the stopped Subagent's row settles",
+        |snapshot| {
+            matches!(
+                the_subagent_row(snapshot),
+                Activity::Subagent {
+                    status: ActivityStatus::Interrupted,
+                    ..
+                }
+            )
+        },
+    )
+    .await;
+    let Activity::Subagent { duration_ms, .. } = the_subagent_row(&stopped) else {
+        unreachable!()
+    };
+    assert!(duration_ms.is_some());
+    let child = settled_session(client, child_id, 0).await;
+    assert_eq!(
+        child.turns[0].status,
+        TurnStatus::Interrupted,
+        "the stop settles the child's Turn, which is what clears Working"
+    );
+
+    assert_eq!(
+        claude.control_subtypes(),
+        after_probe(["list_models", "stop_task"]),
+        "with no loop running there is nothing to interrupt: the stop alone goes out"
+    );
+    assert_eq!(
+        request_named(&claude, "stop_task").pointer("/request/task_id"),
+        Some(&"agent-task-bg".into()),
+    );
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+/// A Turn that fans out to two Subagents and completes, leaving both working.
+const TWO_SUBAGENTS_OUTLIVE_THE_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_1","name":"Task","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"agent-task-1","tool_use_id":"task_1","description":"Scout the workspace","task_type":"local_agent","subagent_type":"Explore","session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"task_2","name":"Task","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"agent-task-2","tool_use_id":"task_2","description":"Audit dependencies","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":400,"num_turns":1,"result":"Fanned out.","session_id":"prov-session"}'
+"#;
+
+/// The Subagent rows in `snapshot`, in Transcript order.
+fn subagent_rows(snapshot: &SessionSnapshot) -> Vec<&Activity> {
+    snapshot
+        .activities
+        .iter()
+        .filter(|activity| matches!(activity, Activity::Subagent { .. }))
+        .collect()
+}
+
+#[tokio::test]
+async fn stopping_one_subagent_by_its_session_leaves_the_other_working() {
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(TWO_SUBAGENTS_OUTLIVE_THE_TURN),
+        stop_task_arm(),
+    ));
+    let opened = opened_session(&claude, "claude-stop-one-subagent", "Fan out").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let settled = settled_session(client, session_id, 0).await;
+    let [
+        Activity::Subagent {
+            session_id: first_child,
+            ..
+        },
+        Activity::Subagent { .. },
+    ] = subagent_rows(&settled)[..]
+    else {
+        panic!(
+            "both spawns reach the Transcript, got {:?}",
+            settled.activities
+        );
+    };
+    let first_child = *first_child;
+
+    // Interrupting the Subagent's own Session is the Picker row's stop.
+    client
+        .interrupt_session(first_child)
+        .await
+        .expect("the Subagent's Session accepts the stop");
+
+    let mut feed = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    let after = session_where(
+        client,
+        &mut feed,
+        session_id,
+        "the stopped Subagent's row settles",
+        |snapshot| {
+            matches!(
+                subagent_rows(snapshot)[..],
+                [
+                    Activity::Subagent {
+                        status: ActivityStatus::Interrupted,
+                        ..
+                    },
+                    ..
+                ]
+            )
+        },
+    )
+    .await;
+    let [_, Activity::Subagent { status, .. }] = subagent_rows(&after)[..] else {
+        unreachable!()
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Active,
+        "the other Subagent works on: the stop reached one delegation, not the Session"
+    );
+    let stopped_child = settled_session(client, first_child, 0).await;
+    assert_eq!(stopped_child.turns[0].status, TurnStatus::Interrupted);
+
+    assert_eq!(
+        claude.control_subtypes(),
+        after_probe(["list_models", "stop_task"]),
+        "one stop goes out, and no interrupt follows it"
+    );
+    assert_eq!(
+        request_named(&claude, "stop_task").pointer("/request/task_id"),
+        Some(&"agent-task-1".into()),
+        "the stop names the task running the Subagent that was asked to stop"
+    );
 
     opened
         .server

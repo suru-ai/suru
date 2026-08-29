@@ -250,6 +250,8 @@ impl ClaudeProjection {
         // start that names none leaves the task id standing in, so the Subagent's row and settle
         // still reach the Transcript even though no chunk can ever be attributed to it.
         let subagent = message.tool_use_id.unwrap_or_else(|| task_id.clone());
+        self.turn
+            .subagent_task_started(task_id.clone(), subagent.clone());
         let spawner = self
             .spawn_tools
             .remove(&subagent)

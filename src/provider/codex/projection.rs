@@ -80,13 +80,17 @@ struct ThreadInFlight {
     active_reasoning: HashMap<String, ActiveNativeReasoning>,
 }
 
-/// One spawned child thread Suru follows: the items it has open, and the
+/// One spawned child thread Suru follows: the items it has open, the
 /// description its row currently reads — kept so a collab call repeating it
-/// unchanged publishes nothing.
+/// unchanged publishes nothing — and the latest native turn its items have
+/// ridden under, which is what a stop must name to `turn/interrupt` the
+/// child. Codex announces no turn boundary for a followed child, so the items
+/// themselves are the only account of it.
 #[derive(Default)]
 struct AttachedChild {
     in_flight: ThreadInFlight,
     description: String,
+    latest_turn_id: Option<String>,
 }
 
 struct ActiveNativeAgentMessage {
@@ -234,11 +238,35 @@ impl NativeCorrelation {
             return None;
         }
         self.children.get_mut(thread_id).map(|child| {
+            child.latest_turn_id = Some(turn_id.to_owned());
             (
                 &mut child.in_flight,
                 ProviderEventAttribution::Subagent(ProviderSubagentId::new(thread_id)),
             )
         })
+    }
+
+    /// The `turn/interrupt` targets stopping every followed child takes: each
+    /// child thread beside the latest turn its items have named. A child none
+    /// have yet leaves `None` — there is no turn a stop could address, and
+    /// skipping it is the caller's call to make.
+    pub(super) fn child_interrupt_targets(&self) -> Vec<(String, Option<String>)> {
+        self.children
+            .iter()
+            .map(|(thread_id, child)| (thread_id.clone(), child.latest_turn_id.clone()))
+            .collect()
+    }
+
+    /// The one child's `turn/interrupt` target, on the same terms as
+    /// [`Self::child_interrupt_targets`]; `None` for a thread not followed —
+    /// already settled, or never spawned.
+    pub(super) fn child_interrupt_target(
+        &self,
+        thread_id: &str,
+    ) -> Option<(String, Option<String>)> {
+        self.children
+            .get(thread_id)
+            .map(|child| (thread_id.to_owned(), child.latest_turn_id.clone()))
     }
 
     /// The attribution a Subagent lifecycle item on `thread_id` rides under,
@@ -280,6 +308,7 @@ impl NativeCorrelation {
             AttachedChild {
                 in_flight: ThreadInFlight::default(),
                 description: description.clone(),
+                latest_turn_id: None,
             },
         );
         self.pending_attaches.push(child_thread_id.clone());
@@ -666,7 +695,7 @@ fn project_subagent_activity(
             correlation.settle_child(&agent_thread_id, ProviderSubagentStatus::Completed)
         }
         NativeSubagentActivityKind::Interrupted => {
-            correlation.settle_child(&agent_thread_id, ProviderSubagentStatus::Failed)
+            correlation.settle_child(&agent_thread_id, ProviderSubagentStatus::Interrupted)
         }
         NativeSubagentActivityKind::Interacted | NativeSubagentActivityKind::Other => Vec::new(),
     }
@@ -718,9 +747,10 @@ fn project_collab_call_completed(
             NativeCollabAgentStatus::Completed | NativeCollabAgentStatus::Shutdown => {
                 ProviderSubagentStatus::Completed
             }
-            NativeCollabAgentStatus::Errored
-            | NativeCollabAgentStatus::Interrupted
-            | NativeCollabAgentStatus::NotFound => ProviderSubagentStatus::Failed,
+            NativeCollabAgentStatus::Interrupted => ProviderSubagentStatus::Interrupted,
+            NativeCollabAgentStatus::Errored | NativeCollabAgentStatus::NotFound => {
+                ProviderSubagentStatus::Failed
+            }
             NativeCollabAgentStatus::PendingInit
             | NativeCollabAgentStatus::Running
             | NativeCollabAgentStatus::Other => continue,

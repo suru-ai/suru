@@ -614,7 +614,9 @@ async fn interrupting_the_first_turn_still_yields_a_derived_title() {
         .await
         .expect("the first Turn reaches the Provider")
         .succeed();
-    let turn_id = timeout(Duration::from_secs(2), async {
+    // The interrupt needs the Turn on the record before it can name something
+    // to stop, so the wait stays even though nothing reads the id any more.
+    timeout(Duration::from_secs(2), async {
         loop {
             let snapshot = client.read_session(session_id).await.expect("read Session");
             if let Some(turn) = snapshot.turns.first() {
@@ -625,7 +627,7 @@ async fn interrupting_the_first_turn_still_yields_a_derived_title() {
     })
     .await
     .expect("the first Turn is recorded");
-    let (acknowledged, ()) = tokio::join!(client.interrupt_turn(session_id, turn_id), async {
+    let (acknowledged, ()) = tokio::join!(client.interrupt_session(session_id), async {
         session.next_interrupt().await.succeed();
     });
     acknowledged.expect("the Provider acknowledges the interruption");

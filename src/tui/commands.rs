@@ -46,6 +46,7 @@ pub enum SemanticCommandId {
     SettingsNumericCancel,
     SubagentBrowse,
     SubagentOpen,
+    SubagentStop,
     SubagentLeave,
     TranscriptFoldsToggle,
     TranscriptGroupsToggle,
@@ -208,6 +209,7 @@ impl SemanticCommandId {
             Self::SettingsNumericCancel => "settings.numeric.cancel",
             Self::SubagentBrowse => "subagent.browse",
             Self::SubagentOpen => "subagent.open",
+            Self::SubagentStop => "subagent.stop",
             Self::SubagentLeave => "subagent.leave",
             Self::TranscriptFoldsToggle => "transcript.folds.toggle",
             Self::TranscriptGroupsToggle => "transcript.groups.toggle",
@@ -643,6 +645,16 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         // the Subagent's row — its Transcript row today, a Picker entry later
         // — rather than from a key or a slash that would have no way to say
         // which Subagent it meant.
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SubagentStop,
+        title: "Stop Subagent",
+        description: "Stop a working Subagent from the row that names it, where its Provider allows",
+        // Like opening, the command names the child Session it stops, so it
+        // is invoked from the Subagent's Picker row rather than from a key or
+        // a slash that would have no way to say which Subagent it meant.
         slash: None,
         keybinding: None,
     },

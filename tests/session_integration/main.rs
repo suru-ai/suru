@@ -21,6 +21,7 @@ mod provider_enablement;
 mod selection;
 mod settlement;
 mod skills;
+mod stops;
 mod storage;
 mod streams;
 mod subagents;

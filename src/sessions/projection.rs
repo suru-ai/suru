@@ -90,7 +90,7 @@ impl SessionStoreState {
     /// When live work below this Session began: the earliest moment any
     /// still-working Turn in its subtree started — its own latest Turn, or a
     /// Subagent's at any depth — and `None` when everything has settled.
-    fn subtree_working_since(&self, session_id: SessionId) -> Option<SessionTimestamp> {
+    pub(super) fn subtree_working_since(&self, session_id: SessionId) -> Option<SessionTimestamp> {
         let mut walk = vec![session_id];
         let mut earliest: Option<SessionTimestamp> = None;
         let mut visit = 0;

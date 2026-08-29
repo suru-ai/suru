@@ -13,7 +13,7 @@
 //! while a Turn is in flight, because stopping that work is something only an interrupt does.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -29,6 +29,10 @@ struct TurnState {
     owed_results: usize,
     /// The tasks the CLI has reported started and not yet reported settled.
     tasks: BTreeSet<String>,
+    /// Of those tasks, the ones running Subagents: the Subagent identity the rest of Suru knows
+    /// each by, keyed by the task id the CLI's stop request takes — the lookup a per-Subagent
+    /// stop resolves through.
+    subagents: BTreeMap<String, String>,
 }
 
 impl TurnInFlight {
@@ -89,13 +93,30 @@ impl TurnInFlight {
         self.state().tasks.insert(task_id);
     }
 
+    /// Remembers that a started task runs the Subagent this identity names, so a stop asking for
+    /// the Subagent can find the task to stop.
+    pub(super) fn subagent_task_started(&self, task_id: String, subagent: String) {
+        self.state().subagents.insert(task_id, subagent);
+    }
+
     pub(super) fn task_settled(&self, task_id: &str) {
-        self.state().tasks.remove(task_id);
+        let mut state = self.state();
+        state.tasks.remove(task_id);
+        state.subagents.remove(task_id);
     }
 
     /// The background work the CLI has reported running, which an interrupt stops before the loop.
     pub(super) fn live_tasks(&self) -> Vec<String> {
         self.state().tasks.iter().cloned().collect()
+    }
+
+    /// The task running the Subagent this identity names, while it is still on the roster.
+    pub(super) fn subagent_task(&self, subagent: &str) -> Option<String> {
+        self.state()
+            .subagents
+            .iter()
+            .find(|(_, held)| held.as_str() == subagent)
+            .map(|(task_id, _)| task_id.clone())
     }
 
     fn state(&self) -> MutexGuard<'_, TurnState> {
@@ -173,5 +194,22 @@ mod tests {
         turn.task_started("task-two".to_owned());
         turn.task_settled("task-one");
         assert_eq!(turn.live_tasks(), ["task-two"]);
+    }
+
+    #[test]
+    fn a_subagents_task_resolves_by_its_identity_until_the_task_settles() {
+        let turn = TurnInFlight::new();
+        turn.task_started("task-one".to_owned());
+        turn.subagent_task_started("task-one".to_owned(), "tool-use-one".to_owned());
+        assert_eq!(
+            turn.subagent_task("tool-use-one"),
+            Some("task-one".to_owned())
+        );
+        turn.task_settled("task-one");
+        assert_eq!(
+            turn.subagent_task("tool-use-one"),
+            None,
+            "a settled task leaves nothing for a stop to resolve"
+        );
     }
 }
