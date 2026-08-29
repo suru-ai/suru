@@ -365,9 +365,7 @@ fn attributed(subagent: Option<&str>, event: ProviderEvent) -> AttributedProvide
     AttributedProviderEvent {
         attribution: match subagent {
             None => ProviderEventAttribution::OwningSession,
-            Some(subagent) => {
-                ProviderEventAttribution::Subagent(ProviderSubagentId::new(subagent))
-            }
+            Some(subagent) => ProviderEventAttribution::Subagent(ProviderSubagentId::new(subagent)),
         },
         event,
     }
@@ -401,8 +399,10 @@ fn project_session_event(
         SessionEventType::SubagentFailed => {
             return Ok(
                 reported(&event).map_or_else(Vec::new, |failed: SubagentFailedData| {
-                    correlation
-                        .project_subagent_settled(&failed.tool_call_id, ProviderSubagentStatus::Failed)
+                    correlation.project_subagent_settled(
+                        &failed.tool_call_id,
+                        ProviderSubagentStatus::Failed,
+                    )
                 }),
             );
         }
@@ -497,10 +497,10 @@ fn project_conversation_event(
                 project_command_output(streams, &output.tool_call_id, output.partial_output)
             },
         )),
-        SessionEventType::ToolExecutionComplete => Ok(reported(event).map_or_else(
-            Vec::new,
-            |completed: ToolExecutionCompleteData| project_command_completed(streams, &completed),
-        )),
+        SessionEventType::ToolExecutionComplete => Ok(reported(event)
+            .map_or_else(Vec::new, |completed: ToolExecutionCompleteData| {
+                project_command_completed(streams, &completed)
+            })),
         SessionEventType::AssistantReasoningDelta => Ok(reported(event).map_or_else(
             Vec::new,
             |delta: AssistantReasoningDeltaData| {
@@ -1530,7 +1530,9 @@ mod tests {
     #[test]
     fn a_spawn_outside_any_turn_with_nothing_owed_lands_nowhere() {
         let mut correlation = CopilotCorrelation::new();
-        assert!(project_attributed(&mut correlation, spawn_started("agent-1", "t-spawn")).is_empty());
+        assert!(
+            project_attributed(&mut correlation, spawn_started("agent-1", "t-spawn")).is_empty()
+        );
         assert!(
             project_attributed(
                 &mut correlation,
@@ -1855,12 +1857,15 @@ mod tests {
                 }),
             ),
         );
-        let [AttributedProviderEvent {
-            event: ProviderEvent::SubagentStarted {
-                subagent_id, name, ..
+        let [
+            AttributedProviderEvent {
+                event:
+                    ProviderEvent::SubagentStarted {
+                        subagent_id, name, ..
+                    },
+                ..
             },
-            ..
-        }] = projected.as_slice()
+        ] = projected.as_slice()
         else {
             panic!("the spawn still opens the Subagent, got {projected:?}");
         };

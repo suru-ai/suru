@@ -6,8 +6,7 @@
 use std::sync::Arc;
 
 use crate::support::{
-    ScriptedCopilot, agent_messages, connect, conversation_fixture, session_where,
-    settled_session,
+    ScriptedCopilot, agent_messages, connect, conversation_fixture, session_where, settled_session,
 };
 use suru::{
     managed_client::ManagedClient,
@@ -118,7 +117,10 @@ async fn attributed_events_land_in_the_child_session_while_the_parents_transcrip
             settled.messages
         );
     };
-    assert_eq!(message.content, "Delegating to the researcher. One TODO file.");
+    assert_eq!(
+        message.content,
+        "Delegating to the researcher. One TODO file."
+    );
     let Activity::Subagent {
         status,
         name,
