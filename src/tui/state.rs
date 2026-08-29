@@ -2560,10 +2560,7 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::Continue)
             }
-            // The picker opens only while the open Session has working
-            // Subagents, so with nothing to browse the invocation leaves the
-            // view put and the key that carried it stays inert.
-            SemanticCommandId::SubagentList => {
+            SemanticCommandId::SubagentBrowse => {
                 self.state.open_subagent_picker();
                 Ok(ApplicationTransition::Continue)
             }

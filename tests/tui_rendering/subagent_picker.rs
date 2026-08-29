@@ -6,7 +6,7 @@
 //! to browse the key stays inert and composer history keeps its meaning.
 
 use crate::support::{
-    connected_application, failed_session_snapshot, rendered_application_buffer,
+    connected_application, enter_session, failed_session_snapshot, rendered_application_buffer,
     rendered_application_rows_at, text_position, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{
@@ -288,6 +288,103 @@ fn down_moves_the_caret_before_it_opens_the_picker() {
     assert!(
         text.contains("└ ⠋ Explore: Map the provider seams"),
         "Down at rest opens the picker: {text}"
+    );
+}
+
+#[test]
+fn down_keeps_walking_history_even_while_subagents_work() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let (session_id, snapshot) = enter_session(&mut application, workspace.path());
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(snapshot.revision.0 + 1),
+                changes: vec![SessionChange::ActivityAdded {
+                    activity: Activity::Subagent {
+                        id: ActivityId::new(),
+                        turn_id: snapshot.turns[0].id,
+                        status: ActivityStatus::Active,
+                        name: "Explore".to_owned(),
+                        description: "Map the provider seams".to_owned(),
+                        session_id: SessionId::new(),
+                        duration_ms: None,
+                    },
+                }],
+            },
+        )))
+        .expect("spawn a working Subagent over the session stream");
+
+    // Up recalls the submitted Prompt, so a history walk is in progress.
+    press_key(&mut application, KeyCode::Up);
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("│Initial Prompt"),
+        "Up recalls the submitted Prompt into the composer: {text}"
+    );
+
+    // Down keeps stepping the walk — here, back off its end to the scratch —
+    // rather than opening the picker over the reader's navigation.
+    press_key(&mut application, KeyCode::Down);
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        !text.contains("│Initial Prompt"),
+        "Down steps the history walk back to the empty scratch: {text}"
+    );
+    assert!(
+        !text.contains("Subagents"),
+        "composer history keeps its meaning while it has one: {text}"
+    );
+
+    // With the walk over, Down is back to its one free meaning.
+    press_key(&mut application, KeyCode::Down);
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("└ ⠋ Explore: Map the provider seams"),
+        "Down at rest opens the picker: {text}"
+    );
+}
+
+#[test]
+fn the_picker_takes_in_a_subagent_spawning_while_it_is_open() {
+    let workspace = workspace_dir();
+    let (snapshot, _) =
+        parent_with_working_subagents(workspace.path(), &[("Explore", "Map the provider seams")]);
+    let session_id = snapshot.session.id;
+    let revision = snapshot.revision.0;
+    let turn_id = snapshot.turns[0].id;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a working Subagent");
+    press_key(&mut application, KeyCode::Down);
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision + 1),
+                changes: vec![SessionChange::ActivityAdded {
+                    activity: Activity::Subagent {
+                        id: ActivityId::new(),
+                        turn_id,
+                        status: ActivityStatus::Active,
+                        name: "Plan".to_owned(),
+                        description: "Design the picker".to_owned(),
+                        session_id: SessionId::new(),
+                        duration_ms: None,
+                    },
+                }],
+            },
+        )))
+        .expect("spawn a second Subagent over the session stream");
+
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("├ ⠋ Explore: Map the provider seams")
+            && text.contains("└ ⠋ Plan: Design the picker"),
+        "a Subagent spawning while the picker is open joins the tree: {text}"
     );
 }
 

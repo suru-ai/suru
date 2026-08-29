@@ -82,10 +82,9 @@ pub(super) fn command_for_subagent_view_event(event: InputEvent) -> Option<Comma
                 // Down has no composer to serve here, so it carries its one
                 // remaining meaning: browsing the Subagents this Session has
                 // working, which is how a reader walks a subtree level by
-                // level. With nothing to browse the command leaves the view
-                // put, so the key stays as inert as it was.
+                // level.
                 (KeyCode::Down, KeyModifiers::NONE) => {
-                    Some(CommandId::InvokeSemantic(SemanticCommandId::SubagentList))
+                    Some(CommandId::InvokeSemantic(SemanticCommandId::SubagentBrowse))
                 }
                 (KeyCode::PageUp, KeyModifiers::NONE) => Some(CommandId::ScrollTranscriptPageUp),
                 (KeyCode::PageDown, KeyModifiers::NONE) => {

@@ -960,29 +960,49 @@ struct RenderedComposer {
     cursor: Option<Position>,
 }
 
+/// Where a surface docks over the composer: bordered while the rows above the
+/// composer can spare a box, borderless when they are scarce, and centered on
+/// the composer's own columns. The completion list and the Subagent Picker
+/// dock through the one account, so the two surfaces cannot drift apart.
+#[derive(Clone, Copy, Debug)]
+struct ComposerDock {
+    area: Rect,
+    bordered: bool,
+}
+
+impl ComposerDock {
+    /// Docks `desired_rows` of content over the composer, giving up rows from
+    /// the bottom when the frame cannot spare them all.
+    fn over(frame: &Frame<'_>, composer_area: Rect, desired_rows: u16) -> Self {
+        let width = composer_area.width.clamp(1, 72);
+        let room_above = composer_area.y.saturating_sub(frame.area().y);
+        let bordered = room_above >= 3;
+        let height = if bordered {
+            desired_rows.saturating_add(2).min(room_above)
+        } else {
+            desired_rows.min(room_above.max(1))
+        };
+        let x = composer_area
+            .x
+            .saturating_add(composer_area.width.saturating_sub(width) / 2);
+        let y = composer_area.y.saturating_sub(height).max(frame.area().y);
+        Self {
+            area: Rect::new(x, y, width, height),
+            bordered,
+        }
+    }
+}
+
 fn render_composer_completion(
     frame: &mut Frame<'_>,
     state: &TuiState,
     composer_area: Rect,
     theme: &Theme,
 ) {
-    let available_width = composer_area.width;
-    let width = available_width.clamp(1, 72);
-    let room_above = composer_area.y.saturating_sub(frame.area().y);
-    let bordered = room_above >= 3;
     let row_count = state.composer_completion.rows().len() as u16;
-    let height = if bordered {
-        row_count.saturating_add(2).min(room_above)
-    } else {
-        row_count.min(room_above.max(1))
-    };
-    let row_capacity = height.saturating_sub(if bordered { 2 } else { 0 });
-    let x = composer_area
-        .x
-        .saturating_add(composer_area.width.saturating_sub(width) / 2);
-    let y = composer_area.y.saturating_sub(height).max(frame.area().y);
-    let area = Rect::new(x, y, width, height);
-    let content_width = width.saturating_sub(if bordered { 2 } else { 0 });
+    let ComposerDock { area, bordered } = ComposerDock::over(frame, composer_area, row_count);
+    let row_capacity = area.height.saturating_sub(if bordered { 2 } else { 0 });
+    let content_width = area.width.saturating_sub(if bordered { 2 } else { 0 });
     let rows = state
         .composer_completion
         .visible_rows(usize::from(row_capacity))
@@ -1078,30 +1098,18 @@ fn render_subagent_picker(
         return;
     }
     let selected = state.subagent_picker.selected();
-    let width = composer_area.width.clamp(1, 72);
-    let room_above = composer_area.y.saturating_sub(frame.area().y);
-    let bordered = room_above >= 3;
     // One footer line naming the keys, kept only while every entry fits
     // beside it: the rows are what the picker is for.
     let desired_rows = (entries.len() as u16).saturating_add(1);
-    let height = if bordered {
-        desired_rows.saturating_add(2).min(room_above)
-    } else {
-        desired_rows.min(room_above.max(1))
-    };
-    let content_height = usize::from(height.saturating_sub(if bordered { 2 } else { 0 }));
+    let ComposerDock { area, bordered } = ComposerDock::over(frame, composer_area, desired_rows);
+    let content_height = usize::from(area.height.saturating_sub(if bordered { 2 } else { 0 }));
     let shows_footer = content_height > entries.len();
     let row_capacity = content_height
         .saturating_sub(usize::from(shows_footer))
         .max(1);
-    let x = composer_area
-        .x
-        .saturating_add(composer_area.width.saturating_sub(width) / 2);
-    let y = composer_area.y.saturating_sub(height).max(frame.area().y);
-    let area = Rect::new(x, y, width, height);
-    let content_width = width.saturating_sub(if bordered { 2 } else { 0 });
-    let content_x = x.saturating_add(u16::from(bordered));
-    let content_y = y.saturating_add(u16::from(bordered));
+    let content_width = area.width.saturating_sub(if bordered { 2 } else { 0 });
+    let content_x = area.x.saturating_add(u16::from(bordered));
+    let content_y = area.y.saturating_add(u16::from(bordered));
     // The window slides to keep the entry the reader is on in view when the
     // tree outgrows the rows above the composer.
     let selected_index = entries

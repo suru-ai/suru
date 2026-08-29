@@ -44,7 +44,7 @@ pub enum SemanticCommandId {
     SettingsNumericDeleteBackward,
     SettingsNumericApply,
     SettingsNumericCancel,
-    SubagentList,
+    SubagentBrowse,
     SubagentOpen,
     SubagentLeave,
     TranscriptFoldsToggle,
@@ -206,7 +206,7 @@ impl SemanticCommandId {
             Self::SettingsNumericDeleteBackward => "settings.numeric.delete-backward",
             Self::SettingsNumericApply => "settings.numeric.apply",
             Self::SettingsNumericCancel => "settings.numeric.cancel",
-            Self::SubagentList => "subagent.list",
+            Self::SubagentBrowse => "subagent.browse",
             Self::SubagentOpen => "subagent.open",
             Self::SubagentLeave => "subagent.leave",
             Self::TranscriptFoldsToggle => "transcript.folds.toggle",
@@ -625,7 +625,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         keybinding: None,
     },
     SemanticCommandDescriptor {
-        id: SemanticCommandId::SubagentList,
+        id: SemanticCommandId::SubagentBrowse,
         title: "Browse Subagents",
         description: "Open the Subagent Picker over the open Session's working Subagents",
         // The picker opens from the down arrow's one free meaning — Down with

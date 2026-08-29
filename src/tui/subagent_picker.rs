@@ -109,8 +109,9 @@ impl SubagentPicker {
     }
 
     pub(super) fn move_selection(&mut self, working: &[SessionId], distance: isize) {
+        // An open picker always has entries — reconciling closes it over
+        // none — so an empty offering leaves the selection alone.
         if working.is_empty() {
-            self.selected = None;
             return;
         }
         let current = self
