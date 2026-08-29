@@ -113,7 +113,7 @@ async fn safe_skill_invocations_are_readable_after_a_server_restart() {
 
     let mut application = Application::new(workspace.path());
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(restored)))
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(restored)))
         .expect("hydrate restored Skill-bearing Session");
     let mut terminal = Terminal::new(TestBackend::new(80, 15)).expect("create test terminal");
     terminal

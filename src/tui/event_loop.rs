@@ -1159,7 +1159,7 @@ fn spawn_session_attachment(
                 return Err(anyhow!("target Session updated before hydration"));
             };
             Ok::<_, anyhow::Error>(SessionPickerResult::Attached {
-                snapshot: Box::new(snapshot),
+                snapshot,
                 subscription,
             })
         }

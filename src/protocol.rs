@@ -615,8 +615,9 @@ pub enum ReasoningVisibility {
 /// Whether a running Command grows from its one-line row into a live output
 /// tail on its own. `Off` keeps disclosure entirely in the reader's hands;
 /// `AfterMillis` promotes a command that has remained Active for that long.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CommandAutoExpand {
+    #[default]
     Off,
     AfterMillis(u64),
 }
@@ -631,12 +632,6 @@ impl CommandAutoExpand {
             Self::Off => None,
             Self::AfterMillis(milliseconds) => Some(milliseconds),
         }
-    }
-}
-
-impl Default for CommandAutoExpand {
-    fn default() -> Self {
-        Self::Off
     }
 }
 

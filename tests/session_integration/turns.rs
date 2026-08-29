@@ -198,7 +198,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
                 .expect("Session snapshot arrives")
                 .expect("Session stream remains open")
                 .expect("Session snapshot is valid"),
-            SessionEvent::Snapshot(created.clone())
+            SessionEvent::snapshot(created.clone())
         );
     }
 
@@ -1552,7 +1552,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
             .expect("initial snapshot arrives")
             .expect("Session stream remains open")
             .expect("initial snapshot is valid"),
-        SessionEvent::Snapshot(created.clone())
+        SessionEvent::snapshot(created.clone())
     );
 
     provider
@@ -1737,7 +1737,7 @@ async fn turn_timing_spans_the_delivery_commit_and_every_settle_path() {
             .expect("initial snapshot arrives")
             .expect("Session stream remains open")
             .expect("initial snapshot is valid"),
-        SessionEvent::Snapshot(created.clone())
+        SessionEvent::snapshot(created.clone())
     );
 
     let mut provider_session = provider.next_start().await.succeed(AgentIdentity {
@@ -1894,7 +1894,7 @@ async fn a_listed_summary_says_when_its_running_turn_began_and_stops_once_it_set
             .expect("initial snapshot arrives")
             .expect("Session stream remains open")
             .expect("initial snapshot is valid"),
-        SessionEvent::Snapshot(created.clone())
+        SessionEvent::snapshot(created.clone())
     );
 
     let mut provider_session = provider.next_start().await.succeed(AgentIdentity {
@@ -1996,7 +1996,7 @@ async fn turn_liveness_is_announced_on_the_session_catalog_stream() {
             .expect("initial snapshot arrives")
             .expect("Session stream remains open")
             .expect("initial snapshot is valid"),
-        SessionEvent::Snapshot(created.clone())
+        SessionEvent::snapshot(created.clone())
     );
     assert_eq!(
         next_catalog_change(&mut catalog).await,

@@ -762,7 +762,7 @@ impl TuiState {
             ),
         };
         match event {
-            SessionEvent::Snapshot(snapshot) => self.hydrate_session(snapshot),
+            SessionEvent::Snapshot(snapshot) => self.hydrate_session(*snapshot),
             SessionEvent::Updated(update) => {
                 let Some(session) = self.session.as_mut() else {
                     return Err(anyhow!("Session update arrived before its snapshot"));
@@ -789,12 +789,12 @@ impl TuiState {
 
     fn apply_created_session(&mut self, snapshot: SessionSnapshot) -> Result<()> {
         self.session_events_blocked = false;
-        self.apply_session(SessionEvent::Snapshot(snapshot))
+        self.apply_session(SessionEvent::snapshot(snapshot))
     }
 
     fn apply_attached_session(&mut self, snapshot: SessionSnapshot) -> Result<()> {
         self.session_events_blocked = false;
-        self.apply_session(SessionEvent::Snapshot(snapshot))
+        self.apply_session(SessionEvent::snapshot(snapshot))
     }
 
     fn hydrate_session(&mut self, snapshot: SessionSnapshot) {

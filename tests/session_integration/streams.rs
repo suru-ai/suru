@@ -164,7 +164,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
             .expect("Session snapshot arrives")
             .expect("Session stream remains open")
             .expect("Session snapshot is valid"),
-        SessionEvent::Snapshot(settled.clone())
+        SessionEvent::snapshot(settled.clone())
     );
 
     let active_update = server

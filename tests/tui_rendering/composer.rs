@@ -782,7 +782,7 @@ fn history_restoration_resolves_exact_skills_without_opening_completion() {
         options: Vec::new(),
     });
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(snapshot)))
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
         .expect("enter the created Session");
     application
         .handle_event(ApplicationEvent::Command(CommandId::HistoryPrevious))
@@ -870,7 +870,7 @@ fn rejected_admission_restores_the_complete_skill_bearing_draft() {
     );
     snapshot.session.agent_selection = initial.agent_selection;
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(snapshot)))
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
         .expect("enter the created Session");
 
     application
@@ -1196,7 +1196,7 @@ fn text_entered_while_the_first_session_is_created_becomes_its_draft() {
         .expect("move the pending landing draft cursor");
 
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
             failed_session_snapshot(
                 SessionId::new(),
                 request.prompt.id,
@@ -1273,7 +1273,7 @@ fn multiline_history_is_boundary_aware_and_session_drafts_keep_their_cursor() {
         workspace.path(),
     );
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
             second_snapshot,
         )))
         .expect("switch to second Session");
@@ -1284,7 +1284,7 @@ fn multiline_history_is_boundary_aware_and_session_drafts_keep_their_cursor() {
         .expect("type second Session draft");
 
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
             first_snapshot,
         )))
         .expect("switch back to first Session");
@@ -1300,7 +1300,7 @@ fn multiline_history_is_boundary_aware_and_session_drafts_keep_their_cursor() {
     );
 
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
             failed_session_snapshot(
                 second_session,
                 PromptId::new(),

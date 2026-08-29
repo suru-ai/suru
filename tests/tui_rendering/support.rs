@@ -203,7 +203,7 @@ pub fn enter_session(
         workspace,
     );
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
             snapshot.clone(),
         )))
         .expect("enter created Session");

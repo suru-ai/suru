@@ -39,7 +39,7 @@ pub(crate) enum InterruptTarget {
     /// The Session's active Turn. The Provider stops the Turn's background
     /// work — its Subagents included — before the loop, in the established
     /// ordering.
-    Turn(Turn),
+    Turn(Box<Turn>),
     /// No Turn is active, but Subagents below the Session still work; the
     /// interrupt stops them all.
     Subagents,
@@ -344,7 +344,7 @@ impl SessionStore {
             .iter()
             .find(|turn| turn.status == TurnStatus::Active)
         {
-            return Ok(InterruptTarget::Turn(turn.clone()));
+            return Ok(InterruptTarget::Turn(Box::new(turn.clone())));
         }
         if state.subtree_working_since(session_id).is_some() {
             return Ok(InterruptTarget::Subagents);

@@ -90,7 +90,7 @@ async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_clie
             .await
             .expect("first Session event arrives")
             .expect("first Session event is valid"),
-        SessionEvent::Snapshot(settled.clone())
+        SessionEvent::snapshot(settled.clone())
     );
 
     drop(first_subscription);
@@ -113,7 +113,7 @@ async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_clie
             .await
             .expect("reconnected Session event arrives")
             .expect("reconnected Session event is valid"),
-        SessionEvent::Snapshot(settled)
+        SessionEvent::snapshot(settled)
     );
 
     drop(second_subscription);
@@ -184,7 +184,7 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
             .await
             .expect("attached Session event arrives")
             .expect("attached Session event is valid"),
-        SessionEvent::Snapshot(settled)
+        SessionEvent::snapshot(settled)
     );
 
     drop(attachment);
@@ -562,7 +562,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
         .expect("second shared Session snapshot is valid");
     assert_eq!(
         first_projection,
-        SessionEvent::Snapshot(shared_settled.clone())
+        SessionEvent::snapshot(shared_settled.clone())
     );
     assert_eq!(second_projection, first_projection);
 
@@ -576,7 +576,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
             .await
             .expect("isolated Session snapshot arrives")
             .expect("isolated Session snapshot is valid"),
-        SessionEvent::Snapshot(isolated_settled)
+        SessionEvent::snapshot(isolated_settled)
     );
 
     let before_update = first_client
@@ -720,7 +720,7 @@ async fn managed_session_stream_rejects_a_non_monotonic_revision() {
             .await
             .expect("Session snapshot arrives")
             .expect("Session snapshot is valid"),
-        SessionEvent::Snapshot(snapshot)
+        SessionEvent::snapshot(snapshot)
     );
     let error = subscription
         .next()
@@ -765,7 +765,7 @@ async fn managed_session_stream_classifies_body_failures_as_recoverable() {
             .await
             .expect("Session snapshot arrives")
             .expect("Session snapshot is valid"),
-        SessionEvent::Snapshot(snapshot)
+        SessionEvent::snapshot(snapshot)
     );
     let error = subscription
         .next()
@@ -825,7 +825,7 @@ async fn managed_attachment_rehydrates_before_live_deltas_after_same_server_disc
             .await
             .expect("initial Session snapshot arrives")
             .expect("initial Session snapshot is valid"),
-        SessionEvent::Snapshot(initial)
+        SessionEvent::snapshot(initial)
     );
     assert_eq!(
         timeout(Duration::from_secs(1), attachment.next())
@@ -833,7 +833,7 @@ async fn managed_attachment_rehydrates_before_live_deltas_after_same_server_disc
             .expect("attachment reconnects")
             .expect("fresh Session snapshot arrives")
             .expect("fresh Session snapshot is valid"),
-        SessionEvent::Snapshot(current)
+        SessionEvent::snapshot(current)
     );
     assert_eq!(
         attachment

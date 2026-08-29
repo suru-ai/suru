@@ -6221,7 +6221,7 @@ fn the_transcript_keeps_a_row_of_air_above_the_composer() {
     let mut application = connected_application(workspace.path());
     let (session_id, _) = crate::support::enter_session(&mut application, workspace.path());
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
             navigable_session_snapshot(session_id, workspace.path(), 8),
         )))
         .expect("attach a Transcript longer than the viewport");
@@ -6256,7 +6256,7 @@ fn the_transcript_keeps_its_margin_when_a_pending_panel_docks_below_it() {
         skill_invocations: Vec::new(),
     });
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(snapshot)))
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
         .expect("attach a long Transcript with a queued Prompt");
 
     let rows = rendered_application_rows_at(&application, 80, 20);

@@ -2966,7 +2966,7 @@ mod tests {
             ..Application::default()
         };
         application
-            .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+            .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
                 SessionSnapshot {
                     session: Session {
                         id: session_id,
@@ -3025,7 +3025,7 @@ mod tests {
             )))
             .expect("receive Session content width");
         application
-            .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+            .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
                 SessionSnapshot {
                     session: Session {
                         id: session_id,

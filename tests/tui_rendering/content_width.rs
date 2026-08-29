@@ -161,7 +161,7 @@ fn session_with_foldable_command(
         exit_status: Some(0),
     };
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(snapshot)))
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
         .expect("attach a foldable command");
     application
 }
@@ -182,7 +182,7 @@ fn session_with_reflowing_transcript(
         message.content = format!("## Agent section {}\n\n{}", index + 1, "reflow ".repeat(60));
     }
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(snapshot)))
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
         .expect("attach a reflowing Transcript");
     application
 }
@@ -247,7 +247,7 @@ fn session_surfaces_share_the_column_while_the_header_keeps_terminal_width() {
     let session_id = initial.session.id;
     let snapshot = navigable_session_snapshot(session_id, workspace.path(), 10);
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(snapshot)))
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
         .expect("attach a long Transcript");
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(

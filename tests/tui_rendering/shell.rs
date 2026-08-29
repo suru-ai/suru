@@ -224,7 +224,9 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
 
     let mut observer = Application::new(workspace.path());
     observer
-        .handle_event(ApplicationEvent::SessionAttached(authoritative.clone()))
+        .handle_event(ApplicationEvent::SessionAttached(
+            authoritative.as_ref().clone(),
+        ))
         .expect("attach an independent observer to the Session");
     observer
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -237,8 +239,8 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         )))
         .expect("edit the client-local Session draft");
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
-            authoritative.clone(),
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+            authoritative.as_ref().clone(),
         )))
         .expect("rehydrate the Session from a fresh snapshot");
     let with_draft = rendered_application_rows(&application).join("\n");
@@ -306,7 +308,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         .expect("handle replacement connection");
     assert_eq!(replacement_transition, ApplicationTransition::SessionEnded);
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(created)))
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(created)))
         .expect("ignore a queued event from the ended Session");
     let after_replacement = rendered_application_rows(&application).join("\n");
     assert!(after_replacement.contains("What would you like to work on?"));

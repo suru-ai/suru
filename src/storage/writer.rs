@@ -41,7 +41,7 @@ enum WriterCommand {
     /// it therefore cannot ride [`WriterCommand::Update`].
     SummaryChanged(Box<SessionSummary>),
     Update {
-        summary: SessionSummary,
+        summary: Box<SessionSummary>,
         update: SessionUpdate,
         durability: Option<std_mpsc::SyncSender<Result<(), String>>>,
     },
@@ -120,7 +120,7 @@ impl StorageWriter {
                                 "project update for Session {session_id}: {error:#}"
                             ))
                         })?;
-                        state.persisted.summary = summary;
+                        state.persisted.summary = *summary;
                         state.dirty = true;
                         if is_turn_boundary(&update) {
                             let result =
@@ -228,7 +228,7 @@ impl StorageSink {
         };
         self.commands
             .send(WriterCommand::Update {
-                summary,
+                summary: Box::new(summary),
                 update: update.clone(),
                 durability,
             })

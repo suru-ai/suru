@@ -46,7 +46,7 @@ fn new_session_keybinding_defers_creation_until_the_next_prompt() {
         ApplicationTransition::DetachSession
     );
     application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
             old_snapshot.clone(),
         )))
         .expect("ignore a queued event from the detached Session");

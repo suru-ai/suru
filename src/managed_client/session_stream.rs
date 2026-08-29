@@ -68,8 +68,14 @@ impl std::error::Error for SessionStreamError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEvent {
-    Snapshot(SessionSnapshot),
+    Snapshot(Box<SessionSnapshot>),
     Updated(SessionUpdate),
+}
+
+impl SessionEvent {
+    pub fn snapshot(snapshot: SessionSnapshot) -> Self {
+        Self::Snapshot(Box::new(snapshot))
+    }
 }
 
 pub struct SessionSubscription {
@@ -284,7 +290,7 @@ fn decode_event(
             }
             *saw_snapshot = true;
             *last_revision = Some(snapshot.revision);
-            Ok(SessionEvent::Snapshot(snapshot))
+            Ok(SessionEvent::snapshot(snapshot))
         }
         SESSION_UPDATED_EVENT => {
             if !*saw_snapshot {
