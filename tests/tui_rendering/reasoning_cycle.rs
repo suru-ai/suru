@@ -165,20 +165,20 @@ fn reasoning_cycle_advances_provider_order_wrapping_through_the_default() {
     else {
         panic!("the first landing selection should dispatch immediately");
     };
-    assert!(reasoning_summary(&application).contains("Reasoning High"));
+    assert!(reasoning_summary(&application).contains("codex · Cycling GPT · High · Off"));
 
     assert_eq!(
         press_reasoning_cycle(&mut application),
         ApplicationTransition::Continue
     );
-    assert!(reasoning_summary(&application).contains("Reasoning Low"));
+    assert!(reasoning_summary(&application).contains("codex · Cycling GPT · Low · Off"));
 
     // The explicit default participates as an ordinary choice on the wrap.
     assert_eq!(
         press_reasoning_cycle(&mut application),
         ApplicationTransition::Continue
     );
-    assert!(reasoning_summary(&application).contains("Reasoning Medium"));
+    assert!(reasoning_summary(&application).contains("codex · Cycling GPT · Medium · Off"));
 
     let ApplicationTransition::ConfirmLandingAgentSelection(latest) = application
         .handle_event(ApplicationEvent::LandingAgentSelectionConfirmed(high))
@@ -223,7 +223,10 @@ fn reasoning_cycle_reports_unavailable_effort_without_mutation() {
     );
     let rows = reasoning_summary(&single);
     assert!(rows.contains("Cycling GPT has no alternate Reasoning Effort choice"));
-    assert!(!rows.contains("Reasoning Medium"), "no selection is staged");
+    assert!(
+        !rows.contains("codex · Cycling GPT · Medium · Off"),
+        "no selection is staged"
+    );
 
     let mut without = Application::default();
     let mut model = cycling_model(Vec::new(), "medium");
@@ -286,19 +289,19 @@ fn rapid_reasoning_cycles_coalesce_to_one_serialized_latest_selection() {
     };
     assert_eq!(first_session, session_id);
     assert_eq!(first_request.selection, cycling_selection("medium"));
-    assert!(reasoning_summary(&application).contains("Reasoning Medium"));
+    assert!(reasoning_summary(&application).contains("codex · Cycling GPT · Medium · Off"));
 
     // Later presses coalesce while the first request stays in flight.
     assert_eq!(
         press_reasoning_cycle(&mut application),
         ApplicationTransition::Continue
     );
-    assert!(reasoning_summary(&application).contains("Reasoning High"));
+    assert!(reasoning_summary(&application).contains("codex · Cycling GPT · High · Off"));
     assert_eq!(
         press_reasoning_cycle(&mut application),
         ApplicationTransition::Continue
     );
-    assert!(reasoning_summary(&application).contains("Reasoning Low"));
+    assert!(reasoning_summary(&application).contains("codex · Cycling GPT · Low · Off"));
 
     type_terminal_text(&mut application, "must wait");
     assert_eq!(
@@ -332,7 +335,7 @@ fn rapid_reasoning_cycles_coalesce_to_one_serialized_latest_selection() {
     assert_eq!(flushed_session, session_id);
     assert_eq!(flushed_request.selection, cycling_selection("low"));
     assert_ne!(flushed_request.operation_id, first_request.operation_id);
-    assert!(reasoning_summary(&application).contains("Reasoning Low"));
+    assert!(reasoning_summary(&application).contains("codex · Cycling GPT · Low · Off"));
 
     assert_eq!(
         application
@@ -343,7 +346,7 @@ fn rapid_reasoning_cycles_coalesce_to_one_serialized_latest_selection() {
             .expect("settle the coalesced selection"),
         ApplicationTransition::Continue
     );
-    assert!(reasoning_summary(&application).contains("Reasoning Low"));
+    assert!(reasoning_summary(&application).contains("codex · Cycling GPT · Low · Off"));
     assert!(matches!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
@@ -386,7 +389,7 @@ fn stale_selection_results_cannot_overwrite_newer_intent_or_roll_back() {
         press_reasoning_cycle(&mut application),
         ApplicationTransition::Continue
     );
-    assert!(reasoning_summary(&application).contains("Reasoning High"));
+    assert!(reasoning_summary(&application).contains("codex · Cycling GPT · High · Off"));
 
     // Stale settlements for unknown operations change nothing.
     assert_eq!(
@@ -408,7 +411,7 @@ fn stale_selection_results_cannot_overwrite_newer_intent_or_roll_back() {
         ApplicationTransition::Continue
     );
     let unaffected = reasoning_summary(&application);
-    assert!(unaffected.contains("Reasoning High"));
+    assert!(unaffected.contains("codex · Cycling GPT · High · Off"));
     assert!(!unaffected.contains("stale failure"));
 
     // An earlier failure must not roll back the newer queued selection.
@@ -426,7 +429,7 @@ fn stale_selection_results_cannot_overwrite_newer_intent_or_roll_back() {
     };
     assert_eq!(retried_request.selection, cycling_selection("high"));
     let superseded = reasoning_summary(&application);
-    assert!(superseded.contains("Reasoning High"));
+    assert!(superseded.contains("codex · Cycling GPT · High · Off"));
     assert!(!superseded.contains("Effort rejected early"));
 
     // Failing the latest remaining selection reveals the authoritative state.
@@ -503,8 +506,8 @@ fn authoritative_updates_slide_beneath_the_optimistic_overlay_until_settled() {
         )))
         .expect("apply another client's authoritative selection");
     let overlaid = reasoning_summary(&application);
-    assert!(overlaid.contains("Reasoning High"));
-    assert!(!overlaid.contains("Fast On"));
+    assert!(overlaid.contains("codex · Cycling GPT · High · Off"));
+    assert!(!overlaid.contains("codex · Cycling GPT · High · On"));
 
     let ApplicationTransition::UpdateAgentSelection {
         request: flushed_request,
@@ -528,7 +531,7 @@ fn authoritative_updates_slide_beneath_the_optimistic_overlay_until_settled() {
             .expect("settle the coalesced selection"),
         ApplicationTransition::Continue
     );
-    assert!(reasoning_summary(&application).contains("Reasoning High"));
+    assert!(reasoning_summary(&application).contains("codex · Cycling GPT · High · Off"));
 
     // Once local work settles, server acceptance order is authoritative.
     application
@@ -542,7 +545,7 @@ fn authoritative_updates_slide_beneath_the_optimistic_overlay_until_settled() {
             },
         )))
         .expect("apply the first accepted selection");
-    assert!(reasoning_summary(&application).contains("Reasoning Medium"));
+    assert!(reasoning_summary(&application).contains("codex · Cycling GPT · Medium · Off"));
     application
         .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
             SessionUpdate {
@@ -554,5 +557,5 @@ fn authoritative_updates_slide_beneath_the_optimistic_overlay_until_settled() {
             },
         )))
         .expect("apply the last accepted selection");
-    assert!(reasoning_summary(&application).contains("Reasoning High"));
+    assert!(reasoning_summary(&application).contains("codex · Cycling GPT · High · Off"));
 }

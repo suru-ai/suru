@@ -671,7 +671,7 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
     assert!(
         rendered_application_rows(&application)
             .join("\n")
-            .contains("Model New Model")
+            .contains("Codex · New Model · High · On")
     );
     assert!(matches!(
         application
@@ -747,7 +747,10 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
         })
         .expect("reject optimistic selection");
     let rolled_back = rendered_application_rows(&application).join("\n");
-    assert!(rolled_back.contains("Model Old Model"));
+    assert!(
+        rolled_back.contains("Old Model"),
+        "the footer returns to the authoritative selection: {rolled_back}"
+    );
     assert!(rolled_back.contains("Model rejected"));
     assert!(matches!(
         application
@@ -825,11 +828,11 @@ fn landing_model_selection_and_new_session_inherit_complete_agent_selection() {
     assert_eq!(confirmed.model, ModelId::new("gpt-native"));
     assert_eq!(confirmed.options.len(), 1);
     let wide = rendered_application_rows_at(&application, 100, 16).join("\n");
-    assert!(wide.contains("Model GPT Friendly"));
-    assert!(wide.contains("Reasoning High"));
+    assert!(wide.contains("codex · GPT Friendly · High"));
     let compact = rendered_application_rows_at(&application, 43, 10).join("\n");
-    assert!(compact.contains("Model GPT Friendly"));
-    assert!(!compact.contains("Reasoning High"));
+    assert!(compact.contains("GPT Friendly"));
+    assert!(!compact.contains("codex"));
+    assert!(!compact.contains("High"));
 
     type_terminal_text(&mut application, "Create with selection");
     let ApplicationTransition::CreateSession(request) = application

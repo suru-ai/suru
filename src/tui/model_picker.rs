@@ -380,23 +380,29 @@ impl ModelPicker {
         else {
             return if detailed {
                 format!(
-                    "Model {} · Provider {}",
-                    selection.model,
-                    self.provider_display_name(&selection.provider)
+                    "{} · {}",
+                    self.provider_display_name(&selection.provider),
+                    selection.model
                 )
             } else {
-                format!("Model {}", selection.model)
+                selection.model.to_string()
             };
         };
-        let mut parts = vec![format!("Model {}", model.display_name)];
         if !detailed {
-            return parts.pop().expect("Model summary always has one part");
+            return model.display_name.clone();
         }
-        parts.push(format!(
-            "Provider {}",
-            self.provider_display_name(&selection.provider)
-        ));
-        for descriptor in &model.options {
+        let mut parts = vec![
+            self.provider_display_name(&selection.provider).to_owned(),
+            model.display_name.clone(),
+        ];
+        for role in [
+            ModelOptionRole::ReasoningEffort,
+            ModelOptionRole::Context,
+            ModelOptionRole::Speed,
+        ] {
+            let Some(descriptor) = model.options.iter().find(|option| option.role == role) else {
+                continue;
+            };
             let Some(selected) = selection
                 .options
                 .iter()
@@ -404,14 +410,6 @@ impl ModelPicker {
             else {
                 continue;
             };
-            let visible = descriptor.role == ModelOptionRole::ReasoningEffort
-                || matches!(
-                    descriptor.role,
-                    ModelOptionRole::Speed | ModelOptionRole::Context
-                ) && !option_is_default(&descriptor.kind, &selected.value);
-            if !visible {
-                continue;
-            }
             let value = match (&descriptor.kind, &selected.value) {
                 (ModelOptionKind::Select { choices, .. }, ModelOptionValue::Select { choice }) => {
                     choices
@@ -424,7 +422,7 @@ impl ModelPicker {
                 }
                 _ => continue,
             };
-            parts.push(format!("{} {value}", descriptor.label));
+            parts.push(value);
         }
         parts.join(" · ")
     }
@@ -714,16 +712,4 @@ fn is_unavailable(status: &ProviderCatalogStatus) -> bool {
 /// replace one message with another.
 fn is_disabled(status: &ProviderCatalogStatus) -> bool {
     matches!(status, ProviderCatalogStatus::Disabled)
-}
-
-fn option_is_default(kind: &ModelOptionKind, value: &ModelOptionValue) -> bool {
-    match (kind, value) {
-        (ModelOptionKind::Select { default, .. }, ModelOptionValue::Select { choice }) => {
-            choice == default
-        }
-        (ModelOptionKind::Toggle { default }, ModelOptionValue::Toggle { enabled }) => {
-            enabled == default
-        }
-        _ => false,
-    }
 }

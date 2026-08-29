@@ -526,7 +526,7 @@ fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
         ]
     );
     let optimistic = rendered_application_rows_at(&application, 100, 16).join("\n");
-    assert!(optimistic.contains("Reasoning High"));
+    assert!(optimistic.contains("codex · Configurable GPT · High · Off"));
     type_terminal_text(&mut application, "must wait");
     assert_eq!(
         application
@@ -915,13 +915,13 @@ fn context_tier_is_configurable_and_surfaces_once_it_leaves_its_default() {
     assert!(
         rendered_application_rows_at(&application, 140, 16)
             .join("\n")
-            .contains("Context Long context"),
+            .contains("copilot · Tiered Fixture · High · Long context"),
         "a context tier off its default is worth a place in the Agent Selection summary"
     );
 }
 
 #[test]
-fn a_context_tier_left_at_its_default_stays_out_of_the_selection_summary() {
+fn a_context_tier_left_at_its_default_remains_a_present_selection_summary_field() {
     let mut application = landing_on_the_tiered_model();
     let ApplicationTransition::ConfirmLandingAgentSelection(confirmed) = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -938,11 +938,116 @@ fn a_context_tier_left_at_its_default_stays_out_of_the_selection_summary() {
             choice: ModelOptionChoiceId::new("default"),
         },
     }));
-    // Wide enough that an absent Option is absent rather than truncated away.
+    // Wide enough that every present field can be observed rather than truncated away.
     let summary = rendered_application_rows_at(&application, 140, 16).join("\n");
-    assert!(summary.contains("Reasoning effort High"));
     assert!(
-        !summary.contains("Context Default"),
-        "the default tier is the unremarkable case and stays out of the summary"
+        summary.contains("copilot · Tiered Fixture · High · Default"),
+        "a selected default tier is still a present Context field: {summary}"
     );
+}
+
+#[test]
+fn selection_summary_orders_unlabelled_provider_model_and_supported_options() {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open the landing Model picker")
+    else {
+        panic!("the Model picker should request the catalog");
+    };
+    let mut model = model_descriptor(
+        "codex",
+        "gpt-5.6-luna",
+        "GPT-5.6 Luna",
+        true,
+        ModelAvailability::Available,
+    );
+    model.options = vec![
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("fast"),
+            label: "Speed".to_owned(),
+            description: None,
+            role: ModelOptionRole::Speed,
+            kind: ModelOptionKind::Toggle { default: true },
+        },
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("verbosity"),
+            label: "Verbosity".to_owned(),
+            description: None,
+            role: ModelOptionRole::Verbosity,
+            kind: ModelOptionKind::Toggle { default: true },
+        },
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("context_tier"),
+            label: "Context".to_owned(),
+            description: None,
+            role: ModelOptionRole::Context,
+            kind: ModelOptionKind::Select {
+                choices: vec![ModelOptionChoice {
+                    id: ModelOptionChoiceId::new("long_context"),
+                    label: "Long context".to_owned(),
+                    description: None,
+                    availability: ModelAvailability::Available,
+                }],
+                default: ModelOptionChoiceId::new("long_context"),
+            },
+        },
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("reasoning_effort"),
+            label: "Reasoning effort".to_owned(),
+            description: None,
+            role: ModelOptionRole::ReasoningEffort,
+            kind: ModelOptionKind::Select {
+                choices: vec![ModelOptionChoice {
+                    id: ModelOptionChoiceId::new("high"),
+                    label: "High".to_owned(),
+                    description: None,
+                    availability: ModelAvailability::Available,
+                }],
+                default: ModelOptionChoiceId::new("high"),
+            },
+        },
+    ];
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    display_name: "Codex".to_owned(),
+                    models: vec![model],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("load the landing Model");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("select the landing Model");
+    assert!(matches!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::CONTROL,
+            )))
+            .expect("apply the complete Agent Selection"),
+        ApplicationTransition::ConfirmLandingAgentSelection(_)
+    ));
+
+    let screen = rendered_application_rows_at(&application, 140, 16).join("\n");
+    assert!(
+        screen.contains("Codex · GPT-5.6 Luna · High · Long context · On"),
+        "the footer follows Provider, Model, Effort, Context, Speed order: {screen}"
+    );
+    assert!(!screen.contains("Verbosity On"));
+    assert!(!screen.contains("Provider Codex"));
+    assert!(!screen.contains("Model GPT-5.6 Luna"));
+    assert!(!screen.contains("Reasoning effort High"));
+    assert!(!screen.contains("Context Long context"));
+    assert!(!screen.contains("Speed On"));
 }

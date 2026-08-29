@@ -444,8 +444,7 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
         "Keep the draft visible",
         "active",
         "Esc interrupt",
-        "Provider openai",
-        "Model gpt-5",
+        "openai · gpt-5",
         "Enter submit",
     ] {
         assert!(
@@ -468,7 +467,7 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
             "narrow Session frame omitted {core:?}"
         );
     }
-    for secondary in ["Workspace", "Provider", "Model", "Enter submit"] {
+    for secondary in ["Workspace", "openai", "Enter submit"] {
         assert!(
             !narrow.contains(secondary),
             "narrow Session frame retained secondary metadata {secondary:?}"
