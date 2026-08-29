@@ -1178,12 +1178,18 @@ fn project_command_completed(
         ));
     };
     let remaining = match aggregated_output {
-        Some(output) => output
-            .strip_prefix(&command.streamed_output)
-            .ok_or_else(|| {
-                codex_error("Codex completed a command with output that did not match its stream")
-            })?
-            .to_owned(),
+        Some(output) => match output.strip_prefix(&command.streamed_output) {
+            Some(remaining) => remaining.to_owned(),
+            // Codex caps the completed item's aggregate independently of its
+            // live deltas. Once the stream extends that retained prefix, it is
+            // already the fuller account and completion carries only status.
+            None if command.streamed_output.starts_with(&output) => String::new(),
+            None => {
+                return Err(codex_error(
+                    "Codex completed a command with output that did not match its stream",
+                ));
+            }
+        },
         None => String::new(),
     };
     let status = match status {
@@ -1477,7 +1483,9 @@ mod tests {
         ModelOptionValue, ProviderId,
     };
 
-    use crate::provider::{AttributedProviderEvent, ProviderSubagentId, ProviderSubagentStatus};
+    use crate::provider::{
+        AttributedProviderEvent, ProviderCommandStatus, ProviderSubagentId, ProviderSubagentStatus,
+    };
 
     use super::{
         NativeCommandStatus, NativeCorrelation, NativeNotification, NativeSubagentActivityKind,
@@ -1608,6 +1616,40 @@ mod tests {
             Some(ProviderEvent::CommandStarted { command, .. }) => command,
             other => panic!("expected a started command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_capped_final_command_aggregate_settles_the_fuller_live_stream() {
+        let mut correlation = reasoning_turn();
+        project(&mut correlation, command_started("find the answer"));
+        project(
+            &mut correlation,
+            NativeNotification::CommandOutputDelta {
+                thread_id: THREAD.to_owned(),
+                turn_id: TURN.to_owned(),
+                item_id: ITEM.to_owned(),
+                delta: "retained prefix\nstreamed beyond the final cap\n".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            project(
+                &mut correlation,
+                NativeNotification::CommandCompleted {
+                    thread_id: THREAD.to_owned(),
+                    turn_id: TURN.to_owned(),
+                    item_id: ITEM.to_owned(),
+                    aggregated_output: Some("retained prefix\n".to_owned()),
+                    exit_status: Some(0),
+                    status: NativeCommandStatus::Completed,
+                },
+            ),
+            vec![ProviderEvent::CommandCompleted {
+                activity_id: ProviderActivityId::new(ITEM),
+                status: ProviderCommandStatus::Completed,
+                exit_status: Some(0),
+            }]
+        );
     }
 
     #[test]

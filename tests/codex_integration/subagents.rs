@@ -244,6 +244,80 @@ async fn a_collab_spawn_opens_the_row_and_the_child_session_fed_by_the_childs_ow
     opened.server.shutdown().await.expect("shut down server");
 }
 
+/// Codex may stream more command output than it retains in the completed item's
+/// `aggregatedOutput`. The live stream remains the child's visible output; the
+/// capped final value must not tear down the Provider Session that parent and
+/// child share.
+const CAPPED_CHILD_COMMAND_OUTPUT_CODEX: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
+      ;;
+    *'"method":"thread/resume"'*)
+      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"find the answer","cwd":"/fixture/work","status":"inProgress"}}}'
+      printf '%s\n' '{"method":"item/commandExecution/outputDelta","params":{"threadId":"child-thread","turnId":"child-turn","itemId":"child-command","delta":"retained prefix\nstreamed beyond the final cap\n"}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"find the answer","cwd":"/fixture/work","status":"completed","aggregatedOutput":"retained prefix\n","exitCode":0}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed","items":[]}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-completed","kind":"completed","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed","items":[]}}}'
+      ;;
+"#;
+
+#[tokio::test]
+async fn capped_final_command_output_does_not_fail_the_parent_or_subagent() {
+    let fixture = ScriptedCodex::new_multiprocess(CAPPED_CHILD_COMMAND_OUTPUT_CODEX);
+    let opened = opened_session(
+        &fixture,
+        "codex-subagent-capped-command-output",
+        "Delegate a noisy search",
+    )
+    .await;
+    let parent = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(parent.turns[0].status, TurnStatus::Completed);
+    let Activity::Subagent {
+        status,
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&parent)
+    else {
+        unreachable!()
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+
+    let child = settled_session(&opened.client, *child_id, 0).await;
+    assert_eq!(child.turns[0].status, TurnStatus::Completed);
+    let [
+        Activity::Command {
+            status,
+            output,
+            exit_status,
+            ..
+        },
+    ] = child.activities.as_slice()
+    else {
+        panic!(
+            "the child keeps its one streamed command, got {:?}",
+            child.activities
+        );
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(*exit_status, Some(0));
+    assert_eq!(
+        output, "retained prefix\nstreamed beyond the final cap\n",
+        "the live stream remains authoritative when the final aggregate is capped"
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
+}
+
 /// A spawned agent outliving the Turn, on the multi-agent wire shape whose items are
 /// `subAgentActivity`s: the spawn's activity item streams, the parent's Turn completes with the
 /// child still working, and — once released — the child's command settles and the parent thread
