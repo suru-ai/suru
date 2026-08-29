@@ -68,7 +68,7 @@ pub(super) struct PromptStatusSlotContext {
 pub(super) struct PromptContextSlotContext {
     pub(super) session_id: SessionId,
     pub(super) agent: SlotText,
-    pub(super) connection: SlotText,
+    pub(super) usage: Option<SlotText>,
 }
 
 #[derive(Clone, Debug)]
@@ -245,16 +245,15 @@ impl RenderSlots {
         );
         let context = self.prompt_footer_context.compose(
             context,
-            vec![
-                FooterItem {
-                    side: FooterSide::Left,
-                    content: context.agent.clone(),
-                },
-                FooterItem {
-                    side: FooterSide::Right,
-                    content: context.connection.clone(),
-                },
-            ],
+            std::iter::once(FooterItem {
+                side: FooterSide::Left,
+                content: context.agent.clone(),
+            })
+            .chain(context.usage.clone().map(|content| FooterItem {
+                side: FooterSide::Right,
+                content,
+            }))
+            .collect(),
         );
         let mut failures = status.failures;
         failures.extend(context.failures);

@@ -19,6 +19,7 @@ mod spinner;
 mod state;
 mod subagent_picker;
 mod transcript;
+mod usage;
 
 pub use commands::{NumericDigit, SemanticCommandId};
 pub use completion::CompletionMode;

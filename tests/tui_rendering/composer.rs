@@ -1,9 +1,10 @@
 //! Composer input: cursor placement, growth, editing bindings, and history.
 
 use crate::support::{
-    WorkspaceDir, buffer_rows, enter_session, failed_session_snapshot, rendered_application_buffer,
-    rendered_application_cursor_at, rendered_application_rows, rendered_application_rows_at,
-    text_position, type_terminal_text, workspace_dir,
+    WorkspaceDir, buffer_rows, connected_application, enter_active_session, enter_session,
+    failed_session_snapshot, rendered_application_buffer, rendered_application_cursor_at,
+    rendered_application_rows, rendered_application_rows_at, text_position, type_terminal_text,
+    workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
@@ -11,9 +12,10 @@ use ratatui::style::Color;
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
-        AgentSelection, ModelId, PromptId, ProviderId, SessionId, SkillCatalog,
-        SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor,
-        SkillId, SkillPromptDelivery, Workspace,
+        AgentSelection, Cost, CostBasis, ModelId, PromptId, ProviderId, SessionChange, SessionId,
+        SessionRevision, SessionUpdate, SkillCatalog, SkillCatalogCapabilities,
+        SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery,
+        Turn, TurnId, TurnStatus, Usage, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, command_for_terminal_event,
@@ -22,6 +24,110 @@ use suru::{
 use uuid::Uuid;
 
 use crate::support::ready_health;
+
+#[test]
+fn session_composer_footer_sums_persisted_usage_across_all_turn_outcomes() {
+    let workspace = workspace_dir();
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Measure the whole Session",
+        workspace.path(),
+    );
+    snapshot.turns[0].usage = Some(Usage {
+        fresh_input_tokens: Some(10_000),
+        cache_read_tokens: Some(100_000),
+        output_tokens: Some(5_000),
+        reasoning_tokens: Some(3_000),
+        ..Usage::default()
+    });
+    snapshot.turns[0].cost = Cost::from_usd(0.31);
+    snapshot.turns[0].cost_basis = Some(CostBasis::Reported);
+    snapshot.turns.push(Turn {
+        id: TurnId::new(),
+        prompt_id: Some(snapshot.prompts[0].id),
+        agent: None,
+        status: TurnStatus::Interrupted,
+        started_at: None,
+        settled_at: None,
+        usage: Some(Usage {
+            fresh_input_tokens: Some(10_000),
+            cache_write_tokens: Some(50_000),
+            output_tokens: Some(8_000),
+            reasoning_tokens: Some(2_000),
+            ..Usage::default()
+        }),
+        cost: Cost::from_usd(0.52),
+        cost_basis: Some(CostBasis::Reported),
+    });
+
+    let mut current_client = connected_application(workspace.path());
+    current_client
+        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .expect("open the measured Session");
+    let current_screen = rendered_application_rows(&current_client).join("\n");
+    let mut reloaded_client = Application::new(workspace.path());
+    reloaded_client
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("restore the persisted Session in a fresh client");
+    let reloaded_screen = rendered_application_rows(&reloaded_client).join("\n");
+
+    for (client, screen) in [
+        ("current", current_screen.as_str()),
+        ("reloaded", reloaded_screen.as_str()),
+    ] {
+        assert!(
+            screen.contains("38K · $0.83"),
+            "the {client} client totals failed and interrupted Turns from the snapshot: {screen}"
+        );
+        assert!(
+            !screen.contains("188K"),
+            "cache traffic is excluded from the blended total: {screen}"
+        );
+    }
+}
+
+#[test]
+fn session_composer_footer_updates_with_active_turn_usage_and_hides_unknown_cost() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path());
+    let (session_id, snapshot, turn_id) = enter_active_session(&mut application, workspace.path());
+    let without_usage = rendered_application_rows(&application).join("\n");
+    assert!(!without_usage.contains("tokens"));
+    assert!(!without_usage.contains('$'));
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(snapshot.revision.0 + 1),
+                changes: vec![SessionChange::TurnUsageChanged {
+                    turn_id,
+                    usage: Usage {
+                        fresh_input_tokens: Some(1_200),
+                        cache_read_tokens: Some(8_000),
+                        output_tokens: Some(900),
+                        reasoning_tokens: Some(2_100),
+                        ..Usage::default()
+                    },
+                    cost: None,
+                    cost_basis: None,
+                }],
+            },
+        )))
+        .expect("record active Turn Usage");
+
+    let updated = rendered_application_rows(&application).join("\n");
+    assert!(
+        updated.contains("4.2K"),
+        "the footer updates from the shared Session projection: {updated}"
+    );
+    assert!(!updated.contains("12.2K"));
+    assert!(
+        !updated.contains("$0.00"),
+        "unknown Cost is absent rather than fabricated as zero: {updated}"
+    );
+}
 
 #[test]
 fn composer_cursor_tracks_empty_unicode_and_multiline_input() {

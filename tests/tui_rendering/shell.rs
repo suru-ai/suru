@@ -480,7 +480,10 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
     assert!(short.contains("Working"));
     assert!(short.contains("Keep the draft visible"));
     assert!(short.contains("active"));
-    assert!(short.contains("Connected"));
+    assert!(
+        !short.contains("Connected"),
+        "connection status belongs to the hidden Session header, not the composer footer: {short}"
+    );
 
     let mut idle = Application::new(workspace.path());
     let mut idle_snapshot = active_snapshot;

@@ -45,6 +45,7 @@ use super::{
     state::{CommandId, CommandMode, QueuedPrompt, TranscriptViewport, TuiState},
     subagent_picker::working_subagents,
     transcript::TranscriptDisclosure,
+    usage::{compact_cost, compact_count},
 };
 
 const NARROW_TERMINAL_WIDTH: u16 = 44;
@@ -1986,6 +1987,7 @@ fn render_session(
             activity_style,
         )
     };
+    let usage = session_usage_text(snapshot).map(|text| SlotText::new(text, theme.text.subdued));
     let footer = slots.prompt_footer(
         &PromptFooterSlotContext {
             session_id,
@@ -1998,10 +2000,7 @@ fn render_session(
         &PromptContextSlotContext {
             session_id,
             agent: SlotText::new(agent, agent_style),
-            connection: SlotText::new(
-                connection_status_text(state, ResponsiveDetail::CoreOnly),
-                status_style(state, theme),
-            ),
+            usage,
         },
     );
     let queued_prompts = state.queued_prompts(session_id);
@@ -2232,6 +2231,28 @@ fn render_session(
         area: composer_area,
         cursor,
     }
+}
+
+fn session_usage_text(snapshot: &SessionSnapshot) -> Option<String> {
+    let blended_tokens = snapshot
+        .turns
+        .iter()
+        .filter_map(|turn| turn.usage.as_ref()?.blended_tokens())
+        .reduce(u64::saturating_add)?;
+    let cost = snapshot
+        .turns
+        .iter()
+        .filter_map(|turn| turn.cost)
+        .try_fold(crate::protocol::Cost::from_nano_usd(0), |total, cost| {
+            total.checked_add(cost)
+        })
+        .filter(|cost| !cost.is_zero());
+    let mut text = compact_count(blended_tokens);
+    if let Some(cost) = cost {
+        text.push_str(" · ");
+        text.push_str(&compact_cost(cost));
+    }
+    Some(text)
 }
 
 fn render_session_header(
