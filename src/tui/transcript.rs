@@ -1556,6 +1556,9 @@ fn plan_units<'a>(
         if folding.hides(position) {
             continue;
         }
+        let Some(entry) = content.entry(item) else {
+            continue;
+        };
         let disclosed = folding.discloses(position);
         // A run never crosses a fold boundary: an Activity inside the
         // disclosure and one outside it sit in different gutters, so they
@@ -1563,12 +1566,12 @@ fn plan_units<'a>(
         if run.as_ref().is_some_and(|open| open.disclosed != disclosed) {
             close_run(&mut units, &mut run, groups);
         }
-        match content.entry(item) {
-            Some(TranscriptEntry::Message(message)) => {
+        match entry {
+            TranscriptEntry::Message(message) => {
                 close_run(&mut units, &mut run, groups);
                 units.push(in_turn_gutter(RenderUnit::Message(message), disclosed));
             }
-            Some(TranscriptEntry::Activity(activity)) => match GroupableKind::joined_by(activity) {
+            TranscriptEntry::Activity(activity) => match GroupableKind::joined_by(activity) {
                 Some(kind) => {
                     if run.as_ref().is_some_and(|open| open.kind != kind) {
                         close_run(&mut units, &mut run, groups);
@@ -1586,7 +1589,6 @@ fn plan_units<'a>(
                     units.push(in_turn_gutter(RenderUnit::Activity(activity), disclosed));
                 }
             },
-            None => {}
         }
     }
     close_run(&mut units, &mut run, groups);

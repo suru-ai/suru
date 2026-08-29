@@ -4020,6 +4020,72 @@ fn hidden_reasoning_neither_breaks_a_command_run_nor_leaves_a_gap() {
 }
 
 #[test]
+fn interrupting_a_turn_does_not_split_a_command_group_at_hidden_reasoning() {
+    let workspace = workspace_dir();
+    let session_id = SessionId::new();
+    let snapshot = command_run_snapshot(
+        session_id,
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Run the workflow"),
+            SUCCESSFUL_COMMAND,
+            RunEntry::Reasoning(ReasoningBlock::thought(
+                "Checking the result",
+                "The second command can run.",
+                4_000,
+            )),
+            SUCCESSFUL_COMMAND,
+        ],
+    );
+    let interrupted_turn = snapshot.turns[0].id;
+    let revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a live Turn whose command run crosses hidden Reasoning");
+
+    let live = rendered_application_rows_at(&application, 80, 24).join("\n");
+    assert!(
+        live.contains("✓ Ran 2 commands"),
+        "the live Turn starts with its command Group intact: {live}"
+    );
+
+    for _ in 0..2 {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .expect("request and confirm the interrupt");
+    }
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![SessionChange::TurnStatusChanged {
+                    turn_id: interrupted_turn,
+                    status: TurnStatus::Interrupted,
+                    settled_at: None,
+                }],
+            },
+        )))
+        .expect("settle the interrupted Turn");
+
+    let interrupted = rendered_application_rows_at(&application, 80, 24).join("\n");
+    assert!(
+        interrupted.contains("✓ Ran 2 commands"),
+        "opening the interrupted Turn preserves the command Group: {interrupted}"
+    );
+    for member in ["command 1", "command 2"] {
+        assert!(
+            !interrupted.contains(member),
+            "the collapsed Group still hides {member:?}: {interrupted}"
+        );
+    }
+}
+
+#[test]
 fn an_active_command_grows_beneath_the_existing_group_while_the_turn_runs() {
     let workspace = workspace_dir();
     let mut snapshot = live_command_run_snapshot(SessionId::new(), workspace.path());

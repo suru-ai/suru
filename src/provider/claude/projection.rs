@@ -476,7 +476,11 @@ impl ClaudeProjection {
                         }
                     }
                     "thinking" => {
-                        if block.thinking.as_deref().is_some_and(|text| !text.is_empty()) {
+                        if block
+                            .thinking
+                            .as_deref()
+                            .is_some_and(|text| !text.is_empty())
+                        {
                             self.open_thinking(
                                 &mut conversation,
                                 index,
