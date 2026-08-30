@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 28;
+pub const PROTOCOL_VERSION: u32 = 29;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
@@ -1069,11 +1069,23 @@ pub struct Peer {
     pub fingerprint: String,
 }
 
-/// Proof that a Remote accepted a fresh key-authenticated connection.
+/// Whether a Remote can serve this Server's protocol. Kept on the successful
+/// status response so a Client can present incompatibility without treating
+/// the local Server request itself as failed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteStatus {
+    Available,
+    ProtocolMismatch,
+}
+
+/// Proof that a Remote accepted a fresh key-authenticated connection, together
+/// with whether its protocol can be used by this Server.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteHealth {
     pub protocol_version: u32,
+    pub status: RemoteStatus,
 }
 
 impl Default for ServingSettings {

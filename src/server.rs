@@ -433,11 +433,6 @@ pub async fn spawn_with_providers_and_timings(
     protect_current_user_file(&config.lock_path())?;
 
     let config_documents = ConfigDocuments::new(config.config_dir());
-    let serving = ServingController::new(
-        config.data_dir(),
-        timings.invite_ttl,
-        timings.pairing_protocol_version,
-    )?;
     let (settings, _) = watch::channel(SettingsSnapshot::default());
     let opening_settings = config_documents.load();
 
@@ -468,6 +463,13 @@ pub async fn spawn_with_providers_and_timings(
         },
     );
     write_descriptor(&config.descriptor_path(), &descriptor)?;
+    let serving = ServingController::new(
+        config.data_dir(),
+        timings.invite_ttl,
+        timings.pairing_protocol_version,
+        descriptor.base_url.clone(),
+        descriptor.token.clone(),
+    )?;
 
     // After all fallible local-server setup, so an error returning from spawn
     // can never leave a detached Serving listener behind; still before any
@@ -537,6 +539,10 @@ pub async fn spawn_with_providers_and_timings(
         .route("/v1/pairing/invites", post(issue_invite))
         .route("/v1/pairing/remotes", get(list_remotes).post(redeem_invite))
         .route("/v1/pairing/remotes/{name}/health", post(probe_remote))
+        .route(
+            "/v1/remotes/{name}/{*path}",
+            axum::routing::any(proxy_remote),
+        )
         .route("/v1/pairing/peers", get(list_peers))
         .route(
             "/v1/pairing/peers/{peer_id}",
@@ -886,6 +892,34 @@ async fn probe_remote(
     }
     match state.serving.probe_remote(&name).await {
         Ok(health) => Json(health).into_response(),
+        Err(error) => pairing_error_response(error),
+    }
+}
+
+async fn proxy_remote(
+    State(state): State<AppState>,
+    AxumPath((name, path)): AxumPath<(String, String)>,
+    mut request: Request,
+) -> Response {
+    if !is_authenticated(request.headers(), &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let query = request
+        .uri()
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    let remote_path = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    };
+    let Ok(uri) = format!("{remote_path}{query}").parse() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    *request.uri_mut() = uri;
+    match state.serving.proxy_remote(&name, request).await {
+        Ok(response) => response,
         Err(error) => pairing_error_response(error),
     }
 }

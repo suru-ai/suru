@@ -10,9 +10,11 @@ use suru::{
     logging::{self, Role},
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, stop_server},
     protocol::{
-        Health, IssueInviteRequest, LifecycleState, PROTOCOL_VERSION, RedeemInviteRequest,
-        SERVER_SHUTDOWN_EVENT, ServerIdentity, ServerShutdown, SessionError, SessionErrorCode,
-        SettingMutation, ShutdownReason,
+        AdmitPromptRequest, CreateSessionRequest, Health, InitialPrompt, IssueInviteRequest,
+        LifecycleState, PROTOCOL_VERSION, PromptDelivery, PromptId, RedeemInviteRequest,
+        RemoteStatus, SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
+        ServerIdentity, ServerShutdown, SessionError, SessionErrorCode, SessionSnapshot,
+        SessionUpdate, SettingMutation, ShutdownReason, Workspace,
     },
     server::{self, ServerConfig, ServerTimings},
 };
@@ -772,6 +774,424 @@ async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
     drop(serving_client);
     connecting.shutdown().await.expect("stop connecting Server");
     serving.shutdown().await.expect("stop Serving Server");
+}
+
+struct PairedServers {
+    _serving_state: tempfile::TempDir,
+    _serving_config_root: tempfile::TempDir,
+    _connecting_state: tempfile::TempDir,
+    serving: server::RunningServer,
+    connecting: server::RunningServer,
+    serving_client: ManagedClient,
+    connecting_client: ManagedClient,
+}
+
+impl PairedServers {
+    async fn shutdown(self) {
+        drop(self.connecting_client);
+        drop(self.serving_client);
+        self.connecting
+            .shutdown()
+            .await
+            .expect("stop connecting Server");
+        self.serving.shutdown().await.expect("stop Serving Server");
+    }
+}
+
+async fn paired_servers(name: &str) -> PairedServers {
+    let serving_state = tempfile::tempdir().expect("create Serving state directory");
+    let serving_config_root = tempfile::tempdir().expect("create Serving config directory");
+    let serving_channel = format!("{name}-serving");
+    let serving = server::spawn_with_timings(
+        ServerConfig::new(serving_state.path(), &serving_channel)
+            .expect("configure Serving Server")
+            .with_config_dir(serving_config_root.path()),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .expect("spawn Serving Server");
+    let mut serving_client = ManagedClient::connect(
+        ManagedClientConfig::new(serving_state.path(), &serving_channel)
+            .expect("configure Serving Client"),
+    )
+    .await
+    .expect("attach Serving Client");
+    receive_initial_state(&mut serving_client).await;
+    serving_client
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
+        .await
+        .expect("ask the operating system for a Serving port");
+    serving_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .expect("turn Serving on");
+    let serving_address = serving
+        .serving_address()
+        .expect("Serving listener is ready");
+
+    let connecting_state = tempfile::tempdir().expect("create connecting state directory");
+    let connecting_channel = format!("{name}-connecting");
+    let connecting = server::spawn_with_timings(
+        ServerConfig::new(connecting_state.path(), &connecting_channel)
+            .expect("configure connecting Server"),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .expect("spawn connecting Server");
+    let mut connecting_client = ManagedClient::connect(
+        ManagedClientConfig::new(connecting_state.path(), &connecting_channel)
+            .expect("configure connecting Client"),
+    )
+    .await
+    .expect("attach connecting Client");
+    receive_initial_state(&mut connecting_client).await;
+    let invite = serving_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![serving_address],
+        })
+        .await
+        .expect("issue Invite");
+    connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: invite.invite,
+            name: Some("workstation".to_owned()),
+            addresses: Vec::new(),
+        })
+        .await
+        .expect("form Pairing");
+
+    PairedServers {
+        _serving_state: serving_state,
+        _serving_config_root: serving_config_root,
+        _connecting_state: connecting_state,
+        serving,
+        connecting,
+        serving_client,
+        connecting_client,
+    }
+}
+
+#[tokio::test]
+async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_server() {
+    let pair = paired_servers("remote-proxy").await;
+
+    let workspace = tempfile::tempdir().expect("create Serving Workspace");
+    let descriptor = pair.connecting.descriptor();
+    let http = reqwest::Client::new();
+    let remote_api = format!("{}/v1/remotes/workstation", descriptor.base_url);
+    let remote_health = http
+        .get(format!("{remote_api}/health"))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("read the Remote's full health API through the local proxy")
+        .error_for_status()
+        .expect("Remote health succeeds")
+        .json::<Health>()
+        .await
+        .expect("decode the Remote's ordinary health response");
+    assert_eq!(
+        remote_health.instance_id,
+        pair.serving.descriptor().instance_id
+    );
+    let created = http
+        .post(format!("{remote_api}/v1/sessions"))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Map the Remote workspace".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Remote Session through local proxy")
+        .error_for_status()
+        .expect("Remote Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode Remote Session");
+    assert!(
+        pair.connecting_client
+            .list_sessions(None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the connecting Server must not create the proxied Session locally"
+    );
+    assert_eq!(
+        pair.serving_client.list_sessions(None).await.unwrap()[0].id(),
+        created.session.id
+    );
+
+    let response = http
+        .get(format!(
+            "{remote_api}/v1/sessions/{}/events",
+            created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("open Remote Session stream through local proxy")
+        .error_for_status()
+        .expect("Remote Session stream succeeds");
+    let mut events = response.bytes_stream().eventsource();
+    let snapshot = timeout(Duration::from_secs(1), events.next())
+        .await
+        .expect("Remote Session snapshot arrives")
+        .expect("Remote Session stream remains open")
+        .expect("decode Remote Session snapshot event");
+    assert_eq!(snapshot.event, SESSION_SNAPSHOT_EVENT);
+    assert_eq!(
+        serde_json::from_str::<SessionSnapshot>(&snapshot.data)
+            .expect("decode streamed Remote Session")
+            .session
+            .id,
+        created.session.id
+    );
+
+    let admitted = http
+        .post(format!(
+            "{remote_api}/v1/sessions/{}/prompts",
+            created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&AdmitPromptRequest {
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Continue on the Remote".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+            delivery: PromptDelivery::Queue,
+        })
+        .send()
+        .await
+        .expect("admit Remote Prompt through local proxy")
+        .error_for_status()
+        .expect("Remote Prompt admission succeeds")
+        .json::<suru::protocol::Prompt>()
+        .await
+        .expect("decode admitted Remote Prompt");
+    let update = timeout(Duration::from_secs(1), async {
+        loop {
+            let event = events
+                .next()
+                .await
+                .expect("Remote Session stream remains open")
+                .expect("decode Remote Session update");
+            if event.event == SESSION_UPDATED_EVENT {
+                let update = serde_json::from_str::<SessionUpdate>(&event.data)
+                    .expect("decode Remote Session update body");
+                if update.changes.iter().any(|change| {
+                    matches!(
+                        change,
+                        suru::protocol::SessionChange::PromptAdded { prompt }
+                            if prompt.id == admitted.id
+                    )
+                }) {
+                    break update;
+                }
+            }
+        }
+    })
+    .await
+    .expect("admitted Remote Prompt reaches the proxied SSE stream");
+    assert!(update.revision > created.revision);
+
+    drop(events);
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_proxy_refuses_server_administration_routes_to_peers() {
+    let pair = paired_servers("remote-admin").await;
+
+    let descriptor = pair.connecting.descriptor();
+    let remote_api = format!("{}/v1/remotes/workstation", descriptor.base_url);
+    let http = reqwest::Client::new();
+    let settings = http
+        .post(format!("{remote_api}/v1/settings"))
+        .bearer_auth(&descriptor.token)
+        .json(&SettingMutation::ServingEnabled { value: Some(false) })
+        .send()
+        .await
+        .expect("attempt Remote Settings mutation");
+    assert_eq!(settings.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let stop = http
+        .post(format!("{remote_api}/v1/server/stop"))
+        .bearer_auth(&descriptor.token)
+        .json(&ServerShutdown {
+            instance_id: pair.serving.descriptor().instance_id,
+            reason: ShutdownReason::Manual,
+        })
+        .send()
+        .await
+        .expect("attempt Remote Server stop");
+    assert_eq!(stop.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let peers = http
+        .get(format!("{remote_api}/v1/pairing/peers"))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("attempt Remote Peer listing");
+    assert_eq!(peers.status(), reqwest::StatusCode::FORBIDDEN);
+    let peer_id = &pair.serving_client.list_peers().await.unwrap()[0].id;
+    let removal = http
+        .delete(format!("{remote_api}/v1/pairing/peers/{peer_id}"))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("attempt Remote Peer removal");
+    assert_eq!(removal.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(
+        pair.serving_client
+            .probe_remote("missing")
+            .await
+            .expect_err("the Serving Server has no Remotes")
+            .downcast_ref::<SessionError>()
+            .expect("the local API error remains typed")
+            .code,
+        SessionErrorCode::RemoteNotFound,
+        "the refused stop must leave the Serving Server running"
+    );
+
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use() {
+    let reserved = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("reserve a stable Serving port");
+    let serving_port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let serving_state = tempfile::tempdir().expect("create Serving state directory");
+    let serving_data = tempfile::tempdir().expect("create Serving data directory");
+    let serving_config_root = tempfile::tempdir().expect("create Serving config directory");
+    let serving_config = ServerConfig::new(serving_state.path(), "remote-version-serving")
+        .expect("configure Serving Server")
+        .with_data_dir(serving_data.path())
+        .with_config_dir(serving_config_root.path());
+    let timings = ServerTimings {
+        shutdown_grace: Duration::from_millis(5),
+        ..ServerTimings::default()
+    };
+    let serving = server::spawn_with_timings(serving_config.clone(), timings)
+        .await
+        .expect("spawn Serving Server");
+    let mut serving_client = ManagedClient::connect(
+        ManagedClientConfig::new(serving_state.path(), "remote-version-serving")
+            .expect("configure Serving Client"),
+    )
+    .await
+    .expect("attach Serving Client");
+    receive_initial_state(&mut serving_client).await;
+    serving_client
+        .mutate_setting(SettingMutation::ServingPort {
+            value: Some(serving_port),
+        })
+        .await
+        .expect("pin the Serving port");
+    serving_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .expect("turn Serving on");
+    let serving_address = serving
+        .serving_address()
+        .expect("Serving listener is ready");
+
+    let connecting_state = tempfile::tempdir().expect("create connecting state directory");
+    let connecting = server::spawn_with_timings(
+        ServerConfig::new(connecting_state.path(), "remote-version-connecting")
+            .expect("configure connecting Server"),
+        timings,
+    )
+    .await
+    .expect("spawn connecting Server");
+    let mut connecting_client = ManagedClient::connect(
+        ManagedClientConfig::new(connecting_state.path(), "remote-version-connecting")
+            .expect("configure connecting Client"),
+    )
+    .await
+    .expect("attach connecting Client");
+    receive_initial_state(&mut connecting_client).await;
+    let invite = serving_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![serving_address],
+        })
+        .await
+        .expect("issue Invite");
+    connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: invite.invite,
+            name: Some("workstation".to_owned()),
+            addresses: Vec::new(),
+        })
+        .await
+        .expect("form Pairing");
+
+    drop(serving_client);
+    serving
+        .shutdown()
+        .await
+        .expect("stop original Serving Server");
+    let incompatible = server::spawn_with_timings(
+        serving_config,
+        ServerTimings {
+            pairing_protocol_version: PROTOCOL_VERSION + 1,
+            ..timings
+        },
+    )
+    .await
+    .expect("restart Serving Server with a newer Pairing protocol");
+
+    let status = connecting_client
+        .probe_remote("workstation")
+        .await
+        .expect("read mismatched Remote status");
+    assert_eq!(status.protocol_version, PROTOCOL_VERSION + 1);
+    assert_eq!(status.status, RemoteStatus::ProtocolMismatch);
+
+    let descriptor = connecting.descriptor();
+    let http = reqwest::Client::new();
+    let refused = http
+        .get(format!(
+            "{}/v1/remotes/workstation/v1/sessions",
+            descriptor.base_url
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("attempt to use mismatched Remote API");
+    assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        refused
+            .json::<SessionError>()
+            .await
+            .expect("decode mismatch refusal")
+            .code,
+        SessionErrorCode::PairingProtocolMismatch
+    );
+
+    drop(connecting_client);
+    connecting.shutdown().await.expect("stop connecting Server");
+    incompatible
+        .shutdown()
+        .await
+        .expect("stop incompatible Server");
 }
 
 #[tokio::test]

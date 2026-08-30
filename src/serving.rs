@@ -21,8 +21,9 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{ConnectInfo, State},
-    http::StatusCode,
+    http::{HeaderMap, Method, Request, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
     serve::{IncomingStream, Listener},
@@ -58,7 +59,7 @@ use uuid::Uuid;
 use crate::{
     protocol::{
         IssueInviteRequest, IssuedInvite, Peer, RedeemInviteRequest, Remote, RemoteHealth,
-        ServingSettings, SessionError, SessionErrorCode,
+        RemoteStatus, ServingSettings, SessionError, SessionErrorCode,
     },
     runtime::protect_current_user_file,
 };
@@ -70,6 +71,7 @@ const REMOTES_FILE: &str = "remotes.json";
 #[derive(Clone)]
 pub(crate) struct ServingController {
     data_dir: PathBuf,
+    local_api: LocalApi,
     active: Arc<Mutex<Option<ActiveServing>>>,
     address: watch::Sender<Option<SocketAddr>>,
     invite_ttl: tokio::time::Duration,
@@ -79,6 +81,13 @@ pub(crate) struct ServingController {
     peers: Arc<RwLock<Vec<StoredPeer>>>,
     remotes: Arc<RwLock<Vec<StoredRemote>>>,
     revocations: Arc<RwLock<HashMap<String, Arc<PeerRevocation>>>>,
+}
+
+#[derive(Clone)]
+struct LocalApi {
+    base_url: String,
+    token: String,
+    http: reqwest::Client,
 }
 
 struct ActiveServing {
@@ -225,6 +234,8 @@ impl ServingController {
         data_dir: &Path,
         invite_ttl: tokio::time::Duration,
         protocol_version: u32,
+        local_base_url: String,
+        local_token: String,
     ) -> Result<Self> {
         let (address, _) = watch::channel(None);
         let peers: Vec<StoredPeer> = read_records(&data_dir.join(PEERS_FILE))?;
@@ -234,6 +245,11 @@ impl ServingController {
             .collect();
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
+            local_api: LocalApi {
+                base_url: local_base_url,
+                token: local_token,
+                http: reqwest::Client::new(),
+            },
             active: Arc::new(Mutex::new(None)),
             address,
             invite_ttl,
@@ -385,17 +401,23 @@ impl ServingController {
         for address in &remote.remote.addresses {
             let response = client
                 .http
-                .get(format!("https://{address}/health"))
+                .get(format!("https://{address}/v1/pairing/health"))
                 .send()
                 .await;
             match response {
                 Ok(response) if response.status().is_success() => {
-                    return response.json().await.map_err(|_| {
+                    let mut health = response.json::<RemoteHealth>().await.map_err(|_| {
                         PairingFailure::new(
                             SessionErrorCode::PairingConnectionFailed,
                             "Remote returned an invalid health response",
                         )
-                    });
+                    })?;
+                    health.status = if health.protocol_version == self.protocol_version {
+                        RemoteStatus::Available
+                    } else {
+                        RemoteStatus::ProtocolMismatch
+                    };
+                    return Ok(health);
                 }
                 Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
                     return Err(PairingFailure::new(
@@ -416,6 +438,19 @@ impl ServingController {
             SessionErrorCode::PairingConnectionFailed,
             "could not reach Remote at any paired address",
         ))
+    }
+
+    pub(crate) async fn proxy_remote(
+        &self,
+        name: &str,
+        request: Request<Body>,
+    ) -> std::result::Result<Response, PairingFailure> {
+        let remote = self.stored_remote(name)?;
+        let identity = self.identity().map_err(internal_pairing_failure)?;
+        let client = paired_http_client(&remote.public_key, &identity, None)
+            .map_err(internal_pairing_failure)?;
+        let address = self.compatible_address(&remote, &client).await?;
+        forward_request(&client.http, format!("https://{address}"), None, request).await
     }
 
     pub(crate) fn remove_peer(&self, id: &str) -> std::result::Result<(), PairingFailure> {
@@ -546,6 +581,54 @@ impl ServingController {
             return Err(remote_name_conflict(name));
         }
         Ok(())
+    }
+
+    fn stored_remote(&self, name: &str) -> std::result::Result<StoredRemote, PairingFailure> {
+        self.remotes
+            .read()
+            .expect("Remote record lock is not poisoned")
+            .iter()
+            .find(|stored| stored.remote.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                PairingFailure::new(SessionErrorCode::RemoteNotFound, "Remote not found")
+            })
+    }
+
+    async fn compatible_address(
+        &self,
+        remote: &StoredRemote,
+        client: &PairingHttpClient,
+    ) -> std::result::Result<SocketAddr, PairingFailure> {
+        for address in &remote.remote.addresses {
+            let response = client
+                .http
+                .get(format!("https://{address}/v1/pairing/health"))
+                .send()
+                .await;
+            if let Ok(response) = response
+                && response.status().is_success()
+                && let Ok(health) = response.json::<RemoteHealth>().await
+            {
+                if health.protocol_version != self.protocol_version {
+                    return Err(protocol_mismatch(
+                        self.protocol_version,
+                        health.protocol_version,
+                    ));
+                }
+                return Ok(*address);
+            }
+        }
+        if client.server_key_rejected.load(Ordering::Acquire) {
+            return Err(PairingFailure::new(
+                SessionErrorCode::PairingAuthenticationFailed,
+                "Remote presented a key other than its pinned key",
+            ));
+        }
+        Err(PairingFailure::new(
+            SessionErrorCode::PairingConnectionFailed,
+            "could not reach Remote at any paired address",
+        ))
     }
 
     fn is_enrolled_peer(&self, public_key: &[u8]) -> bool {
@@ -710,14 +793,126 @@ async fn serve(listener: TcpListener, tls: Arc<ServerConfig>, controller: Servin
         protocol_version,
     };
     let app = Router::new()
-        .route("/health", get(serving_health))
+        .route("/v1/pairing/health", get(serving_health))
         .route("/v1/pairing/enroll", post(enroll_peer))
+        .fallback(forward_peer_api)
         .with_state(state);
     let _ = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<ServingConnectionInfo>(),
     )
     .await;
+}
+
+async fn forward_peer_api(
+    State(state): State<ServingState>,
+    ConnectInfo(connection): ConnectInfo<ServingConnectionInfo>,
+    request: Request<Body>,
+) -> Response {
+    let authenticated = connection
+        .peer_key
+        .as_deref()
+        .is_some_and(|key| state.controller.is_enrolled_peer(key));
+    if !authenticated {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if peer_route_class(request.method(), request.uri().path()) == PeerRouteClass::Administration {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match forward_request(
+        &state.controller.local_api.http,
+        state.controller.local_api.base_url.clone(),
+        Some(&state.controller.local_api.token),
+        request,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => error.response(),
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PeerRouteClass {
+    Api,
+    Administration,
+}
+
+fn peer_route_class(method: &Method, path: &str) -> PeerRouteClass {
+    let settings_mutation = *method == Method::POST && path == "/v1/settings";
+    let stop = *method == Method::POST && path == "/v1/server/stop";
+    let peer_management = path == "/v1/pairing/peers" || path.starts_with("/v1/pairing/peers/");
+    if settings_mutation || stop || peer_management {
+        PeerRouteClass::Administration
+    } else {
+        PeerRouteClass::Api
+    }
+}
+
+async fn forward_request(
+    http: &reqwest::Client,
+    base_url: String,
+    bearer_token: Option<&str>,
+    request: Request<Body>,
+) -> std::result::Result<Response, PairingFailure> {
+    let (parts, body) = request.into_parts();
+    let target = format!(
+        "{}{}",
+        base_url,
+        parts
+            .uri
+            .path_and_query()
+            .map_or("/", axum::http::uri::PathAndQuery::as_str)
+    );
+    let mut headers = parts.headers;
+    remove_hop_by_hop_headers(&mut headers);
+    headers.remove(header::HOST);
+    headers.remove(header::AUTHORIZATION);
+    let mut forwarded = http
+        .request(parts.method, target)
+        .headers(headers)
+        .body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    if let Some(token) = bearer_token {
+        forwarded = forwarded.bearer_auth(token);
+    }
+    let response = forwarded.send().await.map_err(|_| {
+        PairingFailure::new(
+            SessionErrorCode::PairingConnectionFailed,
+            "Remote API request failed",
+        )
+    })?;
+    let status = response.status();
+    let mut headers = response.headers().clone();
+    remove_hop_by_hop_headers(&mut headers);
+    let mut forwarded = Response::new(Body::from_stream(response.bytes_stream()));
+    *forwarded.status_mut() = status;
+    *forwarded.headers_mut() = headers;
+    Ok(forwarded)
+}
+
+fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
+    let named_by_connection = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| header::HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .collect::<Vec<_>>();
+    for name in named_by_connection {
+        headers.remove(name);
+    }
+    for name in [
+        header::CONNECTION,
+        header::HeaderName::from_static("keep-alive"),
+        header::PROXY_AUTHENTICATE,
+        header::PROXY_AUTHORIZATION,
+        header::TE,
+        header::TRAILER,
+        header::TRANSFER_ENCODING,
+        header::UPGRADE,
+    ] {
+        headers.remove(name);
+    }
 }
 
 async fn serving_health(
@@ -733,6 +928,7 @@ async fn serving_health(
     }
     Json(RemoteHealth {
         protocol_version: state.protocol_version,
+        status: RemoteStatus::Available,
     })
     .into_response()
 }
@@ -1146,6 +1342,9 @@ fn paired_http_client(
         .context("configure Pairing client identity")?;
     let http = reqwest::Client::builder()
         .use_preconfigured_tls(tls)
+        // Pairing connections exist only while a probe or proxied response
+        // holds them. Never retain an idle socket after that interest ends.
+        .pool_max_idle_per_host(0)
         .build()
         .context("build Pairing HTTP client")?;
     Ok(PairingHttpClient {
