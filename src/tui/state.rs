@@ -36,15 +36,17 @@ use super::{
         command_for_completion_event, command_for_interrupt_confirmation_event,
         command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
         command_for_numeric_editor_event, command_for_queued_prompt_event,
-        command_for_session_picker_event, command_for_settings_panel_event,
-        command_for_sidebar_event, command_for_sidebar_menu_event,
-        command_for_subagent_picker_event, command_for_subagent_view_event,
-        command_for_terminal_event, command_for_workspace_picker_event,
+        command_for_serve_overlay_event, command_for_session_picker_event,
+        command_for_settings_panel_event, command_for_sidebar_event,
+        command_for_sidebar_menu_event, command_for_subagent_picker_event,
+        command_for_subagent_view_event, command_for_terminal_event,
+        command_for_workspace_picker_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
     notice::{LandingNotice, Notice},
     render::render_with_slots,
+    serve_overlay::ServeOverlay,
     session_picker::SessionPicker,
     settings_panel::{AvailabilityRead, SettingsPanel},
     sidebar::{Sidebar, SidebarActivation, SidebarPress},
@@ -320,6 +322,7 @@ pub struct TuiState {
     pub(super) session_picker: SessionPicker,
     pub(super) workspace_picker: WorkspacePicker,
     pub(super) subagent_picker: SubagentPicker,
+    pub(super) serve_overlay: ServeOverlay,
     pub(super) sidebar: Sidebar,
     pub(super) settings_panel: SettingsPanel,
 }
@@ -427,6 +430,7 @@ impl TuiState {
             session_picker: SessionPicker::new(workspace.clone()),
             workspace_picker: WorkspacePicker::new(workspace.clone()),
             subagent_picker: SubagentPicker::default(),
+            serve_overlay: ServeOverlay::default(),
             sidebar: Sidebar::new(workspace),
             settings_panel: SettingsPanel::default(),
         }
@@ -1596,6 +1600,19 @@ pub enum ApplicationEvent {
     /// The effective settings an accepted edit left in force.
     SettingMutated(SettingsSnapshot),
     SettingMutationFailed(String),
+    /// Serving is enabled (where needed) and the machine's current candidate
+    /// addresses are ready for the reader to choose among.
+    ServingPrepared {
+        settings: Option<SettingsSnapshot>,
+        candidates: Vec<std::net::SocketAddr>,
+    },
+    ServingPreparationFailed(String),
+    InviteIssued {
+        invite: crate::protocol::IssuedInvite,
+        peers: Vec<crate::protocol::Peer>,
+    },
+    ServingOperationFailed(String),
+    PeerRemoved(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1731,6 +1748,16 @@ pub enum ApplicationTransition {
     },
     /// One Setting's typed edit, on its way to the server that owns the file.
     MutateSetting(SettingMutation),
+    /// Prepare the `/serve` surface, enabling the durable Setting first when
+    /// it was off before discovering candidate addresses.
+    BeginServing {
+        enable: bool,
+        port: u16,
+    },
+    /// Issue a fresh Invite containing exactly the addresses the reader chose.
+    IssueInvite(crate::protocol::IssueInviteRequest),
+    CopyToClipboard(String),
+    RemovePeer(String),
 }
 
 impl Application {
@@ -1804,6 +1831,32 @@ impl Application {
             }
             ApplicationEvent::SettingMutationFailed(error) => {
                 self.state.settings_panel.report_failure(error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::ServingPrepared {
+                settings,
+                candidates,
+            } => {
+                if let Some(settings) = settings {
+                    self.state.adopt_settings(settings);
+                }
+                self.state.serve_overlay.load_candidates(candidates);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::ServingPreparationFailed(error) => {
+                self.state.serve_overlay.fail_preparation(error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::InviteIssued { invite, peers } => {
+                self.state.serve_overlay.show_invite(invite, peers);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::ServingOperationFailed(error) => {
+                self.state.serve_overlay.fail_operation(error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::PeerRemoved(peer_id) => {
+                self.state.serve_overlay.peer_removed(&peer_id);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::PromptAdmissionSucceeded(prompt_id) => {
@@ -2770,6 +2823,43 @@ impl Application {
         }
         match command {
             SemanticCommandId::ApplicationExit => Ok(ApplicationTransition::Exit),
+            SemanticCommandId::ServeOpen => {
+                let enable = !self.state.settings.serving.enabled;
+                let port = self.state.settings.serving.port;
+                self.state.serve_overlay.open();
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::BeginServing { enable, port })
+            }
+            SemanticCommandId::ServePrevious => {
+                self.state.serve_overlay.select_previous();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ServeNext => {
+                self.state.serve_overlay.select_next();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ServeToggleAddress => {
+                self.state.serve_overlay.toggle_selected();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ServeConfirm => Ok(self.state.serve_overlay.issue_request().map_or(
+                ApplicationTransition::Continue,
+                ApplicationTransition::IssueInvite,
+            )),
+            SemanticCommandId::ServeCopyInvite => Ok(self.state.serve_overlay.copy_text().map_or(
+                ApplicationTransition::Continue,
+                ApplicationTransition::CopyToClipboard,
+            )),
+            SemanticCommandId::ServeRemovePeer => {
+                Ok(self.state.serve_overlay.remove_selected().map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::RemovePeer,
+                ))
+            }
+            SemanticCommandId::ServeClose => {
+                self.state.serve_overlay.close();
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::ModelList => {
                 let current = self.state.agent_selection().cloned();
                 let provider_scope = self
@@ -3315,6 +3405,9 @@ impl Application {
         // open at once.
         if self.state.model_picker.is_open() {
             return command_for_model_picker_event(event);
+        }
+        if self.state.serve_overlay.is_open() {
+            return command_for_serve_overlay_event(event);
         }
         if self.state.settings_panel.numeric_editor_is_open() {
             return command_for_numeric_editor_event(event);

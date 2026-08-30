@@ -133,6 +133,33 @@ pub(super) fn command_for_subagent_picker_event(event: InputEvent) -> Option<Com
     }
 }
 
+/// The Serve overlay owns the keys while it is visible. Its address picker
+/// follows the other picker surfaces, with Space changing membership rather
+/// than typing and Enter issuing the Invite for the complete chosen set.
+pub(super) fn command_for_serve_overlay_event(event: InputEvent) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let command = match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::ServePrevious
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::ServeNext
+        }
+        (KeyCode::Char(' '), KeyModifiers::NONE) => SemanticCommandId::ServeToggleAddress,
+        (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::ServeConfirm,
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => SemanticCommandId::ServeCopyInvite,
+        (KeyCode::Char('x'), KeyModifiers::NONE) => SemanticCommandId::ServeRemovePeer,
+        (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::ServeClose,
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(command))
+}
+
 pub(super) fn command_for_completion_event(event: InputEvent) -> Option<CommandId> {
     let InputEvent::Key(key) = event else {
         return None;

@@ -6,6 +6,7 @@ use std::{
     collections::HashMap,
     future::{Future, pending},
     io::{Stdout, stdout},
+    net::{IpAddr, SocketAddr, SocketAddrV6},
     ops::ControlFlow,
     path::PathBuf,
     pin::Pin,
@@ -24,6 +25,7 @@ use crate::{
     },
 };
 use anyhow::{Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     cursor::{Hide, Show},
     event::{DisableBracketedPaste, EnableBracketedPaste, Event as InputEvent, EventStream},
@@ -259,6 +261,7 @@ struct TaskChannels {
     pickers: UnboundedSender<SessionPickerResult>,
     models: UnboundedSender<ModelPickerResult>,
     skills: UnboundedSender<SkillCatalogResult>,
+    serving: UnboundedSender<ServingResult>,
 }
 
 /// The run loop's mutable world: the Application it feeds, the client it sends
@@ -288,6 +291,7 @@ async fn run_loop(
     let (pickers, mut picker_rx) = tokio::sync::mpsc::unbounded_channel();
     let (models, mut model_rx) = tokio::sync::mpsc::unbounded_channel();
     let (skills, mut skill_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (serving, mut serving_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut run = RunLoop {
         client,
         application: Application::new(workspace),
@@ -298,6 +302,7 @@ async fn run_loop(
             pickers,
             models,
             skills,
+            serving,
         },
         reconnect_grace: None,
         spinner_tick: None,
@@ -331,8 +336,12 @@ async fn run_loop(
             model = model_rx.recv() => run.receive_model_listing(model)?,
             skill = skill_rx.recv() => run.receive_skill_listing(skill)?,
             picker = picker_rx.recv() => run.receive_session_picker(picker)?,
+            serving = serving_rx.recv() => run.receive_serving_result(serving)?,
             input_event = input.next() => match input_event {
-                Some(Ok(event)) => run.handle_input_event(event)?,
+                Some(Ok(event)) => {
+                    let mut output = TerminalOutput(terminal.backend_mut());
+                    run.handle_input_event(event, &mut output)?
+                }
                 Some(Err(error)) => return Err(error.into()),
                 None => ControlFlow::Break(Exit::Now),
             },
@@ -361,7 +370,10 @@ async fn run_loop(
                 break;
             };
             let step = match pending_input {
-                Some(Ok(event)) => run.handle_input_event(event)?,
+                Some(Ok(event)) => {
+                    let mut output = TerminalOutput(terminal.backend_mut());
+                    run.handle_input_event(event, &mut output)?
+                }
                 Some(Err(error)) => return Err(error.into()),
                 None => ControlFlow::Break(Exit::Now),
             };
@@ -398,7 +410,11 @@ impl RunLoop {
         );
     }
 
-    fn handle_input_event(&mut self, event: InputEvent) -> Result<ControlFlow<Exit>> {
+    fn handle_input_event(
+        &mut self,
+        event: InputEvent,
+        output: &mut impl TerminalSink,
+    ) -> Result<ControlFlow<Exit>> {
         if matches!(event, InputEvent::Resize(..)) {
             self.needs_redraw = true;
         }
@@ -412,6 +428,10 @@ impl RunLoop {
         let transition = self
             .application
             .handle_event(ApplicationEvent::Command(command))?;
+        if let ApplicationTransition::CopyToClipboard(text) = transition {
+            copy_to_clipboard(output, &text)?;
+            return Ok(ControlFlow::Continue(()));
+        }
         Ok(self.dispatch_transition(transition))
     }
 
@@ -520,6 +540,31 @@ impl RunLoop {
                     self.channels.submissions.clone(),
                 );
             }
+            ApplicationTransition::BeginServing { enable, port } => {
+                spawn_serving_preparation(
+                    self.client.session_commands(),
+                    enable,
+                    port,
+                    self.channels.serving.clone(),
+                );
+            }
+            ApplicationTransition::IssueInvite(request) => {
+                spawn_invite_issuance(
+                    self.client.session_commands(),
+                    request,
+                    self.channels.serving.clone(),
+                );
+            }
+            ApplicationTransition::RemovePeer(peer_id) => {
+                spawn_peer_removal(
+                    self.client.session_commands(),
+                    peer_id,
+                    self.channels.serving.clone(),
+                );
+            }
+            ApplicationTransition::CopyToClipboard(_) => {
+                unreachable!("clipboard output is handled before task dispatch")
+            }
         }
         ControlFlow::Continue(())
     }
@@ -582,7 +627,11 @@ impl RunLoop {
             | ApplicationTransition::RefreshSkills(_)
             | ApplicationTransition::ConfirmLandingAgentSelection(_)
             | ApplicationTransition::UpdateAgentSelection { .. }
-            | ApplicationTransition::MutateSetting(_) => {
+            | ApplicationTransition::MutateSetting(_)
+            | ApplicationTransition::BeginServing { .. }
+            | ApplicationTransition::IssueInvite(_)
+            | ApplicationTransition::CopyToClipboard(_)
+            | ApplicationTransition::RemovePeer(_) => {
                 unreachable!("managed events issue no other Session command");
             }
         }
@@ -886,6 +935,137 @@ impl RunLoop {
         }
         Ok(ControlFlow::Continue(()))
     }
+
+    fn receive_serving_result(
+        &mut self,
+        result: Option<ServingResult>,
+    ) -> Result<ControlFlow<Exit>> {
+        self.needs_redraw = true;
+        let result = result.ok_or_else(|| anyhow!("Serving task channel stopped unexpectedly"))?;
+        let event = match result {
+            ServingResult::Prepared {
+                settings,
+                candidates,
+            } => ApplicationEvent::ServingPrepared {
+                settings: settings.map(|settings| *settings),
+                candidates,
+            },
+            ServingResult::PreparationFailed(error) => {
+                ApplicationEvent::ServingPreparationFailed(error)
+            }
+            ServingResult::InviteIssued { invite, peers } => {
+                ApplicationEvent::InviteIssued { invite, peers }
+            }
+            ServingResult::PeerRemoved(peer_id) => ApplicationEvent::PeerRemoved(peer_id),
+            ServingResult::OperationFailed(error) => {
+                ApplicationEvent::ServingOperationFailed(error)
+            }
+        };
+        self.application.handle_event(event)?;
+        Ok(ControlFlow::Continue(()))
+    }
+}
+
+enum ServingResult {
+    Prepared {
+        settings: Option<Box<SettingsSnapshot>>,
+        candidates: Vec<SocketAddr>,
+    },
+    PreparationFailed(String),
+    InviteIssued {
+        invite: crate::protocol::IssuedInvite,
+        peers: Vec<crate::protocol::Peer>,
+    },
+    PeerRemoved(String),
+    OperationFailed(String),
+}
+
+fn spawn_serving_preparation(
+    commands: SessionCommandClient,
+    enable: bool,
+    port: u16,
+    results: UnboundedSender<ServingResult>,
+) {
+    tokio::spawn(async move {
+        let result = async {
+            let settings = if enable {
+                Some(Box::new(
+                    commands
+                        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+                        .await?,
+                ))
+            } else {
+                None
+            };
+            let mut candidates = if_addrs::get_if_addrs()?
+                .into_iter()
+                .filter(if_addrs::Interface::is_oper_up)
+                .filter_map(|interface| invite_candidate(&interface, port))
+                .collect::<Vec<_>>();
+            candidates.sort_unstable();
+            candidates.dedup();
+            Ok::<_, anyhow::Error>(ServingResult::Prepared {
+                settings,
+                candidates,
+            })
+        }
+        .await
+        .unwrap_or_else(|error| ServingResult::PreparationFailed(error.to_string()));
+        let _ = results.send(result);
+    });
+}
+
+fn invite_candidate(interface: &if_addrs::Interface, port: u16) -> Option<SocketAddr> {
+    let address = interface.ip();
+    let is_candidate = match address {
+        IpAddr::V4(address) => {
+            !address.is_loopback() && !address.is_unspecified() && !address.is_multicast()
+        }
+        IpAddr::V6(address) => {
+            !address.is_loopback() && !address.is_unspecified() && !address.is_multicast()
+        }
+    };
+    if !is_candidate {
+        return None;
+    }
+    Some(match address {
+        IpAddr::V6(address) if address.is_unicast_link_local() => {
+            SocketAddr::V6(SocketAddrV6::new(address, port, 0, interface.index?))
+        }
+        address => SocketAddr::new(address, port),
+    })
+}
+
+fn spawn_invite_issuance(
+    commands: SessionCommandClient,
+    request: crate::protocol::IssueInviteRequest,
+    results: UnboundedSender<ServingResult>,
+) {
+    tokio::spawn(async move {
+        let result = async {
+            let invite = commands.issue_invite(request).await?;
+            let peers = commands.list_peers().await?;
+            Ok::<_, anyhow::Error>(ServingResult::InviteIssued { invite, peers })
+        }
+        .await
+        .unwrap_or_else(|error| ServingResult::OperationFailed(error.to_string()));
+        let _ = results.send(result);
+    });
+}
+
+fn spawn_peer_removal(
+    commands: SessionCommandClient,
+    peer_id: String,
+    results: UnboundedSender<ServingResult>,
+) {
+    tokio::spawn(async move {
+        let result = commands
+            .remove_peer(&peer_id)
+            .await
+            .map(|()| ServingResult::PeerRemoved(peer_id))
+            .unwrap_or_else(|error| ServingResult::OperationFailed(error.to_string()));
+        let _ = results.send(result);
+    });
 }
 
 fn spawn_session_creation(
@@ -1441,6 +1621,26 @@ trait TerminalSink {
     fn apply(&mut self, command: impl crossterm::Command) -> std::io::Result<()>;
 }
 
+/// OSC 52 asks the terminal to place bytes on its clipboard. The Invite stays
+/// drawn after this command, so a terminal that ignores OSC 52 still leaves
+/// the reader able to select the same string directly from the screen.
+struct CopyToClipboard<'a>(&'a str);
+
+impl crossterm::Command for CopyToClipboard<'_> {
+    fn write_ansi(&self, output: &mut impl std::fmt::Write) -> std::fmt::Result {
+        write!(output, "\x1b]52;c;{}\x07", STANDARD.encode(self.0))
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+fn copy_to_clipboard(output: &mut impl TerminalSink, text: &str) -> std::io::Result<()> {
+    ignore_unsupported(output.apply(CopyToClipboard(text)))
+}
+
 struct TerminalOutput<W: std::io::Write>(W);
 
 impl<W: std::io::Write> TerminalSink for TerminalOutput<W> {
@@ -1540,8 +1740,8 @@ mod tests {
 
     use super::{
         DisableMouseButtonReporting, EnableMouseButtonReporting, PopModifiedKeyReporting,
-        PushModifiedKeyReporting, TerminalSink, enter_terminal_display, ignore_unsupported,
-        leave_terminal_display,
+        PushModifiedKeyReporting, TerminalSink, copy_to_clipboard, enter_terminal_display,
+        ignore_unsupported, leave_terminal_display,
     };
 
     /// Records what an ANSI terminal would receive. Going through `write_ansi`
@@ -1577,6 +1777,14 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn copying_an_invite_writes_osc_52_through_the_terminal_sink() {
+        let transcript =
+            AnsiTranscript::record(|output| copy_to_clipboard(output, "suru-v1-example"));
+
+        assert_eq!(transcript, "\x1b]52;c;c3VydS12MS1leGFtcGxl\x07");
     }
 
     /// The screen has to be taken before the input features are turned on: a

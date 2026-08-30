@@ -154,6 +154,9 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     if state.model_picker.is_open() && !state.reconnect_overlay_visible {
         render_model_picker(frame, state, main, &theme);
     }
+    if state.serve_overlay.is_open() && !state.reconnect_overlay_visible {
+        render_serve_overlay(frame, state, main, &theme);
+    }
     if state.reconnect_overlay_visible {
         render_reconnect_overlay(frame, &theme);
     } else if !state.session_picker.is_open()
@@ -161,6 +164,7 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
         && !state.model_picker.is_open()
         && !state.model_options.is_open()
         && !state.settings_panel.is_open()
+        && !state.serve_overlay.is_open()
         && !state.sidebar.menu_is_open()
         && !state.subagent_picker.is_open()
         && state.composer_focused()
@@ -171,6 +175,166 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     {
         frame.set_cursor_position(cursor);
     }
+}
+
+fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
+    let area = centered_rect(
+        main,
+        main.width.saturating_sub(4).min(96),
+        main.height.saturating_sub(2).min(18),
+    );
+    if state.serve_overlay.is_preparing() {
+        render_overlay_box(
+            frame,
+            area,
+            vec![Line::styled("Preparing Serving…", theme.text.subdued)],
+            " Serve ",
+            theme,
+        );
+        return;
+    }
+
+    if let Some(invite) = state.serve_overlay.invite() {
+        let content_width = area.width.saturating_sub(2);
+        let content_height = usize::from(area.height.saturating_sub(2));
+        let invite_lines = TextLayout::new(&invite.invite, content_width)
+            .rows()
+            .map(|row| Line::styled(row.text.to_owned(), theme.text.primary))
+            .collect::<Vec<_>>();
+        let mut lines = vec![Line::styled(
+            "Fresh Invite",
+            theme.text.primary.add_modifier(Modifier::BOLD),
+        )];
+        lines.extend(invite_lines);
+        lines.push(Line::styled("Enrolled Peers", theme.text.primary));
+        if state.serve_overlay.peers().is_empty() {
+            lines.push(Line::styled("No Peers enrolled", theme.text.subdued));
+        } else {
+            let error_rows = usize::from(state.serve_overlay.error().is_some());
+            let peer_capacity = content_height.saturating_sub(lines.len() + error_rows + 1);
+            let peer_groups = state
+                .serve_overlay
+                .peers()
+                .iter()
+                .enumerate()
+                .map(|(index, peer)| {
+                    serve_peer_lines(
+                        &peer.fingerprint,
+                        index == state.serve_overlay.selected(),
+                        content_width,
+                        theme,
+                    )
+                })
+                .collect::<Vec<_>>();
+            lines.extend(visible_line_groups(
+                peer_groups,
+                state.serve_overlay.selected(),
+                peer_capacity,
+            ));
+        }
+        if let Some(error) = state.serve_overlay.error() {
+            lines.push(Line::styled(error.to_owned(), theme.feedback.error));
+        }
+        lines.push(Line::styled(
+            "Ctrl+C copy · ↑↓ choose Peer · x remove · Esc close",
+            theme.text.subdued,
+        ));
+        render_overlay_box(frame, area, lines, " Serve ", theme);
+        return;
+    }
+
+    let mut lines = vec![Line::styled(
+        "Choose Invite addresses",
+        theme.text.primary.add_modifier(Modifier::BOLD),
+    )];
+    if state.serve_overlay.candidates().is_empty() {
+        lines.push(Line::styled(
+            "No non-loopback addresses found",
+            theme.feedback.error,
+        ));
+    } else {
+        let content_height = usize::from(area.height.saturating_sub(2));
+        let error_rows = usize::from(state.serve_overlay.error().is_some());
+        let capacity = content_height.saturating_sub(lines.len() + error_rows + 1);
+        let rows = state
+            .serve_overlay
+            .candidates()
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let marker = if candidate.chosen { "[x]" } else { "[ ]" };
+                Line::styled(
+                    format!("{marker} {}", candidate.address),
+                    if index == state.serve_overlay.selected() {
+                        theme.selection.focused
+                    } else {
+                        theme.text.primary
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        lines.extend(visible_window(
+            rows,
+            state.serve_overlay.selected(),
+            capacity,
+        ));
+    }
+    if let Some(error) = state.serve_overlay.error() {
+        lines.push(Line::styled(error.to_owned(), theme.feedback.error));
+    }
+    lines.push(Line::styled(
+        "↑↓ move · Space toggle · Enter issue Invite · Esc close",
+        theme.text.subdued,
+    ));
+    render_overlay_box(frame, area, lines, " Serve ", theme);
+}
+
+fn serve_peer_lines(
+    fingerprint: &str,
+    selected: bool,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let prefix = if selected { "› " } else { "  " };
+    let style = if selected {
+        theme.selection.focused
+    } else {
+        theme.text.primary
+    };
+    TextLayout::new(fingerprint, width.saturating_sub(2))
+        .rows()
+        .map(|row| Line::styled(format!("{prefix}{}", row.text), style))
+        .collect()
+}
+
+/// A variable-height list window that always keeps the complete focused group
+/// on screen where it fits, then fills the remaining room with its neighbors.
+fn visible_line_groups(
+    groups: Vec<Vec<Line<'static>>>,
+    selected: usize,
+    capacity: usize,
+) -> Vec<Line<'static>> {
+    let Some(selected) = (selected < groups.len()).then_some(selected) else {
+        return Vec::new();
+    };
+    let mut start = selected;
+    let mut end = selected + 1;
+    let mut used = groups[selected].len();
+    while start > 0 && used + groups[start - 1].len() <= capacity {
+        start -= 1;
+        used += groups[start].len();
+    }
+    while end < groups.len() && used + groups[end].len() <= capacity {
+        used += groups[end].len();
+        end += 1;
+    }
+    groups
+        .into_iter()
+        .skip(start)
+        .take(end - start)
+        .flatten()
+        .take(capacity)
+        .collect()
 }
 
 fn render_numeric_editor(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {

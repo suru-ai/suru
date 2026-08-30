@@ -11,6 +11,7 @@ mod model_options;
 mod model_picker;
 mod notice;
 mod render;
+mod serve_overlay;
 mod session_listing;
 mod session_picker;
 mod settings_panel;

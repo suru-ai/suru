@@ -17,6 +17,7 @@ eventsource-stream = "0.2.3"
 fs2 = "0.4.3"
 futures-util = "0.3.31"
 hostname = "0.4.1"
+if-addrs = "0.15.0"
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 pulldown-cmark = "0.13.4"
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
