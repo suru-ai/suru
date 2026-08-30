@@ -3,7 +3,6 @@
 mod commands;
 mod completion;
 mod composer;
-mod composer_layout;
 mod event_loop;
 mod keymap;
 mod markdown;
@@ -19,6 +18,7 @@ mod slots;
 mod spinner;
 mod state;
 mod subagent_picker;
+mod text_layout;
 mod transcript;
 mod usage;
 

@@ -54,6 +54,7 @@ use super::{
     markdown,
     slots::{SlotText, truncate_slot_text},
     spinner,
+    text_layout::TextLayout,
     usage::{compact_cost, compact_count},
 };
 
@@ -85,6 +86,14 @@ const COMMAND_DETAIL_INDENT: &str = "      ";
 /// The extra gutter an expanded Group's or Turn Fold's members sit in, so a
 /// member reads as subordinate to the header row it folds back into.
 const MEMBER_INDENT: &str = "  ";
+
+/// The bar and space every row of a user Message opens with.
+const USER_MESSAGE_GUTTER: &str = "┃ ";
+
+/// Columns of air a user Message keeps at its right edge, so its text ends
+/// short of the surface it is drawn on.
+/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
+const USER_MESSAGE_RIGHT_MARGIN: usize = 1;
 
 /// Paths a folded FileChange Activity lists before its fold marker.
 /// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
@@ -3088,30 +3097,16 @@ fn push_user_message(
         .then(|| recognized_skill_ranges(&content, skill_invocations))
         .unwrap_or_default();
     let available_width = usize::from(available_width);
-    let content_width = available_width.saturating_sub(2).max(1);
-    let mut source_offset = 0;
-    for source_line in content.split('\n') {
-        if source_line.is_empty() {
-            push_user_message_row(lines, Vec::new(), 0, available_width, surface, accent);
-            source_offset += 1;
-            continue;
-        }
+    // The gutter takes two columns and the air at the right edge one, so what
+    // is left is what a row of the Message is wrapped to.
+    let content_width = available_width
+        .saturating_sub(USER_MESSAGE_GUTTER.width() + USER_MESSAGE_RIGHT_MARGIN)
+        .max(1);
+    let layout = TextLayout::new(&content, u16::try_from(content_width).unwrap_or(u16::MAX));
+    for row in layout.rows() {
         let mut segments = Vec::<(Style, String)>::new();
-        let mut line_width = 0;
-        for (offset, character) in source_line.char_indices() {
-            let character_width = character.width().unwrap_or(1);
-            if line_width > 0 && line_width + character_width > content_width {
-                push_user_message_row(
-                    lines,
-                    std::mem::take(&mut segments),
-                    line_width,
-                    available_width,
-                    surface,
-                    accent,
-                );
-                line_width = 0;
-            }
-            let byte = source_offset + offset;
+        for (offset, character) in row.text.char_indices() {
+            let byte = row.start + offset;
             let style = if skill_ranges.iter().any(|range| range.contains(&byte)) {
                 accent
             } else {
@@ -3121,17 +3116,8 @@ fn push_user_message(
                 Some((last_style, text)) if *last_style == style => text.push(character),
                 _ => segments.push((style, character.to_string())),
             }
-            line_width += character_width;
         }
-        push_user_message_row(
-            lines,
-            segments,
-            line_width,
-            available_width,
-            surface,
-            accent,
-        );
-        source_offset += source_line.len() + 1;
+        push_user_message_row(lines, segments, row.width, available_width, surface, accent);
     }
 }
 
@@ -3152,14 +3138,14 @@ fn recognized_skill_ranges(
 fn push_user_message_row(
     lines: &mut Vec<Line<'static>>,
     segments: Vec<(Style, String)>,
-    content_width: usize,
+    row_width: usize,
     available_width: usize,
     surface: Style,
     accent: Style,
 ) {
-    let padding = available_width.saturating_sub(2 + content_width);
+    let padding = available_width.saturating_sub(USER_MESSAGE_GUTTER.width() + row_width);
     let mut spans = Vec::with_capacity(segments.len() + 2);
-    spans.push(Span::styled("┃ ", accent));
+    spans.push(Span::styled(USER_MESSAGE_GUTTER, accent));
     spans.extend(
         segments
             .into_iter()
@@ -3945,8 +3931,8 @@ mod tests {
     use super::{
         CappedStream, FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, TranscriptCache,
         TranscriptDisclosure, TranscriptFolds, TranscriptGroups, TranscriptTurnFolds,
-        TranscriptView, UnitKey, UnitStart, layout_line, render_activity, render_message,
-        split_oversized_line, wrapped_line_count,
+        TranscriptView, UnitKey, UnitStart, layout_line, push_user_message, render_activity,
+        render_message, split_oversized_line, wrapped_line_count,
     };
 
     fn rendered_text(line: &Line<'static>) -> String {
@@ -4946,6 +4932,32 @@ mod tests {
             Entry::Activity(status("Preparing the workspace")),
             Entry::Activity(command("cargo test", "running 2 tests\nall green")),
         ]
+    }
+
+    #[test]
+    fn a_user_message_moves_a_whole_word_to_the_next_row() {
+        let mut lines = Vec::new();
+        push_user_message(&mut lines, "aaaa bbbbbb", &[], &Theme::system(), 12);
+        assert_eq!(
+            lines.iter().map(rendered_text).collect::<Vec<_>>(),
+            ["\u{2503} aaaa      ", "\u{2503} bbbbbb    "],
+            "a word that does not fit the room left moves down whole"
+        );
+    }
+
+    #[test]
+    fn a_user_message_keeps_a_column_of_air_at_its_right_edge() {
+        let mut lines = Vec::new();
+        push_user_message(&mut lines, "aaaaaaaaaaaa", &[], &Theme::system(), 12);
+        let rows = lines.iter().map(rendered_text).collect::<Vec<_>>();
+        assert_eq!(rows, ["\u{2503} aaaaaaaaa ", "\u{2503} aaa       "]);
+        for row in &rows {
+            assert_eq!(row.width(), 12, "every row fills the width it was given");
+            assert!(
+                row.ends_with(' '),
+                "text stops a column short of the right edge: {row:?}"
+            );
+        }
     }
 
     #[test]

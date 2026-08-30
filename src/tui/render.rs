@@ -24,7 +24,6 @@ use crate::{
 use super::{
     completion::CompletionRow,
     composer::{ComposerKey, ComposerSkillMarkers},
-    composer_layout::ComposerLayout,
     keymap::binding_label,
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
@@ -45,6 +44,7 @@ use super::{
     spinner,
     state::{CommandId, CommandMode, QueuedPrompt, TranscriptViewport, TuiState},
     subagent_picker::working_subagents,
+    text_layout::TextLayout,
     transcript::TranscriptDisclosure,
     usage::{compact_cost, compact_count},
 };
@@ -2367,7 +2367,7 @@ fn render_composer(
         .border_style(style);
     let content_width = composer_content_width(area.width);
     let content_height = area.height.saturating_sub(2).max(1);
-    let layout = ComposerLayout::new(text, content_width);
+    let layout = TextLayout::new(text, content_width);
     let (cursor_row, cursor_column) = layout.cursor_position(cursor);
     let scroll = cursor_row.saturating_sub(content_height.saturating_sub(1));
     let paragraph = if text.is_empty() {
@@ -2485,7 +2485,7 @@ fn render_reconnect_overlay(frame: &mut Frame<'_>, theme: &Theme) {
 }
 
 fn composer_block_height(terminal_height: u16, width: u16, text: &str, cursor: usize) -> u16 {
-    let layout = ComposerLayout::new(text, composer_content_width(width));
+    let layout = TextLayout::new(text, composer_content_width(width));
     let cursor_rows = layout.cursor_position(cursor).0.saturating_add(1);
     let desired = layout.row_count().max(cursor_rows).max(1);
     let cap = (terminal_height / 3).max(1);
@@ -2502,16 +2502,16 @@ fn composer_content_width(width: u16) -> u16 {
 }
 
 fn wrapped_composer_lines(
-    layout: &ComposerLayout<'_>,
+    layout: &TextLayout<'_>,
     skill_markers: &ComposerSkillMarkers,
     theme: &Theme,
 ) -> Text<'static> {
     let lines = layout
         .rows()
-        .map(|(start, row)| {
+        .map(|row| {
             let mut line = Vec::<(Style, String)>::new();
-            for (offset, character) in row.char_indices() {
-                let offset = start + offset;
+            for (offset, character) in row.text.char_indices() {
+                let offset = row.start + offset;
                 let style = if skill_markers
                     .invalid
                     .iter()

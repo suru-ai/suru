@@ -1,24 +1,33 @@
-//! Where a Prompt's text breaks across the composer's content rows.
+//! Where text breaks across the rows a surface draws it in.
 //!
-//! The caret, the composer block's height, and the styled lines a frame draws
-//! all have to agree on the same wrap, so they all read it from one layout
-//! rather than each re-deriving it. Rows break on whole words: a word that does
-//! not fit the room left on a row moves to the next row entire, and only a word
-//! too wide for a row of its own is split within.
+//! The composer reads this for its caret, its block height, and the lines a
+//! frame draws — all three have to agree on one wrap rather than each deriving
+//! its own — and the Transcript reads it for the user Messages it draws. Rows
+//! break on whole words: a word that does not fit the room left on a row moves
+//! to the next row entire, and only a word too wide for a row of its own is
+//! split within.
 
 use std::ops::Range;
 
 use unicode_width::UnicodeWidthChar;
 
-/// A Prompt's text laid out over content columns `width` wide, as the byte
-/// range of each visual row.
-pub(super) struct ComposerLayout<'a> {
+/// One visual row: where its text begins in the whole text, the text it draws,
+/// and the columns that text occupies.
+pub(super) struct LaidOutRow<'a> {
+    pub(super) start: usize,
+    pub(super) text: &'a str,
+    pub(super) width: usize,
+}
+
+/// Text laid out over content columns `width` wide, as the byte range of each
+/// visual row.
+pub(super) struct TextLayout<'a> {
     text: &'a str,
     width: usize,
     rows: Vec<Range<usize>>,
 }
 
-impl<'a> ComposerLayout<'a> {
+impl<'a> TextLayout<'a> {
     pub(super) fn new(text: &'a str, width: u16) -> Self {
         let width = usize::from(width.max(1));
         let mut rows = Vec::new();
@@ -73,12 +82,34 @@ impl<'a> ComposerLayout<'a> {
         Self { text, width, rows }
     }
 
-    /// Each visual row in order, as the byte offset it begins at and the text
-    /// it draws.
-    pub(super) fn rows(&self) -> impl Iterator<Item = (usize, &'a str)> + '_ {
-        self.rows
-            .iter()
-            .map(|row| (row.start, &self.text[row.clone()]))
+    /// Each visual row in order.
+    pub(super) fn rows(&self) -> impl Iterator<Item = LaidOutRow<'a>> + '_ {
+        self.rows.iter().map(|row| self.drawn(row))
+    }
+
+    /// What a row shows: the whitespace that ran past the layout's columns is
+    /// left out, since none of it shows, so a row is never wider than those
+    /// columns — save a lone character too wide for a row of its own, which is
+    /// kept rather than dropped, having nowhere narrower to go.
+    fn drawn(&self, row: &Range<usize>) -> LaidOutRow<'a> {
+        let text = &self.text[row.clone()];
+        let mut width = 0_usize;
+        for (offset, character) in text.char_indices() {
+            let character_width = display_width(character);
+            if width > 0 && width + character_width > self.width {
+                return LaidOutRow {
+                    start: row.start,
+                    text: &text[..offset],
+                    width,
+                };
+            }
+            width += character_width;
+        }
+        LaidOutRow {
+            start: row.start,
+            text,
+            width,
+        }
     }
 
     /// How many rows the text occupies.
@@ -130,12 +161,12 @@ fn display_width(character: char) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::ComposerLayout;
+    use super::TextLayout;
 
     fn rows(text: &str, width: u16) -> Vec<String> {
-        ComposerLayout::new(text, width)
+        TextLayout::new(text, width)
             .rows()
-            .map(|(_, row)| row.to_owned())
+            .map(|row| row.text.to_owned())
             .collect()
     }
 
@@ -171,7 +202,7 @@ mod tests {
 
     #[test]
     fn a_caret_at_a_wrapped_word_reads_from_the_row_the_word_moved_to() {
-        let layout = ComposerLayout::new("hello wonderful world", 12);
+        let layout = TextLayout::new("hello wonderful world", 12);
         assert_eq!(
             layout.cursor_position(6),
             (1, 0),
@@ -185,7 +216,7 @@ mod tests {
     #[test]
     fn a_caret_at_a_full_rows_right_edge_spills_to_the_row_below() {
         let filled = "x".repeat(12);
-        let layout = ComposerLayout::new(&filled, 12);
+        let layout = TextLayout::new(&filled, 12);
         assert_eq!(layout.row_count(), 1, "a filled row is one row of text");
         assert_eq!(
             layout.cursor_position(12),
@@ -198,11 +229,12 @@ mod tests {
     fn the_space_that_ends_a_row_stays_with_it_rather_than_indenting_the_next() {
         assert_eq!(
             rows("aaaaaaaaaaaa bbb", 12),
-            vec!["aaaaaaaaaaaa ", "bbb"],
-            "the moved word starts at the left edge"
+            vec!["aaaaaaaaaaaa", "bbb"],
+            "the moved word starts at the left edge, the space it left behind \
+             showing nowhere"
         );
         assert_eq!(
-            ComposerLayout::new("aaaa        ", 8).row_count(),
+            TextLayout::new("aaaa        ", 8).row_count(),
             1,
             "trailing spaces do not grow the composer by a row of blanks"
         );
@@ -210,7 +242,7 @@ mod tests {
 
     #[test]
     fn a_caret_at_the_edge_of_a_line_a_newline_ended_waits_in_that_lines_margin() {
-        let layout = ComposerLayout::new("aaaa\nbb", 4);
+        let layout = TextLayout::new("aaaa\nbb", 4);
         assert_eq!(
             layout.cursor_position(4),
             (0, 4),
@@ -224,9 +256,23 @@ mod tests {
     }
 
     #[test]
+    fn a_character_too_wide_for_a_row_of_its_own_is_kept_rather_than_dropped() {
+        let layout = TextLayout::new("🙂", 1);
+        let row = layout
+            .rows()
+            .next()
+            .expect("the text lays out over one row");
+        assert_eq!(
+            (row.text, row.width),
+            ("🙂", 2),
+            "a character with nowhere narrower to go still shows"
+        );
+    }
+
+    #[test]
     fn wide_characters_are_measured_by_the_columns_they_occupy() {
         assert_eq!(rows("ab 🙂🙂", 5), vec!["ab ", "🙂🙂"]);
-        let layout = ComposerLayout::new("🙂🙂", 3);
+        let layout = TextLayout::new("🙂🙂", 3);
         assert_eq!(
             layout.cursor_position("🙂".len()),
             (1, 0),
