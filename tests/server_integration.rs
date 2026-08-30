@@ -668,7 +668,6 @@ async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
     let serving_address = serving
         .serving_address()
         .expect("Serving listener is ready");
-
     let connecting_state = tempfile::tempdir().expect("create connecting state directory");
     let connecting_data = tempfile::tempdir().expect("create connecting data directory");
     let connecting_config = ServerConfig::new(connecting_state.path(), "pairing-connecting-test")
@@ -784,6 +783,7 @@ struct PairedServers {
     connecting: server::RunningServer,
     serving_client: ManagedClient,
     connecting_client: ManagedClient,
+    wire: ObservedTcpProxy,
 }
 
 impl PairedServers {
@@ -795,6 +795,64 @@ impl PairedServers {
             .await
             .expect("stop connecting Server");
         self.serving.shutdown().await.expect("stop Serving Server");
+    }
+}
+
+struct ObservedTcpProxy {
+    address: std::net::SocketAddr,
+    active_connections: tokio::sync::watch::Receiver<usize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ObservedTcpProxy {
+    async fn start(target: std::net::SocketAddr) -> Self {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind observed Pairing route");
+        let address = listener.local_addr().expect("read observed Pairing route");
+        let (active, active_connections) = tokio::sync::watch::channel(0_usize);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    break;
+                };
+                active.send_modify(|count| *count += 1);
+                let active = active.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                    active.send_modify(|count| *count = count.saturating_sub(1));
+                });
+            }
+        });
+        Self {
+            address,
+            active_connections,
+            task,
+        }
+    }
+
+    async fn wait_for_connections(&mut self, expected: usize) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if *self.active_connections.borrow() == expected {
+                    return;
+                }
+                self.active_connections
+                    .changed()
+                    .await
+                    .expect("observed Pairing route remains open");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Pairing route should settle at {expected} connections"));
+    }
+}
+
+impl Drop for ObservedTcpProxy {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -831,6 +889,7 @@ async fn paired_servers(name: &str) -> PairedServers {
     let serving_address = serving
         .serving_address()
         .expect("Serving listener is ready");
+    let mut wire = ObservedTcpProxy::start(serving_address).await;
 
     let connecting_state = tempfile::tempdir().expect("create connecting state directory");
     let connecting_channel = format!("{name}-connecting");
@@ -853,7 +912,7 @@ async fn paired_servers(name: &str) -> PairedServers {
     receive_initial_state(&mut connecting_client).await;
     let invite = serving_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![serving_address],
+            addresses: vec![wire.address],
         })
         .await
         .expect("issue Invite");
@@ -865,6 +924,7 @@ async fn paired_servers(name: &str) -> PairedServers {
         })
         .await
         .expect("form Pairing");
+    wire.wait_for_connections(0).await;
 
     PairedServers {
         _serving_state: serving_state,
@@ -874,12 +934,13 @@ async fn paired_servers(name: &str) -> PairedServers {
         connecting,
         serving_client,
         connecting_client,
+        wire,
     }
 }
 
 #[tokio::test]
 async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_server() {
-    let pair = paired_servers("remote-proxy").await;
+    let mut pair = paired_servers("remote-proxy").await;
 
     let workspace = tempfile::tempdir().expect("create Serving Workspace");
     let descriptor = pair.connecting.descriptor();
@@ -900,6 +961,7 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
         remote_health.instance_id,
         pair.serving.descriptor().instance_id
     );
+    pair.wire.wait_for_connections(0).await;
     let created = http
         .post(format!("{remote_api}/v1/sessions"))
         .bearer_auth(&descriptor.token)
@@ -934,6 +996,7 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
         pair.serving_client.list_sessions(None).await.unwrap()[0].id(),
         created.session.id
     );
+    pair.wire.wait_for_connections(0).await;
 
     let response = http
         .get(format!(
@@ -947,6 +1010,7 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
         .error_for_status()
         .expect("Remote Session stream succeeds");
     let mut events = response.bytes_stream().eventsource();
+    pair.wire.wait_for_connections(1).await;
     let snapshot = timeout(Duration::from_secs(1), events.next())
         .await
         .expect("Remote Session snapshot arrives")
@@ -1010,6 +1074,7 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
     assert!(update.revision > created.revision);
 
     drop(events);
+    pair.wire.wait_for_connections(0).await;
     pair.shutdown().await;
 }
 
@@ -1065,6 +1130,14 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
         .await
         .expect("attempt Remote Pairing management");
     assert_eq!(remotes.status(), reqwest::StatusCode::FORBIDDEN);
+    let normalized_settings = http
+        .post(format!("{remote_api}/ordinary/%2e%2e/v1/settings"))
+        .bearer_auth(&descriptor.token)
+        .json(&SettingMutation::ServingEnabled { value: Some(false) })
+        .send()
+        .await
+        .expect("attempt encoded Remote Settings mutation");
+    assert_eq!(normalized_settings.status(), reqwest::StatusCode::FORBIDDEN);
     let peer_id = &pair.serving_client.list_peers().await.unwrap()[0].id;
     let removal = http
         .delete(format!("{remote_api}/v1/pairing/peers/{peer_id}"))

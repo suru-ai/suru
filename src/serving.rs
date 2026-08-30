@@ -22,10 +22,10 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Path as AxumPath, State},
     http::{HeaderMap, Method, Request, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
     serve::{IncomingStream, Listener},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -67,6 +67,8 @@ use crate::{
 const IDENTITY_FILE: &str = "server-identity.pk8";
 const PEERS_FILE: &str = "peers.json";
 const REMOTES_FILE: &str = "remotes.json";
+const PAIRING_PROTOCOL_HEADER: &str = "x-suru-protocol-version";
+const PEER_API_PREFIX: &str = "/v1/pairing/proxy";
 
 #[derive(Clone)]
 pub(crate) struct ServingController {
@@ -172,6 +174,15 @@ enum EnrollmentPhase {
 #[serde(deny_unknown_fields)]
 struct EnrollmentResponse {
     hostname: String,
+    protocol_version: u32,
+}
+
+/// The compatibility handshake deliberately retains the v28 wire shape so a
+/// newly upgraded Server can still identify an older paired Server as a
+/// protocol mismatch rather than a transport failure.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PairingHealth {
     protocol_version: u32,
 }
 
@@ -392,7 +403,7 @@ impl ServingController {
     pub(crate) async fn proxy_remote(
         &self,
         name: &str,
-        request: Request<Body>,
+        mut request: Request<Body>,
     ) -> std::result::Result<Response, PairingFailure> {
         let remote = self.stored_remote(name)?;
         let connection = self.dial_remote(&remote).await?;
@@ -402,12 +413,24 @@ impl ServingController {
                 connection.health.protocol_version,
             ));
         }
+        let path_and_query = request
+            .uri()
+            .path_and_query()
+            .map_or("/", axum::http::uri::PathAndQuery::as_str);
+        *request.uri_mut() = format!("/v1/pairing/proxy{path_and_query}")
+            .parse()
+            .map_err(|_| {
+                PairingFailure::new(
+                    SessionErrorCode::PairingConnectionFailed,
+                    "Remote API path is invalid",
+                )
+            })?;
         let interest = connection.client.http.clone();
         forward_request(
             &connection.client.http,
             format!("https://{}", connection.address),
-            None,
             request,
+            remote_forward_headers(self.protocol_version),
             Some(interest),
         )
         .await
@@ -565,21 +588,24 @@ impl ServingController {
         for address in &remote.remote.addresses {
             let response = client
                 .http
-                .get(format!("https://{address}/v1/pairing/health"))
+                .get(format!("https://{address}/health"))
                 .send()
                 .await;
             match response {
                 Ok(response) if response.status().is_success() => {
-                    let mut health = response.json::<RemoteHealth>().await.map_err(|_| {
+                    let pairing_health = response.json::<PairingHealth>().await.map_err(|_| {
                         PairingFailure::new(
                             SessionErrorCode::PairingConnectionFailed,
                             "Remote returned an invalid health response",
                         )
                     })?;
-                    health.status = if health.protocol_version == self.protocol_version {
-                        RemoteStatus::Available
-                    } else {
-                        RemoteStatus::ProtocolMismatch
+                    let health = RemoteHealth {
+                        protocol_version: pairing_health.protocol_version,
+                        status: if pairing_health.protocol_version == self.protocol_version {
+                            RemoteStatus::Available
+                        } else {
+                            RemoteStatus::ProtocolMismatch
+                        },
                     };
                     return Ok(RemoteConnection {
                         address: *address,
@@ -770,9 +796,9 @@ async fn serve(listener: TcpListener, tls: Arc<ServerConfig>, controller: Servin
         protocol_version,
     };
     let app = Router::new()
-        .route("/v1/pairing/health", get(serving_health))
+        .route("/health", get(serving_health))
         .route("/v1/pairing/enroll", post(enroll_peer))
-        .fallback(forward_peer_api)
+        .route("/v1/pairing/proxy/{*path}", any(forward_peer_api))
         .with_state(state);
     let _ = axum::serve(
         listener,
@@ -784,7 +810,8 @@ async fn serve(listener: TcpListener, tls: Arc<ServerConfig>, controller: Servin
 async fn forward_peer_api(
     State(state): State<ServingState>,
     ConnectInfo(connection): ConnectInfo<ServingConnectionInfo>,
-    request: Request<Body>,
+    AxumPath(_path): AxumPath<String>,
+    mut request: Request<Body>,
 ) -> Response {
     let authenticated = connection
         .peer_key
@@ -793,14 +820,46 @@ async fn forward_peer_api(
     if !authenticated {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if peer_route_class(request.method(), request.uri().path()) == PeerRouteClass::Administration {
+    let Some(peer_protocol_version) = request
+        .headers()
+        .get(PAIRING_PROTOCOL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return PairingFailure::new(
+            SessionErrorCode::PairingProtocolMismatch,
+            "Peer did not state a valid Pairing protocol version",
+        )
+        .response();
+    };
+    if peer_protocol_version != state.protocol_version {
+        return protocol_mismatch(state.protocol_version, peer_protocol_version).response();
+    }
+    let Some(path_and_query) = request
+        .uri()
+        .path_and_query()
+        .map(axum::http::uri::PathAndQuery::as_str)
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(remote_path_and_query) = path_and_query.strip_prefix(PEER_API_PREFIX) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(uri) = remote_path_and_query.parse() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    *request.uri_mut() = uri;
+    let Some(canonical_path) = canonical_forward_path(request.uri()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if peer_route_class(request.method(), &canonical_path) == PeerRouteClass::Administration {
         return StatusCode::FORBIDDEN.into_response();
     }
     match forward_request(
         &state.controller.local_api.http,
         state.controller.local_api.base_url.clone(),
-        Some(&state.controller.local_api.token),
         request,
+        local_forward_headers(&state.controller.local_api.token),
         None,
     )
     .await
@@ -808,6 +867,12 @@ async fn forward_peer_api(
         Ok(response) => response,
         Err(error) => error.response(),
     }
+}
+
+fn canonical_forward_path(uri: &axum::http::Uri) -> Option<String> {
+    reqwest::Url::parse(&format!("http://suru.invalid{uri}"))
+        .ok()
+        .map(|url| url.path().to_owned())
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -830,8 +895,8 @@ fn peer_route_class(method: &Method, path: &str) -> PeerRouteClass {
 async fn forward_request(
     http: &reqwest::Client,
     base_url: String,
-    bearer_token: Option<&str>,
     request: Request<Body>,
+    added_headers: HeaderMap,
     interest: Option<reqwest::Client>,
 ) -> std::result::Result<Response, PairingFailure> {
     let (parts, body) = request.into_parts();
@@ -847,13 +912,12 @@ async fn forward_request(
     remove_hop_by_hop_headers(&mut headers);
     headers.remove(header::HOST);
     headers.remove(header::AUTHORIZATION);
-    let mut forwarded = http
+    headers.remove(PAIRING_PROTOCOL_HEADER);
+    headers.extend(added_headers);
+    let forwarded = http
         .request(parts.method, target)
         .headers(headers)
         .body(reqwest::Body::wrap_stream(body.into_data_stream()));
-    if let Some(token) = bearer_token {
-        forwarded = forwarded.bearer_auth(token);
-    }
     let response = forwarded.send().await.map_err(|_| {
         PairingFailure::new(
             SessionErrorCode::PairingConnectionFailed,
@@ -871,6 +935,30 @@ async fn forward_request(
     *forwarded.status_mut() = status;
     *forwarded.headers_mut() = headers;
     Ok(forwarded)
+}
+
+fn local_forward_headers(token: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .expect("runtime descriptor tokens are valid header values"),
+    );
+    headers
+}
+
+fn remote_forward_headers(protocol_version: u32) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        PAIRING_PROTOCOL_HEADER,
+        header::HeaderValue::from_str(&protocol_version.to_string())
+            .expect("protocol versions are valid header values"),
+    );
+    headers.insert(
+        header::CONNECTION,
+        header::HeaderValue::from_static("close"),
+    );
+    headers
 }
 
 fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
@@ -909,9 +997,8 @@ async fn serving_health(
     if !authenticated {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(RemoteHealth {
+    Json(PairingHealth {
         protocol_version: state.protocol_version,
-        status: RemoteStatus::Available,
     })
     .into_response()
 }
