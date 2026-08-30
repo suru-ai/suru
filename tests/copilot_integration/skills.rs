@@ -5,9 +5,9 @@ use std::sync::Arc;
 use crate::{
     server_support::{next_skill_catalog, receive_initial_state},
     support::{
-        ScriptedCopilot, connect_arm, create_session_arm, current_model_arm, delete_session_arm,
-        destroy_session_arm, permission_decision_arm, send_arm, session_where, settled_session,
-        signed_in_arm, upgradable_connect_arm,
+        COPILOT_MODELS, ScriptedCopilot, connect_arm, create_session_arm, current_model_arm,
+        delete_session_arm, destroy_session_arm, models_arm, permission_decision_arm, send_arm,
+        session_where, settled_session, signed_in_arm, upgradable_connect_arm,
     },
 };
 use serde_json::json;
@@ -361,9 +361,10 @@ async fn a_partial_native_catalog_keeps_valid_skills_with_an_aggregate_warning()
 async fn copilot_invokes_one_skill_with_the_full_marker_free_input_and_sends_only_its_agent_prompt()
 {
     let copilot = ScriptedCopilot::new(&format!(
-        "{}{}{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}{}{}",
         connect_arm(),
         signed_in_arm(),
+        models_arm(COPILOT_MODELS),
         create_session_arm(),
         current_model_arm("claude-fixture", "high", "default"),
         command_catalog_arm(),
@@ -446,9 +447,10 @@ async fn copilot_invokes_one_skill_with_the_full_marker_free_input_and_sends_onl
 #[tokio::test]
 async fn copilot_expands_queued_and_steer_skills_before_using_each_native_delivery_mode() {
     let copilot = ScriptedCopilot::new(&format!(
-        "{}{}{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}{}{}",
         connect_arm(),
         signed_in_arm(),
+        models_arm(COPILOT_MODELS),
         create_session_arm(),
         current_model_arm("claude-fixture", "high", "default"),
         command_catalog_arm(),
@@ -598,9 +600,10 @@ async fn copilot_expands_queued_and_steer_skills_before_using_each_native_delive
 async fn unavailable_experimental_commands_make_skills_actionably_unavailable_without_text_fallback()
  {
     let copilot = ScriptedCopilot::new(&format!(
-        "{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}",
         connect_arm(),
         signed_in_arm(),
+        models_arm(COPILOT_MODELS),
         create_session_arm(),
         current_model_arm("claude-fixture", "high", "default"),
         unavailable_command_catalog_arm(),
@@ -685,9 +688,10 @@ async fn unavailable_experimental_commands_make_skills_actionably_unavailable_wi
 #[tokio::test]
 async fn a_failed_native_skill_invocation_fails_without_sending_literal_marker_text() {
     let copilot = ScriptedCopilot::new(&format!(
-        "{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}",
         connect_arm(),
         signed_in_arm(),
+        models_arm(COPILOT_MODELS),
         create_session_arm(),
         current_model_arm("claude-fixture", "high", "default"),
         command_catalog_arm(),
@@ -825,9 +829,10 @@ async fn native_skill_changes_refresh_identity_and_nonsteer_commands_do_not_adve
       event change-idle session.idle '{}'
 "#;
     let copilot = ScriptedCopilot::new(&format!(
-        "{}{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}{}",
         connect_arm(),
         signed_in_arm(),
+        models_arm(COPILOT_MODELS),
         create_session_arm(),
         current_model_arm("claude-fixture", "high", "default"),
         changing_nonsteer_skill_catalog_arms(),

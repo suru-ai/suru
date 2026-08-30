@@ -12,8 +12,8 @@ use ratatui::style::Color;
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
-        AgentSelection, Cost, CostBasis, ModelId, PromptId, ProviderId, SessionChange, SessionId,
-        SessionRevision, SessionUpdate, SkillCatalog, SkillCatalogCapabilities,
+        AgentSelection, Cost, CostBasis, ModelId, NativeMeter, PromptId, ProviderId, SessionChange,
+        SessionId, SessionRevision, SessionUpdate, SkillCatalog, SkillCatalogCapabilities,
         SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery,
         Turn, TurnId, TurnStatus, Usage, Workspace,
     },
@@ -39,6 +39,7 @@ fn session_composer_footer_sums_persisted_usage_across_all_turn_outcomes() {
         cache_read_tokens: Some(100_000),
         output_tokens: Some(5_000),
         reasoning_tokens: Some(3_000),
+        native_meter: NativeMeter::from_units(7.25),
         ..Usage::default()
     });
     snapshot.turns[0].cost = Cost::from_usd(0.31);
@@ -83,6 +84,10 @@ fn session_composer_footer_sums_persisted_usage_across_all_turn_outcomes() {
         assert!(
             !screen.contains("188K"),
             "cache traffic is excluded from the blended total: {screen}"
+        );
+        assert!(
+            !screen.contains("7.25"),
+            "the Provider-native premium-request meter has no footer surface: {screen}"
         );
     }
 }

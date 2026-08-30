@@ -31,8 +31,8 @@ use suru::{
     protocol::{
         Activity, ActivityId, ActivityStatus, CommandAutoExpand, Cost, CostBasis,
         CreateSessionRequest, EffectiveSettings, FileChange, FoldPosture, InitialPrompt, Message,
-        MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder,
-        PromptStatus, ReasoningVisibility, SessionChange, SessionId, SessionRevision,
+        MessageId, MessageRole, MessageStatus, NativeMeter, Prompt, PromptDelivery, PromptId,
+        PromptOrder, PromptStatus, ReasoningVisibility, SessionChange, SessionId, SessionRevision,
         SessionStatus, SessionTimestamp, SessionUpdate, SettingsSnapshot, TranscriptItem,
         TranscriptSettings, Turn, TurnId, TurnStatus, Usage, Workspace,
     },
@@ -5618,7 +5618,7 @@ fn a_settled_turn_fold_marker_renders_duration_blended_tokens_and_cost() {
         cache_write_tokens: Some(400),
         output_tokens: Some(900),
         reasoning_tokens: Some(2_100),
-        native_meter: None,
+        native_meter: NativeMeter::from_units(3.25),
         model_context_window: Some(200_000),
     });
     snapshot.turns[0].cost = Cost::from_usd(0.03);
@@ -5637,6 +5637,10 @@ fn a_settled_turn_fold_marker_renders_duration_blended_tokens_and_cost() {
     assert!(
         !rows.contains("12.2K tokens"),
         "cache traffic stays out of the blended count: {rows}"
+    );
+    assert!(
+        !rows.contains("3.25"),
+        "the Provider-native premium-request meter has no Turn Fold surface: {rows}"
     );
 }
 

@@ -12,8 +12,8 @@ use serde_json::Value;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
     protocol::{
-        AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId,
-        SessionId, SessionSnapshot, TurnStatus, Workspace,
+        AdmitPromptRequest, Cost, CostBasis, CreateSessionRequest, InitialPrompt, NativeMeter,
+        PromptDelivery, PromptId, SessionId, SessionSnapshot, TurnStatus, Usage, Workspace,
     },
     provider::CopilotRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -24,6 +24,11 @@ use suru::{
 const STREAMED_MESSAGE: &str = r#"      event e1 assistant.message_start '{"messageId":"m1"}'
       event e2 assistant.message_delta '{"messageId":"m1","deltaContent":"Still here"}'
       event e3 assistant.message '{"messageId":"m1","content":"Still here"}'
+      if [ "$attempt" -eq 1 ]; then
+        event u1 assistant.usage '{"model":"claude-fixture","inputTokens":100,"outputTokens":20,"cost":0.5}'
+      else
+        event u2 assistant.usage '{"model":"claude-fixture","inputTokens":40,"outputTokens":10,"cost":0.25}'
+      fi
       event e4 session.idle '{}'
 "#;
 
@@ -174,6 +179,30 @@ async fn a_reopened_session_resumes_its_persisted_copilot_session_after_a_restar
         2,
         "the restored Transcript keeps its first agent Message and gains the second"
     );
+    assert_eq!(
+        settled.turns[0].usage,
+        Some(Usage {
+            fresh_input_tokens: Some(100),
+            output_tokens: Some(20),
+            native_meter: NativeMeter::from_units(0.5),
+            ..Usage::default()
+        }),
+        "the original Turn's recorded Usage survives the restart"
+    );
+    assert_eq!(settled.turns[0].cost, Cost::from_usd(0.0036));
+    assert_eq!(settled.turns[0].cost_basis, Some(CostBasis::Reported));
+    assert_eq!(
+        settled.turns[1].usage,
+        Some(Usage {
+            fresh_input_tokens: Some(40),
+            output_tokens: Some(10),
+            native_meter: NativeMeter::from_units(0.25),
+            ..Usage::default()
+        }),
+        "ephemeral events after resume belong only to the new Turn"
+    );
+    assert_eq!(settled.turns[1].cost, Cost::from_usd(0.0016));
+    assert_eq!(settled.turns[1].cost_basis, Some(CostBasis::Reported));
 
     assert_eq!(
         copilot.launches(),

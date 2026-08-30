@@ -23,6 +23,7 @@ use tokio::{
 use super::{
     concise_remote_message, copilot_error, copilot_error_context,
     event_drain::{CopilotEventDrain, EventDrainCheckpoint},
+    pricing::CopilotPricing,
 };
 use crate::{
     protocol::ProviderUnavailability,
@@ -71,6 +72,7 @@ impl HarnessConnector for CopilotConnector {
             invalidator,
             event_drain,
             warning: Arc::new(OnceLock::new()),
+            pricing: Arc::new(StdMutex::new(CopilotPricing::default())),
         })
     }
 
@@ -149,6 +151,10 @@ pub(super) struct CopilotConnection {
     event_drain: CopilotEventDrain,
     /// Non-blocking package-version guidance learned once when this process handshakes.
     warning: Arc<OnceLock<Option<String>>>,
+    /// The prices most recently published by this harness generation. Session
+    /// projections share it so a catalog refresh changes only future recorded
+    /// Costs; Turns already stamped by the store remain frozen.
+    pricing: Arc<StdMutex<CopilotPricing>>,
 }
 
 /// Why this connection stopped serving requests, once it has.
@@ -175,13 +181,39 @@ impl CopilotConnection {
     /// every catalog refresh, so this asks the CLI each time.
     pub(super) async fn list_models(&self) -> Result<Vec<Model>, ProviderError> {
         self.verify_signed_in().await?;
-        self.client
+        let models = self
+            .client
             .rpc()
             .models()
             .list()
             .await
             .map(|listed| listed.models)
-            .map_err(|error| self.failure("Copilot Model discovery failed", error))
+            .map_err(|error| self.failure("Copilot Model discovery failed", error))?;
+        self.pricing
+            .lock()
+            .expect("Copilot pricing lock is not poisoned")
+            .replace(&models);
+        Ok(models)
+    }
+
+    pub(super) fn pricing(&self) -> Arc<StdMutex<CopilotPricing>> {
+        self.pricing.clone()
+    }
+
+    /// Loads Copilot's published prices once for a harness generation. A
+    /// Session can already have a Model in force without the client ever
+    /// listing Models, so startup asks here independently; failure deliberately
+    /// degrades only Cost and leaves the Session usable.
+    pub(super) async fn ensure_pricing(&self) {
+        if self
+            .pricing
+            .lock()
+            .expect("Copilot pricing lock is not poisoned")
+            .is_loaded()
+        {
+            return;
+        }
+        let _ = self.list_models().await;
     }
 
     /// Fails with the typed not-signed-in condition unless the CLI holds credentials it can work

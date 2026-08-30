@@ -45,9 +45,10 @@ use github_copilot_sdk::{
     EventSubscription, SessionEvent,
     session_events::{
         AssistantMessageData, AssistantMessageDeltaData, AssistantMessageStartData,
-        AssistantReasoningData, AssistantReasoningDeltaData, SessionErrorData, SessionEventType,
-        SessionIdleData, SubagentCompletedData, SubagentFailedData, SubagentStartedData,
-        ToolExecutionCompleteData, ToolExecutionPartialResultData, ToolExecutionStartData,
+        AssistantReasoningData, AssistantReasoningDeltaData, AssistantUsageData, SessionErrorData,
+        SessionEventType, SessionIdleData, SubagentCompletedData, SubagentFailedData,
+        SubagentStartedData, ToolExecutionCompleteData, ToolExecutionPartialResultData,
+        ToolExecutionStartData,
     },
     subscription::RecvErrorKind,
 };
@@ -55,8 +56,10 @@ use tokio::sync::mpsc;
 
 use super::{
     COPILOT_FAILURE_FALLBACK, copilot_error, event_drain::EventDrainCheckpoint,
-    skills::CopilotSkills, tools::command_text, transport::CopilotConnection,
+    pricing::CopilotPricing, skills::CopilotSkills, tools::command_text,
+    transport::CopilotConnection,
 };
+use crate::protocol::{Cost, NativeMeter, Usage};
 use crate::provider::{
     AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
     ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderSubagentId,
@@ -90,6 +93,10 @@ pub(super) struct CopilotCorrelation {
     /// that output turns out to be; a Turn beginning clears it, because from then on such
     /// output has a Turn to land in.
     late_settle_owes_continuation: bool,
+    /// Copilot's most recently published per-Model prices. The connection
+    /// updates this on catalog discovery; each usage event reads it once while
+    /// the call still belongs to an active Turn.
+    pricing: Arc<StdMutex<CopilotPricing>>,
 }
 
 /// One stretch of Copilot's loop that Suru reads as a Turn, and the main conversation's state
@@ -134,6 +141,43 @@ struct ConversationStreams {
     /// The Commands the conversation is still running, by the Tool call identity Copilot gave
     /// each. Copilot runs several Tools at once, so a conversation holds as many as it started.
     commands: HashMap<String, ActiveCommand>,
+    /// The cumulative reading for this conversation's one Suru Turn. Copilot
+    /// emits one usage event per model call and gives it no Turn identity, so
+    /// this state lives exactly as long as the surrounding Turn streams do.
+    metering: Option<CopilotTurnMetering>,
+}
+
+struct CopilotTurnMetering {
+    usage: Usage,
+    reported_cost: Option<Cost>,
+}
+
+impl CopilotTurnMetering {
+    fn record(&mut self, usage: Usage, reported_cost: Option<Cost>) -> ProviderEvent {
+        self.usage.fresh_input_tokens =
+            add_reported_counts(self.usage.fresh_input_tokens, usage.fresh_input_tokens);
+        self.usage.cache_read_tokens =
+            add_reported_counts(self.usage.cache_read_tokens, usage.cache_read_tokens);
+        self.usage.cache_write_tokens =
+            add_reported_counts(self.usage.cache_write_tokens, usage.cache_write_tokens);
+        self.usage.output_tokens =
+            add_reported_counts(self.usage.output_tokens, usage.output_tokens);
+        self.usage.reasoning_tokens =
+            add_reported_counts(self.usage.reasoning_tokens, usage.reasoning_tokens);
+        self.usage.native_meter = self
+            .usage
+            .native_meter
+            .zip(usage.native_meter)
+            .and_then(|(current, next)| current.checked_add(next));
+        self.reported_cost = self
+            .reported_cost
+            .zip(reported_cost)
+            .and_then(|(current, next)| current.checked_add(next));
+        ProviderEvent::Usage {
+            usage: self.usage.clone(),
+            reported_cost: self.reported_cost,
+        }
+    }
 }
 
 /// The agent Message Copilot is still streaming, and the text it has carried so far — against
@@ -171,7 +215,12 @@ struct ActiveReasoning {
 }
 
 impl CopilotCorrelation {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::with_pricing(Arc::new(StdMutex::new(CopilotPricing::default())))
+    }
+
+    pub(super) fn with_pricing(pricing: Arc<StdMutex<CopilotPricing>>) -> Self {
         Self {
             turn: None,
             stale_stretches: 0,
@@ -179,6 +228,7 @@ impl CopilotCorrelation {
             spawns: HashMap::new(),
             delegations: HashSet::new(),
             late_settle_owes_continuation: false,
+            pricing,
         }
     }
 
@@ -432,6 +482,18 @@ fn project_session_event(
         let Some(streams) = correlation.subagents.get_mut(&subagent) else {
             return Ok(Vec::new());
         };
+        if event.parsed_type() == SessionEventType::AssistantUsage {
+            let usage: AssistantUsageData = decode(&event)?;
+            let reported_cost = correlation
+                .pricing
+                .lock()
+                .expect("Copilot pricing lock is not poisoned")
+                .cost(&usage);
+            return Ok(vec![attributed(
+                Some(&subagent),
+                project_usage(streams, usage, reported_cost),
+            )]);
+        }
         return Ok(
             project_conversation_event(streams, &mut correlation.delegations, &event)?
                 .into_iter()
@@ -455,6 +517,25 @@ fn project_session_event(
                 .into_iter()
                 .map(|projected| attributed(None, projected))
                 .collect())
+        }
+        SessionEventType::AssistantUsage => {
+            if correlation.open_main_streams().is_none() {
+                return Ok(Vec::new());
+            }
+            let usage: AssistantUsageData = decode(&event)?;
+            let reported_cost = correlation
+                .pricing
+                .lock()
+                .expect("Copilot pricing lock is not poisoned")
+                .cost(&usage);
+            let turn = correlation
+                .turn
+                .as_mut()
+                .expect("usage opened or found the main conversation's Turn");
+            Ok(vec![attributed(
+                None,
+                project_usage(&mut turn.streams, usage, reported_cost),
+            )])
         }
         // Content the Transcript presents belongs to a Turn, so late content — like the error
         // above — opens a Continuation stretch for what it carries; everything else on the
@@ -480,6 +561,60 @@ fn project_session_event(
         }
         _ => Ok(Vec::new()),
     }
+}
+
+fn project_usage(
+    streams: &mut ConversationStreams,
+    reported: AssistantUsageData,
+    reported_cost: Option<Cost>,
+) -> ProviderEvent {
+    let usage = Usage {
+        fresh_input_tokens: exclusive_count(
+            reported.input_tokens,
+            [reported.cache_read_tokens, reported.cache_write_tokens],
+        ),
+        cache_read_tokens: reported_count(reported.cache_read_tokens),
+        cache_write_tokens: reported_count(reported.cache_write_tokens),
+        output_tokens: exclusive_count(reported.output_tokens, [reported.reasoning_tokens, None]),
+        reasoning_tokens: reported_count(reported.reasoning_tokens),
+        native_meter: reported.cost.and_then(NativeMeter::from_units),
+        model_context_window: None,
+    };
+    match streams.metering.as_mut() {
+        Some(metering) => metering.record(usage, reported_cost),
+        None => {
+            let event = ProviderEvent::Usage {
+                usage: usage.clone(),
+                reported_cost,
+            };
+            streams.metering = Some(CopilotTurnMetering {
+                usage,
+                reported_cost,
+            });
+            event
+        }
+    }
+}
+
+fn reported_count(count: Option<i64>) -> Option<u64> {
+    count.and_then(|count| u64::try_from(count).ok())
+}
+
+fn exclusive_count(total: Option<i64>, subsets: [Option<i64>; 2]) -> Option<u64> {
+    let total = reported_count(total)?;
+    subsets.into_iter().try_fold(total, |remaining, subset| {
+        let subset = match subset {
+            Some(count) => u64::try_from(count).ok()?,
+            None => 0,
+        };
+        remaining.checked_sub(subset)
+    })
+}
+
+fn add_reported_counts(current: Option<u64>, next: Option<u64>) -> Option<u64> {
+    current
+        .zip(next)
+        .map(|(current, next)| current.saturating_add(next))
 }
 
 /// Whether an event carries conversation content this projection presents.

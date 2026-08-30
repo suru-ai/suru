@@ -136,6 +136,7 @@ pub(super) async fn start_copilot_session(
         Some(selection) => selection.clone(),
         None => default_selection(&handle, context).await?,
     };
+    handle.connection().ensure_pricing().await;
     let subscription = native.subscribe();
     let event_drain = handle
         .connection()
@@ -147,7 +148,9 @@ pub(super) async fn start_copilot_session(
         .expect("Copilot Resume State serialization is infallible"),
     );
 
-    let correlation = Arc::new(StdMutex::new(CopilotCorrelation::new()));
+    let correlation = Arc::new(StdMutex::new(CopilotCorrelation::with_pricing(
+        handle.connection().pricing(),
+    )));
     let events = provider_events(
         subscription,
         handle.clone(),

@@ -12,14 +12,31 @@ use crate::support::{
 use serde_json::Value;
 use suru::{
     protocol::{
-        Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, InitialPrompt,
-        MessageStatus, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
-        ModelOptionValue, PromptDelivery, PromptId, PromptStatus, ProviderId, TurnStatus,
-        Workspace,
+        Activity, AdmitPromptRequest, AgentSelection, Cost, CostBasis, CreateSessionRequest,
+        InitialPrompt, MessageStatus, ModelId, ModelOptionChoiceId, ModelOptionId,
+        ModelOptionSelection, ModelOptionValue, NativeMeter, PromptDelivery, PromptId,
+        PromptStatus, ProviderId, TurnStatus, Usage, Workspace,
     },
     provider::CopilotRuntime,
     server::{self, ServerConfig},
 };
+
+/// Two Turns whose native per-call usage has no Turn identity of its own. The first carries two
+/// calls under a priced Model; the second carries one call under a Model Copilot did not publish
+/// prices for. `sends` belongs to the fixture process, so the same `session.send` arm can play the
+/// two distinct stretches in order.
+const METERED_TURNS: &str = r#"      sends=$(( ${sends:-0} + 1 ))
+      if [ "$sends" -eq 1 ]; then
+        event u1 assistant.usage '{"model":"claude-fixture","inputTokens":1000,"cacheReadTokens":100,"cacheWriteTokens":50,"outputTokens":200,"reasoningTokens":50,"cost":1.5}'
+        event u2 assistant.usage '{"model":"claude-fixture","inputTokens":500,"cacheReadTokens":50,"cacheWriteTokens":0,"outputTokens":100,"reasoningTokens":0,"cost":0.5}'
+        event m1 assistant.message '{"messageId":"m1","content":"First answer"}'
+        event i1 session.idle '{}'
+      else
+        event u3 assistant.usage '{"model":"unpriced-fixture","inputTokens":100,"outputTokens":20,"cost":0.25}'
+        event m2 assistant.message '{"messageId":"m2","content":"Second answer"}'
+        event i2 session.idle '{}'
+      fi
+"#;
 
 /// One agent Message arriving as Copilot produces it, then the loop going idle.
 const STREAMED_MESSAGE: &str = r#"      event e1 assistant.message_start '{"messageId":"m1"}'
@@ -48,6 +65,106 @@ fn selection(model: &str, effort: &str, tier: &str) -> AgentSelection {
             },
         ],
     }
+}
+
+#[tokio::test]
+async fn copilot_per_call_usage_is_bracketed_into_turns_with_reported_catalog_cost() {
+    let copilot = conversation_fixture(METERED_TURNS);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "copilot-metered-turns").expect("configure server"),
+        Arc::new(CopilotRuntime::new(copilot.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let client = connect(state_dir.path(), "copilot-metered-turns").await;
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Measure two Turns".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let mut feed = client
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe to Session SSE");
+    let first = settled_session_on(&client, &mut feed, created.session.id, 0).await;
+
+    assert_eq!(
+        first.turns[0].usage,
+        Some(Usage {
+            fresh_input_tokens: Some(1_300),
+            cache_read_tokens: Some(150),
+            cache_write_tokens: Some(50),
+            output_tokens: Some(250),
+            reasoning_tokens: Some(50),
+            native_meter: NativeMeter::from_units(2.0),
+            model_context_window: None,
+        }),
+        "both calls are summed into the first Turn with disjoint token parts"
+    );
+    assert_eq!(first.turns[0].cost, Cost::from_usd(0.052));
+    assert_eq!(first.turns[0].cost_basis, Some(CostBasis::Reported));
+    assert_eq!(
+        serde_json::to_value(first.turns[0].usage.as_ref().expect("first Turn Usage"))
+            .expect("serialize Usage")["native_meter"],
+        serde_json::json!(2.0),
+        "fractional per-call premium-request cost is retained as the Turn's native meter"
+    );
+
+    client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Measure another Turn".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("admit second Prompt");
+    let second = settled_session_on(&client, &mut feed, created.session.id, 1).await;
+
+    assert_eq!(
+        second.turns[1].usage,
+        Some(Usage {
+            fresh_input_tokens: Some(100),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            output_tokens: Some(20),
+            reasoning_tokens: None,
+            native_meter: NativeMeter::from_units(0.25),
+            model_context_window: None,
+        }),
+        "the second Turn starts its own token accumulator"
+    );
+    assert_eq!(
+        serde_json::to_value(second.turns[1].usage.as_ref().expect("second Turn Usage"))
+            .expect("serialize Usage")["native_meter"],
+        serde_json::json!(0.25),
+    );
+    assert_eq!(second.turns[1].cost, None, "unknown pricing stays absent");
+    assert_eq!(second.turns[1].cost_basis, None);
+    assert_eq!(
+        second.turns[0].usage, first.turns[0].usage,
+        "later per-call events do not bleed into a settled Turn"
+    );
+
+    drop(feed);
+    server.shutdown().await.expect("shut the server down");
 }
 
 #[tokio::test]

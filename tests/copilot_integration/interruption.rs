@@ -6,7 +6,10 @@ use crate::support::{
     silent_abort_arm,
 };
 use suru::{
-    protocol::{Activity, ActivityStatus, MessageStatus, SessionStatus, TurnStatus},
+    protocol::{
+        Activity, ActivityStatus, Cost, CostBasis, MessageStatus, NativeMeter, SessionStatus,
+        TurnStatus, Usage,
+    },
     provider::CopilotRuntime,
 };
 use tokio::time::{Duration, timeout};
@@ -16,10 +19,11 @@ const WORK_IN_FLIGHT: &str = r#"      event e1 assistant.message_start '{"messag
       event e2 assistant.message_delta '{"messageId":"m1","deltaContent":"Halfway"}'
       event e3 assistant.reasoning_delta '{"reasoningId":"r1","deltaContent":"**Weighing it up**\n\nStill going"}'
       event e4 tool.execution_start '{"toolCallId":"t1","toolName":"bash","arguments":{"command":"sleep 600"}}'
+      event e5 assistant.usage '{"model":"claude-fixture","inputTokens":100,"outputTokens":20,"cost":0.5}'
 "#;
 
 /// What Copilot reports once the abort has stopped its loop.
-const ABORTED_IDLE: &str = r#"      event e5 session.idle '{"aborted":true}'
+const ABORTED_IDLE: &str = r#"      event e6 session.idle '{"aborted":true}'
 "#;
 
 #[tokio::test]
@@ -49,6 +53,18 @@ async fn an_interrupt_settles_the_turn_and_everything_it_left_running() {
         .await;
 
     assert_eq!(interrupted.turns[0].status, TurnStatus::Interrupted);
+    assert_eq!(
+        interrupted.turns[0].usage,
+        Some(Usage {
+            fresh_input_tokens: Some(100),
+            output_tokens: Some(20),
+            native_meter: NativeMeter::from_units(0.5),
+            ..Usage::default()
+        }),
+        "the interrupted Turn keeps usage from calls Copilot completed before the abort"
+    );
+    assert_eq!(interrupted.turns[0].cost, Cost::from_usd(0.0036));
+    assert_eq!(interrupted.turns[0].cost_basis, Some(CostBasis::Reported));
     assert_eq!(interrupted.session.status, SessionStatus::Idle);
     let [message] = agent_messages(&interrupted)[..] else {
         panic!(

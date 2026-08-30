@@ -25,6 +25,7 @@
 mod catalog;
 mod errand;
 mod event_drain;
+mod pricing;
 mod projection;
 mod runtime;
 mod session;

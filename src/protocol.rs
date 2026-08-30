@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 26;
+pub const PROTOCOL_VERSION: u32 = 27;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
@@ -1514,8 +1514,54 @@ pub struct Usage {
     /// A Provider-native usage figure retained for a future Provider-specific
     /// surface. Its unit belongs to that Provider and is deliberately not
     /// interpreted as dollars here.
-    pub native_meter: Option<u64>,
+    pub native_meter: Option<NativeMeter>,
     pub model_context_window: Option<u64>,
+}
+
+/// A non-negative figure in a Provider's own metering unit. Like [`Cost`], it
+/// uses billionths internally so a fractional native figure remains exact
+/// across protocol and persistence round-trips; unlike Cost, its unit is not
+/// assumed to be dollars.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct NativeMeter(u64);
+
+impl NativeMeter {
+    const FRACTIONS_PER_UNIT: f64 = 1_000_000_000.0;
+
+    pub fn from_units(units: f64) -> Option<Self> {
+        if !units.is_finite() || units < 0.0 || units > u64::MAX as f64 / Self::FRACTIONS_PER_UNIT {
+            return None;
+        }
+        Some(Self((units * Self::FRACTIONS_PER_UNIT).round() as u64))
+    }
+
+    pub fn as_units(self) -> f64 {
+        self.0 as f64 / Self::FRACTIONS_PER_UNIT
+    }
+
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(Self)
+    }
+}
+
+impl Serialize for NativeMeter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_f64(self.as_units())
+    }
+}
+
+impl<'de> Deserialize<'de> for NativeMeter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let units = f64::deserialize(deserializer)?;
+        Self::from_units(units)
+            .ok_or_else(|| D::Error::custom("native meter must be a non-negative figure"))
+    }
 }
 
 impl Usage {

@@ -28,7 +28,9 @@ pub const COPILOT_MODELS: &str = concat!(
     r#"[{"id":"auto","name":"Auto","capabilities":{}},"#,
     r#"{"id":"claude-fixture","name":"Claude Fixture","capabilities":{},"#,
     r#""supportedReasoningEfforts":["low","high"],"defaultReasoningEffort":"high","#,
-    r#""supportedContextTiers":["default","long_context"]}]"#,
+    r#""supportedContextTiers":["default","long_context"],"#,
+    r#""billing":{"tokenPrices":{"batchSize":1000,"inputPrice":2.0,"#,
+    r#""outputPrice":8.0,"cacheReadPrice":0.5,"cacheWritePrice":2.5}}}]"#,
 );
 
 /// Reads one Content-Length-framed request at a time, records it, and dispatches it to the test's

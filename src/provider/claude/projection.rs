@@ -189,7 +189,11 @@ impl ClaudeTurnMetering {
             add_reported_counts(self.usage.output_tokens, usage.output_tokens);
         self.usage.reasoning_tokens =
             add_reported_counts(self.usage.reasoning_tokens, usage.reasoning_tokens);
-        self.usage.native_meter = add_reported_counts(self.usage.native_meter, usage.native_meter);
+        self.usage.native_meter = self
+            .usage
+            .native_meter
+            .zip(usage.native_meter)
+            .and_then(|(current, next)| current.checked_add(next));
         self.usage.model_context_window = self
             .usage
             .model_context_window
