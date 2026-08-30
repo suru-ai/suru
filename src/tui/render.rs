@@ -2094,7 +2094,10 @@ fn render_session(
             );
             slots.working_indicator(&context, default)
         });
-    let working_indicator_lines = rendered_slot_lines(working_indicator, content_width, theme);
+    let mut working_indicator_lines = rendered_slot_lines(working_indicator, content_width, theme);
+    if !working_indicator_lines.is_empty() {
+        working_indicator_lines.insert(0, Line::default());
+    }
     let (agent, agent_style) = if let Some(error) = state.submission_error.as_ref() {
         (
             format!(

@@ -432,8 +432,12 @@ fn working_indicator_is_the_transient_tail_of_the_transcript() {
     let indicator = rendered_row(&rows, "Working (0s • Esc to interrupt)");
     assert_eq!(
         indicator,
-        transcript_tail + 1,
-        "the Working Indicator immediately follows the latest Transcript row"
+        transcript_tail + 2,
+        "one empty row separates the Working Indicator from the latest Transcript row"
+    );
+    assert!(
+        rows[indicator - 1].trim().is_empty(),
+        "the Working Indicator has breathing room above it"
     );
     assert!(
         rows[indicator + 1].trim().is_empty(),

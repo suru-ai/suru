@@ -626,7 +626,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
         .expect("publish first Agent Message chunk");
     apply_next_session_event(&mut application, &mut subscription).await;
 
-    let partial = rendered_application_buffer(&application, 100, 34);
+    let partial = rendered_application_buffer(&application, 100, 35);
     assert_eq!(
         buffer_rows(&partial)
             .iter()
@@ -652,7 +652,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
         .expect("complete Agent Message");
     apply_next_session_event(&mut application, &mut subscription).await;
 
-    let completed = rendered_application_buffer(&application, 100, 34);
+    let completed = rendered_application_buffer(&application, 100, 35);
     let rows = buffer_rows(&completed);
     let screen = rows.join("\n");
     for readable in [

@@ -9,24 +9,33 @@ use ratatui::style::{Color, Modifier, Style};
 pub(super) const TICK_PERIOD: Duration = Duration::from_millis(32);
 
 const CYCLE_MILLIS: u64 = 2_000;
-const EDGE_PADDING: f64 = 10.0;
 const BAND_HALF_WIDTH: f64 = 5.0;
+// Keep the band just far enough beyond either edge that the palette fallback
+// shows one leading character before the rest of the label joins the sweep.
+const EDGE_OVERHANG: f64 = 3.5;
 
 /// One style per character. All Shimmers share the run loop's frame clock, so
 /// appearing text joins the process-wide sweep instead of starting a private
 /// timer that would have to enter transcript state or its cache key.
 pub(super) fn styles(text: &str, frame: usize, base: Style) -> Vec<Style> {
+    styles_for_color_mode(
+        text,
+        frame,
+        base,
+        *TRUECOLOR.get_or_init(|| available_color_count() == u16::MAX),
+    )
+}
+
+fn styles_for_color_mode(text: &str, frame: usize, base: Style, truecolor: bool) -> Vec<Style> {
     let character_count = text.chars().count();
     if character_count == 0 {
         return Vec::new();
     }
-    let period = character_count as f64 + EDGE_PADDING * 2.0;
     let elapsed = (frame as u64).saturating_mul(TICK_PERIOD.as_millis() as u64) % CYCLE_MILLIS;
-    // Begin with the bright band on the first character. The padding still
-    // carries it fully off either end during the rest of the sweep.
-    let center = elapsed as f64 / CYCLE_MILLIS as f64 * period;
-    let truecolor = *TRUECOLOR.get_or_init(|| available_color_count() == u16::MAX);
-
+    let progress = elapsed as f64 / CYCLE_MILLIS as f64;
+    let first_center = -EDGE_OVERHANG;
+    let last_center = character_count.saturating_sub(1) as f64 + EDGE_OVERHANG;
+    let center = first_center + progress * (last_center - first_center);
     (0..character_count)
         .map(|index| shimmer_style(base, intensity(index as f64 - center), truecolor))
         .collect()
@@ -89,6 +98,36 @@ mod tests {
         assert_eq!(
             styles("Working", 0, Style::default()),
             styles("Working", frames, Style::default())
+        );
+    }
+
+    #[test]
+    fn a_sweep_enters_on_the_first_character_and_leaves_on_the_last() {
+        let base = Style::default();
+        let resting = shimmer_style(base, 0.0, false);
+        let opening = styles_for_color_mode("Working", 0, base, false);
+        let closing = styles_for_color_mode(
+            "Working",
+            (CYCLE_MILLIS / TICK_PERIOD.as_millis() as u64) as usize,
+            base,
+            false,
+        );
+
+        assert_ne!(opening[0], resting, "the first character starts the sweep");
+        assert!(
+            opening[1..].iter().all(|style| *style == resting),
+            "the sweep does not begin with several characters already highlighted"
+        );
+        assert_ne!(
+            closing[closing.len() - 1],
+            resting,
+            "the last character finishes the sweep before it wraps"
+        );
+        assert!(
+            closing[..closing.len() - 1]
+                .iter()
+                .all(|style| *style == resting),
+            "the trailing edge has left the earlier characters"
         );
     }
 }
