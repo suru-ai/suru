@@ -18,6 +18,7 @@ use super::{
     SessionListRequest, SessionListScope, SessionListSurface,
     commands::{SemanticCommandId, SemanticInvocation},
     session_listing::SessionListing,
+    workspace_path::read_workspace,
 };
 
 /// The columns the Sidebar occupies, cloning t3 code's own fixed column. There
@@ -54,13 +55,6 @@ pub(super) const ADD_WORKSPACE: &str = " + ";
 
 /// What the path entry says when the reader offers it nothing.
 const NAME_A_DIRECTORY: &str = "Name a directory";
-
-/// What it says of a path nothing stands at.
-const NO_DIRECTORY_THERE: &str = "No directory there";
-
-/// What it says of a path standing at something other than a directory, which
-/// a Workspace cannot be rooted at.
-const NOT_A_DIRECTORY: &str = "Not a directory";
 
 /// The Workspaces the Sidebar draws: every one the reader has work in, or a
 /// single one of them.
@@ -1314,12 +1308,10 @@ impl Sidebar {
             return self.refuse_workspace(NAME_A_DIRECTORY);
         }
         let named = self.listing.current_workspace().join(named);
-        let Ok(candidate) = std::fs::canonicalize(&named) else {
-            return self.refuse_workspace(NO_DIRECTORY_THERE);
+        let candidate = match read_workspace(&named) {
+            Ok(candidate) => candidate,
+            Err(refusal) => return self.refuse_workspace(refusal.message()),
         };
-        if !candidate.is_dir() {
-            return self.refuse_workspace(NOT_A_DIRECTORY);
-        }
         // The reader is done in the Sidebar: they came to say where the work
         // is, and the work itself is written in the composer.
         self.hand_back_keys();

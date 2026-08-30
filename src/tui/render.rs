@@ -292,13 +292,18 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
     let area = centered_rect(
         main,
         main.width.saturating_sub(4).min(72),
-        main.height.saturating_sub(2).min(12),
+        main.height
+            .saturating_sub(2)
+            .max(4)
+            .min(main.height)
+            .min(12),
     );
     let content_width = usize::from(area.width.saturating_sub(2));
     let content_height = usize::from(area.height.saturating_sub(2));
     let mut lines = Vec::with_capacity(content_height);
-    let shows_search_and_footer = content_height >= 3;
-    if shows_search_and_footer {
+    let shows_search = content_height >= 3;
+    let shows_footer = content_height >= 2;
+    if shows_search {
         lines.push(Line::styled(
             picker_search_line(state.workspace_picker.query(), content_width),
             theme.text.subdued,
@@ -315,7 +320,7 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
     if state.workspace_picker.is_loading() && lines.len() < content_height {
         lines.push(Line::styled("Loading Workspaces…", theme.text.subdued));
     } else {
-        let footer_rows = usize::from(shows_search_and_footer);
+        let footer_rows = usize::from(shows_footer);
         let capacity = content_height.saturating_sub(lines.len() + footer_rows);
         let rows = state
             .workspace_picker
@@ -339,18 +344,20 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
             lines.extend(rows);
         }
     }
-    if shows_search_and_footer && lines.len() < content_height {
+    if shows_footer && lines.len() < content_height {
         // Named in full where the box can hold it, and by the keys alone where
         // it cannot — the same trade the rows make of "[current]" for "C", so
         // a narrow terminal loses wording rather than an affordance.
-        let footer = if content_width < usize::from(NARROW_TERMINAL_WIDTH) {
-            "Enter · Esc"
+        let (footer, style) = if let Some(refusal) = state.workspace_picker.refusal() {
+            (refusal, theme.feedback.error)
+        } else if content_width < usize::from(NARROW_TERMINAL_WIDTH) {
+            ("Enter · Esc", theme.text.subdued)
         } else {
-            "Enter switch · Esc close"
+            ("Enter switch · Esc close", theme.text.subdued)
         };
         lines.push(Line::styled(
             truncate_to_width(footer, content_width),
-            theme.text.subdued,
+            style,
         ));
     }
     render_overlay_box(frame, area, lines, " Workspaces ", theme);

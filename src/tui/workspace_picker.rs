@@ -6,8 +6,11 @@ use std::path::PathBuf;
 use crate::protocol::SessionListItem;
 
 use super::{
-    SessionListRequest, SessionListScope, SessionListSurface, fuzzy::fuzzy_matches,
-    session_listing::SessionListing, sidebar::workspace_name,
+    SessionListRequest, SessionListScope, SessionListSurface,
+    fuzzy::fuzzy_matches,
+    session_listing::SessionListing,
+    sidebar::workspace_name,
+    workspace_path::{WorkspacePathRefusal, read_workspace},
 };
 
 #[derive(Clone, Debug)]
@@ -26,6 +29,10 @@ pub(super) struct WorkspacePicker {
     /// number so a listing landing beneath them leaves them on the Workspace
     /// they were choosing rather than on whatever now stands in its place.
     selected: Option<PathBuf>,
+    /// Why the selected Workspace could not be read when the reader chose it.
+    /// It belongs to the picker rather than to the listing: the row is still
+    /// true of past work even when its directory has since disappeared.
+    refusal: Option<WorkspacePathRefusal>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,6 +60,7 @@ impl WorkspacePicker {
             ),
             query: String::new(),
             selected: None,
+            refusal: None,
         }
     }
 
@@ -60,6 +68,7 @@ impl WorkspacePicker {
         self.open = true;
         self.query.clear();
         self.selected = None;
+        self.refusal = None;
         self.listing.clear_error();
         self.listing.refresh()
     }
@@ -68,6 +77,7 @@ impl WorkspacePicker {
         self.open = false;
         self.query.clear();
         self.selected = None;
+        self.refusal = None;
         self.listing.clear();
     }
 
@@ -87,6 +97,13 @@ impl WorkspacePicker {
         &self.query
     }
 
+    pub(super) const fn refusal(&self) -> Option<&'static str> {
+        match self.refusal {
+            Some(refusal) => Some(refusal.message()),
+            None => None,
+        }
+    }
+
     /// Takes what the reader typed into the query, and leaves them on a
     /// Workspace the narrowed list still offers.
     ///
@@ -96,12 +113,14 @@ impl WorkspacePicker {
     /// towards one they can already see should not be walked away from it.
     pub(super) fn insert(&mut self, text: &str) {
         self.query.push_str(text);
+        self.refusal = None;
         self.keep_selection_offered();
     }
 
     /// Gives the last character of the query back, widening the list again.
     pub(super) fn delete_backward(&mut self) {
         self.query.pop();
+        self.refusal = None;
         self.keep_selection_offered();
     }
 
@@ -150,8 +169,15 @@ impl WorkspacePicker {
     /// The Workspace the row the reader is on names, which is the one choosing
     /// takes. There is none while the listing is on its way: no row is marked,
     /// so Enter names nothing rather than naming whatever would stand first.
-    pub(super) fn selected(&self) -> Option<PathBuf> {
-        self.selected.clone()
+    pub(super) fn offer_selected(&mut self) -> Option<PathBuf> {
+        let selected = self.selected.as_ref()?;
+        match read_workspace(selected) {
+            Ok(workspace) => Some(workspace),
+            Err(refusal) => {
+                self.refusal = Some(refusal);
+                None
+            }
+        }
     }
 
     pub(super) fn select_previous(&mut self) {
@@ -216,6 +242,7 @@ impl WorkspacePicker {
     }
 
     fn move_selection(&mut self, distance: isize) {
+        self.refusal = None;
         let offered = self.offered();
         if offered.is_empty() {
             self.selected = None;

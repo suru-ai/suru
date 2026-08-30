@@ -2122,7 +2122,7 @@ impl Application {
             // it. Before the listing arrives no row is the reader's, so there
             // is nothing to choose and the picker stands on its loading line.
             CommandId::SelectWorkspace => {
-                if let Some(workspace) = self.state.workspace_picker.selected() {
+                if let Some(workspace) = self.state.workspace_picker.offer_selected() {
                     self.state.workspace_picker.close();
                     self.state.adopt_workspace(workspace);
                     return self.open_landing();

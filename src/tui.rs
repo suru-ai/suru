@@ -22,6 +22,7 @@ mod subagent_picker;
 mod text_layout;
 mod transcript;
 mod usage;
+mod workspace_path;
 mod workspace_picker;
 
 pub use commands::{NumericDigit, SemanticCommandId};

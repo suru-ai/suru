@@ -405,8 +405,9 @@ fn a_press_over_the_rows_moves_nothing() {
 /// the first Prompt of a Session rooted there.
 #[test]
 fn enter_closes_the_picker_and_shows_the_landing_of_the_workspace_chosen() {
-    let here = workspace(&["work", "here"]);
-    let atlas = workspace(&["work", "atlas"]);
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
 
     open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
@@ -436,12 +437,140 @@ fn enter_closes_the_picker_and_shows_the_landing_of_the_workspace_chosen() {
     );
 }
 
+/// A Workspace offered from old work may have disappeared since the listing
+/// was recorded. Choosing it costs nothing: the refusal stands where the
+/// reader can see it, and the picker leaves both their row and its listing in
+/// place so they can choose again.
+#[test]
+fn a_workspace_whose_directory_is_gone_is_refused_in_place_and_moves_nothing() {
+    let here = workspace_dir();
+    let gone = here.path().join("gone");
+    let atlas = workspace_in(here.path(), "atlas");
+    let mut application = connected_application(here.path());
+
+    let mut sessions = vec![
+        rooted("Gone work", &gone, 100),
+        rooted("Atlas work", &atlas, 90),
+    ];
+    for (index, name) in [
+        "ledger", "engine", "notes", "website", "service", "client", "tools", "archive",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sessions.push(rooted(
+            "Older work",
+            &workspace(&["work", name]),
+            80 - index as u64,
+        ));
+    }
+    open_picker_with(&mut application, sessions);
+    press(&mut application, KeyCode::Down);
+    let rows_before = picker_rows(&application);
+    assert_eq!(selected_row(&application), "gone");
+
+    assert_eq!(
+        choose(&mut application),
+        ApplicationTransition::Continue,
+        "a refused pick asks nothing of the server and opens no Landing"
+    );
+
+    let frame = rendered_application_rows(&application).join("\n");
+    assert!(
+        frame.contains("No directory there"),
+        "the path entry's refusal stands in the picker: {frame}"
+    );
+    assert!(
+        frame.contains("Workspaces"),
+        "the picker stays open: {frame}"
+    );
+    for height in [5, 6] {
+        let compact = rendered_application_rows_at(&application, 80, height).join("\n");
+        assert!(
+            compact.contains("No directory there") && compact.contains("gone"),
+            "the refusal and selected row both remain visible at 80x{height}: {compact}"
+        );
+    }
+    assert_eq!(selected_row(&application), "gone");
+    assert_eq!(
+        picker_rows(&application),
+        rows_before,
+        "the refused pick neither removes nor rearranges any visible row, even when the viewport is full"
+    );
+
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "atlas");
+    assert_eq!(choose(&mut application), ApplicationTransition::Continue);
+    let switched = rendered_application_rows_at(&application, 120, 20).join("\n");
+    assert!(
+        switched.contains("What would you like to work on?"),
+        "a subsequent valid pick from the still-open picker closes it on a Landing: {switched}"
+    );
+    assert_eq!(
+        session_picker_scope(&mut application),
+        SessionListScope::CurrentWorkspace(atlas),
+        "the subsequent valid pick switched normally"
+    );
+}
+
+/// A path that now stands at a file is refused for what it is. The refusal
+/// leaves every reading of "where I am" alone.
+#[test]
+fn a_workspace_replaced_by_a_file_is_refused_without_moving_any_scope() {
+    let here = workspace_dir();
+    let file = here.path().join("old-work");
+    std::fs::write(&file, "not a directory").expect("replace the old Workspace with a file");
+    let mut application = application_choosing_skills(here.path());
+    load_skills(&mut application, here.path(), "review");
+    type_terminal_text(&mut application, "$rev");
+    show_sidebar(&mut application, Vec::new());
+
+    open_picker_with(&mut application, vec![rooted("Old work", &file, 30)]);
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "old-work");
+
+    assert_eq!(choose(&mut application), ApplicationTransition::Continue);
+    let refusal = rendered_application_rows_at(&application, SIDEBAR_WIDE, 20).join("\n");
+    assert!(
+        refusal.contains("Not a directory"),
+        "the picker gives the path entry's corresponding refusal: {refusal}"
+    );
+    assert!(
+        refusal.contains("Workspaces"),
+        "the picker stays open: {refusal}"
+    );
+    assert_eq!(selected_row(&application), "old-work");
+
+    press(&mut application, KeyCode::Esc);
+    let unchanged = rendered_application_rows_at(&application, SIDEBAR_WIDE, 20);
+    let unchanged_frame = unchanged.join("\n");
+    assert!(
+        unchanged_frame.contains("│ $rev"),
+        "the Landing's draft was untouched: {unchanged_frame}"
+    );
+    assert!(
+        unchanged_frame.contains("$review"),
+        "the Skill Catalog still answers for the Workspace the reader is in: {unchanged_frame}"
+    );
+    assert_eq!(
+        selector_label(&unchanged),
+        "▸ All Workspaces",
+        "the Sidebar's chosen scope was untouched"
+    );
+    assert_eq!(
+        session_picker_scope(&mut application),
+        SessionListScope::CurrentWorkspace(here.path().to_owned()),
+        "current-Workspace scope did not follow the refused path"
+    );
+}
+
 /// Choosing a Workspace is choosing where the work goes: the Session made
 /// next is rooted there rather than where the client was launched.
 #[test]
 fn the_workspace_the_reader_chose_roots_the_sessions_they_make_next() {
-    let here = workspace(&["work", "here"]);
-    let atlas = workspace(&["work", "atlas"]);
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
 
     open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
@@ -467,8 +596,9 @@ fn the_workspace_the_reader_chose_roots_the_sessions_they_make_next() {
 /// for where they are now is what the composer completes from.
 #[test]
 fn the_skill_catalog_answers_for_the_workspace_the_reader_chose() {
-    let here = workspace(&["work", "here"]);
-    let atlas = workspace(&["work", "atlas"]);
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
     let mut application = application_choosing_skills(&here);
     load_skills(&mut application, &here, "review");
 
@@ -505,26 +635,18 @@ fn the_skill_catalog_answers_for_the_workspace_the_reader_chose() {
 /// narrowing follows the reader to the Workspace they chose.
 #[test]
 fn the_session_pickers_current_workspace_scope_comes_to_mean_the_chosen_workspace() {
-    let here = workspace(&["work", "here"]);
-    let atlas = workspace(&["work", "atlas"]);
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
 
     open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
     press(&mut application, KeyCode::Down);
     choose(&mut application);
 
-    let ApplicationTransition::ListSessions(request) = application
-        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            SemanticCommandId::SessionList,
-        )))
-        .expect("open the session picker")
-    else {
-        panic!("opening the session picker asks for its Sessions");
-    };
-    assert_eq!(request.surface(), SessionListSurface::SessionPicker);
     assert_eq!(
-        request.scope(),
-        &SessionListScope::CurrentWorkspace(atlas),
+        session_picker_scope(&mut application),
+        SessionListScope::CurrentWorkspace(atlas),
         "the picker's current-Workspace scope means the Workspace the reader chose"
     );
 }
@@ -569,8 +691,9 @@ fn a_relative_path_at_the_sidebars_entry_reads_from_the_chosen_workspace() {
 /// narrowing, so the column goes on showing what they asked it to show.
 #[test]
 fn the_sidebars_chosen_scope_is_left_where_the_reader_put_it() {
-    let here = workspace(&["work", "here"]);
-    let atlas = workspace(&["work", "atlas"]);
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
     show_sidebar(
         &mut application,
@@ -609,7 +732,7 @@ fn the_sidebars_chosen_scope_is_left_where_the_reader_put_it() {
 #[test]
 fn an_open_session_is_left_working_and_listed_and_nothing_is_asked() {
     let root = workspace_dir();
-    let atlas = workspace(&["work", "atlas"]);
+    let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(root.path());
     let (session_id, ..) = enter_active_session(&mut application, root.path());
     show_sidebar(
@@ -648,8 +771,9 @@ fn an_open_session_is_left_working_and_listed_and_nothing_is_asked() {
 /// nothing.
 #[test]
 fn choosing_the_workspace_the_client_is_already_in_opens_the_landing() {
-    let here = workspace(&["work", "here"]);
-    let atlas = workspace(&["work", "atlas"]);
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
 
     open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
@@ -944,6 +1068,15 @@ fn workspace(components: &[&str]) -> PathBuf {
     )
 }
 
+/// A real Workspace beneath a fixture root, returned in the same canonical
+/// spelling the client and server use. Tests that choose a row use real
+/// directories because choosing re-reads the path at that moment.
+fn workspace_in(root: &Path, name: &str) -> PathBuf {
+    let workspace = root.join(name);
+    std::fs::create_dir(&workspace).expect("create the Workspace fixture");
+    std::fs::canonicalize(workspace).expect("canonicalize the Workspace fixture")
+}
+
 /// A listed Session rooted at the Workspace named, last active when the test
 /// says — which is what a catalog spanning several Workspaces is made of, and
 /// what the picker's ordering is derived from.
@@ -995,6 +1128,21 @@ fn expect_workspace_listing(transition: ApplicationTransition) -> SessionListReq
     request
 }
 
+/// Opens the Session Picker and returns the scope its listing asks for, which
+/// is the observable reading of what current-Workspace scope means.
+fn session_picker_scope(application: &mut Application) -> SessionListScope {
+    let ApplicationTransition::ListSessions(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionList,
+        )))
+        .expect("open the Session Picker")
+    else {
+        panic!("opening the Session Picker asks for its Sessions");
+    };
+    assert_eq!(request.surface(), SessionListSurface::SessionPicker);
+    request.scope().clone()
+}
+
 fn press(application: &mut Application, code: KeyCode) {
     application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
@@ -1010,7 +1158,14 @@ fn picker_rows(application: &Application) -> Vec<String> {
 fn picker_rows_at(application: &Application, width: u16, height: u16) -> Vec<String> {
     let rows = rendered_application_rows_at(application, width, height);
     let search = rendered_row(&rows, "Search:");
-    let footer = rendered_row(&rows, "Esc");
+    let footer = rows
+        .iter()
+        .position(|row| {
+            row.contains("Esc")
+                || row.contains("No directory there")
+                || row.contains("Not a directory")
+        })
+        .expect("the picker draws its footer");
     rows[search + 1..footer]
         .iter()
         .map(|row| row.trim_matches(['│', ' ']).to_owned())
