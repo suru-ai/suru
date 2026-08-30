@@ -56,11 +56,9 @@ const LANDING_BRAND_MINIMUM_HEIGHT: u16 = 9;
 const SESSION_HEADER_MINIMUM_HEIGHT: u16 = 8;
 /// Rows of air the layout keeps below the Transcript, so its last entry never
 /// abuts whatever is docked underneath.
-/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
 const TRANSCRIPT_BOTTOM_MARGIN: u16 = 1;
 /// Columns of air the composer keeps between its border and the Prompt being
 /// typed, so text never abuts the box it is written in.
-/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
 const COMPOSER_TEXT_MARGIN: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -21,10 +21,8 @@ use crate::runtime::{RuntimeConfig, protect_current_user_directory, protect_curr
 const LOG_DIR: &str = "log";
 const FILTER_ENV_VAR: &str = "SURU_LOG";
 /// Filter applied when `SURU_LOG` is unset or invalid.
-/// Candidate user setting: tracked in issue #71.
 const DEFAULT_FILTER: &str = "warn,suru=info";
 /// Per-run Log files kept before the oldest are pruned.
-/// Candidate user setting: tracked in issue #71.
 const RETAINED_LOG_FILES: usize = 20;
 
 /// The process's role, naming its Log file and stamped into its opening line.

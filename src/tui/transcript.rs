@@ -66,12 +66,10 @@ const MAX_TRANSCRIPT_SOURCE_LINE_ROWS: usize = 1_000;
 
 /// Wrapped rows of output tail a settled command Activity's Peek shows below
 /// its fold marker.
-/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
 const FOLDED_COMMAND_OUTPUT_ROWS: usize = 6;
 
 /// Wrapped rows of live tail an Active command Activity shows while it streams,
 /// before it settles into its folded single row.
-/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
 const LIVE_COMMAND_TAIL_ROWS: usize = 3;
 
 /// The gutter an Activity's subordinate content sits in, so a fold or
@@ -92,17 +90,14 @@ const USER_MESSAGE_GUTTER: &str = "┃ ";
 
 /// Columns of air a user Message keeps at its right edge, so its text ends
 /// short of the surface it is drawn on.
-/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
 const USER_MESSAGE_RIGHT_MARGIN: usize = 1;
 
 /// Paths a folded FileChange Activity lists before its fold marker.
-/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
 const FOLDED_FILE_CHANGE_PATHS: usize = 4;
 
 /// What a Reasoning Activity's header calls the block in each of its states.
 /// Suru's own word for the concept is Reasoning, but the Transcript speaks the
 /// reader's: an agent is thinking, and what it leaves behind is a thought.
-/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
 const REASONING_ACTIVE_LABEL: &str = "Thinking";
 const REASONING_COMPLETED_LABEL: &str = "Thought";
 const REASONING_FAILED_LABEL: &str = "Thinking interrupted";

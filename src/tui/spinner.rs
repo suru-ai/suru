@@ -12,7 +12,6 @@ use ratatui::text::Line;
 
 /// The Spinner's frames, each one cell wide so a Marker's outcome glyph can
 /// land in the same cell once the Activity settles.
-/// Candidate setting: https://github.com/jake-tucker/suru/issues/71
 pub(super) const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The Marker a projection renders for an Active Activity: the Spinner's
@@ -24,7 +23,6 @@ pub(super) const MARKER: &str = "⠋ ";
 const PLACEHOLDER: char = '⠋';
 
 /// How long each frame holds before the run loop's tick advances it.
-/// Candidate setting: https://github.com/jake-tucker/suru/issues/71
 pub(super) const TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The frame glyph for a run-loop frame index, cycling forever.

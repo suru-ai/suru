@@ -11,4 +11,4 @@ ADR 0007 makes the transcript projection memoized and frame-independent: its cac
 
 - Rendering-layer tests see the Spinner's first frame; only the draw-time patch is frame-dependent.
 - Anything that adds a new animated surface to the transcript must record its cells in the projection, or the overlay will not reach it.
-- The tick period and frame set are hardcoded (candidate settings, issue #71).
+- The tick period and frame set are hardcoded (candidate settings).
