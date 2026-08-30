@@ -3,6 +3,7 @@
 mod commands;
 mod completion;
 mod composer;
+mod connect_overlay;
 mod event_loop;
 mod fuzzy;
 mod keymap;

@@ -58,8 +58,8 @@ use uuid::Uuid;
 
 use crate::{
     protocol::{
-        IssueInviteRequest, IssuedInvite, Peer, RedeemInviteRequest, Remote, RemoteHealth,
-        RemoteStatus, ServingSettings, SessionError, SessionErrorCode,
+        InvitePreview, IssueInviteRequest, IssuedInvite, Peer, RedeemInviteRequest, Remote,
+        RemoteHealth, RemoteStatus, ServingSettings, SessionError, SessionErrorCode,
     },
     runtime::protect_current_user_file,
 };
@@ -147,12 +147,15 @@ struct InvitePayload {
     server_key: String,
     #[serde(rename = "t")]
     token: String,
+    #[serde(rename = "h")]
+    hostname: String,
 }
 
 struct ParsedInvite {
     addresses: Vec<SocketAddr>,
     server_key: Vec<u8>,
     token: [u8; 32],
+    hostname: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -300,6 +303,7 @@ impl ServingController {
             addresses: request.addresses.clone(),
             server_key: URL_SAFE_NO_PAD.encode(&identity.public_key),
             token: URL_SAFE_NO_PAD.encode(token),
+            hostname: machine_hostname(),
         };
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).map_err(|_| {
             internal_pairing_failure(anyhow::anyhow!("could not encode Invite payload"))
@@ -321,6 +325,18 @@ impl ServingController {
         Ok(IssuedInvite {
             invite: format!("suru-v1-{encoded}"),
             addresses: request.addresses,
+        })
+    }
+
+    pub(crate) fn preview_invite(
+        &self,
+        invite: &str,
+    ) -> std::result::Result<InvitePreview, PairingFailure> {
+        let invite = parse_invite(invite)?;
+        Ok(InvitePreview {
+            hostname: invite.hostname,
+            fingerprint: fingerprint(&invite.server_key),
+            addresses: invite.addresses,
         })
     }
 
@@ -1492,6 +1508,16 @@ fn parse_invite(invite: &str) -> std::result::Result<ParsedInvite, PairingFailur
             "Invite addresses are malformed",
         ));
     }
+    if payload.hostname.trim().is_empty()
+        || payload.hostname != payload.hostname.trim()
+        || payload.hostname.len() > 255
+        || payload.hostname.chars().any(char::is_control)
+    {
+        return Err(PairingFailure::new(
+            SessionErrorCode::InvalidInvite,
+            "Invite hostname is malformed",
+        ));
+    }
     let server_key = URL_SAFE_NO_PAD.decode(payload.server_key).map_err(|_| {
         PairingFailure::new(SessionErrorCode::InvalidInvite, "Invite key is malformed")
     })?;
@@ -1505,6 +1531,7 @@ fn parse_invite(invite: &str) -> std::result::Result<ParsedInvite, PairingFailur
         addresses: payload.addresses,
         server_key,
         token: decode_token(&payload.token)?,
+        hostname: payload.hostname,
     })
 }
 

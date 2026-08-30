@@ -15,13 +15,13 @@ use tokio::{
 use crate::{
     RuntimeConfig,
     protocol::{
-        AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, IssueInviteRequest,
-        IssuedInvite, LifecycleState, ModelCatalog, Peer, Prompt, PromptId, RedeemInviteRequest,
-        Remote, RemoteHealth, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
-        SessionCreated, SessionDeleted, SessionError, SessionId, SessionListItem,
-        SessionSettlementChanged, SessionSnapshot, SessionSummary, SessionTitleChanged,
-        SessionUsageChanged, SessionWorkingChanged, SettingMutation, SettingsSnapshot,
-        SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
+        AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, InvitePreview,
+        IssueInviteRequest, IssuedInvite, LifecycleState, ModelCatalog, Peer, PreviewInviteRequest,
+        Prompt, PromptId, RedeemInviteRequest, Remote, RemoteHealth, RuntimeDescriptor,
+        ServerShutdown, SessionCatalogSnapshot, SessionCreated, SessionDeleted, SessionError,
+        SessionId, SessionListItem, SessionSettlementChanged, SessionSnapshot, SessionSummary,
+        SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged, SettingMutation,
+        SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
         UpdateAgentSelectionRequest,
     },
 };
@@ -331,6 +331,10 @@ impl ManagedClient {
 
     pub async fn issue_invite(&self, request: IssueInviteRequest) -> Result<IssuedInvite> {
         self.session_commands().issue_invite(request).await
+    }
+
+    pub async fn preview_invite(&self, invite: impl Into<String>) -> Result<InvitePreview> {
+        self.session_commands().preview_invite(invite.into()).await
     }
 
     pub async fn redeem_invite(&self, request: RedeemInviteRequest) -> Result<Remote> {
@@ -643,6 +647,15 @@ impl SessionCommandClient {
             .await
     }
 
+    pub(crate) async fn preview_invite(&self, invite: String) -> Result<InvitePreview> {
+        self.post_session_command(
+            "/v1/pairing/invites/preview",
+            &PreviewInviteRequest { invite },
+            "Invite preview",
+        )
+        .await
+    }
+
     pub(crate) async fn redeem_invite(&self, request: RedeemInviteRequest) -> Result<Remote> {
         self.post_session_command("/v1/pairing/remotes", &request, "Invite redemption")
             .await
@@ -659,11 +672,15 @@ impl SessionCommandClient {
     }
 
     pub(crate) async fn probe_remote(&self, name: &str) -> Result<RemoteHealth> {
-        self.post_session_command_without_body(
-            &format!("/v1/pairing/remotes/{name}/health"),
-            "Remote probe",
-        )
-        .await
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(remote_probe_url(&descriptor.base_url, name)?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Remote probe command")?;
+        decode_api_response(response, "Remote probe").await
     }
 
     pub(crate) async fn remove_peer(&self, peer_id: &str) -> Result<()> {
@@ -851,8 +868,32 @@ pub async fn stop_server(config: &ManagedClientConfig) -> Result<Health> {
     Ok(registration.health)
 }
 
+fn remote_probe_url(base_url: &str, name: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base_url).context("parse server base URL")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow!("server base URL cannot contain path segments"))?
+        .extend(["v1", "pairing", "remotes", name, "health"]);
+    Ok(url)
+}
+
 impl Drop for ManagedClient {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_probe_url;
+
+    #[test]
+    fn remote_probe_url_encodes_a_freely_editable_name_as_one_path_segment() {
+        let url = remote_probe_url("http://127.0.0.1:7777", "lab/east?#")
+            .expect("build Remote probe URL");
+
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:7777/v1/pairing/remotes/lab%2Feast%3F%23/health"
+        );
     }
 }

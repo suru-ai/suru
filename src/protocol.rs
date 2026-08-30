@@ -1038,6 +1038,24 @@ pub struct IssuedInvite {
     pub addresses: Vec<std::net::SocketAddr>,
 }
 
+/// The non-secret facts a local Client may show before the reader decides to
+/// trust and dial the Serving Server named by a pasted Invite.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvitePreview {
+    pub hostname: String,
+    pub fingerprint: String,
+    pub addresses: Vec<std::net::SocketAddr>,
+}
+
+/// A pasted Invite to inspect locally. Inspection validates and decodes the
+/// Invite but never dials an offered address or changes Pairing state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewInviteRequest {
+    pub invite: String,
+}
+
 /// The connecting user's choices when redeeming an Invite. `addresses` must
 /// be the Invite's offered addresses in the priority order to dial; an empty
 /// list keeps the offered order. `name` defaults to the Serving machine's

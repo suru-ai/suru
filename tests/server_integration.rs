@@ -701,6 +701,18 @@ async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
         })
         .await
         .expect("issue Invite");
+    let preview = connecting_client
+        .preview_invite(invite.invite.clone())
+        .await
+        .expect("inspect the Invite through the local Server without redeeming it");
+    assert!(!preview.hostname.is_empty());
+    assert_eq!(preview.fingerprint.len(), 64);
+    assert_eq!(
+        preview.addresses,
+        vec![unavailable_address, serving_address]
+    );
+    assert!(connecting_client.list_remotes().await.unwrap().is_empty());
+    assert!(serving_client.list_peers().await.unwrap().is_empty());
     let remote = connecting_client
         .redeem_invite(RedeemInviteRequest {
             invite: invite.invite,
@@ -1340,6 +1352,11 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
         ("not-an-invite", SessionErrorCode::InvalidInvite),
         ("suru-v2-e30", SessionErrorCode::UnsupportedInviteVersion),
     ] {
+        let preview_error = connecting_client
+            .preview_invite(invite)
+            .await
+            .expect_err("invalid Invite preview is rejected");
+        assert_eq!(pairing_error_code(&preview_error), expected);
         let error = connecting_client
             .redeem_invite(RedeemInviteRequest {
                 invite: invite.to_owned(),

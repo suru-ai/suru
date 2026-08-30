@@ -261,7 +261,7 @@ struct TaskChannels {
     pickers: UnboundedSender<SessionPickerResult>,
     models: UnboundedSender<ModelPickerResult>,
     skills: UnboundedSender<SkillCatalogResult>,
-    serving: UnboundedSender<ServingResult>,
+    pairing: UnboundedSender<PairingResult>,
 }
 
 /// The run loop's mutable world: the Application it feeds, the client it sends
@@ -291,7 +291,7 @@ async fn run_loop(
     let (pickers, mut picker_rx) = tokio::sync::mpsc::unbounded_channel();
     let (models, mut model_rx) = tokio::sync::mpsc::unbounded_channel();
     let (skills, mut skill_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (serving, mut serving_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (pairing, mut pairing_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut run = RunLoop {
         client,
         application: Application::new(workspace),
@@ -302,7 +302,7 @@ async fn run_loop(
             pickers,
             models,
             skills,
-            serving,
+            pairing,
         },
         reconnect_grace: None,
         spinner_tick: None,
@@ -336,7 +336,7 @@ async fn run_loop(
             model = model_rx.recv() => run.receive_model_listing(model)?,
             skill = skill_rx.recv() => run.receive_skill_listing(skill)?,
             picker = picker_rx.recv() => run.receive_session_picker(picker)?,
-            serving = serving_rx.recv() => run.receive_serving_result(serving)?,
+            pairing = pairing_rx.recv() => run.receive_pairing_result(pairing)?,
             input_event = input.next() => match input_event {
                 Some(Ok(event)) => {
                     let mut output = TerminalOutput(terminal.backend_mut());
@@ -545,21 +545,41 @@ impl RunLoop {
                     self.client.session_commands(),
                     enable,
                     port,
-                    self.channels.serving.clone(),
+                    self.channels.pairing.clone(),
                 );
             }
             ApplicationTransition::IssueInvite(request) => {
                 spawn_invite_issuance(
                     self.client.session_commands(),
                     request,
-                    self.channels.serving.clone(),
+                    self.channels.pairing.clone(),
                 );
             }
             ApplicationTransition::RemovePeer(peer_id) => {
                 spawn_peer_removal(
                     self.client.session_commands(),
                     peer_id,
-                    self.channels.serving.clone(),
+                    self.channels.pairing.clone(),
+                );
+            }
+            ApplicationTransition::BeginConnecting => {
+                spawn_remote_listing(
+                    self.client.session_commands(),
+                    self.channels.pairing.clone(),
+                );
+            }
+            ApplicationTransition::PreviewInvite(invite) => {
+                spawn_invite_preview(
+                    self.client.session_commands(),
+                    invite,
+                    self.channels.pairing.clone(),
+                );
+            }
+            ApplicationTransition::RedeemInvite(request) => {
+                spawn_invite_redemption(
+                    self.client.session_commands(),
+                    request,
+                    self.channels.pairing.clone(),
                 );
             }
             ApplicationTransition::CopyToClipboard(_) => {
@@ -631,7 +651,10 @@ impl RunLoop {
             | ApplicationTransition::BeginServing { .. }
             | ApplicationTransition::IssueInvite(_)
             | ApplicationTransition::CopyToClipboard(_)
-            | ApplicationTransition::RemovePeer(_) => {
+            | ApplicationTransition::RemovePeer(_)
+            | ApplicationTransition::BeginConnecting
+            | ApplicationTransition::PreviewInvite(_)
+            | ApplicationTransition::RedeemInvite(_) => {
                 unreachable!("managed events issue no other Session command");
             }
         }
@@ -936,28 +959,45 @@ impl RunLoop {
         Ok(ControlFlow::Continue(()))
     }
 
-    fn receive_serving_result(
+    fn receive_pairing_result(
         &mut self,
-        result: Option<ServingResult>,
+        result: Option<PairingResult>,
     ) -> Result<ControlFlow<Exit>> {
         self.needs_redraw = true;
-        let result = result.ok_or_else(|| anyhow!("Serving task channel stopped unexpectedly"))?;
+        let result = result.ok_or_else(|| anyhow!("Pairing task channel stopped unexpectedly"))?;
         let event = match result {
-            ServingResult::Prepared {
+            PairingResult::Prepared {
                 settings,
                 candidates,
             } => ApplicationEvent::ServingPrepared {
                 settings: settings.map(|settings| *settings),
                 candidates,
             },
-            ServingResult::PreparationFailed(error) => {
+            PairingResult::PreparationFailed(error) => {
                 ApplicationEvent::ServingPreparationFailed(error)
             }
-            ServingResult::InviteIssued { invite, peers } => {
+            PairingResult::InviteIssued { invite, peers } => {
                 ApplicationEvent::InviteIssued { invite, peers }
             }
-            ServingResult::PeerRemoved(peer_id) => ApplicationEvent::PeerRemoved(peer_id),
-            ServingResult::OperationFailed(error) => {
+            PairingResult::PeerRemoved(peer_id) => ApplicationEvent::PeerRemoved(peer_id),
+            PairingResult::RemotesListed(remotes) => ApplicationEvent::RemotesListed(remotes),
+            PairingResult::RemoteListingFailed(error) => {
+                ApplicationEvent::RemoteListingFailed(error)
+            }
+            PairingResult::InvitePreviewed { invite, preview } => {
+                ApplicationEvent::InvitePreviewed { invite, preview }
+            }
+            PairingResult::InvitePreviewFailed { invite, error } => {
+                ApplicationEvent::InvitePreviewFailed { invite, error }
+            }
+            PairingResult::RemoteRedeemed(remote) => ApplicationEvent::RemoteRedeemed(remote),
+            PairingResult::InviteRedemptionFailed(error) => {
+                ApplicationEvent::InviteRedemptionFailed(error)
+            }
+            PairingResult::RemoteProbed { name, result } => {
+                ApplicationEvent::RemoteProbed { name, result }
+            }
+            PairingResult::OperationFailed(error) => {
                 ApplicationEvent::ServingOperationFailed(error)
             }
         };
@@ -966,7 +1006,7 @@ impl RunLoop {
     }
 }
 
-enum ServingResult {
+enum PairingResult {
     Prepared {
         settings: Option<Box<SettingsSnapshot>>,
         candidates: Vec<SocketAddr>,
@@ -977,14 +1017,100 @@ enum ServingResult {
         peers: Vec<crate::protocol::Peer>,
     },
     PeerRemoved(String),
+    RemotesListed(Vec<crate::protocol::Remote>),
+    RemoteListingFailed(String),
+    InvitePreviewed {
+        invite: String,
+        preview: crate::protocol::InvitePreview,
+    },
+    InvitePreviewFailed {
+        invite: String,
+        error: String,
+    },
+    RemoteRedeemed(crate::protocol::Remote),
+    InviteRedemptionFailed(String),
+    RemoteProbed {
+        name: String,
+        result: Result<crate::protocol::RemoteHealth, String>,
+    },
     OperationFailed(String),
+}
+
+fn spawn_invite_redemption(
+    commands: SessionCommandClient,
+    request: crate::protocol::RedeemInviteRequest,
+    results: UnboundedSender<PairingResult>,
+) {
+    tokio::spawn(async move {
+        let result = commands
+            .redeem_invite(request)
+            .await
+            .map(PairingResult::RemoteRedeemed)
+            .unwrap_or_else(|error| PairingResult::InviteRedemptionFailed(error.to_string()));
+        let _ = results.send(result);
+    });
+}
+
+fn spawn_invite_preview(
+    commands: SessionCommandClient,
+    invite: String,
+    results: UnboundedSender<PairingResult>,
+) {
+    tokio::spawn(async move {
+        let result = match commands.preview_invite(invite.clone()).await {
+            Ok(preview) => PairingResult::InvitePreviewed { invite, preview },
+            Err(error) => PairingResult::InvitePreviewFailed {
+                invite,
+                error: error.to_string(),
+            },
+        };
+        let _ = results.send(result);
+    });
+}
+
+fn spawn_remote_listing(commands: SessionCommandClient, results: UnboundedSender<PairingResult>) {
+    tokio::spawn(async move {
+        let remotes = match commands.list_remotes().await {
+            Ok(remotes) => remotes,
+            Err(error) => {
+                let _ = results.send(PairingResult::RemoteListingFailed(error.to_string()));
+                return;
+            }
+        };
+        if results
+            .send(PairingResult::RemotesListed(remotes.clone()))
+            .is_err()
+        {
+            return;
+        }
+        let mut probes = futures_util::stream::iter(remotes)
+            .map(|remote| {
+                let commands = commands.clone();
+                async move {
+                    let result = commands
+                        .probe_remote(&remote.name)
+                        .await
+                        .map_err(|error| error.to_string());
+                    (remote.name, result)
+                }
+            })
+            .buffer_unordered(8);
+        while let Some((name, result)) = probes.next().await {
+            if results
+                .send(PairingResult::RemoteProbed { name, result })
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
 }
 
 fn spawn_serving_preparation(
     commands: SessionCommandClient,
     enable: bool,
     port: u16,
-    results: UnboundedSender<ServingResult>,
+    results: UnboundedSender<PairingResult>,
 ) {
     tokio::spawn(async move {
         let result = async {
@@ -1004,13 +1130,13 @@ fn spawn_serving_preparation(
                 .collect::<Vec<_>>();
             candidates.sort_unstable();
             candidates.dedup();
-            Ok::<_, anyhow::Error>(ServingResult::Prepared {
+            Ok::<_, anyhow::Error>(PairingResult::Prepared {
                 settings,
                 candidates,
             })
         }
         .await
-        .unwrap_or_else(|error| ServingResult::PreparationFailed(error.to_string()));
+        .unwrap_or_else(|error| PairingResult::PreparationFailed(error.to_string()));
         let _ = results.send(result);
     });
 }
@@ -1039,16 +1165,16 @@ fn invite_candidate(interface: &if_addrs::Interface, port: u16) -> Option<Socket
 fn spawn_invite_issuance(
     commands: SessionCommandClient,
     request: crate::protocol::IssueInviteRequest,
-    results: UnboundedSender<ServingResult>,
+    results: UnboundedSender<PairingResult>,
 ) {
     tokio::spawn(async move {
         let result = async {
             let invite = commands.issue_invite(request).await?;
             let peers = commands.list_peers().await?;
-            Ok::<_, anyhow::Error>(ServingResult::InviteIssued { invite, peers })
+            Ok::<_, anyhow::Error>(PairingResult::InviteIssued { invite, peers })
         }
         .await
-        .unwrap_or_else(|error| ServingResult::OperationFailed(error.to_string()));
+        .unwrap_or_else(|error| PairingResult::OperationFailed(error.to_string()));
         let _ = results.send(result);
     });
 }
@@ -1056,14 +1182,14 @@ fn spawn_invite_issuance(
 fn spawn_peer_removal(
     commands: SessionCommandClient,
     peer_id: String,
-    results: UnboundedSender<ServingResult>,
+    results: UnboundedSender<PairingResult>,
 ) {
     tokio::spawn(async move {
         let result = commands
             .remove_peer(&peer_id)
             .await
-            .map(|()| ServingResult::PeerRemoved(peer_id))
-            .unwrap_or_else(|error| ServingResult::OperationFailed(error.to_string()));
+            .map(|()| PairingResult::PeerRemoved(peer_id))
+            .unwrap_or_else(|error| PairingResult::OperationFailed(error.to_string()));
         let _ = results.send(result);
     });
 }

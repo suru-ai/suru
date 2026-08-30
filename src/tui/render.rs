@@ -24,6 +24,7 @@ use crate::{
 use super::{
     completion::CompletionRow,
     composer::{ComposerKey, ComposerSkillMarkers},
+    connect_overlay::ConnectOverlay,
     keymap::binding_label,
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
@@ -157,6 +158,9 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     if state.serve_overlay.is_open() && !state.reconnect_overlay_visible {
         render_serve_overlay(frame, state, main, &theme);
     }
+    if state.connect_overlay.is_open() && !state.reconnect_overlay_visible {
+        render_connect_overlay(frame, &state.connect_overlay, main, &theme);
+    }
     if state.reconnect_overlay_visible {
         render_reconnect_overlay(frame, &theme);
     } else if !state.session_picker.is_open()
@@ -165,6 +169,7 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
         && !state.model_options.is_open()
         && !state.settings_panel.is_open()
         && !state.serve_overlay.is_open()
+        && !state.connect_overlay.is_open()
         && !state.sidebar.menu_is_open()
         && !state.subagent_picker.is_open()
         && state.composer_focused()
@@ -175,6 +180,154 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     {
         frame.set_cursor_position(cursor);
     }
+}
+
+fn render_connect_overlay(
+    frame: &mut Frame<'_>,
+    overlay: &ConnectOverlay,
+    main: Rect,
+    theme: &Theme,
+) {
+    let area = centered_rect(
+        main,
+        main.width.saturating_sub(4).min(88),
+        main.height.saturating_sub(2).min(18),
+    );
+    if let Some(label) = overlay.loading_label() {
+        render_overlay_box(
+            frame,
+            area,
+            vec![Line::styled(label, theme.text.subdued)],
+            " Connect ",
+            theme,
+        );
+        return;
+    }
+    if let Some((invite, error)) = overlay.invite_entry() {
+        let mut lines = vec![Line::styled(
+            "Paste Invite",
+            theme.text.primary.add_modifier(Modifier::BOLD),
+        )];
+        lines.push(Line::styled(
+            if invite.is_empty() {
+                "▏".to_owned()
+            } else {
+                invite.to_owned()
+            },
+            theme.text.primary,
+        ));
+        if let Some(error) = error {
+            lines.push(Line::styled(error.to_owned(), theme.feedback.error));
+        }
+        lines.push(Line::styled(
+            "Enter inspect · Esc close",
+            theme.text.subdued,
+        ));
+        render_overlay_box(frame, area, lines, " Connect ", theme);
+        return;
+    }
+    if let Some(preview) = overlay.confirmation() {
+        let mut lines = vec![Line::styled(
+            "Confirm Serving Server",
+            theme.text.primary.add_modifier(Modifier::BOLD),
+        )];
+        lines.push(Line::styled("Fingerprint", theme.text.subdued));
+        lines.extend(
+            TextLayout::new(&preview.fingerprint, area.width.saturating_sub(2))
+                .rows()
+                .map(|row| Line::styled(row.text.to_owned(), theme.text.primary)),
+        );
+        lines.push(Line::styled("Enter trust · Esc cancel", theme.text.subdued));
+        render_overlay_box(frame, area, lines, " Connect ", theme);
+        return;
+    }
+    if let Some(details) = overlay.details() {
+        let mut lines = vec![Line::styled(
+            "Configure Remote",
+            theme.text.primary.add_modifier(Modifier::BOLD),
+        )];
+        lines.push(Line::styled("Remote name", theme.text.subdued));
+        lines.push(Line::styled(
+            format!("> {}", details.name),
+            if details.name_focused {
+                theme.selection.focused
+            } else {
+                theme.text.primary
+            },
+        ));
+        lines.push(Line::styled("Address priority", theme.text.subdued));
+        let content_height = usize::from(area.height.saturating_sub(2));
+        let error_rows = usize::from(details.error.is_some());
+        let address_capacity = content_height.saturating_sub(lines.len() + error_rows + 1);
+        let addresses = details
+            .addresses
+            .iter()
+            .enumerate()
+            .map(|(index, address)| {
+                Line::styled(
+                    format!("{}. {address}", index + 1),
+                    if !details.name_focused && index == details.selected {
+                        theme.selection.focused
+                    } else {
+                        theme.text.primary
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        lines.extend(visible_window(
+            addresses,
+            details.selected,
+            address_capacity,
+        ));
+        if let Some(error) = details.error {
+            lines.push(Line::styled(error.to_owned(), theme.feedback.error));
+        }
+        lines.push(Line::styled(
+            "Tab field · ↑↓ choose · Shift+↑↓ reorder · Enter pair · Esc cancel",
+            theme.text.subdued,
+        ));
+        render_overlay_box(frame, area, lines, " Connect ", theme);
+        return;
+    }
+    let mut lines = vec![Line::styled(
+        "Paired Remotes",
+        theme.text.primary.add_modifier(Modifier::BOLD),
+    )];
+    let remote_capacity = usize::from(area.height.saturating_sub(2)).saturating_sub(2);
+    let remote_rows = overlay
+        .remotes()
+        .iter()
+        .enumerate()
+        .map(|(index, remote)| {
+            let prefix = if index == overlay.selected() {
+                "› "
+            } else {
+                "  "
+            };
+            Line::styled(
+                format!(
+                    "{prefix}{}  {}",
+                    remote.name,
+                    overlay.status_label(&remote.name)
+                ),
+                if index == overlay.selected() {
+                    theme.selection.focused
+                } else {
+                    theme.text.primary
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    lines.extend(visible_window(
+        remote_rows,
+        overlay.selected(),
+        remote_capacity,
+    ));
+    lines.push(Line::styled(
+        "↑↓ choose · a pair another · Esc close",
+        theme.text.subdued,
+    ));
+    render_overlay_box(frame, area, lines, " Connect ", theme);
 }
 
 fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {

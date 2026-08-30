@@ -11,6 +11,7 @@ use super::{
         NumericDigit, SemanticCommandId, command_for_direct_semantic_key, command_for_leader_key,
         descriptor,
     },
+    connect_overlay::ConnectInputMode,
     state::CommandId,
 };
 
@@ -158,6 +159,87 @@ pub(super) fn command_for_serve_overlay_event(event: InputEvent) -> Option<Comma
         _ => return None,
     };
     Some(CommandId::InvokeSemantic(command))
+}
+
+/// The Connect overlay owns the keys while it is visible.
+pub(super) fn command_for_connect_overlay_event(
+    event: InputEvent,
+    mode: ConnectInputMode,
+) -> Option<CommandId> {
+    let key = match event {
+        InputEvent::Paste(text)
+            if matches!(mode, ConnectInputMode::Invite | ConnectInputMode::Name) =>
+        {
+            return Some(CommandId::InsertConnectText(text));
+        }
+        InputEvent::Key(key) => key,
+        _ => return None,
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+        return Some(CommandId::InvokeSemantic(SemanticCommandId::ConnectClose));
+    }
+    match (mode, key.code, key.modifiers) {
+        (ConnectInputMode::Picker, KeyCode::Char('a'), KeyModifiers::NONE) => Some(
+            CommandId::InvokeSemantic(SemanticCommandId::ConnectPairAnother),
+        ),
+        (
+            ConnectInputMode::Picker | ConnectInputMode::Addresses,
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )
+        | (
+            ConnectInputMode::Picker | ConnectInputMode::Addresses,
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        ) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::ConnectPrevious,
+        )),
+        (
+            ConnectInputMode::Picker | ConnectInputMode::Addresses,
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )
+        | (
+            ConnectInputMode::Picker | ConnectInputMode::Addresses,
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL,
+        ) => Some(CommandId::InvokeSemantic(SemanticCommandId::ConnectNext)),
+        (
+            ConnectInputMode::Name | ConnectInputMode::Addresses,
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        ) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::ConnectFocusNext,
+        )),
+        (ConnectInputMode::Addresses, KeyCode::Up, KeyModifiers::SHIFT) => Some(
+            CommandId::InvokeSemantic(SemanticCommandId::ConnectMoveAddressUp),
+        ),
+        (ConnectInputMode::Addresses, KeyCode::Down, KeyModifiers::SHIFT) => Some(
+            CommandId::InvokeSemantic(SemanticCommandId::ConnectMoveAddressDown),
+        ),
+        (
+            ConnectInputMode::Invite
+            | ConnectInputMode::Confirm
+            | ConnectInputMode::Name
+            | ConnectInputMode::Addresses,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ) => Some(CommandId::InvokeSemantic(SemanticCommandId::ConnectConfirm)),
+        (
+            ConnectInputMode::Invite | ConnectInputMode::Name,
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        ) => Some(CommandId::DeleteConnectTextBackward),
+        (
+            ConnectInputMode::Invite | ConnectInputMode::Name,
+            KeyCode::Char(character),
+            KeyModifiers::NONE | KeyModifiers::SHIFT,
+        ) => Some(CommandId::InsertConnectText(character.to_string())),
+        _ => None,
+    }
 }
 
 pub(super) fn command_for_completion_event(event: InputEvent) -> Option<CommandId> {

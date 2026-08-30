@@ -32,9 +32,11 @@ use super::{
     commands::{SemanticCommandId, SemanticInvocation, SemanticSubject},
     completion::{CompletionConfirmation, CompletionMode, ComposerCompletion},
     composer::{ComposerKey, ComposerMemory},
+    connect_overlay::ConnectOverlay,
     keymap::{
-        command_for_completion_event, command_for_interrupt_confirmation_event,
-        command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
+        command_for_completion_event, command_for_connect_overlay_event,
+        command_for_interrupt_confirmation_event, command_for_leader_event,
+        command_for_model_options_event, command_for_model_picker_event,
         command_for_numeric_editor_event, command_for_queued_prompt_event,
         command_for_serve_overlay_event, command_for_session_picker_event,
         command_for_settings_panel_event, command_for_sidebar_event,
@@ -322,6 +324,7 @@ pub struct TuiState {
     pub(super) session_picker: SessionPicker,
     pub(super) workspace_picker: WorkspacePicker,
     pub(super) subagent_picker: SubagentPicker,
+    pub(super) connect_overlay: ConnectOverlay,
     pub(super) serve_overlay: ServeOverlay,
     pub(super) sidebar: Sidebar,
     pub(super) settings_panel: SettingsPanel,
@@ -430,6 +433,7 @@ impl TuiState {
             session_picker: SessionPicker::new(workspace.clone()),
             workspace_picker: WorkspacePicker::new(workspace.clone()),
             subagent_picker: SubagentPicker::default(),
+            connect_overlay: ConnectOverlay::default(),
             serve_overlay: ServeOverlay::default(),
             sidebar: Sidebar::new(workspace),
             settings_panel: SettingsPanel::default(),
@@ -1613,6 +1617,22 @@ pub enum ApplicationEvent {
     },
     ServingOperationFailed(String),
     PeerRemoved(String),
+    RemotesListed(Vec<crate::protocol::Remote>),
+    RemoteListingFailed(String),
+    InvitePreviewed {
+        invite: String,
+        preview: crate::protocol::InvitePreview,
+    },
+    InvitePreviewFailed {
+        invite: String,
+        error: String,
+    },
+    RemoteRedeemed(crate::protocol::Remote),
+    InviteRedemptionFailed(String),
+    RemoteProbed {
+        name: String,
+        result: Result<crate::protocol::RemoteHealth, String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1700,6 +1720,8 @@ pub enum CommandId {
     InvokeSemantic(SemanticCommandId),
     InsertText(String),
     PasteText(String),
+    InsertConnectText(String),
+    DeleteConnectTextBackward,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1758,6 +1780,9 @@ pub enum ApplicationTransition {
     IssueInvite(crate::protocol::IssueInviteRequest),
     CopyToClipboard(String),
     RemovePeer(String),
+    BeginConnecting,
+    PreviewInvite(String),
+    RedeemInvite(crate::protocol::RedeemInviteRequest),
 }
 
 impl Application {
@@ -1859,6 +1884,34 @@ impl Application {
                 self.state.serve_overlay.peer_removed(&peer_id);
                 Ok(ApplicationTransition::Continue)
             }
+            ApplicationEvent::RemotesListed(remotes) => {
+                self.state.connect_overlay.load_remotes(remotes);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::RemoteListingFailed(error) => {
+                self.state.connect_overlay.fail_invite_entry(error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::InvitePreviewed { invite, preview } => {
+                self.state.connect_overlay.show_preview(invite, preview);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::InvitePreviewFailed { invite, error } => {
+                self.state.connect_overlay.fail_preview(invite, error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::RemoteRedeemed(remote) => {
+                self.state.connect_overlay.remote_redeemed(remote);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::InviteRedemptionFailed(error) => {
+                self.state.connect_overlay.redemption_failed(error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::RemoteProbed { name, result } => {
+                self.state.connect_overlay.remote_probed(&name, result);
+                Ok(ApplicationTransition::Continue)
+            }
             ApplicationEvent::PromptAdmissionSucceeded(prompt_id) => {
                 self.state.acknowledge_pending_submission(prompt_id);
                 Ok(ApplicationTransition::Continue)
@@ -1948,6 +2001,14 @@ impl Application {
             CommandId::SubmitSteer => Ok(self.submit_prompt(PromptDelivery::Steer)),
             CommandId::SubmitQueue => Ok(self.submit_prompt(PromptDelivery::Queue)),
             CommandId::InvokeSemantic(command) => self.invoke_semantic(command),
+            CommandId::InsertConnectText(text) => {
+                self.state.connect_overlay.insert(&text);
+                Ok(ApplicationTransition::Continue)
+            }
+            CommandId::DeleteConnectTextBackward => {
+                self.state.connect_overlay.delete_backward();
+                Ok(ApplicationTransition::Continue)
+            }
             CommandId::ActivateCompletion(mode) => {
                 self.state.composer_completion.activate(mode);
                 Ok(ApplicationTransition::Continue)
@@ -2823,6 +2884,51 @@ impl Application {
         }
         match command {
             SemanticCommandId::ApplicationExit => Ok(ApplicationTransition::Exit),
+            SemanticCommandId::ConnectOpen => {
+                self.state.connect_overlay.open();
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::BeginConnecting)
+            }
+            SemanticCommandId::ConnectConfirm => {
+                if self.state.connect_overlay.confirm() {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                if let Some(request) = self.state.connect_overlay.begin_redemption() {
+                    return Ok(ApplicationTransition::RedeemInvite(request));
+                }
+                Ok(self.state.connect_overlay.begin_preview().map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::PreviewInvite,
+                ))
+            }
+            SemanticCommandId::ConnectFocusNext => {
+                self.state.connect_overlay.focus_next();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ConnectPrevious => {
+                self.state.connect_overlay.select_previous();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ConnectNext => {
+                self.state.connect_overlay.select_next();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ConnectMoveAddressUp => {
+                self.state.connect_overlay.move_address_up();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ConnectMoveAddressDown => {
+                self.state.connect_overlay.move_address_down();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ConnectPairAnother => {
+                self.state.connect_overlay.pair_another();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ConnectClose => {
+                self.state.connect_overlay.close();
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::ServeOpen => {
                 let enable = !self.state.settings.serving.enabled;
                 let port = self.state.settings.serving.port;
@@ -3405,6 +3511,12 @@ impl Application {
         // open at once.
         if self.state.model_picker.is_open() {
             return command_for_model_picker_event(event);
+        }
+        if self.state.connect_overlay.is_open() {
+            return command_for_connect_overlay_event(
+                event,
+                self.state.connect_overlay.input_mode(),
+            );
         }
         if self.state.serve_overlay.is_open() {
             return command_for_serve_overlay_event(event);

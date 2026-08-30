@@ -537,6 +537,7 @@ pub async fn spawn_with_providers_and_timings(
         .route("/v1/session-events", get(session_catalog_events))
         .route("/v1/settings", post(mutate_setting))
         .route("/v1/pairing/invites", post(issue_invite))
+        .route("/v1/pairing/invites/preview", post(preview_invite))
         .route("/v1/pairing/remotes", get(list_remotes).post(redeem_invite))
         .route("/v1/pairing/remotes/{name}/health", post(probe_remote))
         .route(
@@ -850,6 +851,23 @@ async fn issue_invite(State(state): State<AppState>, request: Request) -> Respon
     };
     match state.serving.issue_invite(request).await {
         Ok(invite) => Json(invite).into_response(),
+        Err(error) => pairing_error_response(error),
+    }
+}
+
+async fn preview_invite(State(state): State<AppState>, request: Request) -> Response {
+    let request = match decode_session_command::<crate::protocol::PreviewInviteRequest>(
+        &state,
+        request,
+        "Invite preview",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state.serving.preview_invite(&request.invite) {
+        Ok(preview) => Json(preview).into_response(),
         Err(error) => pairing_error_response(error),
     }
 }

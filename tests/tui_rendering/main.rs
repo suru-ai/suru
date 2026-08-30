@@ -8,6 +8,7 @@ mod failing_provider_support;
 
 mod commands;
 mod composer;
+mod connecting;
 mod content_width;
 mod landing_notice;
 mod model_options;

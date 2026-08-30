@@ -22,6 +22,15 @@ pub enum SemanticCommandId {
     SessionNew,
     SessionSettle,
     SessionUnsettle,
+    ConnectOpen,
+    ConnectConfirm,
+    ConnectFocusNext,
+    ConnectPrevious,
+    ConnectNext,
+    ConnectMoveAddressUp,
+    ConnectMoveAddressDown,
+    ConnectPairAnother,
+    ConnectClose,
     ServeOpen,
     ServePrevious,
     ServeNext,
@@ -194,6 +203,15 @@ impl SemanticCommandId {
             Self::SessionNew => "session.new",
             Self::SessionSettle => "session.settle",
             Self::SessionUnsettle => "session.unsettle",
+            Self::ConnectOpen => "connect.open",
+            Self::ConnectConfirm => "connect.confirm",
+            Self::ConnectFocusNext => "connect.focus.next",
+            Self::ConnectPrevious => "connect.previous",
+            Self::ConnectNext => "connect.next",
+            Self::ConnectMoveAddressUp => "connect.address.move-up",
+            Self::ConnectMoveAddressDown => "connect.address.move-down",
+            Self::ConnectPairAnother => "connect.pair-another",
+            Self::ConnectClose => "connect.close",
             Self::ServeOpen => "serve.open",
             Self::ServePrevious => "serve.previous",
             Self::ServeNext => "serve.next",
@@ -506,6 +524,72 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             name: "unsettle",
             aliases: &[],
         }),
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectOpen,
+        title: "Pair or choose a Remote",
+        description: "Redeem an Invite or browse paired Remotes",
+        slash: Some(SlashCommand {
+            name: "connect",
+            aliases: &[],
+        }),
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectConfirm,
+        title: "Confirm Connect Step",
+        description: "Inspect the Invite or trust its fingerprint",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectFocusNext,
+        title: "Next Connect Field",
+        description: "Move between the Remote name and address priorities",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectPrevious,
+        title: "Previous Connect Item",
+        description: "Focus the previous Remote or address",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectNext,
+        title: "Next Connect Item",
+        description: "Focus the next Remote or address",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectMoveAddressUp,
+        title: "Raise Address Priority",
+        description: "Move the focused address earlier in the dialing order",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectMoveAddressDown,
+        title: "Lower Address Priority",
+        description: "Move the focused address later in the dialing order",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectPairAnother,
+        title: "Pair Another Remote",
+        description: "Open Invite entry from the paired Remotes picker",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectClose,
+        title: "Close Connect Overlay",
+        description: "Dismiss the Remote Pairing surface",
+        slash: None,
         keybinding: None,
     },
     SemanticCommandDescriptor {
@@ -843,6 +927,21 @@ pub(super) fn command_matches(query: &str) -> Vec<SemanticCommandId> {
         })
         .collect::<Vec<_>>();
     matches.sort_unstable_by_key(|(score, slash, id, _)| (*score, *slash, *id));
+    // Keep the established short-terminal browse window stable when an empty
+    // slash gives every command the same score. Pairing follows the existing
+    // Model Options action there; any typed part of `connect` ranks normally.
+    if query.is_empty()
+        && let Some(connect_index) = matches
+            .iter()
+            .position(|(_, _, _, id)| *id == SemanticCommandId::ConnectOpen)
+    {
+        let connect = matches.remove(connect_index);
+        let after_options = matches
+            .iter()
+            .position(|(_, _, _, id)| *id == SemanticCommandId::ModelOptions)
+            .map_or(matches.len(), |index| index + 1);
+        matches.insert(after_options, connect);
+    }
     matches
         .into_iter()
         .take(AUTOCOMPLETE_LIMIT)
