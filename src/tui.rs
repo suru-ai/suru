@@ -3,6 +3,7 @@
 mod commands;
 mod completion;
 mod composer;
+mod composer_layout;
 mod event_loop;
 mod keymap;
 mod markdown;

@@ -1086,11 +1086,129 @@ fn skill_completion_shows_live_catalog_states_and_retries_failed_discovery() {
 }
 
 #[test]
+fn composer_text_keeps_a_column_of_air_inside_the_prompt_border() {
+    let mut application = Application::default();
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "zebra".to_owned(),
+        )))
+        .expect("type a short Prompt");
+    let buffer = rendered_application_buffer(&application, 80, 30);
+    let rows = buffer_rows(&buffer);
+    let block = prompt_block(&rows);
+    let typed = text_position(&buffer, "zebra");
+    assert_eq!(
+        typed.0,
+        block.left + 2,
+        "typed text starts a column inside the left border: {}",
+        rows[block.top + 1]
+    );
+    assert_eq!(
+        rendered_application_cursor_at(&application, 80, 30),
+        Position::new(block.left + 7, typed.1),
+        "the caret follows the text past the margin"
+    );
+
+    let mut filled = Application::default();
+    filled
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "y".repeat(200),
+        )))
+        .expect("type a Prompt wider than the composer");
+    let filled_buffer = rendered_application_buffer(&filled, 80, 30);
+    let filled_rows = buffer_rows(&filled_buffer);
+    let first = text_position(&filled_buffer, "yyyy").1;
+    let row = filled_rows[usize::from(first)].chars().collect::<Vec<_>>();
+    assert_eq!(
+        row[usize::from(block.right) - 1],
+        ' ',
+        "a filled row stops a column short of the right border: {}",
+        filled_rows[usize::from(first)]
+    );
+    assert_eq!(
+        row[usize::from(block.right) - 2],
+        'y',
+        "the margin is one column, not a wider gutter: {}",
+        filled_rows[usize::from(first)]
+    );
+}
+
+#[test]
+fn composer_moves_whole_words_to_the_next_row_and_splits_only_oversized_ones() {
+    let prompt = concat!(
+        "Suru wraps the composer by whole words so that no ordinary word ",
+        "is ever cut across two rendered rows of the Prompt block"
+    );
+    let mut application = Application::default();
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            prompt.to_owned(),
+        )))
+        .expect("type a Prompt that outgrows one row");
+    let buffer = rendered_application_buffer(&application, 80, 30);
+    let rows = buffer_rows(&buffer);
+    let block = prompt_block(&rows);
+    let content = rows
+        .iter()
+        .skip(block.top + 1)
+        .take_while(|row| !row.contains('└'))
+        .map(|row| {
+            row.chars()
+                .skip(usize::from(block.left) + 1)
+                .take(usize::from(block.right - block.left) - 1)
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        content.len() > 1,
+        "the Prompt is long enough to wrap: {content:?}"
+    );
+    for word in prompt.split_whitespace() {
+        assert!(
+            content
+                .iter()
+                .any(|row| row.split_whitespace().any(|rendered| rendered == word)),
+            "the word {word:?} stays whole on one row: {content:?}"
+        );
+    }
+
+    let mut oversized = Application::default();
+    let word = "z".repeat(100);
+    oversized
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(format!(
+            "hello {word}"
+        ))))
+        .expect("type a word too wide for a row of its own");
+    let oversized_buffer = rendered_application_buffer(&oversized, 80, 30);
+    let oversized_rows = buffer_rows(&oversized_buffer);
+    let block = prompt_block(&oversized_rows);
+    assert!(
+        oversized_rows[block.top + 1].contains("hello")
+            && !oversized_rows[block.top + 1].contains('z'),
+        "the oversized word moves off the row it does not fit: {}",
+        oversized_rows[block.top + 1]
+    );
+    assert_eq!(
+        oversized_rows[block.top + 2]
+            .chars()
+            .skip(usize::from(block.left) + 2)
+            .take(block.content_width())
+            .collect::<String>(),
+        "z".repeat(block.content_width()),
+        "a word with nowhere to move to is split within, filling the row"
+    );
+}
+
+#[test]
 fn composer_cursor_wraps_at_the_right_edge_and_remains_visible_when_scrolled() {
     let mut wrapped = Application::default();
+    let empty = rendered_application_buffer(&wrapped, 80, 30);
+    let content_width = prompt_block(&buffer_rows(&empty)).content_width();
     wrapped
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
-            "x".repeat(70),
+            "x".repeat(content_width),
         )))
         .expect("fill the composer's content row");
     let wrapped_buffer = rendered_application_buffer(&wrapped, 80, 30);
@@ -1377,11 +1495,39 @@ fn multiline_history_is_boundary_aware_and_session_drafts_keep_their_cursor() {
     assert_ne!(first_session, second_session);
 }
 
-fn prompt_block_height(rows: &[String]) -> usize {
+/// Where the composer's Prompt block sits on screen.
+struct PromptBlock {
+    left: u16,
+    right: u16,
+    top: usize,
+}
+
+impl PromptBlock {
+    /// The columns the Prompt's text is laid out over: the block, less its two
+    /// borders and the column of air kept inside each.
+    fn content_width(&self) -> usize {
+        usize::from(self.right - self.left) - 3
+    }
+}
+
+fn prompt_block(rows: &[String]) -> PromptBlock {
     let top = rows
         .iter()
         .position(|row| row.contains('┌') && row.contains("Prompt"))
         .expect("Prompt block top border is rendered");
+    let left = rows[top]
+        .chars()
+        .position(|character| character == '┌')
+        .expect("Prompt block has a left border") as u16;
+    let right = rows[top]
+        .chars()
+        .position(|character| character == '┐')
+        .expect("Prompt block has a right border") as u16;
+    PromptBlock { left, right, top }
+}
+
+fn prompt_block_height(rows: &[String]) -> usize {
+    let top = prompt_block(rows).top;
     let bottom = rows
         .iter()
         .enumerate()

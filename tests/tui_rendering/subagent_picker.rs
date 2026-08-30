@@ -324,7 +324,7 @@ fn down_keeps_walking_history_even_while_subagents_work() {
     press_key(&mut application, KeyCode::Up);
     let text = rendered_application_rows_at(&application, 80, 22).join("\n");
     assert!(
-        text.contains("│Initial Prompt"),
+        text.contains("│ Initial Prompt"),
         "Up recalls the submitted Prompt into the composer: {text}"
     );
 
@@ -333,7 +333,7 @@ fn down_keeps_walking_history_even_while_subagents_work() {
     press_key(&mut application, KeyCode::Down);
     let text = rendered_application_rows_at(&application, 80, 22).join("\n");
     assert!(
-        !text.contains("│Initial Prompt"),
+        !text.contains("│ Initial Prompt"),
         "Down steps the history walk back to the empty scratch: {text}"
     );
     assert!(

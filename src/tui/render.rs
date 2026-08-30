@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -24,6 +24,7 @@ use crate::{
 use super::{
     completion::CompletionRow,
     composer::{ComposerKey, ComposerSkillMarkers},
+    composer_layout::ComposerLayout,
     keymap::binding_label,
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
@@ -57,6 +58,10 @@ const SESSION_HEADER_MINIMUM_HEIGHT: u16 = 8;
 /// abuts whatever is docked underneath.
 /// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
 const TRANSCRIPT_BOTTOM_MARGIN: u16 = 1;
+/// Columns of air the composer keeps between its border and the Prompt being
+/// typed, so text never abuts the box it is written in.
+/// Candidate setting: <https://github.com/jake-tucker/suru/issues/71>.
+const COMPOSER_TEXT_MARGIN: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResponsiveDetail {
@@ -2357,11 +2362,13 @@ fn render_composer(
     };
     let block = Block::default()
         .borders(Borders::ALL)
+        .padding(Padding::horizontal(COMPOSER_TEXT_MARGIN))
         .title(title)
         .border_style(style);
-    let content_width = area.width.saturating_sub(2).max(1);
+    let content_width = composer_content_width(area.width);
     let content_height = area.height.saturating_sub(2).max(1);
-    let (cursor_row, cursor_column) = visual_cursor_position(text, cursor, content_width);
+    let layout = ComposerLayout::new(text, content_width);
+    let (cursor_row, cursor_column) = layout.cursor_position(cursor);
     let scroll = cursor_row.saturating_sub(content_height.saturating_sub(1));
     let paragraph = if text.is_empty() {
         Paragraph::new(Span::styled(
@@ -2369,17 +2376,15 @@ fn render_composer(
             theme.form_field.placeholder,
         ))
     } else {
-        Paragraph::new(wrapped_composer_lines(
-            text,
-            content_width,
-            skill_markers,
-            theme,
-        ))
-        .style(theme.form_field.text)
+        Paragraph::new(wrapped_composer_lines(&layout, skill_markers, theme))
+            .style(theme.form_field.text)
     };
     frame.render_widget(paragraph.block(block).scroll((scroll, 0)), area);
     Position::new(
-        area.x.saturating_add(1).saturating_add(cursor_column),
+        area.x
+            .saturating_add(1)
+            .saturating_add(COMPOSER_TEXT_MARGIN)
+            .saturating_add(cursor_column),
         area.y
             .saturating_add(1)
             .saturating_add(cursor_row.saturating_sub(scroll)),
@@ -2480,94 +2485,56 @@ fn render_reconnect_overlay(frame: &mut Frame<'_>, theme: &Theme) {
 }
 
 fn composer_block_height(terminal_height: u16, width: u16, text: &str, cursor: usize) -> u16 {
-    let content_width = width.saturating_sub(2).max(1);
-    let cursor_rows = visual_cursor_position(text, cursor, content_width)
-        .0
-        .saturating_add(1);
-    let desired = visual_row_count(text, content_width)
-        .max(cursor_rows)
-        .max(1);
+    let layout = ComposerLayout::new(text, composer_content_width(width));
+    let cursor_rows = layout.cursor_position(cursor).0.saturating_add(1);
+    let desired = layout.row_count().max(cursor_rows).max(1);
     let cap = (terminal_height / 3).max(1);
     desired.min(cap).saturating_add(2)
 }
 
-fn visual_row_count(text: &str, width: u16) -> u16 {
-    visual_text_end(text, width).0.saturating_add(1)
-}
-
-fn visual_cursor_position(text: &str, cursor: usize, width: u16) -> (u16, u16) {
-    let width = width.max(1);
-    let (row, column) = visual_text_end(&text[..cursor], width);
-    if column >= width {
-        (row.saturating_add(1), 0)
-    } else {
-        (row, column)
-    }
-}
-
-fn visual_text_end(text: &str, width: u16) -> (u16, u16) {
-    let width = width.max(1);
-    let mut row = 0_u16;
-    let mut column = 0_u16;
-    for character in text.chars() {
-        if character == '\n' {
-            row = row.saturating_add(1);
-            column = 0;
-            continue;
-        }
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0) as u16;
-        if column > 0 && column.saturating_add(character_width) > width {
-            row = row.saturating_add(1);
-            column = 0;
-        }
-        column = column.saturating_add(character_width);
-    }
-    (row, column)
+/// The columns a Prompt's text is laid out over inside a composer block of
+/// `width`: its two borders, less the margin that keeps typed text off them.
+fn composer_content_width(width: u16) -> u16 {
+    width
+        .saturating_sub(2)
+        .saturating_sub(COMPOSER_TEXT_MARGIN.saturating_mul(2))
+        .max(1)
 }
 
 fn wrapped_composer_lines(
-    text: &str,
-    width: u16,
+    layout: &ComposerLayout<'_>,
     skill_markers: &ComposerSkillMarkers,
     theme: &Theme,
 ) -> Text<'static> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    let mut line = Vec::<(Style, String)>::new();
-    let mut line_width = 0_u16;
-    for (offset, character) in text.char_indices() {
-        if character == '\n' {
-            lines.push(styled_composer_line(std::mem::take(&mut line)));
-            line_width = 0;
-            continue;
-        }
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0) as u16;
-        if line_width > 0 && line_width.saturating_add(character_width) > width {
-            lines.push(styled_composer_line(std::mem::take(&mut line)));
-            line_width = 0;
-        }
-        let style = if skill_markers
-            .invalid
-            .iter()
-            .any(|range| range.contains(&offset))
-        {
-            theme.feedback.error
-        } else if skill_markers
-            .recognized
-            .iter()
-            .any(|range| range.contains(&offset))
-        {
-            theme.accent.primary
-        } else {
-            theme.form_field.text
-        };
-        match line.last_mut() {
-            Some((current, text)) if *current == style => text.push(character),
-            _ => line.push((style, character.to_string())),
-        }
-        line_width = line_width.saturating_add(character_width);
-    }
-    lines.push(styled_composer_line(line));
+    let lines = layout
+        .rows()
+        .map(|(start, row)| {
+            let mut line = Vec::<(Style, String)>::new();
+            for (offset, character) in row.char_indices() {
+                let offset = start + offset;
+                let style = if skill_markers
+                    .invalid
+                    .iter()
+                    .any(|range| range.contains(&offset))
+                {
+                    theme.feedback.error
+                } else if skill_markers
+                    .recognized
+                    .iter()
+                    .any(|range| range.contains(&offset))
+                {
+                    theme.accent.primary
+                } else {
+                    theme.form_field.text
+                };
+                match line.last_mut() {
+                    Some((current, text)) if *current == style => text.push(character),
+                    _ => line.push((style, character.to_string())),
+                }
+            }
+            styled_composer_line(line)
+        })
+        .collect::<Vec<_>>();
     Text::from(lines)
 }
 
