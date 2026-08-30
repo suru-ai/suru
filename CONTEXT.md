@@ -144,6 +144,10 @@ _Avoid_: Panel, drawer, session list, nav; archive or section (for the settled s
 The docked list a client opens over the composer to browse the open Session's working Subagents, drawn as the tree they spawned in. It opens only while there is something to browse, so the key that opens it stays inert otherwise; moving through it and choosing an entry opens that Subagent's Session, a working entry may be stopped from its row, and closing it lands back where it opened. Settled Subagents are not its concern — they are reached from their rows in the Transcript.
 _Avoid_: Agent panel, roster, subagent list
 
+**Workspace Picker**:
+The centered list a client opens over its view to switch Workspaces, listing every Workspace the user's Sessions have rooted in plus the one the client is working in — the current one first, the rest ordered by which held work most recently — and searched by name. Choosing one makes it the client's current Workspace — the root of the Sessions they make next, the Workspace the Skill Catalog answers for, what current-Workspace scope comes to mean, and the base a relative path resolves against — and opens the Landing there, leaving whatever Session was open to its own work and the Sidebar's chosen scope where the reader put it; in that last respect it deliberately differs from the Sidebar's path entry, which narrows the Sidebar it lives in as it switches. A picked Workspace whose directory no longer stands is refused where the reader can see it, exactly as the path entry refuses one, and nothing moves. Every row is a concrete place to root a Session: the Picker offers neither an all-Workspaces row nor a way to add a Workspace it doesn't know.
+_Avoid_: Project picker, project list, workspace switcher
+
 **Truncation**:
 The condition of a Message, command Activity, or Reasoning Activity whose stored content Suru's cap cut short of everything the Provider sent. Truncation is carried as a typed property beside the content rather than as text within it, so a client reads it as data and draws its own **truncation marker**: the line a Transcript shows in place of what the cap dropped.
 _Avoid_: Elision, clipping
