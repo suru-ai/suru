@@ -15,8 +15,9 @@ use tokio::{
 use crate::{
     RuntimeConfig,
     protocol::{
-        AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, LifecycleState,
-        ModelCatalog, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
+        AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, IssueInviteRequest,
+        IssuedInvite, LifecycleState, ModelCatalog, Peer, Prompt, PromptId, RedeemInviteRequest,
+        Remote, RemoteHealth, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
         SessionCreated, SessionDeleted, SessionError, SessionId, SessionListItem,
         SessionSettlementChanged, SessionSnapshot, SessionSummary, SessionTitleChanged,
         SessionUsageChanged, SessionWorkingChanged, SettingMutation, SettingsSnapshot,
@@ -328,6 +329,30 @@ impl ManagedClient {
         self.session_commands().mutate_setting(mutation).await
     }
 
+    pub async fn issue_invite(&self, request: IssueInviteRequest) -> Result<IssuedInvite> {
+        self.session_commands().issue_invite(request).await
+    }
+
+    pub async fn redeem_invite(&self, request: RedeemInviteRequest) -> Result<Remote> {
+        self.session_commands().redeem_invite(request).await
+    }
+
+    pub async fn list_peers(&self) -> Result<Vec<Peer>> {
+        self.session_commands().list_peers().await
+    }
+
+    pub async fn list_remotes(&self) -> Result<Vec<Remote>> {
+        self.session_commands().list_remotes().await
+    }
+
+    pub async fn probe_remote(&self, name: &str) -> Result<RemoteHealth> {
+        self.session_commands().probe_remote(name).await
+    }
+
+    pub async fn remove_peer(&self, peer_id: &str) -> Result<()> {
+        self.session_commands().remove_peer(peer_id).await
+    }
+
     pub async fn subscribe_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
         self.session_commands().subscribe_session(session_id).await
     }
@@ -613,6 +638,68 @@ impl SessionCommandClient {
             .await
     }
 
+    pub(crate) async fn issue_invite(&self, request: IssueInviteRequest) -> Result<IssuedInvite> {
+        self.post_session_command("/v1/pairing/invites", &request, "Invite issuance")
+            .await
+    }
+
+    pub(crate) async fn redeem_invite(&self, request: RedeemInviteRequest) -> Result<Remote> {
+        self.post_session_command("/v1/pairing/remotes", &request, "Invite redemption")
+            .await
+    }
+
+    pub(crate) async fn list_peers(&self) -> Result<Vec<Peer>> {
+        self.get_pairing_resource("/v1/pairing/peers", "Peer listing")
+            .await
+    }
+
+    pub(crate) async fn list_remotes(&self) -> Result<Vec<Remote>> {
+        self.get_pairing_resource("/v1/pairing/remotes", "Remote listing")
+            .await
+    }
+
+    pub(crate) async fn probe_remote(&self, name: &str) -> Result<RemoteHealth> {
+        self.post_session_command_without_body(
+            &format!("/v1/pairing/remotes/{name}/health"),
+            "Remote probe",
+        )
+        .await
+    }
+
+    pub(crate) async fn remove_peer(&self, peer_id: &str) -> Result<()> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .delete(format!(
+                "{}/v1/pairing/peers/{peer_id}",
+                descriptor.base_url
+            ))
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Peer removal")?;
+        decode_empty_api_response(response, "Peer removal").await
+    }
+
+    async fn get_pairing_resource<ResponseBody>(
+        &self,
+        path: &str,
+        operation: &str,
+    ) -> Result<ResponseBody>
+    where
+        ResponseBody: DeserializeOwned,
+    {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .get(format!("{}{path}", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .with_context(|| format!("send {operation}"))?;
+        decode_api_response(response, operation).await
+    }
+
     pub(crate) async fn subscribe_session(
         &self,
         session_id: SessionId,
@@ -710,7 +797,7 @@ async fn decode_api_error(response: reqwest::Response, operation: &str) -> anyho
     let status = response.status();
     response.json::<SessionError>().await.map_or_else(
         |_| anyhow!("{operation} failed with HTTP {status}"),
-        |error| anyhow!(error.message),
+        |error| anyhow!(error),
     )
 }
 

@@ -31,14 +31,14 @@ use crate::errands::{DEFAULT_ERRAND_TIMEOUT, ErrandRunner};
 use crate::model_catalog::ModelCatalogService;
 use crate::protocol::{
     Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, InitialPrompt,
-    LifecycleState, Message, MessageId, MessageRole, MessageStatus, PROTOCOL_VERSION, ProviderId,
-    RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT,
-    SESSION_CATALOG_UPDATED_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
-    SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, ServerIdentity, ServerShutdown,
-    SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode, SessionId,
-    SessionRevision, SessionUpdate, SettingMutation, SettingsSnapshot, SettleSessionRequest,
-    ShutdownReason, SkillCatalog, SkillCatalogRequest, SkillPromptDelivery, TurnId,
-    UpdateAgentSelectionRequest,
+    IssueInviteRequest, LifecycleState, Message, MessageId, MessageRole, MessageStatus,
+    PROTOCOL_VERSION, Peer, ProviderId, RedeemInviteRequest, Remote, RuntimeDescriptor,
+    SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
+    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
+    SKILL_CATALOG_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision,
+    SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionUpdate,
+    SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
+    SkillCatalogRequest, SkillPromptDelivery, TurnId, UpdateAgentSelectionRequest,
 };
 use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
@@ -68,6 +68,8 @@ pub struct ServerTimings {
     pub shutdown_grace: Duration,
     /// How long an Errand may take before Suru stops waiting on it.
     pub errand_timeout: Duration,
+    /// How long a newly issued Invite remains redeemable.
+    pub invite_ttl: Duration,
 }
 
 impl Default for ServerTimings {
@@ -76,6 +78,7 @@ impl Default for ServerTimings {
             sse_keepalive_interval: Duration::from_secs(10),
             shutdown_grace: Duration::from_millis(100),
             errand_timeout: DEFAULT_ERRAND_TIMEOUT,
+            invite_ttl: Duration::from_secs(10 * 60),
         }
     }
 }
@@ -427,7 +430,7 @@ pub async fn spawn_with_providers_and_timings(
     protect_current_user_file(&config.lock_path())?;
 
     let config_documents = ConfigDocuments::new(config.config_dir());
-    let serving = ServingController::new(config.data_dir());
+    let serving = ServingController::new(config.data_dir(), timings.invite_ttl)?;
     let (settings, _) = watch::channel(SettingsSnapshot::default());
     let opening_settings = config_documents.load();
 
@@ -524,6 +527,14 @@ pub async fn spawn_with_providers_and_timings(
         .route("/v1/events", get(events))
         .route("/v1/session-events", get(session_catalog_events))
         .route("/v1/settings", post(mutate_setting))
+        .route("/v1/pairing/invites", post(issue_invite))
+        .route("/v1/pairing/remotes", get(list_remotes).post(redeem_invite))
+        .route("/v1/pairing/remotes/{name}/health", post(probe_remote))
+        .route("/v1/pairing/peers", get(list_peers))
+        .route(
+            "/v1/pairing/peers/{peer_id}",
+            axum::routing::delete(remove_peer),
+        )
         .route("/v1/models", get(list_models))
         .route("/v1/models/refresh", post(refresh_models))
         .route("/v1/skills", post(list_skills))
@@ -811,6 +822,83 @@ async fn mutate_setting(State(state): State<AppState>, request: Request) -> Resp
             )
         }
     }
+}
+
+async fn issue_invite(State(state): State<AppState>, request: Request) -> Response {
+    let request = match decode_session_command::<IssueInviteRequest>(
+        &state,
+        request,
+        "Invite issuance",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state.serving.issue_invite(request).await {
+        Ok(invite) => Json(invite).into_response(),
+        Err(error) => pairing_error_response(error),
+    }
+}
+
+async fn redeem_invite(State(state): State<AppState>, request: Request) -> Response {
+    let request =
+        match decode_session_command::<RedeemInviteRequest>(&state, request, "Invite redemption")
+            .await
+        {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+    match state.serving.redeem_invite(request).await {
+        Ok(remote) => Json(remote).into_response(),
+        Err(error) => pairing_error_response(error),
+    }
+}
+
+async fn list_peers(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json::<Vec<Peer>>(state.serving.list_peers()).into_response()
+}
+
+async fn list_remotes(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json::<Vec<Remote>>(state.serving.list_remotes()).into_response()
+}
+
+async fn probe_remote(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.serving.probe_remote(&name).await {
+        Ok(health) => Json(health).into_response(),
+        Err(error) => pairing_error_response(error),
+    }
+}
+
+async fn remove_peer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(peer_id): AxumPath<String>,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.serving.remove_peer(&peer_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => pairing_error_response(error),
+    }
+}
+
+fn pairing_error_response(error: crate::serving::PairingFailure) -> Response {
+    session_error_response(error.status(), error.code, error.message)
 }
 
 /// Puts a freshly loaded effective-settings view in force: its problems reach

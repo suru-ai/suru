@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use diesel::{
     Connection, QueryableByName, RunQueryDsl, SqliteConnection, connection::SimpleConnection,
     sql_types::BigInt,
@@ -9,7 +10,8 @@ use suru::{
     logging::{self, Role},
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, stop_server},
     protocol::{
-        Health, LifecycleState, SERVER_SHUTDOWN_EVENT, ServerIdentity, ServerShutdown,
+        Health, IssueInviteRequest, LifecycleState, PROTOCOL_VERSION, RedeemInviteRequest,
+        SERVER_SHUTDOWN_EVENT, ServerIdentity, ServerShutdown, SessionError, SessionErrorCode,
         SettingMutation, ShutdownReason,
     },
     server::{self, ServerConfig, ServerTimings},
@@ -170,13 +172,7 @@ fn public_key_from_certificate(certificate: &[u8]) -> Vec<u8> {
 }
 
 fn assert_logs_omit_key_material(log_dir: &std::path::Path, public_key: &[u8]) {
-    let logs = std::fs::read_dir(log_dir)
-        .expect("read Server Log directory")
-        .map(|entry| {
-            std::fs::read_to_string(entry.expect("read Server Log entry").path())
-                .expect("read Server Log")
-        })
-        .collect::<String>();
+    let logs = read_logs(log_dir);
     let key_hex = public_key
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -186,6 +182,35 @@ fn assert_logs_omit_key_material(log_dir: &std::path::Path, public_key: &[u8]) {
         !logs.contains(&key_hex) && !logs.contains(&key_debug),
         "Server Logs must never contain identity key material"
     );
+}
+
+fn assert_logs_omit_invite_material(log_dir: &std::path::Path, invite: &str) {
+    let logs = read_logs(log_dir);
+    let payload = invite.strip_prefix("suru-v1-").unwrap();
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    for secret in [
+        invite,
+        payload["k"].as_str().unwrap(),
+        payload["t"].as_str().unwrap(),
+    ] {
+        assert!(
+            !logs.contains(secret),
+            "Server Logs must never contain Invite, token, or key material"
+        );
+    }
+}
+
+fn read_logs(log_dir: &std::path::Path) -> String {
+    std::fs::read_dir(log_dir)
+        .expect("read Server Log directory")
+        .map(|entry| {
+            std::fs::read_to_string(entry.expect("read Server Log entry").path())
+                .expect("read Server Log")
+        })
+        .collect::<String>()
 }
 
 #[tokio::test]
@@ -257,6 +282,12 @@ async fn serving_starts_and_stops_a_second_mtls_listener_without_disturbing_loca
         "a dialer presenting an unenrolled client certificate must fail the TLS handshake"
     );
     let first_public_key = public_key_from_certificate(&first_certificate);
+    let invite = local_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![first_address],
+        })
+        .await
+        .expect("issue Invite without logging its credentials");
 
     let mut serving_connection = tokio::net::TcpStream::connect(first_address)
         .await
@@ -303,6 +334,582 @@ async fn serving_starts_and_stops_a_second_mtls_listener_without_disturbing_loca
     server.shutdown().await.expect("shut down server");
     drop(log_guard);
     assert_logs_omit_key_material(&config.state_dir().join("log"), &first_public_key);
+    assert_logs_omit_invite_material(&config.state_dir().join("log"), &invite.invite);
+}
+
+#[tokio::test]
+async fn a_serving_server_issues_a_one_line_invite_with_its_chosen_addresses() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let config = ServerConfig::new(state_dir.path(), "invite-issue-test")
+        .expect("configure server")
+        .with_config_dir(config_dir.path());
+    let server = server::spawn_with_timings(
+        config,
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .expect("spawn Server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "invite-issue-test")
+            .expect("configure local Client"),
+    )
+    .await
+    .expect("attach local Client");
+    receive_initial_state(&mut client).await;
+    client
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
+        .await
+        .expect("ask the operating system for a Serving port");
+    client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .expect("turn Serving on");
+    let address = server.serving_address().expect("Serving listener is ready");
+
+    let invite = client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![address],
+        })
+        .await
+        .expect("issue Invite through the Server's local interface");
+
+    assert!(invite.invite.starts_with("suru-v1-"));
+    assert!(!invite.invite.contains(['\r', '\n']));
+    assert_eq!(invite.addresses, vec![address]);
+
+    drop(client);
+    server.shutdown().await.expect("shut down Server");
+}
+
+#[tokio::test]
+async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
+    let serving_state = tempfile::tempdir().expect("create Serving state directory");
+    let serving_config_root = tempfile::tempdir().expect("create Serving config directory");
+    let serving_config = ServerConfig::new(serving_state.path(), "pairing-serving-test")
+        .expect("configure Serving Server")
+        .with_config_dir(serving_config_root.path());
+    let serving = server::spawn_with_timings(
+        serving_config,
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .expect("spawn Serving Server");
+    let mut serving_client = ManagedClient::connect(
+        ManagedClientConfig::new(serving_state.path(), "pairing-serving-test")
+            .expect("configure Serving Client"),
+    )
+    .await
+    .expect("attach Serving Client");
+    receive_initial_state(&mut serving_client).await;
+    serving_client
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
+        .await
+        .expect("ask the operating system for a Serving port");
+    serving_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .expect("turn Serving on");
+    let serving_address = serving
+        .serving_address()
+        .expect("Serving listener is ready");
+
+    let connecting_state = tempfile::tempdir().expect("create connecting state directory");
+    let connecting_data = tempfile::tempdir().expect("create connecting data directory");
+    let connecting_config = ServerConfig::new(connecting_state.path(), "pairing-connecting-test")
+        .expect("configure connecting Server")
+        .with_data_dir(connecting_data.path());
+    let connecting = server::spawn_with_timings(
+        connecting_config,
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .expect("spawn connecting Server");
+    let mut connecting_client = ManagedClient::connect(
+        ManagedClientConfig::new(connecting_state.path(), "pairing-connecting-test")
+            .expect("configure connecting Client"),
+    )
+    .await
+    .expect("attach connecting Client");
+    receive_initial_state(&mut connecting_client).await;
+
+    let unavailable = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("reserve an unavailable first offered address");
+    let unavailable_address = unavailable.local_addr().unwrap();
+    drop(unavailable);
+    let invite = serving_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![unavailable_address, serving_address],
+        })
+        .await
+        .expect("issue Invite");
+    let remote = connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: invite.invite,
+            name: Some("workstation".to_owned()),
+            addresses: vec![serving_address, unavailable_address],
+        })
+        .await
+        .expect("redeem Invite through the connecting Server");
+
+    assert_eq!(remote.name, "workstation");
+    assert_eq!(remote.addresses, vec![serving_address, unavailable_address]);
+    assert_eq!(
+        connecting_client.list_remotes().await.unwrap(),
+        vec![remote]
+    );
+    assert_eq!(serving_client.list_peers().await.unwrap().len(), 1);
+    assert_eq!(
+        connecting_client
+            .probe_remote("workstation")
+            .await
+            .expect("reconnect to the Serving Server without the Invite")
+            .protocol_version,
+        PROTOCOL_VERSION
+    );
+
+    let default_name_invite = serving_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![serving_address],
+        })
+        .await
+        .unwrap();
+    let default_named = connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: default_name_invite.invite,
+            name: None,
+            addresses: Vec::new(),
+        })
+        .await
+        .expect("default the Remote name from the Serving hostname");
+    assert!(!default_named.name.is_empty());
+    let duplicate_name_invite = serving_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![serving_address],
+        })
+        .await
+        .unwrap();
+    let error = connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: duplicate_name_invite.invite,
+            name: Some(default_named.name),
+            addresses: Vec::new(),
+        })
+        .await
+        .expect_err("Remote names are unique");
+    assert_eq!(
+        pairing_error_code(&error),
+        SessionErrorCode::RemoteNameConflict
+    );
+
+    drop(connecting_client);
+    drop(serving_client);
+    connecting.shutdown().await.expect("stop connecting Server");
+    serving.shutdown().await.expect("stop Serving Server");
+}
+
+#[tokio::test]
+async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_errors() {
+    let serving_state = tempfile::tempdir().expect("create Serving state directory");
+    let serving_config_root = tempfile::tempdir().expect("create Serving config directory");
+    let serving = server::spawn_with_timings(
+        ServerConfig::new(serving_state.path(), "invite-errors-serving")
+            .expect("configure Serving Server")
+            .with_config_dir(serving_config_root.path()),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            invite_ttl: Duration::from_millis(200),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .expect("spawn Serving Server");
+    let mut serving_client = ManagedClient::connect(
+        ManagedClientConfig::new(serving_state.path(), "invite-errors-serving")
+            .expect("configure Serving Client"),
+    )
+    .await
+    .expect("attach Serving Client");
+    receive_initial_state(&mut serving_client).await;
+    serving_client
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
+        .await
+        .unwrap();
+    serving_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .unwrap();
+    let address = serving.serving_address().unwrap();
+
+    let connecting_state = tempfile::tempdir().expect("create connecting state directory");
+    let connecting = server::spawn_with_timings(
+        ServerConfig::new(connecting_state.path(), "invite-errors-connecting")
+            .expect("configure connecting Server"),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .expect("spawn connecting Server");
+    let mut connecting_client = ManagedClient::connect(
+        ManagedClientConfig::new(connecting_state.path(), "invite-errors-connecting")
+            .expect("configure connecting Client"),
+    )
+    .await
+    .expect("attach connecting Client");
+    receive_initial_state(&mut connecting_client).await;
+
+    for (invite, expected) in [
+        ("not-an-invite", SessionErrorCode::InvalidInvite),
+        ("suru-v2-e30", SessionErrorCode::UnsupportedInviteVersion),
+    ] {
+        let error = connecting_client
+            .redeem_invite(RedeemInviteRequest {
+                invite: invite.to_owned(),
+                name: Some("unused".to_owned()),
+                addresses: Vec::new(),
+            })
+            .await
+            .expect_err("invalid Invite is rejected");
+        assert_eq!(pairing_error_code(&error), expected);
+    }
+
+    let superseded = serving_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![address],
+        })
+        .await
+        .unwrap();
+    let live = serving_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![address],
+        })
+        .await
+        .unwrap();
+    let error = connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: superseded.invite,
+            name: Some("superseded".to_owned()),
+            addresses: Vec::new(),
+        })
+        .await
+        .expect_err("older Invite is superseded");
+    assert_eq!(
+        pairing_error_code(&error),
+        SessionErrorCode::InviteSuperseded
+    );
+
+    connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: live.invite.clone(),
+            name: Some("first".to_owned()),
+            addresses: Vec::new(),
+        })
+        .await
+        .expect("first redemption spends Invite");
+    let error = connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: live.invite,
+            name: Some("second".to_owned()),
+            addresses: Vec::new(),
+        })
+        .await
+        .expect_err("second redemption is rejected");
+    assert_eq!(pairing_error_code(&error), SessionErrorCode::InviteSpent);
+
+    let expired = serving_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![address],
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(225)).await;
+    let error = connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: expired.invite,
+            name: Some("expired".to_owned()),
+            addresses: Vec::new(),
+        })
+        .await
+        .expect_err("expired Invite is rejected");
+    assert_eq!(pairing_error_code(&error), SessionErrorCode::InviteExpired);
+
+    drop(connecting_client);
+    drop(serving_client);
+    connecting.shutdown().await.unwrap();
+    serving.shutdown().await.unwrap();
+}
+
+fn pairing_error_code(error: &anyhow::Error) -> SessionErrorCode {
+    error
+        .downcast_ref::<SessionError>()
+        .expect("Pairing error remains typed at the local Client interface")
+        .code
+}
+
+#[tokio::test]
+async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing() {
+    let reserved = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("reserve a stable Serving port");
+    let serving_port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+
+    let serving_state = tempfile::tempdir().expect("create Serving state directory");
+    let serving_data = tempfile::tempdir().expect("create Serving data directory");
+    let serving_config_root = tempfile::tempdir().expect("create Serving config directory");
+    let serving_config = ServerConfig::new(serving_state.path(), "durable-pairing-serving")
+        .expect("configure Serving Server")
+        .with_data_dir(serving_data.path())
+        .with_config_dir(serving_config_root.path());
+    let timings = ServerTimings {
+        shutdown_grace: Duration::from_millis(5),
+        ..ServerTimings::default()
+    };
+    let serving = server::spawn_with_timings(serving_config.clone(), timings)
+        .await
+        .expect("spawn Serving Server");
+    let mut serving_client = ManagedClient::connect(
+        ManagedClientConfig::new(serving_state.path(), "durable-pairing-serving")
+            .expect("configure Serving Client"),
+    )
+    .await
+    .expect("attach Serving Client");
+    receive_initial_state(&mut serving_client).await;
+    serving_client
+        .mutate_setting(SettingMutation::ServingPort {
+            value: Some(serving_port),
+        })
+        .await
+        .unwrap();
+    serving_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .unwrap();
+    let address = serving.serving_address().unwrap();
+
+    let connecting_state = tempfile::tempdir().expect("create connecting state directory");
+    let connecting_data = tempfile::tempdir().expect("create connecting data directory");
+    let connecting_config =
+        ServerConfig::new(connecting_state.path(), "durable-pairing-connecting")
+            .expect("configure connecting Server")
+            .with_data_dir(connecting_data.path());
+    let connecting = server::spawn_with_timings(connecting_config.clone(), timings)
+        .await
+        .expect("spawn connecting Server");
+    let mut connecting_client = ManagedClient::connect(
+        ManagedClientConfig::new(connecting_state.path(), "durable-pairing-connecting")
+            .expect("configure connecting Client"),
+    )
+    .await
+    .expect("attach connecting Client");
+    receive_initial_state(&mut connecting_client).await;
+
+    let invite = serving_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![address],
+        })
+        .await
+        .unwrap();
+    connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: invite.invite,
+            name: Some("durable".to_owned()),
+            addresses: Vec::new(),
+        })
+        .await
+        .expect("form Pairing");
+    let peer = serving_client.list_peers().await.unwrap().remove(0);
+
+    drop(connecting_client);
+    drop(serving_client);
+    connecting.shutdown().await.unwrap();
+    serving.shutdown().await.unwrap();
+
+    let serving = server::spawn_with_timings(serving_config.clone(), timings)
+        .await
+        .expect("restart Serving Server");
+    let connecting = server::spawn_with_timings(connecting_config.clone(), timings)
+        .await
+        .expect("restart connecting Server");
+    let mut serving_client = ManagedClient::connect(
+        ManagedClientConfig::new(serving_state.path(), "durable-pairing-serving")
+            .expect("configure restarted Serving Client"),
+    )
+    .await
+    .unwrap();
+    receive_initial_state(&mut serving_client).await;
+    let mut connecting_client = ManagedClient::connect(
+        ManagedClientConfig::new(connecting_state.path(), "durable-pairing-connecting")
+            .expect("configure restarted connecting Client"),
+    )
+    .await
+    .unwrap();
+    receive_initial_state(&mut connecting_client).await;
+
+    assert_eq!(
+        serving_client.list_peers().await.unwrap(),
+        vec![peer.clone()]
+    );
+    assert_eq!(
+        connecting_client.list_remotes().await.unwrap()[0].name,
+        "durable"
+    );
+    connecting_client
+        .probe_remote("durable")
+        .await
+        .expect("reconnect after both Servers restart using keys alone");
+
+    for path in [
+        serving_config.data_dir().join("server-identity.pk8"),
+        serving_config.data_dir().join("peers.json"),
+        connecting_config.data_dir().join("server-identity.pk8"),
+        connecting_config.data_dir().join("remotes.json"),
+    ] {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        #[cfg(windows)]
+        assert_windows_current_user_only(path);
+    }
+
+    serving_client
+        .remove_peer(&peer.id)
+        .await
+        .expect("remove Peer through the Serving Server");
+    assert!(serving_client.list_peers().await.unwrap().is_empty());
+    assert!(
+        connecting_client.probe_remote("durable").await.is_err(),
+        "deleting the Peer ends its Pairing"
+    );
+
+    drop(connecting_client);
+    drop(serving_client);
+    connecting.shutdown().await.unwrap();
+    serving.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_invite_address_presenting_the_wrong_server_key_fails_closed() {
+    let inviter_state = tempfile::tempdir().unwrap();
+    let inviter_config = tempfile::tempdir().unwrap();
+    let inviter = server::spawn_with_timings(
+        ServerConfig::new(inviter_state.path(), "wrong-key-inviter")
+            .unwrap()
+            .with_config_dir(inviter_config.path()),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut inviter_client = ManagedClient::connect(
+        ManagedClientConfig::new(inviter_state.path(), "wrong-key-inviter").unwrap(),
+    )
+    .await
+    .unwrap();
+    receive_initial_state(&mut inviter_client).await;
+    inviter_client
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
+        .await
+        .unwrap();
+    inviter_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .unwrap();
+
+    let impostor_state = tempfile::tempdir().unwrap();
+    let impostor_config = tempfile::tempdir().unwrap();
+    let impostor = server::spawn_with_timings(
+        ServerConfig::new(impostor_state.path(), "wrong-key-impostor")
+            .unwrap()
+            .with_config_dir(impostor_config.path()),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut impostor_client = ManagedClient::connect(
+        ManagedClientConfig::new(impostor_state.path(), "wrong-key-impostor").unwrap(),
+    )
+    .await
+    .unwrap();
+    receive_initial_state(&mut impostor_client).await;
+    impostor_client
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
+        .await
+        .unwrap();
+    impostor_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .unwrap();
+    let impostor_address = impostor.serving_address().unwrap();
+
+    let connector_state = tempfile::tempdir().unwrap();
+    let connector = server::spawn_with_timings(
+        ServerConfig::new(connector_state.path(), "wrong-key-connector").unwrap(),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut connector_client = ManagedClient::connect(
+        ManagedClientConfig::new(connector_state.path(), "wrong-key-connector").unwrap(),
+    )
+    .await
+    .unwrap();
+    receive_initial_state(&mut connector_client).await;
+
+    let invite = inviter_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![impostor_address],
+        })
+        .await
+        .unwrap();
+    let error = connector_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: invite.invite,
+            name: Some("impostor".to_owned()),
+            addresses: Vec::new(),
+        })
+        .await
+        .expect_err("address with the wrong pinned key is refused");
+
+    assert_eq!(
+        pairing_error_code(&error),
+        SessionErrorCode::PairingAuthenticationFailed
+    );
+    assert!(inviter_client.list_peers().await.unwrap().is_empty());
+    assert!(impostor_client.list_peers().await.unwrap().is_empty());
+    assert!(connector_client.list_remotes().await.unwrap().is_empty());
+
+    drop(connector_client);
+    drop(impostor_client);
+    drop(inviter_client);
+    connector.shutdown().await.unwrap();
+    impostor.shutdown().await.unwrap();
+    inviter.shutdown().await.unwrap();
 }
 
 #[tokio::test]

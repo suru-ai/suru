@@ -1,41 +1,72 @@
-//! Lifecycle of the opt-in Server-to-Server listener.
+//! Pairing formation and the opt-in Server-to-Server listener.
 //!
-//! The loopback HTTP listener owns local Clients. This module owns the second
-//! listener independently, so Settings adoption can start, replace, or stop
-//! Serving without involving that local transport at all.
+//! Local callers use the small [`ServingController`] interface. Invite
+//! encoding, durable identity and Pairing records, ordered dialing, and both
+//! sides of the pinned-key TLS transport remain private to this module.
 
 use std::{
-    fs,
+    collections::HashSet,
+    fs::{self, OpenOptions},
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, RwLock},
 };
 
 use anyhow::{Context, Result};
-use rcgen::{CertificateParams, KeyPair};
+use axum::{
+    Json, Router,
+    extract::{ConnectInfo, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    serve::{IncomingStream, Listener},
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use rcgen::{CertificateParams, KeyPair, PublicKeyData};
 use rustls::{
-    DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig, SignatureScheme,
-    client::danger::HandshakeSignatureValid,
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime},
-    server::danger::{ClientCertVerified, ClientCertVerifier},
+    ClientConfig, DigitallySignedStruct, DistinguishedName, Error as TlsError, RootCertStore,
+    ServerConfig, SignatureScheme,
+    client::danger::{
+        HandshakeSignatureValid as ServerHandshakeSignatureValid, ServerCertVerifier,
+    },
+    client::{WebPkiServerVerifier, danger::ServerCertVerified},
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
+    server::danger::ClientCertVerifier,
+    server::{WebPkiClientVerifier, danger::ClientCertVerified},
 };
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use subtle::ConstantTimeEq;
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::{Mutex, watch},
-    task::{JoinHandle, JoinSet},
+    task::JoinHandle,
 };
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use uuid::Uuid;
 
-use crate::{protocol::ServingSettings, runtime::protect_current_user_file};
+use crate::{
+    protocol::{
+        IssueInviteRequest, IssuedInvite, PROTOCOL_VERSION, Peer, RedeemInviteRequest, Remote,
+        RemoteHealth, ServingSettings, SessionError, SessionErrorCode,
+    },
+    runtime::protect_current_user_file,
+};
 
 const IDENTITY_FILE: &str = "server-identity.pk8";
+const PEERS_FILE: &str = "peers.json";
+const REMOTES_FILE: &str = "remotes.json";
 
 #[derive(Clone)]
 pub(crate) struct ServingController {
     data_dir: PathBuf,
     active: Arc<Mutex<Option<ActiveServing>>>,
     address: watch::Sender<Option<SocketAddr>>,
+    invite_ttl: tokio::time::Duration,
+    invites: Arc<Mutex<InviteLedger>>,
+    identity: Arc<StdMutex<Option<IdentityMaterial>>>,
+    peers: Arc<RwLock<Vec<StoredPeer>>>,
+    remotes: Arc<RwLock<Vec<StoredRemote>>>,
 }
 
 struct ActiveServing {
@@ -44,18 +75,325 @@ struct ActiveServing {
     task: JoinHandle<()>,
 }
 
-impl ServingController {
-    pub(crate) fn new(data_dir: &Path) -> Self {
-        let (address, _) = watch::channel(None);
+#[derive(Default)]
+struct InviteLedger {
+    issued: Vec<IssuedToken>,
+}
+
+struct IssuedToken {
+    token: [u8; 32],
+    expires_at: tokio::time::Instant,
+    state: TokenState,
+}
+
+#[derive(Clone, Copy)]
+enum TokenState {
+    Outstanding,
+    Superseded,
+    Spent,
+}
+
+#[derive(Clone)]
+struct IdentityMaterial {
+    private_key: Vec<u8>,
+    certificate: Vec<u8>,
+    public_key: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPeer {
+    id: String,
+    public_key: Vec<u8>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredRemote {
+    name: String,
+    fingerprint: String,
+    addresses: Vec<SocketAddr>,
+    public_key: Vec<u8>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InvitePayload {
+    a: Vec<SocketAddr>,
+    k: String,
+    t: String,
+}
+
+struct ParsedInvite {
+    addresses: Vec<SocketAddr>,
+    server_key: Vec<u8>,
+    token: [u8; 32],
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentRequest {
+    token: String,
+    public_key: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentResponse {
+    hostname: String,
+    protocol_version: u32,
+}
+
+#[derive(Clone)]
+struct ServingState {
+    controller: ServingController,
+    hostname: String,
+}
+
+#[derive(Clone, Debug)]
+struct ServingConnectionInfo {
+    _network_address: SocketAddr,
+    peer_key: Option<Vec<u8>>,
+}
+
+pub(crate) struct PairingFailure {
+    pub(crate) code: SessionErrorCode,
+    pub(crate) message: String,
+}
+
+impl PairingFailure {
+    fn new(code: SessionErrorCode, message: impl Into<String>) -> Self {
         Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn status(&self) -> StatusCode {
+        match self.code {
+            SessionErrorCode::InviteExpired | SessionErrorCode::InviteSpent => StatusCode::GONE,
+            SessionErrorCode::InviteSuperseded | SessionErrorCode::RemoteNameConflict => {
+                StatusCode::CONFLICT
+            }
+            SessionErrorCode::PairingConnectionFailed
+            | SessionErrorCode::PairingAuthenticationFailed => StatusCode::BAD_GATEWAY,
+            SessionErrorCode::PeerNotFound | SessionErrorCode::RemoteNotFound => {
+                StatusCode::NOT_FOUND
+            }
+            _ => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    fn response(self) -> Response {
+        (
+            self.status(),
+            Json(SessionError {
+                code: self.code,
+                message: self.message,
+            }),
+        )
+            .into_response()
+    }
+}
+
+impl ServingController {
+    pub(crate) fn new(data_dir: &Path, invite_ttl: tokio::time::Duration) -> Result<Self> {
+        let (address, _) = watch::channel(None);
+        Ok(Self {
             data_dir: data_dir.to_path_buf(),
             active: Arc::new(Mutex::new(None)),
             address,
-        }
+            invite_ttl,
+            invites: Arc::new(Mutex::new(InviteLedger::default())),
+            identity: Arc::new(StdMutex::new(None)),
+            peers: Arc::new(RwLock::new(read_records(&data_dir.join(PEERS_FILE))?)),
+            remotes: Arc::new(RwLock::new(read_records(&data_dir.join(REMOTES_FILE))?)),
+        })
     }
 
     pub(crate) fn address(&self) -> Option<SocketAddr> {
         *self.address.borrow()
+    }
+
+    pub(crate) async fn issue_invite(
+        &self,
+        request: IssueInviteRequest,
+    ) -> std::result::Result<IssuedInvite, PairingFailure> {
+        if self.address().is_none() {
+            return Err(PairingFailure::new(
+                SessionErrorCode::ServingListenerFailed,
+                "Serving is disabled",
+            ));
+        }
+        if request.addresses.is_empty() {
+            return Err(PairingFailure::new(
+                SessionErrorCode::InvalidInvite,
+                "an Invite needs at least one address",
+            ));
+        }
+        if request.addresses.iter().collect::<HashSet<_>>().len() != request.addresses.len() {
+            return Err(PairingFailure::new(
+                SessionErrorCode::InvalidInviteAddresses,
+                "Invite addresses must be unique",
+            ));
+        }
+
+        let identity = self.identity().map_err(internal_pairing_failure)?;
+        let token = new_token();
+        let payload = InvitePayload {
+            a: request.addresses.clone(),
+            k: URL_SAFE_NO_PAD.encode(&identity.public_key),
+            t: URL_SAFE_NO_PAD.encode(token),
+        };
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).map_err(|_| {
+            internal_pairing_failure(anyhow::anyhow!("could not encode Invite payload"))
+        })?);
+        let mut invites = self.invites.lock().await;
+        for issued in &mut invites.issued {
+            if matches!(issued.state, TokenState::Outstanding) {
+                issued.state = TokenState::Superseded;
+            }
+        }
+        invites.issued.push(IssuedToken {
+            token,
+            expires_at: tokio::time::Instant::now() + self.invite_ttl,
+            state: TokenState::Outstanding,
+        });
+        Ok(IssuedInvite {
+            invite: format!("suru-v1-{encoded}"),
+            addresses: request.addresses,
+        })
+    }
+
+    pub(crate) async fn redeem_invite(
+        &self,
+        request: RedeemInviteRequest,
+    ) -> std::result::Result<Remote, PairingFailure> {
+        let invite = parse_invite(&request.invite)?;
+        let addresses = ordered_addresses(&invite.addresses, &request.addresses)?;
+        if let Some(name) = request.name.as_deref() {
+            validate_remote_name(name)?;
+            self.ensure_remote_name_available(name)?;
+        }
+        let identity = self.identity().map_err(internal_pairing_failure)?;
+        let enrollment = EnrollmentRequest {
+            token: URL_SAFE_NO_PAD.encode(invite.token),
+            public_key: URL_SAFE_NO_PAD.encode(&identity.public_key),
+        };
+        let enrolled = dial_enrollment(&addresses, &invite.server_key, &enrollment).await?;
+        let name = request.name.unwrap_or(enrolled.hostname).trim().to_owned();
+        validate_remote_name(&name)?;
+        self.ensure_remote_name_available(&name)?;
+        let remote = Remote {
+            name: name.clone(),
+            fingerprint: fingerprint(&invite.server_key),
+            addresses,
+        };
+        let mut remotes = self
+            .remotes
+            .write()
+            .expect("Remote record lock is not poisoned");
+        if remotes.iter().any(|known| known.name == name) {
+            return Err(remote_name_conflict(&name));
+        }
+        remotes.push(StoredRemote {
+            name: remote.name.clone(),
+            fingerprint: remote.fingerprint.clone(),
+            addresses: remote.addresses.clone(),
+            public_key: invite.server_key,
+        });
+        if let Err(error) = write_private_json(&self.data_dir.join(REMOTES_FILE), &*remotes) {
+            remotes.pop();
+            return Err(internal_pairing_failure(error));
+        }
+        Ok(remote)
+    }
+
+    pub(crate) fn list_peers(&self) -> Vec<Peer> {
+        self.peers
+            .read()
+            .expect("Peer record lock is not poisoned")
+            .iter()
+            .map(|peer| Peer {
+                id: peer.id.clone(),
+                fingerprint: peer.id.clone(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn list_remotes(&self) -> Vec<Remote> {
+        self.remotes
+            .read()
+            .expect("Remote record lock is not poisoned")
+            .iter()
+            .map(|remote| Remote {
+                name: remote.name.clone(),
+                fingerprint: remote.fingerprint.clone(),
+                addresses: remote.addresses.clone(),
+            })
+            .collect()
+    }
+
+    pub(crate) async fn probe_remote(
+        &self,
+        name: &str,
+    ) -> std::result::Result<RemoteHealth, PairingFailure> {
+        let remote = self
+            .remotes
+            .read()
+            .expect("Remote record lock is not poisoned")
+            .iter()
+            .find(|remote| remote.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                PairingFailure::new(SessionErrorCode::RemoteNotFound, "Remote not found")
+            })?;
+        let identity = self.identity().map_err(internal_pairing_failure)?;
+        let client =
+            paired_http_client(&remote.public_key, &identity).map_err(internal_pairing_failure)?;
+        for address in &remote.addresses {
+            let response = client.get(format!("https://{address}/health")).send().await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    return response.json().await.map_err(|_| {
+                        PairingFailure::new(
+                            SessionErrorCode::PairingConnectionFailed,
+                            "Remote returned an invalid health response",
+                        )
+                    });
+                }
+                Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+                    return Err(PairingFailure::new(
+                        SessionErrorCode::PairingAuthenticationFailed,
+                        "Remote refused this Server's key",
+                    ));
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+        Err(PairingFailure::new(
+            SessionErrorCode::PairingConnectionFailed,
+            "could not reach Remote at any paired address",
+        ))
+    }
+
+    pub(crate) fn remove_peer(&self, id: &str) -> std::result::Result<(), PairingFailure> {
+        let mut peers = self
+            .peers
+            .write()
+            .expect("Peer record lock is not poisoned");
+        let Some(index) = peers.iter().position(|peer| peer.id == id) else {
+            return Err(PairingFailure::new(
+                SessionErrorCode::PeerNotFound,
+                "Peer not found",
+            ));
+        };
+        let removed = peers.remove(index);
+        if let Err(error) = write_private_json(&self.data_dir.join(PEERS_FILE), &*peers) {
+            peers.insert(index, removed);
+            return Err(internal_pairing_failure(error));
+        }
+        Ok(())
     }
 
     /// Reconciles the second listener to the effective Settings before an
@@ -78,9 +416,6 @@ impl ServingController {
         if let Some(running) = active.as_mut()
             && requested == running.address
         {
-            // Port 0 may have been replaced with the assigned port in the Config Document.
-            // That is already the listener in service, so adopting the more precise spelling
-            // needs no transport churn.
             running.settings = settings;
             return Ok(());
         }
@@ -90,9 +425,9 @@ impl ServingController {
         let address = listener
             .local_addr()
             .context("read bound Serving address")?;
-        let tls = Arc::new(server_tls_config(&self.data_dir, address)?);
+        let tls = Arc::new(self.server_tls_config()?);
         stop_active(&mut active, &self.address).await;
-        let task = tokio::spawn(serve(listener, tls));
+        let task = tokio::spawn(serve(listener, tls, self.clone()));
         *active = Some(ActiveServing {
             settings,
             address,
@@ -106,6 +441,123 @@ impl ServingController {
     pub(crate) async fn shutdown(&self) {
         let mut active = self.active.lock().await;
         stop_active(&mut active, &self.address).await;
+    }
+
+    fn identity(&self) -> Result<IdentityMaterial> {
+        let mut identity = self
+            .identity
+            .lock()
+            .expect("Server identity lock is not poisoned");
+        if let Some(identity) = identity.as_ref() {
+            return Ok(identity.clone());
+        }
+        let private_key = load_or_generate_identity(&self.data_dir)?;
+        let signing_key =
+            KeyPair::try_from(private_key.as_slice()).context("read Server identity key")?;
+        let certificate = CertificateParams::new(vec!["suru-server".to_owned()])
+            .context("describe Server identity certificate")?
+            .self_signed(&signing_key)
+            .context("mint Server identity certificate")?;
+        let material = IdentityMaterial {
+            public_key: signing_key.subject_public_key_info(),
+            private_key,
+            certificate: certificate.der().as_ref().to_vec(),
+        };
+        *identity = Some(material.clone());
+        Ok(material)
+    }
+
+    fn server_tls_config(&self) -> Result<ServerConfig> {
+        let identity = self.identity()?;
+        ServerConfig::builder_with_provider(crypto_provider())
+            .with_safe_default_protocol_versions()
+            .context("choose Serving TLS protocol versions")?
+            .with_client_cert_verifier(Arc::new(PinnedPeers {
+                peers: self.peers.clone(),
+            }))
+            .with_single_cert(
+                vec![CertificateDer::from(identity.certificate)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key)),
+            )
+            .context("configure Serving TLS identity")
+    }
+
+    fn ensure_remote_name_available(&self, name: &str) -> std::result::Result<(), PairingFailure> {
+        if self
+            .remotes
+            .read()
+            .expect("Remote record lock is not poisoned")
+            .iter()
+            .any(|remote| remote.name == name)
+        {
+            return Err(remote_name_conflict(name));
+        }
+        Ok(())
+    }
+
+    async fn enroll(&self, request: EnrollmentRequest) -> std::result::Result<(), PairingFailure> {
+        let token = decode_token(&request.token)?;
+        let public_key = URL_SAFE_NO_PAD.decode(request.public_key).map_err(|_| {
+            PairingFailure::new(
+                SessionErrorCode::PairingAuthenticationFailed,
+                "connector public key is malformed",
+            )
+        })?;
+        if public_key.is_empty() || public_key.len() > 4096 {
+            return Err(PairingFailure::new(
+                SessionErrorCode::PairingAuthenticationFailed,
+                "connector public key is malformed",
+            ));
+        }
+
+        let mut invites = self.invites.lock().await;
+        let Some(issued) = invites
+            .issued
+            .iter_mut()
+            .find(|issued| bool::from(issued.token.ct_eq(&token)))
+        else {
+            return Err(PairingFailure::new(
+                SessionErrorCode::InviteSpent,
+                "Invite token is unknown or already discarded",
+            ));
+        };
+        match issued.state {
+            TokenState::Superseded => {
+                return Err(PairingFailure::new(
+                    SessionErrorCode::InviteSuperseded,
+                    "Invite was superseded by a newer Invite",
+                ));
+            }
+            TokenState::Spent => {
+                return Err(PairingFailure::new(
+                    SessionErrorCode::InviteSpent,
+                    "Invite has already been spent",
+                ));
+            }
+            TokenState::Outstanding if tokio::time::Instant::now() >= issued.expires_at => {
+                return Err(PairingFailure::new(
+                    SessionErrorCode::InviteExpired,
+                    "Invite has expired",
+                ));
+            }
+            TokenState::Outstanding => {}
+        }
+
+        let id = fingerprint(&public_key);
+        let mut peers = self
+            .peers
+            .write()
+            .expect("Peer record lock is not poisoned");
+        if let Some(existing) = peers.iter_mut().find(|peer| peer.id == id) {
+            existing.public_key = public_key;
+        } else {
+            peers.push(StoredPeer { id, public_key });
+        }
+        if let Err(error) = write_private_json(&self.data_dir.join(PEERS_FILE), &*peers) {
+            return Err(internal_pairing_failure(error));
+        }
+        issued.state = TokenState::Spent;
+        Ok(())
     }
 }
 
@@ -121,48 +573,541 @@ async fn stop_active(
     }
 }
 
-async fn serve(listener: TcpListener, tls: Arc<ServerConfig>) {
-    let acceptor = TlsAcceptor::from(tls);
-    let mut connections = JoinSet::new();
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, peer)) => {
-                    let acceptor = acceptor.clone();
-                    connections.spawn(async move {
-                        // No Peer is enrolled in this first Serving slice, so every handshake is
-                        // refused. Keep credentials out of the Log: even at debug level only the
-                        // network endpoint, never the verifier error or certificate, is recorded.
-                        if acceptor.accept(stream).await.is_err() {
-                            tracing::debug!(%peer, "Serving TLS handshake refused");
-                        }
-                    });
-                }
-                Err(error) => {
-                    tracing::warn!("Serving listener could not accept a connection: {error}");
-                    break;
-                }
-            },
-            Some(_) = connections.join_next(), if !connections.is_empty() => {}
-        }
+async fn serve(listener: TcpListener, tls: Arc<ServerConfig>, controller: ServingController) {
+    let listener = PairingTlsListener {
+        listener,
+        acceptor: TlsAcceptor::from(tls),
+    };
+    let state = ServingState {
+        controller,
+        hostname: machine_hostname(),
+    };
+    let app = Router::new()
+        .route("/health", get(serving_health))
+        .route("/v1/pairing/enroll", post(enroll_peer))
+        .with_state(state);
+    let _ = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<ServingConnectionInfo>(),
+    )
+    .await;
+}
+
+async fn serving_health(
+    State(state): State<ServingState>,
+    ConnectInfo(connection): ConnectInfo<ServingConnectionInfo>,
+) -> Response {
+    let authenticated = connection.peer_key.as_deref().is_some_and(|key| {
+        state
+            .controller
+            .peers
+            .read()
+            .expect("Peer record lock is not poisoned")
+            .iter()
+            .any(|peer| bool::from(peer.public_key.as_slice().ct_eq(key)))
+    });
+    if !authenticated {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(RemoteHealth {
+        protocol_version: PROTOCOL_VERSION,
+    })
+    .into_response()
+}
+
+async fn enroll_peer(
+    State(state): State<ServingState>,
+    ConnectInfo(connection): ConnectInfo<ServingConnectionInfo>,
+    Json(request): Json<EnrollmentRequest>,
+) -> Response {
+    if connection.peer_key.is_some() {
+        return PairingFailure::new(
+            SessionErrorCode::PairingAuthenticationFailed,
+            "an Invite must be redeemed before key authentication",
+        )
+        .response();
+    }
+    match state.controller.enroll(request).await {
+        Ok(()) => Json(EnrollmentResponse {
+            hostname: state.hostname,
+            protocol_version: PROTOCOL_VERSION,
+        })
+        .into_response(),
+        Err(error) => error.response(),
     }
 }
 
-fn server_tls_config(data_dir: &Path, address: SocketAddr) -> Result<ServerConfig> {
-    let key_der = load_or_generate_identity(data_dir)?;
-    let signing_key = KeyPair::try_from(key_der.as_slice()).context("read Server identity key")?;
-    let names = vec![address.ip().to_string(), "localhost".to_owned()];
-    let certificate = CertificateParams::new(names)
-        .context("describe Server identity certificate")?
-        .self_signed(&signing_key)
-        .context("mint Server identity certificate")?;
-    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
-    ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+struct PairingTlsListener {
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+}
+
+impl Listener for PairingTlsListener {
+    type Io = TlsStream<TcpStream>;
+    type Addr = ServingConnectionInfo;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, network_address) = match self.listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    tracing::warn!("Serving listener could not accept a connection: {error}");
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            };
+            match self.acceptor.accept(stream).await {
+                Ok(stream) => {
+                    let peer_key = stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|certificates| certificates.first())
+                        .and_then(|certificate| public_key_from_certificate(certificate).ok());
+                    return (
+                        stream,
+                        ServingConnectionInfo {
+                            _network_address: network_address,
+                            peer_key,
+                        },
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(peer = %network_address, "Serving TLS handshake refused");
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        Ok(ServingConnectionInfo {
+            _network_address: self.listener.local_addr()?,
+            peer_key: None,
+        })
+    }
+}
+
+impl axum::extract::connect_info::Connected<IncomingStream<'_, PairingTlsListener>>
+    for ServingConnectionInfo
+{
+    fn connect_info(target: IncomingStream<'_, PairingTlsListener>) -> Self {
+        target.remote_addr().clone()
+    }
+}
+
+#[derive(Debug)]
+struct PinnedPeers {
+    peers: Arc<RwLock<Vec<StoredPeer>>>,
+}
+
+impl ClientCertVerifier for PinnedPeers {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> std::result::Result<ClientCertVerified, TlsError> {
+        let key = public_key_from_certificate(end_entity)?;
+        let known = self
+            .peers
+            .read()
+            .expect("Peer record lock is not poisoned")
+            .iter()
+            .any(|peer| bool::from(peer.public_key.as_slice().ct_eq(&key)));
+        if known {
+            Ok(ClientCertVerified::assertion())
+        } else {
+            Err(TlsError::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<ServerHandshakeSignatureValid, TlsError> {
+        client_signature_verifier(cert)?.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<ServerHandshakeSignatureValid, TlsError> {
+        client_signature_verifier(cert)?.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        crypto_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[derive(Debug)]
+struct PinnedServerKey {
+    expected: Vec<u8>,
+}
+
+impl ServerCertVerifier for PinnedServerKey {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, TlsError> {
+        let actual = public_key_from_certificate(end_entity)?;
+        if bool::from(actual.as_slice().ct_eq(&self.expected)) {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(TlsError::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<ServerHandshakeSignatureValid, TlsError> {
+        server_signature_verifier(cert)?.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<ServerHandshakeSignatureValid, TlsError> {
+        server_signature_verifier(cert)?.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        crypto_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn client_signature_verifier(
+    certificate: &CertificateDer<'_>,
+) -> std::result::Result<Arc<dyn ClientCertVerifier>, TlsError> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(certificate.clone().into_owned())
+        .map_err(|error| TlsError::General(error.to_string()))?;
+    WebPkiClientVerifier::builder_with_provider(Arc::new(roots), crypto_provider())
+        .allow_unauthenticated()
+        .build()
+        .map_err(|error| TlsError::General(error.to_string()))
+}
+
+fn server_signature_verifier(
+    certificate: &CertificateDer<'_>,
+) -> std::result::Result<Arc<WebPkiServerVerifier>, TlsError> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(certificate.clone().into_owned())
+        .map_err(|error| TlsError::General(error.to_string()))?;
+    WebPkiServerVerifier::builder_with_provider(Arc::new(roots), crypto_provider())
+        .build()
+        .map_err(|error| TlsError::General(error.to_string()))
+}
+
+fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+async fn dial_enrollment(
+    addresses: &[SocketAddr],
+    server_key: &[u8],
+    enrollment: &EnrollmentRequest,
+) -> std::result::Result<EnrollmentResponse, PairingFailure> {
+    let tls = ClientConfig::builder_with_provider(crypto_provider())
         .with_safe_default_protocol_versions()
-        .context("choose Serving TLS protocol versions")?
-        .with_client_cert_verifier(Arc::new(NoEnrolledPeers))
-        .with_single_cert(vec![certificate.der().clone()], private_key)
-        .context("configure Serving TLS identity")
+        .map_err(|error| internal_pairing_failure(anyhow::anyhow!(error)))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedServerKey {
+            expected: server_key.to_vec(),
+        }))
+        .with_no_client_auth();
+    let client = reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .build()
+        .map_err(|error| internal_pairing_failure(anyhow::anyhow!(error)))?;
+    let mut authentication_failed = false;
+    for address in addresses {
+        match client
+            .post(format!("https://{address}/v1/pairing/enroll"))
+            .json(enrollment)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                return response.json().await.map_err(|_| {
+                    PairingFailure::new(
+                        SessionErrorCode::PairingConnectionFailed,
+                        "Serving Server returned an invalid enrollment response",
+                    )
+                });
+            }
+            Ok(response) => return Err(decode_pairing_response(response).await),
+            Err(error) => {
+                authentication_failed |= is_tls_authentication_failure(&error);
+            }
+        }
+    }
+    if authentication_failed {
+        return Err(PairingFailure::new(
+            SessionErrorCode::PairingAuthenticationFailed,
+            "offered address presented a key other than the Invite's pinned key",
+        ));
+    }
+    Err(PairingFailure::new(
+        SessionErrorCode::PairingConnectionFailed,
+        "could not reach an offered address with the Invite's pinned key",
+    ))
+}
+
+fn is_tls_authentication_failure(error: &reqwest::Error) -> bool {
+    // reqwest's connector nests the rustls error inside two private transport
+    // wrappers which don't expose that innermost value through `source()`.
+    // Its stable Debug representation retains the rustls variant name.
+    if format!("{error:?}").contains("InvalidCertificate(") {
+        return true;
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if error
+            .downcast_ref::<TlsError>()
+            .is_some_and(|error| matches!(error, TlsError::InvalidCertificate(_)))
+            || error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+fn paired_http_client(server_key: &[u8], identity: &IdentityMaterial) -> Result<reqwest::Client> {
+    let tls = ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .context("choose Pairing TLS protocol versions")?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedServerKey {
+            expected: server_key.to_vec(),
+        }))
+        .with_client_auth_cert(
+            vec![CertificateDer::from(identity.certificate.clone())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key.clone())),
+        )
+        .context("configure Pairing client identity")?;
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .build()
+        .context("build Pairing HTTP client")
+}
+
+async fn decode_pairing_response(response: reqwest::Response) -> PairingFailure {
+    let status = response.status();
+    match response.json::<SessionError>().await {
+        Ok(error) => PairingFailure::new(error.code, error.message),
+        Err(_) => PairingFailure::new(
+            SessionErrorCode::PairingConnectionFailed,
+            format!("Serving Server refused enrollment with HTTP {status}"),
+        ),
+    }
+}
+
+fn parse_invite(invite: &str) -> std::result::Result<ParsedInvite, PairingFailure> {
+    let Some(rest) = invite.strip_prefix("suru-") else {
+        return Err(PairingFailure::new(
+            SessionErrorCode::InvalidInvite,
+            "Invite is malformed",
+        ));
+    };
+    let Some((version, encoded)) = rest.split_once('-') else {
+        return Err(PairingFailure::new(
+            SessionErrorCode::InvalidInvite,
+            "Invite is malformed",
+        ));
+    };
+    if version != "v1" {
+        return Err(PairingFailure::new(
+            SessionErrorCode::UnsupportedInviteVersion,
+            format!("Invite version `{version}` is not supported"),
+        ));
+    }
+    let payload = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<InvitePayload>(&bytes).ok())
+        .ok_or_else(|| {
+            PairingFailure::new(
+                SessionErrorCode::InvalidInvite,
+                "Invite payload is malformed",
+            )
+        })?;
+    if payload.a.is_empty() || payload.a.iter().collect::<HashSet<_>>().len() != payload.a.len() {
+        return Err(PairingFailure::new(
+            SessionErrorCode::InvalidInvite,
+            "Invite addresses are malformed",
+        ));
+    }
+    let server_key = URL_SAFE_NO_PAD.decode(payload.k).map_err(|_| {
+        PairingFailure::new(SessionErrorCode::InvalidInvite, "Invite key is malformed")
+    })?;
+    if server_key.is_empty() || server_key.len() > 4096 {
+        return Err(PairingFailure::new(
+            SessionErrorCode::InvalidInvite,
+            "Invite key is malformed",
+        ));
+    }
+    Ok(ParsedInvite {
+        addresses: payload.a,
+        server_key,
+        token: decode_token(&payload.t)?,
+    })
+}
+
+fn decode_token(encoded: &str) -> std::result::Result<[u8; 32], PairingFailure> {
+    URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| {
+            PairingFailure::new(SessionErrorCode::InvalidInvite, "Invite token is malformed")
+        })
+}
+
+fn ordered_addresses(
+    offered: &[SocketAddr],
+    chosen: &[SocketAddr],
+) -> std::result::Result<Vec<SocketAddr>, PairingFailure> {
+    if chosen.is_empty() {
+        return Ok(offered.to_vec());
+    }
+    let offered_set = offered.iter().copied().collect::<HashSet<_>>();
+    let chosen_set = chosen.iter().copied().collect::<HashSet<_>>();
+    if offered_set != chosen_set || chosen_set.len() != chosen.len() {
+        return Err(PairingFailure::new(
+            SessionErrorCode::InvalidInviteAddresses,
+            "ordered addresses must contain each offered address exactly once",
+        ));
+    }
+    Ok(chosen.to_vec())
+}
+
+fn validate_remote_name(name: &str) -> std::result::Result<(), PairingFailure> {
+    if name.trim().is_empty() || name != name.trim() {
+        return Err(PairingFailure::new(
+            SessionErrorCode::InvalidRemoteName,
+            "Remote name must contain non-whitespace characters without outer whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn remote_name_conflict(name: &str) -> PairingFailure {
+    PairingFailure::new(
+        SessionErrorCode::RemoteNameConflict,
+        format!("a Remote named `{name}` already exists"),
+    )
+}
+
+fn internal_pairing_failure(_error: anyhow::Error) -> PairingFailure {
+    // Credential-bearing inputs and filesystem contents are deliberately not
+    // copied into an outward error which a caller might later Log.
+    PairingFailure::new(
+        SessionErrorCode::PairingConnectionFailed,
+        "Pairing operation failed",
+    )
+}
+
+fn new_token() -> [u8; 32] {
+    let first = *Uuid::new_v4().as_bytes();
+    let second = *Uuid::new_v4().as_bytes();
+    let mut token = [0_u8; 32];
+    token[..16].copy_from_slice(&first);
+    token[16..].copy_from_slice(&second);
+    token
+}
+
+fn fingerprint(public_key: &[u8]) -> String {
+    blake3::hash(public_key).to_hex().to_string()
+}
+
+fn public_key_from_certificate(
+    certificate: &CertificateDer<'_>,
+) -> std::result::Result<Vec<u8>, TlsError> {
+    let (_, certificate) = x509_parser::parse_x509_certificate(certificate.as_ref())
+        .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+    Ok(certificate.public_key().raw.to_vec())
+}
+
+fn machine_hostname() -> String {
+    let hostname = hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .unwrap_or_else(|| "remote".to_owned());
+    let hostname = hostname.trim();
+    if hostname.is_empty() {
+        "remote".to_owned()
+    } else {
+        hostname.to_owned()
+    }
+}
+
+fn read_records<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            protect_current_user_file(path)?;
+            serde_json::from_slice(&bytes).with_context(|| format!("read Pairing records {path:?}"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(error) => Err(error).with_context(|| format!("read Pairing records {path:?}")),
+    }
+}
+
+fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open Pairing records {path:?}"))?;
+    serde_json::to_writer(&mut file, value).context("encode Pairing records")?;
+    file.write_all(b"\n").context("finish Pairing records")?;
+    file.sync_all().context("flush Pairing records")?;
+    protect_current_user_file(path)?;
+    Ok(())
 }
 
 fn load_or_generate_identity(data_dir: &Path) -> Result<Vec<u8>> {
@@ -187,7 +1132,6 @@ fn load_or_generate_identity(data_dir: &Path) -> Result<Vec<u8>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-
         temporary
             .as_file()
             .set_permissions(fs::Permissions::from_mode(0o600))
@@ -207,55 +1151,4 @@ fn load_or_generate_identity(data_dir: &Path) -> Result<Vec<u8>> {
         .with_context(|| format!("publish Server identity {path:?}"))?;
     protect_current_user_file(&path)?;
     Ok(identity)
-}
-
-/// Until Pairing enrollment lands there are deliberately no recognized
-/// certificates. Requiring client authentication while rejecting every
-/// presented certificate makes the empty Peer set fail closed.
-#[derive(Debug)]
-struct NoEnrolledPeers;
-
-impl ClientCertVerifier for NoEnrolledPeers {
-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &[]
-    }
-
-    fn verify_client_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _now: UnixTime,
-    ) -> Result<ClientCertVerified, TlsError> {
-        Err(TlsError::InvalidCertificate(
-            rustls::CertificateError::UnknownIssuer,
-        ))
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TlsError> {
-        reject_signature()
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TlsError> {
-        reject_signature()
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-fn reject_signature() -> Result<HandshakeSignatureValid, TlsError> {
-    Err(TlsError::General("no enrolled Peer".to_owned()))
 }

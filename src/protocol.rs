@@ -1020,6 +1020,62 @@ pub struct ServingSettings {
     pub bind_address: IpAddr,
 }
 
+/// The addresses a Serving user chose to advertise in a freshly issued
+/// Invite. They are concrete socket addresses because this first Pairing
+/// transport has no discovery or name-resolution contract of its own.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueInviteRequest {
+    pub addresses: Vec<std::net::SocketAddr>,
+}
+
+/// The pasteable Invite together with the addresses it carries, returned by
+/// the Server's local interface so a Client need not decode credential data.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuedInvite {
+    pub invite: String,
+    pub addresses: Vec<std::net::SocketAddr>,
+}
+
+/// The connecting user's choices when redeeming an Invite. `addresses` must
+/// be the Invite's offered addresses in the priority order to dial; an empty
+/// list keeps the offered order. `name` defaults to the Serving machine's
+/// hostname when omitted.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedeemInviteRequest {
+    pub invite: String,
+    pub name: Option<String>,
+    pub addresses: Vec<std::net::SocketAddr>,
+}
+
+/// A durable paired Serving Server as the connecting Server knows it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Remote {
+    pub name: String,
+    pub fingerprint: String,
+    pub addresses: Vec<std::net::SocketAddr>,
+}
+
+/// A durable redeeming Server as the Serving Server knows it. The key itself
+/// remains credential material inside the Server; local Clients receive only
+/// the stable fingerprint used to identify and remove the Peer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Peer {
+    pub id: String,
+    pub fingerprint: String,
+}
+
+/// Proof that a Remote accepted a fresh key-authenticated connection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteHealth {
+    pub protocol_version: u32,
+}
+
 impl Default for ServingSettings {
     fn default() -> Self {
         Self {
@@ -2176,6 +2232,18 @@ pub enum SessionErrorCode {
     ConfigDocumentNotEditable,
     ConfigDocumentWriteFailed,
     ServingListenerFailed,
+    InvalidInvite,
+    UnsupportedInviteVersion,
+    InviteExpired,
+    InviteSpent,
+    InviteSuperseded,
+    InvalidInviteAddresses,
+    InvalidRemoteName,
+    RemoteNameConflict,
+    RemoteNotFound,
+    PeerNotFound,
+    PairingConnectionFailed,
+    PairingAuthenticationFailed,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2184,6 +2252,14 @@ pub struct SessionError {
     pub code: SessionErrorCode,
     pub message: String,
 }
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SessionError {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
