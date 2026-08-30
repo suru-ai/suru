@@ -523,7 +523,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
             .max(content_left);
     let mut tab_bar = None;
     let mut lines = Vec::with_capacity(content_height);
-    // Both tabs, always, so the reader can see what the panel holds without
+    // Every tab, always, so the reader can see what the panel holds without
     // visiting it; the active one is drawn as the accent. A box too short for
     // its own content gives this line up first, because a tab bar over no rows
     // says nothing about the Settings the reader came for.

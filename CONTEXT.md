@@ -41,7 +41,7 @@ The short line by which a Session is known wherever Sessions are listed, and the
 _Avoid_: Name, subject, summary
 
 **Emoji**:
-A single emoji standing for a Session beside its Title, derived with that Title in the same Errand and carried as a typed property rather than written into the Title's own text, so searching a listing of Sessions matches the words a reader remembers rather than the character in front of them. A Session may have none, which every surface presenting Sessions draws as readily as it draws one.
+A single emoji standing for a Session beside its Title, derived with that Title in the same Errand and carried as a typed property rather than written into the Title's own text, so searching a listing of Sessions matches the words a reader remembers rather than the character in front of them. A Session may have none, which every surface presenting Sessions draws as readily as it draws one. Whether the ones a Session does carry are drawn at all is a Setting, off until the reader turns it on: hiding them is presentation and nothing else, so an Emoji goes on being derived, stored, and carried to every client, and turning them back on reveals what Suru already holds.
 _Avoid_: Icon, glyph — which a Marker and a Spinner already claim — avatar
 
 **Landing**:
@@ -189,7 +189,7 @@ A transient, one-line message a client shows about Suru's own behavior rather th
 _Avoid_: Banner, toast, alert, diagnostic
 
 **Setting**:
-One user-tunable value governing Suru's behavior, carrying a built-in default that applies whenever no Config Document pins it. Every Setting declares a scope: a **Client Setting** governs a client's presentation, and a machine-local Config Document may one day overlay it, while a **Server Setting** governs server or Provider behavior and follows only the server's own Config Documents. Every Setting also declares what it accepts: a **Fixed Setting** — almost all of them — accepts a set of values named up front, which is what lets a reader cycle one through them and lets Suru say exactly what to type where a value is rejected, while an **Open Setting** holds something Suru only discovers while running, such as an Agent Selection, and so names the values it can and describes the rest. Distinct from a Model Option, which is Provider-advertised rather than user-authored.
+One user-tunable value governing Suru's behavior, carrying a built-in default that applies whenever no Config Document pins it. Every Setting declares a scope: a **Client Setting** governs a client's presentation, and a machine-local Config Document may one day overlay it, while a **Server Setting** governs server or Provider behavior and follows only the server's own Config Documents. Every Setting also declares what it accepts: a **Fixed Setting** — almost all of them — accepts a set of values named up front, which is what lets a reader cycle one through them and lets Suru say exactly what to type where a value is rejected, while an **Open Setting** holds something Suru only discovers while running, such as an Agent Selection, and so names the values it can and describes the rest. Every Setting also declares the **group** it keeps company with, which is the whole of what it says about its own presentation: a client maps a group to the tab that lists it, and the group of **Experimental** Settings holds the ones still finding their shape, so a reader meets them knowing as much. Distinct from a Model Option, which is Provider-advertised rather than user-authored.
 _Avoid_: Option, preference, config value
 
 **Config Document**:

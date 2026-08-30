@@ -19,11 +19,12 @@ use ratatui::{buffer::Cell, style::Color};
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AutoSettle, EffectiveSettings, ModelAvailability, PromptId, Session,
+        AutoSettle, EffectiveSettings, EmojiVisibility, ModelAvailability, PromptId, Session,
         SessionCatalogRevision, SessionCatalogSnapshot, SessionCreated, SessionDeleted, SessionId,
-        SessionListItem, SessionSettlementChanged, SessionStatus, SessionSummary, SessionTimestamp,
-        SessionTitleChanged, SessionWorkingChanged, SettingsSnapshot, SidebarScope,
-        SidebarSettings, SidebarVisibility, UnreadableSessionSummary, Workspace,
+        SessionListItem, SessionSettings, SessionSettlementChanged, SessionStatus, SessionSummary,
+        SessionTimestamp, SessionTitleChanged, SessionWorkingChanged, SettingsSnapshot,
+        SidebarScope, SidebarSettings, SidebarVisibility, TitleSettings, UnreadableSessionSummary,
+        Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -80,7 +81,7 @@ fn the_sidebar_stands_beside_an_open_session_too() {
 #[test]
 fn an_active_row_is_three_lines_of_workspace_time_emoji_and_title() {
     let workspace = workspace_dir();
-    let application = sidebar_showing(
+    let application = sidebar_showing_emojis(
         workspace.path(),
         vec![listed(
             "Sidebar shell",
@@ -111,6 +112,101 @@ fn an_active_row_is_three_lines_of_workspace_time_emoji_and_title() {
         sidebar_column(&rows[first + 2]),
         "",
         "the third line is held blank for git awareness"
+    );
+}
+
+/// A snapshot lands while the column is on screen, so the Setting moves the
+/// rows the reader is already reading rather than waiting for a listing to
+/// come round again — and it moves them without asking for one.
+#[test]
+fn showing_emojis_moves_the_rows_a_reader_is_already_looking_at() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![listed(
+            "Sidebar shell",
+            Some("🧪"),
+            &workspace.path().join("suru"),
+            1,
+            minutes_ago(5),
+        )],
+    );
+    let drawn = |application: &Application| {
+        let rows = rendered_application_rows_at(application, WIDE, 20);
+        sidebar_column(&rows[rendered_row(&rows, "Sidebar shell")])
+    };
+    assert_eq!(drawn(&application), "Sidebar shell");
+
+    assert_eq!(
+        deliver_settings(
+            &mut application,
+            EffectiveSettings {
+                sidebar: shown(AutoSettle::default()),
+                session: SessionSettings {
+                    title: TitleSettings {
+                        emoji: EmojiVisibility::Shown,
+                        ..TitleSettings::default()
+                    },
+                    ..SessionSettings::default()
+                },
+                ..EffectiveSettings::default()
+            },
+        ),
+        ApplicationTransition::Continue,
+        "a Sidebar already holding its Sessions asks for nothing to draw them anew"
+    );
+    let title_line = drawn(&application);
+    assert!(
+        title_line.starts_with('🧪') && title_line.ends_with("Sidebar shell"),
+        "the Emoji reaches the row without the listing coming round again: {title_line:?}"
+    );
+}
+
+/// The Emoji a derivation left beside a Session's Title is drawn only where the
+/// reader asked for one. Nothing asks by default, so the column reads as it did
+/// before Emojis existed until the Setting says otherwise — and a Session with
+/// no Emoji reads that way however the Setting stands.
+#[test]
+fn a_sidebar_row_draws_its_emoji_only_where_the_setting_shows_them() {
+    let workspace = workspace_dir();
+    let sessions = || {
+        vec![
+            listed(
+                "Sidebar shell",
+                Some("🧪"),
+                &workspace.path().join("suru"),
+                2,
+                minutes_ago(5),
+            ),
+            listed(
+                "No Emoji of its own",
+                None,
+                &workspace.path().join("suru"),
+                1,
+                minutes_ago(6),
+            ),
+        ]
+    };
+
+    let hidden = sidebar_showing(workspace.path(), sessions());
+    let rows = rendered_application_rows_at(&hidden, WIDE, 20);
+    let title_line = sidebar_column(&rows[rendered_row(&rows, "Sidebar shell")]);
+    assert_eq!(
+        title_line, "Sidebar shell",
+        "a Session's name carries no Emoji until the reader asks for one: {title_line:?}"
+    );
+
+    let shown = sidebar_showing_emojis(workspace.path(), sessions());
+    let rows = rendered_application_rows_at(&shown, WIDE, 20);
+    let title_line = sidebar_column(&rows[rendered_row(&rows, "Sidebar shell")]);
+    assert!(
+        title_line.starts_with('🧪') && title_line.ends_with("Sidebar shell"),
+        "and the Emoji leads the name once they have: {title_line:?}"
+    );
+    let bare = sidebar_column(&rows[rendered_row(&rows, "No Emoji of its own")]);
+    assert_eq!(
+        bare, "No Emoji of its own",
+        "a Session a derivation left no Emoji holds no cell open for one: {bare:?}"
     );
 }
 
@@ -542,15 +638,55 @@ fn sidebar_settling(
     auto_settle: AutoSettle,
     sessions: Vec<SessionListItem>,
 ) -> Application {
-    let mut application = connected_application(workspace);
-    let request = expect_sidebar_listing(deliver_sidebar_settings(
-        &mut application,
-        SidebarSettings {
-            initial_visibility: SidebarVisibility::Shown,
-            auto_settle,
-            ..SidebarSettings::default()
+    sidebar_hydrated(
+        workspace,
+        EffectiveSettings {
+            sidebar: shown(auto_settle),
+            ..EffectiveSettings::default()
         },
-    ));
+        sessions,
+    )
+}
+
+/// The Sidebar shown with Session name Emojis turned on, which is what every
+/// test about a row that draws one asks for: nothing draws an Emoji until the
+/// reader says so.
+fn sidebar_showing_emojis(workspace: &Path, sessions: Vec<SessionListItem>) -> Application {
+    sidebar_hydrated(
+        workspace,
+        EffectiveSettings {
+            sidebar: shown(AutoSettle::default()),
+            session: SessionSettings {
+                title: TitleSettings {
+                    emoji: EmojiVisibility::Shown,
+                    ..TitleSettings::default()
+                },
+                ..SessionSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        sessions,
+    )
+}
+
+/// The Sidebar's own Settings as a reader who wants it on screen leaves them.
+fn shown(auto_settle: AutoSettle) -> SidebarSettings {
+    SidebarSettings {
+        initial_visibility: SidebarVisibility::Shown,
+        auto_settle,
+        ..SidebarSettings::default()
+    }
+}
+
+/// A client whose Sidebar has taken `settings` and been answered with
+/// `sessions`, which is every Sidebar a rendering test reads.
+fn sidebar_hydrated(
+    workspace: &Path,
+    settings: EffectiveSettings,
+    sessions: Vec<SessionListItem>,
+) -> Application {
+    let mut application = connected_application(workspace);
+    let request = expect_sidebar_listing(deliver_settings(&mut application, settings));
     application
         .handle_event(ApplicationEvent::SessionsListed { request, sessions })
         .expect("hydrate the Sidebar");
@@ -574,13 +710,23 @@ fn deliver_sidebar_settings(
     application: &mut Application,
     sidebar: SidebarSettings,
 ) -> ApplicationTransition {
+    deliver_settings(
+        application,
+        EffectiveSettings {
+            sidebar,
+            ..EffectiveSettings::default()
+        },
+    )
+}
+
+fn deliver_settings(
+    application: &mut Application,
+    settings: EffectiveSettings,
+) -> ApplicationTransition {
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
             SettingsSnapshot {
-                settings: EffectiveSettings {
-                    sidebar,
-                    ..EffectiveSettings::default()
-                },
+                settings,
                 pinned: Vec::new(),
                 diagnostics: Vec::new(),
             },
@@ -1193,7 +1339,7 @@ fn selected_sidebar_text(application: &Application) -> String {
 #[test]
 fn a_settled_session_stands_below_the_divider_as_one_slim_line() {
     let workspace = workspace_dir();
-    let application = sidebar_showing(
+    let application = sidebar_showing_emojis(
         workspace.path(),
         vec![
             listed("Active work", None, workspace.path(), 2, now()),

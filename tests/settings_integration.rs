@@ -8,9 +8,10 @@ use std::path::Path;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        AgentSelection, AutoSettle, CommandAutoExpand, FoldPosture, ModelId, ProviderId,
-        ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
-        SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility, TitleErrand,
+        AgentSelection, AutoSettle, CommandAutoExpand, EmojiVisibility, FoldPosture, ModelId,
+        ProviderId, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
+        SettingMutation, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope,
+        SidebarVisibility, TitleErrand,
     },
     server::{self, ServerConfig},
 };
@@ -304,6 +305,54 @@ async fn the_auto_settle_setting_pins_from_a_document_and_resets_to_its_default(
         answered.settings.sidebar.auto_settle,
         AutoSettle::Idle(3),
         "unpinning it lets the built-in three days resume"
+    );
+    assert_eq!(answered.pinned, [] as [String; 0]);
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// Emojis are drawn only where a Config Document says so, and the key sits
+/// beside the one deciding whether they are derived at all — so a document
+/// pinning one must leave the other where its own default is.
+#[tokio::test]
+async fn showing_session_name_emojis_pins_from_a_document_and_resets_to_the_hidden_default() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            // Let me see them.
+            "session": { "title": { "emoji": "shown" } },
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-session-emoji")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (client, opening) = attach(state_dir.path(), "settings-session-emoji").await;
+    assert_eq!(opening.settings.session.title.emoji, EmojiVisibility::Shown);
+    assert_eq!(
+        opening.settings.session.title.errand,
+        TitleErrand::FollowSession,
+        "showing an Emoji says nothing about who derives one"
+    );
+    assert_eq!(opening.pinned, ["session.title.emoji"]);
+    assert_eq!(opening.diagnostics, []);
+
+    let answered = client
+        .mutate_setting(SettingMutation::SessionTitleEmoji { value: None })
+        .await
+        .expect("reset the Setting");
+    assert_eq!(
+        answered.settings.session.title.emoji,
+        EmojiVisibility::Hidden,
+        "unpinning it leaves Session names carrying no Emoji"
     );
     assert_eq!(answered.pinned, [] as [String; 0]);
 

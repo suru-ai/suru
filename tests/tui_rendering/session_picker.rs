@@ -10,9 +10,11 @@ use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        ModelAvailability, PromptId, Session, SessionCatalogRevision, SessionCatalogSnapshot,
-        SessionDeleted, SessionId, SessionListItem, SessionStatus, SessionSummary,
-        SessionTimestamp, SessionTitleChanged, UnreadableSessionSummary, Workspace,
+        EffectiveSettings, EmojiVisibility, ModelAvailability, PromptId, Session,
+        SessionCatalogRevision, SessionCatalogSnapshot, SessionDeleted, SessionId, SessionListItem,
+        SessionSettings, SessionStatus, SessionSummary, SessionTimestamp, SessionTitleChanged,
+        SettingsSnapshot, SidebarSettings, SidebarVisibility, TitleSettings,
+        UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SessionListRequest,
@@ -919,7 +921,7 @@ fn session_picker_draws_an_emoji_beside_its_title_and_leaves_a_session_without_o
     let workspace = workspace_dir();
     let derived_id = SessionId::new();
     let underived_id = SessionId::new();
-    let mut mixed = Application::new(workspace.path());
+    let mut mixed = client_showing_emojis(workspace.path());
     open_session_picker_with(
         &mut mixed,
         vec![
@@ -995,6 +997,53 @@ fn session_picker_draws_an_emoji_beside_its_title_and_leaves_a_session_without_o
 /// the selected row, so what a row draws of its own begins just past them.
 const SESSION_ROW_MARKER_WIDTH: u16 = 2;
 
+/// The Emoji beside a Session's Title is drawn in the picker only where the
+/// reader asked for one, and a row left without it reads exactly as the row of
+/// a Session that never had one.
+#[test]
+fn a_session_picker_row_draws_its_emoji_only_where_the_setting_shows_them() {
+    let workspace = workspace_dir();
+    let sessions = || {
+        vec![emoji_session_summary(
+            SessionId::new(),
+            workspace.path(),
+            "Reasoning group flicker fixed",
+            "🚀",
+            20,
+        )]
+    };
+
+    let mut hidden = Application::new(workspace.path());
+    open_session_picker_with(&mut hidden, sessions());
+    let drawn = rendered_application_rows(&hidden);
+    let row = drawn
+        .iter()
+        .find(|row| row.contains("Reasoning group flicker fixed"))
+        .expect("render the Session")
+        .clone();
+    assert!(
+        !row.contains('🚀'),
+        "a Session's name carries no Emoji until the reader asks for one: {row:?}"
+    );
+    let buffer = rendered_application_buffer(&hidden, 80, 15);
+    assert_eq!(
+        text_position(&buffer, "Reasoning group flicker fixed").0,
+        text_position(&buffer, "Search:").0 + SESSION_ROW_MARKER_WIDTH,
+        "and its Title holds no cell open where an Emoji would have gone"
+    );
+
+    let mut shown = client_showing_emojis(workspace.path());
+    open_session_picker_with(&mut shown, sessions());
+    assert!(
+        rendered_application_rows(&shown)
+            .iter()
+            .find(|row| row.contains("Reasoning group flicker fixed"))
+            .expect("render the Session")
+            .contains('🚀'),
+        "and the Emoji leads the row once they have"
+    );
+}
+
 #[test]
 fn session_picker_search_matches_the_words_of_a_title_and_never_the_emoji_beside_it() {
     let workspace = workspace_dir();
@@ -1044,7 +1093,7 @@ fn session_picker_search_matches_the_words_of_a_title_and_never_the_emoji_beside
 #[test]
 fn an_emoji_arriving_while_the_picker_is_open_lands_on_its_row() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = client_showing_emojis(workspace.path());
     let derived_id = SessionId::new();
     open_session_picker_with(
         &mut application,
@@ -1109,7 +1158,7 @@ fn an_emoji_arriving_while_the_picker_is_open_lands_on_its_row() {
 #[test]
 fn an_emoji_leaves_an_all_workspaces_row_room_for_its_workspace_path() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = client_showing_emojis(workspace.path());
     open_session_picker_with(
         &mut application,
         vec![session_summary(
@@ -1204,6 +1253,37 @@ fn emoji_session_summary(
         })),
         unreadable => unreadable,
     }
+}
+
+/// A client whose reader has turned Session name Emojis on, which is what a
+/// test about a row that draws one asks for: a Session's name carries no Emoji
+/// until the Setting says it does. The Sidebar is left down, so the picker is
+/// the only thing on screen listing Sessions.
+fn client_showing_emojis(workspace: &std::path::Path) -> Application {
+    let mut application = Application::new(workspace);
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
+                settings: EffectiveSettings {
+                    session: SessionSettings {
+                        title: TitleSettings {
+                            emoji: EmojiVisibility::Shown,
+                            ..TitleSettings::default()
+                        },
+                        ..SessionSettings::default()
+                    },
+                    sidebar: SidebarSettings {
+                        initial_visibility: SidebarVisibility::Hidden,
+                        ..SidebarSettings::default()
+                    },
+                    ..EffectiveSettings::default()
+                },
+                pinned: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+        )))
+        .expect("receive the effective-settings snapshot");
+    application
 }
 
 fn open_session_picker_with(application: &mut Application, sessions: Vec<SessionListItem>) {

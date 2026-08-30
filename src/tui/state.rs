@@ -676,10 +676,11 @@ impl TuiState {
                 interaction.folds.borrow_mut().clear_automatic_promotions();
             }
         }
-        // The Sidebar's own Settings are the ones that act on arrival rather
-        // than on the next view opened, because the frame they govern is
-        // already on screen.
-        self.sidebar.adopt_settings(&self.settings.sidebar);
+        // The Settings the Sidebar and the session picker draw under are the
+        // ones that act on arrival rather than on the next view opened,
+        // because the frames they govern may be on screen already.
+        self.sidebar.adopt_settings(&self.settings);
+        self.session_picker.adopt_settings(&self.settings);
         self.landing_notice.receive(&snapshot.diagnostics);
     }
 

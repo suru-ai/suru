@@ -1,5 +1,5 @@
-//! The settings panel: its General and Providers tabs, and editing a Setting
-//! from either of them.
+//! The settings panel: the tabs it splits its Settings across, and editing a
+//! Setting from any of them.
 
 use std::path::Path;
 
@@ -19,10 +19,10 @@ use crate::support::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AgentSelection, AutoSettle, CodexSettings, CopilotSettings, EffectiveSettings, FoldPosture,
-        ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId,
-        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
-        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
+        AgentSelection, AutoSettle, CodexSettings, CopilotSettings, EffectiveSettings,
+        EmojiVisibility, FoldPosture, ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice,
+        ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
+        ModelOptionRole, ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
         ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
         SessionId, SessionSettings, SettingMutation, SettingsSnapshot, TitleErrand, TitleSettings,
         TranscriptSettings,
@@ -158,6 +158,14 @@ fn open_panel(application: &mut Application) {
 fn open_providers_tab(application: &mut Application) {
     open_panel(application);
     press(application, KeyCode::Right, KeyModifiers::NONE);
+}
+
+/// The panel as it opens, on the Experimental tab. Reached by wrapping
+/// backwards off the first tab rather than by walking forwards onto it, so
+/// arriving here never passes through the Providers and the read they begin.
+fn open_experimental_tab(application: &mut Application) {
+    open_panel(application);
+    press(application, KeyCode::Left, KeyModifiers::NONE);
 }
 
 /// The Providers tab, plus the catalog listing entering it asks for — which is
@@ -329,11 +337,11 @@ fn the_leader_key_and_the_slash_command_both_open_the_panel_and_escape_closes_it
     );
 }
 
-/// The tab bar is the panel's map: both tabs are always named, the active one
+/// The tab bar is the panel's map: every tab is always named, the active one
 /// is drawn as such, and Left and Right walk between them in a ring so neither
 /// end of the bar is a dead end.
 #[test]
-fn the_tab_bar_names_both_tabs_and_left_and_right_switch_between_them_with_wrap() {
+fn the_tab_bar_names_every_tab_and_left_and_right_switch_between_them_with_wrap() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
@@ -370,6 +378,14 @@ fn the_tab_bar_names_both_tabs_and_left_and_right_switch_between_them_with_wrap(
     );
 
     press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    let last = rendered_application_buffer(&application, 80, 15);
+    assert_eq!(
+        styling(&last, "Experimental"),
+        active,
+        "Right moves on again, to the tab standing past the Providers"
+    );
+
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
     let wrapped = rendered_application_buffer(&application, 80, 15);
     assert_eq!(
         styling(&wrapped, "General"),
@@ -380,9 +396,53 @@ fn the_tab_bar_names_both_tabs_and_left_and_right_switch_between_them_with_wrap(
     press(&mut application, KeyCode::Left, KeyModifiers::NONE);
     let backwards = rendered_application_buffer(&application, 80, 15);
     assert_eq!(
-        styling(&backwards, "Providers"),
+        styling(&backwards, "Experimental"),
         active,
         "Left before the first tab wraps to the last"
+    );
+}
+
+/// The Experimental tab is the last of the bar, past the Providers, and it is
+/// the one surface an experimental Setting reaches the reader from: a Setting
+/// declared experimental must not also stand among the General ones, and the
+/// General tab must not lose its own.
+#[test]
+fn the_experimental_tab_stands_past_the_providers_and_lists_the_settings_declared_experimental() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_experimental_tab(&mut application);
+
+    let emojis = row(&application, "Session name Emojis");
+    assert!(
+        emojis.contains("hidden [default]"),
+        "a Session's name carries no Emoji until the reader asks for one: {emojis:?}"
+    );
+    assert_eq!(
+        focused_key(&application),
+        "session.title.emoji",
+        "the focused Setting names the key a Config Document would spell"
+    );
+    assert!(
+        !has_row(&application, "Default Fold posture") && !has_row(&application, "Codex"),
+        "the Experimental tab lists its own Settings and nobody else's"
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::SessionTitleEmoji {
+            value: Some(EmojiVisibility::Shown),
+        }),
+        "and Space cycles it on, as it cycles any other Setting"
+    );
+
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    assert!(
+        !has_row(&application, "Session name Emojis"),
+        "an experimental Setting is not also a General one"
+    );
+    assert!(
+        has_row(&application, "Default Fold posture"),
+        "and the General tab keeps every Setting it had"
     );
 }
 
@@ -723,12 +783,17 @@ fn entering_the_providers_tab_reads_availability_every_time() {
 
     press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
     open_panel(&mut application);
+    assert_eq!(
+        press(&mut application, KeyCode::Left, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "wrapping backwards off the first tab lands on one presenting no Provider"
+    );
     assert!(
         matches!(
             press(&mut application, KeyCode::Left, KeyModifiers::NONE),
             ApplicationTransition::ListModels(_)
         ),
-        "reaching the tab by wrapping the other way is the same arrival"
+        "and reaching the tab from that side is the same arrival"
     );
 }
 
@@ -2082,7 +2147,10 @@ fn the_open_panel_takes_the_keys_the_composer_would_otherwise_get() {
 fn deriving_titles_with(errand: TitleErrand) -> EffectiveSettings {
     EffectiveSettings {
         session: SessionSettings {
-            title: TitleSettings { errand },
+            title: TitleSettings {
+                errand,
+                ..TitleSettings::default()
+            },
             ..SessionSettings::default()
         },
         ..EffectiveSettings::default()

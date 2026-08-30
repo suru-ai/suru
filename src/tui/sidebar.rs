@@ -10,8 +10,8 @@ use std::{
 use ratatui::layout::Position;
 
 use crate::protocol::{
-    AutoSettle, SessionId, SessionListItem, SessionTimestamp, SidebarScope, SidebarSettings,
-    SidebarVisibility,
+    AutoSettle, EffectiveSettings, EmojiVisibility, SessionId, SessionListItem, SessionTimestamp,
+    SidebarScope, SidebarVisibility,
 };
 
 use super::{
@@ -135,6 +135,9 @@ pub(super) struct Sidebar {
     /// Settings that seed the Sidebar this one governs what the Sidebar shows for as long as it is
     /// open: editing it reclassifies every listed Session on the next frame.
     auto_settle: AutoSettle,
+    /// Whether a row draws the Emoji derived beside its Session's Title, which
+    /// governs every frame from the moment the Setting lands.
+    emoji: EmojiVisibility,
     /// The Workspaces the Sidebar draws, seeded once from the initial-scope
     /// Setting and moved by the selector afterwards.
     scope: WorkspaceScope,
@@ -257,6 +260,8 @@ pub(super) struct SidebarRow<'a> {
     /// the screen rows it draws so a press lands on the work rather than on
     /// the position.
     pub(super) session_id: SessionId,
+    /// The Emoji this row draws for its Session: none where the derivation
+    /// left it none, and none while the reader keeps Emojis hidden.
     pub(super) emoji: Option<&'a str>,
     pub(super) title: &'a str,
     /// Whether this is the Session the reader has open.
@@ -618,6 +623,7 @@ impl Sidebar {
             focused: false,
             seeded: false,
             auto_settle: AutoSettle::default(),
+            emoji: EmojiVisibility::default(),
             scope: WorkspaceScope::AllWorkspaces,
             selector_open: false,
             workspace_entry: None,
@@ -642,24 +648,25 @@ impl Sidebar {
         }
     }
 
-    /// Takes the Sidebar's own Settings, each on its own schedule: auto-settle
-    /// governs every frame from here on, while the two initial Settings have
-    /// their say once and are then the reader's to overrule. Returns nothing: a
-    /// Sidebar that wants its Sessions leaves the request in
-    /// [`Self::take_listing_request`].
-    pub(super) fn adopt_settings(&mut self, settings: &SidebarSettings) {
-        self.auto_settle = settings.auto_settle;
+    /// Takes the Settings the Sidebar draws under, each on its own schedule:
+    /// auto-settle and how a Session is named govern every frame from here on,
+    /// while the two initial Settings have their say once and are then the
+    /// reader's to overrule. Returns nothing: a Sidebar that wants its Sessions
+    /// leaves the request in [`Self::take_listing_request`].
+    pub(super) fn adopt_settings(&mut self, settings: &EffectiveSettings) {
+        self.auto_settle = settings.sidebar.auto_settle;
+        self.emoji = settings.session.title.emoji;
         if self.seeded {
             return;
         }
         self.seeded = true;
-        self.scope = match settings.initial_scope {
+        self.scope = match settings.sidebar.initial_scope {
             SidebarScope::AllWorkspaces => WorkspaceScope::AllWorkspaces,
             SidebarScope::CurrentWorkspace => {
                 WorkspaceScope::Workspace(self.listing.current_workspace().to_owned())
             }
         };
-        self.reveal(settings.initial_visibility == SidebarVisibility::Shown);
+        self.reveal(settings.sidebar.initial_visibility == SidebarVisibility::Shown);
     }
 
     /// Shows the Sidebar, or hides it. This is view state and nothing more: the
@@ -1666,7 +1673,7 @@ impl Sidebar {
     ) -> SidebarEntry<'a> {
         SidebarEntry::Row(SidebarRow {
             session_id: session.id(),
-            emoji: session.emoji(),
+            emoji: self.emoji.drawn_emoji(session.emoji()),
             title: session.title(),
             current: current == Some(session.id()),
             selected: self.selected == Some(SidebarSelection::Session(session.id())),
@@ -1998,8 +2005,9 @@ mod tests {
 
     use crate::{
         protocol::{
-            AutoSettle, ModelAvailability, Session, SessionId, SessionListItem, SessionStatus,
-            SessionSummary, SessionTimestamp, SidebarSettings, SidebarVisibility, Workspace,
+            AutoSettle, EffectiveSettings, ModelAvailability, Session, SessionId, SessionListItem,
+            SessionStatus, SessionSummary, SessionTimestamp, SidebarSettings, SidebarVisibility,
+            Workspace,
         },
         tui::sidebar::{
             MINIMUM_MAIN_WIDTH, SIDEBAR_WIDTH, Sidebar, SidebarActivation, SidebarEntry,
@@ -2260,11 +2268,11 @@ mod tests {
     #[test]
     fn a_session_settles_itself_the_moment_its_idle_reaches_the_threshold() {
         let mut sidebar = Sidebar::new(root());
-        sidebar.adopt_settings(&SidebarSettings {
+        sidebar.adopt_settings(&under(SidebarSettings {
             initial_visibility: SidebarVisibility::Shown,
             auto_settle: AutoSettle::Idle(1),
             ..SidebarSettings::default()
-        });
+        }));
         let request = sidebar.take_listing_request().expect("ask for Sessions");
         let a_day = AutoSettle::Idle(1)
             .idle_millis()
@@ -2639,22 +2647,31 @@ mod tests {
 
     /// The Sidebar's Settings as a TUI launching under `initial_visibility`
     /// takes them, everything else left where its built-in default is.
-    fn launching(initial_visibility: SidebarVisibility) -> SidebarSettings {
-        SidebarSettings {
+    fn launching(initial_visibility: SidebarVisibility) -> EffectiveSettings {
+        under(SidebarSettings {
             initial_visibility,
             ..SidebarSettings::default()
-        }
+        })
     }
 
     /// The Sidebar shown with nothing settling itself, which is what a test
     /// about the order or the shape of the list asks for: its fixtures stamp
     /// Sessions with ordinals rather than with moments, and every one of those
     /// reads as work left alone since the epoch.
-    fn settling_nothing() -> SidebarSettings {
-        SidebarSettings {
+    fn settling_nothing() -> EffectiveSettings {
+        under(SidebarSettings {
             initial_visibility: SidebarVisibility::Shown,
             auto_settle: AutoSettle::Off,
             ..SidebarSettings::default()
+        })
+    }
+
+    /// Effective settings whose only departure from the built-in defaults is
+    /// what the reader asked of the Sidebar itself.
+    fn under(sidebar: SidebarSettings) -> EffectiveSettings {
+        EffectiveSettings {
+            sidebar,
+            ..EffectiveSettings::default()
         }
     }
 

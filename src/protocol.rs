@@ -801,11 +801,39 @@ impl<'de> Deserialize<'de> for SessionContentWidth {
     }
 }
 
-/// How Suru derives a Session's Title.
+/// Whether the Emoji a derivation left beside a Session's Title is drawn
+/// wherever that Session is named.
+///
+/// Display and nothing else: an Emoji hidden is still derived, still stored,
+/// and still carried to every client, so turning them back on costs no
+/// derivation and reveals the Emojis Suru already holds.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmojiVisibility {
+    #[default]
+    Hidden,
+    Shown,
+}
+
+impl EmojiVisibility {
+    /// The Emoji a Session's name is drawn with: the one derived for it where
+    /// the reader has Emojis on, and none where they have not. Written down
+    /// once, so no two surfaces naming Sessions can disagree about what the
+    /// Setting means.
+    pub fn drawn_emoji(self, emoji: Option<&str>) -> Option<&str> {
+        match self {
+            Self::Shown => emoji,
+            Self::Hidden => None,
+        }
+    }
+}
+
+/// How Suru derives a Session's Title, and how what it derived is drawn.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TitleSettings {
     pub errand: TitleErrand,
+    pub emoji: EmojiVisibility,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1034,6 +1062,9 @@ pub enum SettingMutation {
     },
     SessionTitleErrand {
         value: Option<TitleErrand>,
+    },
+    SessionTitleEmoji {
+        value: Option<EmojiVisibility>,
     },
     SidebarInitialVisibility {
         value: Option<SidebarVisibility>,

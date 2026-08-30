@@ -30,8 +30,8 @@ use jsonc_parser::{
 use serde_json::Value;
 
 use crate::protocol::{
-    AgentSelection, AutoSettle, CommandAutoExpand, EffectiveSettings, FoldPosture, ProviderId,
-    ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
+    AgentSelection, AutoSettle, CommandAutoExpand, EffectiveSettings, EmojiVisibility, FoldPosture,
+    ProviderId, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
     SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope,
     SidebarVisibility, TitleErrand,
 };
@@ -51,6 +51,7 @@ const SESSION_CONTENT_WIDTH: &str = "session.contentWidth";
 // later gets its own key and turning Titles off can never silently disable
 // work that has nothing to do with them.
 const SESSION_TITLE_ERRAND: &str = "session.title.errand";
+const SESSION_TITLE_EMOJI: &str = "session.title.emoji";
 const SIDEBAR_INITIAL_VISIBILITY: &str = "sidebar.initialVisibility";
 const SIDEBAR_INITIAL_SCOPE: &str = "sidebar.initialScope";
 const SIDEBAR_AUTO_SETTLE: &str = "sidebar.autoSettle";
@@ -73,6 +74,11 @@ pub enum SettingGroup {
     /// Settings scoped to one Provider, which the panel presents beside the
     /// Provider they configure rather than in a flat list.
     Providers,
+    /// Settings still finding their shape, kept apart so a reader meets them
+    /// knowing as much. Nothing else follows from the group: an experimental
+    /// Setting is loaded, pinned, and edited exactly like any other, and
+    /// settling one is a one-line move to the group it belongs in.
+    Experimental,
 }
 
 /// One Setting's compile-time definition: what a Config Document calls it,
@@ -422,6 +428,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         }
         SettingMutation::SessionTitleErrand { value } => {
             value.as_ref() == Some(&settings.session.title.errand)
+        }
+        SettingMutation::SessionTitleEmoji { value } => {
+            *value == Some(settings.session.title.emoji)
         }
         SettingMutation::SidebarInitialVisibility { value } => {
             *value == Some(settings.sidebar.initial_visibility)
@@ -823,6 +832,34 @@ pub const SCHEMA: &[SettingDescriptor] = &[
             })
         },
     },
+    // The experimental Settings stand last, as the tab presenting them does.
+    SettingDescriptor {
+        key: SESSION_TITLE_EMOJI,
+        label: "Session name Emojis",
+        description: "Whether the Emoji derived for a Session is drawn wherever it is named",
+        group: SettingGroup::Experimental,
+        scope: SettingScope::Client,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "hidden",
+                pin: SettingMutation::SessionTitleEmoji {
+                    value: Some(EmojiVisibility::Hidden),
+                },
+            },
+            SettingChoice {
+                value: "shown",
+                pin: SettingMutation::SessionTitleEmoji {
+                    value: Some(EmojiVisibility::Shown),
+                },
+            },
+        ]),
+        reset: SettingMutation::SessionTitleEmoji { value: None },
+        apply: |settings, value| {
+            apply_value(value, |visibility| {
+                settings.session.title.emoji = visibility;
+            })
+        },
+    },
 ];
 
 /// The Setting through which the user turns one Provider on or off, which is
@@ -982,6 +1019,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         }
         SettingMutation::SessionContentWidth { value } => (SESSION_CONTENT_WIDTH, pinned(value)),
         SettingMutation::SessionTitleErrand { value } => (SESSION_TITLE_ERRAND, pinned(value)),
+        SettingMutation::SessionTitleEmoji { value } => (SESSION_TITLE_EMOJI, pinned(value)),
         SettingMutation::SidebarInitialVisibility { value } => {
             (SIDEBAR_INITIAL_VISIBILITY, pinned(value))
         }
@@ -1510,6 +1548,7 @@ mod tests {
                 "one of \"auto\", \"concise\", \"detailed\", or \"none\"".to_owned(),
                 "one of true or false".to_owned(),
                 "one of true or false".to_owned(),
+                "one of \"hidden\" or \"shown\"".to_owned(),
             ]
         );
     }

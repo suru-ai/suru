@@ -2,7 +2,9 @@
 
 use std::path::Path;
 
-use crate::protocol::{SessionId, SessionListItem, SessionStatus, SessionTimestamp};
+use crate::protocol::{
+    EffectiveSettings, EmojiVisibility, SessionId, SessionListItem, SessionStatus, SessionTimestamp,
+};
 
 use super::{
     SessionListRequest, SessionListScope, SessionListSurface, session_listing::SessionListing,
@@ -15,6 +17,9 @@ pub(super) struct SessionPicker {
     /// them true. The picker holds only what it does with them: the query it
     /// filters by and the row the reader is on.
     listing: SessionListing,
+    /// Whether a row draws the Emoji derived beside its Session's Title, which
+    /// governs every frame from the moment the Setting lands.
+    emoji: EmojiVisibility,
     query: String,
     selected: Option<SessionId>,
     attaching: Option<SessionId>,
@@ -25,10 +30,11 @@ pub(super) struct SessionPicker {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SessionPickerRow<'a> {
     pub(super) title: &'a str,
-    /// The Emoji standing for this Session, carried beside the Title rather
-    /// than within it so the query never meets it. A Session whose derivation
-    /// was skipped, failed, or abandoned has none, and its row is drawn as
-    /// readily without one.
+    /// The Emoji this row draws for its Session, carried beside the Title
+    /// rather than within it so the query never meets it. A Session whose
+    /// derivation was skipped, failed, or abandoned has none, and so has every
+    /// Session while the reader keeps Emojis hidden; a row is drawn as readily
+    /// without one either way.
     pub(super) emoji: Option<&'a str>,
     pub(super) selected: bool,
     pub(super) current: bool,
@@ -44,6 +50,7 @@ impl SessionPicker {
         Self {
             open: false,
             listing: SessionListing::new(SessionListSurface::SessionPicker, current_workspace),
+            emoji: EmojiVisibility::default(),
             query: String::new(),
             selected: None,
             attaching: None,
@@ -57,6 +64,12 @@ impl SessionPicker {
         self.query.clear();
         self.listing.clear_error();
         self.begin_listing()
+    }
+
+    /// Takes the Settings the picker draws under, which is how a Session is
+    /// named: everything else about a row is the listing's own.
+    pub(super) fn adopt_settings(&mut self, settings: &EffectiveSettings) {
+        self.emoji = settings.session.title.emoji;
     }
 
     /// Takes the Workspace this client has moved to, so the picker's own
@@ -250,7 +263,7 @@ impl SessionPicker {
                 let readable = summary.readable();
                 SessionPickerRow {
                     title: summary.title(),
-                    emoji: summary.emoji(),
+                    emoji: self.emoji.drawn_emoji(summary.emoji()),
                     selected: self.selected == Some(summary.id()),
                     current: readable.is_some() && current == Some(summary.id()),
                     active: readable

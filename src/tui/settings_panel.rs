@@ -6,13 +6,13 @@
 //! the server is what moves a row — the panel never shows a value the Config
 //! Document does not yet carry.
 //!
-//! Two tabs split the listing. General is the schema filtered to the Settings
-//! that configure no Provider, so one added there appears with no work.
-//! Providers is hand-built from the built-in Provider list rather than from the
-//! schema: one row per Provider, always and in the built-in order, each row
-//! standing for that Provider's Enablement. Which tab a Setting lands on is the
-//! Setting's own declaration in the schema, so the panel maps groups to tabs
-//! and invents no grouping of its own.
+//! Three tabs split the listing. General and Experimental are the schema
+//! filtered to their own group, so a Setting added to either appears with no
+//! work. Providers is hand-built from the built-in Provider list rather than
+//! from the schema: one row per Provider, always and in the built-in order,
+//! each row standing for that Provider's Enablement. Which tab a Setting lands
+//! on is the Setting's own declaration in the schema, so the panel maps groups
+//! to tabs and invents no grouping of its own.
 //!
 //! Everything else a Provider is configured by is revealed under it, as
 //! ordinary rows the reader expands the Provider to see. The expansion is view
@@ -69,17 +69,19 @@ pub(super) enum SettingsTab {
     #[default]
     General,
     Providers,
+    Experimental,
 }
 
 impl SettingsTab {
     /// Every tab, in the order the tab bar draws them and Left and Right walk
     /// them. The default is where an opening panel lands.
-    pub(super) const ALL: &'static [Self] = &[Self::General, Self::Providers];
+    pub(super) const ALL: &'static [Self] = &[Self::General, Self::Providers, Self::Experimental];
 
     pub(super) fn title(self) -> &'static str {
         match self {
             Self::General => "General",
             Self::Providers => "Providers",
+            Self::Experimental => "Experimental",
         }
     }
 
@@ -88,6 +90,7 @@ impl SettingsTab {
         match self {
             Self::General => SettingGroup::General,
             Self::Providers => SettingGroup::Providers,
+            Self::Experimental => SettingGroup::Experimental,
         }
     }
 
@@ -747,13 +750,14 @@ impl SettingsPanel {
         Some(self.selected_descriptor()?.reset.clone())
     }
 
-    /// The rows of the tab being shown. General is the schema filtered to its
-    /// group; Providers is built from the built-in Provider list so that every
-    /// Provider holds its place whatever the reader has done to it.
+    /// The rows of the tab being shown. A tab presenting Settings alone is the
+    /// schema filtered to its group; Providers is built from the built-in
+    /// Provider list so that every Provider holds its place whatever the
+    /// reader has done to it.
     fn entries(&self) -> Vec<PanelEntry> {
         let tab = self.tab;
         match tab {
-            SettingsTab::General => SCHEMA
+            SettingsTab::General | SettingsTab::Experimental => SCHEMA
                 .iter()
                 .filter(|descriptor| descriptor.group == tab.group())
                 .map(|descriptor| PanelEntry {
@@ -963,22 +967,28 @@ mod tests {
         }
     }
 
-    /// The General tab is defined by exclusion — everything that configures no
-    /// Provider — so a Provider Setting grouped as General would surface among
-    /// the Transcript ones, and a General one grouped as a Provider's would
-    /// vanish from the panel entirely.
+    /// The Providers tab is the one tab a Setting's key decides: it is built
+    /// from the Providers themselves, so a Provider Setting grouped elsewhere
+    /// would vanish from under the Provider it configures, and a Setting
+    /// configuring no Provider grouped there would surface under one it has
+    /// nothing to do with. Which of the remaining tabs a Setting lands on is
+    /// the schema's own call, which is what makes moving one a one-line
+    /// change.
     #[test]
-    fn a_setting_is_grouped_by_whether_it_configures_a_provider() {
+    fn a_setting_is_grouped_with_the_providers_exactly_when_it_configures_one() {
         for descriptor in SCHEMA {
-            let expected = if descriptor.key.starts_with("provider.") {
-                SettingGroup::Providers
-            } else {
-                SettingGroup::General
-            };
+            let configures_a_provider = descriptor.key.starts_with("provider.");
             assert_eq!(
-                descriptor.group, expected,
-                "{} is grouped away from the tab its key says it belongs to",
-                descriptor.key
+                descriptor.group == SettingGroup::Providers,
+                configures_a_provider,
+                "{} is grouped as {:?} while it configures {}",
+                descriptor.key,
+                descriptor.group,
+                if configures_a_provider {
+                    "a Provider"
+                } else {
+                    "no Provider"
+                }
             );
         }
     }
