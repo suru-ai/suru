@@ -30,7 +30,11 @@ pub const COPILOT_MODELS: &str = concat!(
     r#""supportedReasoningEfforts":["low","high"],"defaultReasoningEffort":"high","#,
     r#""supportedContextTiers":["default","long_context"],"#,
     r#""billing":{"tokenPrices":{"batchSize":1000,"inputPrice":2.0,"#,
-    r#""outputPrice":8.0,"cacheReadPrice":0.5,"cacheWritePrice":2.5}}}]"#,
+    r#""outputPrice":8.0,"cacheReadPrice":0.5,"cacheWritePrice":2.5,"#,
+    r#""cacheWrite1hPrice":5.0}}},"#,
+    r#"{"id":"incomplete-cache-fixture","name":"Incomplete Cache Fixture","#,
+    r#""capabilities":{},"billing":{"tokenPrices":{"batchSize":1000,"#,
+    r#""inputPrice":2.0,"outputPrice":8.0}}}]"#,
 );
 
 /// Reads one Content-Length-framed request at a time, records it, and dispatches it to the test's

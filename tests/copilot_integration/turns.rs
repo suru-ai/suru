@@ -27,15 +27,21 @@ use suru::{
 /// two distinct stretches in order.
 const METERED_TURNS: &str = r#"      sends=$(( ${sends:-0} + 1 ))
       if [ "$sends" -eq 1 ]; then
-        event u1 assistant.usage '{"model":"claude-fixture","inputTokens":1000,"cacheReadTokens":100,"cacheWriteTokens":50,"outputTokens":200,"reasoningTokens":50,"cost":1.5}'
+        event u1 assistant.usage '{"model":"claude-fixture","inputTokens":1000,"cacheReadTokens":100,"cacheWriteTokens":50,"cacheTtlSeconds":3600,"outputTokens":200,"reasoningTokens":50,"cost":1.5,"maxPromptTokens":128000,"maxOutputTokens":32000}'
         event u2 assistant.usage '{"model":"claude-fixture","inputTokens":500,"cacheReadTokens":50,"cacheWriteTokens":0,"outputTokens":100,"reasoningTokens":0,"cost":0.5}'
+        event u_sparse assistant.usage '{"model":"claude-fixture","inputTokens":0,"cacheReadTokens":0,"cacheWriteTokens":0,"outputTokens":0,"reasoningTokens":0}'
         event m1 assistant.message '{"messageId":"m1","content":"First answer"}'
         event i1 session.idle '{}'
       else
-        event u3 assistant.usage '{"model":"unpriced-fixture","inputTokens":100,"outputTokens":20,"cost":0.25}'
+        event u4 assistant.usage '{"model":"unpriced-fixture","inputTokens":100,"outputTokens":20,"cost":0.25,"maxPromptTokens":100000,"maxOutputTokens":20000}'
         event m2 assistant.message '{"messageId":"m2","content":"Second answer"}'
         event i2 session.idle '{}'
       fi
+"#;
+
+const USAGE_WITH_UNPRICED_CACHE: &str = r#"      event u1 assistant.usage '{"model":"incomplete-cache-fixture","inputTokens":1000,"cacheReadTokens":100,"outputTokens":200,"cost":1}'
+      event m1 assistant.message '{"messageId":"m1","content":"Answer"}'
+      event i1 session.idle '{}'
 "#;
 
 /// One agent Message arriving as Copilot produces it, then the loop going idle.
@@ -109,11 +115,11 @@ async fn copilot_per_call_usage_is_bracketed_into_turns_with_reported_catalog_co
             output_tokens: Some(250),
             reasoning_tokens: Some(50),
             native_meter: NativeMeter::from_units(2.0),
-            model_context_window: None,
+            model_context_window: Some(160_000),
         }),
         "both calls are summed into the first Turn with disjoint token parts"
     );
-    assert_eq!(first.turns[0].cost, Cost::from_usd(0.052));
+    assert_eq!(first.turns[0].cost, Cost::from_usd(0.05325));
     assert_eq!(first.turns[0].cost_basis, Some(CostBasis::Reported));
     assert_eq!(
         serde_json::to_value(first.turns[0].usage.as_ref().expect("first Turn Usage"))
@@ -147,7 +153,7 @@ async fn copilot_per_call_usage_is_bracketed_into_turns_with_reported_catalog_co
             output_tokens: Some(20),
             reasoning_tokens: None,
             native_meter: NativeMeter::from_units(0.25),
-            model_context_window: None,
+            model_context_window: Some(120_000),
         }),
         "the second Turn starts its own token accumulator"
     );
@@ -164,6 +170,50 @@ async fn copilot_per_call_usage_is_bracketed_into_turns_with_reported_catalog_co
     );
 
     drop(feed);
+    server.shutdown().await.expect("shut the server down");
+}
+
+#[tokio::test]
+async fn copilot_cost_is_absent_when_an_applicable_cache_price_is_not_published() {
+    let copilot = conversation_fixture(USAGE_WITH_UNPRICED_CACHE);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "copilot-incomplete-cache-price")
+            .expect("configure server"),
+        Arc::new(CopilotRuntime::new(copilot.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let client = connect(state_dir.path(), "copilot-incomplete-cache-price").await;
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Use the cache".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let settled = settled_session(&client, created.session.id, 0).await;
+
+    assert_eq!(settled.turns[0].cost, None);
+    assert_eq!(settled.turns[0].cost_basis, None);
+    assert_eq!(
+        settled.turns[0]
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.cache_read_tokens),
+        Some(100),
+        "usage remains available even though its cache component cannot be priced"
+    );
+
     server.shutdown().await.expect("shut the server down");
 }
 

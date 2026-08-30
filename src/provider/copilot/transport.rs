@@ -72,7 +72,7 @@ impl HarnessConnector for CopilotConnector {
             invalidator,
             event_drain,
             warning: Arc::new(OnceLock::new()),
-            pricing: Arc::new(StdMutex::new(CopilotPricing::default())),
+            pricing: CopilotPricing::default(),
         })
     }
 
@@ -154,7 +154,7 @@ pub(super) struct CopilotConnection {
     /// The prices most recently published by this harness generation. Session
     /// projections share it so a catalog refresh changes only future recorded
     /// Costs; Turns already stamped by the store remain frozen.
-    pricing: Arc<StdMutex<CopilotPricing>>,
+    pricing: CopilotPricing,
 }
 
 /// Why this connection stopped serving requests, once it has.
@@ -189,14 +189,11 @@ impl CopilotConnection {
             .await
             .map(|listed| listed.models)
             .map_err(|error| self.failure("Copilot Model discovery failed", error))?;
-        self.pricing
-            .lock()
-            .expect("Copilot pricing lock is not poisoned")
-            .replace(&models);
+        self.pricing.replace(&models);
         Ok(models)
     }
 
-    pub(super) fn pricing(&self) -> Arc<StdMutex<CopilotPricing>> {
+    pub(super) fn pricing(&self) -> CopilotPricing {
         self.pricing.clone()
     }
 
@@ -205,12 +202,7 @@ impl CopilotConnection {
     /// listing Models, so startup asks here independently; failure deliberately
     /// degrades only Cost and leaves the Session usable.
     pub(super) async fn ensure_pricing(&self) {
-        if self
-            .pricing
-            .lock()
-            .expect("Copilot pricing lock is not poisoned")
-            .is_loaded()
-        {
+        if self.pricing.is_loaded() {
             return;
         }
         let _ = self.list_models().await;

@@ -536,6 +536,77 @@ pub enum ProviderEvent {
     },
 }
 
+/// The cumulative Usage and Provider-reported Cost for one active Turn. A
+/// field stays known only while every contributing Provider report states a
+/// valid value; overflow and omission degrade that field to absence rather
+/// than manufacturing a number.
+pub(super) struct ReportedTurnMetering {
+    usage: Usage,
+    reported_cost: Option<Cost>,
+    native_meter_overflowed: bool,
+}
+
+impl ReportedTurnMetering {
+    pub(super) fn new(usage: Usage, reported_cost: Option<Cost>) -> Self {
+        Self {
+            usage,
+            reported_cost,
+            native_meter_overflowed: false,
+        }
+    }
+
+    pub(super) fn add(&mut self, usage: Usage, reported_cost: Option<Cost>) {
+        self.usage.fresh_input_tokens =
+            add_reported_counts(self.usage.fresh_input_tokens, usage.fresh_input_tokens);
+        self.usage.cache_read_tokens =
+            add_reported_counts(self.usage.cache_read_tokens, usage.cache_read_tokens);
+        self.usage.cache_write_tokens =
+            add_reported_counts(self.usage.cache_write_tokens, usage.cache_write_tokens);
+        self.usage.output_tokens =
+            add_reported_counts(self.usage.output_tokens, usage.output_tokens);
+        self.usage.reasoning_tokens =
+            add_reported_counts(self.usage.reasoning_tokens, usage.reasoning_tokens);
+        if !self.native_meter_overflowed {
+            self.usage.native_meter = match (self.usage.native_meter, usage.native_meter) {
+                (Some(current), Some(next)) => match current.checked_add(next) {
+                    Some(total) => Some(total),
+                    None => {
+                        self.native_meter_overflowed = true;
+                        None
+                    }
+                },
+                (Some(current), None) => Some(current),
+                (None, Some(next)) => Some(next),
+                (None, None) => None,
+            };
+        }
+        self.usage.model_context_window =
+            match (self.usage.model_context_window, usage.model_context_window) {
+                (Some(current), Some(next)) => Some(current.max(next)),
+                (Some(current), None) => Some(current),
+                (None, Some(next)) => Some(next),
+                (None, None) => None,
+            };
+        self.reported_cost = self
+            .reported_cost
+            .zip(reported_cost)
+            .and_then(|(current, next)| current.checked_add(next));
+    }
+
+    pub(super) fn event(&self) -> ProviderEvent {
+        ProviderEvent::Usage {
+            usage: self.usage.clone(),
+            reported_cost: self.reported_cost,
+        }
+    }
+}
+
+fn add_reported_counts(current: Option<u64>, next: Option<u64>) -> Option<u64> {
+    current
+        .zip(next)
+        .and_then(|(current, next)| current.checked_add(next))
+}
+
 pub trait ProviderRuntime: Send + Sync + 'static {
     fn provider_id(&self) -> ProviderId;
 
