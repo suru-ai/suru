@@ -5,12 +5,17 @@
 //! sides of the pinned-key TLS transport remain private to this module.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex, RwLock},
+    pin::Pin,
+    sync::{
+        Arc, Mutex as StdMutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context as TaskContext, Poll},
 };
 
 use anyhow::{Context, Result};
@@ -23,6 +28,7 @@ use axum::{
     serve::{IncomingStream, Listener},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures_util::task::AtomicWaker;
 use rcgen::{CertificateParams, KeyPair, PublicKeyData};
 use rustls::{
     ClientConfig, DigitallySignedStruct, DistinguishedName, Error as TlsError, RootCertStore,
@@ -38,6 +44,7 @@ use rustls::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use subtle::ConstantTimeEq;
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::{Mutex, watch},
     task::JoinHandle,
@@ -47,8 +54,8 @@ use uuid::Uuid;
 
 use crate::{
     protocol::{
-        IssueInviteRequest, IssuedInvite, PROTOCOL_VERSION, Peer, RedeemInviteRequest, Remote,
-        RemoteHealth, ServingSettings, SessionError, SessionErrorCode,
+        IssueInviteRequest, IssuedInvite, Peer, RedeemInviteRequest, Remote, RemoteHealth,
+        ServingSettings, SessionError, SessionErrorCode,
     },
     runtime::protect_current_user_file,
 };
@@ -63,10 +70,12 @@ pub(crate) struct ServingController {
     active: Arc<Mutex<Option<ActiveServing>>>,
     address: watch::Sender<Option<SocketAddr>>,
     invite_ttl: tokio::time::Duration,
-    invites: Arc<Mutex<InviteLedger>>,
+    invites: Arc<StdMutex<InviteLedger>>,
+    protocol_version: u32,
     identity: Arc<StdMutex<Option<IdentityMaterial>>>,
     peers: Arc<RwLock<Vec<StoredPeer>>>,
     remotes: Arc<RwLock<Vec<StoredRemote>>>,
+    revocations: Arc<RwLock<HashMap<String, Arc<PeerRevocation>>>>,
 }
 
 struct ActiveServing {
@@ -110,18 +119,20 @@ struct StoredPeer {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredRemote {
-    name: String,
-    fingerprint: String,
-    addresses: Vec<SocketAddr>,
+    #[serde(flatten)]
+    remote: Remote,
     public_key: Vec<u8>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct InvitePayload {
-    a: Vec<SocketAddr>,
-    k: String,
-    t: String,
+    #[serde(rename = "a")]
+    addresses: Vec<SocketAddr>,
+    #[serde(rename = "k")]
+    server_key: String,
+    #[serde(rename = "t")]
+    token: String,
 }
 
 struct ParsedInvite {
@@ -134,7 +145,15 @@ struct ParsedInvite {
 #[serde(deny_unknown_fields)]
 struct EnrollmentRequest {
     token: String,
-    public_key: String,
+    protocol_version: u32,
+    phase: EnrollmentPhase,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EnrollmentPhase {
+    Prepare,
+    Commit,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -148,6 +167,7 @@ struct EnrollmentResponse {
 struct ServingState {
     controller: ServingController,
     hostname: String,
+    protocol_version: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +197,7 @@ impl PairingFailure {
             }
             SessionErrorCode::PairingConnectionFailed
             | SessionErrorCode::PairingAuthenticationFailed => StatusCode::BAD_GATEWAY,
+            SessionErrorCode::PairingProtocolMismatch => StatusCode::CONFLICT,
             SessionErrorCode::PeerNotFound | SessionErrorCode::RemoteNotFound => {
                 StatusCode::NOT_FOUND
             }
@@ -197,17 +218,28 @@ impl PairingFailure {
 }
 
 impl ServingController {
-    pub(crate) fn new(data_dir: &Path, invite_ttl: tokio::time::Duration) -> Result<Self> {
+    pub(crate) fn new(
+        data_dir: &Path,
+        invite_ttl: tokio::time::Duration,
+        protocol_version: u32,
+    ) -> Result<Self> {
         let (address, _) = watch::channel(None);
+        let peers: Vec<StoredPeer> = read_records(&data_dir.join(PEERS_FILE))?;
+        let revocations = peers
+            .iter()
+            .map(|peer| (peer.id.clone(), Arc::new(PeerRevocation::default())))
+            .collect();
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             active: Arc::new(Mutex::new(None)),
             address,
             invite_ttl,
-            invites: Arc::new(Mutex::new(InviteLedger::default())),
+            invites: Arc::new(StdMutex::new(InviteLedger::default())),
+            protocol_version,
             identity: Arc::new(StdMutex::new(None)),
-            peers: Arc::new(RwLock::new(read_records(&data_dir.join(PEERS_FILE))?)),
+            peers: Arc::new(RwLock::new(peers)),
             remotes: Arc::new(RwLock::new(read_records(&data_dir.join(REMOTES_FILE))?)),
+            revocations: Arc::new(RwLock::new(revocations)),
         })
     }
 
@@ -225,30 +257,27 @@ impl ServingController {
                 "Serving is disabled",
             ));
         }
-        if request.addresses.is_empty() {
-            return Err(PairingFailure::new(
-                SessionErrorCode::InvalidInvite,
-                "an Invite needs at least one address",
-            ));
-        }
-        if request.addresses.iter().collect::<HashSet<_>>().len() != request.addresses.len() {
+        if !addresses_are_unique_and_nonempty(&request.addresses) {
             return Err(PairingFailure::new(
                 SessionErrorCode::InvalidInviteAddresses,
-                "Invite addresses must be unique",
+                "an Invite needs at least one unique address",
             ));
         }
 
         let identity = self.identity().map_err(internal_pairing_failure)?;
         let token = new_token();
         let payload = InvitePayload {
-            a: request.addresses.clone(),
-            k: URL_SAFE_NO_PAD.encode(&identity.public_key),
-            t: URL_SAFE_NO_PAD.encode(token),
+            addresses: request.addresses.clone(),
+            server_key: URL_SAFE_NO_PAD.encode(&identity.public_key),
+            token: URL_SAFE_NO_PAD.encode(token),
         };
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).map_err(|_| {
             internal_pairing_failure(anyhow::anyhow!("could not encode Invite payload"))
         })?);
-        let mut invites = self.invites.lock().await;
+        let mut invites = self
+            .invites
+            .lock()
+            .expect("Invite ledger lock is not poisoned");
         for issued in &mut invites.issued {
             if matches!(issued.state, TokenState::Outstanding) {
                 issued.state = TokenState::Superseded;
@@ -276,11 +305,18 @@ impl ServingController {
             self.ensure_remote_name_available(name)?;
         }
         let identity = self.identity().map_err(internal_pairing_failure)?;
-        let enrollment = EnrollmentRequest {
+        let prepare = EnrollmentRequest {
             token: URL_SAFE_NO_PAD.encode(invite.token),
-            public_key: URL_SAFE_NO_PAD.encode(&identity.public_key),
+            protocol_version: self.protocol_version,
+            phase: EnrollmentPhase::Prepare,
         };
-        let enrolled = dial_enrollment(&addresses, &invite.server_key, &enrollment).await?;
+        let enrolled = dial_enrollment(&addresses, &invite.server_key, &identity, &prepare).await?;
+        if enrolled.protocol_version != self.protocol_version {
+            return Err(protocol_mismatch(
+                self.protocol_version,
+                enrolled.protocol_version,
+            ));
+        }
         let name = request.name.unwrap_or(enrolled.hostname).trim().to_owned();
         validate_remote_name(&name)?;
         self.ensure_remote_name_available(&name)?;
@@ -289,22 +325,18 @@ impl ServingController {
             fingerprint: fingerprint(&invite.server_key),
             addresses,
         };
-        let mut remotes = self
-            .remotes
-            .write()
-            .expect("Remote record lock is not poisoned");
-        if remotes.iter().any(|known| known.name == name) {
-            return Err(remote_name_conflict(&name));
-        }
-        remotes.push(StoredRemote {
-            name: remote.name.clone(),
-            fingerprint: remote.fingerprint.clone(),
-            addresses: remote.addresses.clone(),
-            public_key: invite.server_key,
-        });
-        if let Err(error) = write_private_json(&self.data_dir.join(REMOTES_FILE), &*remotes) {
-            remotes.pop();
-            return Err(internal_pairing_failure(error));
+        self.persist_remote(&remote, &invite.server_key)?;
+
+        let commit = EnrollmentRequest {
+            token: URL_SAFE_NO_PAD.encode(invite.token),
+            protocol_version: self.protocol_version,
+            phase: EnrollmentPhase::Commit,
+        };
+        if let Err(error) =
+            dial_enrollment(&remote.addresses, &invite.server_key, &identity, &commit).await
+        {
+            self.rollback_remote(&remote);
+            return Err(error);
         }
         Ok(remote)
     }
@@ -326,11 +358,7 @@ impl ServingController {
             .read()
             .expect("Remote record lock is not poisoned")
             .iter()
-            .map(|remote| Remote {
-                name: remote.name.clone(),
-                fingerprint: remote.fingerprint.clone(),
-                addresses: remote.addresses.clone(),
-            })
+            .map(|stored| stored.remote.clone())
             .collect()
     }
 
@@ -343,7 +371,7 @@ impl ServingController {
             .read()
             .expect("Remote record lock is not poisoned")
             .iter()
-            .find(|remote| remote.name == name)
+            .find(|stored| stored.remote.name == name)
             .cloned()
             .ok_or_else(|| {
                 PairingFailure::new(SessionErrorCode::RemoteNotFound, "Remote not found")
@@ -351,8 +379,12 @@ impl ServingController {
         let identity = self.identity().map_err(internal_pairing_failure)?;
         let client =
             paired_http_client(&remote.public_key, &identity).map_err(internal_pairing_failure)?;
-        for address in &remote.addresses {
-            let response = client.get(format!("https://{address}/health")).send().await;
+        for address in &remote.remote.addresses {
+            let response = client
+                .http
+                .get(format!("https://{address}/health"))
+                .send()
+                .await;
             match response {
                 Ok(response) if response.status().is_success() => {
                     return response.json().await.map_err(|_| {
@@ -370,6 +402,12 @@ impl ServingController {
                 }
                 Ok(_) | Err(_) => {}
             }
+        }
+        if client.server_key_rejected.load(Ordering::Acquire) {
+            return Err(PairingFailure::new(
+                SessionErrorCode::PairingAuthenticationFailed,
+                "Remote presented a key other than its pinned key",
+            ));
         }
         Err(PairingFailure::new(
             SessionErrorCode::PairingConnectionFailed,
@@ -393,6 +431,14 @@ impl ServingController {
             peers.insert(index, removed);
             return Err(internal_pairing_failure(error));
         }
+        if let Some(revoked) = self
+            .revocations
+            .write()
+            .expect("Peer revocation lock is not poisoned")
+            .remove(id)
+        {
+            revoked.revoke();
+        }
         Ok(())
     }
 
@@ -408,6 +454,7 @@ impl ServingController {
             return Ok(());
         }
         if !settings.enabled {
+            self.supersede_outstanding_invites();
             stop_active(&mut active, &self.address).await;
             return Ok(());
         }
@@ -426,6 +473,7 @@ impl ServingController {
             .local_addr()
             .context("read bound Serving address")?;
         let tls = Arc::new(self.server_tls_config()?);
+        self.supersede_outstanding_invites();
         stop_active(&mut active, &self.address).await;
         let task = tokio::spawn(serve(listener, tls, self.clone()));
         *active = Some(ActiveServing {
@@ -474,6 +522,7 @@ impl ServingController {
             .context("choose Serving TLS protocol versions")?
             .with_client_cert_verifier(Arc::new(PinnedPeers {
                 peers: self.peers.clone(),
+                invites: self.invites.clone(),
             }))
             .with_single_cert(
                 vec![CertificateDer::from(identity.certificate)],
@@ -488,29 +537,84 @@ impl ServingController {
             .read()
             .expect("Remote record lock is not poisoned")
             .iter()
-            .any(|remote| remote.name == name)
+            .any(|stored| stored.remote.name == name)
         {
             return Err(remote_name_conflict(name));
         }
         Ok(())
     }
 
-    async fn enroll(&self, request: EnrollmentRequest) -> std::result::Result<(), PairingFailure> {
-        let token = decode_token(&request.token)?;
-        let public_key = URL_SAFE_NO_PAD.decode(request.public_key).map_err(|_| {
-            PairingFailure::new(
-                SessionErrorCode::PairingAuthenticationFailed,
-                "connector public key is malformed",
-            )
-        })?;
-        if public_key.is_empty() || public_key.len() > 4096 {
-            return Err(PairingFailure::new(
-                SessionErrorCode::PairingAuthenticationFailed,
-                "connector public key is malformed",
+    fn is_enrolled_peer(&self, public_key: &[u8]) -> bool {
+        self.peers
+            .read()
+            .expect("Peer record lock is not poisoned")
+            .iter()
+            .any(|peer| bool::from(peer.public_key.as_slice().ct_eq(public_key)))
+    }
+
+    fn supersede_outstanding_invites(&self) {
+        for invite in &mut self
+            .invites
+            .lock()
+            .expect("Invite ledger lock is not poisoned")
+            .issued
+        {
+            if matches!(invite.state, TokenState::Outstanding) {
+                invite.state = TokenState::Superseded;
+            }
+        }
+    }
+
+    fn persist_remote(
+        &self,
+        remote: &Remote,
+        public_key: &[u8],
+    ) -> std::result::Result<(), PairingFailure> {
+        let mut remotes = self
+            .remotes
+            .write()
+            .expect("Remote record lock is not poisoned");
+        if remotes.iter().any(|known| known.remote.name == remote.name) {
+            return Err(remote_name_conflict(&remote.name));
+        }
+        remotes.push(StoredRemote {
+            remote: remote.clone(),
+            public_key: public_key.to_vec(),
+        });
+        if let Err(error) = write_private_json(&self.data_dir.join(REMOTES_FILE), &*remotes) {
+            remotes.pop();
+            return Err(internal_pairing_failure(error));
+        }
+        Ok(())
+    }
+
+    fn rollback_remote(&self, remote: &Remote) {
+        let mut remotes = self
+            .remotes
+            .write()
+            .expect("Remote record lock is not poisoned");
+        remotes.retain(|known| {
+            known.remote.name != remote.name || known.remote.fingerprint != remote.fingerprint
+        });
+        let _ = write_private_json(&self.data_dir.join(REMOTES_FILE), &*remotes);
+    }
+
+    fn enroll(
+        &self,
+        request: EnrollmentRequest,
+        public_key: Vec<u8>,
+    ) -> std::result::Result<(), PairingFailure> {
+        if request.protocol_version != self.protocol_version {
+            return Err(protocol_mismatch(
+                self.protocol_version,
+                request.protocol_version,
             ));
         }
-
-        let mut invites = self.invites.lock().await;
+        let token = decode_token(&request.token)?;
+        let mut invites = self
+            .invites
+            .lock()
+            .expect("Invite ledger lock is not poisoned");
         let Some(issued) = invites
             .issued
             .iter_mut()
@@ -543,6 +647,10 @@ impl ServingController {
             TokenState::Outstanding => {}
         }
 
+        if matches!(request.phase, EnrollmentPhase::Prepare) {
+            return Ok(());
+        }
+
         let id = fingerprint(&public_key);
         let mut peers = self
             .peers
@@ -551,11 +659,19 @@ impl ServingController {
         if let Some(existing) = peers.iter_mut().find(|peer| peer.id == id) {
             existing.public_key = public_key;
         } else {
-            peers.push(StoredPeer { id, public_key });
+            peers.push(StoredPeer {
+                id: id.clone(),
+                public_key,
+            });
         }
         if let Err(error) = write_private_json(&self.data_dir.join(PEERS_FILE), &*peers) {
             return Err(internal_pairing_failure(error));
         }
+        self.revocations
+            .write()
+            .expect("Peer revocation lock is not poisoned")
+            .entry(id)
+            .or_insert_with(|| Arc::new(PeerRevocation::default()));
         issued.state = TokenState::Spent;
         Ok(())
     }
@@ -577,10 +693,13 @@ async fn serve(listener: TcpListener, tls: Arc<ServerConfig>, controller: Servin
     let listener = PairingTlsListener {
         listener,
         acceptor: TlsAcceptor::from(tls),
+        revocations: controller.revocations.clone(),
     };
+    let protocol_version = controller.protocol_version;
     let state = ServingState {
         controller,
         hostname: machine_hostname(),
+        protocol_version,
     };
     let app = Router::new()
         .route("/health", get(serving_health))
@@ -597,20 +716,15 @@ async fn serving_health(
     State(state): State<ServingState>,
     ConnectInfo(connection): ConnectInfo<ServingConnectionInfo>,
 ) -> Response {
-    let authenticated = connection.peer_key.as_deref().is_some_and(|key| {
-        state
-            .controller
-            .peers
-            .read()
-            .expect("Peer record lock is not poisoned")
-            .iter()
-            .any(|peer| bool::from(peer.public_key.as_slice().ct_eq(key)))
-    });
+    let authenticated = connection
+        .peer_key
+        .as_deref()
+        .is_some_and(|key| state.controller.is_enrolled_peer(key));
     if !authenticated {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     Json(RemoteHealth {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: state.protocol_version,
     })
     .into_response()
 }
@@ -620,17 +734,17 @@ async fn enroll_peer(
     ConnectInfo(connection): ConnectInfo<ServingConnectionInfo>,
     Json(request): Json<EnrollmentRequest>,
 ) -> Response {
-    if connection.peer_key.is_some() {
+    let Some(public_key) = connection.peer_key else {
         return PairingFailure::new(
             SessionErrorCode::PairingAuthenticationFailed,
-            "an Invite must be redeemed before key authentication",
+            "Invite redemption requires proof of the connector's key",
         )
         .response();
-    }
-    match state.controller.enroll(request).await {
+    };
+    match state.controller.enroll(request, public_key) {
         Ok(()) => Json(EnrollmentResponse {
             hostname: state.hostname,
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: state.protocol_version,
         })
         .into_response(),
         Err(error) => error.response(),
@@ -640,10 +754,11 @@ async fn enroll_peer(
 struct PairingTlsListener {
     listener: TcpListener,
     acceptor: TlsAcceptor,
+    revocations: Arc<RwLock<HashMap<String, Arc<PeerRevocation>>>>,
 }
 
 impl Listener for PairingTlsListener {
-    type Io = TlsStream<TcpStream>;
+    type Io = RevocableTlsStream;
     type Addr = ServingConnectionInfo;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
@@ -664,8 +779,15 @@ impl Listener for PairingTlsListener {
                         .peer_certificates()
                         .and_then(|certificates| certificates.first())
                         .and_then(|certificate| public_key_from_certificate(certificate).ok());
+                    let revoked = peer_key.as_deref().and_then(|key| {
+                        self.revocations
+                            .read()
+                            .expect("Peer revocation lock is not poisoned")
+                            .get(&fingerprint(key))
+                            .cloned()
+                    });
                     return (
-                        stream,
+                        RevocableTlsStream { stream, revoked },
                         ServingConnectionInfo {
                             _network_address: network_address,
                             peer_key,
@@ -687,6 +809,87 @@ impl Listener for PairingTlsListener {
     }
 }
 
+struct RevocableTlsStream {
+    stream: TlsStream<TcpStream>,
+    revoked: Option<Arc<PeerRevocation>>,
+}
+
+impl RevocableTlsStream {
+    fn poll_revoked(&self, context: &mut TaskContext<'_>) -> bool {
+        self.revoked
+            .as_ref()
+            .is_some_and(|revoked| revoked.poll(context))
+    }
+
+    fn revoked_error() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Peer was removed")
+    }
+}
+
+#[derive(Default)]
+struct PeerRevocation {
+    revoked: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl PeerRevocation {
+    fn poll(&self, context: &TaskContext<'_>) -> bool {
+        self.waker.register(context.waker());
+        self.revoked.load(Ordering::Acquire)
+    }
+
+    fn revoke(&self) {
+        self.revoked.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+}
+
+impl AsyncRead for RevocableTlsStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.poll_revoked(context) {
+            return Poll::Ready(Err(Self::revoked_error()));
+        }
+        Pin::new(&mut self.stream).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for RevocableTlsStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.poll_revoked(context) {
+            return Poll::Ready(Err(Self::revoked_error()));
+        }
+        Pin::new(&mut self.stream).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.poll_revoked(context) {
+            return Poll::Ready(Err(Self::revoked_error()));
+        }
+        Pin::new(&mut self.stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.poll_revoked(context) {
+            return Poll::Ready(Err(Self::revoked_error()));
+        }
+        Pin::new(&mut self.stream).poll_shutdown(context)
+    }
+}
+
 impl axum::extract::connect_info::Connected<IncomingStream<'_, PairingTlsListener>>
     for ServingConnectionInfo
 {
@@ -695,9 +898,15 @@ impl axum::extract::connect_info::Connected<IncomingStream<'_, PairingTlsListene
     }
 }
 
-#[derive(Debug)]
 struct PinnedPeers {
     peers: Arc<RwLock<Vec<StoredPeer>>>,
+    invites: Arc<StdMutex<InviteLedger>>,
+}
+
+impl std::fmt::Debug for PinnedPeers {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PinnedPeers")
+    }
 }
 
 impl ClientCertVerifier for PinnedPeers {
@@ -726,7 +935,17 @@ impl ClientCertVerifier for PinnedPeers {
             .expect("Peer record lock is not poisoned")
             .iter()
             .any(|peer| bool::from(peer.public_key.as_slice().ct_eq(&key)));
-        if known {
+        let enrollment_open = self
+            .invites
+            .lock()
+            .expect("Invite ledger lock is not poisoned")
+            .issued
+            .iter()
+            .any(|invite| {
+                matches!(invite.state, TokenState::Outstanding)
+                    && tokio::time::Instant::now() < invite.expires_at
+            });
+        if known || enrollment_open {
             Ok(ClientCertVerified::assertion())
         } else {
             Err(TlsError::InvalidCertificate(
@@ -760,9 +979,15 @@ impl ClientCertVerifier for PinnedPeers {
     }
 }
 
-#[derive(Debug)]
 struct PinnedServerKey {
     expected: Vec<u8>,
+    rejected: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for PinnedServerKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PinnedServerKey")
+    }
 }
 
 impl ServerCertVerifier for PinnedServerKey {
@@ -778,6 +1003,7 @@ impl ServerCertVerifier for PinnedServerKey {
         if bool::from(actual.as_slice().ct_eq(&self.expected)) {
             Ok(ServerCertVerified::assertion())
         } else {
+            self.rejected.store(true, Ordering::Release);
             Err(TlsError::InvalidCertificate(
                 rustls::CertificateError::UnknownIssuer,
             ))
@@ -841,23 +1067,13 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 async fn dial_enrollment(
     addresses: &[SocketAddr],
     server_key: &[u8],
+    identity: &IdentityMaterial,
     enrollment: &EnrollmentRequest,
 ) -> std::result::Result<EnrollmentResponse, PairingFailure> {
-    let tls = ClientConfig::builder_with_provider(crypto_provider())
-        .with_safe_default_protocol_versions()
-        .map_err(|error| internal_pairing_failure(anyhow::anyhow!(error)))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedServerKey {
-            expected: server_key.to_vec(),
-        }))
-        .with_no_client_auth();
-    let client = reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
-        .build()
-        .map_err(|error| internal_pairing_failure(anyhow::anyhow!(error)))?;
-    let mut authentication_failed = false;
+    let client = paired_http_client(server_key, identity).map_err(internal_pairing_failure)?;
     for address in addresses {
         match client
+            .http
             .post(format!("https://{address}/v1/pairing/enroll"))
             .json(enrollment)
             .send()
@@ -872,12 +1088,10 @@ async fn dial_enrollment(
                 });
             }
             Ok(response) => return Err(decode_pairing_response(response).await),
-            Err(error) => {
-                authentication_failed |= is_tls_authentication_failure(&error);
-            }
+            Err(_) => {}
         }
     }
-    if authentication_failed {
+    if client.server_key_rejected.load(Ordering::Acquire) {
         return Err(PairingFailure::new(
             SessionErrorCode::PairingAuthenticationFailed,
             "offered address presented a key other than the Invite's pinned key",
@@ -889,46 +1103,34 @@ async fn dial_enrollment(
     ))
 }
 
-fn is_tls_authentication_failure(error: &reqwest::Error) -> bool {
-    // reqwest's connector nests the rustls error inside two private transport
-    // wrappers which don't expose that innermost value through `source()`.
-    // Its stable Debug representation retains the rustls variant name.
-    if format!("{error:?}").contains("InvalidCertificate(") {
-        return true;
-    }
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(error) = source {
-        if error
-            .downcast_ref::<TlsError>()
-            .is_some_and(|error| matches!(error, TlsError::InvalidCertificate(_)))
-            || error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
-        {
-            return true;
-        }
-        source = error.source();
-    }
-    false
+struct PairingHttpClient {
+    http: reqwest::Client,
+    server_key_rejected: Arc<AtomicBool>,
 }
 
-fn paired_http_client(server_key: &[u8], identity: &IdentityMaterial) -> Result<reqwest::Client> {
+fn paired_http_client(server_key: &[u8], identity: &IdentityMaterial) -> Result<PairingHttpClient> {
+    let server_key_rejected = Arc::new(AtomicBool::new(false));
     let tls = ClientConfig::builder_with_provider(crypto_provider())
         .with_safe_default_protocol_versions()
         .context("choose Pairing TLS protocol versions")?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedServerKey {
             expected: server_key.to_vec(),
+            rejected: server_key_rejected.clone(),
         }))
         .with_client_auth_cert(
             vec![CertificateDer::from(identity.certificate.clone())],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key.clone())),
         )
         .context("configure Pairing client identity")?;
-    reqwest::Client::builder()
+    let http = reqwest::Client::builder()
         .use_preconfigured_tls(tls)
         .build()
-        .context("build Pairing HTTP client")
+        .context("build Pairing HTTP client")?;
+    Ok(PairingHttpClient {
+        http,
+        server_key_rejected,
+    })
 }
 
 async fn decode_pairing_response(response: reqwest::Response) -> PairingFailure {
@@ -971,13 +1173,13 @@ fn parse_invite(invite: &str) -> std::result::Result<ParsedInvite, PairingFailur
                 "Invite payload is malformed",
             )
         })?;
-    if payload.a.is_empty() || payload.a.iter().collect::<HashSet<_>>().len() != payload.a.len() {
+    if !addresses_are_unique_and_nonempty(&payload.addresses) {
         return Err(PairingFailure::new(
             SessionErrorCode::InvalidInvite,
             "Invite addresses are malformed",
         ));
     }
-    let server_key = URL_SAFE_NO_PAD.decode(payload.k).map_err(|_| {
+    let server_key = URL_SAFE_NO_PAD.decode(payload.server_key).map_err(|_| {
         PairingFailure::new(SessionErrorCode::InvalidInvite, "Invite key is malformed")
     })?;
     if server_key.is_empty() || server_key.len() > 4096 {
@@ -987,10 +1189,14 @@ fn parse_invite(invite: &str) -> std::result::Result<ParsedInvite, PairingFailur
         ));
     }
     Ok(ParsedInvite {
-        addresses: payload.a,
+        addresses: payload.addresses,
         server_key,
-        token: decode_token(&payload.t)?,
+        token: decode_token(&payload.token)?,
     })
+}
+
+fn addresses_are_unique_and_nonempty(addresses: &[SocketAddr]) -> bool {
+    !addresses.is_empty() && addresses.iter().collect::<HashSet<_>>().len() == addresses.len()
 }
 
 fn decode_token(encoded: &str) -> std::result::Result<[u8; 32], PairingFailure> {
@@ -1035,6 +1241,13 @@ fn remote_name_conflict(name: &str) -> PairingFailure {
     PairingFailure::new(
         SessionErrorCode::RemoteNameConflict,
         format!("a Remote named `{name}` already exists"),
+    )
+}
+
+fn protocol_mismatch(expected: u32, actual: u32) -> PairingFailure {
+    PairingFailure::new(
+        SessionErrorCode::PairingProtocolMismatch,
+        format!("Pairing protocol mismatch: local v{expected}, remote v{actual}"),
     )
 }
 

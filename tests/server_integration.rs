@@ -59,6 +59,53 @@ struct CaptureServerCertificate {
     certificate: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
 }
 
+#[derive(Debug)]
+struct PinnedTestServerCertificate {
+    expected_public_key: Vec<u8>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedTestServerCertificate {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if public_key_from_certificate(end_entity.as_ref()) != self.expected_public_key {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ));
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 impl rustls::client::danger::ServerCertVerifier for CaptureServerCertificate {
     fn verify_server_cert(
         &self,
@@ -169,6 +216,55 @@ fn public_key_from_certificate(certificate: &[u8]) -> Vec<u8> {
     let (_, certificate) = x509_parser::parse_x509_certificate(certificate)
         .expect("parse Serving identity certificate");
     certificate.public_key().raw.to_vec()
+}
+
+async fn open_paired_health_connection(
+    address: std::net::SocketAddr,
+    identity_path: &std::path::Path,
+    server_public_key: Vec<u8>,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let private_key = std::fs::read(identity_path).expect("read connecting Server identity");
+    let signing_key =
+        rcgen::KeyPair::try_from(private_key.as_slice()).expect("parse connecting Server identity");
+    let certificate = rcgen::CertificateParams::new(vec!["paired-test-client".to_owned()])
+        .unwrap()
+        .self_signed(&signing_key)
+        .unwrap();
+    let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(std::sync::Arc::new(PinnedTestServerCertificate {
+        expected_public_key: server_public_key,
+    }))
+    .with_client_auth_cert(
+        vec![certificate.der().clone()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            private_key,
+        )),
+    )
+    .unwrap();
+    let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut stream = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls))
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        )
+        .await
+        .expect("open authenticated Pairing connection");
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = vec![0_u8; 4096];
+    let read = timeout(Duration::from_secs(1), stream.read(&mut response))
+        .await
+        .expect("paired health responds promptly")
+        .expect("read paired health response");
+    assert!(String::from_utf8_lossy(&response[..read]).contains("200 OK"));
+    stream
 }
 
 fn assert_logs_omit_key_material(log_dir: &std::path::Path, public_key: &[u8]) {
@@ -499,18 +595,27 @@ async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
         })
         .await
         .unwrap();
+    let reusable_invite = duplicate_name_invite.invite.clone();
     let error = connecting_client
         .redeem_invite(RedeemInviteRequest {
             invite: duplicate_name_invite.invite,
-            name: Some(default_named.name),
+            name: None,
             addresses: Vec::new(),
         })
         .await
-        .expect_err("Remote names are unique");
+        .expect_err("a duplicate hostname default is rejected before enrollment commits");
     assert_eq!(
         pairing_error_code(&error),
         SessionErrorCode::RemoteNameConflict
     );
+    connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: reusable_invite,
+            name: Some("other-workstation".to_owned()),
+            addresses: Vec::new(),
+        })
+        .await
+        .expect("a rejected default name neither spends the Invite nor enrolls a Peer");
 
     drop(connecting_client);
     drop(serving_client);
@@ -645,6 +750,45 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
         .expect_err("expired Invite is rejected");
     assert_eq!(pairing_error_code(&error), SessionErrorCode::InviteExpired);
 
+    let incompatible = serving_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![address],
+        })
+        .await
+        .unwrap();
+    let incompatible_state = tempfile::tempdir().unwrap();
+    let incompatible_server = server::spawn_with_timings(
+        ServerConfig::new(incompatible_state.path(), "invite-errors-incompatible").unwrap(),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            pairing_protocol_version: PROTOCOL_VERSION + 1,
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut incompatible_client = ManagedClient::connect(
+        ManagedClientConfig::new(incompatible_state.path(), "invite-errors-incompatible").unwrap(),
+    )
+    .await
+    .unwrap();
+    receive_initial_state(&mut incompatible_client).await;
+    let error = incompatible_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: incompatible.invite,
+            name: Some("incompatible".to_owned()),
+            addresses: Vec::new(),
+        })
+        .await
+        .expect_err("a protocol mismatch refuses the Pairing");
+    assert_eq!(
+        pairing_error_code(&error),
+        SessionErrorCode::PairingProtocolMismatch
+    );
+    assert!(incompatible_client.list_remotes().await.unwrap().is_empty());
+    drop(incompatible_client);
+    incompatible_server.shutdown().await.unwrap();
+
     drop(connecting_client);
     drop(serving_client);
     connecting.shutdown().await.unwrap();
@@ -698,6 +842,9 @@ async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing(
         .await
         .unwrap();
     let address = serving.serving_address().unwrap();
+    let (unknown_peer, serving_certificate) = dial_with_unknown_certificate(address).await;
+    assert!(unknown_peer.is_err());
+    let serving_public_key = public_key_from_certificate(&serving_certificate);
 
     let connecting_state = tempfile::tempdir().expect("create connecting state directory");
     let connecting_data = tempfile::tempdir().expect("create connecting data directory");
@@ -770,6 +917,12 @@ async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing(
         .probe_remote("durable")
         .await
         .expect("reconnect after both Servers restart using keys alone");
+    let mut live_connection = open_paired_health_connection(
+        serving.serving_address().unwrap(),
+        &connecting_config.data_dir().join("server-identity.pk8"),
+        serving_public_key,
+    )
+    .await;
 
     for path in [
         serving_config.data_dir().join("server-identity.pk8"),
@@ -798,6 +951,14 @@ async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing(
         connecting_client.probe_remote("durable").await.is_err(),
         "deleting the Peer ends its Pairing"
     );
+    let mut byte = [0_u8];
+    match timeout(Duration::from_secs(1), live_connection.read(&mut byte))
+        .await
+        .expect("removing a Peer promptly ends its live connections")
+    {
+        Ok(0) | Err(_) => {}
+        Ok(read) => panic!("revoked Pairing produced {read} unexpected bytes"),
+    }
 
     drop(connecting_client);
     drop(serving_client);

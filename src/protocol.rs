@@ -2244,6 +2244,7 @@ pub enum SessionErrorCode {
     PeerNotFound,
     PairingConnectionFailed,
     PairingAuthenticationFailed,
+    PairingProtocolMismatch,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

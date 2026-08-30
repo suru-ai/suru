@@ -70,6 +70,8 @@ pub struct ServerTimings {
     pub errand_timeout: Duration,
     /// How long a newly issued Invite remains redeemable.
     pub invite_ttl: Duration,
+    /// Server-to-Server protocol version, injectable for compatibility tests.
+    pub pairing_protocol_version: u32,
 }
 
 impl Default for ServerTimings {
@@ -79,6 +81,7 @@ impl Default for ServerTimings {
             shutdown_grace: Duration::from_millis(100),
             errand_timeout: DEFAULT_ERRAND_TIMEOUT,
             invite_ttl: Duration::from_secs(10 * 60),
+            pairing_protocol_version: PROTOCOL_VERSION,
         }
     }
 }
@@ -430,7 +433,11 @@ pub async fn spawn_with_providers_and_timings(
     protect_current_user_file(&config.lock_path())?;
 
     let config_documents = ConfigDocuments::new(config.config_dir());
-    let serving = ServingController::new(config.data_dir(), timings.invite_ttl)?;
+    let serving = ServingController::new(
+        config.data_dir(),
+        timings.invite_ttl,
+        timings.pairing_protocol_version,
+    )?;
     let (settings, _) = watch::channel(SettingsSnapshot::default());
     let opening_settings = config_documents.load();
 
