@@ -472,6 +472,7 @@ mod tests {
                 cost: None,
                 cost_basis: None,
             }],
+            subagent_usage: None,
             transcript: messages
                 .iter()
                 .map(|message| TranscriptItem::Message {

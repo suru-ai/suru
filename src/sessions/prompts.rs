@@ -193,6 +193,9 @@ impl SessionStore {
             messages: Vec::new(),
             activities: Vec::new(),
             transcript: Vec::new(),
+            // A Session begins having delegated nothing, so there is nothing
+            // below it to roll up.
+            subagent_usage: None,
         };
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
         let timestamp = state.next_timestamp();
@@ -209,6 +212,8 @@ impl SessionStore {
             // And with nothing working: the Prompt that made it has not been
             // admitted yet, so there is no Turn to be running.
             working_since: None,
+            // And with nothing consumed: no Turn has run to report anything.
+            total_usage: None,
             created_at: timestamp,
             updated_at: timestamp,
         };

@@ -14,10 +14,10 @@ use crossterm::event::{
 use suru::{
     managed_client::SessionEvent,
     protocol::{
-        Activity, ActivityStatus, Message, MessageId, MessageRole, MessageStatus,
+        Activity, ActivityStatus, Cost, CostBasis, Message, MessageId, MessageRole, MessageStatus,
         ModelAvailability, PromptId, Session, SessionChange, SessionId, SessionRevision,
         SessionSnapshot, SessionStatus, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
-        Workspace,
+        Usage, UsageTotal, Workspace,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition},
 };
@@ -101,6 +101,7 @@ fn child_session_snapshot(
         }],
         activities: Vec::new(),
         transcript: vec![TranscriptItem::Message { message_id }],
+        subagent_usage: None,
     }
 }
 
@@ -237,6 +238,58 @@ fn returning_to_the_parent_restores_the_readers_view_state() {
         rendered_application_rows_at(&application, 80, 15),
         left_at,
         "the parent comes back exactly where the reader left it"
+    );
+}
+
+#[test]
+fn a_subagent_sessions_view_states_its_own_total_where_its_parents_carries_the_child_too() {
+    let workspace = workspace_dir();
+    let (mut parent, child_id) =
+        parent_with_subagent_row(workspace.path(), ActivityStatus::Active, None, true);
+    let parent_id = parent.session.id;
+    parent.turns[0].usage = Some(Usage {
+        fresh_input_tokens: Some(10_000),
+        output_tokens: Some(5_000),
+        ..Usage::default()
+    });
+    parent.turns[0].cost = Cost::from_usd(0.31);
+    parent.turns[0].cost_basis = Some(CostBasis::Reported);
+    parent.subagent_usage = Some(UsageTotal {
+        fresh_input_tokens: Some(4_000),
+        output_tokens: Some(1_000),
+        cost: Cost::from_usd(0.12),
+        ..UsageTotal::default()
+    });
+    let mut child = child_session_snapshot(child_id, parent_id, workspace.path());
+    child.turns[0].usage = Some(Usage {
+        fresh_input_tokens: Some(4_000),
+        output_tokens: Some(1_000),
+        ..Usage::default()
+    });
+    child.turns[0].cost = Cost::from_usd(0.12);
+    child.turns[0].cost_basis = Some(CostBasis::Reported);
+
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(parent))
+        .expect("attach the delegating Session");
+    let delegating = buffer_rows(&rendered_application_buffer(&application, 80, 22)).join("\n");
+    assert!(
+        delegating.contains("20K · $0.43"),
+        "the parent states its own work and the Subagent's together: {delegating}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::SessionAttached(child))
+        .expect("open the Subagent's Session");
+    let delegated = buffer_rows(&rendered_application_buffer(&application, 80, 22)).join("\n");
+    assert!(
+        delegated.contains("5K · $0.12"),
+        "the child states what it consumed itself: {delegated}"
+    );
+    assert!(
+        !delegated.contains("20K"),
+        "and never what its parent consumed: {delegated}"
     );
 }
 

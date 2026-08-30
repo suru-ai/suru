@@ -648,7 +648,7 @@ fn listed(
     created_at: u64,
     updated_at: u64,
 ) -> SessionListItem {
-    SessionListItem::Readable(SessionSummary {
+    SessionListItem::Readable(Box::new(SessionSummary {
         session: Session {
             id: SessionId::new(),
             workspace: Workspace {
@@ -663,9 +663,10 @@ fn listed(
         emoji: emoji.map(str::to_owned),
         settled_at: None,
         working_since: None,
+        total_usage: None,
         created_at: SessionTimestamp(created_at),
         updated_at: SessionTimestamp(updated_at),
-    })
+    }))
 }
 
 fn now() -> u64 {

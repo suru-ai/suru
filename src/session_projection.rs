@@ -129,6 +129,12 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 turn.cost = *cost;
                 turn.cost_basis = *cost_basis;
             }
+            SessionChange::SubagentUsageChanged { subagent_usage } => {
+                // The reading arrives whole, derived by the one party that
+                // can see across Sessions, so applying it is taking it as
+                // given rather than adding anything up.
+                next.subagent_usage = *subagent_usage;
+            }
             SessionChange::MessageAdded { message } => {
                 if !next.turns.iter().any(|turn| turn.id == message.turn_id) {
                     bail!("Session update referenced an unknown Turn");
@@ -603,6 +609,7 @@ mod tests {
             messages: Vec::new(),
             activities: Vec::new(),
             transcript: Vec::new(),
+            subagent_usage: None,
         };
 
         apply_update(

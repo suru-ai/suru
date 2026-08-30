@@ -6,7 +6,7 @@ use anyhow::anyhow;
 
 use crate::protocol::{
     PromptOrder, SessionCatalogChange, SessionChange, SessionId, SessionRevision, SessionSnapshot,
-    SessionStatus, SessionTimestamp, SessionUpdate, TurnId, TurnStatus,
+    SessionStatus, SessionTimestamp, SessionUpdate, TurnId, TurnStatus, UsageTotal,
 };
 use crate::session_projection::apply_update;
 use crate::storage::StorageSink;
@@ -49,6 +49,7 @@ impl SessionStoreState {
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
         let update = record.commit(storage, session_id, changes, updated_at)?;
         self.reconcile_working(session_id);
+        self.reconcile_usage(storage, session_id);
         Ok(update)
     }
 
@@ -60,47 +61,105 @@ impl SessionStoreState {
     /// that spawned them (ADR 0015). Only the root announces, because a
     /// Subagent's child Session rides no catalog stream.
     pub(super) fn reconcile_working(&mut self, session_id: SessionId) {
-        let mut current = session_id;
-        loop {
-            let reading = self.subtree_working_since(current);
-            let Some(record) = self.sessions.get_mut(&current) else {
-                return;
+        let ancestry = self.ancestry(session_id);
+        for current in &ancestry.sessions {
+            let reading = self.subtree_working_since(*current);
+            let Some(record) = self.sessions.get_mut(current) else {
+                continue;
             };
-            let flipped = record.summary.working_since != reading;
+            if record.summary.working_since == reading {
+                continue;
+            }
             record.summary.working_since = reading;
-            let parent = record.snapshot.session.parent;
-            match parent {
-                Some(parent) if self.sessions.contains_key(&parent) => current = parent,
-                None => {
-                    if flipped {
-                        self.publish_catalog_change(SessionCatalogChange::WorkingChanged {
-                            session_id: current,
-                            working_since: reading,
-                        });
-                    }
-                    return;
-                }
-                // A child severed from its parent joins no listing, so there
-                // is no row its reading could move.
-                Some(_) => return,
+            if ancestry.announces(*current) {
+                self.publish_catalog_change(SessionCatalogChange::WorkingChanged {
+                    session_id: *current,
+                    working_since: reading,
+                });
             }
         }
     }
 
-    /// When live work below this Session began: the earliest moment any
-    /// still-working Turn in its subtree started — its own latest Turn, or a
-    /// Subagent's at any depth — and `None` when everything has settled.
-    pub(super) fn subtree_working_since(&self, session_id: SessionId) -> Option<SessionTimestamp> {
+    /// Re-derives what every Session from this one up to its listed root has
+    /// consumed, and announces the root's total when it moved, mirroring
+    /// [`Self::reconcile_working`]. A Session's own Turns are its own
+    /// business, but the total a surface states for it carries its whole
+    /// Subagent subtree — and a child's Usage lands in the child's Turns,
+    /// where only the state can see it — so each ancestor is told what its
+    /// subtree consumed as a change on its own stream.
+    pub(super) fn reconcile_usage(&mut self, storage: &StorageSink, session_id: SessionId) {
+        let ancestry = self.ancestry(session_id);
+        for current in &ancestry.sessions {
+            let delegated = self.subagent_usage(*current);
+            let Some(record) = self.sessions.get_mut(current) else {
+                continue;
+            };
+            if record.snapshot.subagent_usage != delegated {
+                // The roll-up is the server's own derivation rather than
+                // Agent output, so it goes straight to the record's commit:
+                // the gate output passes through has no Turn to check it
+                // against. A commit that cannot land leaves the Session on
+                // the reading it already had, said out loud because a total
+                // quietly frozen is worse than a total that moved late.
+                if let Err(error) = record.commit_derived(
+                    storage,
+                    *current,
+                    vec![SessionChange::SubagentUsageChanged {
+                        subagent_usage: delegated,
+                    }],
+                ) {
+                    tracing::warn!(session_id = %current, "Subagent Usage did not roll up: {error}");
+                }
+            }
+            let reading = record.snapshot.total_usage();
+            if record.summary.total_usage == reading {
+                continue;
+            }
+            record.summary.total_usage = reading;
+            if ancestry.announces(*current) {
+                self.publish_catalog_change(SessionCatalogChange::UsageChanged {
+                    session_id: *current,
+                    total_usage: reading,
+                });
+            }
+        }
+    }
+
+    /// Derives the roll-up across one restored Session's whole subtree,
+    /// deepest first so every Session is answered from children already
+    /// derived. Nothing is committed or announced: a restored Session has no
+    /// revision to spend and no client to tell yet.
+    pub(super) fn restore_usage(&mut self, root: SessionId) {
+        for session_id in self.subtree(root).into_iter().rev() {
+            let delegated = self.subagent_usage(session_id);
+            let Some(record) = self.sessions.get_mut(&session_id) else {
+                continue;
+            };
+            record.snapshot.subagent_usage = delegated;
+            record.summary.total_usage = record.snapshot.total_usage();
+        }
+    }
+
+    /// Everything this Session's Subagents have consumed, to any depth, and
+    /// `None` where they have reported nothing. The Session's own Turns are
+    /// left out — the walk skips the Session it starts from — because they
+    /// are already in the snapshot every reader holds.
+    fn subagent_usage(&self, session_id: SessionId) -> Option<UsageTotal> {
+        self.subtree(session_id)
+            .into_iter()
+            .skip(1)
+            .filter_map(|child| UsageTotal::of_turns(&self.sessions.get(&child)?.snapshot.turns))
+            .reduce(UsageTotal::saturating_add)
+    }
+
+    /// This Session and every Subagent Session below it, to any depth, each
+    /// reached after the Session that spawned it — so a walk in reverse
+    /// answers the deepest first.
+    fn subtree(&self, session_id: SessionId) -> Vec<SessionId> {
         let mut walk = vec![session_id];
-        let mut earliest: Option<SessionTimestamp> = None;
         let mut visit = 0;
         while visit < walk.len() {
             let current = walk[visit];
-            if let Some(record) = self.sessions.get(&current)
-                && let Some(since) = record.snapshot.working_since()
-            {
-                earliest = Some(earliest.map_or(since, |held| held.min(since)));
-            }
             walk.extend(
                 self.sessions
                     .iter()
@@ -109,7 +168,70 @@ impl SessionStoreState {
             );
             visit += 1;
         }
-        earliest
+        walk
+    }
+
+    /// This Session and every ancestor above it, in the order a derivation
+    /// climbs them. Both readings a listing carries are derived over a whole
+    /// Subagent subtree, so a commit anywhere below can move what the row at
+    /// the top of the walk says.
+    fn ancestry(&self, session_id: SessionId) -> Ancestry {
+        let mut sessions = vec![session_id];
+        loop {
+            let Some(record) = self
+                .sessions
+                .get(sessions.last().expect("the walk begins at one Session"))
+            else {
+                return Ancestry {
+                    sessions,
+                    listed: false,
+                };
+            };
+            match record.snapshot.session.parent {
+                None => {
+                    return Ancestry {
+                        sessions,
+                        listed: true,
+                    };
+                }
+                Some(parent) if self.sessions.contains_key(&parent) => sessions.push(parent),
+                // A child severed from its parent joins no listing, so the
+                // walk ends on a Session no row stands for.
+                Some(_) => {
+                    return Ancestry {
+                        sessions,
+                        listed: false,
+                    };
+                }
+            }
+        }
+    }
+
+    /// When live work below this Session began: the earliest moment any
+    /// still-working Turn in its subtree started — its own latest Turn, or a
+    /// Subagent's at any depth — and `None` when everything has settled.
+    pub(super) fn subtree_working_since(&self, session_id: SessionId) -> Option<SessionTimestamp> {
+        self.subtree(session_id)
+            .into_iter()
+            .filter_map(|current| self.sessions.get(&current)?.snapshot.working_since())
+            .min()
+    }
+}
+
+/// The Sessions one derivation climbs, from where a commit landed up to the
+/// Session a listing holds a row for. That row is the only one an
+/// announcement can move, and a walk that ended on a child severed from its
+/// parent reached no row at all.
+struct Ancestry {
+    sessions: Vec<SessionId>,
+    listed: bool,
+}
+
+impl Ancestry {
+    /// Whether a reading that moved on this Session is one the catalog
+    /// announces: the walk reached a listed root, and this is it.
+    fn announces(&self, session_id: SessionId) -> bool {
+        self.listed && self.sessions.last() == Some(&session_id)
     }
 }
 
@@ -124,6 +246,32 @@ impl SessionRecord {
         stamp_turn_timing(&mut changes, updated_at);
         let update = self.publish(session_id, changes)?;
         self.summary.updated_at = updated_at;
+        self.store_and_broadcast(storage, update)
+    }
+
+    /// Commits changes the server derived rather than a Provider or a reader
+    /// drove — the Subagent roll-up today. It moves the revision and persists
+    /// like any commit, but leaves `updated_at` alone: a Session's own moment
+    /// of last movement is about its own work, and nothing a listing orders
+    /// or draws by moves here, so a client holding the change holds the whole
+    /// of it.
+    pub(super) fn commit_derived(
+        &mut self,
+        storage: &StorageSink,
+        session_id: SessionId,
+        changes: Vec<SessionChange>,
+    ) -> anyhow::Result<SessionUpdate> {
+        let update = self.publish(session_id, changes)?;
+        self.store_and_broadcast(storage, update)
+    }
+
+    /// Puts one committed revision where everyone reading the Session will
+    /// find it: durable storage first, then every attached client.
+    fn store_and_broadcast(
+        &mut self,
+        storage: &StorageSink,
+        update: SessionUpdate,
+    ) -> anyhow::Result<SessionUpdate> {
         storage.updated(self.summary.clone(), &update)?;
         let _ = self.updates.send(update.clone());
         Ok(update)

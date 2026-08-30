@@ -15,7 +15,7 @@ use suru::{
         AgentSelection, Cost, CostBasis, ModelId, NativeMeter, PromptId, ProviderId, SessionChange,
         SessionId, SessionRevision, SessionUpdate, SkillCatalog, SkillCatalogCapabilities,
         SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery,
-        Turn, TurnId, TurnStatus, Usage, Workspace,
+        Turn, TurnId, TurnStatus, Usage, UsageTotal, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, command_for_terminal_event,
@@ -131,6 +131,63 @@ fn session_composer_footer_updates_with_active_turn_usage_and_hides_unknown_cost
     assert!(
         !updated.contains("$0.00"),
         "unknown Cost is absent rather than fabricated as zero: {updated}"
+    );
+}
+
+#[test]
+fn session_composer_footer_counts_the_subagent_subtree_the_server_rolled_up() {
+    let workspace = workspace_dir();
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Delegate the reading",
+        workspace.path(),
+    );
+    let session_id = snapshot.session.id;
+    snapshot.turns[0].usage = Some(Usage {
+        fresh_input_tokens: Some(10_000),
+        output_tokens: Some(5_000),
+        ..Usage::default()
+    });
+    snapshot.turns[0].cost = Cost::from_usd(0.31);
+    snapshot.turns[0].cost_basis = Some(CostBasis::Reported);
+
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .expect("open the delegating Session");
+    let before = rendered_application_rows(&application).join("\n");
+    assert!(
+        before.contains("15K · $0.31"),
+        "the footer starts on what the Session itself consumed: {before}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(snapshot.revision.0 + 1),
+                changes: vec![SessionChange::SubagentUsageChanged {
+                    subagent_usage: Some(UsageTotal {
+                        fresh_input_tokens: Some(4_000),
+                        cache_read_tokens: Some(60_000),
+                        output_tokens: Some(1_000),
+                        cost: Cost::from_usd(0.12),
+                        ..UsageTotal::default()
+                    }),
+                }],
+            },
+        )))
+        .expect("roll the Subagent subtree up into the Session");
+
+    let after = rendered_application_rows(&application).join("\n");
+    assert!(
+        after.contains("20K · $0.43"),
+        "delegated work joins the total the footer states: {after}"
+    );
+    assert!(
+        !after.contains("80K"),
+        "a Subagent's cache traffic is left out of the blended total too: {after}"
     );
 }
 

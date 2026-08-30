@@ -2621,7 +2621,7 @@ mod tests {
     }
 
     fn summary(title: &str, created_at: u64, updated_at: u64) -> SessionListItem {
-        SessionListItem::Readable(SessionSummary {
+        SessionListItem::Readable(Box::new(SessionSummary {
             session: Session {
                 id: SessionId::new(),
                 workspace: Workspace {
@@ -2635,10 +2635,11 @@ mod tests {
             title: title.to_owned(),
             emoji: None,
             settled_at: None,
+            total_usage: None,
             working_since: None,
             created_at: SessionTimestamp(created_at),
             updated_at: SessionTimestamp(updated_at),
-        })
+        }))
     }
 
     /// The Sidebar's Settings as a TUI launching under `initial_visibility`

@@ -19,8 +19,9 @@ use crate::{
         ModelCatalog, Prompt, PromptId, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
         SessionCreated, SessionDeleted, SessionError, SessionId, SessionListItem,
         SessionSettlementChanged, SessionSnapshot, SessionSummary, SessionTitleChanged,
-        SessionWorkingChanged, SettingMutation, SettingsSnapshot, SettleSessionRequest,
-        ShutdownReason, SkillCatalog, SkillCatalogRequest, UpdateAgentSelectionRequest,
+        SessionUsageChanged, SessionWorkingChanged, SettingMutation, SettingsSnapshot,
+        SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
+        UpdateAgentSelectionRequest,
     },
 };
 
@@ -170,6 +171,11 @@ pub enum ManagedEvent {
     /// change, and for the same reason: every client lists the Session, and
     /// only some have it open.
     SessionWorkingChanged(SessionWorkingChanged),
+    /// A Session's total Usage moved, its own Turns and its Subagent subtree
+    /// counted together. It arrives on the same terms as a Working change, so
+    /// a client listing Sessions it has never opened can state what each of
+    /// them has consumed.
+    SessionUsageChanged(SessionUsageChanged),
     SessionCatalogReconciled(SessionCatalogSnapshot),
     Fatal(String),
 }
@@ -181,7 +187,10 @@ impl ManagedEvent {
     /// draws on demand pays for the answer rather than for the announcement
     /// (ADR 0007). Everything else moves something on screen as it arrives.
     pub const fn is_drawn_on_arrival(&self) -> bool {
-        !matches!(self, Self::SessionCreated(_))
+        // A total moving draws nothing yet either: no listing surface states
+        // one, and the client with the Session open reads its total off the
+        // Session's own stream.
+        !matches!(self, Self::SessionCreated(_) | Self::SessionUsageChanged(_))
     }
 
     /// Whether this event reports the body of work moving: a Session made,
@@ -191,6 +200,10 @@ impl ManagedEvent {
     /// the server again for everything the change itself does not say — for a
     /// Turn starting, the last activity the commit moved and the order a
     /// listing keeps by it.
+    ///
+    /// A total moving is deliberately not one of them: unlike the others it
+    /// carries the whole of what it moved and moves nothing a listing is
+    /// ordered or drawn by, so there is nothing left to ask the server for.
     pub const fn moves_the_session_catalog(&self) -> bool {
         matches!(
             self,

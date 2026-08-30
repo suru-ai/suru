@@ -28,7 +28,7 @@ fn readable_session_summaries(items: Vec<SessionListItem>) -> Vec<SessionSummary
     items
         .into_iter()
         .map(|item| match item {
-            SessionListItem::Readable(summary) => summary,
+            SessionListItem::Readable(summary) => *summary,
             SessionListItem::Unreadable(summary) => {
                 panic!("expected readable Session {}, got unreadable", summary.id)
             }

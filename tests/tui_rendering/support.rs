@@ -282,6 +282,7 @@ pub fn failed_session_snapshot(
         messages: vec![delivered.message],
         activities: vec![delivered.activity],
         transcript,
+        subagent_usage: None,
     }
 }
 
@@ -325,6 +326,7 @@ pub fn selected_session_snapshot(
         messages: Vec::new(),
         activities: Vec::new(),
         transcript: Vec::new(),
+        subagent_usage: None,
     }
 }
 
@@ -350,6 +352,7 @@ pub fn navigable_session_snapshot(
         messages: Vec::new(),
         activities: Vec::new(),
         transcript: Vec::new(),
+        subagent_usage: None,
     };
     for section in 1..=section_count {
         let prompt_id = PromptId::new();

@@ -2162,7 +2162,7 @@ async fn listed_summary(client: &mut ManagedClient, session_id: SessionId) -> Se
         .find(|item| item.id() == session_id)
         .expect("the Session remains listed")
     {
-        SessionListItem::Readable(summary) => summary,
+        SessionListItem::Readable(summary) => *summary,
         SessionListItem::Unreadable(summary) => {
             panic!("expected readable Session {}, got unreadable", summary.id)
         }

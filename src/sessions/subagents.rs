@@ -76,6 +76,7 @@ impl SessionStore {
             messages: Vec::new(),
             activities: Vec::new(),
             transcript: Vec::new(),
+            subagent_usage: None,
         };
         let title = match description.trim() {
             "" => name.trim().to_owned(),
@@ -89,6 +90,7 @@ impl SessionStore {
             emoji: None,
             settled_at: None,
             working_since: snapshot.working_since(),
+            total_usage: snapshot.total_usage(),
             created_at: timestamp,
             updated_at: timestamp,
         };
@@ -109,8 +111,11 @@ impl SessionStore {
         );
         self.storage.created(persisted_summary, snapshot);
         // The child begins working the moment it exists, which the listed
-        // root's Working reading has to carry.
+        // root's Working reading has to carry. Its total is derived on the
+        // same terms, so both readings above it are answered from the same
+        // subtree — a child that has consumed nothing yet moves neither.
         state.reconcile_working(session_id);
+        state.reconcile_usage(&self.storage, session_id);
         Ok(SpawnedSubagentSession {
             session_id,
             turn_id,

@@ -194,8 +194,15 @@ impl SessionStore {
             .filter(|(_, record)| record.snapshot.session.parent.is_none())
             .map(|(session_id, _)| *session_id)
             .collect::<Vec<_>>();
+        for root in &roots {
+            state.reconcile_working(*root);
+        }
+        // The roll-up is derived rather than stored, for the same reason: a
+        // child's Usage is its own Turns' and a stored copy above it could
+        // only ever disagree. Every Session is re-derived, not just the roots,
+        // because a Subagent's own Session is opened and read like any other.
         for root in roots {
-            state.reconcile_working(root);
+            state.restore_usage(root);
         }
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -389,7 +396,7 @@ impl SessionStore {
                     .as_ref()
                     .is_none_or(|path| summary.session.workspace.path == *path)
             })
-            .map(SessionListItem::Readable)
+            .map(|summary| SessionListItem::Readable(Box::new(summary)))
             .chain(
                 state
                     .unreadable_sessions

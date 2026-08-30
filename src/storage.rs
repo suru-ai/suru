@@ -415,11 +415,16 @@ fn load_session(
         messages,
         activities,
         transcript: transcript.into_iter().map(|(_, item)| item).collect(),
+        // A child's Usage lives in the child's own stored Turns, so the
+        // roll-up is re-derived across the subtree once every Session is
+        // loaded rather than stored twice.
+        subagent_usage: None,
     };
     // Read back off the Turns rather than out of a column of its own: live
     // work is the Turn's own state, and a stored copy of it could only ever
     // disagree with the Turn it was copied from.
     summary.working_since = snapshot.working_since();
+    summary.total_usage = snapshot.total_usage();
     Ok(PersistedSession {
         summary,
         snapshot,

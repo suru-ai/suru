@@ -627,6 +627,10 @@ impl TuiState {
                 self.sidebar
                     .set_working(working.session_id, working.working_since);
             }
+            // Neither listing surface states a Session's total yet — the
+            // footer of the Session in view reads its own — so the roll-up
+            // the catalog announces moves nothing this client draws.
+            ManagedEvent::SessionUsageChanged(_) => {}
             ManagedEvent::SessionCatalogReconciled(snapshot) => {
                 self.session_picker.retain_catalog(&snapshot.session_ids);
                 self.sidebar.retain_catalog(&snapshot.session_ids);

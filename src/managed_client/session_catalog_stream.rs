@@ -11,7 +11,8 @@ use crate::protocol::{
     RuntimeDescriptor, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
     SKILL_CATALOG_UPDATED_EVENT, SessionCatalogChange, SessionCatalogRevision,
     SessionCatalogSnapshot, SessionCatalogUpdate, SessionCreated, SessionDeleted, SessionId,
-    SessionSettlementChanged, SessionTitleChanged, SessionWorkingChanged, SkillCatalog,
+    SessionSettlementChanged, SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged,
+    SkillCatalog,
 };
 
 use super::ManagedEvent;
@@ -171,6 +172,18 @@ fn apply_update(
             Ok(ManagedEvent::SessionWorkingChanged(SessionWorkingChanged {
                 session_id,
                 working_since,
+            }))
+        }
+        SessionCatalogChange::UsageChanged {
+            session_id,
+            total_usage,
+        } => {
+            if !known.contains(&session_id) {
+                bail!("Session catalog reported Usage on an unknown Session");
+            }
+            Ok(ManagedEvent::SessionUsageChanged(SessionUsageChanged {
+                session_id,
+                total_usage,
             }))
         }
     }

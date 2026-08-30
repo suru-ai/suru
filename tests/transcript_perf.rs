@@ -54,6 +54,7 @@ fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
         messages: Vec::new(),
         activities: Vec::new(),
         transcript: Vec::new(),
+        subagent_usage: None,
     };
     for section in 1..=SECTIONS {
         let prompt_id = PromptId::new();

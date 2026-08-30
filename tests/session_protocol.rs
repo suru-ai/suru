@@ -12,7 +12,7 @@ use suru::protocol::{
     SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog,
     SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId,
     SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, TranscriptItem, Turn, TurnId,
-    TurnStatus, UpdateAgentSelectionRequest, Usage, Workspace,
+    TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal, Workspace,
 };
 use uuid::Uuid;
 
@@ -227,6 +227,14 @@ fn session_summary_round_trips_with_discovery_metadata() {
         emoji: Some("\u{1F5FA}\u{FE0F}".to_owned()),
         settled_at: Some(SessionTimestamp(1_755_497_600_999)),
         working_since: Some(SessionTimestamp(1_755_497_600_100)),
+        total_usage: Some(UsageTotal {
+            fresh_input_tokens: Some(1_200),
+            cache_read_tokens: Some(300),
+            cache_write_tokens: Some(400),
+            output_tokens: Some(900),
+            reasoning_tokens: None,
+            cost: Cost::from_usd(0.03),
+        }),
         created_at: SessionTimestamp(1_755_497_600_000),
         updated_at: SessionTimestamp(1_755_497_600_321),
     };
@@ -236,6 +244,14 @@ fn session_summary_round_trips_with_discovery_metadata() {
         "emoji": "\u{1F5FA}\u{FE0F}",
         "settled_at": 1_755_497_600_999_u64,
         "working_since": 1_755_497_600_100_u64,
+        "total_usage": {
+            "fresh_input_tokens": 1_200,
+            "cache_read_tokens": 300,
+            "cache_write_tokens": 400,
+            "output_tokens": 900,
+            "reasoning_tokens": null,
+            "cost": 0.03
+        },
         "workspace": { "path": "/work/suru" },
         "agent_selection": {
             "provider": "codex",
@@ -262,7 +278,9 @@ fn session_summary_round_trips_with_discovery_metadata() {
     // every Session that predates Title derivation. A Session nobody set aside
     // carries no settle moment either, which is every Session that predates the
     // marker. A Session with nothing running carries no working moment, which
-    // is every Session that is not working right now.
+    // is every Session that is not working right now. A Session whose Turns
+    // reported nothing carries no total, which is every Session stored before
+    // Usage was recorded at all.
     let mut without_optionals = expected;
     let fields = without_optionals
         .as_object_mut()
@@ -270,11 +288,13 @@ fn session_summary_round_trips_with_discovery_metadata() {
     fields.remove("emoji");
     fields.remove("settled_at");
     fields.remove("working_since");
+    fields.remove("total_usage");
     let decoded = serde_json::from_value::<SessionSummary>(without_optionals)
         .expect("decode a Session summary carrying none of them");
     assert_eq!(decoded.emoji, None);
     assert_eq!(decoded.settled_at, None);
     assert_eq!(decoded.working_since, None);
+    assert_eq!(decoded.total_usage, None);
 }
 
 #[test]
@@ -367,6 +387,12 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 )),
             },
         ],
+        subagent_usage: Some(UsageTotal {
+            fresh_input_tokens: Some(2_000),
+            output_tokens: Some(500),
+            cost: Cost::from_usd(0.05),
+            ..UsageTotal::default()
+        }),
     };
     let expected = json!({
         "session": {
@@ -446,7 +472,15 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 "type": "activity",
                 "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87"
             }
-        ]
+        ],
+        "subagent_usage": {
+            "fresh_input_tokens": 2_000,
+            "cache_read_tokens": null,
+            "cache_write_tokens": null,
+            "output_tokens": 500,
+            "reasoning_tokens": null,
+            "cost": 0.05
+        }
     });
 
     assert_eq!(
@@ -454,8 +488,26 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         expected
     );
     assert_eq!(
-        serde_json::from_value::<SessionSnapshot>(expected).expect("decode snapshot"),
+        serde_json::from_value::<SessionSnapshot>(expected.clone()).expect("decode snapshot"),
         snapshot
+    );
+
+    // A Session stored before Subagent Usage rolled up carries no roll-up, and
+    // decodes with the total its own Turns state.
+    let mut without_rollup = expected;
+    without_rollup
+        .as_object_mut()
+        .expect("the encoded snapshot is an object")
+        .remove("subagent_usage");
+    let decoded = serde_json::from_value::<SessionSnapshot>(without_rollup)
+        .expect("decode a snapshot carrying no roll-up");
+    assert_eq!(decoded.subagent_usage, None);
+    assert_eq!(
+        decoded
+            .total_usage()
+            .and_then(|total| total.blended_tokens()),
+        Some(2_100),
+        "a Session with nothing delegated totals its own Turns alone"
     );
 }
 

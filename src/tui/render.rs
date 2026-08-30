@@ -2233,22 +2233,13 @@ fn render_session(
     }
 }
 
+/// What the Session in view has consumed, as its footer states it: the
+/// blended token figure and the Cost beside it, over the Session's own Turns
+/// and the Subagent subtree rolled up under them.
 fn session_usage_text(snapshot: &SessionSnapshot) -> Option<String> {
-    let blended_tokens = snapshot
-        .turns
-        .iter()
-        .filter_map(|turn| turn.usage.as_ref()?.blended_tokens())
-        .reduce(u64::saturating_add)?;
-    let cost = snapshot
-        .turns
-        .iter()
-        .filter_map(|turn| turn.cost)
-        .try_fold(crate::protocol::Cost::from_nano_usd(0), |total, cost| {
-            total.checked_add(cost)
-        })
-        .filter(|cost| !cost.is_zero());
-    let mut text = compact_count(blended_tokens);
-    if let Some(cost) = cost {
+    let total = snapshot.total_usage()?;
+    let mut text = compact_count(total.blended_tokens()?);
+    if let Some(cost) = total.cost.filter(|cost| !cost.is_zero()) {
         text.push_str(" · ");
         text.push_str(&compact_cost(cost));
     }
@@ -2984,6 +2975,7 @@ mod tests {
                     messages: Vec::new(),
                     activities: Vec::new(),
                     transcript: Vec::new(),
+                    subagent_usage: None,
                 },
             )))
             .expect("hydrate test Application");
@@ -3043,6 +3035,7 @@ mod tests {
                     messages: Vec::new(),
                     activities: Vec::new(),
                     transcript: Vec::new(),
+                    subagent_usage: None,
                 },
             )))
             .expect("hydrate test Application");

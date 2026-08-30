@@ -1161,7 +1161,7 @@ fn session_summary(
     status: SessionStatus,
     updated_at: u64,
 ) -> SessionListItem {
-    SessionListItem::Readable(SessionSummary {
+    SessionListItem::Readable(Box::new(SessionSummary {
         session: Session {
             id: session_id,
             workspace: Workspace {
@@ -1176,9 +1176,10 @@ fn session_summary(
         emoji: None,
         settled_at: None,
         working_since: None,
+        total_usage: None,
         created_at: SessionTimestamp(1),
         updated_at: SessionTimestamp(updated_at),
-    })
+    }))
 }
 
 /// A Session listing entry whose derivation already landed, so it carries an
@@ -1197,10 +1198,10 @@ fn emoji_session_summary(
         SessionStatus::Idle,
         updated_at,
     ) {
-        SessionListItem::Readable(summary) => SessionListItem::Readable(SessionSummary {
+        SessionListItem::Readable(summary) => SessionListItem::Readable(Box::new(SessionSummary {
             emoji: Some(emoji.to_owned()),
-            ..summary
-        }),
+            ..*summary
+        })),
         unreadable => unreadable,
     }
 }

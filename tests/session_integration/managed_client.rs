@@ -899,6 +899,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             turn_id,
             text: "No Agent is selected".to_owned(),
         }],
+        subagent_usage: None,
         transcript: vec![
             TranscriptItem::Message { message_id },
             TranscriptItem::Activity { activity_id },

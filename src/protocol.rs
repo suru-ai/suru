@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 28;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
@@ -1337,6 +1337,15 @@ pub struct SessionSummary {
     /// work has been running only when it knows.
     #[serde(default)]
     pub working_since: Option<SessionTimestamp>,
+    /// What this Session and its Subagent subtree have consumed together, and
+    /// `None` where nothing has reported anything — which is every Session
+    /// stored before Usage recording.
+    ///
+    /// Derived from the Turns rather than stored beside them, exactly as
+    /// `working_since` is, so a listing can never disagree with the Session's
+    /// own Transcript.
+    #[serde(default)]
+    pub total_usage: Option<UsageTotal>,
     pub created_at: SessionTimestamp,
     pub updated_at: SessionTimestamp,
 }
@@ -1349,7 +1358,11 @@ pub struct SessionSummary {
     deny_unknown_fields
 )]
 pub enum SessionListItem {
-    Readable(SessionSummary),
+    /// Boxed because a readable summary carries everything a Session states
+    /// about itself — its Selection, its Workspace, its total Usage — while
+    /// the unreadable one carries what little survived a Session Suru could
+    /// not decode.
+    Readable(Box<SessionSummary>),
     Unreadable(UnreadableSessionSummary),
 }
 
@@ -1480,6 +1493,15 @@ pub enum SessionCatalogChange {
         session_id: SessionId,
         working_since: Option<SessionTimestamp>,
     },
+    /// A Session's total — its own Turns and its Subagent subtree together —
+    /// moved. It rides the catalog stream for the same reason Working does:
+    /// every client lists the Session, and only some have it open. It carries
+    /// the whole reading, and moves nothing else about the row, so a listing
+    /// in hand is current the moment it lands.
+    UsageChanged {
+        session_id: SessionId,
+        total_usage: Option<UsageTotal>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1569,15 +1591,27 @@ impl Usage {
     /// reasoning within it. Cache traffic stays in the stored breakdown but
     /// does not inflate the displayed count.
     pub fn blended_tokens(&self) -> Option<u64> {
-        [
+        blended_tokens(
             self.fresh_input_tokens,
             self.output_tokens,
             self.reasoning_tokens,
-        ]
+        )
+    }
+}
+
+/// The one blend every surface states, taken in one place so a Turn's figure
+/// and a Session's total can never be blended differently: fresh input plus
+/// output and the reasoning within it, and absent where none of the three was
+/// measured.
+fn blended_tokens(
+    fresh_input: Option<u64>,
+    output: Option<u64>,
+    reasoning: Option<u64>,
+) -> Option<u64> {
+    [fresh_input, output, reasoning]
         .into_iter()
         .flatten()
         .reduce(u64::saturating_add)
-    }
 }
 
 /// A non-negative dollar figure stored in billionths of one USD. The integer
@@ -1617,6 +1651,14 @@ impl Cost {
         self.0.checked_add(other.0).map(Self)
     }
 
+    /// Adds one Cost to another, holding at the largest representable figure
+    /// rather than wrapping. A total that ran past every dollar a Provider
+    /// could charge is a figure nobody will read, but it must not turn into a
+    /// small one.
+    pub const fn saturating_add(self, other: Self) -> Self {
+        Self(self.0.saturating_add(other.0))
+    }
+
     pub fn as_usd(self) -> f64 {
         self.nano_usd() as f64 / Self::NANO_USD_PER_USD
     }
@@ -1649,6 +1691,102 @@ impl<'de> Deserialize<'de> for Cost {
 pub enum CostBasis {
     Reported,
     Estimated,
+}
+
+/// What a set of Turns consumed together: the token parts that add up, and
+/// the Cost each Turn froze when it recorded its Usage. It is what a surface
+/// states for a whole Session — its own Turns, and its Subagent subtree with
+/// them.
+///
+/// Absence survives the sum, as it does on a Turn's [`Usage`]: a part no Turn
+/// in the set reported stays absent rather than becoming a zero nobody
+/// measured. Two of that Usage's fields are deliberately not here, because
+/// neither is a quantity to add: a model context window belongs to one Turn's
+/// model, and a native meter is in a unit only its Provider defines — the one
+/// Provider that reports it already counts a whole Session, so summing two
+/// would count the same spend twice.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageTotal {
+    pub fresh_input_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub cost: Option<Cost>,
+}
+
+impl UsageTotal {
+    /// What one Turn contributes, or `None` where it recorded nothing at all —
+    /// every Turn stored before Usage recording, and every Turn whose Provider
+    /// never reported a measurement.
+    pub fn of_turn(turn: &Turn) -> Option<Self> {
+        let usage = turn.usage.as_ref();
+        if usage.is_none() && turn.cost.is_none() {
+            return None;
+        }
+        Some(Self {
+            fresh_input_tokens: usage.and_then(|usage| usage.fresh_input_tokens),
+            cache_read_tokens: usage.and_then(|usage| usage.cache_read_tokens),
+            cache_write_tokens: usage.and_then(|usage| usage.cache_write_tokens),
+            output_tokens: usage.and_then(|usage| usage.output_tokens),
+            reasoning_tokens: usage.and_then(|usage| usage.reasoning_tokens),
+            cost: turn.cost,
+        })
+    }
+
+    /// What every Turn in `turns` consumed together, or `None` where none of
+    /// them recorded anything — which is what keeps a Session with no Usage
+    /// off every surface that would otherwise state a zero.
+    pub fn of_turns<'a>(turns: impl IntoIterator<Item = &'a Turn>) -> Option<Self> {
+        turns
+            .into_iter()
+            .filter_map(Self::of_turn)
+            .reduce(Self::saturating_add)
+    }
+
+    /// Adds two totals part by part, holding at the largest representable
+    /// figure rather than wrapping.
+    ///
+    /// A summed Cost is over the Turns that had one: a Turn whose price was
+    /// never known contributes no dollars rather than voiding the figure
+    /// beside it, which is how a Session already totals its own Turns. Only a
+    /// total where nothing at all was priced is absent.
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            fresh_input_tokens: add_parts(self.fresh_input_tokens, other.fresh_input_tokens),
+            cache_read_tokens: add_parts(self.cache_read_tokens, other.cache_read_tokens),
+            cache_write_tokens: add_parts(self.cache_write_tokens, other.cache_write_tokens),
+            output_tokens: add_parts(self.output_tokens, other.output_tokens),
+            reasoning_tokens: add_parts(self.reasoning_tokens, other.reasoning_tokens),
+            cost: match (self.cost, other.cost) {
+                (None, None) => None,
+                (held, added) => Some(
+                    held.unwrap_or(Cost::from_nano_usd(0))
+                        .saturating_add(added.unwrap_or(Cost::from_nano_usd(0))),
+                ),
+            },
+        }
+    }
+
+    /// The compact figure a reader is shown, on the same terms as one Turn's
+    /// [`Usage::blended_tokens`].
+    pub fn blended_tokens(&self) -> Option<u64> {
+        blended_tokens(
+            self.fresh_input_tokens,
+            self.output_tokens,
+            self.reasoning_tokens,
+        )
+    }
+}
+
+/// Adds one measured part to another, keeping absence where neither side
+/// measured anything.
+fn add_parts(held: Option<u64>, added: Option<u64>) -> Option<u64> {
+    match (held, added) {
+        (None, None) => None,
+        (held, added) => Some(held.unwrap_or(0).saturating_add(added.unwrap_or(0))),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1759,6 +1897,14 @@ pub struct SessionSnapshot {
     pub messages: Vec<Message>,
     pub activities: Vec<Activity>,
     pub transcript: Vec<TranscriptItem>,
+    /// What this Session's Subagent subtree consumed, to any depth, and
+    /// `None` while it has delegated nothing that reported anything. It is
+    /// held apart from the Session's own Turns because only the server can
+    /// see across Sessions: a child's Usage lands in the child's own Turns,
+    /// and the server rolls it up here so any client reading this Session
+    /// states the whole of what its work cost.
+    #[serde(default)]
+    pub subagent_usage: Option<UsageTotal>,
 }
 
 impl SessionSnapshot {
@@ -1772,6 +1918,18 @@ impl SessionSnapshot {
             .last()
             .filter(|turn| !turn.status.is_terminal())
             .and_then(|turn| turn.started_at)
+    }
+
+    /// Everything this Session has consumed: its own Turns — failed and
+    /// interrupted ones included — and the Subagent subtree rolled up beneath
+    /// them. It is the one reading [`SessionSummary::total_usage`] carries,
+    /// taken here so a listing and an open Session can never tell a reader
+    /// different things about the same spend.
+    pub fn total_usage(&self) -> Option<UsageTotal> {
+        match (UsageTotal::of_turns(&self.turns), self.subagent_usage) {
+            (Some(own), Some(delegated)) => Some(own.saturating_add(delegated)),
+            (own, delegated) => own.or(delegated),
+        }
     }
 }
 
@@ -1815,6 +1973,13 @@ pub enum SessionChange {
         usage: Usage,
         cost: Option<Cost>,
         cost_basis: Option<CostBasis>,
+    },
+    /// What this Session's Subagent subtree has consumed, rolled up whole by
+    /// the server. It carries the new reading entire rather than a delta,
+    /// because a client holding it must never have to add a change to a total
+    /// it may have joined the stream too late to hold.
+    SubagentUsageChanged {
+        subagent_usage: Option<UsageTotal>,
     },
     MessageAdded {
         message: Message,
@@ -2163,6 +2328,16 @@ pub struct SessionSettlementChanged {
 pub struct SessionWorkingChanged {
     pub session_id: SessionId,
     pub working_since: Option<SessionTimestamp>,
+}
+
+/// A Session's total Usage — its own Turns and its Subagent subtree together
+/// — as the server rolled it up, carried to a client that may be listing that
+/// Session without having it open.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionUsageChanged {
+    pub session_id: SessionId,
+    pub total_usage: Option<UsageTotal>,
 }
 
 /// A Session's Title — and the Emoji beside it — as a derivation left them,

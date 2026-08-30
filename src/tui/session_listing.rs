@@ -205,7 +205,9 @@ impl SessionListing {
     /// to revise, so it is passed over rather than reported missing.
     fn readable_mut(&mut self, session_id: SessionId) -> Option<&mut SessionSummary> {
         self.sessions.iter_mut().find_map(|session| match session {
-            SessionListItem::Readable(summary) if summary.session.id == session_id => Some(summary),
+            SessionListItem::Readable(summary) if summary.session.id == session_id => {
+                Some(summary.as_mut())
+            }
             _ => None,
         })
     }
@@ -519,7 +521,7 @@ mod tests {
     }
 
     fn summary(title: &str, updated_at: u64) -> SessionListItem {
-        SessionListItem::Readable(SessionSummary {
+        SessionListItem::Readable(Box::new(SessionSummary {
             session: Session {
                 id: SessionId::new(),
                 workspace: Workspace {
@@ -533,10 +535,11 @@ mod tests {
             title: title.to_owned(),
             emoji: None,
             settled_at: None,
+            total_usage: None,
             working_since: None,
             created_at: SessionTimestamp(1),
             updated_at: SessionTimestamp(updated_at),
-        })
+        }))
     }
 
     fn root() -> PathBuf {

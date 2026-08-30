@@ -4686,6 +4686,7 @@ mod tests {
             messages,
             activities,
             transcript,
+            subagent_usage: None,
         }
     }
 
