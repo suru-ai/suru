@@ -1,5 +1,5 @@
-//! The Working Indicator's Codex-style shimmer: one two-second brightness
-//! sweep over text, expressed entirely as draw-time styles.
+//! The Working Indicator's Codex-style shimmer: a one-second brightness sweep
+//! followed by one second at rest, expressed entirely as draw-time styles.
 
 use std::{f64::consts::PI, sync::OnceLock, time::Duration};
 
@@ -9,10 +9,8 @@ use ratatui::style::{Color, Modifier, Style};
 pub(super) const TICK_PERIOD: Duration = Duration::from_millis(32);
 
 const CYCLE_MILLIS: u64 = 2_000;
+const SWEEP_MILLIS: u64 = 1_000;
 const BAND_HALF_WIDTH: f64 = 5.0;
-// Keep the band just far enough beyond either edge that the palette fallback
-// shows one leading character before the rest of the label joins the sweep.
-const EDGE_OVERHANG: f64 = 3.5;
 
 /// One style per character. All Shimmers share the run loop's frame clock, so
 /// appearing text joins the process-wide sweep instead of starting a private
@@ -32,9 +30,12 @@ fn styles_for_color_mode(text: &str, frame: usize, base: Style, truecolor: bool)
         return Vec::new();
     }
     let elapsed = (frame as u64).saturating_mul(TICK_PERIOD.as_millis() as u64) % CYCLE_MILLIS;
-    let progress = elapsed as f64 / CYCLE_MILLIS as f64;
-    let first_center = -EDGE_OVERHANG;
-    let last_center = character_count.saturating_sub(1) as f64 + EDGE_OVERHANG;
+    if elapsed >= SWEEP_MILLIS {
+        return vec![shimmer_style(base, 0.0, truecolor); character_count];
+    }
+    let progress = elapsed as f64 / SWEEP_MILLIS as f64;
+    let first_center = -BAND_HALF_WIDTH;
+    let last_center = character_count.saturating_sub(1) as f64 + BAND_HALF_WIDTH;
     let center = first_center + progress * (last_center - first_center);
     (0..character_count)
         .map(|index| shimmer_style(base, intensity(index as f64 - center), truecolor))
@@ -102,32 +103,48 @@ mod tests {
     }
 
     #[test]
-    fn a_sweep_enters_on_the_first_character_and_leaves_on_the_last() {
+    fn a_one_second_sweep_has_dark_boundaries_then_rests_for_one_second() {
         let base = Style::default();
-        let resting = shimmer_style(base, 0.0, false);
-        let opening = styles_for_color_mode("Working", 0, base, false);
-        let closing = styles_for_color_mode(
+        let midpoint = styles_for_color_mode(
             "Working",
-            (CYCLE_MILLIS / TICK_PERIOD.as_millis() as u64) as usize,
+            (SWEEP_MILLIS / 2 / TICK_PERIOD.as_millis() as u64) as usize,
             base,
             false,
         );
+        assert!(
+            midpoint[midpoint.len() / 2]
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "the sweep reaches the middle of the label within half a second"
+        );
+        let first_resting_frame = SWEEP_MILLIS / TICK_PERIOD.as_millis() as u64 + 1;
+        let last_resting_frame = CYCLE_MILLIS / TICK_PERIOD.as_millis() as u64;
+        for truecolor in [false, true] {
+            let resting = shimmer_style(base, 0.0, truecolor);
+            let opening = styles_for_color_mode("Working", 0, base, truecolor);
+            let closing = styles_for_color_mode(
+                "Working",
+                (SWEEP_MILLIS / TICK_PERIOD.as_millis() as u64) as usize,
+                base,
+                truecolor,
+            );
 
-        assert_ne!(opening[0], resting, "the first character starts the sweep");
-        assert!(
-            opening[1..].iter().all(|style| *style == resting),
-            "the sweep does not begin with several characters already highlighted"
-        );
-        assert_ne!(
-            closing[closing.len() - 1],
-            resting,
-            "the last character finishes the sweep before it wraps"
-        );
-        assert!(
-            closing[..closing.len() - 1]
-                .iter()
-                .all(|style| *style == resting),
-            "the trailing edge has left the earlier characters"
-        );
+            assert!(
+                opening.iter().all(|style| *style == resting),
+                "the sweep begins with every character unhighlighted"
+            );
+            assert!(
+                closing.iter().all(|style| *style == resting),
+                "the sweep ends with every character unhighlighted"
+            );
+            assert!(
+                (first_resting_frame..=last_resting_frame).all(|frame| {
+                    styles_for_color_mode("Working", frame as usize, base, truecolor)
+                        .iter()
+                        .all(|style| *style == resting)
+                }),
+                "the label remains unhighlighted for the second half of the cycle"
+            );
+        }
     }
 }
