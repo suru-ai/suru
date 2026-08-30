@@ -212,6 +212,35 @@ async fn dial_with_unknown_certificate(
     (result, certificate)
 }
 
+async fn tls12_handshake_succeeds(address: std::net::SocketAddr) -> bool {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["tls12-test-client".to_owned()]).unwrap();
+    let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS12])
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(std::sync::Arc::new(CaptureServerCertificate {
+        certificate: std::sync::Arc::new(std::sync::Mutex::new(None)),
+    }))
+    .with_client_auth_cert(
+        vec![cert.der().clone()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            signing_key.serialize_der(),
+        )),
+    )
+    .unwrap();
+    let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls))
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        )
+        .await
+        .is_ok()
+}
+
 fn public_key_from_certificate(certificate: &[u8]) -> Vec<u8> {
     let (_, certificate) = x509_parser::parse_x509_certificate(certificate)
         .expect("parse Serving identity certificate");
@@ -265,6 +294,119 @@ async fn open_paired_health_connection(
         .expect("read paired health response");
     assert!(String::from_utf8_lossy(&response[..read]).contains("200 OK"));
     stream
+}
+
+async fn open_invited_enrollment_connection(
+    address: std::net::SocketAddr,
+    invite: &str,
+) -> (
+    tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    String,
+) {
+    let encoded = invite
+        .strip_prefix("suru-v1-")
+        .expect("test Invite uses the supported version");
+    let payload: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .expect("decode test Invite"),
+    )
+    .expect("parse test Invite payload");
+    let server_public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload["k"].as_str().expect("Invite carries a Server key"))
+        .expect("decode invited Server key");
+    let token = payload["t"]
+        .as_str()
+        .expect("Invite carries a token")
+        .to_owned();
+    let signing_key = rcgen::KeyPair::generate().expect("generate invited Peer identity");
+    let mut certificate_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    certificate_params.distinguished_name = rcgen::DistinguishedName::new();
+    certificate_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, format!("suru-invite-{token}"));
+    let certificate = certificate_params.self_signed(&signing_key).unwrap();
+    let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(std::sync::Arc::new(PinnedTestServerCertificate {
+        expected_public_key: server_public_key,
+    }))
+    .with_client_auth_cert(
+        vec![certificate.der().clone()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            signing_key.serialize_der(),
+        )),
+    )
+    .unwrap();
+    let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let stream = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls))
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        )
+        .await
+        .expect("open invited enrollment connection");
+    (stream, token)
+}
+
+async fn send_enrollment_phase(
+    stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    token: &str,
+    phase: &str,
+) {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "token": token,
+        "protocol_version": PROTOCOL_VERSION,
+        "phase": phase,
+    }))
+    .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /v1/pairing/enroll HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    stream.write_all(&body).await.unwrap();
+
+    let mut response = Vec::new();
+    let (header_end, content_length) = loop {
+        let mut chunk = [0_u8; 1024];
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert_ne!(read, 0, "enrollment response ended before its headers");
+        response.extend_from_slice(&chunk[..read]);
+        if let Some(header_end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            let header_end = header_end + 4;
+            let headers = std::str::from_utf8(&response[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            break (header_end, content_length);
+        }
+    };
+    while response.len() < header_end + content_length {
+        let mut chunk = [0_u8; 1024];
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert_ne!(read, 0, "enrollment response ended before its body");
+        response.extend_from_slice(&chunk[..read]);
+    }
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "enrollment phase failed: {}",
+        String::from_utf8_lossy(&response)
+    );
 }
 
 fn assert_logs_omit_key_material(log_dir: &std::path::Path, public_key: &[u8]) {
@@ -356,6 +498,10 @@ async fn serving_starts_and_stops_a_second_mtls_listener_without_disturbing_loca
     assert_eq!(first_address.ip(), std::net::Ipv4Addr::LOCALHOST);
     assert_ne!(first_address.port(), 0);
     assert!(identity_path.exists());
+    assert!(
+        !tls12_handshake_succeeds(first_address).await,
+        "Pairing TLS excludes TLS 1.2 so enrollment credentials stay encrypted"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -384,6 +530,11 @@ async fn serving_starts_and_stops_a_second_mtls_listener_without_disturbing_loca
         })
         .await
         .expect("issue Invite without logging its credentials");
+    let (uninvited_peer, _) = dial_with_unknown_certificate(first_address).await;
+    assert!(
+        uninvited_peer.is_err(),
+        "issuing an Invite does not admit a certificate that cannot present its token"
+    );
 
     let mut serving_connection = tokio::net::TcpStream::connect(first_address)
         .await
@@ -723,7 +874,23 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
         })
         .await
         .expect("first redemption spends Invite");
-    let error = connecting_client
+    let fresh_state = tempfile::tempdir().expect("create fresh connecting state directory");
+    let fresh = server::spawn_with_timings(
+        ServerConfig::new(fresh_state.path(), "invite-errors-fresh").unwrap(),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .expect("spawn fresh connecting Server");
+    let mut fresh_client = ManagedClient::connect(
+        ManagedClientConfig::new(fresh_state.path(), "invite-errors-fresh").unwrap(),
+    )
+    .await
+    .expect("attach fresh connecting Client");
+    receive_initial_state(&mut fresh_client).await;
+    let error = fresh_client
         .redeem_invite(RedeemInviteRequest {
             invite: live.invite,
             name: Some("second".to_owned()),
@@ -740,7 +907,7 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(225)).await;
-    let error = connecting_client
+    let error = fresh_client
         .redeem_invite(RedeemInviteRequest {
             invite: expired.invite,
             name: Some("expired".to_owned()),
@@ -790,8 +957,10 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
     incompatible_server.shutdown().await.unwrap();
 
     drop(connecting_client);
+    drop(fresh_client);
     drop(serving_client);
     connecting.shutdown().await.unwrap();
+    fresh.shutdown().await.unwrap();
     serving.shutdown().await.unwrap();
 }
 
@@ -800,6 +969,152 @@ fn pairing_error_code(error: &anyhow::Error) -> SessionErrorCode {
         .downcast_ref::<SessionError>()
         .expect("Pairing error remains typed at the local Client interface")
         .code
+}
+
+#[tokio::test]
+async fn serving_persistence_failure_does_not_leave_an_authorized_peer() {
+    let serving_state = tempfile::tempdir().unwrap();
+    let serving_data = tempfile::tempdir().unwrap();
+    let serving_config_root = tempfile::tempdir().unwrap();
+    let serving = server::spawn_with_timings(
+        ServerConfig::new(serving_state.path(), "pairing-persistence-serving")
+            .unwrap()
+            .with_data_dir(serving_data.path())
+            .with_config_dir(serving_config_root.path()),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut serving_client = ManagedClient::connect(
+        ManagedClientConfig::new(serving_state.path(), "pairing-persistence-serving").unwrap(),
+    )
+    .await
+    .unwrap();
+    receive_initial_state(&mut serving_client).await;
+    serving_client
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
+        .await
+        .unwrap();
+    serving_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .unwrap();
+    let address = serving.serving_address().unwrap();
+
+    let connecting_state = tempfile::tempdir().unwrap();
+    let connecting = server::spawn_with_timings(
+        ServerConfig::new(connecting_state.path(), "pairing-persistence-connecting").unwrap(),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut connecting_client = ManagedClient::connect(
+        ManagedClientConfig::new(connecting_state.path(), "pairing-persistence-connecting")
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    receive_initial_state(&mut connecting_client).await;
+
+    let invite = serving_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![address],
+        })
+        .await
+        .unwrap();
+    std::fs::create_dir(
+        serving_data
+            .path()
+            .join("pairing-persistence-serving")
+            .join("peers.json"),
+    )
+    .expect("make the Peer record path unwritable on every platform");
+    let error = connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: invite.invite,
+            name: Some("must-not-pair".to_owned()),
+            addresses: Vec::new(),
+        })
+        .await
+        .expect_err("Serving-side persistence failure aborts enrollment");
+
+    assert_eq!(
+        pairing_error_code(&error),
+        SessionErrorCode::PairingConnectionFailed
+    );
+    assert!(serving_client.list_peers().await.unwrap().is_empty());
+    assert!(connecting_client.list_remotes().await.unwrap().is_empty());
+
+    drop(connecting_client);
+    drop(serving_client);
+    connecting.shutdown().await.unwrap();
+    serving.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn removing_a_peer_closes_the_connection_that_enrolled_it() {
+    let serving_state = tempfile::tempdir().unwrap();
+    let serving_config_root = tempfile::tempdir().unwrap();
+    let serving = server::spawn_with_timings(
+        ServerConfig::new(serving_state.path(), "enrollment-revocation-serving")
+            .unwrap()
+            .with_config_dir(serving_config_root.path()),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut serving_client = ManagedClient::connect(
+        ManagedClientConfig::new(serving_state.path(), "enrollment-revocation-serving").unwrap(),
+    )
+    .await
+    .unwrap();
+    receive_initial_state(&mut serving_client).await;
+    serving_client
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
+        .await
+        .unwrap();
+    serving_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .unwrap();
+    let address = serving.serving_address().unwrap();
+    let invite = serving_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![address],
+        })
+        .await
+        .unwrap();
+
+    let (mut enrollment_connection, token) =
+        open_invited_enrollment_connection(address, &invite.invite).await;
+    send_enrollment_phase(&mut enrollment_connection, &token, "prepare").await;
+    send_enrollment_phase(&mut enrollment_connection, &token, "commit").await;
+    let peer = serving_client.list_peers().await.unwrap().remove(0);
+    serving_client.remove_peer(&peer.id).await.unwrap();
+
+    let mut byte = [0_u8];
+    match timeout(
+        Duration::from_secs(1),
+        enrollment_connection.read(&mut byte),
+    )
+    .await
+    .expect("removing the Peer promptly closes its enrollment connection")
+    {
+        Ok(0) | Err(_) => {}
+        Ok(read) => panic!("revoked enrollment connection produced {read} unexpected bytes"),
+    }
+
+    drop(serving_client);
+    serving.shutdown().await.unwrap();
 }
 
 #[tokio::test]
