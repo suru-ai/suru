@@ -184,6 +184,38 @@ _Avoid_: Throbber, loading indicator
 Provider-owned data, opaque to Suru, that lets a Session continue with its Provider after a restart. Without it a restored Session is viewable but cannot continue where it left off.
 _Avoid_: Thread mapping, provider cache
 
+**Server**:
+The long-lived Suru process that owns a user's Sessions, Server Settings, and Provider work on one machine, one per Channel, which Clients attach to rather than doing that work themselves.
+_Avoid_: Daemon, backend, host
+
+**Client**:
+A user-facing Suru surface — today the TUI — that attaches to the Server on its own machine and presents that Server's work. A Client never speaks to another machine's Server directly; anything remote it sees, it sees through its own Server.
+_Avoid_: Frontend, terminal, UI process
+
+**Serving**:
+The state in which a Server accepts connections from other machines' Servers, off unless its user turns it on as a Setting, and never extended to the machine's own Clients — they attach the way they always have.
+_Avoid_: Hosting, remote mode, exposing
+
+**Invite**:
+The one-time pasteable string a Serving Server issues so another machine's Server may form a Pairing with it: the addresses its user chose to offer, the Server's identity, and a token spent by its first redemption, dead after a short while unused, and superseded by the next Invite either way.
+_Avoid_: Connect string, join code, ticket
+
+**Pairing**:
+The durable relationship formed when one Server redeems another's Invite: each side holds the other's identity and trusts nothing else, so the two find each other again on their own until one side removes the other. A Pairing is one-way — the redeeming Server reaches into the Serving one, never the reverse — and a second Pairing in the opposite direction is its own relationship.
+_Avoid_: Link, tunnel, connection (for the relationship itself)
+
+**Remote**:
+A paired Serving Server as the redeeming side knows it: carrying a name its user gave it — offered from the machine's own hostname, theirs to change — reached only through the local Server, and offering its own Sessions and Workspaces for a Client to work in. What a Remote's user does on their own machine is none of the local side's business; a Remote shares its work, not its administration.
+_Avoid_: Remote server, host, upstream
+
+**Peer**:
+A paired redeeming Server as the Serving side knows it: an entry its user can list and remove, and removing it ends the Pairing.
+_Avoid_: Authorized client, key entry
+
+**Outlook**:
+The Server whose world a Client is presently looking into: its own machine's Server unless the user has turned it toward a Remote. A Client holds one Outlook at a time, and everything it presents — the Landing, the Sidebar, the pickers, the Sessions it offers to open or begin — answers for that Server alone.
+_Avoid_: Scope (the Sidebar's Workspace narrowing already owns it), view, context, focus
+
 **Channel**:
 The build variant (release or a development channel) whose sessions and runtime state are kept separate so development runs never touch real data.
 _Avoid_: Environment, profile
