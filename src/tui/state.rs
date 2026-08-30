@@ -1650,6 +1650,8 @@ pub enum CommandId {
     PageNextModels,
     SelectModel,
     CloseModelPicker,
+    InsertWorkspaceSearch(String),
+    DeleteWorkspaceSearchBackward,
     SelectPreviousWorkspace,
     SelectNextWorkspace,
     PagePreviousWorkspaces,
@@ -1930,7 +1932,9 @@ impl Application {
             | CommandId::PageNextModels
             | CommandId::SelectModel
             | CommandId::CloseModelPicker) => self.handle_model_picker_command(command),
-            command @ (CommandId::SelectPreviousWorkspace
+            command @ (CommandId::InsertWorkspaceSearch(_)
+            | CommandId::DeleteWorkspaceSearchBackward
+            | CommandId::SelectPreviousWorkspace
             | CommandId::SelectNextWorkspace
             | CommandId::PagePreviousWorkspaces
             | CommandId::PageNextWorkspaces
@@ -2105,6 +2109,10 @@ impl Application {
     /// picker alone.
     fn handle_workspace_picker_command(&mut self, command: CommandId) -> ApplicationTransition {
         match command {
+            CommandId::InsertWorkspaceSearch(text) => self.state.workspace_picker.insert(&text),
+            CommandId::DeleteWorkspaceSearchBackward => {
+                self.state.workspace_picker.delete_backward();
+            }
             CommandId::SelectPreviousWorkspace => self.state.workspace_picker.select_previous(),
             CommandId::SelectNextWorkspace => self.state.workspace_picker.select_next(),
             CommandId::PagePreviousWorkspaces => self.state.workspace_picker.page_previous(),

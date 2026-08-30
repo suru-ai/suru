@@ -4,6 +4,7 @@ mod commands;
 mod completion;
 mod composer;
 mod event_loop;
+mod fuzzy;
 mod keymap;
 mod markdown;
 mod model_options;

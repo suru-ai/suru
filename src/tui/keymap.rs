@@ -421,10 +421,10 @@ const MODEL_PICKER_COMMANDS: PickerCommandBindings = PickerCommandBindings {
 };
 
 /// The Workspace Picker answers the keys every picker answers — the arrows and
-/// paging keys walk its rows, Enter switches to the row the reader is on where
-/// there is one, and Esc closes — and the pointer as the session picker's rows
-/// answer it. It offers the Workspaces a listing derives rather than a
-/// searchable body of work, so nothing here narrows it by typing yet.
+/// paging keys walk its rows, what the reader types narrows them, Enter
+/// switches to the row the reader is on where there is one, and Esc closes —
+/// and the pointer as the session picker's rows answer it. It has no second
+/// scope to offer: it always asks across every Workspace.
 const WORKSPACE_PICKER_COMMANDS: PickerCommandBindings = PickerCommandBindings {
     previous: CommandId::SelectPreviousWorkspace,
     next: CommandId::SelectNextWorkspace,
@@ -432,7 +432,10 @@ const WORKSPACE_PICKER_COMMANDS: PickerCommandBindings = PickerCommandBindings {
     page_next: CommandId::PageNextWorkspaces,
     select: CommandId::SelectWorkspace,
     close: CommandId::CloseWorkspacePicker,
-    search: None,
+    search: Some(PickerSearchBindings {
+        delete_backward: CommandId::DeleteWorkspaceSearchBackward,
+        insert: CommandId::InsertWorkspaceSearch,
+    }),
     toggle_scope: None,
 };
 

@@ -1,4 +1,4 @@
-//! Session switcher state and title matching.
+//! Session switcher state and the query that narrows it.
 
 use std::path::Path;
 
@@ -7,7 +7,8 @@ use crate::protocol::{
 };
 
 use super::{
-    SessionListRequest, SessionListScope, SessionListSurface, session_listing::SessionListing,
+    SessionListRequest, SessionListScope, SessionListSurface, fuzzy::fuzzy_matches,
+    session_listing::SessionListing,
 };
 
 #[derive(Clone, Debug)]
@@ -258,7 +259,7 @@ impl SessionPicker {
         self.listing
             .sessions()
             .iter()
-            .filter(|summary| fuzzy_title_matches(&self.query, summary.title()))
+            .filter(|summary| fuzzy_matches(&self.query, summary.title()))
             .map(move |summary| {
                 let readable = summary.readable();
                 SessionPickerRow {
@@ -317,7 +318,7 @@ impl SessionPicker {
         self.listing
             .sessions()
             .iter()
-            .filter(|summary| fuzzy_title_matches(&self.query, summary.title()))
+            .filter(|summary| fuzzy_matches(&self.query, summary.title()))
             .map(SessionListItem::id)
             .collect()
     }
@@ -355,12 +356,4 @@ impl SessionPicker {
             self.select_first_visible();
         }
     }
-}
-
-fn fuzzy_title_matches(query: &str, title: &str) -> bool {
-    let mut title = title.chars().flat_map(char::to_lowercase);
-    query
-        .chars()
-        .flat_map(char::to_lowercase)
-        .all(|character| title.by_ref().any(|candidate| candidate == character))
 }

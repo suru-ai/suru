@@ -1,5 +1,6 @@
 //! The Workspace Picker: opening it, the Workspaces it puts on offer, the
-//! order it stands them in, choosing one, and walking away from it unchanged.
+//! order it stands them in, narrowing them by typing, choosing one, and
+//! walking away from it unchanged.
 
 use std::path::{Path, PathBuf};
 
@@ -333,7 +334,7 @@ fn a_narrow_row_gives_up_the_head_of_the_path_rather_than_the_path() {
 
     open_picker_with(&mut application, vec![rooted("Older", &ledger, 10)]);
 
-    let rows = picker_rows_at(&application, 28, 7);
+    let rows = picker_rows_at(&application, 28, 9);
     let row = rows
         .iter()
         .find(|row| row.contains("ledger"))
@@ -694,6 +695,245 @@ fn enter_while_the_listing_is_on_its_way_chooses_nothing() {
     assert!(picker.contains("Loading Workspaces"), "{picker}");
 }
 
+/// Typing narrows the picker the way it narrows the session picker: the
+/// characters stand in order but need not stand together, and the case the
+/// reader types in is never the case they have to type in.
+#[test]
+fn typing_narrows_the_rows_by_fuzzy_name_match() {
+    let mut application = connected_application(&workspace(&["work", "here"]));
+    open_picker_with(&mut application, narrowable_sessions());
+
+    type_terminal_text(&mut application, "ENE");
+    assert_eq!(picker_query(&application), "ENE");
+
+    let rows = picker_rows(&application);
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the Workspace carrying it stands: {rows:?}"
+    );
+    assert!(
+        rows[0].contains("engine"),
+        "the characters stand in order without standing together, and the case \
+         the reader reached for is not the case they have to type: {rows:?}"
+    );
+}
+
+/// Narrowing takes rows away and never rearranges the ones it leaves: the
+/// current Workspace goes on standing first, and the rest go on standing by
+/// which held work most recently.
+#[test]
+fn the_rows_a_query_leaves_keep_the_picker_s_order() {
+    let mut application = connected_application(&workspace(&["work", "here"]));
+    open_picker_with(&mut application, narrowable_sessions());
+
+    type_terminal_text(&mut application, "e");
+
+    let rows = picker_rows(&application);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(
+        rows[0].contains("here") && rows[0].contains("[current]"),
+        "the Workspace the client works in still stands first: {rows:?}"
+    );
+    assert!(
+        rows[1].contains("engine"),
+        "then the Workspace whose newest Session is newest: {rows:?}"
+    );
+    assert!(rows[2].contains("ledger"), "{rows:?}");
+}
+
+/// A row spells its Workspace's path beside the name, but the name is what a
+/// query is read against — as a Title is in the session picker — so the
+/// directories a Workspace stands under never answer for it.
+#[test]
+fn a_query_is_read_against_the_name_rather_than_the_path() {
+    let mut application = connected_application(&workspace(&["work", "here"]));
+    open_picker_with(
+        &mut application,
+        vec![rooted("Older", &workspace(&["zephyr", "atlas"]), 10)],
+    );
+
+    type_terminal_text(&mut application, "zephyr");
+
+    let rows = picker_rows(&application);
+    assert_eq!(
+        rows,
+        vec!["No Workspaces found"],
+        "the head of the path is not part of the name: {rows:?}"
+    );
+}
+
+#[test]
+fn backspace_widens_the_rows_and_giving_the_query_up_restores_them_all() {
+    let mut application = connected_application(&workspace(&["work", "here"]));
+    open_picker_with(&mut application, narrowable_sessions());
+
+    type_terminal_text(&mut application, "eng");
+    assert_eq!(picker_rows(&application).len(), 1, "narrowed to one");
+
+    backspace(&mut application);
+    backspace(&mut application);
+    assert_eq!(picker_query(&application), "e");
+    let widened = picker_rows(&application);
+    assert_eq!(
+        widened.len(),
+        3,
+        "one character back widens again: {widened:?}"
+    );
+
+    backspace(&mut application);
+    assert_eq!(picker_query(&application), "");
+    let restored = picker_rows(&application);
+    assert_eq!(
+        restored.len(),
+        4,
+        "and giving the query up puts every Workspace back: {restored:?}"
+    );
+    assert!(
+        restored[0].contains("here") && restored[3].contains("ledger"),
+        "{restored:?}"
+    );
+}
+
+/// A query nothing carries says so, rather than leaving a box that reads as
+/// having no Workspaces at all.
+#[test]
+fn a_query_no_workspace_carries_says_so() {
+    let mut application = connected_application(&workspace(&["work", "here"]));
+    open_picker_with(&mut application, narrowable_sessions());
+
+    type_terminal_text(&mut application, "qqq");
+
+    let picker = rendered_application_rows(&application).join("\n");
+    assert!(picker.contains("No Workspaces found"), "{picker}");
+    assert!(picker.contains("Search: qqq"), "{picker}");
+    assert!(
+        !picker.contains("engine"),
+        "no row survives the query: {picker}"
+    );
+}
+
+/// Narrowing never leaves the reader on a row that is not there: they keep the
+/// Workspace they were on while the query still carries it, and land on the
+/// first row that survives when it does not.
+#[test]
+fn the_reader_is_left_on_a_workspace_the_query_still_offers() {
+    let mut application = connected_application(&workspace(&["work", "here"]));
+    open_picker_with(&mut application, narrowable_sessions());
+
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "engine");
+
+    type_terminal_text(&mut application, "l");
+    assert_eq!(
+        selected_row(&application),
+        "atlas",
+        "the Workspace they were on is gone, so the first row that stands takes them"
+    );
+
+    backspace(&mut application);
+    assert_eq!(
+        selected_row(&application),
+        "atlas",
+        "and widening leaves them where they are, because it is still offered"
+    );
+}
+
+/// A Title carried in from somewhere else is as good a way to find a Workspace
+/// as one the reader types out, as it is in the session picker.
+#[test]
+fn a_paste_goes_into_the_query_whole() {
+    let mut application = connected_application(&workspace(&["work", "here"]));
+    open_picker_with(&mut application, narrowable_sessions());
+
+    application
+        .handle_terminal_event(InputEvent::Paste("ledger".to_owned()))
+        .expect("paste into the Workspace Picker");
+
+    assert_eq!(picker_query(&application), "ledger");
+    let rows = picker_rows(&application);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].contains("ledger"), "{rows:?}");
+}
+
+/// A query belongs to the look the reader was taking: closing the picker ends
+/// that look, so opening it again offers every Workspace afresh.
+#[test]
+fn opening_the_picker_again_starts_from_no_query() {
+    let mut application = connected_application(&workspace(&["work", "here"]));
+    open_picker_with(&mut application, narrowable_sessions());
+    type_terminal_text(&mut application, "eng");
+    press(&mut application, KeyCode::Esc);
+
+    open_picker_with(&mut application, narrowable_sessions());
+
+    assert_eq!(picker_query(&application), "");
+    let rows = picker_rows(&application);
+    assert_eq!(rows.len(), 4, "every Workspace is on offer again: {rows:?}");
+    assert!(
+        rows[0].contains("here") && rows[0].contains("[current]"),
+        "and the reader is back on the Workspace they work in: {rows:?}"
+    );
+}
+
+/// The picker stays a searchable one down to the small terminals it supports:
+/// the line saying what the reader has typed holds its place beside the rows
+/// it narrows, so a query is never applied invisibly.
+#[test]
+fn the_picker_stays_searchable_on_the_small_terminals_it_supports() {
+    let mut application = connected_application(&workspace(&["work", "here"]));
+    open_picker_with(&mut application, narrowable_sessions());
+    type_terminal_text(&mut application, "l");
+
+    for (width, height) in [(43, 10), (28, 9)] {
+        let rows = picker_rows_at(&application, width, height);
+        let picker = rendered_application_rows_at(&application, width, height).join("\n");
+        assert!(
+            picker.contains("Search: l"),
+            "the query stands beside the rows it narrows at {width}x{height}: {picker}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("atlas"))
+                && rows.iter().any(|row| row.contains("ledger")),
+            "and the rows it leaves are still drawn at {width}x{height}: {rows:?}"
+        );
+    }
+}
+
+/// A query can empty the picker as surely as a listing still on its way can,
+/// and Enter answers the same either way: with no row the reader is on there
+/// is nothing to choose, so the picker stands rather than switching to
+/// whatever would have stood first.
+#[test]
+fn enter_on_a_query_no_workspace_carries_chooses_nothing() {
+    let mut application = connected_application(&workspace(&["work", "here"]));
+    open_picker_with(&mut application, narrowable_sessions());
+    type_terminal_text(&mut application, "qqq");
+
+    assert_eq!(choose(&mut application), ApplicationTransition::Continue);
+
+    let picker = rendered_application_rows(&application).join("\n");
+    assert!(
+        picker.contains("No Workspaces found"),
+        "the picker stands on the query that emptied it: {picker}"
+    );
+    assert!(
+        picker.contains("Search: qqq"),
+        "and the query the reader typed is still theirs: {picker}"
+    );
+}
+
+/// The Workspaces the narrowing tests narrow: the client works in `here`, and
+/// the rest stand by which held work most recently — `engine`, `atlas`, then
+/// `ledger`.
+fn narrowable_sessions() -> Vec<SessionListItem> {
+    vec![
+        rooted("Older", &workspace(&["work", "ledger"]), 10),
+        rooted("Newest", &workspace(&["work", "engine"]), 30),
+        rooted("Newer", &workspace(&["work", "atlas"]), 20),
+    ]
+}
+
 /// A Workspace path rooted per platform, so a fixture reads as an absolute
 /// path on Windows as readily as on Unix — `Path::is_absolute` is
 /// platform-defined, and a Workspace is always somewhere absolute.
@@ -761,7 +1001,7 @@ fn press(application: &mut Application, code: KeyCode) {
         .expect("drive the Workspace Picker");
 }
 
-/// The picker's own rows, taken from the frame between the box's title and its
+/// The picker's own rows, taken from the frame between the search line and the
 /// footer and trimmed of the box that draws them.
 fn picker_rows(application: &Application) -> Vec<String> {
     picker_rows_at(application, 80, 15)
@@ -769,13 +1009,27 @@ fn picker_rows(application: &Application) -> Vec<String> {
 
 fn picker_rows_at(application: &Application, width: u16, height: u16) -> Vec<String> {
     let rows = rendered_application_rows_at(application, width, height);
-    let title = rendered_row(&rows, " Workspaces ");
+    let search = rendered_row(&rows, "Search:");
     let footer = rendered_row(&rows, "Esc");
-    rows[title + 1..footer]
+    rows[search + 1..footer]
         .iter()
         .map(|row| row.trim_matches(['│', ' ']).to_owned())
         .filter(|row| !row.is_empty())
         .collect()
+}
+
+/// What the picker says the reader has typed, read off its search line.
+fn picker_query(application: &Application) -> String {
+    let rows = rendered_application_rows(application);
+    rows[rendered_row(&rows, "Search:")]
+        .trim_matches(['│', ' '])
+        .trim_start_matches("Search:")
+        .trim()
+        .to_owned()
+}
+
+fn backspace(application: &mut Application) {
+    press(application, KeyCode::Backspace);
 }
 
 /// The name of the Workspace the reader is on, read off the marker the frame

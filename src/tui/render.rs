@@ -202,10 +202,7 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         && state.session_picker.error().is_some();
     if shows_search_and_footer {
         lines.push(Line::styled(
-            truncate_to_width(
-                &format!("Search: {}", state.session_picker.query()),
-                usize::from(content_width),
-            ),
+            picker_search_line(state.session_picker.query(), usize::from(content_width)),
             theme.text.subdued,
         ));
     }
@@ -288,8 +285,9 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
 }
 
 /// The Workspace Picker, drawn in the session picker's mold: a centered box
-/// over the main view, a loading line while the listing it derives from is on
-/// its way, then one row per Workspace on offer.
+/// over the main view, the query the reader is narrowing by, a loading line
+/// while the listing it derives from is on its way, then one row per Workspace
+/// on offer — or a line saying the query left none.
 fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
     let area = centered_rect(
         main,
@@ -299,7 +297,13 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
     let content_width = usize::from(area.width.saturating_sub(2));
     let content_height = usize::from(area.height.saturating_sub(2));
     let mut lines = Vec::with_capacity(content_height);
-    let shows_footer = content_height >= 2;
+    let shows_search_and_footer = content_height >= 3;
+    if shows_search_and_footer {
+        lines.push(Line::styled(
+            picker_search_line(state.workspace_picker.query(), content_width),
+            theme.text.subdued,
+        ));
+    }
     if let Some(error) = state.workspace_picker.error()
         && lines.len() < content_height
     {
@@ -311,23 +315,31 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
     if state.workspace_picker.is_loading() && lines.len() < content_height {
         lines.push(Line::styled("Loading Workspaces…", theme.text.subdued));
     } else {
-        let capacity = content_height.saturating_sub(lines.len() + usize::from(shows_footer));
-        lines.extend(
-            state
-                .workspace_picker
-                .visible_rows(capacity)
-                .into_iter()
-                .map(|row| {
-                    let style = if row.selected {
-                        theme.selection.focused
-                    } else {
-                        theme.text.primary
-                    };
-                    Line::styled(workspace_picker_row_text(&row, content_width), style)
-                }),
-        );
+        let footer_rows = usize::from(shows_search_and_footer);
+        let capacity = content_height.saturating_sub(lines.len() + footer_rows);
+        let rows = state
+            .workspace_picker
+            .visible_rows(capacity)
+            .into_iter()
+            .map(|row| {
+                let style = if row.selected {
+                    theme.selection.focused
+                } else {
+                    theme.text.primary
+                };
+                Line::styled(workspace_picker_row_text(&row, content_width), style)
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() && lines.len() < content_height.saturating_sub(footer_rows) {
+            // Only a query can empty the list — the Workspace the client works
+            // in always stands otherwise — and it is said in words, because an
+            // empty box would read as the reader having no Workspaces at all.
+            lines.push(Line::styled("No Workspaces found", theme.text.subdued));
+        } else {
+            lines.extend(rows);
+        }
     }
-    if shows_footer && lines.len() < content_height {
+    if shows_search_and_footer && lines.len() < content_height {
         // Named in full where the box can hold it, and by the keys alone where
         // it cannot — the same trade the rows make of "[current]" for "C", so
         // a narrow terminal loses wording rather than an affordance.
@@ -380,10 +392,7 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
     let mut lines = Vec::with_capacity(usize::from(content_height));
     if content_height >= 3 {
         lines.push(Line::styled(
-            truncate_to_width(
-                &format!("Search: {}", state.model_picker.query()),
-                usize::from(content_width),
-            ),
+            picker_search_line(state.model_picker.query(), usize::from(content_width)),
             theme.text.subdued,
         ));
     }
@@ -835,6 +844,13 @@ fn visible_window<T>(rows: Vec<T>, selected: usize, capacity: usize) -> impl Ite
 /// does: it is what says which row the pointer landed on.
 fn window_start(selected: usize, capacity: usize) -> usize {
     selected.saturating_add(1).saturating_sub(capacity)
+}
+
+/// The line a picker heads its rows with: what the reader has typed to narrow
+/// them, spelled the same way in every picker so one is read as readily as the
+/// next.
+fn picker_search_line(query: &str, width: usize) -> String {
+    truncate_to_width(&format!("Search: {query}"), width)
 }
 
 fn render_overlay_box(

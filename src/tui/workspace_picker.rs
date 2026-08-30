@@ -1,13 +1,13 @@
 //! Workspace Picker state: the Workspaces a Session listing puts on offer,
-//! ordered for choosing.
+//! ordered for choosing and narrowed by what the reader types.
 
 use std::path::PathBuf;
 
 use crate::protocol::SessionListItem;
 
 use super::{
-    SessionListRequest, SessionListScope, SessionListSurface, session_listing::SessionListing,
-    sidebar::workspace_name,
+    SessionListRequest, SessionListScope, SessionListSurface, fuzzy::fuzzy_matches,
+    session_listing::SessionListing, sidebar::workspace_name,
 };
 
 #[derive(Clone, Debug)]
@@ -18,6 +18,10 @@ pub(super) struct WorkspacePicker {
     /// Workspace however narrow another surface's scope, because the
     /// Workspaces the reader is not in are the whole point of the picker.
     listing: SessionListing,
+    /// What the reader has typed to narrow the Workspaces on offer, read
+    /// against each one's name the way the session picker reads its own query
+    /// against a Title.
+    query: String,
     /// The Workspace the reader is on, held as its path rather than as a row
     /// number so a listing landing beneath them leaves them on the Workspace
     /// they were choosing rather than on whatever now stands in its place.
@@ -47,12 +51,14 @@ impl WorkspacePicker {
                 current_workspace,
                 SessionListScope::AllWorkspaces,
             ),
+            query: String::new(),
             selected: None,
         }
     }
 
     pub(super) fn open(&mut self) -> SessionListRequest {
         self.open = true;
+        self.query.clear();
         self.selected = None;
         self.listing.clear_error();
         self.listing.refresh()
@@ -60,6 +66,7 @@ impl WorkspacePicker {
 
     pub(super) fn close(&mut self) {
         self.open = false;
+        self.query.clear();
         self.selected = None;
         self.listing.clear();
     }
@@ -74,6 +81,28 @@ impl WorkspacePicker {
 
     pub(super) fn error(&self) -> Option<&str> {
         self.listing.error()
+    }
+
+    pub(super) fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Takes what the reader typed into the query, and leaves them on a
+    /// Workspace the narrowed list still offers.
+    ///
+    /// Where the session picker sends the reader back to its first row at
+    /// every keystroke, a Workspace they are already on survives their typing:
+    /// a row here is a place rather than a Session, and a reader narrowing
+    /// towards one they can already see should not be walked away from it.
+    pub(super) fn insert(&mut self, text: &str) {
+        self.query.push_str(text);
+        self.keep_selection_offered();
+    }
+
+    /// Gives the last character of the query back, widening the list again.
+    pub(super) fn delete_backward(&mut self) {
+        self.query.pop();
+        self.keep_selection_offered();
     }
 
     /// Takes the Workspace this client has moved to, so the picker marks as
@@ -167,9 +196,18 @@ impl WorkspacePicker {
     /// the client is working in first, because a reader has to see where they
     /// already are, then the rest by which held work most recently, because
     /// that is where the next pick is likeliest to go.
+    ///
+    /// A query takes rows away and never rearranges the ones it leaves, so a
+    /// reader narrowing the list goes on reading it in the order they learned
+    /// it in.
     fn offered(&self) -> Vec<PathBuf> {
         let current = self.listing.current_workspace().to_owned();
-        let mut offered = self.listing.workspaces();
+        let mut offered = self
+            .listing
+            .workspaces()
+            .into_iter()
+            .filter(|path| fuzzy_matches(&self.query, &workspace_name(path)))
+            .collect::<Vec<_>>();
         // A stable sort on "is this not where I am", so the current Workspace
         // takes the first row and the rest keep the order the listing derived
         // them in, which is already newest work first.
@@ -194,7 +232,9 @@ impl WorkspacePicker {
     }
 
     /// Puts the reader on a row that is still offered: the one they were on
-    /// where it stands, and the first row — the current Workspace — otherwise.
+    /// where it stands, and the first row otherwise — which is the current
+    /// Workspace until a query takes it away, and no row at all when a query
+    /// leaves none.
     fn keep_selection_offered(&mut self) {
         let offered = self.offered();
         if self

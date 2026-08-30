@@ -6,7 +6,7 @@ use crate::protocol::{
     ProviderUnavailability, SettingMutation,
 };
 
-use super::ModelListRequest;
+use super::{ModelListRequest, fuzzy::fuzzy_matches};
 
 /// What the Model a reader picks here is for. The picker is one list of Models
 /// however it was opened; where its answer goes is the opener's question, asked
@@ -657,14 +657,6 @@ fn sort_models(models: &mut [ModelDescriptor]) {
 
 fn model_matches(query: &str, model: &ModelDescriptor) -> bool {
     fuzzy_matches(query, &model.display_name) || fuzzy_matches(query, model.id.as_str())
-}
-
-fn fuzzy_matches(query: &str, candidate: &str) -> bool {
-    let mut candidate = candidate.chars().flat_map(char::to_lowercase);
-    query
-        .chars()
-        .flat_map(char::to_lowercase)
-        .all(|character| candidate.by_ref().any(|candidate| candidate == character))
 }
 
 /// What a Provider's catalog status puts in the list beyond its Models: the
