@@ -34,7 +34,7 @@ use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::spinner;
+use super::shimmer;
 use super::state::{
     Application, ApplicationEvent, ApplicationTransition, ModelListRequest, SessionListRequest,
     SessionListSurface,
@@ -270,8 +270,8 @@ struct RunLoop {
     tasks: SessionTasks,
     channels: TaskChannels,
     reconnect_grace: Option<Pin<Box<tokio::time::Sleep>>>,
-    /// Armed only while something on screen animates a Spinner, so an idle
-    /// TUI schedules zero wakeups (ADR 0009). Re-armed on every fire.
+    /// Armed only while something on screen animates, so an idle TUI schedules
+    /// zero wakeups (ADR 0009). Re-armed on every fire.
     spinner_tick: Option<Pin<Box<tokio::time::Sleep>>>,
     /// Set by anything that changes what is on screen, so an event the user
     /// cannot see costs no frame.
@@ -307,11 +307,13 @@ async fn run_loop(
 
     loop {
         run.sync_skill_catalog();
-        run.sync_spinner_tick();
         if run.needs_redraw {
             terminal.draw(|frame| run.application.render(frame))?;
             run.needs_redraw = false;
         }
+        // Rendering records which animation is actually visible, including a
+        // Working Indicator that may have scrolled out of the viewport.
+        run.sync_spinner_tick();
         // Every arm reports through ControlFlow so the two events that can end
         // the run -- a Provider shutdown and the exit command -- leave by the
         // same path as the input stream closing.
@@ -595,14 +597,14 @@ impl RunLoop {
         Ok(ControlFlow::Continue(()))
     }
 
-    /// Arms the Spinner tick while anything on screen animates and drops it
+    /// Arms the presentation tick while anything on screen animates and drops it
     /// the moment nothing does, keeping the run loop idle-by-default. Called
     /// once per loop iteration, so every event that starts or settles work
     /// re-decides the tick before the frame it changed draws.
     fn sync_spinner_tick(&mut self) {
         if self.application.wants_spinner() {
             if self.spinner_tick.is_none() {
-                self.spinner_tick = Some(Box::pin(tokio::time::sleep(spinner::TICK_PERIOD)));
+                self.spinner_tick = Some(Box::pin(tokio::time::sleep(shimmer::TICK_PERIOD)));
             }
         } else {
             self.spinner_tick = None;
@@ -616,7 +618,7 @@ impl RunLoop {
             .handle_event(ApplicationEvent::SpinnerTick)
             .expect("a presentation tick is infallible");
         debug_assert_eq!(transition, ApplicationTransition::Continue);
-        self.spinner_tick = Some(Box::pin(tokio::time::sleep(spinner::TICK_PERIOD)));
+        self.spinner_tick = Some(Box::pin(tokio::time::sleep(shimmer::TICK_PERIOD)));
         ControlFlow::Continue(())
     }
 

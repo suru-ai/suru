@@ -6,7 +6,7 @@ The Client Setting `session.contentWidth` governs the width of the Session Conte
 
 - **Separate mode and maximum Settings**: rejected because they admit contradictory or latent state, such as `fill` paired with a maximum whose future effect is unclear.
 - **A tagged object containing mode and width**: rejected because the object repeats what the value's shape already says. The scalar forms `"fill"` and `80` are unambiguous and keep one intent in one Setting.
-- **Cap only the Transcript**: rejected because the Transcript and composer are one working surface. The cap instead covers the Session Content Column: Transcript, queued Prompts, latest-position affordance, composer extensions, composer, composer footer, and composer autocomplete.
+- **Cap only the Transcript**: rejected because the Transcript and composer are one working surface. The cap instead covers the Session Content Column: Transcript and Working Indicator, queued Prompts, latest-position affordance, composer extensions, composer, composer footer, and composer autocomplete.
 
 ## Consequences
 

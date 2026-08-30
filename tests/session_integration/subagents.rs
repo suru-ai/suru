@@ -5,16 +5,16 @@
 use crate::{
     provider_support::ControlledProvider,
     support::{
-        open_catalog_stream_with_snapshot, read_session_at_least_revision, the_subagent_row,
-        working_turn,
+        open_catalog_stream_with_snapshot, read_session_at_least_revision, read_session_until,
+        the_subagent_row, working_turn,
     },
 };
 use axum::http::StatusCode;
 use suru::{
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, MessageRole, PromptDelivery,
-        PromptId, SessionCatalogChange, SessionError, SessionErrorCode, SessionListItem,
-        SessionRevision, SessionSnapshot, TurnStatus,
+        PromptId, SessionCatalogChange, SessionChange, SessionError, SessionErrorCode,
+        SessionListItem, SessionRevision, SessionSnapshot, TurnStatus,
     },
     provider::{
         ProviderActivityId, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
@@ -426,6 +426,177 @@ async fn child_sessions_join_no_listing_and_ride_no_catalog_stream() {
         },
         "the first announced change is the parent's own settle"
     );
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn working_duration_stays_continuous_when_only_subagents_remain() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let instance = "subagent-working-duration-test";
+    let config = ServerConfig::new(state_dir.path(), instance).expect("configure server");
+    let fixture = working_turn(state_dir.path(), instance).await;
+    let before_spawn = read_session_at_least_revision(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        SessionRevision(3),
+    )
+    .await;
+    let started_at = before_spawn.turns[0]
+        .started_at
+        .expect("the parent Turn knows when Working began");
+    assert_eq!(before_spawn.working_since(), Some(started_at));
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: ProviderSubagentId::new("task-1"),
+            name: "Explore".to_owned(),
+            description: "Map the provider seams".to_owned(),
+        })
+        .await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+
+    let waiting = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the parent Turn settles while its Subagent keeps Working",
+        |snapshot| snapshot.turns[0].status == TurnStatus::Completed,
+    )
+    .await;
+    assert_eq!(
+        waiting.working_since(),
+        Some(started_at),
+        "the open Session keeps the beginning of its uninterrupted Working interval"
+    );
+
+    let listed = fixture
+        .client
+        .get(format!(
+            "{}/v1/sessions",
+            fixture.server.descriptor().base_url
+        ))
+        .bearer_auth(&fixture.server.descriptor().token)
+        .send()
+        .await
+        .expect("list Sessions")
+        .error_for_status()
+        .expect("Session listing succeeds")
+        .json::<Vec<SessionListItem>>()
+        .await
+        .expect("decode Session listing");
+    let summary = listed
+        .iter()
+        .find_map(|item| {
+            item.readable()
+                .filter(|summary| summary.session.id == fixture.session_id)
+        })
+        .expect("the parent Session remains listed");
+    assert_eq!(
+        summary.session.working_since,
+        Some(started_at),
+        "the Sidebar and open Session share one continuous Working clock"
+    );
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+    let (replacement_runtime, _replacement_provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(config, replacement_runtime)
+        .await
+        .expect("respawn server");
+    let restored_parent = fixture
+        .client
+        .get(format!(
+            "{}/v1/sessions/{}",
+            restarted.descriptor().base_url,
+            fixture.session_id
+        ))
+        .bearer_auth(&restarted.descriptor().token)
+        .send()
+        .await
+        .expect("read restored parent")
+        .error_for_status()
+        .expect("restored parent remains readable")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode restored parent");
+    assert_eq!(
+        restored_parent.working_since(),
+        Some(started_at),
+        "restart reconstructs the parent's uninterrupted subtree clock"
+    );
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&restored_parent)
+    else {
+        unreachable!()
+    };
+    let restored_child = fixture
+        .client
+        .get(format!(
+            "{}/v1/sessions/{child_id}",
+            restarted.descriptor().base_url
+        ))
+        .bearer_auth(&restarted.descriptor().token)
+        .send()
+        .await
+        .expect("read restored child")
+        .error_for_status()
+        .expect("restored child remains readable")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode restored child");
+    assert_eq!(
+        restored_child.working_since(),
+        restored_child.turns[0].started_at,
+        "a focused child reconstructs its own Working clock too"
+    );
+    restarted.shutdown().await.expect("stop restarted server");
+}
+
+#[tokio::test]
+async fn callers_cannot_override_the_server_derived_working_clock() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "working-clock-injection-test").await;
+    let before = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the Turn is Working",
+        |snapshot| snapshot.working_since().is_some(),
+    )
+    .await;
+    let canonical = before.working_since();
+
+    let update = fixture
+        .server
+        .session_event_sink()
+        .publish(
+            fixture.session_id,
+            vec![SessionChange::SessionWorkingChanged {
+                working_since: None,
+            }],
+        )
+        .expect("publish an attempted Working override");
+    assert!(
+        update.changes.is_empty(),
+        "the ordinary commit boundary strips caller-supplied Working state"
+    );
+    let after = read_session_at_least_revision(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        update.revision,
+    )
+    .await;
+    assert_eq!(after.working_since(), canonical);
 
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");

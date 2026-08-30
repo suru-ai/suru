@@ -16,7 +16,7 @@ use suru::{
         MessageId, MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId, Prompt,
         PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, ServerIdentity, Session,
         SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
-        SettingsSnapshot, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        SessionTimestamp, SettingsSnapshot, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId},
 };
@@ -313,6 +313,8 @@ pub fn enter_active_session(
     let message_id = MessageId::new();
     snapshot.revision = SessionRevision(2);
     snapshot.session.status = SessionStatus::Active;
+    let started_at = SessionTimestamp::now();
+    snapshot.session.working_since = Some(started_at);
     snapshot.prompts.push(Prompt {
         id: prompt_id,
         text: "Long-running work".to_owned(),
@@ -326,7 +328,7 @@ pub fn enter_active_session(
         prompt_id: Some(prompt_id),
         agent: None,
         status: TurnStatus::Active,
-        started_at: None,
+        started_at: Some(started_at),
         settled_at: None,
         usage: None,
         cost: None,
@@ -367,6 +369,7 @@ pub fn failed_session_snapshot(
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
+            working_since: None,
             parent: None,
         },
         revision: SessionRevision::INITIAL,
@@ -411,6 +414,7 @@ pub fn selected_session_snapshot(
             agent_selection: Some(selection),
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
+            working_since: None,
             parent: None,
         },
         revision: SessionRevision::INITIAL,
@@ -437,6 +441,7 @@ pub fn navigable_session_snapshot(
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
+            working_since: None,
             parent: None,
         },
         revision: SessionRevision::INITIAL,

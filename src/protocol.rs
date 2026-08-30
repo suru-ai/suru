@@ -1319,6 +1319,11 @@ pub struct Session {
     pub agent_selection: Option<AgentSelection>,
     pub agent_selection_availability: ModelAvailability,
     pub status: SessionStatus,
+    /// When this Session's uninterrupted Working interval began, including
+    /// work continued by surviving Subagents after its own Turn Settles.
+    /// `None` means the whole Session subtree is no longer Working.
+    #[serde(default)]
+    pub working_since: Option<SessionTimestamp>,
     /// The Session whose Turn spawned this one, present exactly when this is a
     /// Subagent's Session. A child is reachable only through its parent: it
     /// joins no Session listing, refuses Prompts, and is deleted along with
@@ -1357,24 +1362,13 @@ pub struct SessionSummary {
     /// much as the fact of it.
     #[serde(default)]
     pub settled_at: Option<SessionTimestamp>,
-    /// When this Session's latest Turn began, while that Turn has not Settled,
-    /// and `None` where nothing is working. It is what a client listing
-    /// Sessions says live work has been running for — `updated_at` cannot,
-    /// because a Turn moves it with every commit it streams.
-    ///
-    /// Derived from the Turn rather than stored beside it, so a listing can
-    /// never disagree with the Session's own transcript. A Turn stored before
-    /// Suru recorded Turn timing leaves it absent, so a client states how long
-    /// work has been running only when it knows.
-    #[serde(default)]
-    pub working_since: Option<SessionTimestamp>,
     /// What this Session and its Subagent subtree have consumed together, and
     /// `None` where nothing has reported anything — which is every Session
     /// stored before Usage recording.
     ///
-    /// Derived from the Turns rather than stored beside them, exactly as
-    /// `working_since` is, so a listing can never disagree with the Session's
-    /// own Transcript.
+    /// Derived from the Turns rather than stored beside them, exactly as the
+    /// Session's `working_since` is, so a listing can never disagree with the
+    /// Session's own Transcript.
     #[serde(default)]
     pub total_usage: Option<UsageTotal>,
     pub created_at: SessionTimestamp,
@@ -1447,12 +1441,13 @@ impl SessionListItem {
         }
     }
 
-    /// When this Session's latest Turn began, while that Turn has not Settled,
-    /// and `None` where nothing is working. A Session Suru could not read is
-    /// never working, because a Turn it cannot read is one it cannot run.
+    /// When this Session's uninterrupted Working interval began across its
+    /// whole Subagent subtree, and `None` where nothing is working. A Session
+    /// Suru could not read is never working, because work it cannot read is
+    /// work it cannot run.
     pub const fn working_since(&self) -> Option<SessionTimestamp> {
         match self {
-            Self::Readable(summary) => summary.working_since,
+            Self::Readable(summary) => summary.session.working_since,
             Self::Unreadable(_) => None,
         }
     }
@@ -1514,8 +1509,8 @@ pub enum SessionCatalogChange {
         session_id: SessionId,
         settled_at: Option<SessionTimestamp>,
     },
-    /// A Session's latest Turn began, or settled, so what
-    /// [`SessionSummary::working_since`] reads changed. It rides the catalog
+    /// A Session's uninterrupted subtree Working interval began or ended, so
+    /// what [`Session::working_since`] reads changed. It rides the catalog
     /// stream for the same reason the others do — every client lists the
     /// Session, and only some have it open — and it carries the new reading
     /// whole, so a listing in hand says the right thing before the ask that
@@ -1939,16 +1934,10 @@ pub struct SessionSnapshot {
 }
 
 impl SessionSnapshot {
-    /// When the latest Turn began, while it has not Settled, and `None` where
-    /// there is no Turn or the latest one is done. This is the one reading
-    /// [`SessionSummary::working_since`] carries, taken here so a listing and
-    /// a transcript can never tell a reader different things about the same
-    /// work.
-    pub fn working_since(&self) -> Option<SessionTimestamp> {
-        self.turns
-            .last()
-            .filter(|turn| !turn.status.is_terminal())
-            .and_then(|turn| turn.started_at)
+    /// When this Session's uninterrupted Working interval began, using the
+    /// server-derived subtree reading carried by the Session itself.
+    pub const fn working_since(&self) -> Option<SessionTimestamp> {
+        self.session.working_since
     }
 
     /// Everything this Session has consumed: its own Turns — failed and
@@ -2011,6 +2000,12 @@ pub enum SessionChange {
     /// it may have joined the stream too late to hold.
     SubagentUsageChanged {
         subagent_usage: Option<UsageTotal>,
+    },
+    /// The whole Working reading derived by the server across this Session's
+    /// Subagent subtree. It is carried as one value so a client joining an
+    /// update stream never has to reconstruct work it did not observe begin.
+    SessionWorkingChanged {
+        working_since: Option<SessionTimestamp>,
     },
     MessageAdded {
         message: Message,
@@ -2351,9 +2346,10 @@ pub struct SessionSettlementChanged {
     pub settled_at: Option<SessionTimestamp>,
 }
 
-/// A Session's latest Turn began or settled, carried to a client that may be
-/// listing that Session without having it open: what a listing says live work
-/// has been running for is only true while someone announces it changing.
+/// A Session's uninterrupted subtree Working interval began or ended, carried
+/// to a client that may be listing that Session without having it open: what a
+/// listing says live work has been running for is only true while someone
+/// announces it changing.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionWorkingChanged {

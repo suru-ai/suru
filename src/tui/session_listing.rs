@@ -185,18 +185,19 @@ impl SessionListing {
         }
     }
 
-    /// Records when the Session the server names had its latest Turn begin,
-    /// or `None` as that Turn settles — which is what keeps a Working label
-    /// true on a listing drawn before the work moved. The order this listing
-    /// keeps is by when a Session was last updated, which this change does not
-    /// carry, so nothing moves until the next listing lands.
+    /// Records when the Session the server names began its uninterrupted
+    /// subtree Working interval, or `None` when the last descendant Settles —
+    /// which keeps a Working label true while Subagents outlive their parent
+    /// Turn. The order this listing keeps is by when a Session was last
+    /// updated, which this change does not carry, so nothing moves until the
+    /// next listing lands.
     pub(super) fn set_working(
         &mut self,
         session_id: SessionId,
         working_since: Option<SessionTimestamp>,
     ) {
         if let Some(summary) = self.readable_mut(session_id) {
-            summary.working_since = working_since;
+            summary.session.working_since = working_since;
         }
     }
 
@@ -665,13 +666,13 @@ mod tests {
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,
+                working_since: None,
                 parent: None,
             },
             title: title.to_owned(),
             emoji: None,
             settled_at: None,
             total_usage: None,
-            working_since: None,
             created_at: SessionTimestamp(1),
             updated_at: SessionTimestamp(updated_at),
         }))

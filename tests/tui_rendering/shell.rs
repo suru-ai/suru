@@ -4,8 +4,9 @@ use crate::{
     failing_provider_support::spawn_with_failing_provider,
     support::{
         connected_application, enter_session, failed_session_snapshot, fixture_instance_id,
-        ready_health, rendered_application_rows, rendered_application_rows_at, rendered_rows,
-        type_terminal_text, workspace_dir,
+        navigable_session_snapshot, ready_health, rendered_application_buffer,
+        rendered_application_rows, rendered_application_rows_at, rendered_row, rendered_rows,
+        text_position, type_terminal_text, workspace_dir,
     },
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
@@ -16,8 +17,8 @@ use suru::{
     },
     protocol::{
         Activity, AgentSelection, CreateSessionRequest, InitialPrompt, ModelId, PromptId,
-        ProviderId, ServerShutdown, SessionId, SessionStatus, ShutdownReason, TurnStatus,
-        Workspace,
+        ProviderId, ServerShutdown, SessionId, SessionStatus, SessionTimestamp, ShutdownReason,
+        TurnStatus, Workspace,
     },
     server::ServerConfig,
     tui::{
@@ -404,6 +405,169 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
 }
 
 #[test]
+fn working_indicator_is_the_transient_tail_of_the_transcript() {
+    let workspace = workspace_dir();
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Keep the transcript visible",
+        workspace.path(),
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.session.working_since = Some(SessionTimestamp::now());
+    snapshot.turns[0].status = TurnStatus::Active;
+    let activity_id = snapshot.activities[0].id();
+    snapshot.activities[0] = Activity::Status {
+        id: activity_id,
+        turn_id: snapshot.turns[0].id,
+        text: "Provider activity".to_owned(),
+    };
+
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach Working Session");
+    let rows = rendered_application_rows_at(&application, 100, 16);
+    let transcript_tail = rendered_row(&rows, "Provider activity");
+    let indicator = rendered_row(&rows, "Working (0s • Esc to interrupt)");
+    assert_eq!(
+        indicator,
+        transcript_tail + 1,
+        "the Working Indicator immediately follows the latest Transcript row"
+    );
+    assert!(
+        rows[indicator + 1].trim().is_empty(),
+        "layout's Transcript margin follows the indicator"
+    );
+    assert!(
+        !rows.join("\n").contains("active"),
+        "the composer footer no longer carries an active status"
+    );
+}
+
+#[test]
+fn working_indicator_shimmers_only_its_state_label() {
+    let workspace = workspace_dir();
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Keep the transcript visible",
+        workspace.path(),
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.session.working_since = Some(SessionTimestamp::now());
+    snapshot.turns[0].status = TurnStatus::Active;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach Working Session");
+
+    let before = rendered_application_buffer(&application, 100, 16);
+    let (label_x, label_y) = text_position(&before, "Working");
+    let (metadata_x, metadata_y) = text_position(&before, "Esc to interrupt");
+    let label_before = (0.."Working".len())
+        .map(|offset| {
+            before
+                .cell((label_x + offset as u16, label_y))
+                .unwrap()
+                .style()
+        })
+        .collect::<Vec<_>>();
+    let metadata_before = before.cell((metadata_x, metadata_y)).unwrap().style();
+
+    for _ in 0..10 {
+        application
+            .handle_event(ApplicationEvent::SpinnerTick)
+            .expect("advance presentation animation");
+    }
+    let after = rendered_application_buffer(&application, 100, 16);
+    let label_after = (0.."Working".len())
+        .map(|offset| {
+            after
+                .cell((label_x + offset as u16, label_y))
+                .unwrap()
+                .style()
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(
+        label_after, label_before,
+        "the state label advances its shimmer"
+    );
+    assert_eq!(
+        after.cell((metadata_x, metadata_y)).unwrap().style(),
+        metadata_before,
+        "elapsed time and interrupt guidance remain visually stable"
+    );
+}
+
+#[test]
+fn working_indicator_end_truncates_without_wrapping_on_a_narrow_terminal() {
+    let workspace = workspace_dir();
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Keep the transcript visible",
+        workspace.path(),
+    );
+    snapshot.session.status = SessionStatus::Idle;
+    snapshot.session.working_since = Some(SessionTimestamp::now());
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session waiting for Subagents");
+
+    let rows = rendered_application_rows_at(&application, 28, 14);
+    let indicator_rows = rows
+        .iter()
+        .filter(|row| row.contains("Waiting for subagents"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        indicator_rows.len(),
+        1,
+        "the Working Indicator remains exactly one row: {rows:?}"
+    );
+    assert!(
+        indicator_rows[0].contains('…'),
+        "metadata end-truncates inside the content column: {rows:?}"
+    );
+    assert!(
+        !rows.join("\n").contains("to interrupt"),
+        "truncated metadata does not wrap onto a second row: {rows:?}"
+    );
+}
+
+#[test]
+fn working_indicator_scrolls_away_with_the_transcript_tail() {
+    let workspace = workspace_dir();
+    let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 20);
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.session.working_since = Some(SessionTimestamp::now());
+    snapshot
+        .turns
+        .last_mut()
+        .expect("fixture has a Turn")
+        .status = TurnStatus::Active;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a long Working Session");
+
+    let following = rendered_application_rows_at(&application, 60, 14).join("\n");
+    assert!(following.contains("Working ("));
+    assert!(!following.contains("Latest ↓"));
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::ScrollTranscriptPageUp))
+        .expect("move into Transcript history");
+    let history = rendered_application_rows_at(&application, 60, 14).join("\n");
+    assert!(history.contains("Latest ↓"));
+    assert!(
+        !history.contains("Working ("),
+        "the transient indicator belongs to the Transcript tail: {history}"
+    );
+}
+
+#[test]
 fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
     let workspace = workspace_dir();
     let mut active_snapshot = failed_session_snapshot(
@@ -413,6 +577,7 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
         workspace.path(),
     );
     active_snapshot.session.status = SessionStatus::Active;
+    active_snapshot.session.working_since = Some(SessionTimestamp::now());
     active_snapshot.session.agent_selection = Some(AgentSelection {
         provider: ProviderId::new("openai"),
         model: ModelId::new("gpt-5"),
@@ -444,8 +609,8 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
         "Connected",
         "Keep the transcript visible",
         "Keep the draft visible",
-        "active",
-        "Esc interrupt",
+        "Working (",
+        "Esc to interrupt",
         "openai · gpt-5",
         "Enter submit",
     ] {
@@ -459,10 +624,9 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
     for core in [
         "Suru",
         "Connected",
-        "Keep the transcript visible",
         "Keep the draft visible",
-        "active",
-        "Esc interrupt",
+        "Working (",
+        "Esc to interrupt",
     ] {
         assert!(
             narrow.contains(core),
@@ -481,7 +645,7 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
     assert!(!short.contains("Workspace"));
     assert!(short.contains("Working"));
     assert!(short.contains("Keep the draft visible"));
-    assert!(short.contains("active"));
+    assert!(short.contains("Working ("));
     assert!(
         !short.contains("Connected"),
         "connection status belongs to the hidden Session header, not the composer footer: {short}"
@@ -490,13 +654,14 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
     let mut idle = Application::new(workspace.path());
     let mut idle_snapshot = active_snapshot;
     idle_snapshot.session.status = SessionStatus::Idle;
+    idle_snapshot.session.working_since = None;
     idle_snapshot.session.agent_selection = None;
     idle.handle_event(ApplicationEvent::SessionAttached(idle_snapshot))
         .expect("attach unavailable-Agent Session");
     let idle_frame = rendered_application_rows_at(&idle, 80, 12).join("\n");
-    assert!(idle_frame.contains("idle"));
     assert!(idle_frame.contains("Agent unavailable"));
-    assert!(!idle_frame.contains("Esc interrupt"));
+    assert!(!idle_frame.contains("Working ("));
+    assert!(!idle_frame.contains("Esc to interrupt"));
     assert!(!idle_frame.contains("Provider"));
     assert!(!idle_frame.contains("Model"));
 

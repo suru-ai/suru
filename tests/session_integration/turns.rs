@@ -1919,7 +1919,7 @@ async fn a_listed_summary_says_when_its_running_turn_began_and_stops_once_it_set
         "a Session with a running Turn lists as active"
     );
     assert_eq!(
-        running.working_since,
+        running.session.working_since,
         Some(started_at),
         "a listing says live work has been running since its Turn began, \
          which is what a client draws a Working duration from"
@@ -1932,7 +1932,7 @@ async fn a_listed_summary_says_when_its_running_turn_began_and_stops_once_it_set
     let done = listed_summary(&mut client, created.session.id).await;
     assert_eq!(done.session.status, SessionStatus::Idle);
     assert_eq!(
-        done.working_since, None,
+        done.session.working_since, None,
         "a settled Turn leaves nothing running to say how long about"
     );
     assert!(

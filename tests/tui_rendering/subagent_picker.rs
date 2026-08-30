@@ -17,8 +17,8 @@ use suru::{
     protocol::{
         Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus,
         ModelAvailability, PromptId, Session, SessionChange, SessionId, SessionRevision,
-        SessionSnapshot, SessionStatus, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
-        Workspace,
+        SessionSnapshot, SessionStatus, SessionTimestamp, SessionUpdate, TranscriptItem, Turn,
+        TurnId, TurnStatus, Workspace,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition},
 };
@@ -43,6 +43,7 @@ fn parent_with_working_subagents(
         workspace,
     );
     snapshot.session.status = SessionStatus::Active;
+    snapshot.session.working_since = Some(SessionTimestamp::now());
     snapshot.turns[0].status = TurnStatus::Active;
     let turn_id = snapshot.turns[0].id;
     let mut spawned = Vec::new();
@@ -98,6 +99,7 @@ fn child_with_working_subagent(
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Active,
+            working_since: Some(SessionTimestamp::now()),
             parent: Some(parent_id),
         },
         revision: SessionRevision::INITIAL,
@@ -664,8 +666,8 @@ fn escape_interrupts_the_session_when_only_subagents_keep_it_working() {
         .expect("attach a Session whose Subagent outlived its Turn");
     let text = rendered_application_rows_at(&application, 80, 22).join("\n");
     assert!(
-        text.contains("Esc interrupt"),
-        "the status line keeps offering the interrupt while Subagents work: {text}"
+        text.contains("Waiting for subagents") && text.contains("Esc to interrupt"),
+        "the Working Indicator names the surviving Subagents and keeps offering the interrupt: {text}"
     );
 
     assert_eq!(

@@ -14,6 +14,7 @@ mod render;
 mod session_listing;
 mod session_picker;
 mod settings_panel;
+mod shimmer;
 mod sidebar;
 mod slots;
 mod spinner;

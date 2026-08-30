@@ -56,6 +56,7 @@ impl SessionStore {
                 agent_selection: parent_session.agent_selection.clone(),
                 agent_selection_availability: parent_session.agent_selection_availability,
                 status: SessionStatus::Active,
+                working_since: Some(timestamp),
                 parent: Some(parent_id),
             },
             revision: SessionRevision::INITIAL,
@@ -89,7 +90,6 @@ impl SessionStore {
             // derives it a Title, so no Emoji ever arrives beside one.
             emoji: None,
             settled_at: None,
-            working_since: snapshot.working_since(),
             total_usage: snapshot.total_usage(),
             created_at: timestamp,
             updated_at: timestamp,
@@ -114,7 +114,7 @@ impl SessionStore {
         // root's Working reading has to carry. Its total is derived on the
         // same terms, so both readings above it are answered from the same
         // subtree — a child that has consumed nothing yet moves neither.
-        state.reconcile_working(session_id);
+        state.reconcile_working(&self.storage, session_id);
         state.reconcile_usage(&self.storage, session_id);
         Ok(SpawnedSubagentSession {
             session_id,

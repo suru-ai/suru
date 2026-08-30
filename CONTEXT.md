@@ -64,6 +64,10 @@ _Avoid_: Synthetic turn, background turn, ghost turn
 The transition of a Turn or Activity into a terminal state — completed, failed, or interrupted — after which it accepts no further Provider output. A Session Settles in its own, reversible sense: set aside as done for now, by the user's say-so or on its own after long enough idle, and active again the moment it is prompted or the user unsettles it. Only the say-so is stored, as a marker stamped with the moment it was set. Settling on its own — **auto-settle**, governed by one Setting holding either how long being left alone has to be or the word that suspends it — is instead derived wherever Sessions are listed, from the Session's last activity: nothing is written down for it, no clock fires for it, and moving that Setting reclassifies every Session at once. Neither a Session nothing has moved since it was made nor one Suru cannot read auto-settles: the first has set nothing aside and the second has no activity Suru can see. Unsettling moves a Session's last activity to the moment the user reached for it, so auto-settle cannot put back what they just took off the shelf. Wherever Sessions are listed by liveness, the settled ones stand apart from the active ones.
 _Avoid_: Finish, close, resolve; archive (for a settled Session)
 
+**Working**:
+The liveness of a Session whose current Turn has not Settled or whose surviving Subagents still work after that Turn Settles. Working is continuous across that boundary and applies at every depth of the Session tree.
+_Avoid_: Active, busy, running
+
 **Usage**:
 The record of the tokens a Turn consumed, kept in five parts — fresh input, cache reads, cache writes, output, and the reasoning within that output — with any part a Provider does not report simply absent, never guessed at zero. A Turn records its Usage the way it records when it began and Settled, and a failed or interrupted Turn keeps whatever Usage it accrued, because Usage answers what a Session has consumed rather than what it got for it. A Session's Usage is the sum over its Turns' Usage, and the total a surface shows for a Session includes its Subagent subtree, while each child Session keeps its own.
 _Avoid_: Token count, consumption, spend
@@ -132,8 +136,12 @@ _Avoid_: Patch, file edit
 The ordered, user-visible history of a Session: its Messages and Activities in presentation order.
 _Avoid_: History, log, conversation
 
+**Working Indicator**:
+The transient presentation immediately after a Session's latest Transcript row while that Session is Working. It distinguishes work belonging to the current Turn from waiting on surviving Subagents, and carries the work's elapsed time and interruption guidance without becoming a Message or Activity.
+_Avoid_: Active text, status text, loading row
+
 **Session Content Column**:
-The main working column of an open Session: its Transcript, queued Prompts, latest-position affordance, composer extensions, composer, and composer footer. The Session header and the Landing sit outside it.
+The main working column of an open Session: its Transcript and Working Indicator, queued Prompts, latest-position affordance, composer extensions, composer, and composer footer. The Session header and the Landing sit outside it.
 _Avoid_: Conversation column, transcript column
 
 **Sidebar**:

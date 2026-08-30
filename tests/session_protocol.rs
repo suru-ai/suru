@@ -221,12 +221,12 @@ fn session_summary_round_trips_with_discovery_metadata() {
             }),
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Active,
+            working_since: Some(SessionTimestamp(1_755_497_600_100)),
             parent: None,
         },
         title: "Explain this workspace".to_owned(),
         emoji: Some("\u{1F5FA}\u{FE0F}".to_owned()),
         settled_at: Some(SessionTimestamp(1_755_497_600_999)),
-        working_since: Some(SessionTimestamp(1_755_497_600_100)),
         total_usage: Some(UsageTotal {
             fresh_input_tokens: Some(1_200),
             cache_read_tokens: Some(300),
@@ -293,7 +293,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         .expect("decode a Session summary carrying none of them");
     assert_eq!(decoded.emoji, None);
     assert_eq!(decoded.settled_at, None);
-    assert_eq!(decoded.working_since, None);
+    assert_eq!(decoded.session.working_since, None);
     assert_eq!(decoded.total_usage, None);
 }
 
@@ -317,6 +317,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             }),
             agent_selection_availability: ModelAvailability::Unavailable,
             status: SessionStatus::Idle,
+            working_since: None,
             parent: None,
         },
         revision: SessionRevision(7),
@@ -408,6 +409,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             },
             "agent_selection_availability": "unavailable",
             "status": "idle",
+            "working_since": null,
             "parent": null
         },
         "revision": 7,

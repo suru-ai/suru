@@ -632,6 +632,10 @@ impl TranscriptView {
         self.row_count
     }
 
+    pub(super) fn row_count_with_tail(&self, tail: &[Line<'static>]) -> usize {
+        self.row_count.saturating_add(tail.len())
+    }
+
     pub(super) fn message_starts(&self) -> &[MessageStart] {
         &self.message_starts
     }
@@ -704,6 +708,37 @@ impl TranscriptView {
             local_scroll,
             spinner_lines,
         }
+    }
+
+    /// Draws the memoized Transcript followed by transient, one-row tail
+    /// presentation. The tail participates in scrolling without joining the
+    /// projection or its cache key, so changing elapsed time or animation
+    /// frames never rebuilds persisted Transcript content (ADRs 0007, 0009).
+    pub(super) fn window_with_tail(
+        &self,
+        tail: &[Line<'static>],
+        scroll_position: usize,
+        viewport_rows: usize,
+    ) -> TranscriptWindow {
+        let transcript_rows = self
+            .row_count
+            .saturating_sub(scroll_position)
+            .min(viewport_rows);
+        let mut window = if scroll_position < self.row_count {
+            self.window(scroll_position, transcript_rows)
+        } else {
+            TranscriptWindow {
+                lines: Vec::new(),
+                local_scroll: 0,
+                spinner_lines: Vec::new(),
+            }
+        };
+        let first_tail = scroll_position.saturating_sub(self.row_count);
+        let tail_rows = viewport_rows.saturating_sub(transcript_rows);
+        window
+            .lines
+            .extend(tail.iter().skip(first_tail).take(tail_rows).cloned());
+        window
     }
 }
 
@@ -4659,6 +4694,7 @@ mod tests {
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,
+                working_since: None,
                 parent: None,
             },
             revision: SessionRevision::INITIAL,

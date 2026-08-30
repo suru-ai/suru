@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
@@ -19,7 +19,7 @@ use crate::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentSelection,
         AgentSelectionOperationId, CreateSessionRequest, EffectiveSettings, FoldPosture,
         InitialPrompt, MessageId, ModelCatalog, PromptDelivery, PromptId, PromptStatus,
-        ServerIdentity, SessionChange, SessionId, SessionListItem, SessionSnapshot, SessionStatus,
+        ServerIdentity, SessionChange, SessionId, SessionListItem, SessionSnapshot,
         SettingMutation, SettingsSnapshot, ShutdownReason, SkillCatalog, SkillCatalogRequest,
         TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
     },
@@ -59,6 +59,7 @@ use super::{
 
 /// Rows scrolled per mouse wheel tick, matching common terminal conventions.
 const WHEEL_SCROLL_ROWS: usize = 3;
+const INTERRUPT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct PresentationClock(Arc<dyn Fn() -> Instant + Send + Sync>);
@@ -286,6 +287,9 @@ pub struct TuiState {
     /// Which Spinner frame is showing, advanced by the run loop's tick and
     /// read only at draw time — never by the transcript projection (ADR 0009).
     pub(super) spinner_frame: usize,
+    /// Whether the last frame actually drew current-Session animation. A
+    /// Working Indicator that scrolled away cannot justify 32ms redraws.
+    pub(super) session_animation_on_screen: Cell<bool>,
     /// When each visible Active Command first appeared to this client. Time
     /// stays out of transcript projection; the spinner tick reads these ages
     /// and writes Fold overrides only when a threshold is crossed.
@@ -366,6 +370,7 @@ pub(super) enum CommandMode {
         /// place in it survives the settle — or `None` when only working
         /// Subagents keep the Session going and the interrupt is theirs.
         turn_id: Option<TurnId>,
+        armed_at: Instant,
     },
 }
 
@@ -396,6 +401,7 @@ impl TuiState {
             transcript_cache: TranscriptCache::default(),
             transcript_generation: 0,
             spinner_frame: 0,
+            session_animation_on_screen: Cell::new(false),
             active_commands_started_at: HashMap::new(),
             presentation_clock: PresentationClock::default(),
             submission_error: None,
@@ -1454,7 +1460,7 @@ impl TuiState {
                     });
                 }
             }
-            CommandMode::InterruptConfirmation { turn_id } => {
+            CommandMode::InterruptConfirmation { turn_id, armed_at } => {
                 // The confirmation stands only while what it would stop is
                 // still running: the Turn it named, or — for the interrupt
                 // owed to Subagents alone — any Subagent still working.
@@ -1462,7 +1468,12 @@ impl TuiState {
                     Some(turn_id) => self.active_turn_id() == Some(turn_id),
                     None => !self.working_subagent_ids().is_empty(),
                 };
-                if !still_running {
+                let expired = self
+                    .presentation_clock
+                    .now()
+                    .saturating_duration_since(armed_at)
+                    >= INTERRUPT_CONFIRMATION_TIMEOUT;
+                if !still_running || expired {
                     self.command_mode = CommandMode::Composer;
                 }
             }
@@ -2411,15 +2422,7 @@ impl Application {
                     }
                 });
             }
-            CommandId::RequestInterrupt => {
-                // The gesture reaches whatever is running: the active Turn,
-                // or — with none — the Subagents that outlived it. With
-                // neither there is nothing to stop and the key stays inert.
-                let turn_id = self.state.active_turn_id();
-                if turn_id.is_some() || !self.state.working_subagent_ids().is_empty() {
-                    self.state.command_mode = CommandMode::InterruptConfirmation { turn_id };
-                }
-            }
+            CommandId::RequestInterrupt => self.request_interrupt(),
             CommandId::ConfirmInterrupt => return self.confirm_interrupt(),
             _ => {}
         }
@@ -2474,9 +2477,22 @@ impl Application {
     }
 
     fn confirm_interrupt(&mut self) -> ApplicationTransition {
-        let (Some(session_id), CommandMode::InterruptConfirmation { turn_id }) =
-            (self.session_id(), self.state.command_mode)
+        // Validate at the action boundary as well as on presentation ticks: a
+        // delayed second Esc must not interrupt merely because the run loop
+        // had no opportunity to draw between the two presses.
+        self.state.reconcile_command_mode();
+        let (
+            Some(session_id),
+            CommandMode::InterruptConfirmation {
+                turn_id,
+                armed_at: _,
+            },
+        ) = (self.session_id(), self.state.command_mode)
         else {
+            // This press was routed as a confirmation from the mode visible
+            // before expiry was reconciled. It becomes the first press of a
+            // fresh two-step gesture instead of interrupting late.
+            self.request_interrupt();
             return ApplicationTransition::Continue;
         };
         self.state.command_mode = CommandMode::Composer;
@@ -2484,6 +2500,19 @@ impl Application {
             self.state.keep_interrupted_turn_open(turn_id);
         }
         ApplicationTransition::InterruptSession { session_id }
+    }
+
+    fn request_interrupt(&mut self) {
+        // The gesture reaches whatever is running: the active Turn, or — with
+        // none — the Subagents that outlived it. With neither there is nothing
+        // to stop and the key stays inert.
+        let turn_id = self.state.active_turn_id();
+        if turn_id.is_some() || !self.state.working_subagent_ids().is_empty() {
+            self.state.command_mode = CommandMode::InterruptConfirmation {
+                turn_id,
+                armed_at: self.state.presentation_clock.now(),
+            };
+        }
     }
 
     fn submit_prompt(&mut self, delivery: PromptDelivery) -> ApplicationTransition {
@@ -3367,8 +3396,9 @@ impl Application {
         self.state.recovery.is_some()
     }
 
-    /// Whether anything on screen is animating a Spinner, so the run loop
-    /// ticks only while one shows and an idle TUI schedules zero wakeups.
+    /// Whether anything on screen has live presentation, so the run loop
+    /// ticks only while animation can be drawn and an idle TUI schedules zero
+    /// wakeups.
     pub(super) fn wants_spinner(&self) -> bool {
         // A Provider's Availability being read is live work like any other, and
         // the row showing it animates only while the tick is armed.
@@ -3376,20 +3406,14 @@ impl Application {
             // So is another Session's Turn, drawn in a Sidebar row whose
             // Working duration has to be seen rising.
             || self.state.sidebar.shows_live_work()
-            || self.state.session.as_ref().is_some_and(|session| {
-                let snapshot = session.snapshot();
-                snapshot.session.status == SessionStatus::Active
-                    || snapshot
-                        .activities
-                        .iter()
-                        .any(|activity| activity.status() == Some(ActivityStatus::Active))
-            })
+            || self.state.session_animation_on_screen.get()
     }
 
-    /// Advances the Spinner one frame. Called from the run loop's tick, which
-    /// only exists while [`Self::wants_spinner`] holds.
+    /// Advances presentation animation one frame. Called from the run loop's
+    /// tick, which only exists while [`Self::wants_spinner`] holds.
     pub(super) fn advance_spinner(&mut self) {
         self.state.promote_aged_commands();
+        self.state.reconcile_command_mode();
         self.state.spinner_frame = self.state.spinner_frame.wrapping_add(1);
     }
 }

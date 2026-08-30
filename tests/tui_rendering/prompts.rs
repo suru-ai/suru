@@ -5,6 +5,10 @@ use crate::support::{
     type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use suru::{
     managed_client::SessionEvent,
     protocol::{
@@ -61,7 +65,7 @@ fn new_session_keybinding_defers_creation_until_the_next_prompt() {
         .expect("reattach the independently addressable active Session");
     let reattached = rendered_application_rows(&application).join("\n");
     assert!(reattached.contains("Long-running work"));
-    assert!(reattached.contains("active"));
+    assert!(reattached.contains("Working ("));
     assert_eq!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
@@ -405,6 +409,51 @@ fn escape_confirmation_is_local_and_targets_the_observed_active_turn() {
         panic!("the second Esc should issue the Session's interruption");
     };
     assert_eq!(session_id, expected_session_id);
+}
+
+#[test]
+fn escape_confirmation_expires_after_five_seconds() {
+    let workspace = workspace_dir();
+    let now = Arc::new(Mutex::new(Instant::now()));
+    let clock = Arc::clone(&now);
+    let mut application = Application::new(workspace.path()).with_presentation_clock(move || {
+        *clock.lock().expect("presentation clock remains readable")
+    });
+    enter_active_session(&mut application, workspace.path());
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .expect("arm interruption"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Esc again to interrupt")
+    );
+
+    let start = *now.lock().expect("presentation clock remains writable");
+    *now.lock().expect("presentation clock remains writable") = start + Duration::from_secs(5);
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .expect("arm interruption again"),
+        ApplicationTransition::Continue,
+        "an expired first press cannot become a delayed interruption, even without a presentation tick"
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Esc again to interrupt"),
+        "the expired press starts a fresh confirmation window"
+    );
 }
 
 #[test]

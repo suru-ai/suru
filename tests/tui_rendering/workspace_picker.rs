@@ -1090,12 +1090,12 @@ fn rooted(title: &str, workspace: &Path, updated_at: u64) -> SessionListItem {
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
+            working_since: None,
             parent: None,
         },
         title: title.to_owned(),
         emoji: None,
         settled_at: None,
-        working_since: None,
         total_usage: None,
         created_at: SessionTimestamp(1),
         updated_at: SessionTimestamp(updated_at),
@@ -1229,7 +1229,7 @@ fn working(title: &str, session_id: SessionId, workspace: &Path) -> SessionListI
     };
     summary.session.id = session_id;
     summary.session.status = SessionStatus::Active;
-    summary.working_since = Some(SessionTimestamp(now.saturating_sub(90 * 1_000)));
+    summary.session.working_since = Some(SessionTimestamp(now.saturating_sub(90 * 1_000)));
     SessionListItem::Readable(summary)
 }
 

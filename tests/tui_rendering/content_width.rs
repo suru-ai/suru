@@ -271,7 +271,7 @@ fn session_surfaces_share_the_column_while_the_header_keeps_terminal_width() {
         "Latest ↓",
         "Queued inside the column",
         " Prompt ",
-        "idle",
+        "Agent unavailable",
     ] {
         let (left, right) = occupied_columns(row_containing(&rows, surface));
         assert!(

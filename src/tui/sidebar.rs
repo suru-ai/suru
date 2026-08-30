@@ -2621,7 +2621,7 @@ mod tests {
             unreachable!("the fixture builds a readable Session");
         };
         listed.session.status = SessionStatus::Active;
-        listed.working_since = Some(SessionTimestamp(updated_at));
+        listed.session.working_since = Some(SessionTimestamp(updated_at));
         SessionListItem::Readable(listed)
     }
 
@@ -2635,13 +2635,13 @@ mod tests {
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,
+                working_since: None,
                 parent: None,
             },
             title: title.to_owned(),
             emoji: None,
             settled_at: None,
             total_usage: None,
-            working_since: None,
             created_at: SessionTimestamp(created_at),
             updated_at: SessionTimestamp(updated_at),
         }))

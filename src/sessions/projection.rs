@@ -40,43 +40,86 @@ impl SessionStoreState {
         &mut self,
         storage: &StorageSink,
         session_id: SessionId,
-        changes: Vec<SessionChange>,
+        mut changes: Vec<SessionChange>,
     ) -> anyhow::Result<SessionUpdate> {
         let updated_at = self.next_timestamp();
+        // Working is a server derivation. Callers can describe the Turn
+        // transition that changes it, but cannot inject a competing clock.
+        changes.retain(|change| !matches!(change, SessionChange::SessionWorkingChanged { .. }));
+        stamp_turn_timing(&mut changes, updated_at);
+        let projected = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?
+            .project(session_id, &changes)?;
+        let working_since = self.subtree_working_since_with(session_id, Some(&projected));
+        let working_changed = projected.session.working_since != working_since;
+        if working_changed {
+            changes.push(SessionChange::SessionWorkingChanged { working_since });
+        }
         let record = self
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
         let update = record.commit(storage, session_id, changes, updated_at)?;
-        self.reconcile_working(session_id);
+        if working_changed && self.ancestry(session_id).announces(session_id) {
+            self.publish_catalog_change(SessionCatalogChange::WorkingChanged {
+                session_id,
+                working_since,
+            });
+        }
+        self.reconcile_working(storage, session_id);
         self.reconcile_usage(storage, session_id);
         Ok(update)
     }
 
-    /// Re-derives [`crate::protocol::SessionSummary::working_since`] for the
-    /// Session and every ancestor up to its listed root, and announces the
-    /// root's reading when it flipped. Each summary carries its whole
-    /// subtree's reading — the latest Turn, or any working Subagent below —
+    /// Re-derives [`crate::protocol::Session::working_since`] for the Session
+    /// and every ancestor up to its listed root, and announces the root's
+    /// reading when it flipped. Each Session carries its whole subtree's
+    /// reading — the latest Turn, or any working Subagent below —
     /// so a listing keeps saying Working while Subagents outlive the Turn
     /// that spawned them (ADR 0015). Only the root announces, because a
     /// Subagent's child Session rides no catalog stream.
-    pub(super) fn reconcile_working(&mut self, session_id: SessionId) {
+    pub(super) fn reconcile_working(&mut self, storage: &StorageSink, session_id: SessionId) {
         let ancestry = self.ancestry(session_id);
         for current in &ancestry.sessions {
             let reading = self.subtree_working_since(*current);
             let Some(record) = self.sessions.get_mut(current) else {
                 continue;
             };
-            if record.summary.working_since == reading {
+            if record.snapshot.session.working_since == reading {
                 continue;
             }
-            record.summary.working_since = reading;
+            if let Err(error) = record.commit_derived(
+                storage,
+                *current,
+                vec![SessionChange::SessionWorkingChanged {
+                    working_since: reading,
+                }],
+            ) {
+                tracing::warn!(session_id = %current, "Working did not roll up: {error}");
+            }
             if ancestry.announces(*current) {
                 self.publish_catalog_change(SessionCatalogChange::WorkingChanged {
                     session_id: *current,
                     working_since: reading,
                 });
             }
+        }
+    }
+
+    /// Restores the canonical Working interval on every Session in a subtree
+    /// without spending revisions or writing the derivation back to storage.
+    /// Turn timing is durable, so the uninterrupted interval can be rebuilt
+    /// after restart even though Working itself has no database column.
+    pub(super) fn restore_working(&mut self, root: SessionId) {
+        for session_id in self.subtree(root) {
+            let reading = self.subtree_working_since(session_id);
+            let Some(record) = self.sessions.get_mut(&session_id) else {
+                continue;
+            };
+            record.snapshot.session.working_since = reading;
+            record.summary.session.working_since = reading;
         }
     }
 
@@ -207,14 +250,62 @@ impl SessionStoreState {
         }
     }
 
-    /// When live work below this Session began: the earliest moment any
-    /// still-working Turn in its subtree started — its own latest Turn, or a
-    /// Subagent's at any depth — and `None` when everything has settled.
+    /// When the uninterrupted live-work interval below this Session began.
+    /// Turn intervals are merged across the whole subtree, so a parent Turn
+    /// that overlaps a surviving Subagent keeps anchoring Working after the
+    /// parent Settles. Only the merged interval that is still open matters.
     pub(super) fn subtree_working_since(&self, session_id: SessionId) -> Option<SessionTimestamp> {
-        self.subtree(session_id)
-            .into_iter()
-            .filter_map(|current| self.sessions.get(&current)?.snapshot.working_since())
-            .min()
+        self.subtree_working_since_with(session_id, None)
+    }
+
+    /// The subtree reading with the Session at the head projected through its
+    /// pending commit. This lets the Session's own Working transition ride the
+    /// same revision as the Turn transition that caused it; only ancestors of
+    /// a changed child need a separate derived revision.
+    fn subtree_working_since_with(
+        &self,
+        session_id: SessionId,
+        projected: Option<&SessionSnapshot>,
+    ) -> Option<SessionTimestamp> {
+        let mut intervals = Vec::new();
+        for current in self.subtree(session_id) {
+            let snapshot = if current == session_id {
+                projected.or_else(|| self.sessions.get(&current).map(|record| &record.snapshot))
+            } else {
+                self.sessions.get(&current).map(|record| &record.snapshot)
+            };
+            let Some(snapshot) = snapshot else {
+                continue;
+            };
+            intervals.extend(snapshot.turns.iter().filter_map(|turn| {
+                let started_at = turn.started_at?;
+                let settled_at = if turn.status.is_terminal() {
+                    Some(turn.settled_at?)
+                } else {
+                    None
+                };
+                Some((started_at, settled_at))
+            }));
+        }
+        intervals.sort_unstable_by_key(|(started_at, _)| *started_at);
+
+        let mut component: Option<(SessionTimestamp, Option<SessionTimestamp>)> = None;
+        for (started_at, settled_at) in intervals {
+            component = match component {
+                Some((component_started_at, component_settled_at))
+                    if component_settled_at.is_none_or(|end| started_at <= end) =>
+                {
+                    let end = match (component_settled_at, settled_at) {
+                        (None, _) | (_, None) => None,
+                        (Some(left), Some(right)) => Some(left.max(right)),
+                    };
+                    Some((component_started_at, end))
+                }
+                _ => Some((started_at, settled_at)),
+            };
+        }
+
+        component.and_then(|(started_at, settled_at)| settled_at.is_none().then_some(started_at))
     }
 }
 
@@ -240,10 +331,9 @@ impl SessionRecord {
         &mut self,
         storage: &StorageSink,
         session_id: SessionId,
-        mut changes: Vec<SessionChange>,
+        changes: Vec<SessionChange>,
         updated_at: SessionTimestamp,
     ) -> anyhow::Result<SessionUpdate> {
-        stamp_turn_timing(&mut changes, updated_at);
         let update = self.publish(session_id, changes)?;
         self.summary.updated_at = updated_at;
         self.store_and_broadcast(storage, update)
@@ -328,11 +418,38 @@ impl SessionRecord {
             .retain(|_, turn_id| !terminal_turns.contains(turn_id));
         self.snapshot = next;
         self.summary.session = self.snapshot.session.clone();
-        // `summary.working_since` is deliberately left alone here: it carries
+        // `session.working_since` is deliberately left alone here: it carries
         // the whole subtree's reading, which only the state can derive, so
         // [`SessionStoreState::reconcile_working`] maintains it after every
         // commit.
         Ok(update)
+    }
+
+    /// Projects one pending batch without mutating, storing, or broadcasting
+    /// it. Working derivation needs to see the stamped Turn state before the
+    /// real commit so its canonical clock can join that same revision.
+    fn project(
+        &self,
+        session_id: SessionId,
+        changes: &[SessionChange],
+    ) -> anyhow::Result<SessionSnapshot> {
+        let revision = SessionRevision(
+            self.snapshot
+                .revision
+                .0
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("Session revision is exhausted"))?,
+        );
+        let mut projected = self.snapshot.clone();
+        apply_update(
+            &mut projected,
+            &SessionUpdate {
+                session_id,
+                revision,
+                changes: changes.to_vec(),
+            },
+        )?;
+        Ok(projected)
     }
 }
 

@@ -6,7 +6,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::protocol::SessionId;
+use crate::protocol::{SessionId, SessionTimestamp};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)] // Registration is crate-private until the deferred plugin loader exists.
@@ -58,10 +58,25 @@ pub(super) struct PromptFooterSlotContext {
     pub(super) width: u16,
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct PromptStatusSlotContext {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkingIndicatorState {
+    Working,
+    WaitingForSubagents,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkingIndicatorInterrupt {
+    Ready,
+    Armed,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WorkingIndicatorSlotContext {
     pub(super) session_id: SessionId,
-    pub(super) status: SlotText,
+    pub(super) width: u16,
+    pub(super) state: WorkingIndicatorState,
+    pub(super) working_since: SessionTimestamp,
+    pub(super) interrupt: Option<WorkingIndicatorInterrupt>,
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +99,13 @@ pub(super) struct RenderedSlot<Content> {
 }
 
 impl<Content> RenderedSlot<Content> {
+    pub(super) fn empty() -> Self {
+        Self {
+            content: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+
     pub(super) fn height(&self) -> u16 {
         self.content
             .len()
@@ -171,8 +193,8 @@ pub(super) struct RenderSlots {
     landing_notice: Slot<LandingNoticeSlotContext, Line<'static>>,
     landing_footer: Slot<LandingFooterSlotContext, Line<'static>>,
     session_composer_top: Slot<SessionComposerTopSlotContext, Line<'static>>,
+    working_indicator: Slot<WorkingIndicatorSlotContext, Line<'static>>,
     prompt_footer: Slot<PromptFooterSlotContext, Line<'static>>,
-    prompt_footer_status: Slot<PromptStatusSlotContext, FooterItem>,
     prompt_footer_context: Slot<PromptContextSlotContext, FooterItem>,
 }
 
@@ -182,8 +204,8 @@ impl Default for RenderSlots {
             landing_notice: Slot::new("landing.notice"),
             landing_footer: Slot::new("landing.footer"),
             session_composer_top: Slot::new("session.composer.top"),
+            working_indicator: Slot::new("session.working_indicator"),
             prompt_footer: Slot::new("prompt.footer"),
-            prompt_footer_status: Slot::new("prompt.footer.status"),
             prompt_footer_context: Slot::new("prompt.footer.context"),
         }
     }
@@ -228,21 +250,27 @@ impl RenderSlots {
         self.session_composer_top.compose(context, Vec::new())
     }
 
+    pub(super) fn working_indicator(
+        &self,
+        context: &WorkingIndicatorSlotContext,
+        default: Line<'static>,
+    ) -> RenderedSlot<Line<'static>> {
+        let _ = (
+            context.session_id,
+            context.width,
+            context.state,
+            context.working_since,
+            context.interrupt,
+        );
+        self.working_indicator.compose(context, vec![default])
+    }
+
     pub(super) fn prompt_footer(
         &self,
         footer: &PromptFooterSlotContext,
-        status: &PromptStatusSlotContext,
         context: &PromptContextSlotContext,
     ) -> RenderedSlot<Line<'static>> {
-        debug_assert_eq!(footer.session_id, status.session_id);
         debug_assert_eq!(footer.session_id, context.session_id);
-        let status = self.prompt_footer_status.compose(
-            status,
-            vec![FooterItem {
-                side: FooterSide::Left,
-                content: status.status.clone(),
-            }],
-        );
         let context = self.prompt_footer_context.compose(
             context,
             std::iter::once(FooterItem {
@@ -255,12 +283,14 @@ impl RenderSlots {
             }))
             .collect(),
         );
-        let mut failures = status.failures;
-        failures.extend(context.failures);
-        let default = vec![spread_footer_items(
-            footer.width,
-            status.content.into_iter().chain(context.content),
-        )];
+        let mut failures = context.failures;
+        let default = context
+            .content
+            .iter()
+            .any(|item| !item.content.text.is_empty())
+            .then(|| spread_footer_items(footer.width, context.content))
+            .into_iter()
+            .collect();
         let mut rendered = self.prompt_footer.compose(footer, default);
         failures.append(&mut rendered.failures);
         rendered.failures = failures;
@@ -405,7 +435,7 @@ enum TestSlot {
     LandingFooter,
     SessionComposerTop,
     PromptFooter,
-    PromptFooterStatus,
+    WorkingIndicator,
     PromptFooterContext,
 }
 
@@ -459,12 +489,12 @@ impl TestContribution {
         }
     }
 
-    pub(super) fn prompt_footer_status(
+    pub(super) fn working_indicator(
         placement: Placement,
         result: Result<&'static str, &'static str>,
     ) -> Self {
         Self {
-            slot: TestSlot::PromptFooterStatus,
+            slot: TestSlot::WorkingIndicator,
             placement,
             result,
             style: Style::default(),
@@ -529,17 +559,13 @@ impl RenderSlots {
                             Err(message) => Err(message.to_owned()),
                         })
                 }
-                TestSlot::PromptFooterStatus => {
-                    slots
-                        .prompt_footer_status
-                        .contribute(contribution.placement, move |_| match result {
-                            Ok(text) => Ok(vec![FooterItem {
-                                side: FooterSide::Left,
-                                content: SlotText::new(text, style),
-                            }]),
-                            Err(message) => Err(message.to_owned()),
-                        })
-                }
+                TestSlot::WorkingIndicator => slots.working_indicator.contribute(
+                    contribution.placement,
+                    move |_| match result {
+                        Ok(text) => Ok(vec![Line::styled(text, style)]),
+                        Err(message) => Err(message.to_owned()),
+                    },
+                ),
                 TestSlot::PromptFooterContext => {
                     slots
                         .prompt_footer_context

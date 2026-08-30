@@ -135,6 +135,9 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 // given rather than adding anything up.
                 next.subagent_usage = *subagent_usage;
             }
+            SessionChange::SessionWorkingChanged { working_since } => {
+                next.session.working_since = *working_since;
+            }
             SessionChange::MessageAdded { message } => {
                 if !next.turns.iter().any(|turn| turn.id == message.turn_id) {
                     bail!("Session update referenced an unknown Turn");
@@ -594,6 +597,7 @@ mod tests {
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,
+                working_since: None,
                 parent: None,
             },
             revision: SessionRevision::INITIAL,

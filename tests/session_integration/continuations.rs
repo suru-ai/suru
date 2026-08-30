@@ -178,17 +178,9 @@ async fn working_reads_from_the_subtree_until_the_last_subagent_settles() {
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
         .await;
 
-    // The Turn settled, but the listing keeps saying Working: the reading now
-    // anchors on the Subagent still running.
-    let after_settle = crate::server_support::next_catalog_change(&mut catalog).await;
-    let SessionCatalogChange::WorkingChanged {
-        session_id,
-        working_since: Some(_),
-    } = after_settle
-    else {
-        panic!("the settle re-anchors Working on the Subagent, got {after_settle:?}");
-    };
-    assert_eq!(session_id, fixture.session_id);
+    // The overlapping parent Turn and Subagent form one uninterrupted Working
+    // interval, so settling the Turn neither resets the clock nor announces a
+    // catalog change.
     let listed = fixture
         .client
         .get(format!(
@@ -209,7 +201,8 @@ async fn working_reads_from_the_subtree_until_the_last_subagent_settles() {
         "the listing reads Working while the Subagent runs on"
     );
 
-    // The last Subagent settling is what clears Working.
+    // The last Subagent settling is the next Working change: it clears the
+    // uninterrupted interval.
     fixture
         .provider_session
         .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
@@ -234,6 +227,17 @@ async fn working_reads_from_the_subtree_until_the_last_subagent_settles() {
 async fn late_output_owed_to_a_subagent_begins_a_continuation_that_settles_like_any_turn() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let fixture = working_turn(state_dir.path(), "continuation-test").await;
+    let original = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the original Turn is Working",
+        |snapshot| snapshot.working_since().is_some(),
+    )
+    .await;
+    let original_working_since = original
+        .working_since()
+        .expect("the original Turn anchors Working");
     let subagent = ProviderSubagentId::new("task-1");
     spawn_subagent(&fixture, &subagent).await;
     fixture
@@ -273,6 +277,11 @@ async fn late_output_owed_to_a_subagent_begins_a_continuation_that_settles_like_
         continuation.started_at.is_some(),
         "a Continuation records when it began, like any Turn"
     );
+    assert_eq!(
+        parent.working_since(),
+        Some(original_working_since),
+        "a Continuation overlapping the surviving Subagent does not reset Working"
+    );
     assert_eq!(parent.messages[1].role, MessageRole::Agent);
     assert_eq!(parent.messages[1].content, "Late findings.");
     assert_eq!(
@@ -297,6 +306,11 @@ async fn late_output_owed_to_a_subagent_begins_a_continuation_that_settles_like_
     assert!(
         parent.turns[1].settled_at.is_some(),
         "a Continuation records when it settled, like any Turn"
+    );
+    assert_eq!(
+        parent.working_since(),
+        Some(original_working_since),
+        "settling the Continuation leaves the same uninterrupted Subagent interval"
     );
 
     drop(fixture.provider_session);

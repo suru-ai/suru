@@ -31,6 +31,7 @@ use super::{
     settings_panel::{
         PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, TabBar, TabSpan,
     },
+    shimmer,
     sidebar::{
         self, ADD_WORKSPACE, SIDEBAR_MENU_ITEMS, Sidebar, SidebarEntry, SidebarMenuGeometry,
         SidebarRow, SidebarScopeEntry, SidebarSelectorView, SidebarShelf, SidebarShowMore,
@@ -38,8 +39,9 @@ use super::{
     },
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
-        PromptFooterSlotContext, PromptStatusSlotContext, RenderSlots, RenderedSlot,
-        SessionComposerTopSlotContext, SlotText, truncate_to_width,
+        PromptFooterSlotContext, RenderSlots, RenderedSlot, SessionComposerTopSlotContext,
+        SlotText, WorkingIndicatorInterrupt, WorkingIndicatorSlotContext, WorkingIndicatorState,
+        truncate_slot_text, truncate_to_width,
     },
     spinner,
     state::{CommandId, CommandMode, QueuedPrompt, TranscriptViewport, TuiState},
@@ -102,6 +104,9 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     // The Subagent Picker's rows are pointable, so its record of where they
     // were drawn starts over with the frame as well.
     state.subagent_picker.forget_frame();
+    // Current-Session animation is likewise a fact about this frame, not the
+    // Session in the abstract: its transient tail may have scrolled away.
+    state.session_animation_on_screen.set(false);
     if terminal_is_too_small(frame.area()) {
         render_terminal_too_small(frame, &theme);
         return;
@@ -653,7 +658,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         let availability = match row.availability {
             RowAvailability::Quiet => String::new(),
             RowAvailability::Reading => {
-                format!(" · {}", spinner::frame(state.spinner_frame))
+                format!(" · {}", spinner::frame(state.spinner_frame / 3))
             }
             RowAvailability::Warning => " · warning".to_owned(),
             RowAvailability::Unavailable(reason) => format!(" · {}", reason.label()),
@@ -1244,7 +1249,7 @@ fn render_subagent_picker(
         let content = truncate_to_width(
             &format!(
                 "{guide} {} {}: {}",
-                spinner::frame(state.spinner_frame),
+                spinner::frame(state.spinner_frame / 3),
                 entry.name,
                 entry.description
             ),
@@ -2055,34 +2060,41 @@ fn render_session(
         session_id,
         width: content_width,
     });
-    // The Session is still working — and still interruptible — while
-    // Subagents outlive its settled Turn (ADR 0015), so the status line reads
-    // from that wider truth rather than from the Turn alone.
-    let working =
-        snapshot.session.status == SessionStatus::Active || !working_subagents(snapshot).is_empty();
-    let status = if !working {
-        "idle".to_owned()
-    } else if subagent_view {
-        // Escape leaves a Subagent's Session instead of interrupting it, so
-        // its status offers no interrupt gesture to mislead with.
-        format!("{} active", spinner::frame(state.spinner_frame))
-    } else {
-        let interrupt = binding_label(&CommandId::RequestInterrupt);
-        let glyph = spinner::frame(state.spinner_frame);
-        if matches!(
-            state.command_mode,
-            CommandMode::InterruptConfirmation { .. }
-        ) {
-            format!("{glyph} active · {interrupt} again to interrupt")
-        } else {
-            format!("{glyph} active · {interrupt} interrupt")
-        }
-    };
-    let activity_style = if working {
-        theme.feedback.warning
-    } else {
-        theme.text.subdued
-    };
+    let working_indicator = snapshot
+        .working_since()
+        .map_or_else(RenderedSlot::empty, |since| {
+            let context = WorkingIndicatorSlotContext {
+                session_id,
+                width: content_width,
+                state: if snapshot.session.status == SessionStatus::Active {
+                    WorkingIndicatorState::Working
+                } else {
+                    WorkingIndicatorState::WaitingForSubagents
+                },
+                working_since: since,
+                // Escape leaves a Subagent's Session instead of interrupting it,
+                // so its indicator carries elapsed work but no false gesture.
+                interrupt: (!subagent_view).then_some(
+                    if matches!(
+                        state.command_mode,
+                        CommandMode::InterruptConfirmation { .. }
+                    ) {
+                        WorkingIndicatorInterrupt::Armed
+                    } else {
+                        WorkingIndicatorInterrupt::Ready
+                    },
+                ),
+            };
+            let default = working_indicator_line(
+                &context,
+                SessionTimestamp::now().0,
+                binding_label(&CommandId::RequestInterrupt),
+                state.spinner_frame,
+                theme,
+            );
+            slots.working_indicator(&context, default)
+        });
+    let working_indicator_lines = rendered_slot_lines(working_indicator, content_width, theme);
     let (agent, agent_style) = if let Some(error) = state.submission_error.as_ref() {
         (
             format!(
@@ -2093,11 +2105,11 @@ fn render_session(
         )
     } else if snapshot.session.status == SessionStatus::Active && !content_detail.shows_secondary()
     {
-        (String::new(), activity_style)
+        (String::new(), theme.text.subdued)
     } else {
         (
             agent_selection_context(state, content_detail),
-            activity_style,
+            theme.text.subdued,
         )
     };
     let usage = session_usage_text(snapshot).map(|text| SlotText::new(text, theme.text.subdued));
@@ -2105,10 +2117,6 @@ fn render_session(
         &PromptFooterSlotContext {
             session_id,
             width: content_width,
-        },
-        &PromptStatusSlotContext {
-            session_id,
-            status: SlotText::new(status, activity_style),
         },
         &PromptContextSlotContext {
             session_id,
@@ -2162,6 +2170,7 @@ fn render_session(
         theme,
         content_width,
     );
+    let transcript_rows = transcript_view.row_count_with_tail(&working_indicator_lines);
     let [_, transcript_without_latest, _, _, _, _, _, _] = session_areas(
         area,
         u16::from(show_header),
@@ -2184,9 +2193,7 @@ fn render_session(
     let viewport_with_latest = transcript_viewport_height(transcript_with_latest);
     let (away_from_bottom, viewport_height, maximum_scroll, scroll_position) =
         if interaction.follow_latest.get() {
-            let maximum_scroll = transcript_view
-                .row_count()
-                .saturating_sub(viewport_without_latest);
+            let maximum_scroll = transcript_rows.saturating_sub(viewport_without_latest);
             (
                 false,
                 viewport_without_latest,
@@ -2195,7 +2202,7 @@ fn render_session(
             )
         } else {
             let viewport_height = viewport_with_latest;
-            let maximum_scroll = transcript_view.row_count().saturating_sub(viewport_height);
+            let maximum_scroll = transcript_rows.saturating_sub(viewport_height);
             let scroll_position = interaction.anchor.get().map_or(maximum_scroll, |anchor| {
                 transcript_view
                     .message_starts()
@@ -2210,9 +2217,7 @@ fn render_session(
             if scroll_position >= maximum_scroll {
                 interaction.follow_latest.set(true);
                 interaction.anchor.set(None);
-                let maximum_scroll = transcript_view
-                    .row_count()
-                    .saturating_sub(viewport_without_latest);
+                let maximum_scroll = transcript_rows.saturating_sub(viewport_without_latest);
                 (
                     false,
                     viewport_without_latest,
@@ -2259,11 +2264,15 @@ fn render_session(
     let composer_top_area = in_column(composer_top_area, content_column);
     let composer_area = in_column(composer_area, content_column);
     let footer_area = in_column(status_area, content_column);
-    let mut window = transcript_view.window(scroll_position, usize::from(transcript_area.height));
+    let mut window = transcript_view.window_with_tail(
+        &working_indicator_lines,
+        scroll_position,
+        usize::from(transcript_area.height),
+    );
     spinner::overlay_frame(
         &mut window.lines,
         &window.spinner_lines,
-        state.spinner_frame,
+        state.spinner_frame / 3,
     );
     let local_scroll = window
         .local_scroll
@@ -2273,6 +2282,20 @@ fn render_session(
     // The top border pushes projected rows down one, so a pointer maps back to
     // a transcript row through the same offset the widget draws with.
     let border_rows = u16::from(has_top_border);
+    let visible_rows = usize::from(transcript_area.height.saturating_sub(border_rows));
+    let local_visible_start = usize::from(local_scroll);
+    let local_visible_end = local_visible_start.saturating_add(visible_rows);
+    let spinner_visible = window
+        .spinner_lines
+        .iter()
+        .any(|line| *line >= local_visible_start && *line < local_visible_end);
+    let tail_start = transcript_view.row_count();
+    let tail_visible = !working_indicator_lines.is_empty()
+        && scroll_position < transcript_rows
+        && tail_start < scroll_position.saturating_add(viewport_height);
+    state
+        .session_animation_on_screen
+        .set(spinner_visible || tail_visible);
     interaction.viewport.replace(Some(TranscriptViewport {
         height: viewport_height,
         scroll_position,
@@ -2357,6 +2380,63 @@ fn session_usage_text(snapshot: &SessionSnapshot) -> Option<String> {
         text.push_str(&compact_cost(cost));
     }
     Some(text)
+}
+
+fn working_indicator_line(
+    context: &WorkingIndicatorSlotContext,
+    now: u64,
+    interrupt_binding: &str,
+    animation_frame: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let label = match context.state {
+        WorkingIndicatorState::Working => "Working",
+        WorkingIndicatorState::WaitingForSubagents => "Waiting for subagents",
+    };
+    let elapsed = working_indicator_elapsed(context.working_since, now);
+    let metadata = match context.interrupt {
+        None => format!(" ({elapsed})"),
+        Some(WorkingIndicatorInterrupt::Ready) => {
+            format!(" ({elapsed} • {interrupt_binding} to interrupt)")
+        }
+        Some(WorkingIndicatorInterrupt::Armed) => {
+            format!(" ({elapsed} • {interrupt_binding} again to interrupt)")
+        }
+    };
+    let label = label
+        .chars()
+        .zip(shimmer::styles(label, animation_frame, theme.text.primary))
+        .map(|(character, style)| SlotText::new(character.to_string(), style));
+    Line::from(
+        truncate_slot_text(
+            label
+                .chain(std::iter::once(SlotText::new(metadata, theme.text.subdued)))
+                .collect(),
+            usize::from(context.width),
+        )
+        .into_iter()
+        .map(|item| Span::styled(item.text, item.style))
+        .collect::<Vec<_>>(),
+    )
+}
+
+/// Codex's compact elapsed form: seconds, then zero-padded seconds below an
+/// hour, then zero-padded minutes and seconds once hours are present.
+fn working_indicator_elapsed(since: SessionTimestamp, now: u64) -> String {
+    let seconds = now.saturating_sub(since.0) / 1_000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m {:02}s", seconds % 60);
+    }
+    format!(
+        "{}h {:02}m {:02}s",
+        minutes / 60,
+        minutes % 60,
+        seconds % 60
+    )
 }
 
 fn render_session_header(
@@ -2720,18 +2800,30 @@ fn render_slot(
     slot: RenderedSlot<Line<'static>>,
     theme: &Theme,
 ) {
-    let rows = slot
-        .failures
+    frame.render_widget(
+        Paragraph::new(rendered_slot_lines(slot, area.width, theme)),
+        area,
+    );
+}
+
+fn rendered_slot_lines(
+    slot: RenderedSlot<Line<'static>>,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    slot.failures
         .into_iter()
         .map(|failure| {
             Line::styled(
-                format!("Extension error · {}: {}", failure.slot, failure.message),
+                truncate_to_width(
+                    &format!("Extension error · {}: {}", failure.slot, failure.message),
+                    usize::from(width),
+                ),
                 theme.feedback.error,
             )
         })
         .chain(slot.content)
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(rows), area);
+        .collect()
 }
 
 fn connection_status_text(state: &TuiState, detail: ResponsiveDetail) -> String {
@@ -2787,29 +2879,10 @@ fn status_text(state: &TuiState) -> String {
             recovery.attempt, recovery.retry_in
         );
     }
-    let connection = match &state.identity {
+    match &state.identity {
         Some(identity) => format!("Connected | {}", server_identity_text(identity)),
         None => "Connecting to Suru server...".to_owned(),
-    };
-    if matches!(
-        state
-            .session
-            .as_ref()
-            .map(|session| session.snapshot().session.status),
-        Some(SessionStatus::Active)
-    ) {
-        let interrupt = binding_label(&CommandId::RequestInterrupt);
-        let active = if matches!(
-            state.command_mode,
-            CommandMode::InterruptConfirmation { .. }
-        ) {
-            format!("Active · {interrupt} again to interrupt")
-        } else {
-            format!("Active · {interrupt} interrupt")
-        };
-        return format!("{active} | {connection}");
     }
-    connection
 }
 
 fn server_identity_text(identity: &ServerIdentity) -> String {
@@ -2842,16 +2915,19 @@ mod tests {
     };
 
     use super::super::{
-        slots::{Placement, RenderSlots, TestContribution},
+        slots::{
+            Placement, PromptContextSlotContext, PromptFooterSlotContext, RenderSlots, SlotText,
+            TestContribution,
+        },
         state::{Application, ApplicationEvent},
     };
-    use super::{legible_workspace, verbatim_prefix_dropped};
+    use super::{legible_workspace, verbatim_prefix_dropped, working_indicator_elapsed};
     use crate::{
         managed_client::{ManagedEvent, SessionEvent},
         protocol::{
             EffectiveSettings, ModelAvailability, Session, SessionContentWidth, SessionId,
-            SessionRevision, SessionSettings, SessionSnapshot, SessionStatus, SettingsSnapshot,
-            Workspace,
+            SessionRevision, SessionSettings, SessionSnapshot, SessionStatus, SessionTimestamp,
+            SettingsSnapshot, Workspace,
         },
     };
 
@@ -3021,9 +3097,9 @@ mod tests {
         let session_id = SessionId::new();
         let slots = RenderSlots::testing([
             TestContribution::session_composer_top(Placement::Append, Ok("composer top")),
-            TestContribution::prompt_footer_status(Placement::Prepend, Ok("status extension"))
+            TestContribution::working_indicator(Placement::Prepend, Ok("indicator extension"))
                 .styled(Style::default().fg(Color::LightMagenta)),
-            TestContribution::prompt_footer_status(Placement::Append, Err("status failed")),
+            TestContribution::working_indicator(Placement::Append, Err("indicator failed")),
             TestContribution::prompt_footer_context(Placement::Append, Ok("context extension")),
             TestContribution::prompt_footer(Placement::Append, Ok("footer extension")),
         ]);
@@ -3041,7 +3117,8 @@ mod tests {
                         },
                         agent_selection: None,
                         agent_selection_availability: ModelAvailability::Available,
-                        status: SessionStatus::Idle,
+                        status: SessionStatus::Active,
+                        working_since: Some(SessionTimestamp(1)),
                         parent: None,
                     },
                     revision: SessionRevision::INITIAL,
@@ -3058,15 +3135,16 @@ mod tests {
         let buffer = rendered_buffer(&application);
         let screen = rendered_rows_from_buffer(&buffer).join("\n");
         assert!(screen.contains("composer top"));
-        assert!(screen.contains("status extension · idle"));
+        assert!(screen.contains("indicator extension"));
+        assert!(screen.contains("Working"));
         assert!(screen.contains("Agent unavailable · context extension"));
         assert!(screen.contains("footer extension"));
-        assert!(screen.contains("Extension error · prompt.footer.status: status failed"));
+        assert!(screen.contains("Extension error · session.working_indicator: indicator failed"));
         assert_eq!(
-            text_cell(&buffer, "status extension").fg,
+            text_cell(&buffer, "indicator extension").fg,
             Color::LightMagenta
         );
-        assert_ne!(text_cell(&buffer, "idle").fg, Color::LightMagenta);
+        assert_ne!(text_cell(&buffer, "Working").fg, Color::LightMagenta);
     }
 
     #[test]
@@ -3102,6 +3180,7 @@ mod tests {
                         agent_selection: None,
                         agent_selection_availability: ModelAvailability::Available,
                         status: SessionStatus::Idle,
+                        working_since: None,
                         parent: None,
                     },
                     revision: SessionRevision::INITIAL,
@@ -3118,5 +3197,31 @@ mod tests {
         let screen = rendered_rows(&application).join("\n");
         assert!(screen.contains("composer extension width 60"));
         assert!(screen.contains("footer extension width 60"));
+    }
+
+    #[test]
+    fn working_elapsed_uses_codex_compact_units() {
+        let since = SessionTimestamp(10_000);
+        assert_eq!(working_indicator_elapsed(since, 10_000), "0s");
+        assert_eq!(working_indicator_elapsed(since, 69_000), "59s");
+        assert_eq!(working_indicator_elapsed(since, 78_000), "1m 08s");
+        assert_eq!(working_indicator_elapsed(since, 3_733_000), "1h 02m 03s");
+    }
+
+    #[test]
+    fn empty_session_context_collapses_the_prompt_footer() {
+        let session_id = SessionId::new();
+        let footer = RenderSlots::builtins().prompt_footer(
+            &PromptFooterSlotContext {
+                session_id,
+                width: 80,
+            },
+            &PromptContextSlotContext {
+                session_id,
+                agent: SlotText::new("", Style::default()),
+                usage: None,
+            },
+        );
+        assert_eq!(footer.height(), 0);
     }
 }

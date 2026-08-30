@@ -16,8 +16,8 @@ use suru::{
     protocol::{
         Activity, ActivityStatus, Cost, CostBasis, Message, MessageId, MessageRole, MessageStatus,
         ModelAvailability, PromptId, Session, SessionChange, SessionId, SessionRevision,
-        SessionSnapshot, SessionStatus, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
-        Usage, UsageTotal, Workspace,
+        SessionSnapshot, SessionStatus, SessionTimestamp, SessionUpdate, TranscriptItem, Turn,
+        TurnId, TurnStatus, Usage, UsageTotal, Workspace,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition},
 };
@@ -54,6 +54,9 @@ fn parent_with_subagent_row(
         session_id: child_id,
         duration_ms,
     };
+    if turn_in_flight || status == ActivityStatus::Active {
+        snapshot.session.working_since = Some(SessionTimestamp::now());
+    }
     (snapshot, child_id)
 }
 
@@ -75,6 +78,7 @@ fn child_session_snapshot(
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Active,
+            working_since: Some(SessionTimestamp::now()),
             parent: Some(parent_id),
         },
         revision: SessionRevision::INITIAL,
@@ -323,6 +327,10 @@ fn a_subagent_session_offers_no_path_to_a_prompt() {
     assert!(
         !text.contains("Esc interrupt"),
         "Escape no longer reads as the interrupt gesture: {text}"
+    );
+    assert!(
+        text.contains("Working (") && !text.contains("Esc to interrupt"),
+        "the child states its own Working duration without mislabelling Escape: {text}"
     );
 }
 

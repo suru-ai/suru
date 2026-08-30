@@ -185,6 +185,7 @@ impl SessionStore {
                 agent_selection: request.agent_selection.clone(),
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,
+                working_since: None,
                 parent: None,
             },
             revision: SessionRevision::INITIAL,
@@ -209,9 +210,6 @@ impl SessionStore {
             // And it begins active: a Session created by a Prompt is work
             // beginning, which is the opposite of work set aside.
             settled_at: None,
-            // And with nothing working: the Prompt that made it has not been
-            // admitted yet, so there is no Turn to be running.
-            working_since: None,
             // And with nothing consumed: no Turn has run to report anything.
             total_usage: None,
             created_at: timestamp,

@@ -1193,7 +1193,7 @@ async fn a_restored_summary_reads_live_work_back_off_the_turn_that_is_running() 
         .expect("the Session is listed after the restart");
     assert_eq!(restored.session.status, SessionStatus::Active);
     assert_eq!(
-        restored.working_since,
+        restored.session.working_since,
         Some(started_at),
         "a restored listing says live work has been running since its Turn began"
     );

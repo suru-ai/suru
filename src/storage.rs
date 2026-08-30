@@ -420,10 +420,8 @@ fn load_session(
         // loaded rather than stored twice.
         subagent_usage: None,
     };
-    // Read back off the Turns rather than out of a column of its own: live
-    // work is the Turn's own state, and a stored copy of it could only ever
-    // disagree with the Turn it was copied from.
-    summary.working_since = snapshot.working_since();
+    // Working is reconstructed across the complete Session tree after every
+    // stored Session has been loaded; one row cannot see that subtree here.
     summary.total_usage = snapshot.total_usage();
     Ok(PersistedSession {
         summary,

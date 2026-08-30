@@ -1,5 +1,5 @@
-//! The Spinner: the animated glyph a client shows where work is live right
-//! now — the Marker of an Active Activity and the footer's active state.
+//! The Spinner: the animated glyph a client shows as the Marker of an Active
+//! Activity. The transcript-tail Working Indicator uses a text shimmer instead.
 //!
 //! Animation never reaches the memoized transcript projection (ADR 0009): the
 //! projection renders every live Marker as [`MARKER`], the Spinner's first
@@ -21,9 +21,6 @@ pub(super) const MARKER: &str = "⠋ ";
 /// The glyph the overlay looks for when patching a recorded line. Always the
 /// first frame, because that is what the projection rendered.
 const PLACEHOLDER: char = '⠋';
-
-/// How long each frame holds before the run loop's tick advances it.
-pub(super) const TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The frame glyph for a run-loop frame index, cycling forever.
 pub(super) fn frame(index: usize) -> &'static str {

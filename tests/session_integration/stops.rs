@@ -110,13 +110,6 @@ async fn interrupting_with_no_turn_active_stops_every_subagent_and_clears_workin
         .provider_session
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
         .await;
-    let SessionCatalogChange::WorkingChanged {
-        working_since: Some(_),
-        ..
-    } = next_catalog_change(&mut catalog).await
-    else {
-        panic!("the settle re-anchors Working on the Subagents");
-    };
 
     let (response, ()) = tokio::join!(
         interrupt(

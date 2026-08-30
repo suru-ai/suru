@@ -863,6 +863,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
+            working_since: None,
             parent: None,
         },
         revision: SessionRevision::INITIAL,

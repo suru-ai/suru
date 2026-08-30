@@ -185,9 +185,9 @@ impl SessionStore {
             last_timestamp,
             catalog,
         };
-        // A restored summary carries only its own Session's reading, while a
-        // listing's Working derives from the whole Subagent subtree, so each
-        // root's reading is re-derived before anything can list it.
+        // Working is reconstructed from durable Turn intervals before any
+        // Session can be listed or opened, so reconnecting preserves the
+        // beginning of an uninterrupted parent/Subagent interval.
         let roots = state
             .sessions
             .iter()
@@ -195,7 +195,7 @@ impl SessionStore {
             .map(|(session_id, _)| *session_id)
             .collect::<Vec<_>>();
         for root in &roots {
-            state.reconcile_working(*root);
+            state.restore_working(*root);
         }
         // The roll-up is derived rather than stored, for the same reason: a
         // child's Usage is its own Turns' and a stored copy above it could

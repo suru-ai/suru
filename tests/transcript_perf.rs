@@ -46,6 +46,7 @@ fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
+            working_since: None,
             parent: None,
         },
         revision: SessionRevision::INITIAL,

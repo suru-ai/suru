@@ -457,6 +457,7 @@ mod tests {
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Active,
+                working_since: None,
                 parent: None,
             },
             revision: SessionRevision::INITIAL,

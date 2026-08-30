@@ -775,12 +775,12 @@ fn listed(
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
+            working_since: None,
             parent: None,
         },
         title: title.to_owned(),
         emoji: emoji.map(str::to_owned),
         settled_at: None,
-        working_since: None,
         total_usage: None,
         created_at: SessionTimestamp(created_at),
         updated_at: SessionTimestamp(updated_at),
@@ -2053,7 +2053,7 @@ fn working(session: SessionListItem, working_since: u64) -> SessionListItem {
         unreachable!("the fixture builds a readable Session");
     };
     summary.session.status = SessionStatus::Active;
-    summary.working_since = Some(SessionTimestamp(working_since));
+    summary.session.working_since = Some(SessionTimestamp(working_since));
     SessionListItem::Readable(summary)
 }
 
