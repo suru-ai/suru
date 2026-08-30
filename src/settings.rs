@@ -19,6 +19,7 @@ use std::{
     borrow::Cow,
     ffi::OsStr,
     fmt, fs,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -59,6 +60,9 @@ const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
 const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary";
 const PROVIDER_COPILOT_ENABLED: &str = "provider.copilot.enabled";
 const PROVIDER_CLAUDE_ENABLED: &str = "provider.claude.enabled";
+const SERVING_ENABLED: &str = "serving.enabled";
+const SERVING_PORT: &str = "serving.port";
+const SERVING_BIND_ADDRESS: &str = "serving.bindAddress";
 
 /// What a Config Document that does not exist yet is edited as.
 const EMPTY_DOCUMENT: &str = "{}\n";
@@ -281,6 +285,23 @@ const SIDEBAR_AUTO_SETTLE_NUMERIC: NumericSettingChoice = NumericSettingChoice::
     },
 );
 
+fn validate_serving_port(value: &str) -> Result<u64, &'static str> {
+    value
+        .parse::<u16>()
+        .map(u64::from)
+        .map_err(|_| "a port from 0 to 65535")
+}
+
+const SERVING_PORT_NUMERIC: NumericSettingChoice = NumericSettingChoice::new(
+    "Serving port",
+    |settings| u64::from(settings.serving.port),
+    validate_serving_port,
+    |port| port.to_string(),
+    |port| SettingMutation::ServingPort {
+        value: Some(port as u16),
+    },
+);
+
 impl SettingValues {
     /// The values the schema names, which is everything a Fixed Setting accepts
     /// and only part of what an Open one does. This is the list a client cycles
@@ -452,6 +473,11 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         }
         SettingMutation::ProviderClaudeEnabled { value } => {
             *value == Some(settings.provider.claude.enabled)
+        }
+        SettingMutation::ServingEnabled { value } => *value == Some(settings.serving.enabled),
+        SettingMutation::ServingPort { value } => *value == Some(settings.serving.port),
+        SettingMutation::ServingBindAddress { value } => {
+            *value == Some(settings.serving.bind_address)
         }
     }
 }
@@ -860,6 +886,92 @@ pub const SCHEMA: &[SettingDescriptor] = &[
             })
         },
     },
+    SettingDescriptor {
+        key: SERVING_ENABLED,
+        label: "Serving",
+        description: "Whether this Server accepts paired Servers on its second listener",
+        group: SettingGroup::Experimental,
+        scope: SettingScope::Server,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "false",
+                pin: SettingMutation::ServingEnabled { value: Some(false) },
+            },
+            SettingChoice {
+                value: "true",
+                pin: SettingMutation::ServingEnabled { value: Some(true) },
+            },
+        ]),
+        reset: SettingMutation::ServingEnabled { value: None },
+        apply: |settings, value| {
+            apply_value(value, |enabled| {
+                settings.serving.enabled = enabled;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: SERVING_PORT,
+        label: "Serving port",
+        description: "The TCP port the Serving listener binds",
+        group: SettingGroup::Experimental,
+        scope: SettingScope::Server,
+        values: SettingValues::Open {
+            named: &[],
+            accepts: "a port from 0 to 65535",
+            spell: |settings| settings.serving.port.to_string(),
+            chosen_at: Some(SettingChoiceSurface::Numeric(SERVING_PORT_NUMERIC)),
+        },
+        reset: SettingMutation::ServingPort { value: None },
+        apply: |settings, value| {
+            apply_value(value, |port| {
+                settings.serving.port = port;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: SERVING_BIND_ADDRESS,
+        label: "Serving bind address",
+        description: "Which local network address the Serving listener binds",
+        group: SettingGroup::Experimental,
+        scope: SettingScope::Server,
+        values: SettingValues::Open {
+            named: &[
+                SettingChoice {
+                    value: "127.0.0.1",
+                    pin: SettingMutation::ServingBindAddress {
+                        value: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                    },
+                },
+                SettingChoice {
+                    value: "::1",
+                    pin: SettingMutation::ServingBindAddress {
+                        value: Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+                    },
+                },
+                SettingChoice {
+                    value: "0.0.0.0",
+                    pin: SettingMutation::ServingBindAddress {
+                        value: Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+                    },
+                },
+                SettingChoice {
+                    value: "::",
+                    pin: SettingMutation::ServingBindAddress {
+                        value: Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+                    },
+                },
+            ],
+            accepts: "an IP address",
+            spell: |settings| settings.serving.bind_address.to_string(),
+            chosen_at: None,
+        },
+        reset: SettingMutation::ServingBindAddress { value: None },
+        apply: |settings, value| {
+            apply_value(value, |address| {
+                settings.serving.bind_address = address;
+            })
+        },
+    },
 ];
 
 /// The Setting through which the user turns one Provider on or off, which is
@@ -1035,6 +1147,9 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::ProviderClaudeEnabled { value } => {
             (PROVIDER_CLAUDE_ENABLED, pinned(value))
         }
+        SettingMutation::ServingEnabled { value } => (SERVING_ENABLED, pinned(value)),
+        SettingMutation::ServingPort { value } => (SERVING_PORT, pinned(value)),
+        SettingMutation::ServingBindAddress { value } => (SERVING_BIND_ADDRESS, pinned(value)),
     }
 }
 
@@ -1549,6 +1664,9 @@ mod tests {
                 "one of true or false".to_owned(),
                 "one of true or false".to_owned(),
                 "one of \"hidden\" or \"shown\"".to_owned(),
+                "one of false or true".to_owned(),
+                "a port from 0 to 65535".to_owned(),
+                "one of \"127.0.0.1\", \"::1\", \"0.0.0.0\", \"::\", or an IP address".to_owned(),
             ]
         );
     }

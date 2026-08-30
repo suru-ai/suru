@@ -24,9 +24,10 @@ use suru::{
         ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
         ModelOptionRole, ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
         ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
-        SessionId, SessionSettings, SettingMutation, SettingsSnapshot, TitleErrand, TitleSettings,
-        TranscriptSettings,
+        SessionId, SessionSettings, SettingMutation, SettingScope, SettingsSnapshot, TitleErrand,
+        TitleSettings, TranscriptSettings,
     },
+    settings::SettingGroup,
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, ModelListRequest,
         NumericDigit, SemanticCommandId,
@@ -426,6 +427,20 @@ fn the_experimental_tab_stands_past_the_providers_and_lists_the_settings_declare
         !has_row(&application, "Default Fold posture") && !has_row(&application, "Codex"),
         "the Experimental tab lists its own Settings and nobody else's"
     );
+    for label in ["Serving", "Serving port", "Serving bind address"] {
+        assert!(
+            has_row(&application, label),
+            "the Experimental tab presents the {label} Server Setting"
+        );
+    }
+    for key in ["serving.enabled", "serving.port", "serving.bindAddress"] {
+        let descriptor = suru::settings::SCHEMA
+            .iter()
+            .find(|descriptor| descriptor.key == key)
+            .unwrap_or_else(|| panic!("the schema does not declare {key}"));
+        assert_eq!(descriptor.group, SettingGroup::Experimental);
+        assert_eq!(descriptor.scope, SettingScope::Server);
+    }
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),

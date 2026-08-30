@@ -44,6 +44,7 @@ use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
 };
 use crate::runtime::protect_current_user_file;
+use crate::serving::ServingController;
 use crate::sessions::{
     AdmitPromptError, AgentSelectionMutationError, CreateSessionError, DeleteSessionError,
     InterruptSessionError, ListSessionsError, PromptAdmissionDisposition, PromptMutationError,
@@ -166,6 +167,7 @@ pub struct RunningServer {
     descriptor: RuntimeDescriptor,
     session_events: SessionEventSink,
     shutdown: ShutdownController,
+    serving: ServingController,
     task: JoinHandle<Result<()>>,
 }
 
@@ -201,6 +203,12 @@ impl RunningServer {
         AgentOutputSink {
             session_events: self.session_events.clone(),
         }
+    }
+
+    /// The address currently owned by the opt-in Serving listener. `None`
+    /// means Serving is disabled or its requested address could not be bound.
+    pub fn serving_address(&self) -> Option<std::net::SocketAddr> {
+        self.serving.address()
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -330,6 +338,7 @@ struct AppState {
     /// Selections normalize against this set rather than any single Provider
     /// identity.
     hosted_providers: Arc<Vec<ProviderId>>,
+    serving: ServingController,
     shutdown: ShutdownController,
     timings: ServerTimings,
 }
@@ -418,10 +427,9 @@ pub async fn spawn_with_providers_and_timings(
     protect_current_user_file(&config.lock_path())?;
 
     let config_documents = ConfigDocuments::new(config.config_dir());
+    let serving = ServingController::new(config.data_dir());
     let (settings, _) = watch::channel(SettingsSnapshot::default());
-    // Before any Session starts, so the first Turn already runs under the
-    // Server Settings the Config Documents pinned.
-    adopt_settings(&settings, &runtimes, &config_documents.load());
+    let opening_settings = config_documents.load();
 
     let repository = StorageRepository::open(config.data_dir())
         .await
@@ -450,6 +458,13 @@ pub async fn spawn_with_providers_and_timings(
         },
     );
     write_descriptor(&config.descriptor_path(), &descriptor)?;
+
+    // After all fallible local-server setup, so an error returning from spawn
+    // can never leave a detached Serving listener behind; still before any
+    // Session starts, so the first Turn runs under the pinned Server Settings.
+    if let Err(error) = adopt_settings(&settings, &runtimes, &serving, &opening_settings).await {
+        tracing::error!("could not adopt Serving settings at startup: {error:#}");
+    }
 
     let (lifecycle, _) = watch::channel(LifecycleState::Starting);
     let (shutdown_intent, _) = watch::channel(None);
@@ -500,6 +515,7 @@ pub async fn spawn_with_providers_and_timings(
         config_documents,
         runtimes,
         hosted_providers: Arc::new(hosted_providers),
+        serving: serving.clone(),
         shutdown: shutdown.clone(),
         timings,
     };
@@ -552,6 +568,7 @@ pub async fn spawn_with_providers_and_timings(
         wait_for_shutdown(&mut provider_shutdown_requested).await;
         providers_for_shutdown.shutdown().await;
     });
+    let serving_for_shutdown = serving.clone();
     let task = tokio::spawn(async move {
         let _lock = lock;
         let result = axum::serve(listener, app)
@@ -560,6 +577,7 @@ pub async fn spawn_with_providers_and_timings(
             })
             .await
             .context("serve local HTTP API");
+        serving_for_shutdown.shutdown().await;
         task_shutdown.stop_providers();
         let provider_shutdown_result = provider_shutdown_task
             .await
@@ -600,6 +618,7 @@ pub async fn spawn_with_providers_and_timings(
             lifecycle: lifecycle.subscribe(),
         },
         shutdown,
+        serving,
         task,
     })
 }
@@ -760,8 +779,18 @@ async fn mutate_setting(State(state): State<AppState>, request: Request) -> Resp
         .expect("Config Document edit runs to completion");
     match mutated {
         Ok(snapshot) => {
-            adopt_settings(&state.settings, &state.runtimes, &snapshot);
-            Json(snapshot).into_response()
+            match adopt_settings(&state.settings, &state.runtimes, &state.serving, &snapshot).await
+            {
+                Ok(()) => Json(snapshot).into_response(),
+                Err(error) => {
+                    tracing::error!("could not adopt Serving settings: {error:#}");
+                    session_error_response(
+                        StatusCode::CONFLICT,
+                        SessionErrorCode::ServingListenerFailed,
+                        error.to_string(),
+                    )
+                }
+            }
         }
         Err(error @ SettingsMutationError::NoConfigRoot) => session_error_response(
             StatusCode::CONFLICT,
@@ -789,16 +818,19 @@ async fn mutate_setting(State(state): State<AppState>, request: Request) -> Resp
 /// runs under, and every attached client receives the snapshot. Startup and an
 /// accepted mutation adopt a view the same way, and a future Config Document
 /// watcher will too.
-fn adopt_settings(
+async fn adopt_settings(
     settings: &watch::Sender<SettingsSnapshot>,
     runtimes: &[Arc<dyn ProviderRuntime>],
+    serving: &ServingController,
     snapshot: &SettingsSnapshot,
-) {
+) -> Result<()> {
     crate::settings::log_diagnostics(&snapshot.diagnostics);
     for runtime in runtimes {
         runtime.apply_settings(&snapshot.settings);
     }
+    let serving_result = serving.adopt(snapshot.settings.serving).await;
     settings.send_replace(snapshot.clone());
+    serving_result
 }
 
 fn settings_snapshot_event(snapshot: &SettingsSnapshot) -> Event {

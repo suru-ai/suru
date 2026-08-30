@@ -6,13 +6,15 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use suru::{
     build_identity,
+    logging::{self, Role},
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, stop_server},
     protocol::{
         Health, LifecycleState, SERVER_SHUTDOWN_EVENT, ServerIdentity, ServerShutdown,
-        ShutdownReason,
+        SettingMutation, ShutdownReason,
     },
     server::{self, ServerConfig, ServerTimings},
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Duration, timeout};
 
 #[allow(dead_code)]
@@ -48,6 +50,380 @@ fn sqlite_count(path: &std::path::Path, query: &str) -> i64 {
         .get_result::<SqliteCount>(&mut connection)
         .expect("query fixture database")
         .value
+}
+
+#[derive(Debug)]
+struct CaptureServerCertificate {
+    certificate: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for CaptureServerCertificate {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        *self
+            .certificate
+            .lock()
+            .expect("captured Server certificate lock is not poisoned") =
+            Some(end_entity.as_ref().to_vec());
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+async fn dial_with_unknown_certificate(
+    address: std::net::SocketAddr,
+) -> (std::io::Result<()>, Vec<u8>) {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["unknown-peer".to_owned()])
+            .expect("generate unknown Peer identity");
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let verifier = CaptureServerCertificate {
+        certificate: captured.clone(),
+    };
+    let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("choose test TLS protocol versions")
+    .dangerous()
+    .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+    .with_client_auth_cert(
+        vec![cert.der().clone()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            signing_key.serialize_der(),
+        )),
+    )
+    .expect("configure unknown Peer identity");
+    let stream = tokio::net::TcpStream::connect(address).await;
+    let result = match stream {
+        Ok(stream) => match tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls))
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("localhost is a valid TLS name"),
+                stream,
+            )
+            .await
+        {
+            Err(error) => Err(error),
+            Ok(mut stream) => match stream.write_all(b"GET /health HTTP/1.1\r\n\r\n").await {
+                Err(error) => Err(error),
+                Ok(()) => {
+                    let mut byte = [0];
+                    match timeout(Duration::from_secs(1), stream.read(&mut byte)).await {
+                        Ok(Err(error)) => Err(error),
+                        Ok(Ok(0)) => Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "Serving listener closed the unknown Peer connection",
+                        )),
+                        Ok(Ok(_)) => Ok(()),
+                        Err(_) => Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Serving listener did not settle the unknown Peer connection",
+                        )),
+                    }
+                }
+            },
+        },
+        Err(error) => Err(error),
+    };
+    let certificate = captured
+        .lock()
+        .expect("captured Server certificate lock is not poisoned")
+        .take()
+        .expect("the Serving listener presented its identity before refusing the Peer");
+    (result, certificate)
+}
+
+fn public_key_from_certificate(certificate: &[u8]) -> Vec<u8> {
+    let (_, certificate) = x509_parser::parse_x509_certificate(certificate)
+        .expect("parse Serving identity certificate");
+    certificate.public_key().raw.to_vec()
+}
+
+fn assert_logs_omit_key_material(log_dir: &std::path::Path, public_key: &[u8]) {
+    let logs = std::fs::read_dir(log_dir)
+        .expect("read Server Log directory")
+        .map(|entry| {
+            std::fs::read_to_string(entry.expect("read Server Log entry").path())
+                .expect("read Server Log")
+        })
+        .collect::<String>();
+    let key_hex = public_key
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let key_debug = format!("{public_key:?}");
+    assert!(
+        !logs.contains(&key_hex) && !logs.contains(&key_debug),
+        "Server Logs must never contain identity key material"
+    );
+}
+
+#[tokio::test]
+async fn serving_starts_and_stops_a_second_mtls_listener_without_disturbing_local_clients() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let config = ServerConfig::new(state_dir.path(), "serving-lifecycle-test")
+        .expect("configure server")
+        .with_data_dir(data_dir.path())
+        .with_config_dir(config_dir.path());
+    let identity_path = config.data_dir().join("server-identity.pk8");
+    let log_guard = logging::init(&config, Role::Server).expect("initialize Server Log");
+    let timings = ServerTimings {
+        shutdown_grace: Duration::from_millis(5),
+        ..ServerTimings::default()
+    };
+    let server = server::spawn_with_timings(config.clone(), timings)
+        .await
+        .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let mut local_client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "serving-lifecycle-test")
+            .expect("configure local client"),
+    )
+    .await
+    .expect("attach local client");
+    receive_initial_state(&mut local_client).await;
+
+    assert_eq!(server.serving_address(), None);
+    assert!(
+        !identity_path.exists(),
+        "a local-only Server has no Serving identity"
+    );
+    local_client
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
+        .await
+        .expect("ask the operating system for the Serving port");
+    local_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .expect("turn Serving on");
+
+    let first_address = server
+        .serving_address()
+        .expect("Serving listener has bound before the mutation answers");
+    assert_eq!(first_address.ip(), std::net::Ipv4Addr::LOCALHOST);
+    assert_ne!(first_address.port(), 0);
+    assert!(identity_path.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            std::fs::metadata(&identity_path)
+                .expect("read Server identity metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    #[cfg(windows)]
+    assert_windows_current_user_only(&identity_path);
+
+    let (unknown_peer, first_certificate) = dial_with_unknown_certificate(first_address).await;
+    assert!(
+        unknown_peer.is_err(),
+        "a dialer presenting an unenrolled client certificate must fail the TLS handshake"
+    );
+    let first_public_key = public_key_from_certificate(&first_certificate);
+
+    let mut serving_connection = tokio::net::TcpStream::connect(first_address)
+        .await
+        .expect("hold a connection on the Serving listener");
+    local_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(false) })
+        .await
+        .expect("turn Serving off through the still-attached local Client");
+    assert_eq!(server.serving_address(), None);
+    let mut byte = [0];
+    match timeout(Duration::from_secs(1), serving_connection.read(&mut byte))
+        .await
+        .expect("Serving connection is dropped promptly")
+    {
+        Ok(0) | Err(_) => {}
+        Ok(read) => panic!("disabled Serving connection produced {read} unexpected bytes"),
+    }
+
+    let health = reqwest::Client::new()
+        .get(format!("{}/health", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("local listener remains reachable after Serving stops");
+    assert_eq!(health.status(), reqwest::StatusCode::OK);
+
+    local_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .expect("turn Serving back on through the same local Client");
+    let replacement_address = server
+        .serving_address()
+        .expect("replacement Serving listener is ready");
+    let (unknown_peer, replacement_certificate) =
+        dial_with_unknown_certificate(replacement_address).await;
+    assert!(unknown_peer.is_err());
+    assert_eq!(
+        public_key_from_certificate(&replacement_certificate),
+        first_public_key,
+        "Serving reuses the Server identity generated on first Serve, as observed at the wire"
+    );
+
+    drop(local_client);
+    server.shutdown().await.expect("shut down server");
+    drop(log_guard);
+    assert_logs_omit_key_material(&config.state_dir().join("log"), &first_public_key);
+}
+
+#[tokio::test]
+async fn a_pinned_serving_setting_is_adopted_at_each_startup_with_the_same_identity() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            "serving": {
+                "enabled": true,
+                "port": 0,
+                "bindAddress": "127.0.0.1"
+            }
+        }"#,
+    )
+    .expect("write Serving Config Document");
+    let config = ServerConfig::new(state_dir.path(), "serving-startup-test")
+        .expect("configure server")
+        .with_data_dir(data_dir.path())
+        .with_config_dir(config_dir.path());
+    let identity_path = config.data_dir().join("server-identity.pk8");
+    assert!(!identity_path.exists());
+
+    let timings = ServerTimings {
+        shutdown_grace: Duration::from_millis(5),
+        ..ServerTimings::default()
+    };
+    let first = server::spawn_with_timings(config.clone(), timings)
+        .await
+        .expect("spawn first Serving server");
+    let first_address = first
+        .serving_address()
+        .expect("startup adopts the pinned Serving setting");
+    assert_eq!(first_address.ip(), std::net::Ipv4Addr::LOCALHOST);
+    assert_ne!(first_address.port(), 0);
+    assert!(identity_path.exists());
+    let (unknown_peer, first_certificate) = dial_with_unknown_certificate(first_address).await;
+    assert!(unknown_peer.is_err());
+    let first_public_key = public_key_from_certificate(&first_certificate);
+    first.shutdown().await.expect("stop first Server");
+
+    let replacement = server::spawn_with_timings(config, timings)
+        .await
+        .expect("spawn replacement Serving server");
+    let replacement_address = replacement
+        .serving_address()
+        .expect("replacement Serving listener is ready");
+    let (unknown_peer, replacement_certificate) =
+        dial_with_unknown_certificate(replacement_address).await;
+    assert!(unknown_peer.is_err());
+    assert_eq!(
+        public_key_from_certificate(&replacement_certificate),
+        first_public_key,
+        "a durable Serving Setting reuses the per-channel Server identity at the wire"
+    );
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement Server");
+}
+
+#[tokio::test]
+async fn a_failed_serving_rebind_keeps_the_listener_already_in_service() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let config = ServerConfig::new(state_dir.path(), "serving-rebind-test")
+        .expect("configure server")
+        .with_config_dir(config_dir.path());
+    let timings = ServerTimings {
+        shutdown_grace: Duration::from_millis(5),
+        ..ServerTimings::default()
+    };
+    let server = server::spawn_with_timings(config, timings)
+        .await
+        .expect("spawn server");
+    let mut local_client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "serving-rebind-test")
+            .expect("configure local client"),
+    )
+    .await
+    .expect("attach local client");
+    receive_initial_state(&mut local_client).await;
+    local_client
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
+        .await
+        .expect("ask the operating system for the first Serving port");
+    local_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .expect("turn Serving on");
+    let original = server.serving_address().expect("Serving listener is ready");
+
+    let occupied = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("occupy another loopback port");
+    let occupied_port = occupied.local_addr().expect("read occupied port").port();
+    let error = local_client
+        .mutate_setting(SettingMutation::ServingPort {
+            value: Some(occupied_port),
+        })
+        .await
+        .expect_err("an occupied Serving port cannot be adopted");
+    assert!(
+        format!("{error:#}").contains("Serving listener"),
+        "the mutation explains which live Setting could not be adopted: {error:#}"
+    );
+    assert_eq!(
+        server.serving_address(),
+        Some(original),
+        "a failed replacement leaves the listener already serving untouched"
+    );
+    let connection = tokio::net::TcpStream::connect(original)
+        .await
+        .expect("original Serving listener still accepts connections");
+    drop(connection);
+
+    drop(occupied);
+    drop(local_client);
+    server.shutdown().await.expect("shut down server");
 }
 
 #[test]

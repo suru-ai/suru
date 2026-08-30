@@ -3,7 +3,7 @@
 //! place, per the user configuration spec: a spawned server driven through the
 //! managed client over the real protocol, against temp config directories only.
 
-use std::path::Path;
+use std::{net::IpAddr, path::Path};
 
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
@@ -83,6 +83,62 @@ async fn a_pinned_setting_reaches_every_connecting_client_and_the_rest_default()
         assert_eq!(snapshot.diagnostics, []);
     }
 
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn serving_settings_pin_from_the_config_document_with_loopback_only_defaults() {
+    let defaults = suru::protocol::EffectiveSettings::default().serving;
+    assert!(!defaults.enabled);
+    assert_eq!(defaults.port, 7777);
+    assert_eq!(defaults.bind_address, IpAddr::from([127, 0, 0, 1]));
+
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            "serving": {
+                "enabled": false,
+                "port": 8443,
+                "bindAddress": "0.0.0.0",
+            },
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-serving")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (client, opening) = attach(state_dir.path(), "settings-serving").await;
+    assert!(!opening.settings.serving.enabled);
+    assert_eq!(opening.settings.serving.port, 8443);
+    assert_eq!(
+        opening.settings.serving.bind_address,
+        IpAddr::from([0, 0, 0, 0])
+    );
+    assert_eq!(
+        opening.pinned,
+        ["serving.bindAddress", "serving.enabled", "serving.port"]
+    );
+    assert_eq!(opening.diagnostics, []);
+
+    let answered = client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(IpAddr::from([127, 0, 0, 1])),
+        })
+        .await
+        .expect("pin the localhost Serving address");
+    assert_eq!(
+        answered.settings.serving.bind_address,
+        IpAddr::from([127, 0, 0, 1])
+    );
+
+    drop(client);
     server.shutdown().await.expect("shut down server");
 }
 

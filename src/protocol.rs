@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -1008,6 +1009,27 @@ pub struct ProviderSettings {
     pub claude: ClaudeSettings,
 }
 
+/// How the Server's opt-in second listener is exposed. Keeping the bind
+/// address typed means malformed addresses are rejected by Settings loading
+/// before anything reaches the network boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServingSettings {
+    pub enabled: bool,
+    pub port: u16,
+    pub bind_address: IpAddr,
+}
+
+impl Default for ServingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 7777,
+            bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        }
+    }
+}
+
 /// The effective value of every defined Setting: what a Config Document
 /// pinned where it did, the built-in default everywhere else.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1017,6 +1039,7 @@ pub struct EffectiveSettings {
     pub session: SessionSettings,
     pub sidebar: SidebarSettings,
     pub provider: ProviderSettings,
+    pub serving: ServingSettings,
 }
 
 impl EffectiveSettings {
@@ -1086,6 +1109,15 @@ pub enum SettingMutation {
     },
     ProviderClaudeEnabled {
         value: Option<bool>,
+    },
+    ServingEnabled {
+        value: Option<bool>,
+    },
+    ServingPort {
+        value: Option<u16>,
+    },
+    ServingBindAddress {
+        value: Option<IpAddr>,
     },
 }
 
@@ -2143,6 +2175,7 @@ pub enum SessionErrorCode {
     ConfigRootUnavailable,
     ConfigDocumentNotEditable,
     ConfigDocumentWriteFailed,
+    ServingListenerFailed,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
