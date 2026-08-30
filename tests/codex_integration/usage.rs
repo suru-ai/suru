@@ -1,0 +1,720 @@
+//! Per-Turn Usage and Estimated Cost derived from Codex's cumulative metering.
+
+use crate::support::{ScriptedCodex, receive_initial_state};
+use axum::{Json, Router, routing::get};
+use serde_json::json;
+use std::sync::Arc;
+use suru::{
+    managed_client::{ManagedClient, ManagedClientConfig},
+    pricing::PricingSource,
+    protocol::{
+        Activity, AdmitPromptRequest, Cost, CostBasis, CreateSessionRequest, InitialPrompt,
+        PromptDelivery, PromptId, SessionId, SessionSnapshot, TurnStatus, Usage, Workspace,
+    },
+    provider::CodexRuntime,
+    server::{self, ServerConfig},
+};
+use tokio::{
+    net::TcpListener,
+    time::{Duration, timeout},
+};
+
+/// A Codex whose thread meters two Turns as one running total, restating the
+/// first Turn's figures unchanged before it settles. `__MODEL__` is the Model
+/// the thread reports itself running, which is what the rate table is asked
+/// about.
+const METERED_TURNS_CODEX: &str = r#"#!/bin/sh
+turn_index=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"__MODEL__"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      turn_index=$((turn_index + 1))
+      response_id=$((turn_index + 2))
+      if [ "$turn_index" -eq 1 ]; then
+        printf '{"id":%s,"result":{"turn":{"id":"native-turn-1"}}}\n' "$response_id"
+        printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"other-thread","turnId":"other-turn","tokenUsage":{"total":{"totalTokens":99999,"inputTokens":99999,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":99999,"reasoningOutputTokens":0},"last":{"totalTokens":99999,"inputTokens":99999,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":99999,"reasoningOutputTokens":0},"modelContextWindow":272000}}}'
+        printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn-1","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000,"futureField":true}}}'
+        printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn-1","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-1","status":"completed","items":[]}}}'
+      else
+        printf '{"id":%s,"result":{"turn":{"id":"native-turn-2"}}}\n' "$response_id"
+        printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn-2","tokenUsage":{"total":{"totalTokens":3800,"inputTokens":3100,"cachedInputTokens":900,"cacheWriteInputTokens":50,"outputTokens":700,"reasoningOutputTokens":150},"last":{"totalTokens":2450,"inputTokens":2000,"cachedInputTokens":800,"cacheWriteInputTokens":0,"outputTokens":450,"reasoningOutputTokens":100},"modelContextWindow":272000}}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-2","status":"completed","items":[]}}}'
+      fi
+      ;;
+  esac
+done
+"#;
+
+/// A Codex that meters part of a Turn and then waits to be interrupted, so the
+/// Turn settles on Usage it accrued before anything asked it to stop.
+const INTERRUPTED_METERING_CODEX: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"priced-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
+      ;;
+    *'"method":"turn/interrupt"'*)
+      printf '%s\n' '{"id":4,"result":{}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"interrupted","items":[]}}}'
+      ;;
+  esac
+done
+"#;
+
+/// A Codex whose thread carries a reading no Turn is waiting on — the shape a
+/// reattach replays, and the shape a reading arriving after its Turn settled
+/// takes — between the Turn that settled and the Turn that follows it.
+const REPLAYED_READING_CODEX: &str = r#"#!/bin/sh
+turn_index=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"priced-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      turn_index=$((turn_index + 1))
+      response_id=$((turn_index + 2))
+      if [ "$turn_index" -eq 1 ]; then
+        printf '{"id":%s,"result":{"turn":{"id":"native-turn-1"}}}\n' "$response_id"
+        printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn-1","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-1","status":"completed","items":[]}}}'
+        printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn-1","tokenUsage":{"total":{"totalTokens":2400,"inputTokens":2000,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":400,"reasoningOutputTokens":50},"last":{"totalTokens":1050,"inputTokens":900,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":150,"reasoningOutputTokens":0},"modelContextWindow":272000}}}'
+      else
+        printf '{"id":%s,"result":{"turn":{"id":"native-turn-2"}}}\n' "$response_id"
+        printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn-2","tokenUsage":{"total":{"totalTokens":2600,"inputTokens":2150,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":450,"reasoningOutputTokens":50},"last":{"totalTokens":200,"inputTokens":150,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":50,"reasoningOutputTokens":0},"modelContextWindow":272000}}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-2","status":"completed","items":[]}}}'
+      fi
+      ;;
+  esac
+done
+"#;
+
+/// A Codex delegating to a child thread that meters itself. The child's own
+/// readings ride its own thread, so they must land in the child Session rather
+/// than the parent's.
+const DELEGATED_METERING_CODEX: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"priced-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
+      ;;
+    *'"method":"thread/resume"'*)
+      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"priced-fixture"}}'
+      printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"child-thread","turnId":"child-turn","tokenUsage":{"total":{"totalTokens":600,"inputTokens":500,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":100,"reasoningOutputTokens":20},"last":{"totalTokens":600,"inputTokens":500,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":100,"reasoningOutputTokens":20},"modelContextWindow":272000}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed","items":[]}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-completed","kind":"completed","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
+      printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"root-thread","turnId":"root-turn","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed","items":[]}}}'
+      ;;
+"#;
+
+/// A Codex that restates a settled Turn's figures late, while the Turn after
+/// it is already running. The straggler is stale by construction: the running
+/// Turn is still being measured, and must not be re-based onto it.
+const STALE_READING_CODEX: &str = r#"#!/bin/sh
+turn_index=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"priced-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      turn_index=$((turn_index + 1))
+      response_id=$((turn_index + 2))
+      if [ "$turn_index" -eq 1 ]; then
+        printf '{"id":%s,"result":{"turn":{"id":"native-turn-1"}}}\n' "$response_id"
+        printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn-1","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-1","status":"completed","items":[]}}}'
+      else
+        printf '{"id":%s,"result":{"turn":{"id":"native-turn-2"}}}\n' "$response_id"
+        printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn-2","tokenUsage":{"total":{"totalTokens":2600,"inputTokens":2150,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":450,"reasoningOutputTokens":50},"last":{"totalTokens":1250,"inputTokens":1050,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":200,"reasoningOutputTokens":0},"modelContextWindow":272000}}}'
+        printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn-1","tokenUsage":{"total":{"totalTokens":1400,"inputTokens":1150,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":300,"reasoningOutputTokens":50},"last":{"totalTokens":50,"inputTokens":50,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":50,"reasoningOutputTokens":0},"modelContextWindow":272000}}}'
+        printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn-2","tokenUsage":{"total":{"totalTokens":2900,"inputTokens":2400,"cachedInputTokens":150,"cacheWriteInputTokens":50,"outputTokens":500,"reasoningOutputTokens":80},"last":{"totalTokens":300,"inputTokens":250,"cachedInputTokens":50,"cacheWriteInputTokens":0,"outputTokens":50,"reasoningOutputTokens":30},"modelContextWindow":272000}}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-2","status":"completed","items":[]}}}'
+      fi
+      ;;
+  esac
+done
+"#;
+
+/// A Codex thread that outlives a server restart. The reattach replays the
+/// thread's persisted running total against the Turn it was measured under —
+/// the one shape Codex replays — and the Turn that follows meters on from
+/// there.
+const PERSISTED_METERING_CODEX: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"persisted-thread"},"model":"priced-fixture"}}'
+      ;;
+    *'"method":"thread/resume"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"persisted-thread"},"model":"priced-fixture"}}'
+      printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"persisted-thread","turnId":"persisted-turn-1","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
+      touch "$CODEX_FIXTURE_READY"
+      ;;
+    *'"method":"turn/start"'*)
+      if [ -e "$CODEX_FIXTURE_READY" ]; then
+        printf '%s\n' '{"id":3,"result":{"turn":{"id":"persisted-turn-2"}}}'
+        printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"persisted-thread","turnId":"persisted-turn-2","tokenUsage":{"total":{"totalTokens":2600,"inputTokens":2150,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":450,"reasoningOutputTokens":50},"last":{"totalTokens":1250,"inputTokens":1050,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":200,"reasoningOutputTokens":0},"modelContextWindow":272000}}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"persisted-thread","turn":{"id":"persisted-turn-2","status":"completed","items":[]}}}'
+      else
+        printf '%s\n' '{"id":3,"result":{"turn":{"id":"persisted-turn-1"}}}'
+        printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"persisted-thread","turnId":"persisted-turn-1","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"persisted-thread","turn":{"id":"persisted-turn-1","status":"completed","items":[]}}}'
+      fi
+      ;;
+"#;
+
+/// What the first Turn consumed on its own: Codex's nested counts made
+/// disjoint, and the context window it stated carried through.
+fn first_turn_usage() -> Usage {
+    Usage {
+        fresh_input_tokens: Some(950),
+        cache_read_tokens: Some(100),
+        cache_write_tokens: Some(50),
+        output_tokens: Some(200),
+        reasoning_tokens: Some(50),
+        native_meter: None,
+        model_context_window: Some(272_000),
+    }
+}
+
+/// A models.dev catalog serving one priced Model, and the Suru rate lookup
+/// pointed at it. The refresh interval is millisecond-scale so no test waits
+/// out the daily cadence, and the cache lives in its own directory so no two
+/// tests share one.
+async fn priced_lookup() -> (Arc<PricingSource>, tempfile::TempDir) {
+    let app = Router::new().route(
+        "/api.json",
+        get(|| async {
+            Json(json!({
+                "openai": {
+                    "models": {
+                        "priced-fixture": {
+                            "id": "priced-fixture",
+                            "cost": {
+                                "input": 2.0,
+                                "output": 4.0,
+                                "cache_read": 0.5,
+                                "cache_write": 0.25
+                            }
+                        }
+                    }
+                }
+            }))
+        }),
+    );
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind pricing fixture");
+    let endpoint = format!("http://{}/api.json", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let cache_dir = tempfile::tempdir().expect("create pricing cache directory");
+    let pricing = PricingSource::new(cache_dir.path())
+        .with_source_endpoint(endpoint)
+        .with_refresh_interval(Duration::from_millis(1))
+        .with_fetch_timeout(Duration::from_secs(5));
+    (Arc::new(pricing), cache_dir)
+}
+
+/// A server hosting `codex` against the fixture rate table, a client past its
+/// initial state, and a Session opened on `prompt`. `name` is the client
+/// channel, so each test needs its own.
+struct MeteredSession {
+    server: server::RunningServer,
+    client: ManagedClient,
+    session_id: SessionId,
+    _state_dir: tempfile::TempDir,
+    _workspace: tempfile::TempDir,
+    _pricing_cache: tempfile::TempDir,
+}
+
+async fn metered_session(
+    codex: &ScriptedCodex,
+    name: &'static str,
+    prompt: &str,
+) -> MeteredSession {
+    let (pricing, pricing_cache) = priced_lookup().await;
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), name).expect("configure server"),
+        Arc::new(CodexRuntime::new(codex.executable()).with_pricing_source(pricing)),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), name).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: prompt.to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    MeteredSession {
+        server,
+        client,
+        session_id: created.session.id,
+        _state_dir: state_dir,
+        _workspace: workspace,
+        _pricing_cache: pricing_cache,
+    }
+}
+
+async fn settled_turn(client: &ManagedClient, session: SessionId, index: usize) -> SessionSnapshot {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let snapshot = client
+                .read_session(session)
+                .await
+                .expect("read metered Session");
+            if snapshot
+                .turns
+                .get(index)
+                .is_some_and(|turn| turn.status != TurnStatus::Active)
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("metered Turn settles")
+}
+
+#[tokio::test]
+async fn codex_cumulative_readings_become_per_turn_deltas_priced_from_the_rate_table() {
+    let fixture = ScriptedCodex::new(&METERED_TURNS_CODEX.replace("__MODEL__", "priced-fixture"));
+    let opened = metered_session(&fixture, "codex-metered-turns", "Meter this Turn").await;
+    let client = &opened.client;
+    let first = settled_turn(client, opened.session_id, 0).await;
+
+    assert_eq!(first.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        first.turns[0].usage,
+        Some(first_turn_usage()),
+        "a re-fired reading restates the same total rather than adding to it"
+    );
+    assert_eq!(first.turns[0].cost, Cost::from_usd(0.0029625));
+    assert_eq!(first.turns[0].cost_basis, Some(CostBasis::Estimated));
+
+    client
+        .admit_prompt(
+            opened.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Meter another Turn".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("admit second Prompt");
+    let second = settled_turn(client, opened.session_id, 1).await;
+
+    assert_eq!(
+        second.turns[1].usage,
+        Some(Usage {
+            fresh_input_tokens: Some(1_200),
+            cache_read_tokens: Some(800),
+            cache_write_tokens: Some(0),
+            output_tokens: Some(350),
+            reasoning_tokens: Some(100),
+            native_meter: None,
+            model_context_window: Some(272_000),
+        }),
+        "the second Turn consumed the distance the thread's running total travelled"
+    );
+    assert_eq!(second.turns[1].cost, Cost::from_usd(0.0046));
+    assert_eq!(second.turns[1].cost_basis, Some(CostBasis::Estimated));
+    assert_eq!(
+        second.turns[0].usage,
+        Some(first_turn_usage()),
+        "a later reading does not reopen a settled Turn's record"
+    );
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_reading_no_turn_is_waiting_on_sets_where_the_next_turn_measures_from() {
+    let fixture = ScriptedCodex::new(REPLAYED_READING_CODEX);
+    let opened = metered_session(
+        &fixture,
+        "codex-replayed-reading",
+        "Meter across a Turn boundary",
+    )
+    .await;
+    let client = &opened.client;
+    let first = settled_turn(client, opened.session_id, 0).await;
+    assert_eq!(first.turns[0].usage, Some(first_turn_usage()));
+
+    client
+        .admit_prompt(
+            opened.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Meter after the replay".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("admit second Prompt");
+    let second = settled_turn(client, opened.session_id, 1).await;
+
+    assert_eq!(
+        second.turns[0].usage,
+        Some(first_turn_usage()),
+        "a reading arriving once a Turn has settled is not counted into it"
+    );
+    assert_eq!(
+        second.turns[1].usage,
+        Some(Usage {
+            fresh_input_tokens: Some(150),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            output_tokens: Some(50),
+            reasoning_tokens: Some(0),
+            native_meter: None,
+            model_context_window: Some(272_000),
+        }),
+        "nor is it counted into the Turn that follows it"
+    );
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_codex_model_the_rate_table_does_not_price_records_tokens_without_a_cost() {
+    let fixture = ScriptedCodex::new(&METERED_TURNS_CODEX.replace("__MODEL__", "unpriced-fixture"));
+    let opened = metered_session(&fixture, "codex-unpriced-model", "Meter an unpriced Model").await;
+    let settled = settled_turn(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns[0].usage, Some(first_turn_usage()));
+    assert_eq!(
+        settled.turns[0].cost, None,
+        "an unknown price is absent rather than free"
+    );
+    assert_eq!(settled.turns[0].cost_basis, None);
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_child_threads_readings_land_in_the_subagents_own_session() {
+    let fixture = ScriptedCodex::new_multiprocess(DELEGATED_METERING_CODEX);
+    let opened = metered_session(&fixture, "codex-delegated-metering", "Delegate a survey").await;
+    let parent = settled_turn(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(
+        parent.turns[0].usage,
+        Some(first_turn_usage()),
+        "the parent Turn records only what its own thread metered"
+    );
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = parent
+        .activities
+        .iter()
+        .find(|activity| matches!(activity, Activity::Subagent { .. }))
+        .expect("the Transcript carries a Subagent row")
+    else {
+        unreachable!()
+    };
+
+    let child = settled_turn(&opened.client, *child_id, 0).await;
+    assert_eq!(
+        child.turns[0].usage,
+        Some(Usage {
+            fresh_input_tokens: Some(500),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            output_tokens: Some(80),
+            reasoning_tokens: Some(20),
+            native_meter: None,
+            model_context_window: Some(272_000),
+        }),
+        "the child's own readings fill the child Session's Turn"
+    );
+    assert_eq!(child.turns[0].cost, Cost::from_usd(0.0014));
+    assert_eq!(child.turns[0].cost_basis, Some(CostBasis::Estimated));
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn an_interrupted_codex_turn_keeps_the_usage_it_had_accrued() {
+    let fixture = ScriptedCodex::new(INTERRUPTED_METERING_CODEX);
+    let opened = metered_session(
+        &fixture,
+        "codex-interrupted-metering",
+        "Meter until interrupted",
+    )
+    .await;
+    let client = &opened.client;
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let snapshot = client
+                .read_session(opened.session_id)
+                .await
+                .expect("read metering Session");
+            if snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.usage.is_some())
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Usage streams before the Turn settles");
+
+    client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("Codex acknowledges interruption");
+    let interrupted = settled_turn(client, opened.session_id, 0).await;
+
+    assert_eq!(interrupted.turns[0].status, TurnStatus::Interrupted);
+    assert_eq!(
+        interrupted.turns[0].usage,
+        Some(first_turn_usage()),
+        "an interrupted Turn keeps the partial Usage it accrued"
+    );
+    assert_eq!(interrupted.turns[0].cost, Cost::from_usd(0.0029625));
+    assert_eq!(interrupted.turns[0].cost_basis, Some(CostBasis::Estimated));
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_settled_turns_late_reading_does_not_truncate_the_turn_now_running() {
+    let fixture = ScriptedCodex::new(STALE_READING_CODEX);
+    let opened = metered_session(&fixture, "codex-stale-reading", "Meter this Turn").await;
+    let client = &opened.client;
+    let first = settled_turn(client, opened.session_id, 0).await;
+    assert_eq!(first.turns[0].usage, Some(first_turn_usage()));
+
+    client
+        .admit_prompt(
+            opened.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Meter through a straggler".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("admit second Prompt");
+    let second = settled_turn(client, opened.session_id, 1).await;
+
+    assert_eq!(
+        second.turns[1].usage,
+        Some(Usage {
+            fresh_input_tokens: Some(1_250),
+            cache_read_tokens: Some(50),
+            cache_write_tokens: Some(0),
+            output_tokens: Some(220),
+            reasoning_tokens: Some(30),
+            native_meter: None,
+            model_context_window: Some(272_000),
+        }),
+        "the running Turn keeps measuring from where it opened"
+    );
+    assert_eq!(
+        second.turns[0].usage,
+        Some(first_turn_usage()),
+        "and the settled Turn's own record is not reopened by it"
+    );
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn usage_survives_a_restart_and_the_reattach_replay_is_not_counted_again() {
+    let fixture = ScriptedCodex::new_multiprocess(PERSISTED_METERING_CODEX);
+    let (pricing, _pricing_cache) = priced_lookup().await;
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let channel = "codex-persisted-metering";
+    let config = ServerConfig::new(state_dir.path(), channel)
+        .expect("configure original server")
+        .with_data_dir(data_dir.path());
+    let client_config = || {
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure client")
+            .with_data_dir(data_dir.path())
+    };
+
+    let original = server::spawn_with_provider(
+        config.clone(),
+        Arc::new(CodexRuntime::new(fixture.executable()).with_pricing_source(pricing.clone())),
+    )
+    .await
+    .expect("spawn original server");
+    let mut original_client = ManagedClient::connect(client_config())
+        .await
+        .expect("connect original client");
+    receive_initial_state(&mut original_client).await;
+    let created = original_client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Meter before the restart".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let before = settled_turn(&original_client, created.session.id, 0).await;
+    assert_eq!(before.turns[0].usage, Some(first_turn_usage()));
+    drop(original_client);
+    original.shutdown().await.expect("stop original server");
+
+    let replacement = server::spawn_with_provider(
+        config,
+        Arc::new(CodexRuntime::new(fixture.executable()).with_pricing_source(pricing)),
+    )
+    .await
+    .expect("spawn replacement server");
+    let mut replacement_client = ManagedClient::connect(client_config())
+        .await
+        .expect("connect replacement client");
+    receive_initial_state(&mut replacement_client).await;
+    let restored = replacement_client
+        .read_session(created.session.id)
+        .await
+        .expect("read restored Session");
+    assert_eq!(
+        restored.turns[0].usage,
+        Some(first_turn_usage()),
+        "the Turn's record was persisted as it was recorded"
+    );
+    assert_eq!(restored.turns[0].cost, Cost::from_usd(0.0029625));
+    assert_eq!(restored.turns[0].cost_basis, Some(CostBasis::Estimated));
+
+    replacement_client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Meter after the restart".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("admit Prompt to the reopened Session");
+    let after = settled_turn(&replacement_client, created.session.id, 1).await;
+
+    assert_eq!(
+        after.turns[1].usage,
+        Some(Usage {
+            fresh_input_tokens: Some(1_050),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            output_tokens: Some(200),
+            reasoning_tokens: Some(0),
+            native_meter: None,
+            model_context_window: Some(272_000),
+        }),
+        "the replayed total is where the new Turn measures from, not what it consumed"
+    );
+    assert_eq!(
+        after.turns[0].usage,
+        Some(first_turn_usage()),
+        "and the restored Turn is not rewritten by the replay"
+    );
+
+    drop(replacement_client);
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement server");
+}

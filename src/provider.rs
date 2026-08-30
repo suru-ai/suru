@@ -13,8 +13,9 @@ use futures_util::Stream;
 use serde_json::Value;
 use tokio::sync::watch;
 
+use crate::pricing::{EstimatedCost, PricingSource};
 use crate::protocol::{
-    AgentIdentity, AgentSelection, Cost, EffectiveSettings, FileChange, ModelDescriptor,
+    AgentIdentity, AgentSelection, Cost, CostBasis, EffectiveSettings, FileChange, ModelDescriptor,
     ModelOptionKind, ModelOptionRole, ProviderId, ProviderUnavailability, SkillCatalog,
     SkillCatalogCapabilities, SkillCatalogStatus, SkillId, SkillInvocation, SkillMarkerSpan,
     SkillPromptDelivery, Usage, Workspace,
@@ -70,10 +71,22 @@ pub struct BuiltInProvider {
 
 /// The Provider runtimes a production server hosts, in the fixed built-in
 /// order a fresh Landing defaults from. This is the one place Suru names a
-/// concrete Provider.
-pub fn built_in_runtimes() -> Vec<Arc<dyn ProviderRuntime>> {
+/// concrete Provider. `data_dir` is where durable Provider-neutral caches —
+/// the models.dev rate table a Cost is estimated from — live between runs.
+pub fn built_in_runtimes(data_dir: &Path) -> Vec<Arc<dyn ProviderRuntime>> {
+    runtimes(Some(Arc::new(PricingSource::new(data_dir))))
+}
+
+/// The same set, with the rate table left out for callers that only ask the
+/// runtimes what they are called. Nothing built this way runs a Turn, so
+/// nothing built this way needs somewhere to cache prices.
+fn runtimes(pricing: Option<Arc<PricingSource>>) -> Vec<Arc<dyn ProviderRuntime>> {
+    let codex = CodexRuntime::from_environment();
     vec![
-        Arc::new(CodexRuntime::from_environment()),
+        Arc::new(match pricing {
+            Some(pricing) => codex.with_pricing_source(pricing),
+            None => codex,
+        }),
         Arc::new(CopilotRuntime::from_environment()),
         // Appended last so the Landing default order the earlier Providers set is unchanged.
         Arc::new(ClaudeRuntime::from_environment()),
@@ -87,7 +100,7 @@ pub fn built_in_runtimes() -> Vec<Arc<dyn ProviderRuntime>> {
 pub fn built_in_providers() -> &'static [BuiltInProvider] {
     static PROVIDERS: OnceLock<Vec<BuiltInProvider>> = OnceLock::new();
     PROVIDERS.get_or_init(|| {
-        built_in_runtimes()
+        runtimes(None)
             .iter()
             .map(|runtime| BuiltInProvider {
                 id: runtime.provider_id(),
@@ -520,11 +533,11 @@ pub enum ProviderEvent {
         status: ProviderSubagentStatus,
     },
     /// The Provider's latest complete reading of the active Turn. Each absent
-    /// field remains absent through the protocol; a stated Cost is frozen by
-    /// the Session store with a Reported Basis.
+    /// field remains absent through the protocol, and the Cost beside them is
+    /// frozen by the Session store on the Basis the event names.
     Usage {
         usage: Usage,
-        reported_cost: Option<Cost>,
+        cost: Option<MeteredCost>,
     },
     TurnCompleted,
     TurnInterrupted,
@@ -534,6 +547,43 @@ pub enum ProviderEvent {
     TurnFailed {
         message: String,
     },
+}
+
+/// A Cost one Provider event carries, together with the Basis that says how
+/// far to trust it. Pairing the two makes a Cost impossible to record without
+/// stating who computed it, so a rate-table estimate can never be stored as a
+/// Provider's own figure.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MeteredCost {
+    cost: Cost,
+    basis: CostBasis,
+}
+
+impl MeteredCost {
+    /// A dollar figure the Provider stated itself.
+    pub const fn reported(cost: Cost) -> Self {
+        Self {
+            cost,
+            basis: CostBasis::Reported,
+        }
+    }
+
+    pub const fn cost(self) -> Cost {
+        self.cost
+    }
+
+    pub const fn basis(self) -> CostBasis {
+        self.basis
+    }
+}
+
+impl From<EstimatedCost> for MeteredCost {
+    fn from(estimated: EstimatedCost) -> Self {
+        Self {
+            cost: estimated.cost(),
+            basis: estimated.basis(),
+        }
+    }
 }
 
 /// The cumulative Usage and Provider-reported Cost for one active Turn. A
@@ -596,9 +646,35 @@ impl ReportedTurnMetering {
     pub(super) fn event(&self) -> ProviderEvent {
         ProviderEvent::Usage {
             usage: self.usage.clone(),
-            reported_cost: self.reported_cost,
+            cost: self.reported_cost.map(MeteredCost::reported),
         }
     }
+}
+
+/// A token count a Provider stated, or absence where it did not or where the
+/// figure it stated cannot be one. Every Provider meters in signed counts, and
+/// a negative one is a Provider bug: reading it as absent degrades the record
+/// rather than corrupting it.
+pub(super) fn reported_count(count: Option<i64>) -> Option<u64> {
+    count.and_then(|count| u64::try_from(count).ok())
+}
+
+/// A stated total with the counts nested inside it taken back out, so the five
+/// parts a [`Usage`] stores never overlap and no consumer downstream ever has
+/// to subtract. A subset larger than its total is as unreadable as a negative
+/// count, and degrades the part to absence the same way.
+pub(super) fn exclusive_count(
+    total: Option<i64>,
+    subsets: impl IntoIterator<Item = Option<i64>>,
+) -> Option<u64> {
+    let total = reported_count(total)?;
+    subsets.into_iter().try_fold(total, |remaining, subset| {
+        let subset = match subset {
+            Some(count) => u64::try_from(count).ok()?,
+            None => 0,
+        };
+        remaining.checked_sub(subset)
+    })
 }
 
 fn add_reported_counts(current: Option<u64>, next: Option<u64>) -> Option<u64> {
@@ -867,8 +943,8 @@ mod tests {
     use std::{ffi::OsString, sync::Mutex};
 
     use super::{
-        MAX_REMOTE_ERROR_CHARS, built_in_providers, built_in_runtimes, concise_remote_message,
-        resolve_executable,
+        MAX_REMOTE_ERROR_CHARS, built_in_providers, concise_remote_message, resolve_executable,
+        runtimes,
     };
     use crate::{protocol::EffectiveSettings, settings::provider_enablement};
 
@@ -903,7 +979,7 @@ mod tests {
     /// the list clients read carries every Provider the server hosts.
     #[test]
     fn every_built_in_provider_has_a_display_name() {
-        for runtime in built_in_runtimes() {
+        for runtime in runtimes(None) {
             let provider = runtime.provider_id();
             assert!(
                 !runtime.display_name().trim().is_empty(),
@@ -929,7 +1005,7 @@ mod tests {
     /// actually reaches the gate, lives beside the schema in `settings`.
     #[test]
     fn every_built_in_provider_has_an_enabled_setting() {
-        for runtime in built_in_runtimes() {
+        for runtime in runtimes(None) {
             let provider = runtime.provider_id();
             assert!(
                 provider_enablement(&provider).is_some(),

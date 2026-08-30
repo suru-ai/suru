@@ -63,9 +63,10 @@ use crate::protocol::{NativeMeter, Usage};
 use crate::provider::{
     AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
     ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderSubagentId,
-    ProviderSubagentStatus, ReportedTurnMetering, concise_remote_message,
+    ProviderSubagentStatus, ReportedTurnMetering, concise_remote_message, exclusive_count,
     harness::SharedHarnessHandle,
     reasoning::{ReasoningSegment, ReasoningSummarySplitter},
+    reported_count,
 };
 
 /// Everything the projection must remember between events for one Copilot Session.
@@ -532,7 +533,7 @@ fn project_usage_event(
         ),
         cache_read_tokens: reported_count(reported.cache_read_tokens),
         cache_write_tokens: reported_count(reported.cache_write_tokens),
-        output_tokens: exclusive_count(reported.output_tokens, [reported.reasoning_tokens, None]),
+        output_tokens: exclusive_count(reported.output_tokens, [reported.reasoning_tokens]),
         reasoning_tokens: reported_count(reported.reasoning_tokens),
         native_meter: reported.cost.and_then(NativeMeter::from_units),
         model_context_window: reported_context_window(
@@ -557,21 +558,6 @@ fn project_usage_event(
             streams.metering = Some(metering);
             event
         }
-    })
-}
-
-fn reported_count(count: Option<i64>) -> Option<u64> {
-    count.and_then(|count| u64::try_from(count).ok())
-}
-
-fn exclusive_count(total: Option<i64>, subsets: [Option<i64>; 2]) -> Option<u64> {
-    let total = reported_count(total)?;
-    subsets.into_iter().try_fold(total, |remaining, subset| {
-        let subset = match subset {
-            Some(count) => u64::try_from(count).ok()?,
-            None => 0,
-        };
-        remaining.checked_sub(subset)
     })
 }
 

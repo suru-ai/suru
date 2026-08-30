@@ -348,7 +348,8 @@ impl AppState {
 }
 
 pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
-    spawn_with_providers(config, built_in_runtimes()).await
+    let runtimes = built_in_runtimes(config.data_dir());
+    spawn_with_providers(config, runtimes).await
 }
 
 pub async fn spawn_with_provider(
@@ -369,7 +370,8 @@ pub async fn spawn_with_timings(
     config: ServerConfig,
     timings: ServerTimings,
 ) -> Result<RunningServer> {
-    spawn_with_providers_and_timings(config, built_in_runtimes(), timings).await
+    let runtimes = built_in_runtimes(config.data_dir());
+    spawn_with_providers_and_timings(config, runtimes, timings).await
 }
 
 pub async fn spawn_with_provider_and_timings(

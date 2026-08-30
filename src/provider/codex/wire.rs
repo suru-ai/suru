@@ -14,9 +14,9 @@ use crate::{
     protocol::{
         AgentSelection, FileChange, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
         ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
-        ModelOptionRole, ModelOptionValue, ProviderId, ReasoningSummaryDetail,
+        ModelOptionRole, ModelOptionValue, ProviderId, ReasoningSummaryDetail, Usage,
     },
-    provider::{ProviderError, humanized_wire_id},
+    provider::{ProviderError, exclusive_count, humanized_wire_id, reported_count},
 };
 
 // JSON-RPC envelope.
@@ -731,6 +731,135 @@ pub(super) enum NativeCodexErrorInfo {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(super) struct ThreadTokenUsageParams {
+    pub(super) thread_id: String,
+    pub(super) turn_id: String,
+    pub(super) token_usage: NativeThreadTokenUsage,
+}
+
+/// Codex's metering for one thread. `total` is the thread's running total
+/// since it opened; the `last` breakdown beside it is deliberately not read,
+/// because Codex re-announces an unchanged last call and summing those figures
+/// would count the same call twice.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct NativeThreadTokenUsage {
+    pub(super) total: NativeTokenBreakdown,
+    #[serde(default)]
+    pub(super) model_context_window: Option<i64>,
+}
+
+/// One Codex token breakdown as the wire states it. Every count is optional so
+/// a build that omits one leaves the part absent rather than reading as zero,
+/// and the cached and cache-write counts are subsets of `input_tokens` just as
+/// the reasoning count is a subset of `output_tokens`.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct NativeTokenBreakdown {
+    #[serde(default)]
+    input_tokens: Option<i64>,
+    #[serde(default)]
+    cached_input_tokens: Option<i64>,
+    #[serde(default)]
+    cache_write_input_tokens: Option<i64>,
+    #[serde(default)]
+    output_tokens: Option<i64>,
+    #[serde(default)]
+    reasoning_output_tokens: Option<i64>,
+}
+
+impl NativeThreadTokenUsage {
+    /// Suru's disjoint token parts for this reading. Codex's nested counts are
+    /// made exclusive here — the cache parts leave `input_tokens`, Reasoning
+    /// leaves `output_tokens` — so no consumer downstream ever subtracts, and
+    /// a figure that cannot be represented degrades to absence rather than to
+    /// a wrong number.
+    pub(super) fn into_cumulative(self) -> NativeCumulativeUsage {
+        let breakdown = self.total;
+        NativeCumulativeUsage {
+            fresh_input_tokens: exclusive_count(
+                breakdown.input_tokens,
+                [
+                    breakdown.cached_input_tokens,
+                    breakdown.cache_write_input_tokens,
+                ],
+            ),
+            cache_read_tokens: reported_count(breakdown.cached_input_tokens),
+            cache_write_tokens: reported_count(breakdown.cache_write_input_tokens),
+            output_tokens: exclusive_count(
+                breakdown.output_tokens,
+                [breakdown.reasoning_output_tokens],
+            ),
+            reasoning_tokens: reported_count(breakdown.reasoning_output_tokens),
+            model_context_window: reported_count(self.model_context_window),
+        }
+    }
+}
+
+/// One thread's running total in Suru's own token parts. Codex meters a thread
+/// rather than a Turn, so this is a position rather than an amount: what a Turn
+/// consumed is the distance between two of these.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct NativeCumulativeUsage {
+    fresh_input_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    model_context_window: Option<u64>,
+}
+
+impl NativeCumulativeUsage {
+    /// The further-on of two readings of one thread, part by part. A thread's
+    /// running total only grows, so a part that went backwards belongs to a
+    /// reading that arrived late, and the total already reached stands. The
+    /// context window is not a count that accrues, so the stated one wins.
+    pub(super) fn furthest_of(self, other: Self) -> Self {
+        Self {
+            fresh_input_tokens: furthest_count(self.fresh_input_tokens, other.fresh_input_tokens),
+            cache_read_tokens: furthest_count(self.cache_read_tokens, other.cache_read_tokens),
+            cache_write_tokens: furthest_count(self.cache_write_tokens, other.cache_write_tokens),
+            output_tokens: furthest_count(self.output_tokens, other.output_tokens),
+            reasoning_tokens: furthest_count(self.reasoning_tokens, other.reasoning_tokens),
+            model_context_window: other.model_context_window.or(self.model_context_window),
+        }
+    }
+
+    /// What was consumed between `baseline` and this reading. The context
+    /// window is a property of the Model rather than a count that accrues, so
+    /// it is carried across as it stands.
+    pub(super) fn since(self, baseline: Self) -> Usage {
+        Usage {
+            fresh_input_tokens: accrued(self.fresh_input_tokens, baseline.fresh_input_tokens),
+            cache_read_tokens: accrued(self.cache_read_tokens, baseline.cache_read_tokens),
+            cache_write_tokens: accrued(self.cache_write_tokens, baseline.cache_write_tokens),
+            output_tokens: accrued(self.output_tokens, baseline.output_tokens),
+            reasoning_tokens: accrued(self.reasoning_tokens, baseline.reasoning_tokens),
+            native_meter: None,
+            model_context_window: self.model_context_window,
+        }
+    }
+}
+
+/// The larger of two readings of one part, keeping a part only one of them
+/// measured rather than losing it.
+fn furthest_count(held: Option<u64>, stated: Option<u64>) -> Option<u64> {
+    match (held, stated) {
+        (Some(held), Some(stated)) => Some(held.max(stated)),
+        (held, stated) => held.or(stated),
+    }
+}
+
+/// One part's distance from where it stood at the baseline. A part the
+/// baseline never measured is read as having started at nothing, and a total
+/// that went backwards — which Codex has no reason to do — accrues nothing
+/// rather than wrapping.
+fn accrued(latest: Option<u64>, baseline: Option<u64>) -> Option<u64> {
+    Some(latest?.saturating_sub(baseline.unwrap_or(0)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct ThreadSettingsUpdatedParams {
     pub(super) thread_id: String,
     pub(super) thread_settings: EffectiveThreadSettings,
@@ -869,6 +998,13 @@ pub(super) enum NativeNotification {
         turn_id: String,
         outcome: NativeTurnOutcome,
         final_agent_message: Option<CompletedNativeAgentMessage>,
+    },
+    /// Codex's latest running total for `thread_id`, keyed by the native Turn
+    /// it was measured under.
+    TokenUsage {
+        thread_id: String,
+        turn_id: String,
+        total: NativeCumulativeUsage,
     },
     /// A collab tool call completing on `thread_id` — a spawn naming the child
     /// threads it opened, or any later call carrying Codex's view of the

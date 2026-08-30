@@ -29,20 +29,22 @@ use super::{
     transport::JsonRpcTransport,
     wire::{
         NativeCollabAgentState, NativeCollabAgentStatus, NativeCollabCallStatus, NativeCollabTool,
-        NativeCommandStatus, NativeField, NativeFileChange, NativeFileChangeStatus,
-        NativeNotification, NativeSubagentActivityKind, NativeTurnFailureKind, NativeTurnOutcome,
-        THREAD_APPROVAL_POLICY, THREAD_SANDBOX, ThreadResumeParams,
+        NativeCommandStatus, NativeCumulativeUsage, NativeField, NativeFileChange,
+        NativeFileChangeStatus, NativeNotification, NativeSubagentActivityKind,
+        NativeTurnFailureKind, NativeTurnOutcome, THREAD_APPROVAL_POLICY, THREAD_SANDBOX,
+        ThreadResumeParams,
     },
 };
 use crate::{
+    pricing::{ModelsDevModel, PricingSource},
     protocol::{
         AgentSelection, FileChange, ModelId, ModelOptionChoiceId, ModelOptionId,
-        ModelOptionSelection, ModelOptionValue,
+        ModelOptionSelection, ModelOptionValue, Usage,
     },
     provider::{
-        AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
-        ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus,
-        ProviderSubagentId, ProviderSubagentStatus,
+        AttributedProviderEvent, MeteredCost, ProviderActivityId, ProviderCommandStatus,
+        ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
+        ProviderFileChangeStatus, ProviderSubagentId, ProviderSubagentStatus,
         harness::ProcessGuard,
         reasoning::{ReasoningSegment, ReasoningSummarySplitter},
     },
@@ -52,12 +54,25 @@ use crate::{
 /// it, as on the collab shape whose spawn calls carry only a prompt.
 const GENERIC_SUBAGENT_NAME: &str = "Agent";
 
+/// The one measurement a followed child thread's whole run is taken under.
+/// Codex announces no Turn boundary for a child, so naming every reading the
+/// same fixes the child's baseline at nothing the first time and never rebases
+/// it: the Subagent's Turn spans however many native Turns Codex runs.
+const CHILD_THREAD_TURN: &str = "";
+
 /// Everything the projection must remember between notifications for one Codex connection.
 pub(super) struct NativeCorrelation {
     thread_id: String,
     turn_starting: bool,
     active_turn_id: Option<String>,
     active_selection: Option<AgentSelection>,
+    /// The Model this connection's Usage is priced at. Codex states no dollar
+    /// figure of its own, so the Model is what the rate table is asked about;
+    /// it outlives any one Turn because a spawned child thread meters under
+    /// the Session's Model without a Turn of its own to read it from.
+    metered_model: ModelId,
+    /// Codex's running total for the Session's own thread.
+    root_metering: ThreadMetering,
     /// The streaming items open on the Session's own thread.
     root: ThreadInFlight,
     /// The spawned child threads Suru follows, by thread id — the identity
@@ -91,6 +106,50 @@ struct AttachedChild {
     in_flight: ThreadInFlight,
     description: String,
     latest_turn_id: Option<String>,
+    /// Codex's running total for this child's own thread. It keeps its opening
+    /// baseline of nothing for the thread's whole life, because a spawned
+    /// thread is opened for the delegation and everything it ever meters is
+    /// the Subagent's Turn — including whatever it ran before Suru attached.
+    metering: ThreadMetering,
+}
+
+/// Codex's latest running total for one followed thread, and the point the
+/// Turn in progress measures itself from. Codex meters a thread rather than a
+/// Turn and restates the whole total every time, so a Turn's Usage is the
+/// distance travelled since it opened. Summing the per-call figures Codex
+/// sends beside the total would double-count every call it re-announces
+/// unchanged.
+#[derive(Default)]
+struct ThreadMetering {
+    latest: NativeCumulativeUsage,
+    baseline: NativeCumulativeUsage,
+    /// The native Turn `baseline` was taken for, so the Turn is measured from
+    /// one place however many readings it takes.
+    baseline_turn: Option<String>,
+}
+
+impl ThreadMetering {
+    /// Notes where the thread's total stands without attributing it to a Turn.
+    /// This is what a reattach's replayed total does, and what a reading
+    /// trailing its settled Turn does: neither is anyone's to claim, but both
+    /// say where the next Turn starts measuring from. A reading that arrived
+    /// late leaves the total it already reached standing.
+    fn observe(&mut self, total: NativeCumulativeUsage) {
+        self.latest = self.latest.furthest_of(total);
+    }
+
+    /// Admits a reading belonging to `turn_id` and answers with what that Turn
+    /// has consumed. The first reading of a Turn fixes where it is measured
+    /// from; the rest measure from that same place, so a total Codex restates
+    /// unchanged restates the Turn's Usage rather than adding to it.
+    fn record(&mut self, total: NativeCumulativeUsage, turn_id: &str) -> Usage {
+        if self.baseline_turn.as_deref() != Some(turn_id) {
+            self.baseline = self.latest;
+            self.baseline_turn = Some(turn_id.to_owned());
+        }
+        self.observe(total);
+        self.latest.since(self.baseline)
+    }
 }
 
 struct ActiveNativeAgentMessage {
@@ -147,17 +206,24 @@ impl ActiveNativeReasoning {
 }
 
 impl NativeCorrelation {
-    pub(super) fn new(thread_id: String) -> Self {
+    pub(super) fn new(thread_id: String, metered_model: ModelId) -> Self {
         Self {
             thread_id,
             turn_starting: false,
             active_turn_id: None,
             active_selection: None,
+            metered_model,
+            root_metering: ThreadMetering::default(),
             root: ThreadInFlight::default(),
             children: HashMap::new(),
             settled_children: HashSet::new(),
             pending_attaches: Vec::new(),
         }
+    }
+
+    /// The Model this connection's Costs are estimated at.
+    pub(super) fn metered_model(&self) -> ModelId {
+        self.metered_model.clone()
     }
 
     /// The native Turn whose notifications are currently being projected.
@@ -191,6 +257,7 @@ impl NativeCorrelation {
         match started {
             Ok(turn_id) if self.active_turn_id.is_none() => {
                 self.active_turn_id = Some(turn_id);
+                self.metered_model = selection.model.clone();
                 self.active_selection = Some(selection);
                 self.root = ThreadInFlight::default();
                 Ok(())
@@ -306,9 +373,8 @@ impl NativeCorrelation {
         self.children.insert(
             child_thread_id.clone(),
             AttachedChild {
-                in_flight: ThreadInFlight::default(),
                 description: description.clone(),
-                latest_turn_id: None,
+                ..AttachedChild::default()
             },
         );
         self.pending_attaches.push(child_thread_id.clone());
@@ -402,6 +468,7 @@ pub(super) fn provider_events(
     correlation: Arc<StdMutex<NativeCorrelation>>,
     skill_catalog_invalidations: tokio::sync::watch::Sender<u64>,
     attachment: ChildThreadAttachment,
+    pricing: Option<Arc<PricingSource>>,
 ) -> ProviderEventStream {
     Box::pin(stream::unfold(
         GuardedEventReceiver {
@@ -410,6 +477,7 @@ pub(super) fn provider_events(
             correlation,
             skill_catalog_invalidations,
             attachment,
+            pricing,
             pending: VecDeque::new(),
         },
         next_provider_event,
@@ -456,6 +524,10 @@ struct GuardedEventReceiver {
     correlation: Arc<StdMutex<NativeCorrelation>>,
     skill_catalog_invalidations: tokio::sync::watch::Sender<u64>,
     attachment: ChildThreadAttachment,
+    /// The rate table a Codex Cost is estimated from. Absent where the Session
+    /// was started without one, which leaves Costs absent and tokens intact —
+    /// the same reading as a rate table that has never been fetched.
+    pricing: Option<Arc<PricingSource>>,
     pending: VecDeque<Result<AttributedProviderEvent, ProviderError>>,
 }
 
@@ -481,24 +553,68 @@ async fn next_provider_event(
                         });
                     continue;
                 }
-                let (projected, attaches) = {
+                let (projected, attaches, model) = {
                     let mut correlation = events
                         .correlation
                         .lock()
                         .expect("Codex native correlation lock is not poisoned");
                     let projected = project_native_notification(&mut correlation, native);
-                    (projected, correlation.take_pending_attaches())
+                    (
+                        projected,
+                        correlation.take_pending_attaches(),
+                        correlation.metered_model(),
+                    )
                 };
                 for thread_id in attaches {
                     events.attachment.attach(thread_id);
                 }
                 match projected {
-                    Ok(projected) => events.pending.extend(projected.into_iter().map(Ok)),
+                    Ok(projected) => {
+                        let mut priced = Vec::with_capacity(projected.len());
+                        for event in projected {
+                            priced.push(Ok(estimate_cost(
+                                events.pricing.as_deref(),
+                                &model,
+                                event,
+                            )
+                            .await));
+                        }
+                        events.pending.extend(priced);
+                    }
                     Err(error) => events.pending.push_back(Err(error)),
                 }
             }
         }
     }
+}
+
+/// Prices a Usage event from the rate table, which is the only Cost a Codex
+/// Turn can carry: Codex reports tokens and never dollars, so the Basis is
+/// always Estimated. A Model the table does not price, a table no fetch has
+/// ever filled, and an event that is not a Usage all pass through unchanged,
+/// leaving the Cost absent rather than zero.
+///
+/// A Subagent's tokens are priced at the Session's Model too. Codex states a
+/// spawned thread's own Model only in the attach reply this projection never
+/// sees, and a child ordinarily runs the Model its spawner does — so the
+/// Session's Model is the closest honest rate, and the Estimated Basis is
+/// already what says not to read the figure as exact.
+async fn estimate_cost(
+    pricing: Option<&PricingSource>,
+    model: &ModelId,
+    mut event: AttributedProviderEvent,
+) -> AttributedProviderEvent {
+    let (Some(pricing), ProviderEvent::Usage { usage, cost }) = (pricing, &mut event.event) else {
+        return event;
+    };
+    let estimated = pricing
+        .estimate(
+            &ModelsDevModel::new(super::MODELS_DEV_PROVIDER, model.clone()),
+            usage,
+        )
+        .await;
+    *cost = estimated.map(MeteredCost::from);
+    event
 }
 
 fn project_native_notification(
@@ -635,6 +751,16 @@ fn project_native_notification(
             item_id,
             summary,
         } => project_reasoning_completed(correlation, &thread_id, &turn_id, item_id, summary),
+        NativeNotification::TokenUsage {
+            thread_id,
+            turn_id,
+            total,
+        } => Ok(project_token_usage(
+            correlation,
+            &thread_id,
+            &turn_id,
+            total,
+        )),
         NativeNotification::TurnCompleted {
             thread_id,
             turn_id,
@@ -983,6 +1109,45 @@ fn reasoning_segment_events(
     events
 }
 
+/// One cumulative reading landing on the Turn it belongs to, as the distance
+/// that Turn has travelled since it opened.
+///
+/// On the Session's own thread the reading has to name the Turn Suru is
+/// measuring. Any other reading — the total a reattach replays, or one
+/// trailing a Turn that has already settled — belongs to nobody: it moves the
+/// thread's running total, which is where the next Turn will start measuring
+/// from, but never the baseline the Turn in progress is being measured
+/// against. Turn identity decides that rather than arrival order, because a
+/// reading queued before a Turn opened is drained after it.
+///
+/// A followed child thread has no Turn boundaries of its own: its whole run is
+/// one Subagent's Turn however many native Turns Codex takes over it. The Cost
+/// is left for the Session's rate lookup to fill in, because Codex states no
+/// dollar figure of its own.
+fn project_token_usage(
+    correlation: &mut NativeCorrelation,
+    thread_id: &str,
+    turn_id: &str,
+    total: NativeCumulativeUsage,
+) -> Vec<AttributedProviderEvent> {
+    if correlation.thread_id == thread_id {
+        if correlation.active_turn_id.as_deref() != Some(turn_id) {
+            correlation.root_metering.observe(total);
+            return Vec::new();
+        }
+        let usage = correlation.root_metering.record(total, turn_id);
+        return owning(vec![ProviderEvent::Usage { usage, cost: None }]);
+    }
+    let Some(child) = correlation.children.get_mut(thread_id) else {
+        return Vec::new();
+    };
+    let usage = child.metering.record(total, CHILD_THREAD_TURN);
+    attributed(
+        &ProviderEventAttribution::Subagent(ProviderSubagentId::new(thread_id)),
+        vec![ProviderEvent::Usage { usage, cost: None }],
+    )
+}
+
 fn project_agent_selection_changed(
     correlation: &mut NativeCorrelation,
     thread_id: &str,
@@ -1020,6 +1185,7 @@ fn project_agent_selection_changed(
     if effective == *requested {
         return Ok(Vec::new());
     }
+    correlation.metered_model = effective.model.clone();
     correlation.active_selection = Some(effective.clone());
     Ok(vec![ProviderEvent::AgentSelectionChanged {
         selection: effective,
@@ -1525,7 +1691,8 @@ mod tests {
     const ITEM: &str = "item-fixture";
 
     fn reasoning_turn() -> NativeCorrelation {
-        let mut correlation = NativeCorrelation::new(THREAD.to_owned());
+        let mut correlation =
+            NativeCorrelation::new(THREAD.to_owned(), ModelId::new("gpt-fixture"));
         correlation.begin_turn_start().expect("claim the Turn slot");
         correlation
             .finish_turn_start(

@@ -14,16 +14,16 @@ use tokio::{
 };
 
 use super::{
-    AttributedProviderEvent, ProviderCommandStatus, ProviderError, ProviderEvent,
+    AttributedProviderEvent, MeteredCost, ProviderCommandStatus, ProviderError, ProviderEvent,
     ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus, ProviderPrompt,
     ProviderRuntime, ProviderSession, ProviderSessionRequest, ProviderSteerInput,
     ProviderSubagentId, ProviderSubagentStatus, ProviderTurnInput,
 };
 use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, AgentIdentity, CostBasis, Message, MessageId,
-    MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
-    ProviderId, SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery, TurnId,
+    Activity, ActivityId, ActivityStatus, AgentIdentity, Message, MessageId, MessageRole,
+    MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
+    SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery, TurnId,
 };
 use crate::sessions::{
     DeliveredTurn, DeliveredTurnStatus, InterruptSessionError, InterruptTarget,
@@ -2431,17 +2431,14 @@ fn project_provider_event(
                 }
                 Some(settled) => settled.map(|()| ProviderEventProjection::Continue),
             },
-            ProviderEvent::Usage {
-                usage,
-                reported_cost,
-            } => sessions
+            ProviderEvent::Usage { usage, cost } => sessions
                 .publish_agent_output(
                     session_id,
                     SessionChange::TurnUsageChanged {
                         turn_id: active.turn_id,
                         usage,
-                        cost: reported_cost,
-                        cost_basis: reported_cost.map(|_| CostBasis::Reported),
+                        cost: cost.map(MeteredCost::cost),
+                        cost_basis: cost.map(MeteredCost::basis),
                     },
                 )
                 .map(|_| ProviderEventProjection::Continue),

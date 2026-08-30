@@ -13,7 +13,7 @@ use suru::{
         Activity, Cost, SessionCatalogChange, SessionCatalogUpdate, SessionId, SessionSnapshot,
         Usage, UsageTotal,
     },
-    provider::{ProviderEvent, ProviderEventAttribution, ProviderSubagentId},
+    provider::{MeteredCost, ProviderEvent, ProviderEventAttribution, ProviderSubagentId},
     server::{self, ServerConfig},
 };
 
@@ -126,7 +126,7 @@ async fn a_parents_total_carries_its_subagents_usage_while_the_child_keeps_its_o
         .provider_session
         .emit_and_wait_until_observed(ProviderEvent::Usage {
             usage: measured(4_000, 1_000),
-            reported_cost: Cost::from_usd(0.20),
+            cost: Cost::from_usd(0.20).map(MeteredCost::reported),
         })
         .await;
     fixture
@@ -135,7 +135,7 @@ async fn a_parents_total_carries_its_subagents_usage_while_the_child_keeps_its_o
             ProviderEventAttribution::Subagent(subagent),
             ProviderEvent::Usage {
                 usage: measured(2_000, 500),
-                reported_cost: Cost::from_usd(0.05),
+                cost: Cost::from_usd(0.05).map(MeteredCost::reported),
             },
         )
         .await;
@@ -200,7 +200,7 @@ async fn roll_up_recurses_through_a_subagents_own_subagents() {
             ProviderEventAttribution::Subagent(nested),
             ProviderEvent::Usage {
                 usage: measured(900, 100),
-                reported_cost: Cost::from_usd(0.01),
+                cost: Cost::from_usd(0.01).map(MeteredCost::reported),
             },
         )
         .await;
@@ -250,7 +250,7 @@ async fn the_catalog_announces_a_roll_up_without_the_session_open() {
             ProviderEventAttribution::Subagent(subagent),
             ProviderEvent::Usage {
                 usage: measured(2_000, 500),
-                reported_cost: Cost::from_usd(0.05),
+                cost: Cost::from_usd(0.05).map(MeteredCost::reported),
             },
         )
         .await;
@@ -295,7 +295,7 @@ async fn usage_owed_to_a_subagent_after_its_spawning_turn_settled_still_rolls_up
             ProviderEventAttribution::Subagent(subagent),
             ProviderEvent::Usage {
                 usage: measured(2_000, 500),
-                reported_cost: Cost::from_usd(0.05),
+                cost: Cost::from_usd(0.05).map(MeteredCost::reported),
             },
         )
         .await;
@@ -319,7 +319,7 @@ async fn usage_owed_to_a_subagent_after_its_spawning_turn_settled_still_rolls_up
         .provider_session
         .emit_and_wait_until_observed(ProviderEvent::Usage {
             usage: measured(1_000, 200),
-            reported_cost: Cost::from_usd(0.02),
+            cost: Cost::from_usd(0.02).map(MeteredCost::reported),
         })
         .await;
 
@@ -355,7 +355,7 @@ async fn a_restarted_server_derives_the_roll_up_again_from_the_turns_it_stored()
         .provider_session
         .emit_and_wait_until_observed(ProviderEvent::Usage {
             usage: measured(4_000, 1_000),
-            reported_cost: Cost::from_usd(0.20),
+            cost: Cost::from_usd(0.20).map(MeteredCost::reported),
         })
         .await;
     fixture
@@ -364,7 +364,7 @@ async fn a_restarted_server_derives_the_roll_up_again_from_the_turns_it_stored()
             ProviderEventAttribution::Subagent(subagent),
             ProviderEvent::Usage {
                 usage: measured(2_000, 500),
-                reported_cost: Cost::from_usd(0.05),
+                cost: Cost::from_usd(0.05).map(MeteredCost::reported),
             },
         )
         .await;

@@ -33,6 +33,7 @@ use super::{
     },
 };
 use crate::{
+    pricing::PricingSource,
     protocol::{
         AgentId, AgentIdentity, AgentSelection, EffectiveSettings, ModelId, ModelOptionChoiceId,
         ModelOptionId, ModelOptionSelection, ModelOptionValue, ProviderId, ReasoningSummaryDetail,
@@ -66,6 +67,10 @@ pub struct CodexRuntime {
     reasoning_summary: Arc<StdMutex<ReasoningSummaryDetail>>,
     skills: CodexSkills,
     skill_catalog_invalidations: watch::Sender<u64>,
+    /// The rate table every Session this runtime starts estimates its Costs
+    /// from. Absent until the server hands one over, which leaves Costs absent
+    /// and tokens intact.
+    pricing: Option<Arc<PricingSource>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -94,7 +99,17 @@ impl CodexRuntime {
             reasoning_summary: Arc::new(StdMutex::new(ReasoningSummaryDetail::default())),
             skills: CodexSkills::default(),
             skill_catalog_invalidations,
+            pricing: None,
         }
+    }
+
+    /// Hands this runtime the models.dev rate lookup its Sessions price Turns
+    /// from. Codex states no dollar figure of its own, so this is what decides
+    /// whether a Codex Turn carries an Estimated Cost at all; injectable so
+    /// tests point it at a fixture rather than the network.
+    pub fn with_pricing_source(mut self, pricing: Arc<PricingSource>) -> Self {
+        self.pricing = Some(pricing);
+        self
     }
 
     /// Bounds how long a Session shutdown waits for Codex to acknowledge the
@@ -198,6 +213,7 @@ impl ProviderRuntime for CodexRuntime {
             skills: self.skills.clone(),
             skill_catalog_invalidations: self.skill_catalog_invalidations.clone(),
             workspace: request.workspace.clone(),
+            pricing: self.pricing.clone(),
         };
         Box::pin(async move { start_codex_session(executable, request, processes, context).await })
     }
@@ -300,6 +316,7 @@ struct SessionContext {
     skills: CodexSkills,
     skill_catalog_invalidations: watch::Sender<u64>,
     workspace: std::path::PathBuf,
+    pricing: Option<Arc<PricingSource>>,
 }
 
 async fn start_codex_session(
@@ -414,9 +431,18 @@ async fn start_codex_thread(
 
     let correlation = Arc::new(StdMutex::new(NativeCorrelation::new(
         started.thread.id.clone(),
+        ModelId::new(started.model.clone()),
     )));
     let turn_start_changed = Arc::new(Notify::new());
     let skill_catalog_invalidations = context.skill_catalog_invalidations.clone();
+    // Codex meters mid-Turn, and the lookup that prices a reading runs on the
+    // event pump, so the rate table is warmed here instead: a Session opening
+    // waits on nothing, and by the time a Turn meters anything the fetch has
+    // long since settled one way or the other.
+    let pricing = context.pricing.clone();
+    if let Some(pricing) = pricing.clone() {
+        tokio::spawn(async move { pricing.prime().await });
+    }
     let attachment = ChildThreadAttachment {
         transport: transport.clone(),
         cwd: cwd.to_owned(),
@@ -436,6 +462,7 @@ async fn start_codex_thread(
         correlation,
         skill_catalog_invalidations,
         attachment,
+        pricing,
     );
     Ok(ProviderSessionConnection::new(
         AgentIdentity {

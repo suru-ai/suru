@@ -56,6 +56,7 @@ impl EstimatedCost {
 /// Best-effort models.dev pricing behind one lookup interface. The source's
 /// Provider nesting, USD-per-million units, durable cache, refresh cadence,
 /// and failures remain internal; callers only supply a Model and its Usage.
+#[derive(Debug)]
 pub struct PricingSource {
     cache_path: PathBuf,
     source_endpoint: String,
@@ -65,7 +66,7 @@ pub struct PricingSource {
     state: Mutex<PricingState>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct PricingState {
     cache_loaded: bool,
     document: Option<CacheDocument>,
@@ -124,6 +125,14 @@ impl PricingSource {
     pub fn with_fetch_timeout(mut self, fetch_timeout: Duration) -> Self {
         self.fetch_timeout = fetch_timeout;
         self
+    }
+
+    /// Fetches the rate table if it is due, so a later lookup reads a warm
+    /// cache instead of waiting on the network. Callers run this away from any
+    /// path a user is waiting on: the fetch is bounded, but a Turn's output
+    /// should never be held behind it.
+    pub async fn prime(&self) {
+        let _ = self.fetch_catalog().await;
     }
 
     /// Prices every reported token part at the Model's own catalog rates;

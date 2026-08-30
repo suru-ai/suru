@@ -25,6 +25,10 @@ const CODEX_HARNESS_NAME: &str = "Codex app-server";
 /// a different process in a different mode from the app-server above.
 const CODEX_ONE_SHOT_NAME: &str = "Codex exec";
 
+/// The catalog Codex's Models are priced from. models.dev files them under
+/// the Model vendor rather than the CLI that fronts them.
+const MODELS_DEV_PROVIDER: &str = "openai";
+
 const REASONING_EFFORT_OPTION_ID: &str = "reasoning_effort";
 const SERVICE_TIER_OPTION_ID: &str = "service_tier";
 const DEFAULT_SERVICE_TIER_CHOICE_ID: &str = "default";

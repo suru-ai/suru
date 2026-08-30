@@ -17,7 +17,7 @@ use suru::{
         SessionStatus, SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan, TurnStatus,
         UpdateAgentSelectionRequest, Usage, Workspace,
     },
-    provider::{ProviderActivityId, ProviderCommandStatus, ProviderEvent},
+    provider::{MeteredCost, ProviderActivityId, ProviderCommandStatus, ProviderEvent},
     server::{self, ServerConfig},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
@@ -1044,7 +1044,7 @@ async fn turn_usage_survives_a_restart() {
             native_meter: None,
             model_context_window: Some(200_000),
         },
-        reported_cost: Cost::from_usd(0.03),
+        cost: Cost::from_usd(0.03).map(MeteredCost::reported),
     });
     provider_session.emit(ProviderEvent::TurnCompleted);
     let completed = read_session_at_least_revision(
