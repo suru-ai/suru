@@ -1048,6 +1048,23 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
         .await
         .expect("attempt Remote Peer listing");
     assert_eq!(peers.status(), reqwest::StatusCode::FORBIDDEN);
+    let invites = http
+        .post(format!("{remote_api}/v1/pairing/invites"))
+        .bearer_auth(&descriptor.token)
+        .json(&IssueInviteRequest {
+            addresses: Vec::new(),
+        })
+        .send()
+        .await
+        .expect("attempt Remote Invite issuance");
+    assert_eq!(invites.status(), reqwest::StatusCode::FORBIDDEN);
+    let remotes = http
+        .get(format!("{remote_api}/v1/pairing/remotes"))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("attempt Remote Pairing management");
+    assert_eq!(remotes.status(), reqwest::StatusCode::FORBIDDEN);
     let peer_id = &pair.serving_client.list_peers().await.unwrap()[0].id;
     let removal = http
         .delete(format!("{remote_api}/v1/pairing/peers/{peer_id}"))

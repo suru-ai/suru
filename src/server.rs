@@ -462,7 +462,6 @@ pub async fn spawn_with_providers_and_timings(
             build_identity: build_identity::for_current_executable()?,
         },
     );
-    write_descriptor(&config.descriptor_path(), &descriptor)?;
     let serving = ServingController::new(
         config.data_dir(),
         timings.invite_ttl,
@@ -470,6 +469,7 @@ pub async fn spawn_with_providers_and_timings(
         descriptor.base_url.clone(),
         descriptor.token.clone(),
     )?;
+    write_descriptor(&config.descriptor_path(), &descriptor)?;
 
     // After all fallible local-server setup, so an error returning from spawn
     // can never leave a detached Serving listener behind; still before any
@@ -898,23 +898,26 @@ async fn probe_remote(
 
 async fn proxy_remote(
     State(state): State<AppState>,
-    AxumPath((name, path)): AxumPath<(String, String)>,
+    AxumPath((name, _path)): AxumPath<(String, String)>,
     mut request: Request,
 ) -> Response {
     if !is_authenticated(request.headers(), &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let query = request
+    let Some(path_and_query) = request
         .uri()
-        .query()
-        .map(|query| format!("?{query}"))
-        .unwrap_or_default();
-    let remote_path = if path.starts_with('/') {
-        path
-    } else {
-        format!("/{path}")
+        .path_and_query()
+        .map(axum::http::uri::PathAndQuery::as_str)
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
     };
-    let Ok(uri) = format!("{remote_path}{query}").parse() else {
+    let Some((_, remote_path_and_query)) = path_and_query
+        .strip_prefix("/v1/remotes/")
+        .and_then(|path| path.split_once('/'))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(uri) = format!("/{remote_path_and_query}").parse() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     *request.uri_mut() = uri;
