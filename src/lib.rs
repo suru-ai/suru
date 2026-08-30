@@ -4,6 +4,7 @@ mod errands;
 pub mod logging;
 pub mod managed_client;
 mod model_catalog;
+pub mod pricing;
 pub mod protocol;
 pub mod provider;
 mod runtime;
