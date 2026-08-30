@@ -8,9 +8,11 @@ use std::{
 };
 
 use crate::support::{
-    connected_application, enter_session, failed_session_snapshot, noncanonical_spelling,
-    rendered_application_buffer, rendered_application_rows_at, rendered_row, type_terminal_text,
-    workspace_dir,
+    ADD_WORKSPACE, SELECTOR_ROW, SIDEBAR_PRESS_HEIGHT as PRESS_HEIGHT, SIDEBAR_WIDE as WIDE,
+    add_workspace, connected_application, deliver_settings, drawn_in_sidebar, enter_session,
+    failed_session_snapshot, noncanonical_spelling, press_add_workspace,
+    rendered_application_buffer, rendered_application_rows_at, rendered_row, selector_label,
+    sidebar_column, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -22,19 +24,14 @@ use suru::{
         AutoSettle, EffectiveSettings, EmojiVisibility, ModelAvailability, PromptId, Session,
         SessionCatalogRevision, SessionCatalogSnapshot, SessionCreated, SessionDeleted, SessionId,
         SessionListItem, SessionSettings, SessionSettlementChanged, SessionStatus, SessionSummary,
-        SessionTimestamp, SessionTitleChanged, SessionWorkingChanged, SettingsSnapshot,
-        SidebarScope, SidebarSettings, SidebarVisibility, TitleSettings, UnreadableSessionSummary,
-        Workspace,
+        SessionTimestamp, SessionTitleChanged, SessionWorkingChanged, SidebarScope,
+        SidebarSettings, SidebarVisibility, TitleSettings, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
         SessionListScope, SessionListSurface,
     },
 };
-
-/// Wide enough for the Sidebar and a main view both, which is what every test
-/// about the Sidebar's own content needs.
-const WIDE: u16 = 100;
 
 /// Short enough that six active rows do not fit: the search box, the selector,
 /// and three three-line rows fill the column, so the rest is read through the
@@ -719,21 +716,6 @@ fn deliver_sidebar_settings(
     )
 }
 
-fn deliver_settings(
-    application: &mut Application,
-    settings: EffectiveSettings,
-) -> ApplicationTransition {
-    application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
-            SettingsSnapshot {
-                settings,
-                pinned: Vec::new(),
-                diagnostics: Vec::new(),
-            },
-        )))
-        .expect("receive the effective-settings snapshot")
-}
-
 fn press_toggle(application: &mut Application) -> ApplicationTransition {
     application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -761,16 +743,6 @@ fn expect_sidebar_listing(transition: ApplicationTransition) -> suru::tui::Sessi
 fn sidebar_is_drawn(rows: &[String]) -> bool {
     rows.iter()
         .all(|row| row.chars().nth(31) == Some('\u{2502}'))
-}
-
-/// The Sidebar's own columns of one rendered row, trimmed of the padding that
-/// insets them from the divider.
-fn sidebar_column(row: &str) -> String {
-    row.chars()
-        .take_while(|character| *character != '│')
-        .collect::<String>()
-        .trim()
-        .to_owned()
 }
 
 fn listed_as(
@@ -1990,10 +1962,6 @@ fn set_aside_shelf(workspace: &Path, count: u64) -> Vec<SessionListItem> {
 }
 
 /// Whether the Sidebar's own columns carry `needle` anywhere down the frame.
-fn drawn_in_sidebar(rows: &[String], needle: &str) -> bool {
-    rows.iter().any(|row| sidebar_column(row).contains(needle))
-}
-
 /// A Turn starting or settling in some client's Session, arriving on the
 /// session-catalog stream, reporting whatever the Sidebar asks for in answer.
 fn work_elsewhere(
@@ -2505,8 +2473,6 @@ const SIDEBAR_CELL: u16 = 4;
 
 /// The frame every press test draws: tall enough for a menu opened on any row
 /// its fixtures list to stand whole.
-const PRESS_HEIGHT: u16 = 20;
-
 /// A press of one mouse button on one cell. The press rather than the release,
 /// so a row answers the click the reader has just made rather than trailing a
 /// drag that ends elsewhere.
@@ -3365,9 +3331,6 @@ fn workspace_name(workspace: &Path) -> String {
 // listed. It stands beside the selector, opens a path entry, and — when the
 // reader names a directory — moves the Workspace this client works in.
 
-/// What the affordance is drawn as, beside the selector on its own line.
-const ADD_WORKSPACE: char = '+';
-
 /// What the path entry labels the line the reader types into.
 const WORKSPACE_ENTRY: &str = "Workspace:";
 
@@ -3827,45 +3790,6 @@ fn the_session_picker_narrows_to_the_workspace_the_reader_added() {
         &SessionListScope::CurrentWorkspace(canonical),
         "the picker asks for the Workspace the reader now works in"
     );
-}
-
-/// Opens the path entry the way a pointer does: a press on the affordance at
-/// the right of the selector's own line.
-fn press_add_workspace(application: &mut Application) -> ApplicationTransition {
-    let column = add_workspace_cell(application);
-    press_at(application, MouseButton::Left, column, SELECTOR_ROW)
-}
-
-/// The screen row the selector and its affordance share, which is the line
-/// under the search box.
-const SELECTOR_ROW: u16 = 1;
-
-/// The cell the affordance is drawn at, read off the frame so a press lands
-/// where the reader would point.
-fn add_workspace_cell(application: &Application) -> u16 {
-    let rows = rendered_application_rows_at(application, WIDE, PRESS_HEIGHT);
-    let column = rows[usize::from(SELECTOR_ROW)]
-        .chars()
-        .position(|character| character == ADD_WORKSPACE)
-        .expect("the affordance is drawn beside the selector");
-    u16::try_from(column).expect("the column fits a screen column")
-}
-
-/// What the selector says, read off the label region of the line it shares
-/// with the add-Workspace affordance.
-fn selector_label(rows: &[String]) -> String {
-    sidebar_column(&rows[usize::from(SELECTOR_ROW)])
-        .trim_end_matches(ADD_WORKSPACE)
-        .trim_end()
-        .to_owned()
-}
-
-/// Names a Workspace the way a reader does: open the entry, type the path,
-/// and offer it.
-fn add_workspace(application: &mut Application, path: &str) -> ApplicationTransition {
-    press_add_workspace(application);
-    type_terminal_text(application, path);
-    press_sidebar_key(application, KeyCode::Enter)
 }
 
 /// The Sidebar stays truthful without the reader asking: every change the

@@ -1335,12 +1335,23 @@ impl Sidebar {
         SidebarActivation::Answered
     }
 
-    /// Takes the Workspace this client has moved to, which the reader named at
-    /// the path entry.
+    /// Takes the Workspace this client has moved to, however it moved.
     ///
-    /// The Sidebar narrows to it: a reader who has just said where they work is
-    /// saying which work they mean, and the settled shelf opens on its first
-    /// rows again as it does under any other narrowing. Nothing is asked of the
+    /// Only what "where I am" means moves with it: the selector's entries and
+    /// a scope narrowed to the current Workspace are derived from the
+    /// listing's reading of it. The scope the reader chose is left exactly
+    /// where they put it — switching Workspaces is navigation, and narrowing
+    /// the column is a view they configured — so re-pointing it is the
+    /// separate act [`Self::narrow_to_workspace`] is for.
+    pub(super) fn adopt_workspace(&mut self, workspace: PathBuf) {
+        self.listing.adopt_current_workspace(workspace);
+    }
+
+    /// Narrows the Sidebar to the Workspace the reader named at its own path
+    /// entry, which is the one switch that re-points the column with it: a
+    /// reader who has just said where they work, in the Sidebar, is saying
+    /// which work they mean. The settled shelf opens on its first rows again
+    /// as it does under any other narrowing, and nothing is asked of the
     /// server — the listing is the whole body of work either way.
     ///
     /// The row left marked is the selector, which now says where they are. It
@@ -1348,8 +1359,7 @@ impl Sidebar {
     /// handed the keys back to the composer: it says where Enter would land
     /// were the reader to come back, which is what that mark says everywhere
     /// else in the column.
-    pub(super) fn adopt_workspace(&mut self, workspace: PathBuf) {
-        self.listing.adopt_current_workspace(workspace.clone());
+    pub(super) fn narrow_to_workspace(&mut self, workspace: PathBuf) {
         self.choose_scope(WorkspaceScope::Workspace(workspace));
         self.selected = Some(SidebarSelection::Selector);
     }

@@ -1,19 +1,25 @@
 //! The Workspace Picker: opening it, the Workspaces it puts on offer, the
-//! order it stands them in, and walking away from it unchanged.
+//! order it stands them in, choosing one, and walking away from it unchanged.
 
 use std::path::{Path, PathBuf};
 
 use crate::support::{
-    connected_application, noncanonical_spelling, rendered_application_rows,
-    rendered_application_rows_at, rendered_row, type_terminal_text, workspace_dir,
+    SIDEBAR_WIDE, add_workspace, connected_application, deliver_settings, drawn_in_sidebar,
+    enter_active_session, fixture_instance_id, noncanonical_spelling, ready_health,
+    rendered_application_rows, rendered_application_rows_at, rendered_row, selector_label,
+    sidebar_column, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use suru::{
+    managed_client::ManagedEvent,
     protocol::{
-        ModelAvailability, Session, SessionId, SessionListItem, SessionStatus, SessionSummary,
-        SessionTimestamp, Workspace,
+        AgentSelection, EffectiveSettings, ModelAvailability, ModelId, ProviderId, Session,
+        SessionId, SessionListItem, SessionStatus, SessionSummary, SessionTimestamp,
+        SidebarSettings, SidebarVisibility, SkillCatalog, SkillCatalogCapabilities,
+        SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery,
+        Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -393,6 +399,301 @@ fn a_press_over_the_rows_moves_nothing() {
     assert_eq!(rendered_application_rows(&application), before);
 }
 
+/// The whole of the switch: Enter on a row takes the reader out of the picker
+/// and puts them on the Landing of the Workspace they chose, ready to write
+/// the first Prompt of a Session rooted there.
+#[test]
+fn enter_closes_the_picker_and_shows_the_landing_of_the_workspace_chosen() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["work", "atlas"]);
+    let mut application = connected_application(&here);
+
+    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "atlas");
+
+    assert_eq!(
+        choose(&mut application),
+        ApplicationTransition::Continue,
+        "with no Session open there is nothing to leave behind, and the switch \
+         itself asks the server for nothing"
+    );
+
+    // Wide enough for the footer to spell the Workspace rather than truncate it.
+    let landing = rendered_application_rows_at(&application, 120, 20).join("\n");
+    assert!(
+        !landing.contains("Workspaces"),
+        "the picker is done with: {landing}"
+    );
+    assert!(
+        landing.contains("What would you like to work on?"),
+        "the Landing stands in its place: {landing}"
+    );
+    assert!(
+        landing.contains(atlas.to_string_lossy().as_ref()),
+        "and it stands in the Workspace the reader chose: {landing}"
+    );
+}
+
+/// Choosing a Workspace is choosing where the work goes: the Session made
+/// next is rooted there rather than where the client was launched.
+#[test]
+fn the_workspace_the_reader_chose_roots_the_sessions_they_make_next() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["work", "atlas"]);
+    let mut application = connected_application(&here);
+
+    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    press(&mut application, KeyCode::Down);
+    choose(&mut application);
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Initial Prompt".to_owned(),
+        )))
+        .expect("type an initial Prompt");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the initial Prompt")
+    else {
+        panic!("a Landing submission creates a Session");
+    };
+    assert_eq!(request.workspace.path, atlas);
+}
+
+/// The Skills on offer are the picked Workspace's: the catalog the client was
+/// holding answers for a Workspace the reader has left, and the one answered
+/// for where they are now is what the composer completes from.
+#[test]
+fn the_skill_catalog_answers_for_the_workspace_the_reader_chose() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["work", "atlas"]);
+    let mut application = application_choosing_skills(&here);
+    load_skills(&mut application, &here, "review");
+
+    type_terminal_text(&mut application, "$rev");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("$review"),
+        "the Workspace the client launched in answers for its own Skills"
+    );
+
+    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    press(&mut application, KeyCode::Down);
+    choose(&mut application);
+
+    type_terminal_text(&mut application, "$rev");
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("$review"),
+        "the catalog the client held answers for a Workspace the reader has left"
+    );
+
+    load_skills(&mut application, &atlas, "revise");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("$revise"),
+        "and the Skill Catalog the client now asks for is the picked Workspace's"
+    );
+}
+
+/// "Where I am" is one idea across the client: the session picker's own
+/// narrowing follows the reader to the Workspace they chose.
+#[test]
+fn the_session_pickers_current_workspace_scope_comes_to_mean_the_chosen_workspace() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["work", "atlas"]);
+    let mut application = connected_application(&here);
+
+    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    press(&mut application, KeyCode::Down);
+    choose(&mut application);
+
+    let ApplicationTransition::ListSessions(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionList,
+        )))
+        .expect("open the session picker")
+    else {
+        panic!("opening the session picker asks for its Sessions");
+    };
+    assert_eq!(request.surface(), SessionListSurface::SessionPicker);
+    assert_eq!(
+        request.scope(),
+        &SessionListScope::CurrentWorkspace(atlas),
+        "the picker's current-Workspace scope means the Workspace the reader chose"
+    );
+}
+
+/// A path typed at the Sidebar's entry is read from the Workspace the reader
+/// is working in, and after a switch that is the Workspace they chose.
+#[test]
+fn a_relative_path_at_the_sidebars_entry_reads_from_the_chosen_workspace() {
+    let root = workspace_dir();
+    let atlas = root.path().join("atlas");
+    let notes = atlas.join("notes");
+    std::fs::create_dir_all(&notes).expect("create the directories the reader moves between");
+    let mut application = connected_application(root.path());
+    show_sidebar(&mut application, Vec::new());
+
+    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    press(&mut application, KeyCode::Down);
+    choose(&mut application);
+
+    add_workspace(&mut application, "notes");
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Initial Prompt".to_owned(),
+        )))
+        .expect("type an initial Prompt");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the initial Prompt")
+    else {
+        panic!("a Landing submission creates a Session");
+    };
+    assert_eq!(
+        request.workspace.path, notes,
+        "the relative path was read from the Workspace the reader chose in the picker, \
+         not from the one the client was launched in"
+    );
+}
+
+/// The one thing a switch leaves alone. The Sidebar's scope is a view the
+/// reader configured, and switching Workspaces is navigation rather than
+/// narrowing, so the column goes on showing what they asked it to show.
+#[test]
+fn the_sidebars_chosen_scope_is_left_where_the_reader_put_it() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["work", "atlas"]);
+    let mut application = connected_application(&here);
+    show_sidebar(
+        &mut application,
+        vec![
+            rooted("Work where I am", &here, 20),
+            rooted("Work elsewhere", &atlas, 30),
+        ],
+    );
+
+    open_picker_with(
+        &mut application,
+        vec![
+            rooted("Work where I am", &here, 20),
+            rooted("Work elsewhere", &atlas, 30),
+        ],
+    );
+    press(&mut application, KeyCode::Down);
+    choose(&mut application);
+
+    let rows = rendered_application_rows_at(&application, SIDEBAR_WIDE, 20);
+    assert_eq!(
+        selector_label(&rows),
+        "▸ All Workspaces",
+        "the switch left the Sidebar answering for the whole body of work: {rows:?}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Work where I am"),
+        "including the Sessions of the Workspace the reader left: {rows:?}"
+    );
+    assert!(drawn_in_sidebar(&rows, "Work elsewhere"), "{rows:?}");
+}
+
+/// Leaving an open Session is plain navigation: nothing is asked of the
+/// reader, nothing is asked of the server about the Turn, and the Session goes
+/// on working where it stands.
+#[test]
+fn an_open_session_is_left_working_and_listed_and_nothing_is_asked() {
+    let root = workspace_dir();
+    let atlas = workspace(&["work", "atlas"]);
+    let mut application = connected_application(root.path());
+    let (session_id, ..) = enter_active_session(&mut application, root.path());
+    show_sidebar(
+        &mut application,
+        vec![working("Long-running work", session_id, root.path())],
+    );
+
+    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    press(&mut application, KeyCode::Down);
+
+    assert_eq!(
+        choose(&mut application),
+        ApplicationTransition::DetachSession,
+        "the client stops watching the Session; the Turn is neither interrupted \
+         nor confirmed away"
+    );
+
+    let rows = rendered_application_rows_at(&application, SIDEBAR_WIDE, 20);
+    let frame = rows.join("\n");
+    assert!(
+        frame.contains("What would you like to work on?"),
+        "the Landing stands where the Session was, with nothing asked in between: {frame}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Long-running work"),
+        "the Session the reader left is still listed: {rows:?}"
+    );
+    assert!(
+        sidebar_text(&rows).contains("Working"),
+        "and it is still working: {rows:?}"
+    );
+}
+
+/// The command doubles as "take me to a fresh start here": choosing the
+/// Workspace the client is already in opens the Landing rather than doing
+/// nothing.
+#[test]
+fn choosing_the_workspace_the_client_is_already_in_opens_the_landing() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["work", "atlas"]);
+    let mut application = connected_application(&here);
+
+    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    assert_eq!(
+        selected_row(&application),
+        "here",
+        "the picker opens on the Workspace the reader is in"
+    );
+
+    assert_eq!(choose(&mut application), ApplicationTransition::Continue);
+
+    let landing = rendered_application_rows_at(&application, 120, 20).join("\n");
+    assert!(
+        !landing.contains("Workspaces"),
+        "the picker is done with: {landing}"
+    );
+    assert!(
+        landing.contains("What would you like to work on?"),
+        "{landing}"
+    );
+    assert!(
+        landing.contains(here.to_string_lossy().as_ref()),
+        "and the Workspace is where it was: {landing}"
+    );
+}
+
+/// Enter before the listing lands names no Workspace, so it chooses none: the
+/// picker stands on its loading line rather than switching to whatever row
+/// would have stood first.
+#[test]
+fn enter_while_the_listing_is_on_its_way_chooses_nothing() {
+    let here = workspace(&["work", "here"]);
+    let mut application = connected_application(&here);
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::WorkspaceList,
+        )))
+        .expect("open the Workspace Picker");
+
+    assert_eq!(choose(&mut application), ApplicationTransition::Continue);
+
+    let picker = rendered_application_rows(&application).join("\n");
+    assert!(picker.contains("Loading Workspaces"), "{picker}");
+}
+
 /// A Workspace path rooted per platform, so a fixture reads as an absolute
 /// path on Windows as readily as on Unix — `Path::is_absolute` is
 /// platform-defined, and a Workspace is always somewhere absolute.
@@ -469,7 +770,7 @@ fn picker_rows(application: &Application) -> Vec<String> {
 fn picker_rows_at(application: &Application, width: u16, height: u16) -> Vec<String> {
     let rows = rendered_application_rows_at(application, width, height);
     let title = rendered_row(&rows, " Workspaces ");
-    let footer = rendered_row(&rows, "Esc close");
+    let footer = rendered_row(&rows, "Esc");
     rows[title + 1..footer]
         .iter()
         .map(|row| row.trim_matches(['│', ' ']).to_owned())
@@ -491,4 +792,113 @@ fn selected_row(application: &Application) -> String {
         .next()
         .expect("a marked row names a Workspace")
         .to_owned()
+}
+
+/// Enter on the row the reader is on, which is how a Workspace is chosen.
+fn choose(application: &mut Application) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("choose the Workspace the reader is on")
+}
+
+/// A listed Session mid-Turn, named by the Session it stands for so a frame
+/// can be read for the Session the reader left rather than for any row. Its
+/// times are read off the clock, because a Sidebar shelves a Session by how
+/// long ago it last moved.
+fn working(title: &str, session_id: SessionId, workspace: &Path) -> SessionListItem {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("read the clock")
+        .as_millis()
+        .try_into()
+        .expect("the clock fits a Session timestamp");
+    let SessionListItem::Readable(mut summary) = rooted(title, workspace, now) else {
+        unreachable!("the fixture builds a readable Session");
+    };
+    summary.session.id = session_id;
+    summary.session.status = SessionStatus::Active;
+    summary.working_since = Some(SessionTimestamp(now.saturating_sub(90 * 1_000)));
+    SessionListItem::Readable(summary)
+}
+
+/// A client whose Landing has an Agent chosen, which is what it takes for a
+/// Skill Catalog to be asked for at all.
+fn application_choosing_skills(workspace: &Path) -> Application {
+    let mut application = Application::new(workspace);
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(fixture_instance_id(), 42_424).with_landing_agent_selection(Some(
+                AgentSelection {
+                    provider: ProviderId::new("codex"),
+                    model: ModelId::new("gpt-fixture"),
+                    options: Vec::new(),
+                },
+            )),
+        )))
+        .expect("connect a client with an Agent chosen");
+    application
+}
+
+/// The Skill Catalog the server answers with for one Workspace, holding the
+/// one Skill named — which is how a frame says which Workspace the catalog on
+/// offer answers for.
+fn load_skills(application: &mut Application, workspace: &Path, skill: &str) {
+    let request = SkillCatalogRequest {
+        provider: ProviderId::new("codex"),
+        workspace: Workspace {
+            path: workspace.to_owned(),
+        },
+    };
+    application
+        .handle_event(ApplicationEvent::SkillsListed {
+            request: request.clone(),
+            catalog: SkillCatalog {
+                provider: request.provider.clone(),
+                workspace: request.workspace.clone(),
+                skills: vec![SkillDescriptor {
+                    id: SkillId::new(skill),
+                    name: skill.to_owned(),
+                    description: format!("{skill} the current change"),
+                    scope: Some("Workspace".to_owned()),
+                }],
+                capabilities: SkillCatalogCapabilities {
+                    max_distinct_invocations: None,
+                    supported_deliveries: vec![SkillPromptDelivery::Initial],
+                },
+                status: SkillCatalogStatus::Fresh { warning: None },
+            },
+        })
+        .expect("load the Skill Catalog");
+}
+
+/// The Sidebar on screen and answered with `sessions`, which is what it takes
+/// to read the scope it stands under or the Sessions it lists.
+fn show_sidebar(application: &mut Application, sessions: Vec<SessionListItem>) {
+    let transition = deliver_settings(
+        application,
+        EffectiveSettings {
+            sidebar: SidebarSettings {
+                initial_visibility: SidebarVisibility::Shown,
+                ..SidebarSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+    );
+    let ApplicationTransition::ListSessions(request) = transition else {
+        panic!("a Sidebar coming into view asks for its Sessions, not {transition:?}");
+    };
+    assert_eq!(request.surface(), SessionListSurface::Sidebar);
+    application
+        .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+        .expect("hydrate the Sidebar");
+}
+
+fn sidebar_text(rows: &[String]) -> String {
+    rows.iter()
+        .map(|row| sidebar_column(row))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

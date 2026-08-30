@@ -328,10 +328,16 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
         );
     }
     if shows_footer && lines.len() < content_height {
-        // Choosing a Workspace is not built yet, so the footer offers only
-        // what the picker answers: backing out of it.
+        // Named in full where the box can hold it, and by the keys alone where
+        // it cannot — the same trade the rows make of "[current]" for "C", so
+        // a narrow terminal loses wording rather than an affordance.
+        let footer = if content_width < usize::from(NARROW_TERMINAL_WIDTH) {
+            "Enter · Esc"
+        } else {
+            "Enter switch · Esc close"
+        };
         lines.push(Line::styled(
-            truncate_to_width("Esc close", content_width),
+            truncate_to_width(footer, content_width),
             theme.text.subdued,
         ));
     }

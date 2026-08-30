@@ -1,6 +1,8 @@
 //! Fixtures and rendering helpers shared by more than one area of the TUI tests.
 
-use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{
     Frame, Terminal,
     backend::TestBackend,
@@ -10,11 +12,11 @@ use ratatui::{
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
-        Activity, ActivityId, AgentSelection, Health, LifecycleState, Message, MessageId,
-        MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId, Prompt,
+        Activity, ActivityId, AgentSelection, EffectiveSettings, Health, LifecycleState, Message,
+        MessageId, MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId, Prompt,
         PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, ServerIdentity, Session,
-        SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus, TranscriptItem,
-        Turn, TurnId, TurnStatus, Workspace,
+        SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
+        SettingsSnapshot, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId},
 };
@@ -164,6 +166,97 @@ pub fn connected_application(workspace: &std::path::Path) -> Application {
         )))
         .expect("connect application");
     application
+}
+
+/// Hands the client the effective-settings snapshot the server answers with,
+/// which is how every Setting a rendering test leans on comes into force.
+pub fn deliver_settings(
+    application: &mut Application,
+    settings: EffectiveSettings,
+) -> ApplicationTransition {
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
+                settings,
+                pinned: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+        )))
+        .expect("receive the effective-settings snapshot")
+}
+
+// The Sidebar as a rendering test reads it: the column's own geometry, what its
+// selector says, and the path entry the add-Workspace affordance opens. Every
+// test that reads a Sidebar shares these, because the geometry is the frame's
+// rather than any one area's.
+
+/// Wide enough for the Sidebar and a main view both.
+pub const SIDEBAR_WIDE: u16 = 100;
+
+/// Tall enough that the rows a press lands on are drawn.
+pub const SIDEBAR_PRESS_HEIGHT: u16 = 20;
+
+/// The screen row the selector and its add-Workspace affordance share, which
+/// is the line under the Sidebar's search box.
+pub const SELECTOR_ROW: u16 = 1;
+
+/// What the add-Workspace affordance is drawn as, beside the selector on its
+/// own line.
+pub const ADD_WORKSPACE: char = '+';
+
+/// The Sidebar's own columns of one rendered row, trimmed of the padding that
+/// holds them apart from the main view beside them.
+pub fn sidebar_column(row: &str) -> String {
+    row.chars()
+        .take_while(|character| *character != '\u{2502}')
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+pub fn drawn_in_sidebar(rows: &[String], needle: &str) -> bool {
+    rows.iter().any(|row| sidebar_column(row).contains(needle))
+}
+
+/// What the selector says, read off the label region of the line it shares
+/// with the add-Workspace affordance.
+pub fn selector_label(rows: &[String]) -> String {
+    sidebar_column(&rows[usize::from(SELECTOR_ROW)])
+        .trim_end_matches(ADD_WORKSPACE)
+        .trim_end()
+        .to_owned()
+}
+
+/// Opens the path entry the way a pointer does: a press on the affordance at
+/// the right of the selector's own line, read off the frame so it lands where
+/// the reader would point.
+pub fn press_add_workspace(application: &mut Application) -> ApplicationTransition {
+    let rows = rendered_application_rows_at(application, SIDEBAR_WIDE, SIDEBAR_PRESS_HEIGHT);
+    let column = rows[usize::from(SELECTOR_ROW)]
+        .chars()
+        .position(|character| character == ADD_WORKSPACE)
+        .expect("the affordance is drawn beside the selector");
+    application
+        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: column.try_into().expect("the column fits a screen column"),
+            row: SELECTOR_ROW,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("press the add-Workspace affordance")
+}
+
+/// Names a Workspace the way a reader does: open the path entry, type the
+/// path, and offer it.
+pub fn add_workspace(application: &mut Application, path: &str) -> ApplicationTransition {
+    press_add_workspace(application);
+    type_terminal_text(application, path);
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("offer the path the reader typed")
 }
 
 pub fn type_terminal_text(application: &mut Application, text: &str) {

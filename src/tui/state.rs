@@ -427,12 +427,18 @@ impl TuiState {
     }
 
     /// Takes the Workspace this client works in, which the reader moved by
-    /// naming a directory in the Sidebar.
+    /// choosing one in the Workspace Picker or by naming a directory in the
+    /// Sidebar.
     ///
-    /// It is where the Sessions they make next are rooted and what
-    /// current-Workspace scope comes to mean, so every surface holding a
+    /// It is where the Sessions they make next are rooted, the Workspace the
+    /// Skill Catalog answers for, what current-Workspace scope comes to mean,
+    /// and the base a relative path is read from, so every surface holding a
     /// reading of it is given the new one here rather than being left to
     /// answer for a Workspace the reader has left.
+    ///
+    /// Adoption is all this is. The Sidebar's own scope is the reader's to
+    /// choose, and the path entry re-points it separately, so nothing here
+    /// rearranges a column they configured.
     fn adopt_workspace(&mut self, workspace: PathBuf) {
         self.workspace = workspace.clone();
         self.session_picker.adopt_workspace(workspace.clone());
@@ -1955,7 +1961,9 @@ impl Application {
     }
 
     /// Commands that begin a Turn or retarget the Agent wait for an in-flight
-    /// Agent Selection update instead of racing it.
+    /// Agent Selection update instead of racing it. Choosing a Workspace is one
+    /// of them: it opens the Landing, which takes over the Agent Selection from
+    /// the Session being left.
     fn defers_for_agent_selection(&self, command: &CommandId) -> bool {
         self.state.selection_update_pending()
             && matches!(
@@ -1963,6 +1971,7 @@ impl Application {
                 CommandId::SubmitSteer
                     | CommandId::SubmitQueue
                     | CommandId::SelectSession
+                    | CommandId::SelectWorkspace
                     | CommandId::SelectModel
                     | CommandId::InvokeSemantic(
                         SemanticCommandId::SessionList
@@ -2101,9 +2110,16 @@ impl Application {
             CommandId::PagePreviousWorkspaces => self.state.workspace_picker.page_previous(),
             CommandId::PageNextWorkspaces => self.state.workspace_picker.page_next(),
             CommandId::CloseWorkspacePicker => self.state.workspace_picker.close(),
-            // Choosing a Workspace is its own piece of work: until then the
-            // reader can walk the rows and back out, and Enter leaves
-            // everything where it stands.
+            // Choosing a Workspace adopts it in full and lands the reader in
+            // it. Before the listing arrives no row is the reader's, so there
+            // is nothing to choose and the picker stands on its loading line.
+            CommandId::SelectWorkspace => {
+                if let Some(workspace) = self.state.workspace_picker.selected() {
+                    self.state.workspace_picker.close();
+                    self.state.adopt_workspace(workspace);
+                    return self.open_landing();
+                }
+            }
             _ => {}
         }
         ApplicationTransition::Continue
@@ -2267,8 +2283,13 @@ impl Application {
                     SidebarActivation::Attach(session_id) => {
                         ApplicationTransition::AttachSession(session_id)
                     }
+                    // The path entry is a local act inside the Sidebar as
+                    // well as a switch, so it does both: the client moves, and
+                    // the column the reader typed into narrows to what they
+                    // just said they meant.
                     SidebarActivation::Workspace(workspace) => {
-                        self.state.adopt_workspace(workspace);
+                        self.state.adopt_workspace(workspace.clone());
+                        self.state.sidebar.narrow_to_workspace(workspace);
                         ApplicationTransition::Continue
                     }
                 };
@@ -2865,29 +2886,38 @@ impl Application {
                     ApplicationTransition::DeleteSession,
                 ))
             }
-            SemanticCommandId::SessionNew => {
-                let inherited_selection = self.state.agent_selection().cloned();
-                let source = self.state.composer_key();
-                self.state.composers.clear(source);
-                self.state.composers.clear(ComposerKey::Landing);
-                self.state.submission_error = None;
-                self.state.command_mode = CommandMode::Composer;
-                let detached = self.state.session.take().is_some();
-                if detached {
-                    self.state.landing_agent_selection = inherited_selection.clone();
-                    self.state.confirmed_landing_agent_selection = inherited_selection;
-                    self.state.pending_landing_agent_selection = None;
-                    self.state.queued_landing_agent_selection = None;
-                    self.state.confirmed_agent_selection = None;
-                }
-                self.state.session_events_blocked = detached;
-                self.state.sync_composer_completion();
-                Ok(if detached {
-                    ApplicationTransition::DetachSession
-                } else {
-                    ApplicationTransition::Continue
-                })
-            }
+            SemanticCommandId::SessionNew => Ok(self.open_landing()),
+        }
+    }
+
+    /// Opens the Landing: a cleared composer standing ready for the first
+    /// Prompt of a Session in the Workspace this client works in, carrying
+    /// over whatever Agent was chosen for the Session being left.
+    ///
+    /// A Session open when it opens is left where it stands — still listed,
+    /// and still working if it is mid-Turn. Only this client stops watching
+    /// it, which is why nothing is asked before it happens.
+    fn open_landing(&mut self) -> ApplicationTransition {
+        let inherited_selection = self.state.agent_selection().cloned();
+        let source = self.state.composer_key();
+        self.state.composers.clear(source);
+        self.state.composers.clear(ComposerKey::Landing);
+        self.state.submission_error = None;
+        self.state.command_mode = CommandMode::Composer;
+        let detached = self.state.session.take().is_some();
+        if detached {
+            self.state.landing_agent_selection = inherited_selection.clone();
+            self.state.confirmed_landing_agent_selection = inherited_selection;
+            self.state.pending_landing_agent_selection = None;
+            self.state.queued_landing_agent_selection = None;
+            self.state.confirmed_agent_selection = None;
+        }
+        self.state.session_events_blocked = detached;
+        self.state.sync_composer_completion();
+        if detached {
+            ApplicationTransition::DetachSession
+        } else {
+            ApplicationTransition::Continue
         }
     }
 

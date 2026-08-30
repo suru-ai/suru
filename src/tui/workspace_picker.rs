@@ -118,6 +118,13 @@ impl WorkspacePicker {
         self.listing.awaits(request)
     }
 
+    /// The Workspace the row the reader is on names, which is the one choosing
+    /// takes. There is none while the listing is on its way: no row is marked,
+    /// so Enter names nothing rather than naming whatever would stand first.
+    pub(super) fn selected(&self) -> Option<PathBuf> {
+        self.selected.clone()
+    }
+
     pub(super) fn select_previous(&mut self) {
         self.move_selection(-1);
     }
