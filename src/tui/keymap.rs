@@ -170,6 +170,10 @@ pub(super) fn command_for_model_picker_event(event: InputEvent) -> Option<Comman
     command_for_picker_event(event, &MODEL_PICKER_COMMANDS)
 }
 
+pub(super) fn command_for_workspace_picker_event(event: InputEvent) -> Option<CommandId> {
+    command_for_picker_event(event, &WORKSPACE_PICKER_COMMANDS)
+}
+
 /// The Sidebar has the keyboard and not the mouse. Up and Down move through
 /// the rows, Enter opens the Session the reader is on, Esc backs out of the
 /// Sidebar a step at a time, and the toggle closes it from inside as readily
@@ -376,9 +380,16 @@ struct PickerCommandBindings {
     page_next: CommandId,
     select: CommandId,
     close: CommandId,
+    /// The keys that narrow the list by what the reader types, where the
+    /// picker narrows that way at all. A picker that offers a fixed list binds
+    /// none, and a letter typed at it reaches nothing.
+    search: Option<PickerSearchBindings>,
+    toggle_scope: Option<CommandId>,
+}
+
+struct PickerSearchBindings {
     delete_backward: CommandId,
     insert: fn(String) -> CommandId,
-    toggle_scope: Option<CommandId>,
 }
 
 const SESSION_PICKER_COMMANDS: PickerCommandBindings = PickerCommandBindings {
@@ -388,8 +399,10 @@ const SESSION_PICKER_COMMANDS: PickerCommandBindings = PickerCommandBindings {
     page_next: CommandId::PageNextSessions,
     select: CommandId::SelectSession,
     close: CommandId::CloseSessionPicker,
-    delete_backward: CommandId::DeleteSessionSearchBackward,
-    insert: CommandId::InsertSessionSearch,
+    search: Some(PickerSearchBindings {
+        delete_backward: CommandId::DeleteSessionSearchBackward,
+        insert: CommandId::InsertSessionSearch,
+    }),
     toggle_scope: Some(CommandId::ToggleSessionScope),
 };
 
@@ -400,8 +413,27 @@ const MODEL_PICKER_COMMANDS: PickerCommandBindings = PickerCommandBindings {
     page_next: CommandId::PageNextModels,
     select: CommandId::SelectModel,
     close: CommandId::CloseModelPicker,
-    delete_backward: CommandId::DeleteModelSearchBackward,
-    insert: CommandId::InsertModelSearch,
+    search: Some(PickerSearchBindings {
+        delete_backward: CommandId::DeleteModelSearchBackward,
+        insert: CommandId::InsertModelSearch,
+    }),
+    toggle_scope: None,
+};
+
+/// The Workspace Picker answers the keys every picker answers — the arrows and
+/// paging keys walk its rows, Esc closes, and Enter names the row the reader
+/// is on, which nothing acts on until choosing a Workspace is built — and the
+/// pointer as the session picker's rows answer it. It offers the Workspaces a
+/// listing derives rather than a searchable body of work, so nothing here
+/// narrows it by typing yet.
+const WORKSPACE_PICKER_COMMANDS: PickerCommandBindings = PickerCommandBindings {
+    previous: CommandId::SelectPreviousWorkspace,
+    next: CommandId::SelectNextWorkspace,
+    page_previous: CommandId::PagePreviousWorkspaces,
+    page_next: CommandId::PageNextWorkspaces,
+    select: CommandId::SelectWorkspace,
+    close: CommandId::CloseWorkspacePicker,
+    search: None,
     toggle_scope: None,
 };
 
@@ -423,9 +455,12 @@ fn command_for_picker_event(
             (KeyCode::Char('a'), KeyModifiers::CONTROL) => bindings.toggle_scope.clone(),
             (KeyCode::Enter, KeyModifiers::NONE) => Some(bindings.select.clone()),
             (KeyCode::Esc, KeyModifiers::NONE) => Some(bindings.close.clone()),
-            _ => command_for_search_key(key, &bindings.delete_backward, bindings.insert),
+            _ => {
+                let search = bindings.search.as_ref()?;
+                command_for_search_key(key, &search.delete_backward, search.insert)
+            }
         },
-        InputEvent::Paste(text) => Some((bindings.insert)(text)),
+        InputEvent::Paste(text) => bindings.search.as_ref().map(|search| (search.insert)(text)),
         _ => None,
     }
 }

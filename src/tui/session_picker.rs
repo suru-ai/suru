@@ -43,7 +43,7 @@ impl SessionPicker {
     pub(super) fn new(current_workspace: std::path::PathBuf) -> Self {
         Self {
             open: false,
-            listing: SessionListing::new(SessionListSurface::Picker, current_workspace),
+            listing: SessionListing::new(SessionListSurface::SessionPicker, current_workspace),
             query: String::new(),
             selected: None,
             attaching: None,

@@ -39,7 +39,7 @@ use super::{
         command_for_session_picker_event, command_for_settings_panel_event,
         command_for_sidebar_event, command_for_sidebar_menu_event,
         command_for_subagent_picker_event, command_for_subagent_view_event,
-        command_for_terminal_event,
+        command_for_terminal_event, command_for_workspace_picker_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
@@ -54,6 +54,7 @@ use super::{
         FoldDisclosure, FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups,
         TranscriptTurnFolds, UnitKey, UnitStart,
     },
+    workspace_picker::WorkspacePicker,
 };
 
 /// Rows scrolled per mouse wheel tick, matching common terminal conventions.
@@ -112,13 +113,18 @@ impl SessionListScope {
     }
 }
 
-/// Which surface a Session listing answers. Two of them list Sessions at once —
-/// the picker over the main view and the Sidebar beside it — so every request
-/// names its own, and neither surface can take the other's reply for one of
-/// its own.
+/// Which surface a Session listing answers. Several of them list Sessions at
+/// once — the two pickers over the main view and the Sidebar beside it — so
+/// every request names its own, and no surface can take another's reply for
+/// one of its own.
+///
+/// The Workspace Picker lists Sessions for what they say about where work is
+/// rooted rather than to offer the Sessions themselves, but it asks the same
+/// question of the same server, so it asks through the same listing.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SessionListSurface {
-    Picker,
+    SessionPicker,
+    WorkspacePicker,
     Sidebar,
 }
 
@@ -308,6 +314,7 @@ pub struct TuiState {
     pub(super) model_options: ModelOptions,
     pub(super) model_picker: ModelPicker,
     pub(super) session_picker: SessionPicker,
+    pub(super) workspace_picker: WorkspacePicker,
     pub(super) subagent_picker: SubagentPicker,
     pub(super) sidebar: Sidebar,
     pub(super) settings_panel: SettingsPanel,
@@ -412,6 +419,7 @@ impl TuiState {
             model_options: ModelOptions::default(),
             model_picker: ModelPicker::default(),
             session_picker: SessionPicker::new(workspace.clone()),
+            workspace_picker: WorkspacePicker::new(workspace.clone()),
             subagent_picker: SubagentPicker::default(),
             sidebar: Sidebar::new(workspace),
             settings_panel: SettingsPanel::default(),
@@ -428,6 +436,7 @@ impl TuiState {
     fn adopt_workspace(&mut self, workspace: PathBuf) {
         self.workspace = workspace.clone();
         self.session_picker.adopt_workspace(workspace.clone());
+        self.workspace_picker.adopt_workspace(workspace.clone());
         self.sidebar.adopt_workspace(workspace);
     }
 
@@ -1634,6 +1643,12 @@ pub enum CommandId {
     PageNextModels,
     SelectModel,
     CloseModelPicker,
+    SelectPreviousWorkspace,
+    SelectNextWorkspace,
+    PagePreviousWorkspaces,
+    PageNextWorkspaces,
+    SelectWorkspace,
+    CloseWorkspacePicker,
     SelectPreviousSubagent,
     SelectNextSubagent,
     OpenSelectedSubagent,
@@ -1781,9 +1796,12 @@ impl Application {
             }
             ApplicationEvent::SessionsListed { request, sessions } => {
                 match request.surface() {
-                    SessionListSurface::Picker => {
+                    SessionListSurface::SessionPicker => {
                         let current = self.session_id();
                         self.state.session_picker.load(&request, sessions, current);
+                    }
+                    SessionListSurface::WorkspacePicker => {
+                        self.state.workspace_picker.load(&request, sessions);
                     }
                     SessionListSurface::Sidebar => {
                         let current = self.session_id();
@@ -1794,8 +1812,11 @@ impl Application {
             }
             ApplicationEvent::SessionListingFailed { request, error } => {
                 match request.surface() {
-                    SessionListSurface::Picker => {
+                    SessionListSurface::SessionPicker => {
                         self.state.session_picker.fail_listing(&request, error);
+                    }
+                    SessionListSurface::WorkspacePicker => {
+                        self.state.workspace_picker.fail_listing(&request, error);
                     }
                     SessionListSurface::Sidebar => self.state.sidebar.fail_listing(&request, error),
                 }
@@ -1902,6 +1923,12 @@ impl Application {
             | CommandId::PageNextModels
             | CommandId::SelectModel
             | CommandId::CloseModelPicker) => self.handle_model_picker_command(command),
+            command @ (CommandId::SelectPreviousWorkspace
+            | CommandId::SelectNextWorkspace
+            | CommandId::PagePreviousWorkspaces
+            | CommandId::PageNextWorkspaces
+            | CommandId::SelectWorkspace
+            | CommandId::CloseWorkspacePicker) => Ok(self.handle_workspace_picker_command(command)),
             command @ (CommandId::SelectPreviousSubagent
             | CommandId::SelectNextSubagent
             | CommandId::OpenSelectedSubagent
@@ -2062,6 +2089,23 @@ impl Application {
             SidebarPress::Invoke(invocation) => self.invoke_semantic(invocation),
             SidebarPress::Answered | SidebarPress::Elsewhere => Ok(ApplicationTransition::Continue),
         }
+    }
+
+    /// Handles the Workspace Picker's commands; any other command leaves the
+    /// picker alone.
+    fn handle_workspace_picker_command(&mut self, command: CommandId) -> ApplicationTransition {
+        match command {
+            CommandId::SelectPreviousWorkspace => self.state.workspace_picker.select_previous(),
+            CommandId::SelectNextWorkspace => self.state.workspace_picker.select_next(),
+            CommandId::PagePreviousWorkspaces => self.state.workspace_picker.page_previous(),
+            CommandId::PageNextWorkspaces => self.state.workspace_picker.page_next(),
+            CommandId::CloseWorkspacePicker => self.state.workspace_picker.close(),
+            // Choosing a Workspace is its own piece of work: until then the
+            // reader can walk the rows and back out, and Enter leaves
+            // everything where it stands.
+            _ => {}
+        }
+        ApplicationTransition::Continue
     }
 
     /// Handles the Subagent Picker's commands; any other command leaves the
@@ -2711,6 +2755,11 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::ListSessions(request))
             }
+            SemanticCommandId::WorkspaceList => {
+                let request = self.state.workspace_picker.open();
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::ListSessions(request))
+            }
             SemanticCommandId::TranscriptFoldsToggle => {
                 self.state.toggle_fold_posture();
                 self.state.command_mode = CommandMode::Composer;
@@ -3164,7 +3213,12 @@ impl Application {
         sessions: &[SessionListItem],
     ) -> bool {
         match request.surface() {
-            SessionListSurface::Picker => self.state.session_picker.would_move(request, sessions),
+            SessionListSurface::SessionPicker => {
+                self.state.session_picker.would_move(request, sessions)
+            }
+            SessionListSurface::WorkspacePicker => {
+                self.state.workspace_picker.would_move(request, sessions)
+            }
             SessionListSurface::Sidebar => self.state.sidebar.would_move(request, sessions),
         }
     }
@@ -3174,7 +3228,10 @@ impl Application {
     /// nowhere, so it moves nothing on screen — a refusal included.
     pub fn awaits_listing(&self, request: &SessionListRequest) -> bool {
         match request.surface() {
-            SessionListSurface::Picker => self.state.session_picker.awaits_listing(request),
+            SessionListSurface::SessionPicker => self.state.session_picker.awaits_listing(request),
+            SessionListSurface::WorkspacePicker => {
+                self.state.workspace_picker.awaits_listing(request)
+            }
             SessionListSurface::Sidebar => self.state.sidebar.awaits_listing(request),
         }
     }
@@ -3202,6 +3259,9 @@ impl Application {
         }
         if self.state.session_picker.is_open() {
             return command_for_session_picker_event(event);
+        }
+        if self.state.workspace_picker.is_open() {
+            return command_for_workspace_picker_event(event);
         }
         // A Sidebar row's context menu is drawn over the rows and takes the
         // keys while it is up, whether or not the Sidebar itself has them: a

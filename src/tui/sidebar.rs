@@ -1588,18 +1588,13 @@ impl Sidebar {
     /// selector: a reader who narrowed has to be able to widen again, and to
     /// step straight across to a third.
     fn scopes(&self) -> Vec<WorkspaceScope> {
-        let mut workspaces = self
-            .listing
-            .sessions()
-            .iter()
-            .filter_map(SessionListItem::workspace)
-            .map(|workspace| workspace.path.clone())
-            .chain(std::iter::once(self.listing.current_workspace().to_owned()))
-            .collect::<Vec<_>>();
-        // Ordered by path and deduplicated, so the entries hold their places
-        // between one listing and the next.
+        let mut workspaces = self.listing.workspaces();
+        // Ordered by path, so the entries hold their places between one
+        // listing and the next. The Workspace Picker orders the same
+        // population by which held work most recently; the divergence is
+        // deliberate — a persistent list wants entries that stay put, a
+        // choose-and-dismiss picker wants the likeliest target near the top.
         workspaces.sort_unstable();
-        workspaces.dedup();
         std::iter::once(WorkspaceScope::AllWorkspaces)
             .chain(workspaces.into_iter().map(WorkspaceScope::Workspace))
             .collect()

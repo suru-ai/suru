@@ -22,3 +22,4 @@ mod subagent_picker;
 mod subagent_view;
 mod support;
 mod transcript;
+mod workspace_picker;

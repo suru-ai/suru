@@ -47,6 +47,7 @@ use super::{
     text_layout::TextLayout,
     transcript::TranscriptDisclosure,
     usage::{compact_cost, compact_count},
+    workspace_picker::WorkspacePickerRow,
 };
 
 const NARROW_TERMINAL_WIDTH: u16 = 44;
@@ -131,6 +132,9 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     if state.session_picker.is_open() && !state.reconnect_overlay_visible {
         render_session_picker(frame, state, main, &theme);
     }
+    if state.workspace_picker.is_open() && !state.reconnect_overlay_visible {
+        render_workspace_picker(frame, state, main, &theme);
+    }
     if state.model_options.is_open() && !state.reconnect_overlay_visible {
         render_model_options(frame, state, main, &theme);
     }
@@ -148,6 +152,7 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     if state.reconnect_overlay_visible {
         render_reconnect_overlay(frame, &theme);
     } else if !state.session_picker.is_open()
+        && !state.workspace_picker.is_open()
         && !state.model_picker.is_open()
         && !state.model_options.is_open()
         && !state.settings_panel.is_open()
@@ -280,6 +285,82 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         ),
         area,
     );
+}
+
+/// The Workspace Picker, drawn in the session picker's mold: a centered box
+/// over the main view, a loading line while the listing it derives from is on
+/// its way, then one row per Workspace on offer.
+fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
+    let area = centered_rect(
+        main,
+        main.width.saturating_sub(4).min(72),
+        main.height.saturating_sub(2).min(12),
+    );
+    let content_width = usize::from(area.width.saturating_sub(2));
+    let content_height = usize::from(area.height.saturating_sub(2));
+    let mut lines = Vec::with_capacity(content_height);
+    let shows_footer = content_height >= 2;
+    if let Some(error) = state.workspace_picker.error()
+        && lines.len() < content_height
+    {
+        lines.push(Line::styled(
+            truncate_to_width(&format!("Error: {error}"), content_width),
+            theme.feedback.error,
+        ));
+    }
+    if state.workspace_picker.is_loading() && lines.len() < content_height {
+        lines.push(Line::styled("Loading Workspaces…", theme.text.subdued));
+    } else {
+        let capacity = content_height.saturating_sub(lines.len() + usize::from(shows_footer));
+        lines.extend(
+            state
+                .workspace_picker
+                .visible_rows(capacity)
+                .into_iter()
+                .map(|row| {
+                    let style = if row.selected {
+                        theme.selection.focused
+                    } else {
+                        theme.text.primary
+                    };
+                    Line::styled(workspace_picker_row_text(&row, content_width), style)
+                }),
+        );
+    }
+    if shows_footer && lines.len() < content_height {
+        // Choosing a Workspace is not built yet, so the footer offers only
+        // what the picker answers: backing out of it.
+        lines.push(Line::styled(
+            truncate_to_width("Esc close", content_width),
+            theme.text.subdued,
+        ));
+    }
+    render_overlay_box(frame, area, lines, " Workspaces ", theme);
+}
+
+/// One Workspace Picker row: the name the Workspace goes by, whether it is
+/// where the client is working, and the path spelled in full — truncated from
+/// the left where the row cannot hold it, so the directories that tell two
+/// Workspaces of the same name apart are what survives.
+fn workspace_picker_row_text(row: &WorkspacePickerRow, width: usize) -> String {
+    let marker = if row.selected { "› " } else { "  " };
+    let compact = width < usize::from(NARROW_TERMINAL_WIDTH);
+    let separator = if compact { " " } else { " · " };
+    let mut fields = vec![row.name.clone()];
+    if row.current {
+        fields.push((if compact { "C" } else { "[current]" }).to_owned());
+    }
+    let path_budget = width
+        .saturating_sub(marker.width())
+        .saturating_sub(fields.join(separator).width())
+        .saturating_sub(separator.width());
+    if path_budget > 0 {
+        fields.push(truncate_from_left_to_width(
+            &legible_workspace(&row.path),
+            path_budget,
+        ));
+    }
+    truncate_to_width(&format!("{marker}{}", fields.join(separator)), width)
 }
 
 fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {

@@ -52,6 +52,7 @@ pub enum SemanticCommandId {
     TranscriptGroupsToggle,
     TranscriptTurnToggle,
     TranscriptTurnsToggle,
+    WorkspaceList,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -215,6 +216,7 @@ impl SemanticCommandId {
             Self::TranscriptGroupsToggle => "transcript.groups.toggle",
             Self::TranscriptTurnToggle => "transcript.turn.fold.toggle",
             Self::TranscriptTurnsToggle => "transcript.turns.toggle",
+            Self::WorkspaceList => "workspace.list",
         }
     }
 }
@@ -379,6 +381,24 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             code: KeyCode::Char('l'),
             modifiers: KeyModifiers::NONE,
             label: "Ctrl+X L",
+        }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorkspaceList,
+        title: "Switch Workspace",
+        description: "Choose the Workspace to work in",
+        // "Project" is vocabulary Suru avoids, so it stands only as a typed
+        // synonym: an alias is matchable and never displayed, which lets
+        // whichever word a reader's fingers reach for find the one command.
+        slash: Some(SlashCommand {
+            name: "workspace",
+            aliases: &["project"],
+        }),
+        keybinding: Some(SemanticKeybinding {
+            prefix: Some(LEADER_PREFIX),
+            code: KeyCode::Char('w'),
+            modifiers: KeyModifiers::NONE,
+            label: "Ctrl+X W",
         }),
     },
     SemanticCommandDescriptor {
