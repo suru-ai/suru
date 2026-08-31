@@ -735,7 +735,7 @@ async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
             .await
             .expect("reconnect to the Serving Server without the Invite")
             .protocol_version,
-        PROTOCOL_VERSION
+        Some(PROTOCOL_VERSION)
     );
 
     let default_name_invite = serving_client
@@ -813,6 +813,8 @@ impl PairedServers {
 struct ObservedTcpProxy {
     address: std::net::SocketAddr,
     active_connections: tokio::sync::watch::Receiver<usize>,
+    opened_connections: tokio::sync::watch::Receiver<usize>,
+    online: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -823,16 +825,34 @@ impl ObservedTcpProxy {
             .expect("bind observed Pairing route");
         let address = listener.local_addr().expect("read observed Pairing route");
         let (active, active_connections) = tokio::sync::watch::channel(0_usize);
+        let (opened, opened_connections) = tokio::sync::watch::channel(0_usize);
+        let (online, online_rx) = tokio::sync::watch::channel(true);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut inbound, _)) = listener.accept().await else {
                     break;
                 };
+                opened.send_modify(|count| *count += 1);
+                if !*online_rx.borrow() {
+                    continue;
+                }
                 active.send_modify(|count| *count += 1);
                 let active = active.clone();
+                let mut online = online_rx.clone();
                 tokio::spawn(async move {
                     if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
-                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                        let transfer = tokio::io::copy_bidirectional(&mut inbound, &mut outbound);
+                        tokio::pin!(transfer);
+                        loop {
+                            tokio::select! {
+                                _ = &mut transfer => break,
+                                changed = online.changed() => {
+                                    if changed.is_err() || !*online.borrow() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                     active.send_modify(|count| *count = count.saturating_sub(1));
                 });
@@ -841,25 +861,63 @@ impl ObservedTcpProxy {
         Self {
             address,
             active_connections,
+            opened_connections,
+            online,
             task,
         }
     }
 
-    async fn wait_for_connections(&mut self, expected: usize) {
-        timeout(Duration::from_secs(1), async {
-            loop {
-                if *self.active_connections.borrow() == expected {
-                    return;
-                }
-                self.active_connections
-                    .changed()
-                    .await
-                    .expect("observed Pairing route remains open");
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("Pairing route should settle at {expected} connections"));
+    async fn set_online(&mut self, online: bool) {
+        self.online.send_replace(online);
+        if !online {
+            self.wait_for_connections(0).await;
+        }
     }
+
+    fn opened_connections(&self) -> usize {
+        *self.opened_connections.borrow()
+    }
+
+    async fn wait_for_opened_connections(&mut self, expected: usize) {
+        wait_for_counter(
+            &mut self.opened_connections,
+            expected,
+            |actual, expected| actual >= expected,
+            "open at least",
+        )
+        .await;
+    }
+
+    async fn wait_for_connections(&mut self, expected: usize) {
+        wait_for_counter(
+            &mut self.active_connections,
+            expected,
+            |actual, expected| actual == expected,
+            "settle at",
+        )
+        .await;
+    }
+}
+
+async fn wait_for_counter(
+    counter: &mut tokio::sync::watch::Receiver<usize>,
+    expected: usize,
+    reached: fn(usize, usize) -> bool,
+    description: &str,
+) {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reached(*counter.borrow(), expected) {
+                return;
+            }
+            counter
+                .changed()
+                .await
+                .expect("observed Pairing route remains open");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Pairing route should {description} {expected} connections"));
 }
 
 impl Drop for ObservedTcpProxy {
@@ -917,7 +975,8 @@ async fn paired_servers(name: &str) -> PairedServers {
     .expect("spawn connecting Server");
     let mut connecting_client = ManagedClient::connect(
         ManagedClientConfig::new(connecting_state.path(), &connecting_channel)
-            .expect("configure connecting Client"),
+            .expect("configure connecting Client")
+            .with_recovery_backoff(Duration::from_millis(5), Duration::from_millis(10)),
     )
     .await
     .expect("attach connecting Client");
@@ -1161,6 +1220,265 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
 }
 
 #[tokio::test]
+async fn a_remote_catalog_interest_retries_a_transient_drop_with_injected_backoff() {
+    let mut pair = paired_servers("remote-transient-recovery").await;
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()));
+    let mut catalog = remote.subscribe_catalog();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), catalog.next())
+            .await
+            .expect("Remote catalog snapshot arrives"),
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+    pair.wire.wait_for_connections(1).await;
+
+    pair.wire.set_online(false).await;
+    assert_eq!(
+        timeout(Duration::from_secs(1), catalog.next())
+            .await
+            .expect("transient drop announces recovery")
+            .expect("Remote catalog interest remains live"),
+        ManagedEvent::Recovering(suru::managed_client::RecoveryStatus {
+            attempt: 1,
+            retry_in: Duration::from_millis(5),
+        })
+    );
+
+    pair.wire.set_online(true).await;
+    let first_restored_event = timeout(Duration::from_secs(1), async {
+        loop {
+            match catalog.next().await {
+                Some(ManagedEvent::Recovering(_)) => {}
+                event => return event,
+            }
+        }
+    })
+    .await
+    .expect("Remote catalog reconnects when the route returns");
+    assert!(
+        matches!(
+            first_restored_event,
+            Some(ManagedEvent::SessionCatalogReconciled(_))
+        ),
+        "the recovered catalog snapshot lands before reconnect presentation clears"
+    );
+    assert!(matches!(
+        timeout(Duration::from_secs(1), catalog.next())
+            .await
+            .expect("reconnect presentation clears after catalog hydration"),
+        Some(ManagedEvent::RemoteRecovered)
+    ));
+    pair.wire.wait_for_connections(1).await;
+
+    drop(catalog);
+    pair.wire.wait_for_connections(0).await;
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn dropping_remote_catalog_interest_stops_its_retry_loop() {
+    let mut pair = paired_servers("remote-interest-release").await;
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()));
+    let mut catalog = remote.subscribe_catalog();
+    timeout(Duration::from_secs(1), catalog.next())
+        .await
+        .expect("Remote catalog snapshot arrives")
+        .expect("Remote catalog interest remains live");
+    pair.wire.wait_for_connections(1).await;
+
+    pair.wire.set_online(false).await;
+    assert!(matches!(
+        timeout(Duration::from_secs(1), catalog.next())
+            .await
+            .expect("transient drop announces recovery"),
+        Some(ManagedEvent::Recovering(_))
+    ));
+    drop(catalog);
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    let attempts_after_release = pair.wire.opened_connections();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        pair.wire.opened_connections(),
+        attempts_after_release,
+        "no Remote dial continues after the Client releases its interest"
+    );
+
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn revocation_stops_remote_catalog_retries_and_surfaces_a_terminal_status() {
+    let mut pair = paired_servers("remote-live-revocation").await;
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()));
+    let mut catalog = remote.subscribe_catalog();
+    timeout(Duration::from_secs(1), catalog.next())
+        .await
+        .expect("Remote catalog snapshot arrives")
+        .expect("Remote catalog interest remains live");
+    pair.wire.wait_for_connections(1).await;
+
+    let peer = pair.serving_client.list_peers().await.unwrap().remove(0);
+    pair.serving_client.remove_peer(&peer.id).await.unwrap();
+    let mut saw_recovery = false;
+    let failure = timeout(Duration::from_secs(1), async {
+        loop {
+            match catalog.next().await {
+                Some(ManagedEvent::Recovering(_)) => saw_recovery = true,
+                Some(ManagedEvent::RemoteFailed { status, message }) => return (status, message),
+                Some(_) => {}
+                None => panic!("terminal Remote failure closed without a status"),
+            }
+        }
+    })
+    .await
+    .expect("revocation is classified without an unbounded retry loop");
+    assert!(
+        saw_recovery,
+        "the dropped live link uses reconnect presentation first"
+    );
+    assert_eq!(failure.0, RemoteStatus::Revoked);
+    assert!(failure.1.contains("revoked"));
+    assert_eq!(
+        pair.connecting_client.list_remotes().await.unwrap()[0].status,
+        RemoteStatus::Revoked,
+        "terminal failure marks the durable Remote record"
+    );
+    assert_eq!(
+        pair.connecting_client
+            .probe_remote("workstation")
+            .await
+            .expect("read the marked Remote status")
+            .status,
+        RemoteStatus::Revoked
+    );
+    let attempts_after_failure = pair.wire.opened_connections();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(pair.wire.opened_connections(), attempts_after_failure);
+
+    drop(catalog);
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn revocation_stops_retries_when_a_remote_session_is_the_only_interest() {
+    let mut pair = paired_servers("remote-session-revocation").await;
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()));
+    let workspace = tempfile::tempdir().expect("create Serving Workspace");
+    let created = remote
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Hold only this Remote Session".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Remote Session");
+    let mut session = remote
+        .attach_session(created.session.id)
+        .await
+        .expect("attach Remote Session");
+    assert!(matches!(
+        timeout(Duration::from_secs(1), session.next())
+            .await
+            .expect("Remote Session snapshot arrives")
+            .expect("Remote Session interest remains live")
+            .expect("decode Remote Session snapshot"),
+        suru::managed_client::SessionEvent::Snapshot(_)
+    ));
+    pair.wire.wait_for_connections(1).await;
+
+    let peer = pair.serving_client.list_peers().await.unwrap().remove(0);
+    pair.serving_client.remove_peer(&peer.id).await.unwrap();
+    let error = timeout(Duration::from_secs(1), session.next())
+        .await
+        .expect("revocation settles the Remote Session retry loop")
+        .expect("terminal failure is delivered before the stream closes")
+        .expect_err("revoked Remote Session cannot recover");
+    assert_eq!(error.remote_status(), Some(RemoteStatus::Revoked));
+    assert!(
+        timeout(Duration::from_millis(50), session.next())
+            .await
+            .expect("terminal Remote Session stream closes")
+            .is_none()
+    );
+    let attempts_after_failure = pair.wire.opened_connections();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(pair.wire.opened_connections(), attempts_after_failure);
+
+    drop(session);
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_remote_session_as_the_only_interest_recovers_with_the_injected_backoff() {
+    let mut pair = paired_servers("remote-session-recovery").await;
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()));
+    let workspace = tempfile::tempdir().expect("create Serving Workspace");
+    let created = remote
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Recover this Remote Session".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Remote Session");
+    let mut session = remote
+        .attach_session(created.session.id)
+        .await
+        .expect("attach Remote Session");
+    timeout(Duration::from_secs(1), session.next())
+        .await
+        .expect("Remote Session snapshot arrives")
+        .expect("Remote Session interest remains live")
+        .expect("decode Remote Session snapshot");
+    pair.wire.wait_for_connections(1).await;
+
+    pair.wire.set_online(false).await;
+    let opened_before_recovery = pair.wire.opened_connections();
+    pair.wire
+        .wait_for_opened_connections(opened_before_recovery + 2)
+        .await;
+    pair.wire.set_online(true).await;
+    assert!(matches!(
+        timeout(Duration::from_secs(1), session.next())
+            .await
+            .expect("Remote Session reconnects when its route returns")
+            .expect("Remote Session interest remains live")
+            .expect("decode rehydrated Remote Session snapshot"),
+        suru::managed_client::SessionEvent::Snapshot(_)
+    ));
+    pair.wire.wait_for_connections(1).await;
+
+    drop(session);
+    pair.wire.wait_for_connections(0).await;
+    let attempts_after_release = pair.wire.opened_connections();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(pair.wire.opened_connections(), attempts_after_release);
+    pair.shutdown().await;
+}
+
+#[tokio::test]
 async fn outlook_client_resolves_workspace_paths_on_its_remote() {
     let pair = paired_servers("remote-workspace-resolution").await;
     let root = tempfile::tempdir().expect("create Remote Workspace root");
@@ -1359,8 +1677,12 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
         .probe_remote("workstation")
         .await
         .expect("read mismatched Remote status");
-    assert_eq!(status.protocol_version, PROTOCOL_VERSION + 1);
+    assert_eq!(status.protocol_version, Some(PROTOCOL_VERSION + 1));
     assert_eq!(status.status, RemoteStatus::ProtocolMismatch);
+    assert_eq!(
+        connecting_client.list_remotes().await.unwrap()[0].status,
+        RemoteStatus::ProtocolMismatch
+    );
 
     let descriptor = connecting.descriptor();
     let http = reqwest::Client::new();
@@ -1381,6 +1703,28 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
             .expect("decode mismatch refusal")
             .code,
         SessionErrorCode::PairingProtocolMismatch
+    );
+
+    let mut catalog = connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()))
+        .subscribe_catalog();
+    let terminal = timeout(Duration::from_secs(1), catalog.next())
+        .await
+        .expect("protocol mismatch answers without retrying")
+        .expect("Remote catalog reports its terminal status");
+    assert!(matches!(
+        terminal,
+        ManagedEvent::RemoteFailed {
+            status: RemoteStatus::ProtocolMismatch,
+            ..
+        }
+    ));
+    assert!(
+        timeout(Duration::from_millis(30), catalog.next())
+            .await
+            .expect("terminal Remote catalog closes promptly")
+            .is_none(),
+        "a terminal protocol mismatch schedules no retry event"
     );
 
     drop(connecting_client);
@@ -1884,10 +2228,6 @@ async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing(
         .await
         .expect("remove Peer through the Serving Server");
     assert!(serving_client.list_peers().await.unwrap().is_empty());
-    assert!(
-        connecting_client.probe_remote("durable").await.is_err(),
-        "deleting the Peer ends its Pairing"
-    );
     let mut byte = [0_u8];
     match timeout(Duration::from_secs(1), live_connection.read(&mut byte))
         .await
@@ -1897,8 +2237,38 @@ async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing(
         Ok(read) => panic!("revoked Pairing produced {read} unexpected bytes"),
     }
 
-    drop(connecting_client);
+    let revoked_peers = serving_config.data_dir().join("revoked-peers.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&revoked_peers)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    #[cfg(windows)]
+    assert_windows_current_user_only(revoked_peers);
+
     drop(serving_client);
+    serving.shutdown().await.unwrap();
+    let serving = server::spawn_with_timings(serving_config.clone(), timings)
+        .await
+        .expect("restart Serving Server after revocation");
+    assert_eq!(
+        connecting_client
+            .probe_remote("durable")
+            .await
+            .expect("persisted revocation remains a terminal status")
+            .status,
+        RemoteStatus::Revoked,
+        "deleting the Peer ends its Pairing across a Serving restart"
+    );
+
+    drop(connecting_client);
     connecting.shutdown().await.unwrap();
     serving.shutdown().await.unwrap();
 }

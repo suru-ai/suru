@@ -1085,6 +1085,9 @@ pub struct Remote {
     pub name: String,
     pub fingerprint: String,
     pub addresses: Vec<std::net::SocketAddr>,
+    /// The last status observed by this Server, refreshed by explicit probes
+    /// and Remote API use so it survives beyond the request that discovered it.
+    pub status: RemoteStatus,
 }
 
 /// The Server whose world a Client is presently presenting. This is Client
@@ -1138,15 +1141,17 @@ pub struct Peer {
 #[serde(rename_all = "snake_case")]
 pub enum RemoteStatus {
     Available,
+    Unavailable,
+    Revoked,
     ProtocolMismatch,
 }
 
-/// Proof that a Remote accepted a fresh key-authenticated connection, together
-/// with whether its protocol can be used by this Server.
+/// The result of probing a Remote. The protocol version is known only after an
+/// authenticated health response.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteHealth {
-    pub protocol_version: u32,
+    pub protocol_version: Option<u32>,
     pub status: RemoteStatus,
 }
 

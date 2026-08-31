@@ -25,13 +25,14 @@ fn choosing_a_remote_turns_the_outlook_and_the_footer_names_it() {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
             addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            status: RemoteStatus::Available,
         }]))
         .unwrap();
     application
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: 28,
+                protocol_version: Some(28),
                 status: RemoteStatus::Available,
             }),
         })
@@ -71,6 +72,82 @@ fn choosing_a_remote_turns_the_outlook_and_the_footer_names_it() {
 }
 
 #[test]
+fn a_transient_remote_drop_reconnects_over_the_existing_view_and_preserves_its_composer() {
+    let mut application = application_looking_at_studio();
+    let session_id = SessionId::new();
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            navigable_session_snapshot(session_id, std::path::Path::new("."), 1),
+        ))
+        .unwrap();
+    type_terminal_text(&mut application, "unfinished thought");
+
+    application
+        .handle_event(ApplicationEvent::OutlookCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::Recovering(suru::managed_client::RecoveryStatus {
+                attempt: 1,
+                retry_in: std::time::Duration::from_millis(5),
+            }),
+        })
+        .unwrap();
+    application
+        .handle_event(ApplicationEvent::ReconnectGraceElapsed)
+        .unwrap();
+
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Reconnecting to Suru…")
+    );
+
+    application
+        .handle_event(ApplicationEvent::OutlookCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::RemoteRecovered,
+        })
+        .unwrap();
+    let recovered = rendered_application_rows(&application).join("\n");
+    assert!(recovered.contains("unfinished thought"));
+    assert!(recovered.contains("Outlook studio"));
+    assert!(!recovered.contains("Reconnecting to Suru…"));
+}
+
+#[test]
+fn a_revoked_remote_returns_to_the_local_landing_with_the_session_composer_recovered() {
+    let mut application = application_looking_at_studio();
+    let session_id = SessionId::new();
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            navigable_session_snapshot(session_id, std::path::Path::new("."), 1),
+        ))
+        .unwrap();
+    type_terminal_text(&mut application, "words worth keeping");
+    assert!(matches!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::AdmitPrompt { .. }
+    ));
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::OutlookCatalog {
+                outlook: Outlook::Remote("studio".to_owned()),
+                event: ManagedEvent::RemoteFailed {
+                    status: RemoteStatus::Revoked,
+                    message: "Remote revoked this Pairing".to_owned(),
+                },
+            })
+            .unwrap(),
+        ApplicationTransition::TurnOutlook(Outlook::Local)
+    );
+
+    let landing = rendered_application_rows(&application).join("\n");
+    assert!(landing.contains("words worth keeping"));
+    assert!(landing.contains("Remote revoked this Pairing"));
+    assert!(!landing.contains("Outlook studio"));
+}
+
+#[test]
 fn choosing_local_again_restores_the_local_outlook_and_workspace() {
     let local_workspace = std::env::current_dir().expect("read local Workspace");
     let mut application = Application::new(&local_workspace);
@@ -81,13 +158,14 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
             addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            status: RemoteStatus::Available,
         }]))
         .unwrap();
     application
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: 28,
+                protocol_version: Some(28),
                 status: RemoteStatus::Available,
             }),
         })
@@ -102,13 +180,14 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
             addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            status: RemoteStatus::Available,
         }]))
         .unwrap();
     application
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: 28,
+                protocol_version: Some(28),
                 status: RemoteStatus::Available,
             }),
         })
@@ -150,6 +229,7 @@ fn choosing_the_current_outlook_only_closes_the_picker() {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
             addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            status: RemoteStatus::Available,
         }]))
         .unwrap();
 
@@ -338,13 +418,14 @@ fn a_remote_session_row_carries_its_origin_into_attachment() {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
             addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            status: RemoteStatus::Available,
         }]))
         .unwrap();
     application
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: 28,
+                protocol_version: Some(28),
                 status: RemoteStatus::Available,
             }),
         })
@@ -404,13 +485,14 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
             addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            status: RemoteStatus::Available,
         }]))
         .unwrap();
     application
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: 28,
+                protocol_version: Some(28),
                 status: RemoteStatus::Available,
             }),
         })
@@ -473,11 +555,36 @@ fn press(application: &mut Application, code: KeyCode) -> ApplicationTransition 
     press_with(application, code, KeyModifiers::NONE)
 }
 
+fn application_looking_at_studio() -> Application {
+    let mut application = Application::default();
+    type_terminal_text(&mut application, "/connect");
+    press(&mut application, KeyCode::Enter);
+    application
+        .handle_event(ApplicationEvent::RemotesListed(vec![studio_remote()]))
+        .unwrap();
+    application
+        .handle_event(ApplicationEvent::RemoteProbed {
+            name: "studio".to_owned(),
+            result: Ok(RemoteHealth {
+                protocol_version: Some(28),
+                status: RemoteStatus::Available,
+            }),
+        })
+        .unwrap();
+    press(&mut application, KeyCode::Down);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::TurnOutlook(Outlook::Remote("studio".to_owned()))
+    );
+    application
+}
+
 fn studio_remote() -> Remote {
     Remote {
         name: "studio".to_owned(),
         fingerprint: "studio-fingerprint".to_owned(),
         addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+        status: RemoteStatus::Available,
     }
 }
 
@@ -498,7 +605,7 @@ fn turn_to_studio(application: &mut Application) {
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: 28,
+                protocol_version: Some(28),
                 status: RemoteStatus::Available,
             }),
         })
@@ -519,11 +626,13 @@ fn paired_remote_picker_shows_each_pairing_status() {
         name: name.to_owned(),
         fingerprint: format!("{name}-fingerprint"),
         addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+        status: RemoteStatus::Available,
     };
     application
         .handle_event(ApplicationEvent::RemotesListed(vec![
             remote("studio"),
             remote("old"),
+            remote("revoked"),
             remote("offline"),
         ]))
         .unwrap();
@@ -537,7 +646,7 @@ fn paired_remote_picker_shows_each_pairing_status() {
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: 28,
+                protocol_version: Some(28),
                 status: RemoteStatus::Available,
             }),
         })
@@ -546,8 +655,17 @@ fn paired_remote_picker_shows_each_pairing_status() {
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "old".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: 27,
+                protocol_version: Some(27),
                 status: RemoteStatus::ProtocolMismatch,
+            }),
+        })
+        .unwrap();
+    application
+        .handle_event(ApplicationEvent::RemoteProbed {
+            name: "revoked".to_owned(),
+            result: Ok(RemoteHealth {
+                protocol_version: None,
+                status: RemoteStatus::Revoked,
             }),
         })
         .unwrap();
@@ -561,6 +679,7 @@ fn paired_remote_picker_shows_each_pairing_status() {
     let picker = rendered_application_rows(&application).join("\n");
     assert!(picker.contains("studio  Available"));
     assert!(picker.contains("old  Protocol v27 mismatch"));
+    assert!(picker.contains("revoked  Revoked"));
     assert!(picker.contains("offline  Unavailable · could not reach Remote"));
 }
 
@@ -574,6 +693,7 @@ fn pairing_another_remote_refuses_a_duplicate_prefilled_name_in_the_draft() {
             name: "studio".to_owned(),
             fingerprint: "known".to_owned(),
             addresses: vec!["10.0.0.4:7777".parse().unwrap()],
+            status: RemoteStatus::Available,
         }]))
         .unwrap();
 
@@ -700,6 +820,7 @@ fn successful_redemption_opens_the_paired_remote_picker() {
             name: "studio".to_owned(),
             fingerprint: "fingerprint".to_owned(),
             addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            status: RemoteStatus::Available,
         }))
         .unwrap();
 
@@ -718,6 +839,7 @@ fn pairing_another_remote_keeps_every_paired_remote_in_the_picker() {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
             addresses: vec!["10.0.0.4:7777".parse().unwrap()],
+            status: RemoteStatus::Available,
         }]))
         .unwrap();
     press(&mut application, KeyCode::Char('a'));
@@ -745,6 +867,7 @@ fn pairing_another_remote_keeps_every_paired_remote_in_the_picker() {
             name: "laptop".to_owned(),
             fingerprint: "laptop-fingerprint".to_owned(),
             addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            status: RemoteStatus::Available,
         }))
         .unwrap();
 

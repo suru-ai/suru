@@ -15,8 +15,8 @@ use std::{
 
 use crate::{
     managed_client::{
-        ManagedClient, ManagedEvent, SessionCatalogSubscription, SessionCommandClient,
-        SessionEvent, SessionStreamError, SessionSubscription,
+        ManagedClient, ManagedEvent, RecoveryBackoff, SessionCatalogSubscription,
+        SessionCommandClient, SessionEvent, SessionStreamError, SessionSubscription,
     },
     protocol::{
         AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
@@ -883,8 +883,18 @@ impl RunLoop {
                 self.application
                     .handle_event(ApplicationEvent::Session(event))?;
             }
-            Some(Err(error)) if !error.is_recoverable() => return Err(error.into()),
-            Some(Err(_)) | None => self.recover_session_subscription()?,
+            Some(Err(error)) => {
+                if let Some(event) =
+                    remote_failure_from_session_error(self.application.outlook().clone(), &error)
+                {
+                    return self.receive_outlook_catalog(Some(event));
+                }
+                if !error.is_recoverable() {
+                    return Err(error.into());
+                }
+                self.recover_session_subscription()?;
+            }
+            None => self.recover_session_subscription()?,
         }
         Ok(ControlFlow::Continue(()))
     }
@@ -1282,12 +1292,20 @@ impl RunLoop {
             return Ok(ControlFlow::Continue(()));
         }
         self.needs_redraw |= event.event.is_drawn_on_arrival();
+        let was_recovering = self.application.is_recovering();
         let transition = self
             .application
             .handle_event(ApplicationEvent::OutlookCatalog {
                 outlook: event.outlook,
                 event: event.event,
             })?;
+        if self.application.is_recovering() {
+            if !was_recovering {
+                self.reconnect_grace = Some(Box::pin(tokio::time::sleep(RECONNECT_GRACE_PERIOD)));
+            }
+        } else {
+            self.reconnect_grace = None;
+        }
         Ok(self.dispatch_transition(transition))
     }
 }
@@ -1295,6 +1313,19 @@ impl RunLoop {
 struct OutlookCatalogEvent {
     outlook: Outlook,
     event: ManagedEvent,
+}
+
+fn remote_failure_from_session_error(
+    outlook: Outlook,
+    error: &SessionStreamError,
+) -> Option<OutlookCatalogEvent> {
+    error.remote_status().map(|status| OutlookCatalogEvent {
+        outlook,
+        event: ManagedEvent::RemoteFailed {
+            status,
+            message: error.to_string(),
+        },
+    })
 }
 
 fn spawn_outlook_catalog_forwarder(
@@ -2005,7 +2036,8 @@ fn spawn_session_subscription(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let session_id = reference.session_id;
-        let mut retry_in = tokio::time::Duration::from_millis(50);
+        let (initial_backoff, max_backoff) = commands.recovery_backoff();
+        let mut backoff = RecoveryBackoff::new(initial_backoff, max_backoff);
         loop {
             if connected.is_closed() {
                 return;
@@ -2018,11 +2050,16 @@ fn spawn_session_subscription(
                     });
                     return;
                 }
+                Err(error)
+                    if error
+                        .downcast_ref::<SessionStreamError>()
+                        .is_some_and(|error| error.remote_status().is_some()) =>
+                {
+                    return;
+                }
                 Err(_) => {
+                    let retry_in = backoff.next();
                     tokio::time::sleep(retry_in).await;
-                    retry_in = retry_in
-                        .saturating_mul(2)
-                        .min(tokio::time::Duration::from_secs(1));
                 }
             }
         }
@@ -2282,8 +2319,31 @@ mod tests {
     use super::{
         DisableMouseButtonReporting, EnableMouseButtonReporting, PopModifiedKeyReporting,
         PushModifiedKeyReporting, TerminalSink, copy_to_clipboard, enter_terminal_display,
-        ignore_unsupported, leave_terminal_display,
+        ignore_unsupported, leave_terminal_display, remote_failure_from_session_error,
     };
+    use crate::{
+        managed_client::{ManagedEvent, SessionStreamError},
+        protocol::{Outlook, RemoteStatus},
+    };
+
+    #[test]
+    fn a_terminal_remote_session_failure_uses_the_outlook_ejection_path() {
+        let outlook = Outlook::Remote("studio".to_owned());
+        let event = remote_failure_from_session_error(
+            outlook.clone(),
+            &SessionStreamError::remote(RemoteStatus::Revoked, "Remote revoked this Pairing"),
+        )
+        .expect("terminal Remote Session errors become Outlook failures");
+
+        assert_eq!(event.outlook, outlook);
+        assert!(matches!(
+            event.event,
+            ManagedEvent::RemoteFailed {
+                status: RemoteStatus::Revoked,
+                ref message,
+            } if message == "Remote revoked this Pairing"
+        ));
+    }
 
     /// Records what an ANSI terminal would receive. Going through `write_ansi`
     /// rather than `execute!` keeps the recording independent of the console the

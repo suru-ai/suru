@@ -683,6 +683,12 @@ impl TuiState {
         }
     }
 
+    fn settle_remote_failure(&mut self, message: String) {
+        self.recovery = None;
+        self.reconnect_overlay_visible = false;
+        self.submission_error = Some(message);
+    }
+
     fn apply_managed_event(&mut self, event: ManagedEvent) {
         // Every change the session-catalog stream reports leaves the Sidebar
         // asking the server for its listing again. What the change says is
@@ -756,6 +762,11 @@ impl TuiState {
                 self.manually_stopped = false;
                 self.fatal_error = None;
             }
+            ManagedEvent::RemoteRecovered => {
+                self.recovery = None;
+                self.reconnect_overlay_visible = false;
+            }
+            ManagedEvent::RemoteFailed { message, .. } => self.settle_remote_failure(message),
             ManagedEvent::ServerShutdown(shutdown) => {
                 if shutdown.reason == ShutdownReason::Manual {
                     self.recovery = None;
@@ -3117,6 +3128,35 @@ impl Application {
     ) -> Result<ApplicationTransition> {
         if outlook != self.state.outlook {
             return Ok(ApplicationTransition::Continue);
+        }
+        if let ManagedEvent::RemoteFailed { status, message } = event {
+            let Some(name) = outlook.remote_name().map(str::to_owned) else {
+                return Ok(ApplicationTransition::Continue);
+            };
+            let pending_prompt = self
+                .state
+                .pending_submission
+                .as_ref()
+                .filter(|pending| match &pending.target {
+                    SubmissionTarget::CreateSession => true,
+                    SubmissionTarget::AdmitPrompt(session, _) => session.origin == outlook,
+                })
+                .map(|pending| pending.prompt.id);
+            if let Some(prompt_id) = pending_prompt {
+                self.state
+                    .fail_pending_submission(prompt_id, message.clone());
+            }
+            if let Some(reference) = self.state.session_reference.clone() {
+                self.state
+                    .composers
+                    .recover_session_to_landing(reference.clone());
+                self.state.session_interactions.remove(&reference);
+            }
+            self.state.connect_overlay.remote_failed(&name, status);
+            self.state.turn_outlook(Outlook::Local);
+            self.state.settle_remote_failure(message);
+            self.state.sync_composer_completion();
+            return Ok(ApplicationTransition::TurnOutlook(Outlook::Local));
         }
         let had_session = self.state.session.is_some();
         self.state.apply_outlook_catalog(&outlook, event);

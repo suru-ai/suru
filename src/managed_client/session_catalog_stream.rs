@@ -19,27 +19,33 @@ use crate::protocol::{
     SkillCatalog,
 };
 
-use super::{ManagedEvent, server_url};
+use super::{
+    ManagedEvent, RecoveryBackoff,
+    remote_connection::{self, RemoteConnectionFailure},
+    server_url,
+};
 
 pub(super) async fn open(
     http: &reqwest::Client,
     descriptor: &RuntimeDescriptor,
 ) -> reqwest::Result<reqwest::Response> {
-    open_for_outlook(http, descriptor, &Outlook::Local).await
-}
-
-async fn open_for_outlook(
-    http: &reqwest::Client,
-    descriptor: &RuntimeDescriptor,
-    outlook: &Outlook,
-) -> reqwest::Result<reqwest::Response> {
-    let url = server_url(&descriptor.base_url, outlook, "/v1/session-events")
+    let url = server_url(&descriptor.base_url, &Outlook::Local, "/v1/session-events")
         .expect("a validated runtime descriptor builds a Server URL");
     http.get(url)
         .bearer_auth(&descriptor.token)
         .send()
         .await?
         .error_for_status()
+}
+
+async fn open_for_outlook(
+    http: &reqwest::Client,
+    descriptor: &RuntimeDescriptor,
+    outlook: &Outlook,
+) -> std::result::Result<reqwest::Response, RemoteConnectionFailure> {
+    let url = server_url(&descriptor.base_url, outlook, "/v1/session-events")
+        .expect("a validated runtime descriptor builds a Server URL");
+    remote_connection::classify(http.get(url).bearer_auth(&descriptor.token).send().await).await
 }
 
 /// A reconnecting catalog stream for the Server named by one Client Outlook.
@@ -84,6 +90,60 @@ impl Drop for SessionCatalogSubscription {
     }
 }
 
+struct RemoteRecovery {
+    attempt: u32,
+    backoff: RecoveryBackoff,
+    active: bool,
+}
+
+impl RemoteRecovery {
+    fn new(initial_backoff: Duration, max_backoff: Duration) -> Self {
+        Self {
+            attempt: 0,
+            backoff: RecoveryBackoff::new(initial_backoff, max_backoff),
+            active: false,
+        }
+    }
+
+    async fn wait_after_failure(
+        &mut self,
+        events: &mpsc::Sender<ManagedEvent>,
+        descriptor: &mut watch::Receiver<RuntimeDescriptor>,
+    ) -> bool {
+        let retry_in = self.backoff.next();
+        self.attempt = self.attempt.saturating_add(1);
+        self.active = true;
+        if events
+            .send(ManagedEvent::Recovering(super::RecoveryStatus {
+                attempt: self.attempt,
+                retry_in,
+            }))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        if wait_to_reconnect(descriptor, retry_in).await {
+            self.reset_schedule();
+        }
+        true
+    }
+
+    /// A snapshot is the point at which the familiar reconnect presentation
+    /// can honestly clear: response headers alone have not restored the
+    /// catalog the reader was looking at.
+    fn hydrated(&mut self) -> bool {
+        let recovered = std::mem::replace(&mut self.active, false);
+        self.reset_schedule();
+        recovered
+    }
+
+    fn reset_schedule(&mut self) {
+        self.backoff.reset();
+        self.attempt = 0;
+    }
+}
+
 async fn run_attached(
     http: reqwest::Client,
     mut descriptor: watch::Receiver<RuntimeDescriptor>,
@@ -96,30 +156,59 @@ async fn run_attached(
     // first snapshot as reconciliation so the TUI refreshes any listing that
     // raced with opening the stream.
     let mut known_session_ids = Some(HashSet::new());
-    let mut retry_in = Duration::ZERO;
+    let mut recovery = RemoteRecovery::new(initial_backoff, max_backoff);
     loop {
         if events.is_closed() {
             return;
         }
         let active_descriptor = descriptor.borrow().clone();
-        let response = open_for_outlook(&http, &active_descriptor, &outlook).await;
-        let Ok(response) = response else {
-            retry_in = next_backoff(retry_in, initial_backoff, max_backoff);
-            if wait_to_reconnect(&mut descriptor, retry_in).await {
-                retry_in = Duration::ZERO;
+        let response = match open_for_outlook(&http, &active_descriptor, &outlook).await {
+            Ok(response) => response,
+            Err(RemoteConnectionFailure::Terminal { status, message }) => {
+                let _ = events
+                    .send(ManagedEvent::RemoteFailed { status, message })
+                    .await;
+                return;
             }
-            continue;
+            Err(RemoteConnectionFailure::Transient | RemoteConnectionFailure::Rejected(_)) => {
+                if !recovery.wait_after_failure(&events, &mut descriptor).await {
+                    return;
+                }
+                continue;
+            }
         };
         let (hydrated, hydration) = oneshot::channel();
-        match consume(response, &events, &mut known_session_ids, hydrated).await {
+        let consumption = consume(response, &events, &mut known_session_ids, hydrated);
+        tokio::pin!(consumption);
+        tokio::pin!(hydration);
+        let outcome = tokio::select! {
+            biased;
+            outcome = &mut consumption => {
+                if (&mut hydration).await.is_ok()
+                    && recovery.hydrated()
+                    && events.send(ManagedEvent::RemoteRecovered).await.is_err()
+                {
+                    return;
+                }
+                outcome
+            }
+            hydrated = &mut hydration => {
+                if hydrated.is_err() {
+                    return;
+                }
+                if recovery.hydrated()
+                    && events.send(ManagedEvent::RemoteRecovered).await.is_err()
+                {
+                    return;
+                }
+                consumption.await
+            }
+        };
+        match outcome {
             Ok(StreamOutcome::ReceiverClosed) => return,
             Ok(StreamOutcome::Disconnected) | Err(_) => {
-                if hydration.await.is_ok() {
-                    retry_in = Duration::ZERO;
-                }
-                retry_in = next_backoff(retry_in, initial_backoff, max_backoff);
-                if wait_to_reconnect(&mut descriptor, retry_in).await {
-                    retry_in = Duration::ZERO;
+                if !recovery.wait_after_failure(&events, &mut descriptor).await {
+                    return;
                 }
             }
         }
@@ -135,14 +224,6 @@ async fn wait_to_reconnect(
     tokio::select! {
         changed = descriptor.changed(), if descriptor.has_changed().is_ok() => changed.is_ok(),
         _ = tokio::time::sleep(retry_in) => false,
-    }
-}
-
-fn next_backoff(previous: Duration, initial: Duration, max: Duration) -> Duration {
-    if previous.is_zero() {
-        initial
-    } else {
-        previous.saturating_mul(2).min(max)
     }
 }
 
@@ -354,24 +435,7 @@ fn validate_event_id(id: &str, revision: SessionCatalogRevision) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::managed_client::{INITIAL_RECOVERY_BACKOFF, MAX_RECOVERY_BACKOFF};
     use crate::protocol::SessionTimestamp;
-
-    #[test]
-    fn attached_catalog_backoff_doubles_and_caps_at_the_managed_client_limit() {
-        let mut retry_in = Duration::ZERO;
-        let waits = (0..10)
-            .map(|_| {
-                retry_in = next_backoff(retry_in, INITIAL_RECOVERY_BACKOFF, MAX_RECOVERY_BACKOFF);
-                retry_in
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            waits,
-            [50, 100, 200, 400, 800, 1600, 3200, 5000, 5000, 5000].map(Duration::from_millis)
-        );
-    }
 
     #[test]
     fn reconnect_snapshot_recovers_a_missed_deletion() {

@@ -31,10 +31,12 @@ mod event_stream;
 mod launcher;
 mod lifecycle;
 mod recovery;
+mod remote_connection;
 mod session_catalog_stream;
 mod session_projection;
 mod session_stream;
 
+pub(crate) use recovery::RecoveryBackoff;
 pub use session_catalog_stream::SessionCatalogSubscription;
 pub(crate) use session_projection::SessionProjection;
 pub use session_stream::{SessionEvent, SessionStreamError, SessionSubscription};
@@ -155,6 +157,14 @@ pub enum ManagedEvent {
     /// invalidation. Every attached client receives the same state transition.
     SkillCatalogUpdated(SkillCatalog),
     Recovering(RecoveryStatus),
+    /// A Remote catalog stream resumed after a transient link failure.
+    RemoteRecovered,
+    /// A Remote rejected further use of its Pairing. Unlike a transient drop,
+    /// this ends the current Outlook and must not be retried automatically.
+    RemoteFailed {
+        status: crate::protocol::RemoteStatus,
+        message: String,
+    },
     ServerShutdown(ServerShutdown),
     /// A Session joined the catalog. It carries an id and no more, so a
     /// surface listing Sessions answers it by asking for the listing the new
@@ -575,6 +585,10 @@ impl OutlookClient {
 }
 
 impl SessionCommandClient {
+    pub(crate) fn recovery_backoff(&self) -> (Duration, Duration) {
+        (self.initial_recovery_backoff, self.max_recovery_backoff)
+    }
+
     pub(crate) fn subscribe_catalog(&self) -> SessionCatalogSubscription {
         SessionCatalogSubscription::open_attached(
             self.http.clone(),
@@ -974,6 +988,8 @@ impl SessionCommandClient {
             self.descriptor.clone(),
             self.outlook.clone(),
             session_id,
+            self.initial_recovery_backoff,
+            self.max_recovery_backoff,
         )
         .await
     }

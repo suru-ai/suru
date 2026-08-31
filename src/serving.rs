@@ -66,6 +66,7 @@ use crate::{
 
 const IDENTITY_FILE: &str = "server-identity.pk8";
 const PEERS_FILE: &str = "peers.json";
+const REVOKED_PEERS_FILE: &str = "revoked-peers.json";
 const REMOTES_FILE: &str = "remotes.json";
 const PAIRING_PROTOCOL_HEADER: &str = "x-suru-protocol-version";
 const PEER_API_PREFIX: &str = "/v1/pairing/proxy";
@@ -253,10 +254,15 @@ impl ServingController {
     ) -> Result<Self> {
         let (address, _) = watch::channel(None);
         let peers: Vec<StoredPeer> = read_records(&data_dir.join(PEERS_FILE))?;
-        let revocations = peers
+        let mut revocations = peers
             .iter()
             .map(|peer| (peer.id.clone(), Arc::new(PeerRevocation::default())))
-            .collect();
+            .collect::<HashMap<_, _>>();
+        for id in read_records::<Vec<String>>(&data_dir.join(REVOKED_PEERS_FILE))? {
+            let revocation = Arc::new(PeerRevocation::default());
+            revocation.revoke();
+            revocations.insert(id, revocation);
+        }
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             local_api: LocalApi {
@@ -370,6 +376,7 @@ impl ServingController {
             name: name.clone(),
             fingerprint: fingerprint(&invite.server_key),
             addresses,
+            status: RemoteStatus::Available,
         };
         self.persist_remote(&remote, &invite.server_key)?;
 
@@ -413,7 +420,24 @@ impl ServingController {
         name: &str,
     ) -> std::result::Result<RemoteHealth, PairingFailure> {
         let remote = self.stored_remote(name)?;
-        Ok(self.dial_remote(&remote).await?.health)
+        let health = match self.dial_remote(&remote).await {
+            Ok(connection) => Ok(connection.health),
+            Err(error) if error.code == SessionErrorCode::PairingAuthenticationFailed => {
+                Ok(RemoteHealth {
+                    protocol_version: None,
+                    status: RemoteStatus::Revoked,
+                })
+            }
+            Err(error) if error.code == SessionErrorCode::PairingConnectionFailed => {
+                Ok(RemoteHealth {
+                    protocol_version: None,
+                    status: RemoteStatus::Unavailable,
+                })
+            }
+            Err(error) => Err(error),
+        }?;
+        self.record_remote_status(name, health.status);
+        Ok(health)
     }
 
     pub(crate) async fn proxy_remote(
@@ -422,11 +446,23 @@ impl ServingController {
         mut request: Request<Body>,
     ) -> std::result::Result<Response, PairingFailure> {
         let remote = self.stored_remote(name)?;
-        let connection = self.dial_remote(&remote).await?;
+        let connection = match self.dial_remote(&remote).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                if error.code == SessionErrorCode::PairingAuthenticationFailed {
+                    self.record_remote_status(name, RemoteStatus::Revoked);
+                }
+                return Err(error);
+            }
+        };
+        self.record_remote_status(name, connection.health.status);
         if connection.health.status == RemoteStatus::ProtocolMismatch {
             return Err(protocol_mismatch(
                 self.protocol_version,
-                connection.health.protocol_version,
+                connection
+                    .health
+                    .protocol_version
+                    .expect("a protocol mismatch includes the Remote's version"),
             ));
         }
         let path_and_query = request
@@ -477,6 +513,8 @@ impl ServingController {
         {
             revoked.revoke();
         }
+        self.persist_revoked_peer_ids()
+            .map_err(internal_pairing_failure)?;
         Ok(())
     }
 
@@ -561,6 +599,7 @@ impl ServingController {
             .with_client_cert_verifier(Arc::new(PinnedPeers {
                 peers: self.peers.clone(),
                 invites: self.invites.clone(),
+                revocations: self.revocations.clone(),
             }))
             .with_single_cert(
                 vec![CertificateDer::from(identity.certificate)],
@@ -594,6 +633,37 @@ impl ServingController {
             })
     }
 
+    fn record_remote_status(&self, name: &str, status: RemoteStatus) {
+        let mut remotes = self
+            .remotes
+            .write()
+            .expect("Remote record lock is not poisoned");
+        let Some(index) = remotes.iter().position(|stored| stored.remote.name == name) else {
+            return;
+        };
+        if remotes[index].remote.status == status {
+            return;
+        }
+        let previous = remotes[index].remote.status;
+        remotes[index].remote.status = status;
+        if let Err(error) = write_private_json(&self.data_dir.join(REMOTES_FILE), &*remotes) {
+            remotes[index].remote.status = previous;
+            tracing::warn!("could not persist Remote status: {error:#}");
+        }
+    }
+
+    fn persist_revoked_peer_ids(&self) -> Result<()> {
+        let revoked = self
+            .revocations
+            .read()
+            .expect("Peer revocation lock is not poisoned")
+            .iter()
+            .filter(|(_, revocation)| revocation.revoked.load(Ordering::Acquire))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        write_private_json(&self.data_dir.join(REVOKED_PEERS_FILE), &revoked)
+    }
+
     async fn dial_remote(
         &self,
         remote: &StoredRemote,
@@ -616,7 +686,7 @@ impl ServingController {
                         )
                     })?;
                     let health = RemoteHealth {
-                        protocol_version: pairing_health.protocol_version,
+                        protocol_version: Some(pairing_health.protocol_version),
                         status: if pairing_health.protocol_version == self.protocol_version {
                             RemoteStatus::Available
                         } else {
@@ -781,6 +851,10 @@ impl ServingController {
                 .or_insert_with(|| Arc::new(PeerRevocation::default()));
         } else {
             revocations.insert(id, Arc::new(PeerRevocation::default()));
+        }
+        drop(revocations);
+        if let Err(error) = self.persist_revoked_peer_ids() {
+            tracing::warn!("could not persist revoked Peer tombstones: {error:#}");
         }
         issued.state = TokenState::Spent;
         Ok(())
@@ -1070,10 +1144,17 @@ impl Listener for PairingTlsListener {
                         .and_then(|certificates| certificates.first())
                         .and_then(|certificate| public_key_from_certificate(certificate).ok());
                     let peer_id = peer_key.as_deref().map(fingerprint);
+                    let revocable_peer_id = peer_id.filter(|peer_id| {
+                        self.revocations
+                            .read()
+                            .expect("Peer revocation lock is not poisoned")
+                            .get(peer_id)
+                            .is_none_or(|revocation| !revocation.revoked.load(Ordering::Acquire))
+                    });
                     return (
                         RevocableTlsStream {
                             stream,
-                            peer_id,
+                            peer_id: revocable_peer_id,
                             revocations: self.revocations.clone(),
                         },
                         ServingConnectionInfo {
@@ -1197,6 +1278,7 @@ impl axum::extract::connect_info::Connected<IncomingStream<'_, PairingTlsListene
 struct PinnedPeers {
     peers: Arc<RwLock<Vec<StoredPeer>>>,
     invites: Arc<StdMutex<InviteLedger>>,
+    revocations: Arc<RwLock<HashMap<String, Arc<PeerRevocation>>>>,
 }
 
 impl std::fmt::Debug for PinnedPeers {
@@ -1239,7 +1321,17 @@ impl ClientCertVerifier for PinnedPeers {
                 .iter()
                 .any(|issued| bool::from(issued.token.ct_eq(&token)))
         });
-        if known || invited {
+        // A just-revoked key remains pinned only as a tombstone, allowing the
+        // authenticated Serving endpoint to answer 401 on the next health
+        // check. That makes revocation distinguishable from a network drop;
+        // ordinary unknown keys still fail during mutual TLS.
+        let revoked = self
+            .revocations
+            .read()
+            .expect("Peer revocation lock is not poisoned")
+            .get(&fingerprint(&key))
+            .is_some_and(|revocation| revocation.revoked.load(Ordering::Acquire));
+        if known || invited || revoked {
             Ok(ClientCertVerified::assertion())
         } else {
             Err(TlsError::InvalidCertificate(

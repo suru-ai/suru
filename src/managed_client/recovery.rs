@@ -15,6 +15,37 @@ use super::{
     session_catalog_stream,
 };
 
+/// One exponential retry schedule shared by managed, Remote catalog, and
+/// Session recovery so all three honor the same configured policy.
+pub(crate) struct RecoveryBackoff {
+    current: Duration,
+    initial: Duration,
+    max: Duration,
+}
+
+impl RecoveryBackoff {
+    pub(crate) fn new(initial: Duration, max: Duration) -> Self {
+        Self {
+            current: Duration::ZERO,
+            initial,
+            max,
+        }
+    }
+
+    pub(crate) fn next(&mut self) -> Duration {
+        self.current = if self.current.is_zero() {
+            self.initial
+        } else {
+            self.current.saturating_mul(2).min(self.max)
+        };
+        self.current
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.current = Duration::ZERO;
+    }
+}
+
 struct ActiveConnection {
     descriptor: RuntimeDescriptor,
     health: Health,
@@ -267,6 +298,8 @@ async fn run_managed_client(
                 .is_ok_and(|identity| identity == active_build_identity);
         let mut attempt = 1;
         let mut retry_in = Duration::ZERO;
+        let mut backoff =
+            RecoveryBackoff::new(config.initial_recovery_backoff, config.max_recovery_backoff);
         loop {
             tracing::warn!(
                 attempt,
@@ -310,11 +343,7 @@ async fn run_managed_client(
                 }
                 Err(_) => {
                     attempt = attempt.saturating_add(1);
-                    retry_in = next_recovery_backoff(
-                        retry_in,
-                        config.initial_recovery_backoff,
-                        config.max_recovery_backoff,
-                    );
+                    retry_in = backoff.next();
                 }
             }
         }
@@ -396,14 +425,6 @@ async fn probe_protocol_compatible_connection(
     }))
 }
 
-fn next_recovery_backoff(previous: Duration, initial: Duration, max: Duration) -> Duration {
-    if previous.is_zero() {
-        initial
-    } else {
-        previous.saturating_mul(2).min(max)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,12 +433,8 @@ mod tests {
     #[test]
     fn default_recovery_backoff_doubles_from_fifty_millis_and_caps_at_five_seconds() {
         let mut waits = Vec::new();
-        let mut retry_in = Duration::ZERO;
-        for _ in 0..10 {
-            retry_in =
-                next_recovery_backoff(retry_in, INITIAL_RECOVERY_BACKOFF, MAX_RECOVERY_BACKOFF);
-            waits.push(retry_in);
-        }
+        let mut backoff = RecoveryBackoff::new(INITIAL_RECOVERY_BACKOFF, MAX_RECOVERY_BACKOFF);
+        waits.extend((0..10).map(|_| backoff.next()));
         assert_eq!(
             waits,
             [50, 100, 200, 400, 800, 1600, 3200, 5000, 5000, 5000]

@@ -39,8 +39,27 @@ enum ConnectOverlayState {
 enum RemoteProbeStatus {
     Checking,
     Available,
-    ProtocolMismatch(u32),
+    ProtocolMismatch(Option<u32>),
     Unavailable(String),
+    Revoked,
+}
+
+impl RemoteProbeStatus {
+    fn remembered(status: RemoteStatus) -> Self {
+        match status {
+            RemoteStatus::Available => Self::Available,
+            RemoteStatus::Unavailable => Self::Unavailable("could not reach Remote".to_owned()),
+            RemoteStatus::Revoked => Self::Revoked,
+            RemoteStatus::ProtocolMismatch => Self::ProtocolMismatch(None),
+        }
+    }
+
+    fn probed(health: RemoteHealth) -> Self {
+        match health.status {
+            RemoteStatus::ProtocolMismatch => Self::ProtocolMismatch(health.protocol_version),
+            status => Self::remembered(status),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,7 +122,13 @@ impl ConnectOverlay {
         self.known_names = remotes.iter().map(|remote| remote.name.clone()).collect();
         self.remote_statuses = remotes
             .iter()
-            .map(|remote| (remote.name.clone(), RemoteProbeStatus::Checking))
+            .map(|remote| {
+                let status = match remote.status {
+                    RemoteStatus::Available => RemoteProbeStatus::Checking,
+                    status => RemoteProbeStatus::remembered(status),
+                };
+                (remote.name.clone(), status)
+            })
             .collect();
         self.known_remotes = remotes;
         self.state = if self.known_remotes.is_empty() && *outlook == Outlook::Local {
@@ -330,17 +355,12 @@ impl ConnectOverlay {
         let Some(status) = self.remote_statuses.get_mut(name) else {
             return;
         };
-        *status = match result {
-            Ok(RemoteHealth {
-                status: RemoteStatus::Available,
-                ..
-            }) => RemoteProbeStatus::Available,
-            Ok(RemoteHealth {
-                protocol_version,
-                status: RemoteStatus::ProtocolMismatch,
-            }) => RemoteProbeStatus::ProtocolMismatch(protocol_version),
-            Err(error) => RemoteProbeStatus::Unavailable(error),
-        };
+        *status = result.map_or_else(RemoteProbeStatus::Unavailable, RemoteProbeStatus::probed);
+    }
+
+    pub(super) fn remote_failed(&mut self, name: &str, status: RemoteStatus) {
+        self.remote_statuses
+            .insert(name.to_owned(), RemoteProbeStatus::remembered(status));
     }
 
     pub(super) fn invite_entry(&self) -> Option<(&str, Option<&str>)> {
@@ -384,10 +404,12 @@ impl ConnectOverlay {
         match self.remote_statuses.get(name) {
             Some(RemoteProbeStatus::Checking) | None => "Checking…".to_owned(),
             Some(RemoteProbeStatus::Available) => "Available".to_owned(),
-            Some(RemoteProbeStatus::ProtocolMismatch(version)) => {
+            Some(RemoteProbeStatus::ProtocolMismatch(Some(version))) => {
                 format!("Protocol v{version} mismatch")
             }
+            Some(RemoteProbeStatus::ProtocolMismatch(None)) => "Protocol mismatch".to_owned(),
             Some(RemoteProbeStatus::Unavailable(error)) => format!("Unavailable · {error}"),
+            Some(RemoteProbeStatus::Revoked) => "Revoked".to_owned(),
         }
     }
 
