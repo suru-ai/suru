@@ -3498,10 +3498,17 @@ fn wrapped_line_count(line: &Line<'static>, width: u16) -> usize {
     // row, so the Paragraph wrap machinery only runs for lines that actually
     // wrap. The width sum uses the same unicode-width tables ratatui's reflow
     // does; a span-embedded newline would break a line the sum cannot see, so
-    // it falls back to the measured count.
+    // it falls back to the measured count. Whitespace-only content also falls
+    // back because ratatui's reflow counts a trailing row after its whitespace.
     if width > 0
         && line.width() <= usize::from(width)
         && line.spans.iter().all(|span| !span.content.contains('\n'))
+        && (line.width() == 0
+            || line.spans.iter().any(|span| {
+                span.content
+                    .chars()
+                    .any(|character| !character.is_whitespace())
+            }))
     {
         return 1;
     }
@@ -4001,6 +4008,8 @@ mod tests {
     fn wrapped_line_count_fast_path_matches_paragraph_wrapping() {
         let corpus = vec![
             Line::from(""),
+            Line::from("  "),
+            Line::from("      "),
             Line::from("x"),
             Line::from("word"),
             Line::from("exactly-tw"),

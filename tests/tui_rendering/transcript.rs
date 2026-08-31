@@ -1870,6 +1870,162 @@ fn a_failed_command_opens_to_its_peek_by_default() {
 }
 
 #[test]
+fn expanding_failed_command_blank_output_keeps_working_tail_visible() {
+    let workspace = workspace_dir();
+    let output = format!("{}\n\n{}", numbered_output(9), prefixed_output("tail", 3));
+    let (mut snapshot, _) =
+        command_activity_session(workspace.path(), ActivityStatus::Failed, &output, false);
+    snapshot.session.working_since = Some(SessionTimestamp::now());
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Working Session with blank command output");
+
+    let peek_rows = rendered_application_rows_at(&application, 60, 24);
+    let peek = peek_rows.join("\n");
+    assert!(
+        peek.contains("Working ("),
+        "the Peek keeps the tail: {peek}"
+    );
+    assert!(
+        !peek.contains("Latest ↓"),
+        "a view following the tail has no Latest affordance: {peek}"
+    );
+
+    application
+        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "… +") as u16))
+        .expect("expand the failed command from its Peek");
+
+    let expanded_rows = rendered_application_rows_at(&application, 60, 24);
+    let expanded = expanded_rows.join("\n");
+    assert!(
+        expanded.contains("Working ("),
+        "blank expanded output cannot clip the Working tail: {expanded}"
+    );
+    assert!(
+        !expanded.contains("Latest ↓"),
+        "expanding a Fold does not leave the followed-latest position: {expanded}"
+    );
+
+    let resized_rows = rendered_application_rows_at(&application, 72, 20);
+    let resized = resized_rows.join("\n");
+    assert!(
+        resized.contains("Working (") && !resized.contains("Latest ↓"),
+        "resizing a followed-latest view keeps its Working tail: {resized}"
+    );
+
+    let restored_rows = rendered_application_rows_at(&application, 60, 24);
+    application
+        .handle_terminal_event(left_click_at(
+            rendered_row(&restored_rows, "× cargo test") as u16
+        ))
+        .expect("collapse the expanded failed command");
+    let collapsed = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        collapsed.contains("Working (") && !collapsed.contains("Latest ↓"),
+        "collapsing the Fold keeps the followed Working tail: {collapsed}"
+    );
+}
+
+#[test]
+fn streaming_blank_command_output_keeps_working_tail_visible() {
+    let workspace = workspace_dir();
+    let output = format!("{}\n\n{}", numbered_output(9), prefixed_output("tail", 3));
+    let (mut snapshot, activity_id) =
+        command_activity_session(workspace.path(), ActivityStatus::Active, &output, false);
+    snapshot.session.working_since = Some(SessionTimestamp::now());
+    let session_id = snapshot.session.id;
+    let revision = snapshot.revision;
+    let mut application = session_opened_under(
+        workspace.path(),
+        EffectiveSettings {
+            transcript: TranscriptSettings {
+                command_auto_expand: CommandAutoExpand::AfterMillis(0),
+                ..TranscriptSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &["transcript.commandAutoExpand"],
+        snapshot,
+    );
+    application
+        .handle_event(ApplicationEvent::SpinnerTick)
+        .expect("promote the streaming command to its live tail");
+
+    let before = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        before.contains("Working (") && !before.contains("Latest ↓"),
+        "expanded blank output keeps the followed Working tail: {before}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![SessionChange::CommandOutputAppended {
+                    activity_id,
+                    content: "\n\nstreamed tail".to_owned(),
+                }],
+            },
+        )))
+        .expect("grow the streaming command through another blank line");
+
+    let grown = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        grown.contains("streamed tail"),
+        "streamed output arrives: {grown}"
+    );
+    assert!(
+        grown.contains("Working (") && !grown.contains("Latest ↓"),
+        "blank streaming growth keeps the followed Working tail: {grown}"
+    );
+}
+
+#[test]
+fn blank_status_and_error_lines_keep_working_tail_visible() {
+    let workspace = workspace_dir();
+    let text = format!(
+        "{}\n\n{}",
+        prefixed_output("detail", 9),
+        prefixed_output("tail", 3)
+    );
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Report progress",
+        workspace.path(),
+    );
+    let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
+    snapshot.session.working_since = Some(SessionTimestamp::now());
+    snapshot.activities[0] = Activity::Error {
+        id: snapshot.activities[0].id(),
+        turn_id,
+        text: text.clone(),
+    };
+    let status_id = ActivityId::new();
+    snapshot.activities.push(Activity::Status {
+        id: status_id,
+        turn_id,
+        text,
+    });
+    snapshot.transcript.push(TranscriptItem::Activity {
+        activity_id: status_id,
+    });
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Working Session with blank Status and Error lines");
+
+    let rendered = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        rendered.contains("Working (") && !rendered.contains("Latest ↓"),
+        "blank Status and Error lines keep the followed Working tail: {rendered}"
+    );
+}
+
+#[test]
 fn a_command_interrupted_without_being_watched_folds_to_its_single_row() {
     let workspace = workspace_dir();
     let (mut snapshot, activity_id) = command_activity_session(
