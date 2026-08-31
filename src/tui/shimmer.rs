@@ -1,4 +1,4 @@
-//! The Working Indicator's Codex-style shimmer: a one-second brightness sweep
+//! The Working Indicator's Codex-style shimmer: a 1.5-second brightness sweep
 //! followed by one second at rest, expressed entirely as draw-time styles.
 
 use std::{f64::consts::PI, sync::OnceLock, time::Duration};
@@ -8,8 +8,8 @@ use ratatui::style::{Color, Modifier, Style};
 
 pub(super) const TICK_PERIOD: Duration = Duration::from_millis(32);
 
-const CYCLE_MILLIS: u64 = 2_000;
-const SWEEP_MILLIS: u64 = 1_000;
+const CYCLE_MILLIS: u64 = 2_500;
+const SWEEP_MILLIS: u64 = 1_500;
 const BAND_HALF_WIDTH: f64 = 5.0;
 
 /// One style per character. All Shimmers share the run loop's frame clock, so
@@ -93,9 +93,9 @@ mod tests {
 
     #[test]
     fn a_cycle_returns_to_the_same_styles() {
-        // 125 × 32ms is exactly two 2s sweeps; one sweep is not an integral
+        // 625 × 32ms is exactly eight 2.5s cycles; one cycle is not an integral
         // number of frames at the chosen refresh interval.
-        let frames = 125;
+        let frames = 625;
         assert_eq!(
             styles("Working", 0, Style::default()),
             styles("Working", frames, Style::default())
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn a_one_second_sweep_has_dark_boundaries_then_rests_for_one_second() {
+    fn a_sweep_has_dark_boundaries_then_rests_for_one_second() {
         let base = Style::default();
         let midpoint = styles_for_color_mode(
             "Working",
@@ -117,17 +117,15 @@ mod tests {
                 .contains(Modifier::BOLD),
             "the sweep reaches the middle of the label within half a second"
         );
-        let first_resting_frame = SWEEP_MILLIS / TICK_PERIOD.as_millis() as u64 + 1;
+        // The sweep does not end on a frame boundary, so the first resting
+        // frame is the first tick at or after the sweep's final millisecond.
+        let first_resting_frame = SWEEP_MILLIS.div_ceil(TICK_PERIOD.as_millis() as u64);
         let last_resting_frame = CYCLE_MILLIS / TICK_PERIOD.as_millis() as u64;
         for truecolor in [false, true] {
             let resting = shimmer_style(base, 0.0, truecolor);
             let opening = styles_for_color_mode("Working", 0, base, truecolor);
-            let closing = styles_for_color_mode(
-                "Working",
-                (SWEEP_MILLIS / TICK_PERIOD.as_millis() as u64) as usize,
-                base,
-                truecolor,
-            );
+            let closing =
+                styles_for_color_mode("Working", first_resting_frame as usize, base, truecolor);
 
             assert!(
                 opening.iter().all(|style| *style == resting),
