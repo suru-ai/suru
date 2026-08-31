@@ -251,12 +251,50 @@ pub fn press_add_workspace(application: &mut Application) -> ApplicationTransiti
 pub fn add_workspace(application: &mut Application, path: &str) -> ApplicationTransition {
     press_add_workspace(application);
     type_terminal_text(application, path);
-    application
+    let transition = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,
         )))
-        .expect("offer the path the reader typed")
+        .expect("offer the path the reader typed");
+    answer_workspace_resolution(application, transition)
+}
+
+/// Answers a Workspace resolution transition the way the local Server would.
+/// Rendering tests stay at the Application seam: they deliver the server's
+/// visible answer rather than reaching into picker or Sidebar state.
+pub fn answer_workspace_resolution(
+    application: &mut Application,
+    transition: ApplicationTransition,
+) -> ApplicationTransition {
+    let ApplicationTransition::ResolveWorkspace {
+        outlook,
+        surface,
+        request_id,
+        request,
+    } = transition
+    else {
+        return transition;
+    };
+    let base = request
+        .base
+        .unwrap_or_else(|| std::env::current_dir().expect("read test current directory"));
+    let named = base.join(request.path);
+    let result = std::fs::canonicalize(named)
+        .map_err(|_| "No directory there".to_owned())
+        .and_then(|path| {
+            path.is_dir()
+                .then_some(suru::protocol::Workspace { path })
+                .ok_or_else(|| "Not a directory".to_owned())
+        });
+    application
+        .handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface,
+            request_id,
+            result,
+        })
+        .expect("deliver the Server's Workspace resolution")
 }
 
 pub fn type_terminal_text(application: &mut Application, text: &str) {

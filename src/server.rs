@@ -32,13 +32,14 @@ use crate::model_catalog::ModelCatalogService;
 use crate::protocol::{
     Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, InitialPrompt,
     IssueInviteRequest, LifecycleState, Message, MessageId, MessageRole, MessageStatus,
-    PROTOCOL_VERSION, Peer, ProviderId, RedeemInviteRequest, Remote, RuntimeDescriptor,
-    SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
-    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
-    SKILL_CATALOG_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision,
-    SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionUpdate,
-    SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
-    SkillCatalogRequest, SkillPromptDelivery, TurnId, UpdateAgentSelectionRequest,
+    PROTOCOL_VERSION, Peer, ProviderId, RedeemInviteRequest, Remote, ResolveWorkspaceRequest,
+    RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT,
+    SESSION_CATALOG_UPDATED_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
+    SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, ServerIdentity, ServerShutdown,
+    SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode, SessionId,
+    SessionRevision, SessionUpdate, SettingMutation, SettingsSnapshot, SettleSessionRequest,
+    ShutdownReason, SkillCatalog, SkillCatalogRequest, SkillPromptDelivery, TurnId,
+    UpdateAgentSelectionRequest,
 };
 use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
@@ -557,6 +558,7 @@ pub async fn spawn_with_providers_and_timings(
             "/v1/landing-agent-selection",
             put(confirm_landing_agent_selection),
         )
+        .route("/v1/workspaces/resolve", post(resolve_workspace))
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route(
             "/v1/sessions/{session_id}",
@@ -1551,6 +1553,48 @@ async fn decode_session_command<T: DeserializeOwned>(
             format!("{command_name} command is not valid JSON"),
         )
     })
+}
+
+async fn resolve_workspace(State(state): State<AppState>, request: Request) -> Response {
+    let request = match decode_session_command::<ResolveWorkspaceRequest>(
+        &state,
+        request,
+        "Workspace resolution",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let base = match request.base {
+        Some(base) => base,
+        None => match std::env::current_dir() {
+            Ok(base) => base,
+            Err(_) => {
+                return session_error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    SessionErrorCode::InvalidWorkspace,
+                    "Could not read the Server's current Workspace",
+                );
+            }
+        },
+    };
+    let named = base.join(request.path);
+    let Ok(path) = std::fs::canonicalize(named) else {
+        return session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::InvalidWorkspace,
+            "No directory there",
+        );
+    };
+    if !path.is_dir() {
+        return session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::InvalidWorkspace,
+            "Not a directory",
+        );
+    }
+    Json(crate::protocol::Workspace { path }).into_response()
 }
 
 #[derive(Deserialize)]

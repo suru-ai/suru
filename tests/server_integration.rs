@@ -11,10 +11,10 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, stop_server},
     protocol::{
         AdmitPromptRequest, CreateSessionRequest, Health, InitialPrompt, IssueInviteRequest,
-        LifecycleState, PROTOCOL_VERSION, PromptDelivery, PromptId, RedeemInviteRequest,
-        RemoteStatus, SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
-        ServerIdentity, ServerShutdown, SessionError, SessionErrorCode, SessionSnapshot,
-        SessionUpdate, SettingMutation, ShutdownReason, Workspace,
+        LifecycleState, Outlook, PROTOCOL_VERSION, PromptDelivery, PromptId, RedeemInviteRequest,
+        RemoteStatus, ResolveWorkspaceRequest, SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT,
+        SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionError, SessionErrorCode,
+        SessionSnapshot, SessionUpdate, SettingMutation, ShutdownReason, Workspace,
     },
     server::{self, ServerConfig, ServerTimings},
 };
@@ -1087,6 +1087,101 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
 
     drop(events);
     pair.wire.wait_for_connections(0).await;
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
+    let pair = paired_servers("remote-outlook-client").await;
+    let workspace = tempfile::tempdir().expect("create Serving Workspace");
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()));
+    let mut catalog = remote.subscribe_catalog();
+    let initial = timeout(Duration::from_secs(1), catalog.next())
+        .await
+        .expect("Remote catalog snapshot arrives")
+        .expect("Remote catalog stream remains open");
+    assert!(matches!(initial, ManagedEvent::SessionCatalogReconciled(_)));
+
+    let created = remote
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Begin through the Outlook-aware Client".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create a Session on the Remote");
+    let announced = timeout(Duration::from_secs(1), catalog.next())
+        .await
+        .expect("Remote catalog update arrives")
+        .expect("Remote catalog stream remains open");
+    assert!(matches!(
+        announced,
+        ManagedEvent::SessionCreated(created_event)
+            if created_event.session_id == created.session.id
+    ));
+    let listed = remote
+        .list_sessions(None)
+        .await
+        .expect("list the Remote's Sessions");
+    assert_eq!(listed[0].id(), created.session.id);
+    assert!(
+        pair.connecting_client
+            .list_sessions(None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut stream = remote
+        .subscribe_session(created.session.id)
+        .await
+        .expect("open the Remote Session stream");
+    let snapshot = timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("Remote Session snapshot arrives")
+        .expect("Remote Session stream remains open")
+        .expect("decode Remote Session snapshot");
+    assert!(matches!(
+        snapshot,
+        suru::managed_client::SessionEvent::Snapshot(snapshot)
+            if snapshot.session.id == created.session.id
+    ));
+
+    drop(stream);
+    drop(catalog);
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn outlook_client_resolves_workspace_paths_on_its_remote() {
+    let pair = paired_servers("remote-workspace-resolution").await;
+    let root = tempfile::tempdir().expect("create Remote Workspace root");
+    let nested = root.path().join("nested");
+    std::fs::create_dir(&nested).expect("create nested Remote Workspace");
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()));
+
+    let resolved = remote
+        .resolve_workspace(ResolveWorkspaceRequest {
+            base: Some(root.path().to_owned()),
+            path: "nested".into(),
+        })
+        .await
+        .expect("resolve the path on the Remote");
+
+    assert_eq!(
+        resolved.path,
+        std::fs::canonicalize(nested).expect("read canonical fixture path")
+    );
     pair.shutdown().await;
 }
 

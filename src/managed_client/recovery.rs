@@ -34,6 +34,8 @@ pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient
     let (events_tx, events_rx) = mpsc::channel(32);
     let (descriptor_tx, descriptor_rx) = watch::channel(connection.descriptor.clone());
     let managed_http = http.clone();
+    let initial_recovery_backoff = config.initial_recovery_backoff;
+    let max_recovery_backoff = config.max_recovery_backoff;
     let task = tokio::spawn(run_managed_client(
         config,
         managed_http,
@@ -45,6 +47,8 @@ pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient
         events: events_rx,
         http,
         descriptor: descriptor_rx,
+        initial_recovery_backoff,
+        max_recovery_backoff,
         task,
     })
 }

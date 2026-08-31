@@ -3,7 +3,8 @@
 use std::path::Path;
 
 use crate::protocol::{
-    EffectiveSettings, EmojiVisibility, SessionId, SessionListItem, SessionStatus, SessionTimestamp,
+    EffectiveSettings, EmojiVisibility, Outlook, SessionId, SessionListItem, SessionStatus,
+    SessionTimestamp,
 };
 
 use super::{
@@ -77,6 +78,11 @@ impl SessionPicker {
     /// narrowing to "where I am" narrows to where the reader now is.
     pub(super) fn adopt_workspace(&mut self, workspace: std::path::PathBuf) {
         self.listing.adopt_current_workspace(workspace);
+    }
+
+    pub(super) fn adopt_outlook(&mut self, outlook: Outlook) {
+        self.listing.adopt_outlook(outlook);
+        self.close();
     }
 
     pub(super) fn close(&mut self) {

@@ -3,14 +3,11 @@
 
 use std::path::PathBuf;
 
-use crate::protocol::SessionListItem;
+use crate::protocol::{Outlook, SessionListItem};
 
 use super::{
-    SessionListRequest, SessionListScope, SessionListSurface,
-    fuzzy::fuzzy_matches,
-    session_listing::SessionListing,
-    sidebar::workspace_name,
-    workspace_path::{WorkspacePathRefusal, read_workspace},
+    SessionListRequest, SessionListScope, SessionListSurface, fuzzy::fuzzy_matches,
+    session_listing::SessionListing, sidebar::workspace_name,
 };
 
 #[derive(Clone, Debug)]
@@ -32,7 +29,7 @@ pub(super) struct WorkspacePicker {
     /// Why the selected Workspace could not be read when the reader chose it.
     /// It belongs to the picker rather than to the listing: the row is still
     /// true of past work even when its directory has since disappeared.
-    refusal: Option<WorkspacePathRefusal>,
+    refusal: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,11 +94,8 @@ impl WorkspacePicker {
         &self.query
     }
 
-    pub(super) const fn refusal(&self) -> Option<&'static str> {
-        match self.refusal {
-            Some(refusal) => Some(refusal.message()),
-            None => None,
-        }
+    pub(super) fn refusal(&self) -> Option<&str> {
+        self.refusal.as_deref()
     }
 
     /// Takes what the reader typed into the query, and leaves them on a
@@ -128,6 +122,11 @@ impl WorkspacePicker {
     /// current — and stands first — where the reader now is.
     pub(super) fn adopt_workspace(&mut self, workspace: PathBuf) {
         self.listing.adopt_current_workspace(workspace);
+    }
+
+    pub(super) fn adopt_outlook(&mut self, outlook: Outlook) {
+        self.listing.adopt_outlook(outlook);
+        self.close();
     }
 
     /// Takes a listing the server answered with, leaving the reader on the
@@ -170,14 +169,11 @@ impl WorkspacePicker {
     /// takes. There is none while the listing is on its way: no row is marked,
     /// so Enter names nothing rather than naming whatever would stand first.
     pub(super) fn offer_selected(&mut self) -> Option<PathBuf> {
-        let selected = self.selected.as_ref()?;
-        match read_workspace(selected) {
-            Ok(workspace) => Some(workspace),
-            Err(refusal) => {
-                self.refusal = Some(refusal);
-                None
-            }
-        }
+        self.selected.clone()
+    }
+
+    pub(super) fn fail_resolution(&mut self, error: String) {
+        self.refusal = Some(error);
     }
 
     pub(super) fn select_previous(&mut self) {

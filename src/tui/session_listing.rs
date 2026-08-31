@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::protocol::{SessionId, SessionListItem, SessionSummary, SessionTimestamp};
+use crate::protocol::{Outlook, SessionId, SessionListItem, SessionSummary, SessionTimestamp};
 
 use super::{SessionListRequest, SessionListScope, SessionListSurface};
 
@@ -25,6 +25,7 @@ pub(super) struct SessionListing {
     /// The surface this listing belongs to, stamped on every request it makes
     /// so a reply lands on the listing that asked and on no other.
     surface: SessionListSurface,
+    outlook: Outlook,
     /// The Workspace `CurrentWorkspace` scope means, kept so narrowing back to
     /// it needs nothing from the caller.
     current_workspace: PathBuf,
@@ -54,6 +55,7 @@ impl SessionListing {
     ) -> Self {
         Self {
             surface,
+            outlook: Outlook::Local,
             scope,
             current_workspace,
             request_sequence: 0,
@@ -82,10 +84,18 @@ impl SessionListing {
     /// supersedes whatever this listing was waiting for before.
     pub(super) fn catch_up(&mut self) -> SessionListRequest {
         self.request_sequence = self.request_sequence.wrapping_add(1);
-        let request =
-            SessionListRequest::new(self.surface, self.request_sequence, self.scope.clone());
+        let request = SessionListRequest::new(
+            self.surface,
+            self.request_sequence,
+            self.outlook.clone(),
+            self.scope.clone(),
+        );
         self.pending_request = Some(request.clone());
         request
+    }
+
+    pub(super) fn outlook(&self) -> &Outlook {
+        &self.outlook
     }
 
     /// Widens the listing to every Workspace, or narrows it back to this
@@ -287,6 +297,16 @@ impl SessionListing {
             self.scope = SessionListScope::CurrentWorkspace(workspace.clone());
         }
         self.current_workspace = workspace;
+    }
+
+    /// Turns this listing toward another Server. Rows and in-flight replies
+    /// belong to the old Outlook and cannot cross into the new one.
+    pub(super) fn adopt_outlook(&mut self, outlook: Outlook) {
+        if self.outlook == outlook {
+            return;
+        }
+        self.outlook = outlook;
+        self.clear();
     }
 
     pub(super) const fn is_loading(&self) -> bool {

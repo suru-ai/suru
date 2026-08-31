@@ -995,7 +995,10 @@ fn enter_attaches_the_selected_session_in_place() {
 
     assert_eq!(
         press_sidebar_key(&mut application, KeyCode::Enter),
-        ApplicationTransition::AttachSession(wanted),
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            wanted,
+        )),
         "Enter attaches the Session the reader has selected"
     );
 }
@@ -2308,7 +2311,10 @@ fn enter_attaches_the_result_the_reader_is_on() {
     );
     assert_eq!(
         press_sidebar_key(&mut application, KeyCode::Enter),
-        ApplicationTransition::AttachSession(wanted),
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            wanted,
+        )),
         "Enter attaches the result the reader is on"
     );
 }
@@ -2571,7 +2577,10 @@ fn a_left_press_on_a_row_attaches_the_session_it_stands_on() {
 
     assert_eq!(
         press_line(&mut application, MouseButton::Left, "Wanted work"),
-        ApplicationTransition::AttachSession(wanted),
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            wanted,
+        )),
         "the press opens the Session under it, keys or no keys"
     );
 }
@@ -2714,7 +2723,7 @@ fn the_menu_sets_the_row_it_stands_on_aside() {
     assert_eq!(
         press_menu_item(&mut application, anchor, 0),
         ApplicationTransition::SettleSession {
-            session_id: wanted,
+            session: suru::protocol::SessionReference::new(suru::protocol::Outlook::Local, wanted,),
             settled: true,
         },
         "the menu acts on the Session it was opened on rather than the one that is open"
@@ -2745,7 +2754,10 @@ fn the_menu_takes_a_settled_row_back_off_the_shelf() {
     assert_eq!(
         press_menu_item(&mut application, anchor, 0),
         ApplicationTransition::SettleSession {
-            session_id: brought_back,
+            session: suru::protocol::SessionReference::new(
+                suru::protocol::Outlook::Local,
+                brought_back,
+            ),
             settled: false,
         },
         "a settled row is brought back rather than set aside again"
@@ -2775,7 +2787,10 @@ fn the_menu_asks_again_before_it_deletes() {
 
     assert_eq!(
         press_menu_item(&mut application, anchor, 1),
-        ApplicationTransition::DeleteSession(wanted),
+        ApplicationTransition::DeleteSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            wanted,
+        )),
         "and the second press acts on the Session the menu stands on"
     );
     assert!(
@@ -2891,7 +2906,7 @@ fn a_right_press_inside_the_menu_leaves_it_where_it_is() {
     assert_eq!(
         press_menu_item(&mut application, anchor, 0),
         ApplicationTransition::SettleSession {
-            session_id: wanted,
+            session: suru::protocol::SessionReference::new(suru::protocol::Outlook::Local, wanted,),
             settled: true,
         },
         "the menu stands where it was, on the row it was opened on"
@@ -3614,6 +3629,132 @@ fn esc_gives_up_the_path_entry_and_leaves_the_workspace_where_it_was() {
         drawn_in_sidebar(&rows, "Listed work"),
         "and the list the entry stood in front of is back: {rows:?}"
     );
+}
+
+#[test]
+fn esc_cancels_a_workspace_resolution_still_in_flight() {
+    let workspace = workspace_dir();
+    let added = workspace.path().join("notes");
+    std::fs::create_dir(&added).expect("create a directory the reader does not take");
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![listed("Listed work", None, workspace.path(), 1, now())],
+    );
+    press_add_workspace(&mut application);
+    type_terminal_text(&mut application, &added.to_string_lossy());
+    let ApplicationTransition::ResolveWorkspace {
+        outlook,
+        surface,
+        request_id,
+        ..
+    } = press_sidebar_key(&mut application, KeyCode::Enter)
+    else {
+        panic!("offering the Sidebar path asks its Server to resolve it");
+    };
+
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Esc),
+        ApplicationTransition::CancelWorkspaceResolution(
+            suru::tui::WorkspaceResolutionSurface::Sidebar,
+        )
+    );
+    application
+        .handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface,
+            request_id,
+            result: Ok(Workspace { path: added }),
+        })
+        .expect("deliver the result that lost the cancellation race");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert_eq!(selector_label(&rows), format!("▸ {ALL_WORKSPACES}"));
+    assert!(drawn_in_sidebar(&rows, "Listed work"));
+}
+
+#[test]
+fn editing_the_path_cancels_the_resolution_for_its_old_spelling() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(workspace.path(), Vec::new());
+    press_add_workspace(&mut application);
+    type_terminal_text(&mut application, "first");
+    let ApplicationTransition::ResolveWorkspace {
+        outlook,
+        surface,
+        request_id,
+        ..
+    } = press_sidebar_key(&mut application, KeyCode::Enter)
+    else {
+        panic!("offering the Sidebar path asks its Server to resolve it");
+    };
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InsertSidebarText(
+                "-corrected".to_owned(),
+            )))
+            .expect("correct the path while its first spelling resolves"),
+        ApplicationTransition::CancelWorkspaceResolution(
+            suru::tui::WorkspaceResolutionSurface::Sidebar,
+        )
+    );
+    application
+        .handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface,
+            request_id,
+            result: Err("old spelling failed".to_owned()),
+        })
+        .expect("deliver the stale refusal");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(sidebar_column(&rows[2]).contains("first-corrected"));
+    assert!(!rows.iter().any(|row| row.contains("old spelling failed")));
+}
+
+#[test]
+fn hiding_the_sidebar_cancels_its_workspace_resolution() {
+    let workspace = workspace_dir();
+    let added = workspace.path().join("notes");
+    std::fs::create_dir(&added).expect("create a directory the reader abandons");
+    let mut application = sidebar_showing(workspace.path(), Vec::new());
+    press_add_workspace(&mut application);
+    type_terminal_text(&mut application, &added.to_string_lossy());
+    let ApplicationTransition::ResolveWorkspace {
+        outlook,
+        surface,
+        request_id,
+        ..
+    } = press_sidebar_key(&mut application, KeyCode::Enter)
+    else {
+        panic!("offering the Sidebar path asks its Server to resolve it");
+    };
+
+    assert_eq!(
+        press_toggle(&mut application),
+        ApplicationTransition::CancelWorkspaceResolution(
+            suru::tui::WorkspaceResolutionSurface::Sidebar,
+        )
+    );
+    application
+        .handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface,
+            request_id,
+            result: Ok(Workspace {
+                path: added.clone(),
+            }),
+        })
+        .expect("deliver the result that lost the hide race");
+    let ApplicationTransition::ListSessions(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionList,
+        )))
+        .expect("open the Session picker")
+    else {
+        panic!("opening the Session picker asks for its Sessions");
+    };
+    assert_ne!(request.scope(), &SessionListScope::CurrentWorkspace(added));
 }
 
 /// The arrows reach the affordance as they reach the selector beside it: the

@@ -2,7 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::protocol::{SessionId, TurnId};
+use crate::protocol::{SessionReference, TurnId};
 
 pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
 
@@ -27,6 +27,7 @@ pub enum SemanticCommandId {
     ConnectFocusNext,
     ConnectPrevious,
     ConnectNext,
+    OutlookSelect,
     ConnectMoveAddressUp,
     ConnectMoveAddressDown,
     ConnectPairAnother,
@@ -141,17 +142,17 @@ impl NumericDigit {
 /// names a subject carries it here rather than letting the surface that
 /// invoked it reach into view state itself, so a click, a keybinding, and a
 /// future plugin all drive the very same command.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SemanticSubject {
     View,
     Turn(TurnId),
     /// One Session, which is what a reader names by acting on its row rather
     /// than on the Session they have open.
-    Session(SessionId),
+    Session(SessionReference),
 }
 
 /// One invocation of a semantic command: which command, and what it acts on.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SemanticInvocation {
     pub(super) id: SemanticCommandId,
     pub(super) subject: SemanticSubject,
@@ -180,10 +181,10 @@ impl SemanticCommandId {
 
     /// This command invoked against one Session, which is what a reader asks
     /// for from that Session's own row in the Sidebar.
-    pub(super) const fn on_session(self, session_id: SessionId) -> SemanticInvocation {
+    pub(super) fn on_session(self, session: SessionReference) -> SemanticInvocation {
         SemanticInvocation {
             id: self,
-            subject: SemanticSubject::Session(session_id),
+            subject: SemanticSubject::Session(session),
         }
     }
 
@@ -208,6 +209,7 @@ impl SemanticCommandId {
             Self::ConnectFocusNext => "connect.focus.next",
             Self::ConnectPrevious => "connect.previous",
             Self::ConnectNext => "connect.next",
+            Self::OutlookSelect => "outlook.select",
             Self::ConnectMoveAddressUp => "connect.address.move-up",
             Self::ConnectMoveAddressDown => "connect.address.move-down",
             Self::ConnectPairAnother => "connect.pair-another",
@@ -561,6 +563,13 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::ConnectNext,
         title: "Next Connect Item",
         description: "Focus the next Remote or address",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OutlookSelect,
+        title: "Turn Outlook",
+        description: "Present the selected local or Remote Server",
         slash: None,
         keybinding: None,
     },

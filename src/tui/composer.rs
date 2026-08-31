@@ -4,14 +4,14 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use crate::protocol::{
-    InitialPrompt, PromptId, SessionId, SkillDescriptor, SkillInvocation, SkillMarkerSpan,
+    InitialPrompt, PromptId, SessionReference, SkillDescriptor, SkillInvocation, SkillMarkerSpan,
     skill_marker_matches,
 };
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) enum ComposerKey {
     Landing,
-    Session(SessionId),
+    Session(SessionReference),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -185,8 +185,8 @@ impl ComposerMemory {
         self.composer_mut(key).clear();
     }
 
-    pub(super) fn discard_session(&mut self, session_id: SessionId) {
-        self.composers.remove(&ComposerKey::Session(session_id));
+    pub(super) fn discard_session(&mut self, session: SessionReference) {
+        self.composers.remove(&ComposerKey::Session(session));
     }
 
     pub(super) fn begin_submission(&mut self, key: ComposerKey) -> InitialPrompt {
@@ -219,13 +219,16 @@ impl ComposerMemory {
         })
     }
 
-    pub(super) fn recover_session_to_landing(&mut self, session_id: SessionId) {
-        let Some(mut recovered) = self.composers.remove(&ComposerKey::Session(session_id)) else {
+    pub(super) fn recover_session_to_landing(&mut self, session: SessionReference) {
+        let Some(mut recovered) = self
+            .composers
+            .remove(&ComposerKey::Session(session.clone()))
+        else {
             return;
         };
         if recovered.text.is_empty() {
             self.composers
-                .insert(ComposerKey::Session(session_id), recovered);
+                .insert(ComposerKey::Session(session), recovered);
             return;
         }
         if let Some(landing) = self.composers.remove(&ComposerKey::Landing) {

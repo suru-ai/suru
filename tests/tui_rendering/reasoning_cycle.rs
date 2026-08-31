@@ -294,13 +294,14 @@ fn rapid_reasoning_cycles_coalesce_to_one_serialized_latest_selection() {
     );
 
     let ApplicationTransition::UpdateAgentSelection {
-        session_id: first_session,
+        session: first_session,
         request: first_request,
     } = press_reasoning_cycle(&mut application)
     else {
         panic!("the first cycle should dispatch one selection request");
     };
-    assert_eq!(first_session, session_id);
+    assert_eq!(first_session.origin, suru::protocol::Outlook::Local);
+    assert_eq!(first_session.session_id, session_id);
     assert_eq!(first_request.selection, cycling_selection("medium"));
     assert_reasoning_summary(&application, "Medium");
 
@@ -334,7 +335,7 @@ fn rapid_reasoning_cycles_coalesce_to_one_serialized_latest_selection() {
 
     // Settling the first request flushes only the coalesced latest selection.
     let ApplicationTransition::UpdateAgentSelection {
-        session_id: flushed_session,
+        session: flushed_session,
         request: flushed_request,
     } = application
         .handle_event(ApplicationEvent::AgentSelectionUpdated {
@@ -345,7 +346,8 @@ fn rapid_reasoning_cycles_coalesce_to_one_serialized_latest_selection() {
     else {
         panic!("settling should flush the coalesced latest selection");
     };
-    assert_eq!(flushed_session, session_id);
+    assert_eq!(flushed_session.origin, suru::protocol::Outlook::Local);
+    assert_eq!(flushed_session.session_id, session_id);
     assert_eq!(flushed_request.selection, cycling_selection("low"));
     assert_ne!(flushed_request.operation_id, first_request.operation_id);
     assert_reasoning_summary(&application, "Low");

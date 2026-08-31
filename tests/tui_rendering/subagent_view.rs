@@ -147,7 +147,10 @@ fn pressing_a_working_subagent_row_opens_the_childs_session() {
 
     assert_eq!(
         press_text(&mut application, 80, 22, "Explore: Map the provider seams"),
-        ApplicationTransition::AttachSession(child_id),
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            child_id,
+        )),
         "pressing the row asks to open the child Session it names"
     );
 }
@@ -178,7 +181,10 @@ fn a_settled_subagent_row_in_history_still_opens_the_child() {
 
     assert_eq!(
         press_text(&mut application, 80, 22, "Explore: Map the provider seams"),
-        ApplicationTransition::AttachSession(child_id),
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            child_id,
+        )),
         "a settled row in scrollback is still the way into the child"
     );
 }
@@ -196,7 +202,10 @@ fn escape_in_a_subagent_session_returns_to_the_parent() {
 
     assert_eq!(
         press_key(&mut application, KeyCode::Esc),
-        ApplicationTransition::AttachSession(parent_id),
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            parent_id,
+        )),
         "Escape asks to open the parent Session, never to interrupt the child"
     );
 }
@@ -231,7 +240,10 @@ fn returning_to_the_parent_restores_the_readers_view_state() {
     rendered_application_rows_at(&application, 80, 15);
     assert_eq!(
         press_key(&mut application, KeyCode::Esc),
-        ApplicationTransition::AttachSession(parent_id),
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            parent_id,
+        )),
         "Escape asks for the parent back"
     );
     application

@@ -5,27 +5,145 @@ use std::collections::HashSet;
 use anyhow::{Context, Result, bail};
 use eventsource_stream::{Event, EventStreamError, Eventsource};
 use futures_util::StreamExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    task::JoinHandle,
+    time::Duration,
+};
 
 use crate::protocol::{
-    RuntimeDescriptor, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
+    Outlook, RuntimeDescriptor, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
     SKILL_CATALOG_UPDATED_EVENT, SessionCatalogChange, SessionCatalogRevision,
     SessionCatalogSnapshot, SessionCatalogUpdate, SessionCreated, SessionDeleted, SessionId,
     SessionSettlementChanged, SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged,
     SkillCatalog,
 };
 
-use super::ManagedEvent;
+use super::{ManagedEvent, server_url};
 
 pub(super) async fn open(
     http: &reqwest::Client,
     descriptor: &RuntimeDescriptor,
 ) -> reqwest::Result<reqwest::Response> {
-    http.get(format!("{}/v1/session-events", descriptor.base_url))
+    open_for_outlook(http, descriptor, &Outlook::Local).await
+}
+
+async fn open_for_outlook(
+    http: &reqwest::Client,
+    descriptor: &RuntimeDescriptor,
+    outlook: &Outlook,
+) -> reqwest::Result<reqwest::Response> {
+    let url = server_url(&descriptor.base_url, outlook, "/v1/session-events")
+        .expect("a validated runtime descriptor builds a Server URL");
+    http.get(url)
         .bearer_auth(&descriptor.token)
         .send()
         .await?
         .error_for_status()
+}
+
+/// A reconnecting catalog stream for the Server named by one Client Outlook.
+/// Its lifetime is the interest: dropping it aborts the task and releases the
+/// Remote proxy connection.
+pub struct SessionCatalogSubscription {
+    events: mpsc::Receiver<ManagedEvent>,
+    task: JoinHandle<()>,
+}
+
+impl SessionCatalogSubscription {
+    pub(super) fn open_attached(
+        http: reqwest::Client,
+        descriptor: watch::Receiver<RuntimeDescriptor>,
+        outlook: Outlook,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) -> Self {
+        let (events_tx, events_rx) = mpsc::channel(32);
+        let task = tokio::spawn(run_attached(
+            http,
+            descriptor,
+            outlook,
+            events_tx,
+            initial_backoff,
+            max_backoff,
+        ));
+        Self {
+            events: events_rx,
+            task,
+        }
+    }
+
+    pub async fn next(&mut self) -> Option<ManagedEvent> {
+        self.events.recv().await
+    }
+}
+
+impl Drop for SessionCatalogSubscription {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn run_attached(
+    http: reqwest::Client,
+    mut descriptor: watch::Receiver<RuntimeDescriptor>,
+    outlook: Outlook,
+    events: mpsc::Sender<ManagedEvent>,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+) {
+    // An attached Outlook has no separately hydrated local catalog. Treat its
+    // first snapshot as reconciliation so the TUI refreshes any listing that
+    // raced with opening the stream.
+    let mut known_session_ids = Some(HashSet::new());
+    let mut retry_in = Duration::ZERO;
+    loop {
+        if events.is_closed() {
+            return;
+        }
+        let active_descriptor = descriptor.borrow().clone();
+        let response = open_for_outlook(&http, &active_descriptor, &outlook).await;
+        let Ok(response) = response else {
+            retry_in = next_backoff(retry_in, initial_backoff, max_backoff);
+            if wait_to_reconnect(&mut descriptor, retry_in).await {
+                retry_in = Duration::ZERO;
+            }
+            continue;
+        };
+        let (hydrated, hydration) = oneshot::channel();
+        match consume(response, &events, &mut known_session_ids, hydrated).await {
+            Ok(StreamOutcome::ReceiverClosed) => return,
+            Ok(StreamOutcome::Disconnected) | Err(_) => {
+                if hydration.await.is_ok() {
+                    retry_in = Duration::ZERO;
+                }
+                retry_in = next_backoff(retry_in, initial_backoff, max_backoff);
+                if wait_to_reconnect(&mut descriptor, retry_in).await {
+                    retry_in = Duration::ZERO;
+                }
+            }
+        }
+    }
+}
+
+/// Waits for the retry delay or a replacement local Server descriptor. A new
+/// descriptor starts a fresh retry schedule because it names a new proxy.
+async fn wait_to_reconnect(
+    descriptor: &mut watch::Receiver<RuntimeDescriptor>,
+    retry_in: Duration,
+) -> bool {
+    tokio::select! {
+        changed = descriptor.changed(), if descriptor.has_changed().is_ok() => changed.is_ok(),
+        _ = tokio::time::sleep(retry_in) => false,
+    }
+}
+
+fn next_backoff(previous: Duration, initial: Duration, max: Duration) -> Duration {
+    if previous.is_zero() {
+        initial
+    } else {
+        previous.saturating_mul(2).min(max)
+    }
 }
 
 pub(super) enum StreamOutcome {
@@ -236,7 +354,24 @@ fn validate_event_id(id: &str, revision: SessionCatalogRevision) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed_client::{INITIAL_RECOVERY_BACKOFF, MAX_RECOVERY_BACKOFF};
     use crate::protocol::SessionTimestamp;
+
+    #[test]
+    fn attached_catalog_backoff_doubles_and_caps_at_the_managed_client_limit() {
+        let mut retry_in = Duration::ZERO;
+        let waits = (0..10)
+            .map(|_| {
+                retry_in = next_backoff(retry_in, INITIAL_RECOVERY_BACKOFF, MAX_RECOVERY_BACKOFF);
+                retry_in
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            waits,
+            [50, 100, 200, 400, 800, 1600, 3200, 5000, 5000, 5000].map(Duration::from_millis)
+        );
+    }
 
     #[test]
     fn reconnect_snapshot_recovers_a_missed_deletion() {

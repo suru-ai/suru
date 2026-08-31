@@ -818,7 +818,10 @@ fn ended_session_subscription_requests_a_fresh_snapshot_for_reconciliation() {
         application
             .handle_event(ApplicationEvent::SessionSubscriptionEnded)
             .expect("handle ended Session subscription"),
-        ApplicationTransition::SubscribeSession(session_id)
+        ApplicationTransition::SubscribeSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            session_id,
+        ))
     );
 }
 
@@ -866,7 +869,7 @@ async fn headless_slash_settle_sets_the_open_session_aside_on_a_real_server() {
 
     type_terminal_text(&mut application, "/settle");
     let ApplicationTransition::SettleSession {
-        session_id: named,
+        session: named,
         settled: set_aside,
     } = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -878,16 +881,17 @@ async fn headless_slash_settle_sets_the_open_session_aside_on_a_real_server() {
         panic!("/settle in an open Session should ask for that Session to be set aside");
     };
     assert_eq!(
-        named, session_id,
+        named.session_id, session_id,
         "the command names the Session the reader is in"
     );
+    assert_eq!(named.origin, suru::protocol::Outlook::Local);
     assert!(
         set_aside,
         "and asks for it to be set aside rather than brought back"
     );
 
     let settled = client
-        .settle_session(named, true)
+        .settle_session(named.session_id, true)
         .await
         .expect("the server accepts the Session the command named");
     assert!(

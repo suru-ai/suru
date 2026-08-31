@@ -25,7 +25,6 @@ mod subagent_picker;
 mod text_layout;
 mod transcript;
 mod usage;
-mod workspace_path;
 mod workspace_picker;
 
 pub use commands::{NumericDigit, SemanticCommandId};
@@ -35,5 +34,5 @@ pub use keymap::command_for_terminal_event;
 pub use render::render;
 pub use state::{
     Application, ApplicationEvent, ApplicationTransition, CommandId, ModelListRequest,
-    SessionListRequest, SessionListScope, SessionListSurface, TuiState,
+    SessionListRequest, SessionListScope, SessionListSurface, TuiState, WorkspaceResolutionSurface,
 };

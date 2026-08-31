@@ -59,7 +59,10 @@ fn slash_settle_sets_the_open_session_aside() {
             )))
             .expect("invoke the settle command"),
         ApplicationTransition::SettleSession {
-            session_id,
+            session: suru::protocol::SessionReference::new(
+                suru::protocol::Outlook::Local,
+                session_id,
+            ),
             settled: true,
         }
     );

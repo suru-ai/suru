@@ -150,7 +150,10 @@ fn session_picker_orders_marks_focuses_and_wraps_live_sessions() {
                 KeyModifiers::NONE,
             )))
             .expect("select wrapped Session row"),
-        ApplicationTransition::AttachSession(newest_id)
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            newest_id,
+        ))
     );
 }
 
@@ -200,7 +203,10 @@ fn session_picker_requires_confirmation_and_removes_authoritatively_deleted_sess
                 KeyModifiers::CONTROL,
             )))
             .expect("confirm Session deletion"),
-        ApplicationTransition::DeleteSession(selected_id)
+        ApplicationTransition::DeleteSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            selected_id,
+        ))
     );
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::SessionDeleted(
@@ -312,7 +318,10 @@ fn session_attachment_failure_preserves_the_original_until_target_hydration() {
                 KeyModifiers::NONE,
             )))
             .expect("begin target attachment"),
-        ApplicationTransition::AttachSession(target_id)
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            target_id,
+        ))
     );
     assert!(
         rendered_application_rows(&application)
@@ -743,7 +752,10 @@ fn session_picker_scroll_window_keeps_the_current_session_visible() {
                 KeyModifiers::NONE,
             )))
             .expect("select wrapped newest Session"),
-        ApplicationTransition::AttachSession(newest_id)
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            newest_id,
+        ))
     );
 }
 

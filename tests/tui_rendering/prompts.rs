@@ -12,8 +12,8 @@ use std::{
 use suru::{
     managed_client::SessionEvent,
     protocol::{
-        Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, SessionChange, SessionId,
-        SessionRevision, SessionUpdate,
+        Outlook, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, SessionChange,
+        SessionId, SessionReference, SessionRevision, SessionUpdate,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, command_for_terminal_event,
@@ -99,7 +99,7 @@ fn new_session_releases_a_detached_prompt_after_its_admission_succeeds() {
             "Continue in the old Session".to_owned(),
         )))
         .expect("type an in-flight Prompt");
-    let ApplicationTransition::AdmitPrompt { request, .. } = application
+    let ApplicationTransition::AdmitPrompt { session, request } = application
         .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
         .expect("begin Prompt admission")
     else {
@@ -116,9 +116,10 @@ fn new_session_releases_a_detached_prompt_after_its_admission_succeeds() {
         ApplicationTransition::DetachSession
     );
     application
-        .handle_event(ApplicationEvent::PromptAdmissionSucceeded(
-            admitted_prompt_id,
-        ))
+        .handle_event(ApplicationEvent::PromptAdmissionSucceeded {
+            session,
+            prompt_id: admitted_prompt_id,
+        })
         .expect("acknowledge the detached Prompt admission");
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -147,7 +148,7 @@ fn provisional_steer_is_immediate_single_and_reconciles_in_place() {
         )))
         .expect("type steer");
     let ApplicationTransition::AdmitPrompt {
-        session_id: admitted_to,
+        session: admitted_to,
         request,
     } = application
         .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
@@ -155,7 +156,8 @@ fn provisional_steer_is_immediate_single_and_reconciles_in_place() {
     else {
         panic!("a Session steer should request Prompt admission");
     };
-    assert_eq!(admitted_to, session_id);
+    assert_eq!(admitted_to.origin, suru::protocol::Outlook::Local);
+    assert_eq!(admitted_to.session_id, session_id);
     let prompt_id = request.prompt.id;
     let provisional = rendered_application_rows(&application).join("\n");
     assert_eq!(provisional.matches("Use the smaller interface").count(), 1);
@@ -168,7 +170,10 @@ fn provisional_steer_is_immediate_single_and_reconciles_in_place() {
         ApplicationTransition::Continue
     );
     application
-        .handle_event(ApplicationEvent::PromptAdmissionSucceeded(prompt_id))
+        .handle_event(ApplicationEvent::PromptAdmissionSucceeded {
+            session: admitted_to,
+            prompt_id,
+        })
         .expect("handle Prompt admission acknowledgement");
     assert_eq!(
         rendered_application_rows(&application)
@@ -317,7 +322,7 @@ fn queued_prompt_docks_immediately_and_scoped_mode_preserves_the_draft() {
         )))
         .expect("open queued-Prompt mode");
     let ApplicationTransition::PromotePrompt {
-        session_id: promoted_in,
+        session: promoted_in,
         prompt_id: promoted,
     } = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -328,7 +333,7 @@ fn queued_prompt_docks_immediately_and_scoped_mode_preserves_the_draft() {
     else {
         panic!("Enter in queued-Prompt mode should promote the selection");
     };
-    assert_eq!((promoted_in, promoted), (session_id, prompt_id));
+    assert_eq!((promoted_in.session_id, promoted), (session_id, prompt_id));
     application
         .handle_event(ApplicationEvent::SessionOperationFailed(
             "competing mutation lost".to_owned(),
@@ -353,7 +358,7 @@ fn queued_prompt_docks_immediately_and_scoped_mode_preserves_the_draft() {
         )))
         .expect("reopen queued-Prompt mode");
     let ApplicationTransition::CancelPrompt {
-        session_id: cancelled_in,
+        session: cancelled_in,
         prompt_id: cancelled,
     } = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -364,7 +369,10 @@ fn queued_prompt_docks_immediately_and_scoped_mode_preserves_the_draft() {
     else {
         panic!("Ctrl+D in queued-Prompt mode should cancel the selection");
     };
-    assert_eq!((cancelled_in, cancelled), (session_id, prompt_id));
+    assert_eq!(
+        (cancelled_in.session_id, cancelled),
+        (session_id, prompt_id)
+    );
 }
 
 #[test]
@@ -399,7 +407,9 @@ fn escape_confirmation_is_local_and_targets_the_observed_active_turn() {
         "interruption confirmation must remain client-local"
     );
 
-    let ApplicationTransition::InterruptSession { session_id } = application
+    let ApplicationTransition::InterruptSession {
+        session: session_id,
+    } = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::Esc,
             KeyModifiers::NONE,
@@ -408,7 +418,8 @@ fn escape_confirmation_is_local_and_targets_the_observed_active_turn() {
     else {
         panic!("the second Esc should issue the Session's interruption");
     };
-    assert_eq!(session_id, expected_session_id);
+    assert_eq!(session_id.origin, suru::protocol::Outlook::Local);
+    assert_eq!(session_id.session_id, expected_session_id);
 }
 
 #[test]
@@ -467,7 +478,7 @@ fn failed_admission_restores_stable_prompt_and_saves_intervening_input_to_histor
             "Do not lose this Prompt".to_owned(),
         )))
         .expect("type steer");
-    let ApplicationTransition::AdmitPrompt { request, .. } = application
+    let ApplicationTransition::AdmitPrompt { session, request } = application
         .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
         .expect("submit steer")
     else {
@@ -481,6 +492,7 @@ fn failed_admission_restores_stable_prompt_and_saves_intervening_input_to_histor
         .expect("type while admission is pending");
     application
         .handle_event(ApplicationEvent::PromptAdmissionFailed {
+            session: session.clone(),
             prompt_id,
             error: "server unavailable".to_owned(),
         })
@@ -502,6 +514,7 @@ fn failed_admission_restores_stable_prompt_and_saves_intervening_input_to_histor
     assert_eq!(exact_retry.prompt.id, prompt_id);
     application
         .handle_event(ApplicationEvent::PromptAdmissionFailed {
+            session,
             prompt_id,
             error: "still unavailable".to_owned(),
         })
@@ -526,6 +539,55 @@ fn failed_admission_restores_stable_prompt_and_saves_intervening_input_to_histor
 }
 
 #[test]
+fn an_admission_result_from_another_origin_cannot_settle_the_pending_prompt() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path());
+    enter_session(&mut application, workspace.path());
+    type_terminal_text(&mut application, "Keep this origin");
+    let ApplicationTransition::AdmitPrompt { session, request } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the local Prompt")
+    else {
+        panic!("a Session Prompt should request admission");
+    };
+    let prompt_id = request.prompt.id;
+    let other_origin =
+        SessionReference::new(Outlook::Remote("studio".to_owned()), session.session_id);
+
+    application
+        .handle_event(ApplicationEvent::PromptAdmissionFailed {
+            session: other_origin,
+            prompt_id,
+            error: "wrong Server".to_owned(),
+        })
+        .expect("ignore an answer from another origin");
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("the other origin leaves admission pending"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("wrong Server")
+    );
+
+    application
+        .handle_event(ApplicationEvent::PromptAdmissionFailed {
+            session,
+            prompt_id,
+            error: "local Server unavailable".to_owned(),
+        })
+        .expect("accept the answer from the owning origin");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("local Server unavailable")
+    );
+}
+
+#[test]
 fn authoritative_delivery_after_an_ambiguous_failure_removes_the_restored_retry() {
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path());
@@ -535,7 +597,7 @@ fn authoritative_delivery_after_an_ambiguous_failure_removes_the_restored_retry(
             "Accepted despite transport failure".to_owned(),
         )))
         .expect("type steer");
-    let ApplicationTransition::AdmitPrompt { request, .. } = application
+    let ApplicationTransition::AdmitPrompt { session, request } = application
         .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
         .expect("submit steer")
     else {
@@ -543,6 +605,7 @@ fn authoritative_delivery_after_an_ambiguous_failure_removes_the_restored_retry(
     };
     application
         .handle_event(ApplicationEvent::PromptAdmissionFailed {
+            session,
             prompt_id: request.prompt.id,
             error: "response connection closed".to_owned(),
         })

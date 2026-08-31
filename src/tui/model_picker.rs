@@ -2,8 +2,8 @@
 
 use crate::protocol::{
     AgentSelection, ModelAvailability, ModelCatalog, ModelDescriptor, ModelId, ModelOptionKind,
-    ModelOptionRole, ModelOptionValue, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
-    ProviderUnavailability, SettingMutation,
+    ModelOptionRole, ModelOptionValue, Outlook, ProviderCatalogStatus, ProviderId,
+    ProviderModelCatalog, ProviderUnavailability, SettingMutation,
 };
 
 use super::{ModelListRequest, fuzzy::fuzzy_matches};
@@ -61,6 +61,7 @@ struct ProviderModels {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ModelPicker {
+    outlook: Outlook,
     open: bool,
     request_sequence: u64,
     active_request: Option<ModelListRequest>,
@@ -141,9 +142,21 @@ impl ModelPicker {
 
     pub(super) fn begin_refresh(&mut self) -> ModelListRequest {
         self.request_sequence = self.request_sequence.wrapping_add(1);
-        let request = ModelListRequest::new(self.request_sequence);
+        let request = ModelListRequest::new(self.request_sequence, self.outlook.clone());
         self.active_request = Some(request.clone());
         request
+    }
+
+    pub(super) fn adopt_outlook(&mut self, outlook: Outlook) {
+        if self.outlook == outlook {
+            return;
+        }
+        self.outlook = outlook;
+        self.close();
+        self.active_request = None;
+        self.cached_providers.clear();
+        self.providers.clear();
+        self.provider_scope = None;
     }
 
     pub(super) fn is_active_request(&self, request: &ModelListRequest) -> bool {
@@ -302,7 +315,7 @@ impl ModelPicker {
     pub(super) fn begin_retry(&mut self) -> Option<ModelListRequest> {
         matches!(self.selected, Some(PickerSelection::Retry(_))).then(|| {
             self.request_sequence = self.request_sequence.wrapping_add(1);
-            let request = ModelListRequest::new(self.request_sequence);
+            let request = ModelListRequest::new(self.request_sequence, self.outlook.clone());
             self.active_request = Some(request.clone());
             request
         })

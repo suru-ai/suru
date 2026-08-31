@@ -294,30 +294,38 @@ fn render_connect_overlay(
         theme.text.primary.add_modifier(Modifier::BOLD),
     )];
     let remote_capacity = usize::from(area.height.saturating_sub(2)).saturating_sub(2);
-    let remote_rows = overlay
-        .remotes()
-        .iter()
-        .enumerate()
-        .map(|(index, remote)| {
-            let prefix = if index == overlay.selected() {
-                "› "
+    let mut remote_rows = vec![Line::styled(
+        if overlay.selected() == 0 {
+            "› Local"
+        } else {
+            "  Local"
+        },
+        if overlay.selected() == 0 {
+            theme.selection.focused
+        } else {
+            theme.text.primary
+        },
+    )];
+    remote_rows.extend(overlay.remotes().iter().enumerate().map(|(index, remote)| {
+        let row_index = index + 1;
+        let prefix = if row_index == overlay.selected() {
+            "› "
+        } else {
+            "  "
+        };
+        Line::styled(
+            format!(
+                "{prefix}{}  {}",
+                remote.name,
+                overlay.status_label(&remote.name)
+            ),
+            if row_index == overlay.selected() {
+                theme.selection.focused
             } else {
-                "  "
-            };
-            Line::styled(
-                format!(
-                    "{prefix}{}  {}",
-                    remote.name,
-                    overlay.status_label(&remote.name)
-                ),
-                if index == overlay.selected() {
-                    theme.selection.focused
-                } else {
-                    theme.text.primary
-                },
-            )
-        })
-        .collect::<Vec<_>>();
+                theme.text.primary
+            },
+        )
+    }));
     lines.extend(visible_window(
         remote_rows,
         overlay.selected(),
@@ -2261,8 +2269,8 @@ fn render_landing(
     .areas(area);
     let content = horizontally_inset(main, horizontal_padding(area.width));
     let key = ComposerKey::Landing;
-    let composer_text = state.composers.text(key);
-    let composer_cursor = state.composers.cursor(key);
+    let composer_text = state.composers.text(key.clone());
+    let composer_cursor = state.composers.cursor(key.clone());
     let skill_markers = state.composers.skill_markers(key);
     let composer_height = composer_block_height(
         area.height,
@@ -2364,9 +2372,13 @@ fn render_session(
     // stands down for a one-line way back, and Escape means leaving rather
     // than interrupting.
     let subagent_view = snapshot.session.parent.is_some();
-    let key = ComposerKey::Session(session_id);
-    let composer_text = state.composers.text(key);
-    let composer_cursor = state.composers.cursor(key);
+    let session_reference = state
+        .session_reference
+        .clone()
+        .expect("Session renderer requires its origin-qualified reference");
+    let key = ComposerKey::Session(session_reference.clone());
+    let composer_text = state.composers.text(key.clone());
+    let composer_cursor = state.composers.cursor(key.clone());
     let skill_markers = state.composers.skill_markers(key);
     let desired_composer_height = if subagent_view {
         1
@@ -2472,7 +2484,7 @@ fn render_session(
         desired_composer_height.min(area.height.saturating_sub(reserved_height).max(1));
     let provisional_prompts = state.provisional_prompts(session_id);
     let interaction = state
-        .session_interaction(session_id)
+        .session_interaction(&session_reference)
         .expect("Session interaction is initialized with its snapshot");
     let folds = interaction.folds.borrow();
     let groups = interaction.groups.borrow();
@@ -3147,19 +3159,24 @@ fn rendered_slot_lines(
 }
 
 fn connection_status_text(state: &TuiState, detail: ResponsiveDetail) -> String {
+    let outlook = state
+        .outlook
+        .remote_name()
+        .map(|name| format!("Outlook {name} · "))
+        .unwrap_or_default();
     if detail.shows_secondary() {
-        return status_text(state);
+        return format!("{outlook}{}", status_text(state));
     }
     if state.fatal_error.is_some() {
-        "Connection failed".to_owned()
+        format!("{outlook}Connection failed")
     } else if state.manually_stopped {
-        "Server stopped".to_owned()
+        format!("{outlook}Server stopped")
     } else if state.recovery.is_some() {
-        "Recovering".to_owned()
+        format!("{outlook}Recovering")
     } else if state.identity.is_some() {
-        "Connected".to_owned()
+        format!("{outlook}Connected")
     } else {
-        "Connecting".to_owned()
+        format!("{outlook}Connecting")
     }
 }
 

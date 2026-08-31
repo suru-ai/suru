@@ -498,7 +498,7 @@ fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
         .expect("stage High");
 
     let ApplicationTransition::UpdateAgentSelection {
-        session_id: updated_session,
+        session: updated_session,
         request,
     } = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -509,7 +509,8 @@ fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
     else {
         panic!("Session options should produce one authoritative update");
     };
-    assert_eq!(updated_session, session_id);
+    assert_eq!(updated_session.origin, suru::protocol::Outlook::Local);
+    assert_eq!(updated_session.session_id, session_id);
     assert_eq!(
         request.selection.options,
         vec![

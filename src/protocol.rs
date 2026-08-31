@@ -429,6 +429,16 @@ pub struct Workspace {
     pub path: PathBuf,
 }
 
+/// A path a Client asks its Outlook Server to interpret as a Workspace. A
+/// relative path is read from `base`, or from the Server process's current
+/// directory when no base is supplied.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveWorkspaceRequest {
+    pub base: Option<PathBuf>,
+    pub path: PathBuf,
+}
+
 /// Safe presentation metadata for one user-invocable Skill. The Provider keeps
 /// every native path, command name, and configuration detail behind its own
 /// runtime boundary; clients receive only this opaque identity and the words
@@ -1075,6 +1085,40 @@ pub struct Remote {
     pub name: String,
     pub fingerprint: String,
     pub addresses: Vec<std::net::SocketAddr>,
+}
+
+/// The Server whose world a Client is presently presenting. This is Client
+/// state rather than wire state: Remote requests still travel through the
+/// local Server's explicit proxy route.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub enum Outlook {
+    #[default]
+    Local,
+    Remote(String),
+}
+
+impl Outlook {
+    pub fn remote_name(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Remote(name) => Some(name),
+        }
+    }
+}
+
+/// A Client-side reference to one Session together with the Server that owns
+/// it. Session IDs are only unique within an origin Server, so callers must
+/// retain both even while the current UI presents one Outlook at a time.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct SessionReference {
+    pub origin: Outlook,
+    pub session_id: SessionId,
+}
+
+impl SessionReference {
+    pub fn new(origin: Outlook, session_id: SessionId) -> Self {
+        Self { origin, session_id }
+    }
 }
 
 /// A durable redeeming Server as the Serving Server knows it. The key itself

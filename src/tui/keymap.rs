@@ -185,6 +185,9 @@ pub(super) fn command_for_connect_overlay_event(
         (ConnectInputMode::Picker, KeyCode::Char('a'), KeyModifiers::NONE) => Some(
             CommandId::InvokeSemantic(SemanticCommandId::ConnectPairAnother),
         ),
+        (ConnectInputMode::Picker, KeyCode::Enter, KeyModifiers::NONE) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::OutlookSelect))
+        }
         (
             ConnectInputMode::Picker | ConnectInputMode::Addresses,
             KeyCode::Up,

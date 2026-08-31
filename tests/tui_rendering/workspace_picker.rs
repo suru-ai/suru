@@ -5,10 +5,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::support::{
-    SIDEBAR_WIDE, add_workspace, connected_application, deliver_settings, drawn_in_sidebar,
-    enter_active_session, fixture_instance_id, noncanonical_spelling, ready_health,
-    rendered_application_rows, rendered_application_rows_at, rendered_row, selector_label,
-    sidebar_column, type_terminal_text, workspace_dir,
+    SIDEBAR_WIDE, add_workspace, answer_workspace_resolution, connected_application,
+    deliver_settings, drawn_in_sidebar, enter_active_session, fixture_instance_id,
+    noncanonical_spelling, ready_health, rendered_application_rows, rendered_application_rows_at,
+    rendered_row, selector_label, sidebar_column, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -1205,12 +1205,13 @@ fn selected_row(application: &Application) -> String {
 
 /// Enter on the row the reader is on, which is how a Workspace is chosen.
 fn choose(application: &mut Application) -> ApplicationTransition {
-    application
+    let transition = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,
         )))
-        .expect("choose the Workspace the reader is on")
+        .expect("choose the Workspace the reader is on");
+    answer_workspace_resolution(application, transition)
 }
 
 /// A listed Session mid-Turn, named by the Session it stands for so a frame

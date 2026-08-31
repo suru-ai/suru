@@ -10,15 +10,14 @@ use std::{
 use ratatui::layout::Position;
 
 use crate::protocol::{
-    AutoSettle, EffectiveSettings, EmojiVisibility, SessionId, SessionListItem, SessionTimestamp,
-    SidebarScope, SidebarVisibility,
+    AutoSettle, EffectiveSettings, EmojiVisibility, Outlook, ResolveWorkspaceRequest, SessionId,
+    SessionListItem, SessionReference, SessionTimestamp, SidebarScope, SidebarVisibility,
 };
 
 use super::{
     SessionListRequest, SessionListScope, SessionListSurface,
     commands::{SemanticCommandId, SemanticInvocation},
     session_listing::SessionListing,
-    workspace_path::read_workspace,
 };
 
 /// The columns the Sidebar occupies, cloning t3 code's own fixed column. There
@@ -236,14 +235,14 @@ struct WorkspaceEntry {
     /// Why the path they last offered was refused, and `None` before they have
     /// offered one — or once they have typed anything since, because a refusal
     /// is about the path it read rather than about the entry it stands under.
-    rejection: Option<&'static str>,
+    rejection: Option<String>,
 }
 
 /// The path entry as a frame draws it.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SidebarWorkspaceEntryView<'a> {
     pub(super) path: &'a str,
-    pub(super) rejection: Option<&'static str>,
+    pub(super) rejection: Option<&'a str>,
 }
 
 /// One Session as the Sidebar draws it. The shelf it stands on decides its
@@ -480,7 +479,7 @@ impl SidebarGeometry {
 }
 
 /// What one press of the Sidebar came to.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[must_use]
 pub(super) enum SidebarPress {
     /// The press asked for a behavior, which its caller invokes: a press
@@ -510,7 +509,7 @@ pub(super) enum SidebarActivation {
     /// The reader named a directory to work in. It is the client's current
     /// Workspace from here: the root of the Sessions they make next, and what
     /// current-Workspace scope comes to mean.
-    Workspace(PathBuf),
+    ResolveWorkspace(ResolveWorkspaceRequest),
 }
 
 /// The items a Sidebar row's context menu offers. Which of the first two it
@@ -528,11 +527,11 @@ pub(super) enum SidebarMenuItem {
 pub(super) const SIDEBAR_MENU_ITEMS: usize = 2;
 
 /// The context menu a reader opened on one Sidebar row.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SidebarMenu {
     /// The Session the menu stands on, named rather than positioned so a
     /// listing arriving underneath it acts on the work the reader pointed at.
-    session: SessionId,
+    session: SessionReference,
     /// Whether that row stands on the settled shelf, read when the menu was
     /// opened, which is what decides whether it offers to set the Session
     /// aside or to bring it back.
@@ -878,7 +877,7 @@ impl Sidebar {
         };
         self.select(SidebarTarget::Session(session_id));
         self.menu = Some(SidebarMenu {
-            session: session_id,
+            session: SessionReference::new(self.listing.outlook().clone(), session_id),
             settled,
             selected: 0,
             confirming_delete: false,
@@ -962,9 +961,9 @@ impl Sidebar {
             menu.confirming_delete = true;
             return SidebarPress::Answered;
         }
-        let session_id = menu.session;
+        let session = menu.session.clone();
         self.menu = None;
-        SidebarPress::Invoke(item.command().on_session(session_id))
+        SidebarPress::Invoke(item.command().on_session(session))
     }
 
     /// Puts the reader on the row a press landed on.
@@ -1307,24 +1306,29 @@ impl Sidebar {
         if named.is_empty() {
             return self.refuse_workspace(NAME_A_DIRECTORY);
         }
-        let named = self.listing.current_workspace().join(named);
-        let candidate = match read_workspace(&named) {
-            Ok(candidate) => candidate,
-            Err(refusal) => return self.refuse_workspace(refusal.message()),
-        };
-        // The reader is done in the Sidebar: they came to say where the work
-        // is, and the work itself is written in the composer.
-        self.hand_back_keys();
-        SidebarActivation::Workspace(candidate)
+        SidebarActivation::ResolveWorkspace(ResolveWorkspaceRequest {
+            base: Some(self.listing.current_workspace().to_owned()),
+            path: PathBuf::from(named),
+        })
     }
 
     /// Draws the refusal under the entry, leaving it open on the path that
     /// earned it.
-    fn refuse_workspace(&mut self, rejection: &'static str) -> SidebarActivation {
+    fn refuse_workspace(&mut self, rejection: impl Into<String>) -> SidebarActivation {
         if let Some(entry) = &mut self.workspace_entry {
-            entry.rejection = Some(rejection);
+            entry.rejection = Some(rejection.into());
         }
         SidebarActivation::Answered
+    }
+
+    pub(super) fn accept_workspace(&mut self, workspace: PathBuf) {
+        self.hand_back_keys();
+        self.adopt_workspace(workspace.clone());
+        self.narrow_to_workspace(workspace);
+    }
+
+    pub(super) fn fail_workspace_resolution(&mut self, error: String) {
+        let _ = self.refuse_workspace(error);
     }
 
     /// Takes the Workspace this client has moved to, however it moved.
@@ -1337,6 +1341,29 @@ impl Sidebar {
     /// separate act [`Self::narrow_to_workspace`] is for.
     pub(super) fn adopt_workspace(&mut self, workspace: PathBuf) {
         self.listing.adopt_current_workspace(workspace);
+    }
+
+    pub(super) fn adopt_outlook(&mut self, outlook: Outlook) {
+        self.listing.adopt_outlook(outlook);
+        self.query.clear();
+        self.selected = None;
+        self.attaching = None;
+        self.deleting = None;
+        self.menu = None;
+        self.workspace_entry = None;
+        self.awaiting_dispatch = None;
+        if self.revealed {
+            self.ask_for_sessions();
+        }
+    }
+
+    /// Re-asks after a newly chosen Outlook has named its canonical Workspace.
+    /// The first ask may have used the temporary `.` reading while the Remote
+    /// resolved it, so a visible Sidebar must replace that answer.
+    pub(super) fn refresh_after_outlook_workspace(&mut self) {
+        if self.revealed {
+            self.ask_for_sessions();
+        }
     }
 
     /// Narrows the Sidebar to the Workspace the reader named at its own path
@@ -1363,7 +1390,7 @@ impl Sidebar {
             .as_ref()
             .map(|entry| SidebarWorkspaceEntryView {
                 path: &entry.path,
-                rejection: entry.rejection,
+                rejection: entry.rejection.as_deref(),
             })
     }
 
@@ -1829,7 +1856,8 @@ impl Sidebar {
         }
         if self
             .menu
-            .is_some_and(|menu| !self.listing.contains(menu.session))
+            .as_ref()
+            .is_some_and(|menu| !self.listing.contains(menu.session.session_id))
         {
             self.menu = None;
         }

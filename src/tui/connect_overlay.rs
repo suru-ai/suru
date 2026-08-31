@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use crate::protocol::{InvitePreview, RedeemInviteRequest, Remote, RemoteHealth, RemoteStatus};
+use crate::protocol::{
+    InvitePreview, Outlook, RedeemInviteRequest, Remote, RemoteHealth, RemoteStatus,
+};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ConnectOverlay {
@@ -97,20 +99,29 @@ impl ConnectOverlay {
         }
     }
 
-    pub(super) fn load_remotes(&mut self, remotes: Vec<Remote>) {
+    pub(super) fn load_remotes(&mut self, remotes: Vec<Remote>, outlook: &Outlook) {
         self.known_names = remotes.iter().map(|remote| remote.name.clone()).collect();
         self.remote_statuses = remotes
             .iter()
             .map(|remote| (remote.name.clone(), RemoteProbeStatus::Checking))
             .collect();
         self.known_remotes = remotes;
-        self.state = if self.known_remotes.is_empty() {
+        self.state = if self.known_remotes.is_empty() && *outlook == Outlook::Local {
             ConnectOverlayState::InviteEntry {
                 invite: String::new(),
                 error: None,
             }
         } else {
-            ConnectOverlayState::RemotePicker { selected: 0 }
+            ConnectOverlayState::RemotePicker {
+                selected: outlook
+                    .remote_name()
+                    .and_then(|name| {
+                        self.known_remotes
+                            .iter()
+                            .position(|remote| remote.name == name)
+                    })
+                    .map_or(0, |index| index + 1),
+            }
         };
     }
 
@@ -234,10 +245,8 @@ impl ConnectOverlay {
                     .checked_sub(1)
                     .unwrap_or(draft.addresses.len() - 1);
             }
-            ConnectOverlayState::RemotePicker { selected } if !self.known_remotes.is_empty() => {
-                *selected = selected
-                    .checked_sub(1)
-                    .unwrap_or(self.known_remotes.len() - 1);
+            ConnectOverlayState::RemotePicker { selected } => {
+                *selected = selected.checked_sub(1).unwrap_or(self.known_remotes.len());
             }
             _ => {}
         }
@@ -250,8 +259,8 @@ impl ConnectOverlay {
             {
                 draft.selected = (draft.selected + 1) % draft.addresses.len();
             }
-            ConnectOverlayState::RemotePicker { selected } if !self.known_remotes.is_empty() => {
-                *selected = (*selected + 1) % self.known_remotes.len();
+            ConnectOverlayState::RemotePicker { selected } => {
+                *selected = (*selected + 1) % (self.known_remotes.len() + 1);
             }
             _ => {}
         }
@@ -313,7 +322,7 @@ impl ConnectOverlay {
             .insert(remote.name.clone(), RemoteProbeStatus::Available);
         self.known_remotes.push(remote);
         self.state = ConnectOverlayState::RemotePicker {
-            selected: self.known_remotes.len() - 1,
+            selected: self.known_remotes.len(),
         };
     }
 
@@ -387,5 +396,20 @@ impl ConnectOverlay {
             ConnectOverlayState::RemotePicker { selected, .. } => selected,
             _ => 0,
         }
+    }
+
+    pub(super) fn selected_outlook(&self) -> Option<Outlook> {
+        let ConnectOverlayState::RemotePicker { selected } = self.state else {
+            return None;
+        };
+        if selected == 0 {
+            return Some(Outlook::Local);
+        }
+        let remote = self.known_remotes.get(selected - 1)?;
+        matches!(
+            self.remote_statuses.get(&remote.name),
+            Some(RemoteProbeStatus::Available)
+        )
+        .then(|| Outlook::Remote(remote.name.clone()))
     }
 }

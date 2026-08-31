@@ -11,9 +11,11 @@ use tokio::{
 };
 
 use crate::protocol::{
-    RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SessionId, SessionSnapshot,
-    SessionUpdate,
+    Outlook, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SessionId,
+    SessionSnapshot, SessionUpdate,
 };
+
+use super::server_url;
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct SessionStreamError {
@@ -87,9 +89,10 @@ impl SessionSubscription {
     pub(super) async fn open(
         http: &reqwest::Client,
         descriptor: &RuntimeDescriptor,
+        outlook: &Outlook,
         session_id: SessionId,
     ) -> Result<Self> {
-        let response = open_response(http, descriptor, session_id)
+        let response = open_response(http, descriptor, outlook, session_id)
             .await
             .context("server rejected the Session event stream")?;
         let (events_tx, events_rx) = mpsc::channel(32);
@@ -103,16 +106,18 @@ impl SessionSubscription {
     pub(super) async fn open_attached(
         http: &reqwest::Client,
         descriptor: watch::Receiver<RuntimeDescriptor>,
+        outlook: Outlook,
         session_id: SessionId,
     ) -> Result<Self> {
         let initial_descriptor = descriptor.borrow().clone();
-        let response = open_response(http, &initial_descriptor, session_id)
+        let response = open_response(http, &initial_descriptor, &outlook, session_id)
             .await
             .context("server rejected the Session event stream")?;
         let (events_tx, events_rx) = mpsc::channel(32);
         let task = tokio::spawn(run_attached(
             http.clone(),
             descriptor,
+            outlook,
             initial_descriptor.instance_id,
             session_id,
             response,
@@ -132,16 +137,20 @@ impl SessionSubscription {
 async fn open_response(
     http: &reqwest::Client,
     descriptor: &RuntimeDescriptor,
+    outlook: &Outlook,
     session_id: SessionId,
 ) -> reqwest::Result<reqwest::Response> {
-    http.get(format!(
-        "{}/v1/sessions/{session_id}/events",
-        descriptor.base_url
-    ))
-    .bearer_auth(&descriptor.token)
-    .send()
-    .await?
-    .error_for_status()
+    let url = server_url(
+        &descriptor.base_url,
+        outlook,
+        &format!("/v1/sessions/{session_id}/events"),
+    )
+    .expect("a validated runtime descriptor builds a Server URL");
+    http.get(url)
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await?
+        .error_for_status()
 }
 
 impl Drop for SessionSubscription {
@@ -172,6 +181,7 @@ async fn consume_once(
 async fn run_attached(
     http: reqwest::Client,
     mut descriptor: watch::Receiver<RuntimeDescriptor>,
+    outlook: Outlook,
     attached_instance_id: uuid::Uuid,
     session_id: SessionId,
     initial_response: reqwest::Response,
@@ -186,7 +196,7 @@ async fn run_attached(
         }
         let next_response = match response.take() {
             Some(response) => Ok(response),
-            None => open_response(&http, &active_descriptor, session_id).await,
+            None => open_response(&http, &active_descriptor, &outlook, session_id).await,
         };
         let next_response = match next_response {
             Ok(response) => response,

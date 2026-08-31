@@ -15,13 +15,14 @@ use std::{
 
 use crate::{
     managed_client::{
-        ManagedClient, ManagedEvent, SessionCommandClient, SessionEvent, SessionStreamError,
-        SessionSubscription,
+        ManagedClient, ManagedEvent, SessionCatalogSubscription, SessionCommandClient,
+        SessionEvent, SessionStreamError, SessionSubscription,
     },
     protocol::{
         AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
-        ModelCatalog, PromptId, SessionId, SessionListItem, SessionSnapshot, SettingMutation,
-        SettingsSnapshot, SkillCatalog, SkillCatalogRequest, UpdateAgentSelectionRequest,
+        ModelCatalog, Outlook, PromptId, ResolveWorkspaceRequest, SessionId, SessionListItem,
+        SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot, SkillCatalog,
+        SkillCatalogRequest, UpdateAgentSelectionRequest, Workspace,
     },
 };
 use anyhow::{Result, anyhow};
@@ -39,7 +40,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::shimmer;
 use super::state::{
     Application, ApplicationEvent, ApplicationTransition, ModelListRequest, SessionListRequest,
-    SessionListSurface,
+    SessionListSurface, WorkspaceResolutionSurface,
 };
 
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
@@ -65,15 +66,17 @@ enum Exit {
 #[derive(Default)]
 struct SessionTasks {
     subscription: Option<SessionSubscription>,
-    subscribing: Option<(SessionId, tokio::task::JoinHandle<()>)>,
-    attaching: Option<tokio::task::JoinHandle<()>>,
+    subscribing: Option<(SessionReference, tokio::task::JoinHandle<()>)>,
+    attaching: Option<(SessionReference, tokio::task::JoinHandle<()>)>,
     /// One in-flight Session listing per surface that lists Sessions: the
     /// picker and the Sidebar list at once, and a fresh request from either
     /// must replace only that surface's own.
     listing_sessions:
         HashMap<SessionListSurface, (SessionListRequest, tokio::task::JoinHandle<()>)>,
     listing_models: Option<(ModelListRequest, tokio::task::JoinHandle<()>)>,
-    listing_skills: Option<(SkillCatalogRequest, tokio::task::JoinHandle<()>)>,
+    listing_skills: Option<((Outlook, SkillCatalogRequest), tokio::task::JoinHandle<()>)>,
+    outlook_catalog: Option<tokio::task::JoinHandle<()>>,
+    resolving_workspaces: HashMap<WorkspaceResolutionSurface, (u64, tokio::task::JoinHandle<()>)>,
 }
 
 impl SessionTasks {
@@ -96,8 +99,90 @@ impl SessionTasks {
         }
     }
 
+    fn abort_attaching(&mut self) {
+        if let Some((_, task)) = self.attaching.take() {
+            task.abort();
+        }
+    }
+
     fn reset_skill_listing(&mut self) {
         if let Some((_, task)) = self.listing_skills.take() {
+            task.abort();
+        }
+    }
+
+    fn watch_outlook_catalog(
+        &mut self,
+        commands: SessionCommandClient,
+        outlook: Outlook,
+        events: &UnboundedSender<OutlookCatalogEvent>,
+    ) {
+        if let Some(task) = self.outlook_catalog.take() {
+            task.abort();
+        }
+        self.outlook_catalog = Some(spawn_outlook_catalog_forwarder(
+            commands.subscribe_catalog(),
+            outlook,
+            events.clone(),
+        ));
+    }
+
+    fn reset_outlook_catalog(&mut self) {
+        if let Some(task) = self.outlook_catalog.take() {
+            task.abort();
+        }
+    }
+
+    fn resolve_workspace(
+        &mut self,
+        commands: SessionCommandClient,
+        outlook: Outlook,
+        surface: WorkspaceResolutionSurface,
+        request_id: u64,
+        request: ResolveWorkspaceRequest,
+        results: &UnboundedSender<WorkspaceResolutionResult>,
+    ) {
+        if surface != WorkspaceResolutionSurface::Outlook {
+            self.cancel_workspace_resolution(WorkspaceResolutionSurface::Outlook);
+        }
+        let task = spawn_workspace_resolution(
+            commands,
+            outlook,
+            surface,
+            request_id,
+            request,
+            results.clone(),
+        );
+        if let Some((_, superseded)) = self
+            .resolving_workspaces
+            .insert(surface, (request_id, task))
+        {
+            superseded.abort();
+        }
+    }
+
+    fn finish_workspace_resolution(
+        &mut self,
+        surface: WorkspaceResolutionSurface,
+        request_id: u64,
+    ) {
+        if self
+            .resolving_workspaces
+            .get(&surface)
+            .is_some_and(|(active, _)| *active == request_id)
+        {
+            self.resolving_workspaces.remove(&surface);
+        }
+    }
+
+    fn cancel_workspace_resolution(&mut self, surface: WorkspaceResolutionSurface) {
+        if let Some((_, task)) = self.resolving_workspaces.remove(&surface) {
+            task.abort();
+        }
+    }
+
+    fn reset_workspace_resolutions(&mut self) {
+        for (_, (_, task)) in self.resolving_workspaces.drain() {
             task.abort();
         }
     }
@@ -112,11 +197,11 @@ impl SessionTasks {
     fn resubscribe(
         &mut self,
         commands: SessionCommandClient,
-        session_id: SessionId,
+        reference: SessionReference,
         connected: &UnboundedSender<ConnectedSessionSubscription>,
     ) {
         self.abort_subscribing();
-        self.spawn_subscribe(commands, session_id, connected);
+        self.spawn_subscribe(commands, reference, connected);
     }
 
     /// Subscribes to `session_id` only when no attempt is already in flight, so
@@ -124,32 +209,32 @@ impl SessionTasks {
     fn subscribe_if_idle(
         &mut self,
         commands: SessionCommandClient,
-        session_id: SessionId,
+        reference: SessionReference,
         connected: &UnboundedSender<ConnectedSessionSubscription>,
     ) {
         if self.subscribing.is_none() {
-            self.spawn_subscribe(commands, session_id, connected);
+            self.spawn_subscribe(commands, reference, connected);
         }
     }
 
     fn spawn_subscribe(
         &mut self,
         commands: SessionCommandClient,
-        session_id: SessionId,
+        reference: SessionReference,
         connected: &UnboundedSender<ConnectedSessionSubscription>,
     ) {
         self.subscribing = Some((
-            session_id,
-            spawn_session_subscription(commands, session_id, connected.clone()),
+            reference.clone(),
+            spawn_session_subscription(commands, reference, connected.clone()),
         ));
     }
 
     /// Forgets the subscription attempt for `session_id` now that it connected.
-    fn finish_subscribing(&mut self, session_id: SessionId) {
+    fn finish_subscribing(&mut self, reference: &SessionReference) {
         if self
             .subscribing
             .as_ref()
-            .is_some_and(|(subscribing, _)| *subscribing == session_id)
+            .is_some_and(|(subscribing, _)| subscribing == reference)
         {
             self.subscribing = None;
         }
@@ -160,20 +245,23 @@ impl SessionTasks {
     fn attach(
         &mut self,
         commands: SessionCommandClient,
-        session_id: SessionId,
+        reference: SessionReference,
         results: &UnboundedSender<SessionPickerResult>,
     ) {
         if self.attaching.is_none() {
-            self.attaching = Some(spawn_session_attachment(
-                commands,
-                session_id,
-                results.clone(),
-            ));
+            let task = spawn_session_attachment(commands, reference.clone(), results.clone());
+            self.attaching = Some((reference, task));
         }
     }
 
-    fn finish_attaching(&mut self) {
-        self.attaching = None;
+    fn finish_attaching(&mut self, reference: &SessionReference) {
+        if self
+            .attaching
+            .as_ref()
+            .is_some_and(|(attaching, _)| attaching == reference)
+        {
+            self.attaching = None;
+        }
     }
 
     fn finish_listing_sessions(&mut self, request: &SessionListRequest) {
@@ -220,37 +308,55 @@ impl SessionTasks {
     fn list_skills_if_needed(
         &mut self,
         commands: SessionCommandClient,
+        outlook: Outlook,
         request: SkillCatalogRequest,
         results: &UnboundedSender<SkillCatalogResult>,
     ) {
+        let qualified_request = (outlook, request);
         if self
             .listing_skills
             .as_ref()
-            .is_some_and(|(active, _)| active == &request)
+            .is_some_and(|(active, _)| active == &qualified_request)
         {
             return;
         }
         let results = results.clone();
-        replace_listing(&mut self.listing_skills, request, |request| {
-            spawn_skill_catalog_operation(commands, request, results, SkillCatalogOperation::List)
-        });
+        replace_listing(
+            &mut self.listing_skills,
+            qualified_request,
+            |(outlook, request)| {
+                spawn_skill_catalog_operation(
+                    commands,
+                    outlook,
+                    request,
+                    results,
+                    SkillCatalogOperation::List,
+                )
+            },
+        );
     }
 
     fn refresh_skills(
         &mut self,
         commands: SessionCommandClient,
+        outlook: Outlook,
         request: SkillCatalogRequest,
         results: &UnboundedSender<SkillCatalogResult>,
     ) {
         let results = results.clone();
-        replace_listing(&mut self.listing_skills, request, |request| {
-            spawn_skill_catalog_operation(
-                commands,
-                request,
-                results,
-                SkillCatalogOperation::Refresh,
-            )
-        });
+        replace_listing(
+            &mut self.listing_skills,
+            (outlook, request),
+            |(outlook, request)| {
+                spawn_skill_catalog_operation(
+                    commands,
+                    outlook,
+                    request,
+                    results,
+                    SkillCatalogOperation::Refresh,
+                )
+            },
+        );
     }
 }
 
@@ -262,6 +368,8 @@ struct TaskChannels {
     models: UnboundedSender<ModelPickerResult>,
     skills: UnboundedSender<SkillCatalogResult>,
     pairing: UnboundedSender<PairingResult>,
+    workspaces: UnboundedSender<WorkspaceResolutionResult>,
+    outlook_catalog: UnboundedSender<OutlookCatalogEvent>,
 }
 
 /// The run loop's mutable world: the Application it feeds, the client it sends
@@ -292,6 +400,8 @@ async fn run_loop(
     let (models, mut model_rx) = tokio::sync::mpsc::unbounded_channel();
     let (skills, mut skill_rx) = tokio::sync::mpsc::unbounded_channel();
     let (pairing, mut pairing_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (workspaces, mut workspace_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (outlook_catalog, mut outlook_catalog_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut run = RunLoop {
         client,
         application: Application::new(workspace),
@@ -303,6 +413,8 @@ async fn run_loop(
             models,
             skills,
             pairing,
+            workspaces,
+            outlook_catalog,
         },
         reconnect_grace: None,
         spinner_tick: None,
@@ -337,6 +449,8 @@ async fn run_loop(
             skill = skill_rx.recv() => run.receive_skill_listing(skill)?,
             picker = picker_rx.recv() => run.receive_session_picker(picker)?,
             pairing = pairing_rx.recv() => run.receive_pairing_result(pairing)?,
+            workspace = workspace_rx.recv() => run.receive_workspace_result(workspace)?,
+            catalog = outlook_catalog_rx.recv() => run.receive_outlook_catalog(catalog)?,
             input_event = input.next() => match input_event {
                 Some(Ok(event)) => {
                     let mut output = TerminalOutput(terminal.backend_mut());
@@ -404,7 +518,8 @@ impl RunLoop {
             return;
         }
         self.tasks.list_skills_if_needed(
-            self.client.session_commands(),
+            self.outlook_commands(),
+            self.application.outlook().clone(),
             request,
             &self.channels.skills,
         );
@@ -444,91 +559,92 @@ impl RunLoop {
             ApplicationTransition::SessionEnded => self.tasks.end_subscription(),
             ApplicationTransition::DetachSession => self.tasks.detach(),
             ApplicationTransition::CreateSession(request) => {
+                let outlook = self.application.outlook().clone();
                 spawn_session_creation(
-                    self.client.session_commands(),
+                    self.client.session_commands_for(outlook.clone()),
+                    outlook,
                     request,
                     self.channels.submissions.clone(),
                 );
             }
-            ApplicationTransition::AdmitPrompt {
-                session_id,
-                request,
-            } => {
+            ApplicationTransition::AdmitPrompt { session, request } => {
+                let commands = self.client.session_commands_for(session.origin.clone());
                 spawn_prompt_admission(
-                    self.client.session_commands(),
-                    session_id,
+                    commands,
+                    session,
                     request,
                     self.channels.submissions.clone(),
                 );
             }
-            ApplicationTransition::PromotePrompt {
-                session_id,
-                prompt_id,
-            } => self.spawn_operation(SessionOperation::PromotePrompt {
-                session_id,
-                prompt_id,
-            }),
-            ApplicationTransition::CancelPrompt {
-                session_id,
-                prompt_id,
-            } => self.spawn_operation(SessionOperation::CancelPrompt {
-                session_id,
-                prompt_id,
-            }),
-            ApplicationTransition::InterruptSession { session_id } => {
-                self.spawn_operation(SessionOperation::InterruptSession { session_id });
+            ApplicationTransition::PromotePrompt { session, prompt_id } => self.spawn_operation(
+                session.clone(),
+                SessionOperation::PromotePrompt {
+                    session_id: session.session_id,
+                    prompt_id,
+                },
+            ),
+            ApplicationTransition::CancelPrompt { session, prompt_id } => self.spawn_operation(
+                session.clone(),
+                SessionOperation::CancelPrompt {
+                    session_id: session.session_id,
+                    prompt_id,
+                },
+            ),
+            ApplicationTransition::InterruptSession { session } => {
+                let session_id = session.session_id;
+                self.spawn_operation(session, SessionOperation::InterruptSession { session_id });
             }
-            ApplicationTransition::DeleteSession(session_id) => {
-                self.spawn_operation(SessionOperation::DeleteSession { session_id });
+            ApplicationTransition::DeleteSession(session) => {
+                let session_id = session.session_id;
+                self.spawn_operation(session, SessionOperation::DeleteSession { session_id });
             }
-            ApplicationTransition::SettleSession {
-                session_id,
-                settled,
-            } => {
-                self.spawn_operation(SessionOperation::SettleSession {
-                    session_id,
-                    settled,
-                });
+            ApplicationTransition::SettleSession { session, settled } => {
+                let session_id = session.session_id;
+                self.spawn_operation(
+                    session,
+                    SessionOperation::SettleSession {
+                        session_id,
+                        settled,
+                    },
+                );
             }
             ApplicationTransition::SubscribeSession(_) => {
                 unreachable!("terminal input cannot end a Session subscription")
             }
-            ApplicationTransition::AttachSession(session_id) => {
-                self.tasks.attach(
-                    self.client.session_commands(),
-                    session_id,
-                    &self.channels.pickers,
-                );
+            ApplicationTransition::AttachSession(reference) => {
+                let commands = self.client.session_commands_for(reference.origin.clone());
+                self.tasks
+                    .attach(commands, reference, &self.channels.pickers);
             }
             ApplicationTransition::ListSessions(request) => self.list_sessions(request),
             ApplicationTransition::ListModels(request) => {
-                self.tasks.list_models(
-                    self.client.session_commands(),
-                    request,
-                    &self.channels.models,
-                );
+                let commands = self.client.session_commands_for(request.outlook().clone());
+                self.tasks
+                    .list_models(commands, request, &self.channels.models);
             }
             ApplicationTransition::RefreshSkills(request) => {
+                let outlook = self.application.outlook().clone();
                 self.tasks.refresh_skills(
-                    self.client.session_commands(),
+                    self.client.session_commands_for(outlook.clone()),
+                    outlook,
                     request,
                     &self.channels.skills,
                 );
             }
             ApplicationTransition::ConfirmLandingAgentSelection(selection) => {
+                let outlook = self.application.outlook().clone();
                 spawn_landing_agent_selection_confirmation(
-                    self.client.session_commands(),
+                    self.client.session_commands_for(outlook.clone()),
+                    outlook,
                     selection,
                     self.channels.submissions.clone(),
                 );
             }
-            ApplicationTransition::UpdateAgentSelection {
-                session_id,
-                request,
-            } => {
+            ApplicationTransition::UpdateAgentSelection { session, request } => {
+                let commands = self.client.session_commands_for(session.origin.clone());
                 spawn_agent_selection_update(
-                    self.client.session_commands(),
-                    session_id,
+                    commands,
+                    session,
                     request,
                     self.channels.submissions.clone(),
                 );
@@ -582,6 +698,54 @@ impl RunLoop {
                     self.channels.pairing.clone(),
                 );
             }
+            ApplicationTransition::TurnOutlook(outlook) => {
+                self.tasks.detach();
+                self.tasks.abort_attaching();
+                self.tasks.reset_skill_listing();
+                self.tasks.reset_outlook_catalog();
+                self.tasks.reset_workspace_resolutions();
+                if let Some(request) = self.application.take_listing_request() {
+                    self.list_sessions(request);
+                }
+                if matches!(outlook, Outlook::Remote(_)) {
+                    self.tasks.watch_outlook_catalog(
+                        self.client.session_commands_for(outlook.clone()),
+                        outlook.clone(),
+                        &self.channels.outlook_catalog,
+                    );
+                    self.tasks.resolve_workspace(
+                        self.client.session_commands_for(outlook.clone()),
+                        outlook,
+                        WorkspaceResolutionSurface::Outlook,
+                        self.application
+                            .pending_workspace_resolution(WorkspaceResolutionSurface::Outlook)
+                            .expect("turning toward a remote begins Workspace resolution"),
+                        ResolveWorkspaceRequest {
+                            base: None,
+                            path: PathBuf::from("."),
+                        },
+                        &self.channels.workspaces,
+                    );
+                }
+            }
+            ApplicationTransition::ResolveWorkspace {
+                outlook,
+                surface,
+                request_id,
+                request,
+            } => {
+                self.tasks.resolve_workspace(
+                    self.client.session_commands_for(outlook.clone()),
+                    outlook,
+                    surface,
+                    request_id,
+                    request,
+                    &self.channels.workspaces,
+                );
+            }
+            ApplicationTransition::CancelWorkspaceResolution(surface) => {
+                self.tasks.cancel_workspace_resolution(surface);
+            }
             ApplicationTransition::CopyToClipboard(_) => {
                 unreachable!("clipboard output is handled before task dispatch")
             }
@@ -589,20 +753,24 @@ impl RunLoop {
         ControlFlow::Continue(())
     }
 
-    fn spawn_operation(&self, operation: SessionOperation) {
+    fn spawn_operation(&self, session: SessionReference, operation: SessionOperation) {
         spawn_session_operation(
-            self.client.session_commands(),
+            self.client.session_commands_for(session.origin.clone()),
+            session,
             operation,
             self.channels.submissions.clone(),
         );
     }
 
     fn list_sessions(&mut self, request: SessionListRequest) {
-        self.tasks.list_sessions(
-            self.client.session_commands(),
-            request,
-            &self.channels.pickers,
-        );
+        let commands = self.client.session_commands_for(request.outlook().clone());
+        self.tasks
+            .list_sessions(commands, request, &self.channels.pickers);
+    }
+
+    fn outlook_commands(&self) -> SessionCommandClient {
+        self.client
+            .session_commands_for(self.application.outlook().clone())
     }
 
     fn receive_managed_event(&mut self, event: Option<ManagedEvent>) -> Result<ControlFlow<Exit>> {
@@ -654,7 +822,10 @@ impl RunLoop {
             | ApplicationTransition::RemovePeer(_)
             | ApplicationTransition::BeginConnecting
             | ApplicationTransition::PreviewInvite(_)
-            | ApplicationTransition::RedeemInvite(_) => {
+            | ApplicationTransition::RedeemInvite(_)
+            | ApplicationTransition::TurnOutlook(_)
+            | ApplicationTransition::ResolveWorkspace { .. }
+            | ApplicationTransition::CancelWorkspaceResolution(_) => {
                 unreachable!("managed events issue no other Session command");
             }
         }
@@ -727,7 +898,7 @@ impl RunLoop {
             .handle_event(ApplicationEvent::SessionSubscriptionEnded)?;
         if let ApplicationTransition::SubscribeSession(session_id) = transition {
             self.tasks.subscribe_if_idle(
-                self.client.session_commands(),
+                self.client.session_commands_for(session_id.origin.clone()),
                 session_id,
                 &self.channels.subscriptions,
             );
@@ -743,8 +914,8 @@ impl RunLoop {
     ) -> Result<ControlFlow<Exit>> {
         let connected = connected
             .ok_or_else(|| anyhow!("Session subscription task channel stopped unexpectedly"))?;
-        self.tasks.finish_subscribing(connected.session_id);
-        if self.application.session_id() == Some(connected.session_id) {
+        self.tasks.finish_subscribing(&connected.reference);
+        if self.application.session_reference().as_ref() == Some(&connected.reference) {
             self.tasks.adopt(connected.subscription);
         }
         Ok(ControlFlow::Continue(()))
@@ -758,49 +929,93 @@ impl RunLoop {
         let submission = submission
             .ok_or_else(|| anyhow!("Prompt admission task channel stopped unexpectedly"))?;
         match submission {
-            SubmissionResult::SessionCreated(created) => {
-                let session_id = created.session.id;
+            SubmissionResult::SessionCreated { outlook, snapshot } => {
+                if self.application.outlook() != &outlook {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                let session_id = snapshot.session.id;
                 self.application
-                    .handle_event(ApplicationEvent::SessionCreated(*created))?;
+                    .handle_event(ApplicationEvent::SessionCreated(*snapshot))?;
                 self.tasks.resubscribe(
-                    self.client.session_commands(),
-                    session_id,
+                    self.client.session_commands_for(outlook.clone()),
+                    SessionReference::new(outlook, session_id),
                     &self.channels.subscriptions,
                 );
             }
-            SubmissionResult::PromptAdmitted(prompt_id) => {
+            SubmissionResult::PromptAdmitted { session, prompt_id } => {
                 self.application
-                    .handle_event(ApplicationEvent::PromptAdmissionSucceeded(prompt_id))?;
+                    .handle_event(ApplicationEvent::PromptAdmissionSucceeded {
+                        session,
+                        prompt_id,
+                    })?;
             }
-            SubmissionResult::Failed { prompt_id, error } => {
-                self.application
-                    .handle_event(ApplicationEvent::PromptAdmissionFailed { prompt_id, error })?;
+            SubmissionResult::PromptDeliveryFailed {
+                outlook,
+                session,
+                prompt_id,
+                error,
+            } => {
+                if self.application.outlook() != &outlook {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                let event = match session {
+                    Some(session) => ApplicationEvent::PromptAdmissionFailed {
+                        session,
+                        prompt_id,
+                        error,
+                    },
+                    None => ApplicationEvent::SessionCreationFailed { prompt_id, error },
+                };
+                self.application.handle_event(event)?;
             }
-            SubmissionResult::OperationSucceeded => {}
-            SubmissionResult::OperationFailed(error) => {
+            SubmissionResult::OperationSucceeded(session) => {
+                if self.application.outlook() != &session.origin {
+                    return Ok(ControlFlow::Continue(()));
+                }
+            }
+            SubmissionResult::OperationFailed { session, error } => {
+                if self.application.outlook() != &session.origin {
+                    return Ok(ControlFlow::Continue(()));
+                }
                 self.application
                     .handle_event(ApplicationEvent::SessionOperationFailed(error))?;
             }
-            SubmissionResult::SessionDeletionFailed { session_id, error } => {
+            SubmissionResult::SessionDeletionFailed { session, error } => {
+                if self.application.outlook() != &session.origin {
+                    return Ok(ControlFlow::Continue(()));
+                }
                 self.application
-                    .handle_event(ApplicationEvent::SessionDeletionFailed { session_id, error })?;
+                    .handle_event(ApplicationEvent::SessionDeletionFailed {
+                        session_id: session.session_id,
+                        error,
+                    })?;
             }
-            SubmissionResult::LandingAgentSelectionConfirmed(selection) => {
+            SubmissionResult::LandingAgentSelectionConfirmed { outlook, selection } => {
+                if self.application.outlook() != &outlook {
+                    return Ok(ControlFlow::Continue(()));
+                }
                 let transition = self
                     .application
                     .handle_event(ApplicationEvent::LandingAgentSelectionConfirmed(selection))?;
                 self.flush_landing_agent_selection(transition);
             }
-            SubmissionResult::LandingAgentSelectionConfirmationFailed(error) => {
+            SubmissionResult::LandingAgentSelectionConfirmationFailed { outlook, error } => {
+                if self.application.outlook() != &outlook {
+                    return Ok(ControlFlow::Continue(()));
+                }
                 let transition = self.application.handle_event(
                     ApplicationEvent::LandingAgentSelectionConfirmationFailed(error),
                 )?;
                 self.flush_landing_agent_selection(transition);
             }
             SubmissionResult::AgentSelectionUpdated {
+                session,
                 operation_id,
                 selection,
             } => {
+                if self.application.session_reference().as_ref() != Some(&session) {
+                    return Ok(ControlFlow::Continue(()));
+                }
                 let transition =
                     self.application
                         .handle_event(ApplicationEvent::AgentSelectionUpdated {
@@ -810,9 +1025,13 @@ impl RunLoop {
                 self.flush_agent_selection(transition);
             }
             SubmissionResult::AgentSelectionUpdateFailed {
+                session,
                 operation_id,
                 error,
             } => {
+                if self.application.session_reference().as_ref() != Some(&session) {
+                    return Ok(ControlFlow::Continue(()));
+                }
                 let transition = self.application.handle_event(
                     ApplicationEvent::AgentSelectionUpdateFailed {
                         operation_id,
@@ -836,14 +1055,10 @@ impl RunLoop {
     /// Dispatches the follow-up request when settling one Agent Selection
     /// operation released a coalesced newer selection.
     fn flush_agent_selection(&self, transition: ApplicationTransition) {
-        if let ApplicationTransition::UpdateAgentSelection {
-            session_id,
-            request,
-        } = transition
-        {
+        if let ApplicationTransition::UpdateAgentSelection { session, request } = transition {
             spawn_agent_selection_update(
-                self.client.session_commands(),
-                session_id,
+                self.client.session_commands_for(session.origin.clone()),
+                session,
                 request,
                 self.channels.submissions.clone(),
             );
@@ -852,8 +1067,10 @@ impl RunLoop {
 
     fn flush_landing_agent_selection(&self, transition: ApplicationTransition) {
         if let ApplicationTransition::ConfirmLandingAgentSelection(selection) = transition {
+            let outlook = self.application.outlook().clone();
             spawn_landing_agent_selection_confirmation(
-                self.client.session_commands(),
+                self.client.session_commands_for(outlook.clone()),
+                outlook,
                 selection,
                 self.channels.submissions.clone(),
             );
@@ -867,6 +1084,15 @@ impl RunLoop {
         self.needs_redraw = true;
         let result =
             result.ok_or_else(|| anyhow!("Model picker task channel stopped unexpectedly"))?;
+        let request = match &result {
+            ModelPickerResult::Listed { request, .. }
+            | ModelPickerResult::Refreshed { request, .. }
+            | ModelPickerResult::Failed { request, .. } => request,
+        };
+        if request.outlook() != self.application.outlook() {
+            self.tasks.finish_listing_models(request);
+            return Ok(ControlFlow::Continue(()));
+        }
         match result {
             ModelPickerResult::Listed { request, catalog } => {
                 self.application
@@ -894,11 +1120,25 @@ impl RunLoop {
         let result =
             result.ok_or_else(|| anyhow!("Skill Catalog task channel stopped unexpectedly"))?;
         match result {
-            SkillCatalogResult::Listed { request, catalog } => {
+            SkillCatalogResult::Listed {
+                outlook,
+                request,
+                catalog,
+            } => {
+                if self.application.outlook() != &outlook {
+                    return Ok(ControlFlow::Continue(()));
+                }
                 self.application
                     .handle_event(ApplicationEvent::SkillsListed { request, catalog })?;
             }
-            SkillCatalogResult::Failed { request, error } => {
+            SkillCatalogResult::Failed {
+                outlook,
+                request,
+                error,
+            } => {
+                if self.application.outlook() != &outlook {
+                    return Ok(ControlFlow::Continue(()));
+                }
                 self.application
                     .handle_event(ApplicationEvent::SkillListingFailed { request, error })?;
             }
@@ -923,7 +1163,9 @@ impl RunLoop {
             SessionPickerResult::ListingFailed { request, .. } => {
                 self.application.awaits_listing(request)
             }
-            SessionPickerResult::Attached { .. } | SessionPickerResult::AttachmentFailed(_) => true,
+            SessionPickerResult::Attached { .. } | SessionPickerResult::AttachmentFailed { .. } => {
+                true
+            }
         };
         match result {
             SessionPickerResult::Listed { request, sessions } => {
@@ -937,20 +1179,26 @@ impl RunLoop {
                     .handle_event(ApplicationEvent::SessionListingFailed { request, error })?;
             }
             SessionPickerResult::Attached {
+                reference,
                 snapshot,
                 subscription,
             } => {
-                self.tasks.finish_attaching();
+                self.tasks.finish_attaching(&reference);
                 self.application
-                    .handle_event(ApplicationEvent::SessionAttached(*snapshot))?;
-                self.tasks.adopt(subscription);
-                self.tasks.abort_subscribing();
+                    .handle_event(ApplicationEvent::OriginSessionAttached {
+                        reference: reference.clone(),
+                        snapshot: *snapshot,
+                    })?;
+                if self.application.session_reference().as_ref() == Some(&reference) {
+                    self.tasks.adopt(subscription);
+                    self.tasks.abort_subscribing();
+                }
             }
-            SessionPickerResult::AttachmentFailed(error) => {
-                self.tasks.finish_attaching();
-                let transition = self
-                    .application
-                    .handle_event(ApplicationEvent::SessionAttachmentFailed(error))?;
+            SessionPickerResult::AttachmentFailed { reference, error } => {
+                self.tasks.finish_attaching(&reference);
+                let transition = self.application.handle_event(
+                    ApplicationEvent::OriginSessionAttachmentFailed { reference, error },
+                )?;
                 if let ApplicationTransition::ListSessions(request) = transition {
                     self.list_sessions(request);
                 }
@@ -1004,6 +1252,98 @@ impl RunLoop {
         self.application.handle_event(event)?;
         Ok(ControlFlow::Continue(()))
     }
+
+    fn receive_workspace_result(
+        &mut self,
+        result: Option<WorkspaceResolutionResult>,
+    ) -> Result<ControlFlow<Exit>> {
+        self.needs_redraw = true;
+        let result = result
+            .ok_or_else(|| anyhow!("Workspace resolution task channel stopped unexpectedly"))?;
+        self.tasks
+            .finish_workspace_resolution(result.surface, result.request_id);
+        let transition = self
+            .application
+            .handle_event(ApplicationEvent::WorkspaceResolved {
+                outlook: result.outlook,
+                surface: result.surface,
+                request_id: result.request_id,
+                result: result.result,
+            })?;
+        Ok(self.dispatch_transition(transition))
+    }
+
+    fn receive_outlook_catalog(
+        &mut self,
+        event: Option<OutlookCatalogEvent>,
+    ) -> Result<ControlFlow<Exit>> {
+        let event = event.ok_or_else(|| anyhow!("Outlook catalog task channel stopped"))?;
+        if self.application.outlook() != &event.outlook {
+            return Ok(ControlFlow::Continue(()));
+        }
+        self.needs_redraw |= event.event.is_drawn_on_arrival();
+        let transition = self
+            .application
+            .handle_event(ApplicationEvent::OutlookCatalog {
+                outlook: event.outlook,
+                event: event.event,
+            })?;
+        Ok(self.dispatch_transition(transition))
+    }
+}
+
+struct OutlookCatalogEvent {
+    outlook: Outlook,
+    event: ManagedEvent,
+}
+
+fn spawn_outlook_catalog_forwarder(
+    mut subscription: SessionCatalogSubscription,
+    outlook: Outlook,
+    events: UnboundedSender<OutlookCatalogEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = subscription.next().await {
+            if events
+                .send(OutlookCatalogEvent {
+                    outlook: outlook.clone(),
+                    event,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
+}
+
+struct WorkspaceResolutionResult {
+    outlook: Outlook,
+    surface: WorkspaceResolutionSurface,
+    request_id: u64,
+    result: std::result::Result<Workspace, String>,
+}
+
+fn spawn_workspace_resolution(
+    commands: SessionCommandClient,
+    outlook: Outlook,
+    surface: WorkspaceResolutionSurface,
+    request_id: u64,
+    request: ResolveWorkspaceRequest,
+    results: UnboundedSender<WorkspaceResolutionResult>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = commands
+            .resolve_workspace(request)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = results.send(WorkspaceResolutionResult {
+            outlook,
+            surface,
+            request_id,
+            result,
+        });
+    })
 }
 
 enum PairingResult {
@@ -1196,32 +1536,48 @@ fn spawn_peer_removal(
 
 fn spawn_session_creation(
     commands: SessionCommandClient,
+    outlook: Outlook,
     request: CreateSessionRequest,
     results: UnboundedSender<SubmissionResult>,
 ) {
     let prompt_id = request.prompt.id;
-    spawn_prompt_delivery(prompt_id, results, async move {
+    spawn_prompt_delivery(outlook.clone(), None, prompt_id, results, async move {
         let created = commands.create_session(request).await?;
-        Ok(SubmissionResult::SessionCreated(Box::new(created)))
+        Ok(SubmissionResult::SessionCreated {
+            outlook,
+            snapshot: Box::new(created),
+        })
     });
 }
 
 fn spawn_prompt_admission(
     commands: SessionCommandClient,
-    session_id: SessionId,
+    session: SessionReference,
     request: AdmitPromptRequest,
     results: UnboundedSender<SubmissionResult>,
 ) {
     let prompt_id = request.prompt.id;
-    spawn_prompt_delivery(prompt_id, results, async move {
-        let prompt = commands.admit_prompt(session_id, request).await?;
-        Ok(SubmissionResult::PromptAdmitted(prompt.id))
-    });
+    let outlook = session.origin.clone();
+    spawn_prompt_delivery(
+        outlook,
+        Some(session.clone()),
+        prompt_id,
+        results,
+        async move {
+            let prompt = commands.admit_prompt(session.session_id, request).await?;
+            Ok(SubmissionResult::PromptAdmitted {
+                session,
+                prompt_id: prompt.id,
+            })
+        },
+    );
 }
 
 /// Delivers a Prompt, reporting any transport failure against `prompt_id` so
 /// the composer can restore the text the user submitted.
 fn spawn_prompt_delivery(
+    outlook: Outlook,
+    session: Option<SessionReference>,
     prompt_id: PromptId,
     results: UnboundedSender<SubmissionResult>,
     deliver: impl Future<Output = Result<SubmissionResult>> + Send + 'static,
@@ -1229,7 +1585,9 @@ fn spawn_prompt_delivery(
     tokio::spawn(async move {
         let result = deliver
             .await
-            .unwrap_or_else(|error| SubmissionResult::Failed {
+            .unwrap_or_else(|error| SubmissionResult::PromptDeliveryFailed {
+                outlook,
+                session,
                 prompt_id,
                 error: error.to_string(),
             });
@@ -1238,25 +1596,44 @@ fn spawn_prompt_delivery(
 }
 
 enum SubmissionResult {
-    SessionCreated(Box<SessionSnapshot>),
-    PromptAdmitted(PromptId),
-    Failed {
+    SessionCreated {
+        outlook: Outlook,
+        snapshot: Box<SessionSnapshot>,
+    },
+    PromptAdmitted {
+        session: SessionReference,
+        prompt_id: PromptId,
+    },
+    PromptDeliveryFailed {
+        outlook: Outlook,
+        session: Option<SessionReference>,
         prompt_id: PromptId,
         error: String,
     },
-    OperationSucceeded,
-    OperationFailed(String),
-    SessionDeletionFailed {
-        session_id: SessionId,
+    OperationSucceeded(SessionReference),
+    OperationFailed {
+        session: SessionReference,
         error: String,
     },
-    LandingAgentSelectionConfirmed(AgentSelection),
-    LandingAgentSelectionConfirmationFailed(String),
+    SessionDeletionFailed {
+        session: SessionReference,
+        error: String,
+    },
+    LandingAgentSelectionConfirmed {
+        outlook: Outlook,
+        selection: AgentSelection,
+    },
+    LandingAgentSelectionConfirmationFailed {
+        outlook: Outlook,
+        error: String,
+    },
     AgentSelectionUpdated {
+        session: SessionReference,
         operation_id: AgentSelectionOperationId,
         selection: AgentSelection,
     },
     AgentSelectionUpdateFailed {
+        session: SessionReference,
         operation_id: AgentSelectionOperationId,
         error: String,
     },
@@ -1281,10 +1658,12 @@ enum ModelPickerResult {
 
 enum SkillCatalogResult {
     Listed {
+        outlook: Outlook,
         request: SkillCatalogRequest,
         catalog: SkillCatalog,
     },
     Failed {
+        outlook: Outlook,
         request: SkillCatalogRequest,
         error: String,
     },
@@ -1298,6 +1677,7 @@ enum SkillCatalogOperation {
 
 fn spawn_skill_catalog_operation(
     commands: SessionCommandClient,
+    outlook: Outlook,
     request: SkillCatalogRequest,
     results: UnboundedSender<SkillCatalogResult>,
     operation: SkillCatalogOperation,
@@ -1308,8 +1688,13 @@ fn spawn_skill_catalog_operation(
             SkillCatalogOperation::Refresh => commands.refresh_skills(request.clone()).await,
         };
         let result = match response {
-            Ok(catalog) => SkillCatalogResult::Listed { request, catalog },
+            Ok(catalog) => SkillCatalogResult::Listed {
+                outlook,
+                request,
+                catalog,
+            },
             Err(error) => SkillCatalogResult::Failed {
+                outlook,
                 request,
                 error: error.to_string(),
             },
@@ -1355,15 +1740,19 @@ fn spawn_model_listing(
 
 fn spawn_landing_agent_selection_confirmation(
     commands: SessionCommandClient,
+    outlook: Outlook,
     selection: AgentSelection,
     results: UnboundedSender<SubmissionResult>,
 ) {
     tokio::spawn(async move {
         let result = match commands.confirm_landing_agent_selection(selection).await {
-            Ok(selection) => SubmissionResult::LandingAgentSelectionConfirmed(selection),
-            Err(error) => {
-                SubmissionResult::LandingAgentSelectionConfirmationFailed(error.to_string())
+            Ok(selection) => {
+                SubmissionResult::LandingAgentSelectionConfirmed { outlook, selection }
             }
+            Err(error) => SubmissionResult::LandingAgentSelectionConfirmationFailed {
+                outlook,
+                error: error.to_string(),
+            },
         };
         let _ = results.send(result);
     });
@@ -1371,18 +1760,23 @@ fn spawn_landing_agent_selection_confirmation(
 
 fn spawn_agent_selection_update(
     commands: SessionCommandClient,
-    session_id: SessionId,
+    session: SessionReference,
     request: UpdateAgentSelectionRequest,
     results: UnboundedSender<SubmissionResult>,
 ) {
     tokio::spawn(async move {
         let operation_id = request.operation_id;
-        let result = match commands.update_agent_selection(session_id, request).await {
+        let result = match commands
+            .update_agent_selection(session.session_id, request)
+            .await
+        {
             Ok(selection) => SubmissionResult::AgentSelectionUpdated {
+                session,
                 operation_id,
                 selection,
             },
             Err(error) => SubmissionResult::AgentSelectionUpdateFailed {
+                session,
                 operation_id,
                 error: error.to_string(),
             },
@@ -1401,10 +1795,14 @@ enum SessionPickerResult {
         error: String,
     },
     Attached {
+        reference: SessionReference,
         snapshot: Box<SessionSnapshot>,
         subscription: SessionSubscription,
     },
-    AttachmentFailed(String),
+    AttachmentFailed {
+        reference: SessionReference,
+        error: String,
+    },
 }
 
 fn replace_listing<Request: Clone>(
@@ -1453,10 +1851,11 @@ fn spawn_session_listing(
 
 fn spawn_session_attachment(
     commands: SessionCommandClient,
-    session_id: SessionId,
+    reference: SessionReference,
     results: UnboundedSender<SessionPickerResult>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let session_id = reference.session_id;
         let result = async {
             let mut subscription = commands.attach_session(session_id).await?;
             let event = subscription
@@ -1467,12 +1866,16 @@ fn spawn_session_attachment(
                 return Err(anyhow!("target Session updated before hydration"));
             };
             Ok::<_, anyhow::Error>(SessionPickerResult::Attached {
+                reference: reference.clone(),
                 snapshot,
                 subscription,
             })
         }
         .await
-        .unwrap_or_else(|error| SessionPickerResult::AttachmentFailed(error.to_string()));
+        .unwrap_or_else(|error| SessionPickerResult::AttachmentFailed {
+            reference,
+            error: error.to_string(),
+        });
         let _ = results.send(result);
     })
 }
@@ -1499,12 +1902,16 @@ enum SessionOperation {
 }
 
 impl SessionOperation {
-    async fn run(self, commands: SessionCommandClient) -> SubmissionResult {
+    async fn run(
+        self,
+        commands: SessionCommandClient,
+        session: SessionReference,
+    ) -> SubmissionResult {
         match self {
             Self::DeleteSession { session_id } => match commands.delete_session(session_id).await {
-                Ok(()) => SubmissionResult::OperationSucceeded,
+                Ok(()) => SubmissionResult::OperationSucceeded(session),
                 Err(error) => SubmissionResult::SessionDeletionFailed {
-                    session_id,
+                    session,
                     error: error.to_string(),
                 },
             },
@@ -1515,6 +1922,7 @@ impl SessionOperation {
                 session_id,
                 settled,
             } => operation_result(
+                session,
                 commands
                     .settle_session(session_id, settled)
                     .await
@@ -1524,6 +1932,7 @@ impl SessionOperation {
                 session_id,
                 prompt_id,
             } => operation_result(
+                session,
                 commands
                     .promote_prompt(session_id, prompt_id)
                     .await
@@ -1533,22 +1942,26 @@ impl SessionOperation {
                 session_id,
                 prompt_id,
             } => operation_result(
+                session,
                 commands
                     .cancel_prompt(session_id, prompt_id)
                     .await
                     .map(|_| ()),
             ),
             Self::InterruptSession { session_id } => {
-                operation_result(commands.interrupt_session(session_id).await)
+                operation_result(session, commands.interrupt_session(session_id).await)
             }
         }
     }
 }
 
-fn operation_result(result: anyhow::Result<()>) -> SubmissionResult {
+fn operation_result(session: SessionReference, result: anyhow::Result<()>) -> SubmissionResult {
     match result {
-        Ok(()) => SubmissionResult::OperationSucceeded,
-        Err(error) => SubmissionResult::OperationFailed(error.to_string()),
+        Ok(()) => SubmissionResult::OperationSucceeded(session),
+        Err(error) => SubmissionResult::OperationFailed {
+            session,
+            error: error.to_string(),
+        },
     }
 }
 
@@ -1570,26 +1983,28 @@ fn spawn_setting_mutation(
 
 fn spawn_session_operation(
     commands: SessionCommandClient,
+    session: SessionReference,
     operation: SessionOperation,
     results: UnboundedSender<SubmissionResult>,
 ) {
     tokio::spawn(async move {
-        let result = operation.run(commands).await;
+        let result = operation.run(commands, session).await;
         let _ = results.send(result);
     });
 }
 
 struct ConnectedSessionSubscription {
-    session_id: SessionId,
+    reference: SessionReference,
     subscription: SessionSubscription,
 }
 
 fn spawn_session_subscription(
     commands: SessionCommandClient,
-    session_id: SessionId,
+    reference: SessionReference,
     connected: UnboundedSender<ConnectedSessionSubscription>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let session_id = reference.session_id;
         let mut retry_in = tokio::time::Duration::from_millis(50);
         loop {
             if connected.is_closed() {
@@ -1598,7 +2013,7 @@ fn spawn_session_subscription(
             match commands.subscribe_session(session_id).await {
                 Ok(subscription) => {
                     let _ = connected.send(ConnectedSessionSubscription {
-                        session_id,
+                        reference,
                         subscription,
                     });
                     return;

@@ -940,7 +940,7 @@ fn rejected_admission_restores_the_complete_skill_bearing_draft() {
             "$review preserve every marker".to_owned(),
         )))
         .expect("paste a Skill-bearing Prompt");
-    let ApplicationTransition::AdmitPrompt { request, .. } = application
+    let ApplicationTransition::AdmitPrompt { session, request } = application
         .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
         .expect("submit Skill-bearing Prompt")
     else {
@@ -948,6 +948,7 @@ fn rejected_admission_restores_the_complete_skill_bearing_draft() {
     };
     application
         .handle_event(ApplicationEvent::PromptAdmissionFailed {
+            session,
             prompt_id: request.prompt.id,
             error: "catalog changed during admission".to_owned(),
         })

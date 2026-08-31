@@ -16,12 +16,13 @@ use crate::{
     RuntimeConfig,
     protocol::{
         AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, InvitePreview,
-        IssueInviteRequest, IssuedInvite, LifecycleState, ModelCatalog, Peer, PreviewInviteRequest,
-        Prompt, PromptId, RedeemInviteRequest, Remote, RemoteHealth, RuntimeDescriptor,
-        ServerShutdown, SessionCatalogSnapshot, SessionCreated, SessionDeleted, SessionError,
-        SessionId, SessionListItem, SessionSettlementChanged, SessionSnapshot, SessionSummary,
-        SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged, SettingMutation,
-        SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
+        IssueInviteRequest, IssuedInvite, LifecycleState, ModelCatalog, Outlook, Peer,
+        PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest, Remote, RemoteHealth,
+        ResolveWorkspaceRequest, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
+        SessionCreated, SessionDeleted, SessionError, SessionId, SessionListItem,
+        SessionSettlementChanged, SessionSnapshot, SessionSummary, SessionTitleChanged,
+        SessionUsageChanged, SessionWorkingChanged, SettingMutation, SettingsSnapshot,
+        SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
         UpdateAgentSelectionRequest,
     },
 };
@@ -34,6 +35,7 @@ mod session_catalog_stream;
 mod session_projection;
 mod session_stream;
 
+pub use session_catalog_stream::SessionCatalogSubscription;
 pub(crate) use session_projection::SessionProjection;
 pub use session_stream::{SessionEvent, SessionStreamError, SessionSubscription};
 
@@ -228,6 +230,8 @@ pub struct ManagedClient {
     events: mpsc::Receiver<ManagedEvent>,
     http: reqwest::Client,
     descriptor: watch::Receiver<RuntimeDescriptor>,
+    initial_recovery_backoff: Duration,
+    max_recovery_backoff: Duration,
     task: JoinHandle<()>,
 }
 
@@ -235,6 +239,17 @@ pub struct ManagedClient {
 pub(crate) struct SessionCommandClient {
     http: reqwest::Client,
     descriptor: watch::Receiver<RuntimeDescriptor>,
+    outlook: Outlook,
+    initial_recovery_backoff: Duration,
+    max_recovery_backoff: Duration,
+}
+
+/// Commands addressed to the one Server a Client's Outlook names. Remote
+/// requests are encoded beneath the local Server's explicit proxy route; the
+/// caller never needs to construct or understand that route.
+#[derive(Clone)]
+pub struct OutlookClient {
+    commands: SessionCommandClient,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -287,6 +302,12 @@ impl ManagedClient {
 
     pub async fn next(&mut self) -> Option<ManagedEvent> {
         self.events.recv().await
+    }
+
+    pub fn outlook(&self, outlook: Outlook) -> OutlookClient {
+        OutlookClient {
+            commands: self.session_commands_for(outlook),
+        }
     }
 
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionSnapshot> {
@@ -431,19 +452,156 @@ impl ManagedClient {
     }
 
     pub(crate) fn session_commands(&self) -> SessionCommandClient {
+        self.session_commands_for(Outlook::Local)
+    }
+
+    pub(crate) fn session_commands_for(&self, outlook: Outlook) -> SessionCommandClient {
         SessionCommandClient {
             http: self.http.clone(),
             descriptor: self.descriptor.clone(),
+            outlook,
+            initial_recovery_backoff: self.initial_recovery_backoff,
+            max_recovery_backoff: self.max_recovery_backoff,
         }
     }
 }
 
+impl OutlookClient {
+    pub fn subscribe_catalog(&self) -> SessionCatalogSubscription {
+        self.commands.subscribe_catalog()
+    }
+
+    pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionSnapshot> {
+        self.commands.create_session(request).await
+    }
+
+    pub async fn resolve_workspace(
+        &self,
+        request: ResolveWorkspaceRequest,
+    ) -> Result<crate::protocol::Workspace> {
+        self.commands.resolve_workspace(request).await
+    }
+
+    pub async fn admit_prompt(
+        &self,
+        session_id: SessionId,
+        request: AdmitPromptRequest,
+    ) -> Result<Prompt> {
+        self.commands.admit_prompt(session_id, request).await
+    }
+
+    pub async fn update_agent_selection(
+        &self,
+        session_id: SessionId,
+        request: UpdateAgentSelectionRequest,
+    ) -> Result<AgentSelection> {
+        self.commands
+            .update_agent_selection(session_id, request)
+            .await
+    }
+
+    pub async fn confirm_landing_agent_selection(
+        &self,
+        selection: AgentSelection,
+    ) -> Result<AgentSelection> {
+        self.commands
+            .confirm_landing_agent_selection(selection)
+            .await
+    }
+
+    pub async fn subscribe_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
+        self.commands.subscribe_session(session_id).await
+    }
+
+    pub async fn promote_prompt(
+        &self,
+        session_id: SessionId,
+        prompt_id: PromptId,
+    ) -> Result<Prompt> {
+        self.commands.promote_prompt(session_id, prompt_id).await
+    }
+
+    pub async fn cancel_prompt(
+        &self,
+        session_id: SessionId,
+        prompt_id: PromptId,
+    ) -> Result<Prompt> {
+        self.commands.cancel_prompt(session_id, prompt_id).await
+    }
+
+    pub async fn interrupt_session(&self, session_id: SessionId) -> Result<()> {
+        self.commands.interrupt_session(session_id).await
+    }
+
+    pub async fn read_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+        self.commands.read_session(session_id).await
+    }
+
+    pub async fn delete_session(&self, session_id: SessionId) -> Result<()> {
+        self.commands.delete_session(session_id).await
+    }
+
+    pub async fn settle_session(
+        &self,
+        session_id: SessionId,
+        settled: bool,
+    ) -> Result<SessionSummary> {
+        self.commands.settle_session(session_id, settled).await
+    }
+
+    pub async fn list_sessions(&self, workspace: Option<&Path>) -> Result<Vec<SessionListItem>> {
+        self.commands.list_sessions(workspace).await
+    }
+
+    pub async fn list_models(&self) -> Result<ModelCatalog> {
+        self.commands.list_models().await
+    }
+
+    pub async fn refresh_models(&self) -> Result<ModelCatalog> {
+        self.commands.refresh_models().await
+    }
+
+    pub async fn list_skills(&self, request: SkillCatalogRequest) -> Result<SkillCatalog> {
+        self.commands.list_skills(request).await
+    }
+
+    pub async fn refresh_skills(&self, request: SkillCatalogRequest) -> Result<SkillCatalog> {
+        self.commands.refresh_skills(request).await
+    }
+
+    pub async fn attach_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
+        self.commands.attach_session(session_id).await
+    }
+}
+
 impl SessionCommandClient {
+    pub(crate) fn subscribe_catalog(&self) -> SessionCatalogSubscription {
+        SessionCatalogSubscription::open_attached(
+            self.http.clone(),
+            self.descriptor.clone(),
+            self.outlook.clone(),
+            self.initial_recovery_backoff,
+            self.max_recovery_backoff,
+        )
+    }
+
+    pub(crate) async fn resolve_workspace(
+        &self,
+        request: ResolveWorkspaceRequest,
+    ) -> Result<crate::protocol::Workspace> {
+        self.post_session_command("/v1/workspaces/resolve", &request, "Workspace resolution")
+            .await
+    }
+
     pub(crate) async fn list_skills(&self, request: SkillCatalogRequest) -> Result<SkillCatalog> {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
-            .post(format!("{}/v1/skills", descriptor.base_url))
+            .post(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/skills",
+            )?)
             .bearer_auth(&descriptor.token)
             .json(&request)
             .send()
@@ -459,7 +617,11 @@ impl SessionCommandClient {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
-            .post(format!("{}/v1/skills/refresh", descriptor.base_url))
+            .post(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/skills/refresh",
+            )?)
             .bearer_auth(&descriptor.token)
             .json(&request)
             .send()
@@ -472,7 +634,11 @@ impl SessionCommandClient {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
-            .get(format!("{}/v1/models", descriptor.base_url))
+            .get(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/models",
+            )?)
             .bearer_auth(&descriptor.token)
             .send()
             .await
@@ -484,7 +650,11 @@ impl SessionCommandClient {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
-            .post(format!("{}/v1/models/refresh", descriptor.base_url))
+            .post(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/models/refresh",
+            )?)
             .bearer_auth(&descriptor.token)
             .send()
             .await
@@ -532,10 +702,11 @@ impl SessionCommandClient {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
-            .put(format!(
-                "{}/v1/landing-agent-selection",
-                descriptor.base_url
-            ))
+            .put(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/landing-agent-selection",
+            )?)
             .bearer_auth(&descriptor.token)
             .json(&selection)
             .send()
@@ -585,7 +756,7 @@ impl SessionCommandClient {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
-            .post(format!("{}{path}", descriptor.base_url))
+            .post(server_url(&descriptor.base_url, &self.outlook, path)?)
             .bearer_auth(&descriptor.token)
             .send()
             .await
@@ -606,7 +777,7 @@ impl SessionCommandClient {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
-            .post(format!("{}{path}", descriptor.base_url))
+            .post(server_url(&descriptor.base_url, &self.outlook, path)?)
             .bearer_auth(&descriptor.token)
             .json(request)
             .send()
@@ -626,7 +797,7 @@ impl SessionCommandClient {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
-            .post(format!("{}{path}", descriptor.base_url))
+            .post(server_url(&descriptor.base_url, &self.outlook, path)?)
             .bearer_auth(&descriptor.token)
             .send()
             .await
@@ -722,14 +893,18 @@ impl SessionCommandClient {
         session_id: SessionId,
     ) -> Result<SessionSubscription> {
         let descriptor = self.descriptor.borrow().clone();
-        SessionSubscription::open(&self.http, &descriptor, session_id).await
+        SessionSubscription::open(&self.http, &descriptor, &self.outlook, session_id).await
     }
 
     pub(crate) async fn read_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
-            .get(format!("{}/v1/sessions/{session_id}", descriptor.base_url))
+            .get(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                &format!("/v1/sessions/{session_id}"),
+            )?)
             .bearer_auth(&descriptor.token)
             .send()
             .await
@@ -741,7 +916,11 @@ impl SessionCommandClient {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
-            .delete(format!("{}/v1/sessions/{session_id}", descriptor.base_url))
+            .delete(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                &format!("/v1/sessions/{session_id}"),
+            )?)
             .bearer_auth(&descriptor.token)
             .send()
             .await
@@ -772,7 +951,11 @@ impl SessionCommandClient {
         let descriptor = self.descriptor.borrow().clone();
         let request = self
             .http
-            .get(format!("{}/v1/sessions", descriptor.base_url))
+            .get(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/sessions",
+            )?)
             .bearer_auth(&descriptor.token);
         let request = match workspace {
             Some(workspace) => request.query(&[("workspace", workspace)]),
@@ -786,8 +969,28 @@ impl SessionCommandClient {
         &self,
         session_id: SessionId,
     ) -> Result<SessionSubscription> {
-        SessionSubscription::open_attached(&self.http, self.descriptor.clone(), session_id).await
+        SessionSubscription::open_attached(
+            &self.http,
+            self.descriptor.clone(),
+            self.outlook.clone(),
+            session_id,
+        )
+        .await
     }
+}
+
+pub(super) fn server_url(base_url: &str, outlook: &Outlook, path: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base_url).context("parse server base URL")?;
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|()| anyhow!("server base URL cannot contain path segments"))?;
+    segments.clear();
+    if let Outlook::Remote(name) = outlook {
+        segments.extend(["v1", "remotes", name]);
+    }
+    segments.extend(path.trim_start_matches('/').split('/'));
+    drop(segments);
+    Ok(url)
 }
 
 async fn decode_api_response<T>(response: reqwest::Response, operation: &str) -> Result<T>

@@ -461,7 +461,10 @@ fn arrows_choose_and_enter_opens_the_chosen_subagent() {
     press_key(&mut application, KeyCode::Down);
     assert_eq!(
         press_key(&mut application, KeyCode::Enter),
-        ApplicationTransition::AttachSession(spawned[1].child_id),
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            spawned[1].child_id,
+        )),
         "Enter opens the Session of the Subagent the arrows chose"
     );
     let text = rendered_application_rows_at(&application, 80, 22).join("\n");
@@ -514,7 +517,10 @@ fn rows_answer_the_pointer_as_readily_as_the_keys() {
 
     assert_eq!(
         press_text(&mut application, 80, 22, "└ ⠋ Plan: Design the picker"),
-        ApplicationTransition::AttachSession(spawned[1].child_id),
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            spawned[1].child_id,
+        )),
         "pressing a picker row opens the Subagent it names"
     );
 }
@@ -568,7 +574,10 @@ fn a_subagent_session_browses_its_own_working_subagents() {
     );
     assert_eq!(
         press_key(&mut application, KeyCode::Enter),
-        ApplicationTransition::AttachSession(grandchild_id),
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            grandchild_id,
+        )),
         "Enter steps into the grandchild's Session"
     );
 }
@@ -610,7 +619,10 @@ fn x_stops_the_chosen_subagent_at_once_where_the_provider_allows() {
     assert_eq!(
         press_key(&mut application, KeyCode::Char('x')),
         ApplicationTransition::InterruptSession {
-            session_id: spawned[0].child_id
+            session: suru::protocol::SessionReference::new(
+                suru::protocol::Outlook::Local,
+                spawned[0].child_id,
+            )
         },
         "the stop interrupts the chosen Subagent's own Session"
     );
@@ -682,7 +694,12 @@ fn escape_interrupts_the_session_when_only_subagents_keep_it_working() {
     );
     assert_eq!(
         press_key(&mut application, KeyCode::Esc),
-        ApplicationTransition::InterruptSession { session_id },
+        ApplicationTransition::InterruptSession {
+            session: suru::protocol::SessionReference::new(
+                suru::protocol::Outlook::Local,
+                session_id,
+            ),
+        },
         "the second Esc interrupts the Session even with no Turn active"
     );
 }

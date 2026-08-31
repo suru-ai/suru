@@ -640,7 +640,7 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
     let tiny_options = rendered_application_rows_at(&application, 28, 5).join("\n");
     assert!(tiny_options.contains("Reasoning"));
     let ApplicationTransition::UpdateAgentSelection {
-        session_id: updated_session,
+        session: updated_session,
         request,
     } = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -651,7 +651,8 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
     else {
         panic!("applying a Session Model's options should update Agent Selection");
     };
-    assert_eq!(updated_session, session_id);
+    assert_eq!(updated_session.origin, suru::protocol::Outlook::Local);
+    assert_eq!(updated_session.session_id, session_id);
     assert_eq!(request.selection.model, ModelId::new("new"));
     assert_eq!(
         request.selection.options,

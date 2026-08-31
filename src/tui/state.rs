@@ -18,10 +18,11 @@ use crate::{
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentSelection,
         AgentSelectionOperationId, CreateSessionRequest, EffectiveSettings, FoldPosture,
-        InitialPrompt, MessageId, ModelCatalog, PromptDelivery, PromptId, PromptStatus,
-        ServerIdentity, SessionChange, SessionId, SessionListItem, SessionSnapshot,
-        SettingMutation, SettingsSnapshot, ShutdownReason, SkillCatalog, SkillCatalogRequest,
-        TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        InitialPrompt, MessageId, ModelCatalog, Outlook, PromptDelivery, PromptId, PromptStatus,
+        ResolveWorkspaceRequest, ServerIdentity, SessionChange, SessionId, SessionListItem,
+        SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot, ShutdownReason,
+        SkillCatalog, SkillCatalogRequest, TurnId, TurnStatus, UpdateAgentSelectionRequest,
+        Workspace,
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
@@ -133,27 +134,50 @@ pub enum SessionListSurface {
     Sidebar,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum WorkspaceResolutionSurface {
+    Outlook,
+    WorkspacePicker,
+    Sidebar,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionListRequest {
     surface: SessionListSurface,
     id: u64,
+    outlook: Outlook,
     pub(super) scope: SessionListScope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelListRequest {
     sequence: u64,
+    outlook: Outlook,
 }
 
 impl ModelListRequest {
-    pub(super) const fn new(sequence: u64) -> Self {
-        Self { sequence }
+    pub(super) const fn new(sequence: u64, outlook: Outlook) -> Self {
+        Self { sequence, outlook }
+    }
+
+    pub fn outlook(&self) -> &Outlook {
+        &self.outlook
     }
 }
 
 impl SessionListRequest {
-    pub(super) fn new(surface: SessionListSurface, id: u64, scope: SessionListScope) -> Self {
-        Self { surface, id, scope }
+    pub(super) fn new(
+        surface: SessionListSurface,
+        id: u64,
+        outlook: Outlook,
+        scope: SessionListScope,
+    ) -> Self {
+        Self {
+            surface,
+            id,
+            outlook,
+            scope,
+        }
     }
 
     pub fn scope(&self) -> &SessionListScope {
@@ -162,6 +186,10 @@ impl SessionListRequest {
 
     pub fn surface(&self) -> SessionListSurface {
         self.surface
+    }
+
+    pub fn outlook(&self) -> &Outlook {
+        &self.outlook
     }
 }
 
@@ -265,6 +293,10 @@ impl TranscriptViewport {
 
 #[derive(Clone, Debug)]
 pub struct TuiState {
+    pub(super) outlook: Outlook,
+    outlook_workspaces: HashMap<Outlook, PathBuf>,
+    workspace_resolution_sequence: u64,
+    pending_workspace_resolutions: HashMap<WorkspaceResolutionSurface, u64>,
     pub(super) identity: Option<ServerIdentity>,
     pub(super) recovery: Option<RecoveryStatus>,
     /// Manual stop preserves the last confirmed identity as useful final context.
@@ -272,7 +304,7 @@ pub struct TuiState {
     pub(super) fatal_error: Option<String>,
     pub(super) workspace: PathBuf,
     pub(super) composers: ComposerMemory,
-    session_interactions: HashMap<SessionId, SessionInteraction>,
+    session_interactions: HashMap<SessionReference, SessionInteraction>,
     /// The effective value of every Setting, as the server last pushed it.
     /// Client Settings govern presentation from here. The snapshot leads the
     /// lifecycle stream, so it is in hand before any Session view opens.
@@ -301,6 +333,8 @@ pub struct TuiState {
     presentation_clock: PresentationClock,
     pub(super) submission_error: Option<String>,
     pub(super) session: Option<SessionProjection>,
+    pub(super) session_reference: Option<SessionReference>,
+    outlook_landing_selections: HashMap<Outlook, Option<AgentSelection>>,
     landing_agent_selection: Option<AgentSelection>,
     confirmed_landing_agent_selection: Option<AgentSelection>,
     pending_landing_agent_selection: Option<AgentSelection>,
@@ -308,8 +342,8 @@ pub struct TuiState {
     pending_agent_selection: Option<PendingAgentSelection>,
     /// Newest complete Agent Selection awaiting the in-flight request; rapid
     /// cycles coalesce here so transport stays serialized per Session.
-    queued_agent_selection: Option<(SessionId, AgentSelection)>,
-    confirmed_agent_selection: Option<(SessionId, AgentSelection)>,
+    queued_agent_selection: Option<(SessionReference, AgentSelection)>,
+    confirmed_agent_selection: Option<(SessionReference, AgentSelection)>,
     session_events_blocked: bool,
     pub(super) reconnect_overlay_visible: bool,
     pending_submission: Option<PendingSubmission>,
@@ -339,7 +373,7 @@ struct PendingSubmission {
 
 #[derive(Clone, Debug)]
 struct PendingAgentSelection {
-    session_id: SessionId,
+    session: SessionReference,
     operation_id: AgentSelectionOperationId,
     selection: AgentSelection,
 }
@@ -353,14 +387,14 @@ struct FailedSubmission {
 
 #[derive(Clone, Debug)]
 struct PendingSteer {
-    session_id: SessionId,
+    session: SessionReference,
     prompt: InitialPrompt,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum SubmissionTarget {
     CreateSession,
-    AdmitPrompt(SessionId, PromptDelivery),
+    AdmitPrompt(SessionReference, PromptDelivery),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -394,6 +428,10 @@ impl TuiState {
         // Workspace none of this client's Sessions match.
         let workspace = workspace_reading(workspace.as_ref());
         Self {
+            outlook: Outlook::Local,
+            outlook_workspaces: HashMap::from([(Outlook::Local, workspace.clone())]),
+            workspace_resolution_sequence: 0,
+            pending_workspace_resolutions: HashMap::new(),
             identity: None,
             recovery: None,
             manually_stopped: false,
@@ -412,6 +450,8 @@ impl TuiState {
             presentation_clock: PresentationClock::default(),
             submission_error: None,
             session: None,
+            session_reference: None,
+            outlook_landing_selections: HashMap::from([(Outlook::Local, None)]),
             landing_agent_selection: None,
             confirmed_landing_agent_selection: None,
             pending_landing_agent_selection: None,
@@ -454,19 +494,95 @@ impl TuiState {
     /// choose, and the path entry re-points it separately, so nothing here
     /// rearranges a column they configured.
     fn adopt_workspace(&mut self, workspace: PathBuf) {
+        self.outlook_workspaces
+            .insert(self.outlook.clone(), workspace.clone());
         self.workspace = workspace.clone();
         self.session_picker.adopt_workspace(workspace.clone());
         self.workspace_picker.adopt_workspace(workspace.clone());
         self.sidebar.adopt_workspace(workspace);
     }
 
+    fn turn_outlook(&mut self, outlook: Outlook) {
+        if self.outlook == outlook {
+            return;
+        }
+        self.outlook_landing_selections
+            .insert(self.outlook.clone(), self.landing_agent_selection.clone());
+        self.outlook = outlook.clone();
+        self.pending_workspace_resolutions.clear();
+        self.workspace = self
+            .outlook_workspaces
+            .get(&outlook)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.session = None;
+        self.session_reference = None;
+        self.session_events_blocked = true;
+        self.pending_submission = None;
+        self.pending_steers.clear();
+        self.pending_agent_selection = None;
+        self.queued_agent_selection = None;
+        self.confirmed_agent_selection = None;
+        self.landing_agent_selection = self
+            .outlook_landing_selections
+            .get(&outlook)
+            .cloned()
+            .flatten();
+        self.confirmed_landing_agent_selection = self.landing_agent_selection.clone();
+        self.pending_landing_agent_selection = None;
+        self.queued_landing_agent_selection = None;
+        self.skill_catalog = None;
+        self.model_picker.adopt_outlook(outlook.clone());
+        self.model_options = ModelOptions::default();
+        self.pending_model_options = false;
+        self.session_picker.adopt_workspace(self.workspace.clone());
+        self.workspace_picker
+            .adopt_workspace(self.workspace.clone());
+        self.sidebar.adopt_workspace(self.workspace.clone());
+        self.session_picker.adopt_outlook(outlook.clone());
+        self.workspace_picker.adopt_outlook(outlook.clone());
+        self.sidebar.adopt_outlook(outlook);
+        self.command_mode = CommandMode::Composer;
+        self.submission_error = None;
+        self.sync_composer_completion();
+    }
+
+    fn begin_workspace_resolution(&mut self, surface: WorkspaceResolutionSurface) -> u64 {
+        self.workspace_resolution_sequence = self.workspace_resolution_sequence.wrapping_add(1);
+        if surface != WorkspaceResolutionSurface::Outlook {
+            self.pending_workspace_resolutions
+                .remove(&WorkspaceResolutionSurface::Outlook);
+        }
+        let id = self.workspace_resolution_sequence;
+        self.pending_workspace_resolutions.insert(surface, id);
+        id
+    }
+
+    fn accept_workspace_resolution(
+        &mut self,
+        surface: WorkspaceResolutionSurface,
+        id: u64,
+    ) -> bool {
+        if self.pending_workspace_resolutions.get(&surface) != Some(&id) {
+            return false;
+        }
+        self.pending_workspace_resolutions.remove(&surface);
+        true
+    }
+
+    fn cancel_workspace_resolution(&mut self, surface: WorkspaceResolutionSurface) -> bool {
+        self.pending_workspace_resolutions
+            .remove(&surface)
+            .is_some()
+    }
+
     fn sync_composer_completion(&mut self) {
         let key = self.composer_key();
         let catalog = self.current_skill_catalog().cloned();
-        self.composers.resolve_skills(key, catalog.as_ref());
-        let bound_skills = self.composers.valid_skill_ids(key);
+        self.composers.resolve_skills(key.clone(), catalog.as_ref());
+        let bound_skills = self.composers.valid_skill_ids(key.clone());
         self.composer_completion.sync(
-            self.composers.text(key),
+            self.composers.text(key.clone()),
             self.composers.cursor(key),
             catalog.as_ref(),
             &bound_skills,
@@ -487,7 +603,10 @@ impl TuiState {
             || self.workspace.clone(),
             |session| session.snapshot().session.workspace.path.clone(),
         );
-        let workspace = workspace_reading(&workspace);
+        let workspace = match self.outlook {
+            Outlook::Local => workspace_reading(&workspace),
+            Outlook::Remote(_) => workspace,
+        };
         Some(SkillCatalogRequest {
             provider: selection.provider.clone(),
             workspace: Workspace { path: workspace },
@@ -547,6 +666,24 @@ impl TuiState {
     }
 
     pub fn apply(&mut self, event: ManagedEvent) {
+        // The managed catalog stream belongs to the local Server. A Remote
+        // Outlook has its own listings and must never be moved by local work.
+        if self.outlook != Outlook::Local
+            && (event.moves_the_session_catalog()
+                || matches!(&event, ManagedEvent::SkillCatalogUpdated(_)))
+        {
+            return;
+        }
+        self.apply_managed_event(event);
+    }
+
+    fn apply_outlook_catalog(&mut self, outlook: &Outlook, event: ManagedEvent) {
+        if outlook == &self.outlook {
+            self.apply_managed_event(event);
+        }
+    }
+
+    fn apply_managed_event(&mut self, event: ManagedEvent) {
         // Every change the session-catalog stream reports leaves the Sidebar
         // asking the server for its listing again. What the change says is
         // taken in place below, so the frame is right before the answer lands;
@@ -566,20 +703,21 @@ impl TuiState {
                 self.fatal_error = None;
             }
             ManagedEvent::Connected(health) => {
+                self.outlook_landing_selections
+                    .insert(Outlook::Local, health.landing_agent_selection.clone());
                 let replaced_server = self
                     .identity
                     .as_ref()
                     .is_some_and(|identity| identity.instance_id != health.instance_id);
                 if replaced_server {
-                    if let Some(session_id) =
-                        self.session.as_ref().map(SessionProjection::session_id)
-                    {
-                        self.composers.recover_session_to_landing(session_id);
-                        self.session_interactions.remove(&session_id);
+                    if let Some(reference) = self.session_reference.clone() {
+                        self.composers.recover_session_to_landing(reference.clone());
+                        self.session_interactions.remove(&reference);
                         self.pending_steers
-                            .retain(|steer| steer.session_id != session_id);
+                            .retain(|steer| steer.session != reference);
                     }
                     self.session = None;
+                    self.session_reference = None;
                     self.pending_agent_selection = None;
                     self.queued_agent_selection = None;
                     self.confirmed_agent_selection = None;
@@ -588,7 +726,7 @@ impl TuiState {
                         Some("Session ended because the shared server was replaced".to_owned());
                     self.sync_composer_completion();
                 }
-                if self.session.is_none() {
+                if self.session.is_none() && self.outlook == Outlook::Local {
                     self.landing_agent_selection = health.landing_agent_selection.clone();
                     self.confirmed_landing_agent_selection = health.landing_agent_selection.clone();
                     self.pending_landing_agent_selection = None;
@@ -717,55 +855,57 @@ impl TuiState {
     }
 
     fn remove_deleted_session(&mut self, deleted_session_id: SessionId) {
-        if !self
-            .session
+        let Some(reference) = self
+            .session_reference
             .as_ref()
-            .is_some_and(|session| session.session_id() == deleted_session_id)
-        {
+            .filter(|reference| reference.session_id == deleted_session_id)
+            .cloned()
+        else {
             return;
-        }
-        self.composers.discard_session(deleted_session_id);
-        self.session_interactions.remove(&deleted_session_id);
+        };
+        self.composers.discard_session(reference.clone());
+        self.session_interactions.remove(&reference);
         self.pending_steers
-            .retain(|steer| steer.session_id != deleted_session_id);
+            .retain(|steer| steer.session != reference);
         if self.pending_submission.as_ref().is_some_and(|submission| {
             matches!(
-                submission.target,
-                SubmissionTarget::AdmitPrompt(session_id, _)
-                    if session_id == deleted_session_id
+                &submission.target,
+                SubmissionTarget::AdmitPrompt(session, _)
+                    if session == &reference
             )
         }) {
             self.pending_submission = None;
         }
         self.failed_submissions.retain(|_, submission| {
             !matches!(
-                submission.target,
-                SubmissionTarget::AdmitPrompt(session_id, _)
-                    if session_id == deleted_session_id
+                &submission.target,
+                SubmissionTarget::AdmitPrompt(session, _)
+                    if session == &reference
             )
         });
         if self
             .pending_agent_selection
             .as_ref()
-            .is_some_and(|pending| pending.session_id == deleted_session_id)
+            .is_some_and(|pending| pending.session == reference)
         {
             self.pending_agent_selection = None;
         }
         if self
             .queued_agent_selection
             .as_ref()
-            .is_some_and(|(session_id, _)| *session_id == deleted_session_id)
+            .is_some_and(|(session, _)| session == &reference)
         {
             self.queued_agent_selection = None;
         }
         if self
             .confirmed_agent_selection
             .as_ref()
-            .is_some_and(|(session_id, _)| *session_id == deleted_session_id)
+            .is_some_and(|(session, _)| session == &reference)
         {
             self.confirmed_agent_selection = None;
         }
         self.session = None;
+        self.session_reference = None;
         self.session_events_blocked = true;
         self.command_mode = CommandMode::Composer;
         self.submission_error = Some("Session ended because it was deleted".to_owned());
@@ -838,8 +978,10 @@ impl TuiState {
         if self.session.as_ref().map(SessionProjection::session_id) != Some(snapshot.session.id) {
             self.subagent_picker.close();
         }
-        self.ensure_interaction(snapshot.session.id);
+        let reference = SessionReference::new(self.outlook.clone(), snapshot.session.id);
+        self.ensure_interaction(reference.clone());
         self.submission_error = None;
+        self.session_reference = Some(reference);
         self.session = Some(SessionProjection::new(snapshot));
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.sync_composer_completion();
@@ -903,11 +1045,15 @@ impl TuiState {
     }
 
     fn composer_key(&self) -> ComposerKey {
-        self.session
+        self.session_reference
+            .clone()
+            .map_or(ComposerKey::Landing, ComposerKey::Session)
+    }
+
+    fn reference_in_current_origin(&self, session_id: SessionId) -> Option<SessionReference> {
+        self.session_reference
             .as_ref()
-            .map_or(ComposerKey::Landing, |session| {
-                ComposerKey::Session(session.session_id())
-            })
+            .map(|current| SessionReference::new(current.origin.clone(), session_id))
     }
 
     /// The parent of the open Session, present exactly while the reader is in
@@ -978,27 +1124,30 @@ impl TuiState {
     }
 
     pub(super) fn agent_selection(&self) -> Option<&AgentSelection> {
-        let Some(session) = self.session.as_ref() else {
+        let Some(projection) = self.session.as_ref() else {
             return self.landing_agent_selection.as_ref();
         };
-        let session_id = session.session_id();
+        let session = self
+            .session_reference
+            .as_ref()
+            .expect("a Session projection carries its reference");
         self.queued_agent_selection
             .as_ref()
-            .filter(|(queued_session, _)| *queued_session == session_id)
+            .filter(|(queued_session, _)| queued_session == session)
             .map(|(_, selection)| selection)
             .or_else(|| {
                 self.pending_agent_selection
                     .as_ref()
-                    .filter(|pending| pending.session_id == session_id)
+                    .filter(|pending| &pending.session == session)
                     .map(|pending| &pending.selection)
             })
             .or_else(|| {
                 self.confirmed_agent_selection
                     .as_ref()
-                    .filter(|(confirmed_session, _)| *confirmed_session == session_id)
+                    .filter(|(confirmed_session, _)| confirmed_session == session)
                     .map(|(_, selection)| selection)
             })
-            .or(session.snapshot().session.agent_selection.as_ref())
+            .or(projection.snapshot().session.agent_selection.as_ref())
     }
 
     fn selection_update_pending(&self) -> bool {
@@ -1020,15 +1169,19 @@ impl TuiState {
         else {
             return;
         };
-        let destination = ComposerKey::Session(snapshot.session.id);
+        let destination = ComposerKey::Session(
+            self.session_reference
+                .clone()
+                .expect("a Session snapshot carries its reference"),
+        );
         let pending = self
             .pending_submission
             .take()
             .expect("pending submission was just observed");
-        if let SubmissionTarget::AdmitPrompt(session_id, PromptDelivery::Steer) = pending.target
+        if let SubmissionTarget::AdmitPrompt(session, PromptDelivery::Steer) = &pending.target
             && authoritative.status == PromptStatus::Pending
         {
-            self.track_pending_steer(session_id, pending.prompt.clone());
+            self.track_pending_steer(session.clone(), pending.prompt.clone());
         }
         self.composers
             .admission_reconciled(pending.source, destination, &pending.prompt);
@@ -1039,10 +1192,9 @@ impl TuiState {
         let detached = self.pending_submission.as_ref().is_some_and(|pending| {
             pending.prompt.id == prompt_id
                 && matches!(
-                    pending.target,
-                    SubmissionTarget::AdmitPrompt(session_id, _)
-                        if self.session.as_ref().map(SessionProjection::session_id)
-                            != Some(session_id)
+                    &pending.target,
+                    SubmissionTarget::AdmitPrompt(session, _)
+                        if self.session_reference.as_ref() != Some(session)
                 )
         });
         if !detached {
@@ -1053,13 +1205,19 @@ impl TuiState {
             .pending_submission
             .take()
             .expect("detached pending submission was just observed");
-        self.composers
-            .admission_reconciled(pending.source, pending.source, &pending.prompt);
+        self.composers.admission_reconciled(
+            pending.source.clone(),
+            pending.source,
+            &pending.prompt,
+        );
         self.submission_error = None;
     }
 
-    pub(super) fn session_interaction(&self, session_id: SessionId) -> Option<&SessionInteraction> {
-        self.session_interactions.get(&session_id)
+    pub(super) fn session_interaction(
+        &self,
+        session: &SessionReference,
+    ) -> Option<&SessionInteraction> {
+        self.session_interactions.get(session)
     }
 
     fn navigate_transcript_page(&mut self, direction: TranscriptDirection) {
@@ -1071,10 +1229,10 @@ impl TuiState {
     }
 
     fn navigate_transcript(&mut self, direction: TranscriptDirection, rows: Option<usize>) {
-        let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id) else {
+        let Some(session) = self.session_reference.clone() else {
             return;
         };
-        let Some(interaction) = self.session_interactions.get_mut(&session_id) else {
+        let Some(interaction) = self.session_interactions.get_mut(&session) else {
             return;
         };
         let Some(viewport) = interaction.viewport.get_mut().as_mut() else {
@@ -1105,18 +1263,18 @@ impl TuiState {
     /// for if this is the first thing to reach for it. Rendering reads it back
     /// expecting it to be there, so hydrating a Session view calls this before
     /// the first frame.
-    fn ensure_interaction(&mut self, session_id: SessionId) -> &mut SessionInteraction {
+    fn ensure_interaction(&mut self, session: SessionReference) -> &mut SessionInteraction {
         let fold_posture = self.settings.transcript.default_fold_posture;
         self.session_interactions
-            .entry(session_id)
+            .entry(session)
             .or_insert_with(|| SessionInteraction::opening_at(fold_posture))
     }
 
     /// The attached Session's interaction state, created if this is the first
     /// thing to reach for it.
     fn current_interaction(&mut self) -> Option<&SessionInteraction> {
-        let session_id = self.session.as_ref().map(SessionProjection::session_id)?;
-        Some(self.ensure_interaction(session_id))
+        let session = self.session_reference.clone()?;
+        Some(self.ensure_interaction(session))
     }
 
     /// Toggles the disclosure of the unit drawn at `screen_row`: the Fold of
@@ -1188,7 +1346,9 @@ impl TuiState {
             // The whole row is the way into the child Session it names, so any
             // press on it resolves to the open command rather than to a Fold.
             UnitKey::Subagent(session_id) => {
-                return Some(SemanticCommandId::SubagentOpen.on_session(session_id));
+                return self
+                    .reference_in_current_origin(session_id)
+                    .map(|session| SemanticCommandId::SubagentOpen.on_session(session));
             }
             UnitKey::Message(_) | UnitKey::Provisional(_) => {}
         }
@@ -1280,10 +1440,10 @@ impl TuiState {
     }
 
     fn follow_latest(&mut self) {
-        let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id) else {
+        let Some(session) = self.session_reference.clone() else {
             return;
         };
-        let interaction = self.ensure_interaction(session_id);
+        let interaction = self.ensure_interaction(session);
         interaction.follow_latest.set(true);
         interaction.anchor.set(None);
     }
@@ -1318,7 +1478,7 @@ impl TuiState {
             .take()
             .expect("matching pending submission exists");
         self.composers
-            .admission_failed(pending.source, &pending.prompt);
+            .admission_failed(pending.source.clone(), &pending.prompt);
         self.failed_submissions.insert(
             pending.prompt.id,
             FailedSubmission {
@@ -1334,7 +1494,11 @@ impl TuiState {
         let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
             return;
         };
-        let destination = ComposerKey::Session(snapshot.session.id);
+        let destination = ComposerKey::Session(
+            self.session_reference
+                .clone()
+                .expect("a Session snapshot carries its reference"),
+        );
         let reconciled = self
             .failed_submissions
             .keys()
@@ -1352,43 +1516,44 @@ impl TuiState {
                 .failed_submissions
                 .remove(&authoritative.id)
                 .expect("failed submission identity was just observed");
-            if let SubmissionTarget::AdmitPrompt(session_id, PromptDelivery::Steer) = failed.target
+            if let SubmissionTarget::AdmitPrompt(session, PromptDelivery::Steer) = &failed.target
                 && authoritative.status == PromptStatus::Pending
             {
-                self.track_pending_steer(session_id, failed.prompt.clone());
+                self.track_pending_steer(session.clone(), failed.prompt.clone());
             }
-            if self
-                .composers
-                .late_admission_reconciled(failed.source, destination, &failed.prompt)
-            {
+            if self.composers.late_admission_reconciled(
+                failed.source,
+                destination.clone(),
+                &failed.prompt,
+            ) {
                 self.submission_error = None;
             }
         }
     }
 
     pub(super) fn provisional_prompts(&self, session_id: SessionId) -> Vec<&InitialPrompt> {
+        let session = SessionReference::new(self.outlook.clone(), session_id);
         let mut prompts = self
             .pending_steers
             .iter()
-            .filter(|steer| steer.session_id == session_id)
+            .filter(|steer| steer.session == session)
             .map(|steer| &steer.prompt)
             .collect::<Vec<_>>();
         if let Some(pending) = self.pending_submission.as_ref().filter(|pending| {
-            pending.target == SubmissionTarget::AdmitPrompt(session_id, PromptDelivery::Steer)
+            pending.target == SubmissionTarget::AdmitPrompt(session.clone(), PromptDelivery::Steer)
         }) {
             prompts.push(&pending.prompt);
         }
         prompts
     }
 
-    fn track_pending_steer(&mut self, session_id: SessionId, prompt: InitialPrompt) {
+    fn track_pending_steer(&mut self, session: SessionReference, prompt: InitialPrompt) {
         if !self
             .pending_steers
             .iter()
             .any(|pending| pending.prompt.id == prompt.id)
         {
-            self.pending_steers
-                .push(PendingSteer { session_id, prompt });
+            self.pending_steers.push(PendingSteer { session, prompt });
         }
     }
 
@@ -1396,8 +1561,12 @@ impl TuiState {
         let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
             return;
         };
+        let session = self
+            .session_reference
+            .as_ref()
+            .expect("a Session snapshot carries its reference");
         self.pending_steers.retain(|pending| {
-            pending.session_id != snapshot.session.id
+            &pending.session != session
                 || snapshot.prompts.iter().any(|prompt| {
                     prompt.id == pending.prompt.id && prompt.status == PromptStatus::Pending
                 })
@@ -1405,6 +1574,7 @@ impl TuiState {
     }
 
     pub(super) fn queued_prompts(&self, session_id: SessionId) -> Vec<QueuedPrompt<'_>> {
+        let session_reference = SessionReference::new(self.outlook.clone(), session_id);
         let mut queued = self
             .session
             .as_ref()
@@ -1430,7 +1600,8 @@ impl TuiState {
             })
             .unwrap_or_default();
         if let Some(pending) = self.pending_submission.as_ref().filter(|pending| {
-            pending.target == SubmissionTarget::AdmitPrompt(session_id, PromptDelivery::Queue)
+            pending.target
+                == SubmissionTarget::AdmitPrompt(session_reference.clone(), PromptDelivery::Queue)
                 && !queued.iter().any(|entry| entry.id == pending.prompt.id)
         }) {
             queued.push(QueuedPrompt {
@@ -1548,14 +1719,30 @@ pub enum ApplicationEvent {
     SpinnerTick,
     ReconnectGraceElapsed,
     Managed(ManagedEvent),
+    OutlookCatalog {
+        outlook: Outlook,
+        event: ManagedEvent,
+    },
     Session(SessionEvent),
     SessionSubscriptionEnded,
-    PromptAdmissionSucceeded(PromptId),
+    PromptAdmissionSucceeded {
+        session: SessionReference,
+        prompt_id: PromptId,
+    },
     PromptAdmissionFailed {
+        session: SessionReference,
+        prompt_id: PromptId,
+        error: String,
+    },
+    SessionCreationFailed {
         prompt_id: PromptId,
         error: String,
     },
     SessionAttached(SessionSnapshot),
+    OriginSessionAttached {
+        reference: SessionReference,
+        snapshot: SessionSnapshot,
+    },
     SessionsListed {
         request: SessionListRequest,
         sessions: Vec<SessionListItem>,
@@ -1595,6 +1782,10 @@ pub enum ApplicationEvent {
         error: String,
     },
     SessionAttachmentFailed(String),
+    OriginSessionAttachmentFailed {
+        reference: SessionReference,
+        error: String,
+    },
     SessionDeletionFailed {
         session_id: SessionId,
         error: String,
@@ -1632,6 +1823,12 @@ pub enum ApplicationEvent {
     RemoteProbed {
         name: String,
         result: Result<crate::protocol::RemoteHealth, String>,
+    },
+    WorkspaceResolved {
+        outlook: Outlook,
+        surface: WorkspaceResolutionSurface,
+        request_id: u64,
+        result: std::result::Result<Workspace, String>,
     },
 }
 
@@ -1730,42 +1927,42 @@ pub enum ApplicationTransition {
     Exit,
     SessionEnded,
     DetachSession,
-    DeleteSession(SessionId),
+    DeleteSession(SessionReference),
     /// A Session set aside as done for now, or brought back off the shelf.
     /// Which of the two is stated rather than toggled, so a client acting on a
     /// listing that has moved on cannot flip a Session it meant to leave
     /// alone.
     SettleSession {
-        session_id: SessionId,
+        session: SessionReference,
         settled: bool,
     },
     CreateSession(CreateSessionRequest),
     AdmitPrompt {
-        session_id: SessionId,
+        session: SessionReference,
         request: AdmitPromptRequest,
     },
     PromotePrompt {
-        session_id: SessionId,
+        session: SessionReference,
         prompt_id: PromptId,
     },
     CancelPrompt {
-        session_id: SessionId,
+        session: SessionReference,
         prompt_id: PromptId,
     },
     /// Stop what a Session is doing — its active Turn and the Subagents it
     /// spawned, or the Subagents alone once the Turn has settled. Naming a
     /// Subagent's own Session stops that one Subagent.
     InterruptSession {
-        session_id: SessionId,
+        session: SessionReference,
     },
-    SubscribeSession(SessionId),
-    AttachSession(SessionId),
+    SubscribeSession(SessionReference),
+    AttachSession(SessionReference),
     ListSessions(SessionListRequest),
     ListModels(ModelListRequest),
     RefreshSkills(SkillCatalogRequest),
     ConfirmLandingAgentSelection(AgentSelection),
     UpdateAgentSelection {
-        session_id: SessionId,
+        session: SessionReference,
         request: UpdateAgentSelectionRequest,
     },
     /// One Setting's typed edit, on its way to the server that owns the file.
@@ -1783,6 +1980,14 @@ pub enum ApplicationTransition {
     BeginConnecting,
     PreviewInvite(String),
     RedeemInvite(crate::protocol::RedeemInviteRequest),
+    TurnOutlook(Outlook),
+    CancelWorkspaceResolution(WorkspaceResolutionSurface),
+    ResolveWorkspace {
+        outlook: Outlook,
+        surface: WorkspaceResolutionSurface,
+        request_id: u64,
+        request: ResolveWorkspaceRequest,
+    },
 }
 
 impl Application {
@@ -1791,6 +1996,16 @@ impl Application {
             state: TuiState::new(workspace),
             slots: RenderSlots::builtins(),
         }
+    }
+
+    pub(super) fn pending_workspace_resolution(
+        &self,
+        surface: WorkspaceResolutionSurface,
+    ) -> Option<u64> {
+        self.state
+            .pending_workspace_resolutions
+            .get(&surface)
+            .copied()
     }
 
     /// Injects the clock used by presentation latency. Production uses the
@@ -1813,12 +2028,15 @@ impl Application {
             }
             ApplicationEvent::ReconnectGraceElapsed => Ok(self.elapse_reconnect_grace()),
             ApplicationEvent::Managed(event) => self.handle_managed_event(event),
+            ApplicationEvent::OutlookCatalog { outlook, event } => {
+                self.handle_outlook_catalog(outlook, event)
+            }
             ApplicationEvent::Session(event) => {
                 self.state.apply_session(event)?;
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::SessionSubscriptionEnded => Ok(self
-                .session_id()
+                .session_reference()
                 .map_or(ApplicationTransition::Continue, |session_id| {
                     ApplicationTransition::SubscribeSession(session_id)
                 })),
@@ -1827,10 +2045,33 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::SessionAttached(snapshot) => self.attach_session(snapshot),
+            ApplicationEvent::OriginSessionAttached {
+                reference,
+                snapshot,
+            } => {
+                if reference.origin != self.state.outlook
+                    || reference.session_id != snapshot.session.id
+                {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                self.attach_session(snapshot)
+            }
             ApplicationEvent::SessionAttachmentFailed(error) => {
                 if self.state.sidebar.is_attaching() {
                     // The Sidebar keeps its list and the reader keeps the keys:
                     // the refusal is drawn above the rows they are still on.
+                    self.state.sidebar.fail_attachment(error);
+                    Ok(ApplicationTransition::Continue)
+                } else {
+                    let request = self.state.session_picker.fail_attachment(error);
+                    Ok(ApplicationTransition::ListSessions(request))
+                }
+            }
+            ApplicationEvent::OriginSessionAttachmentFailed { reference, error } => {
+                if reference.origin != self.state.outlook {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                if self.state.sidebar.is_attaching() {
                     self.state.sidebar.fail_attachment(error);
                     Ok(ApplicationTransition::Continue)
                 } else {
@@ -1885,7 +2126,9 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::RemotesListed(remotes) => {
-                self.state.connect_overlay.load_remotes(remotes);
+                self.state
+                    .connect_overlay
+                    .load_remotes(remotes, &self.state.outlook);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::RemoteListingFailed(error) => {
@@ -1912,12 +2155,104 @@ impl Application {
                 self.state.connect_overlay.remote_probed(&name, result);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::PromptAdmissionSucceeded(prompt_id) => {
-                self.state.acknowledge_pending_submission(prompt_id);
+            ApplicationEvent::WorkspaceResolved {
+                outlook,
+                surface,
+                request_id,
+                result,
+            } => {
+                if outlook != self.state.outlook
+                    || !self.state.accept_workspace_resolution(surface, request_id)
+                {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                match result {
+                    Ok(workspace) => {
+                        self.state.adopt_workspace(workspace.path.clone());
+                        match surface {
+                            WorkspaceResolutionSurface::Outlook => {
+                                self.state.sidebar.refresh_after_outlook_workspace();
+                                Ok(self.state.sidebar.take_listing_request().map_or(
+                                    ApplicationTransition::Continue,
+                                    ApplicationTransition::ListSessions,
+                                ))
+                            }
+                            WorkspaceResolutionSurface::WorkspacePicker => {
+                                self.state.workspace_picker.close();
+                                Ok(self.open_landing())
+                            }
+                            WorkspaceResolutionSurface::Sidebar => {
+                                self.state.sidebar.accept_workspace(workspace.path);
+                                Ok(ApplicationTransition::Continue)
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        match surface {
+                            WorkspaceResolutionSurface::Outlook => {
+                                self.state.submission_error = Some(error);
+                            }
+                            WorkspaceResolutionSurface::WorkspacePicker => {
+                                self.state.workspace_picker.fail_resolution(error);
+                            }
+                            WorkspaceResolutionSurface::Sidebar => {
+                                self.state.sidebar.fail_workspace_resolution(error);
+                            }
+                        }
+                        Ok(ApplicationTransition::Continue)
+                    }
+                }
+            }
+            ApplicationEvent::PromptAdmissionSucceeded { session, prompt_id } => {
+                if self
+                    .state
+                    .pending_submission
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.prompt.id == prompt_id
+                            && matches!(
+                                &pending.target,
+                                SubmissionTarget::AdmitPrompt(target, _) if target == &session
+                            )
+                    })
+                {
+                    self.state.acknowledge_pending_submission(prompt_id);
+                }
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::PromptAdmissionFailed { prompt_id, error } => {
-                self.state.fail_pending_submission(prompt_id, error);
+            ApplicationEvent::PromptAdmissionFailed {
+                session,
+                prompt_id,
+                error,
+            } => {
+                if self
+                    .state
+                    .pending_submission
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.prompt.id == prompt_id
+                            && matches!(
+                                &pending.target,
+                                SubmissionTarget::AdmitPrompt(target, _) if target == &session
+                            )
+                    })
+                {
+                    self.state.fail_pending_submission(prompt_id, error);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SessionCreationFailed { prompt_id, error } => {
+                if self
+                    .state
+                    .pending_submission
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.prompt.id == prompt_id
+                            && pending.target == SubmissionTarget::CreateSession
+                    })
+                {
+                    self.state.fail_pending_submission(prompt_id, error);
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::SessionsListed { request, sessions } => {
@@ -2205,7 +2540,10 @@ impl Application {
             self.state.subagent_picker.close();
             return match pressed {
                 Some(session_id) => {
-                    self.invoke_semantic(SemanticCommandId::SubagentOpen.on_session(session_id))
+                    let Some(session) = self.state.reference_in_current_origin(session_id) else {
+                        return Ok(ApplicationTransition::Continue);
+                    };
+                    self.invoke_semantic(SemanticCommandId::SubagentOpen.on_session(session))
                 }
                 None => Ok(ApplicationTransition::Continue),
             };
@@ -2226,7 +2564,19 @@ impl Application {
     fn answer_sidebar_press(&mut self, press: SidebarPress) -> Result<ApplicationTransition> {
         match press {
             SidebarPress::Invoke(invocation) => self.invoke_semantic(invocation),
-            SidebarPress::Answered | SidebarPress::Elsewhere => Ok(ApplicationTransition::Continue),
+            SidebarPress::Answered => {
+                let cancelled = self
+                    .state
+                    .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
+                Ok(if cancelled {
+                    ApplicationTransition::CancelWorkspaceResolution(
+                        WorkspaceResolutionSurface::Sidebar,
+                    )
+                } else {
+                    ApplicationTransition::Continue
+                })
+            }
+            SidebarPress::Elsewhere => Ok(ApplicationTransition::Continue),
         }
     }
 
@@ -2242,15 +2592,34 @@ impl Application {
             CommandId::SelectNextWorkspace => self.state.workspace_picker.select_next(),
             CommandId::PagePreviousWorkspaces => self.state.workspace_picker.page_previous(),
             CommandId::PageNextWorkspaces => self.state.workspace_picker.page_next(),
-            CommandId::CloseWorkspacePicker => self.state.workspace_picker.close(),
+            CommandId::CloseWorkspacePicker => {
+                let cancelled = self
+                    .state
+                    .cancel_workspace_resolution(WorkspaceResolutionSurface::WorkspacePicker);
+                self.state.workspace_picker.close();
+                if cancelled {
+                    return ApplicationTransition::CancelWorkspaceResolution(
+                        WorkspaceResolutionSurface::WorkspacePicker,
+                    );
+                }
+            }
             // Choosing a Workspace adopts it in full and lands the reader in
             // it. Before the listing arrives no row is the reader's, so there
             // is nothing to choose and the picker stands on its loading line.
             CommandId::SelectWorkspace => {
                 if let Some(workspace) = self.state.workspace_picker.offer_selected() {
-                    self.state.workspace_picker.close();
-                    self.state.adopt_workspace(workspace);
-                    return self.open_landing();
+                    let request_id = self
+                        .state
+                        .begin_workspace_resolution(WorkspaceResolutionSurface::WorkspacePicker);
+                    return ApplicationTransition::ResolveWorkspace {
+                        outlook: self.state.outlook.clone(),
+                        surface: WorkspaceResolutionSurface::WorkspacePicker,
+                        request_id,
+                        request: ResolveWorkspaceRequest {
+                            base: None,
+                            path: workspace,
+                        },
+                    };
                 }
             }
             _ => {}
@@ -2271,8 +2640,11 @@ impl Application {
             CommandId::OpenSelectedSubagent => {
                 if let Some(session_id) = self.state.selected_working_subagent() {
                     self.state.subagent_picker.close();
+                    let Some(session) = self.state.reference_in_current_origin(session_id) else {
+                        return Ok(ApplicationTransition::Continue);
+                    };
                     return self
-                        .invoke_semantic(SemanticCommandId::SubagentOpen.on_session(session_id));
+                        .invoke_semantic(SemanticCommandId::SubagentOpen.on_session(session));
                 }
             }
             CommandId::StopSelectedSubagent => {
@@ -2282,9 +2654,10 @@ impl Application {
                 // never asks.
                 if self.state.subagent_stop_offered()
                     && let Some(session_id) = self.state.selected_working_subagent()
+                    && let Some(session) = self.state.reference_in_current_origin(session_id)
                 {
                     return self
-                        .invoke_semantic(SemanticCommandId::SubagentStop.on_session(session_id));
+                        .invoke_semantic(SemanticCommandId::SubagentStop.on_session(session));
                 }
             }
             _ => {}
@@ -2375,7 +2748,12 @@ impl Application {
             CommandId::SelectSession => {
                 return self.state.session_picker.begin_attachment().map_or(
                     ApplicationTransition::Continue,
-                    ApplicationTransition::AttachSession,
+                    |session_id| {
+                        ApplicationTransition::AttachSession(SessionReference::new(
+                            self.state.outlook.clone(),
+                            session_id,
+                        ))
+                    },
                 );
             }
             CommandId::CloseSessionPicker => self.edit_session_picker(SessionPicker::close),
@@ -2389,10 +2767,23 @@ impl Application {
     /// no typing, for the same reason it takes no arrows.
     fn handle_sidebar_text_command(&mut self, command: CommandId) -> ApplicationTransition {
         if self.state.sidebar.is_revealed() {
+            let edits = matches!(
+                &command,
+                CommandId::InsertSidebarText(_) | CommandId::DeleteSidebarTextBackward
+            );
+            let cancelled = edits
+                && self
+                    .state
+                    .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
             match command {
                 CommandId::InsertSidebarText(text) => self.state.sidebar.insert(&text),
                 CommandId::DeleteSidebarTextBackward => self.state.sidebar.delete_backward(),
                 _ => {}
+            }
+            if cancelled {
+                return ApplicationTransition::CancelWorkspaceResolution(
+                    WorkspaceResolutionSurface::Sidebar,
+                );
             }
         }
         ApplicationTransition::Continue
@@ -2408,22 +2799,38 @@ impl Application {
         match command {
             SemanticCommandId::SidebarPrevious => self.state.sidebar.select_previous(),
             SemanticCommandId::SidebarNext => self.state.sidebar.select_next(),
-            SemanticCommandId::SidebarLeave => self.state.sidebar.leave(),
+            SemanticCommandId::SidebarLeave => {
+                let cancelled = self
+                    .state
+                    .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
+                self.state.sidebar.leave();
+                if cancelled {
+                    return ApplicationTransition::CancelWorkspaceResolution(
+                        WorkspaceResolutionSurface::Sidebar,
+                    );
+                }
+            }
             SemanticCommandId::SidebarAttach => {
                 let current = self.session_id();
                 return match self.state.sidebar.activate(current) {
                     SidebarActivation::Answered => ApplicationTransition::Continue,
-                    SidebarActivation::Attach(session_id) => {
-                        ApplicationTransition::AttachSession(session_id)
-                    }
+                    SidebarActivation::Attach(session_id) => ApplicationTransition::AttachSession(
+                        SessionReference::new(self.state.outlook.clone(), session_id),
+                    ),
                     // The path entry is a local act inside the Sidebar as
                     // well as a switch, so it does both: the client moves, and
                     // the column the reader typed into narrows to what they
                     // just said they meant.
-                    SidebarActivation::Workspace(workspace) => {
-                        self.state.adopt_workspace(workspace.clone());
-                        self.state.sidebar.narrow_to_workspace(workspace);
-                        ApplicationTransition::Continue
+                    SidebarActivation::ResolveWorkspace(request) => {
+                        let request_id = self
+                            .state
+                            .begin_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
+                        ApplicationTransition::ResolveWorkspace {
+                            outlook: self.state.outlook.clone(),
+                            surface: WorkspaceResolutionSurface::Sidebar,
+                            request_id,
+                            request,
+                        }
                     }
                 };
             }
@@ -2521,19 +2928,13 @@ impl Application {
                 self.select_queued_prompt(QueuedPromptStep::Next);
             }
             CommandId::PromoteSelectedPrompt => {
-                return self.apply_to_selected_prompt(|session_id, prompt_id| {
-                    ApplicationTransition::PromotePrompt {
-                        session_id,
-                        prompt_id,
-                    }
+                return self.apply_to_selected_prompt(|session, prompt_id| {
+                    ApplicationTransition::PromotePrompt { session, prompt_id }
                 });
             }
             CommandId::CancelSelectedPrompt => {
-                return self.apply_to_selected_prompt(|session_id, prompt_id| {
-                    ApplicationTransition::CancelPrompt {
-                        session_id,
-                        prompt_id,
-                    }
+                return self.apply_to_selected_prompt(|session, prompt_id| {
+                    ApplicationTransition::CancelPrompt { session, prompt_id }
                 });
             }
             CommandId::RequestInterrupt => self.request_interrupt(),
@@ -2579,15 +2980,15 @@ impl Application {
     /// Leaves the queued Prompt mode, handing the selected Prompt to `act`.
     fn apply_to_selected_prompt(
         &mut self,
-        act: impl FnOnce(SessionId, PromptId) -> ApplicationTransition,
+        act: impl FnOnce(SessionReference, PromptId) -> ApplicationTransition,
     ) -> ApplicationTransition {
-        let (Some(session_id), CommandMode::QueuedPrompts { selected }) =
-            (self.session_id(), self.state.command_mode)
+        let (Some(session), CommandMode::QueuedPrompts { selected }) =
+            (self.session_reference(), self.state.command_mode)
         else {
             return ApplicationTransition::Continue;
         };
         self.state.command_mode = CommandMode::Composer;
-        act(session_id, selected)
+        act(session, selected)
     }
 
     fn confirm_interrupt(&mut self) -> ApplicationTransition {
@@ -2596,12 +2997,12 @@ impl Application {
         // had no opportunity to draw between the two presses.
         self.state.reconcile_command_mode();
         let (
-            Some(session_id),
+            Some(session),
             CommandMode::InterruptConfirmation {
                 turn_id,
                 armed_at: _,
             },
-        ) = (self.session_id(), self.state.command_mode)
+        ) = (self.session_reference(), self.state.command_mode)
         else {
             // This press was routed as a confirmation from the mode visible
             // before expiry was reconciled. It becomes the first press of a
@@ -2613,7 +3014,7 @@ impl Application {
         if let Some(turn_id) = turn_id {
             self.state.keep_interrupted_turn_open(turn_id);
         }
-        ApplicationTransition::InterruptSession { session_id }
+        ApplicationTransition::InterruptSession { session }
     }
 
     fn request_interrupt(&mut self) {
@@ -2639,29 +3040,29 @@ impl Application {
             return ApplicationTransition::Continue;
         }
         let key = self.state.composer_key();
-        if self.state.composers.text(key).trim().is_empty() {
+        if self.state.composers.text(key.clone()).trim().is_empty() {
             self.state.submission_error =
                 Some("Prompt must contain non-whitespace text".to_owned());
             return ApplicationTransition::Continue;
         }
         self.state.sync_composer_completion();
-        if let Some(error) = self.state.composers.skill_issue(key) {
+        if let Some(error) = self.state.composers.skill_issue(key.clone()) {
             self.state.submission_error = Some(error.to_owned());
             self.state.composer_completion.dismiss_active();
             return ApplicationTransition::Continue;
         }
-        let prompt = self.state.composers.begin_submission(key);
+        let prompt = self.state.composers.begin_submission(key.clone());
         self.state.sync_composer_completion();
         self.state.failed_submissions.remove(&prompt.id);
         self.state.submission_error = None;
-        if let ComposerKey::Session(session_id) = key {
+        if let ComposerKey::Session(session) = &key {
             self.state.pending_submission = Some(PendingSubmission {
-                source: key,
-                target: SubmissionTarget::AdmitPrompt(session_id, delivery),
+                source: key.clone(),
+                target: SubmissionTarget::AdmitPrompt(session.clone(), delivery),
                 prompt: prompt.clone(),
             });
             return ApplicationTransition::AdmitPrompt {
-                session_id,
+                session: session.clone(),
                 request: AdmitPromptRequest { prompt, delivery },
             };
         }
@@ -2706,6 +3107,27 @@ impl Application {
                     ))
                 }
             }
+        }
+    }
+
+    fn handle_outlook_catalog(
+        &mut self,
+        outlook: Outlook,
+        event: ManagedEvent,
+    ) -> Result<ApplicationTransition> {
+        if outlook != self.state.outlook {
+            return Ok(ApplicationTransition::Continue);
+        }
+        let had_session = self.state.session.is_some();
+        self.state.apply_outlook_catalog(&outlook, event);
+        self.state.reconcile_command_mode();
+        if had_session && self.state.session.is_none() {
+            Ok(ApplicationTransition::SessionEnded)
+        } else {
+            Ok(self.state.sidebar.take_listing_request().map_or(
+                ApplicationTransition::Continue,
+                ApplicationTransition::ListSessions,
+            ))
         }
     }
 
@@ -2774,6 +3196,10 @@ impl Application {
             return self.begin_landing_agent_selection_confirmation(queued);
         }
         self.state.landing_agent_selection = Some(selection);
+        self.state.outlook_landing_selections.insert(
+            self.state.outlook.clone(),
+            self.state.landing_agent_selection.clone(),
+        );
         ApplicationTransition::Continue
     }
 
@@ -2795,7 +3221,7 @@ impl Application {
     fn take_pending_agent_selection(
         &mut self,
         operation_id: AgentSelectionOperationId,
-    ) -> Option<SessionId> {
+    ) -> Option<SessionReference> {
         let settles = self
             .state
             .pending_agent_selection
@@ -2806,7 +3232,7 @@ impl Application {
                 .pending_agent_selection
                 .take()
                 .expect("matching pending Agent Selection exists")
-                .session_id
+                .session
         })
     }
 
@@ -2815,18 +3241,18 @@ impl Application {
         operation_id: AgentSelectionOperationId,
         selection: AgentSelection,
     ) -> Result<ApplicationTransition> {
-        let Some(session_id) = self.take_pending_agent_selection(operation_id) else {
+        let Some(session) = self.take_pending_agent_selection(operation_id) else {
             return Ok(ApplicationTransition::Continue);
         };
         self.state.submission_error = None;
         if let Some((queued_session, queued)) = self.state.queued_agent_selection.take()
-            && queued_session == session_id
+            && queued_session == session
             && queued != selection
         {
-            self.state.confirmed_agent_selection = Some((session_id, selection));
+            self.state.confirmed_agent_selection = Some((session.clone(), selection));
             return self.begin_agent_selection_update(queued_session, queued);
         }
-        self.state.confirmed_agent_selection = Some((session_id, selection));
+        self.state.confirmed_agent_selection = Some((session, selection));
         Ok(ApplicationTransition::Continue)
     }
 
@@ -2835,11 +3261,11 @@ impl Application {
         operation_id: AgentSelectionOperationId,
         error: String,
     ) -> Result<ApplicationTransition> {
-        let Some(session_id) = self.take_pending_agent_selection(operation_id) else {
+        let Some(session) = self.take_pending_agent_selection(operation_id) else {
             return Ok(ApplicationTransition::Continue);
         };
         if let Some((queued_session, queued)) = self.state.queued_agent_selection.take()
-            && queued_session == session_id
+            && queued_session == session
         {
             // A newer queued selection supersedes this failure.
             return self.begin_agent_selection_update(queued_session, queued);
@@ -2912,6 +3338,21 @@ impl Application {
             SemanticCommandId::ConnectNext => {
                 self.state.connect_overlay.select_next();
                 Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::OutlookSelect => {
+                let Some(outlook) = self.state.connect_overlay.selected_outlook() else {
+                    return Ok(ApplicationTransition::Continue);
+                };
+                self.state.connect_overlay.close();
+                if self.state.outlook == outlook {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                self.state.turn_outlook(outlook.clone());
+                if matches!(outlook, Outlook::Remote(_)) {
+                    self.state
+                        .begin_workspace_resolution(WorkspaceResolutionSurface::Outlook);
+                }
+                Ok(ApplicationTransition::TurnOutlook(outlook))
             }
             SemanticCommandId::ConnectMoveAddressUp => {
                 self.state.connect_overlay.move_address_up();
@@ -3037,16 +3478,14 @@ impl Application {
             // The child Session is the command's subject, so an invocation
             // that names none has nothing to open and leaves the view put.
             SemanticCommandId::SubagentOpen => Ok(match invocation.subject {
-                SemanticSubject::Session(session_id) => {
-                    ApplicationTransition::AttachSession(session_id)
-                }
+                SemanticSubject::Session(session) => ApplicationTransition::AttachSession(session),
                 SemanticSubject::View | SemanticSubject::Turn(_) => ApplicationTransition::Continue,
             }),
             // Stopping a Subagent is interrupting its child Session, on the
             // same subject terms as opening one.
             SemanticCommandId::SubagentStop => Ok(match invocation.subject {
-                SemanticSubject::Session(session_id) => {
-                    ApplicationTransition::InterruptSession { session_id }
+                SemanticSubject::Session(session) => {
+                    ApplicationTransition::InterruptSession { session }
                 }
                 SemanticSubject::View | SemanticSubject::Turn(_) => ApplicationTransition::Continue,
             }),
@@ -3056,8 +3495,12 @@ impl Application {
             SemanticCommandId::SubagentLeave => Ok(self
                 .state
                 .open_subagent_parent()
-                .map_or(ApplicationTransition::Continue, |parent| {
-                    ApplicationTransition::AttachSession(parent)
+                .zip(self.session_reference())
+                .map_or(ApplicationTransition::Continue, |(parent, session)| {
+                    ApplicationTransition::AttachSession(SessionReference::new(
+                        session.origin,
+                        parent,
+                    ))
                 })),
             // The Turn is the command's subject, so an invocation that names
             // none has no Turn to flip and leaves the view where it is.
@@ -3075,18 +3518,11 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 let settled = command == SemanticCommandId::SessionSettle;
                 let named = match invocation.subject {
-                    SemanticSubject::Session(session_id) => Some(session_id),
-                    SemanticSubject::View | SemanticSubject::Turn(_) => self
-                        .state
-                        .session
-                        .as_ref()
-                        .map(SessionProjection::session_id),
+                    SemanticSubject::Session(session) => Some(session),
+                    SemanticSubject::View | SemanticSubject::Turn(_) => self.session_reference(),
                 };
-                Ok(named.map_or(ApplicationTransition::Continue, |session_id| {
-                    ApplicationTransition::SettleSession {
-                        session_id,
-                        settled,
-                    }
+                Ok(named.map_or(ApplicationTransition::Continue, |session| {
+                    ApplicationTransition::SettleSession { session, settled }
                 }))
             }
             command @ (SemanticCommandId::SidebarPrevious
@@ -3098,8 +3534,16 @@ impl Application {
             | SemanticCommandId::SidebarMenuSelect
             | SemanticCommandId::SidebarMenuClose) => self.handle_sidebar_menu_command(command),
             SemanticCommandId::SidebarToggle => {
+                let cancelled = self
+                    .state
+                    .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
                 self.state.sidebar.toggle();
                 self.state.command_mode = CommandMode::Composer;
+                if cancelled {
+                    return Ok(ApplicationTransition::CancelWorkspaceResolution(
+                        WorkspaceResolutionSurface::Sidebar,
+                    ));
+                }
                 Ok(self.state.sidebar.take_listing_request().map_or(
                     ApplicationTransition::Continue,
                     ApplicationTransition::ListSessions,
@@ -3110,13 +3554,18 @@ impl Application {
             // what asking again is for. Naming none means the row the session
             // picker is on, which asks there.
             SemanticCommandId::SessionDelete => {
-                if let SemanticSubject::Session(session_id) = invocation.subject {
-                    self.state.sidebar.begin_deletion(session_id);
-                    return Ok(ApplicationTransition::DeleteSession(session_id));
+                if let SemanticSubject::Session(session) = invocation.subject {
+                    self.state.sidebar.begin_deletion(session.session_id);
+                    return Ok(ApplicationTransition::DeleteSession(session));
                 }
                 Ok(self.state.session_picker.begin_deletion().map_or(
                     ApplicationTransition::Continue,
-                    ApplicationTransition::DeleteSession,
+                    |session_id| {
+                        ApplicationTransition::DeleteSession(SessionReference::new(
+                            self.state.outlook.clone(),
+                            session_id,
+                        ))
+                    },
                 ))
             }
             SemanticCommandId::SessionNew => Ok(self.open_landing()),
@@ -3139,6 +3588,7 @@ impl Application {
         self.state.command_mode = CommandMode::Composer;
         let detached = self.state.session.take().is_some();
         if detached {
+            self.state.session_reference = None;
             self.state.landing_agent_selection = inherited_selection.clone();
             self.state.confirmed_landing_agent_selection = inherited_selection;
             self.state.pending_landing_agent_selection = None;
@@ -3332,7 +3782,7 @@ impl Application {
         &mut self,
         selection: AgentSelection,
     ) -> Result<ApplicationTransition> {
-        let Some(session_id) = self.session_id() else {
+        let Some(session) = self.session_reference() else {
             self.state.landing_agent_selection = Some(selection.clone());
             if self.state.pending_landing_agent_selection.is_some() {
                 self.state.queued_landing_agent_selection = Some(selection);
@@ -3344,10 +3794,10 @@ impl Application {
         if self.state.pending_agent_selection.is_some() {
             // Transport stays serialized: coalesce to the newest complete
             // Agent Selection instead of sending every intermediate state.
-            self.state.queued_agent_selection = Some((session_id, selection));
+            self.state.queued_agent_selection = Some((session, selection));
             return Ok(ApplicationTransition::Continue);
         }
-        self.begin_agent_selection_update(session_id, selection)
+        self.begin_agent_selection_update(session, selection)
     }
 
     fn begin_landing_agent_selection_confirmation(
@@ -3360,17 +3810,17 @@ impl Application {
 
     fn begin_agent_selection_update(
         &mut self,
-        session_id: SessionId,
+        session: SessionReference,
         selection: AgentSelection,
     ) -> Result<ApplicationTransition> {
         let operation_id = AgentSelectionOperationId::new();
         self.state.pending_agent_selection = Some(PendingAgentSelection {
-            session_id,
+            session: session.clone(),
             operation_id,
             selection: selection.clone(),
         });
         Ok(ApplicationTransition::UpdateAgentSelection {
-            session_id,
+            session,
             request: UpdateAgentSelectionRequest {
                 operation_id,
                 selection,
@@ -3584,6 +4034,14 @@ impl Application {
             .session
             .as_ref()
             .map(SessionProjection::session_id)
+    }
+
+    pub(super) fn session_reference(&self) -> Option<SessionReference> {
+        self.state.session_reference.clone()
+    }
+
+    pub(super) fn outlook(&self) -> &Outlook {
+        &self.state.outlook
     }
 
     pub(super) fn skill_catalog_request(&self) -> Option<SkillCatalogRequest> {
