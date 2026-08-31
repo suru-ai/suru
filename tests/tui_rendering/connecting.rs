@@ -1,13 +1,17 @@
 //! The connecting user's `/connect` command and Pairing surfaces.
 
-use crate::support::{navigable_session_snapshot, rendered_application_rows, type_terminal_text};
+use crate::support::{
+    fixture_instance_id, model_descriptor, navigable_session_snapshot, ready_health,
+    rendered_application_rows, rendered_application_rows_at, type_terminal_text,
+};
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        InvitePreview, ModelAvailability, Outlook, RedeemInviteRequest, Remote, RemoteHealth,
-        RemoteStatus, Session, SessionCreated, SessionId, SessionListItem, SessionReference,
-        SessionStatus, SessionSummary, SessionTimestamp, Workspace,
+        AgentSelection, InvitePreview, ModelAvailability, ModelCatalog, ModelId, Outlook,
+        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, RedeemInviteRequest, Remote,
+        RemoteHealth, RemoteStatus, Session, SessionCreated, SessionId, SessionListItem,
+        SessionReference, SessionStatus, SessionSummary, SessionTimestamp, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -217,6 +221,74 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
         request.scope(),
         &suru::tui::SessionListScope::CurrentWorkspace(local_workspace)
     );
+}
+
+#[test]
+fn returning_to_an_outlook_restores_its_stable_selection_presentation() {
+    let selection = AgentSelection {
+        provider: ProviderId::new("generic-provider"),
+        model: ModelId::new("native-model-id"),
+        options: Vec::new(),
+    };
+    let mut application = Application::default();
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(fixture_instance_id(), 42_424)
+                .with_landing_agent_selection(Some(selection)),
+        )))
+        .expect("restore the local Landing selection");
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelList,
+        )))
+        .expect("open the local Model picker")
+    else {
+        panic!("opening the Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("generic-provider"),
+                    display_name: "Generic Provider".to_owned(),
+                    models: vec![model_descriptor(
+                        "generic-provider",
+                        "native-model-id",
+                        "Friendly Model",
+                        true,
+                        ModelAvailability::Available,
+                    )],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("load the local Model catalog");
+    press(&mut application, KeyCode::Esc);
+
+    turn_to_studio(&mut application);
+    open_connect(&mut application);
+    application
+        .handle_event(ApplicationEvent::RemotesListed(vec![studio_remote()]))
+        .unwrap();
+    application
+        .handle_event(ApplicationEvent::RemoteProbed {
+            name: "studio".to_owned(),
+            result: Ok(RemoteHealth {
+                protocol_version: Some(28),
+                status: RemoteStatus::Available,
+            }),
+        })
+        .unwrap();
+    press(&mut application, KeyCode::Up);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::TurnOutlook(Outlook::Local)
+    );
+
+    let local_again = rendered_application_rows_at(&application, 100, 16).join("\n");
+    assert!(local_again.contains("generic-provider · native-model-id"));
+    assert!(!local_again.contains("Friendly Model"));
 }
 
 #[test]

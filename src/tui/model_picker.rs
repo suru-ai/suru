@@ -59,6 +59,19 @@ struct ProviderModels {
     status: ProviderCatalogStatus,
 }
 
+/// The presentation metadata known when an Outlook's current Agent Selection
+/// becomes the one in force. Catalog discovery is deliberately not allowed to
+/// rewrite it: opening a catalog-consuming surface must not make an unchanged
+/// Agent look as though it renamed itself. An actual selection change captures
+/// the best metadata then available.
+#[derive(Clone, Debug)]
+struct SelectionPresentation {
+    outlook: Outlook,
+    selection: AgentSelection,
+    provider_display_name: String,
+    model: Option<ModelDescriptor>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct ModelPicker {
     outlook: Outlook,
@@ -76,6 +89,9 @@ pub(super) struct ModelPicker {
     query: String,
     cached_providers: Vec<ProviderModels>,
     providers: Vec<ProviderModels>,
+    /// One current presentation per Outlook, retained while another Outlook is
+    /// visible so returning to it restores the label it previously showed.
+    selection_presentations: Vec<SelectionPresentation>,
     selected: Option<PickerSelection>,
     cursor_moved: bool,
 }
@@ -385,18 +401,15 @@ impl ModelPicker {
     }
 
     pub(super) fn selection_summary(&self, selection: &AgentSelection, detailed: bool) -> String {
-        let Some(model) = self
-            .providers
-            .iter()
-            .flat_map(|provider| &provider.models)
-            .find(|model| model.provider == selection.provider && model.id == selection.model)
-        else {
+        let presentation = self.selection_presentations.iter().find(|presentation| {
+            presentation.outlook == self.outlook && presentation.selection == *selection
+        });
+        let Some(model) = presentation.and_then(|presentation| presentation.model.as_ref()) else {
+            let provider = presentation.map_or(selection.provider.as_str(), |presentation| {
+                presentation.provider_display_name.as_str()
+            });
             return if detailed {
-                format!(
-                    "{} · {}",
-                    self.provider_display_name(&selection.provider),
-                    selection.model
-                )
+                format!("{provider} · {}", selection.model)
             } else {
                 selection.model.to_string()
             };
@@ -405,7 +418,10 @@ impl ModelPicker {
             return model.display_name.clone();
         }
         let mut parts = vec![
-            self.provider_display_name(&selection.provider).to_owned(),
+            presentation
+                .expect("a remembered Model has remembered Provider presentation")
+                .provider_display_name
+                .clone(),
             model.display_name.clone(),
         ];
         for role in [
@@ -438,6 +454,51 @@ impl ModelPicker {
             parts.push(value);
         }
         parts.join(" · ")
+    }
+
+    /// Freezes the best presentation currently available beside the durable
+    /// selection. A missing catalog has an explicit ID fallback; later catalog
+    /// loads can serve pickers and new selections without mutating an unchanged
+    /// one. A real selection change replaces the Outlook's presentation.
+    pub(super) fn remember_selection(&mut self, selection: Option<&AgentSelection>) {
+        let Some(selection) = selection else {
+            return;
+        };
+        let existing = self
+            .selection_presentations
+            .iter()
+            .position(|presentation| presentation.outlook == self.outlook);
+        if existing.is_some_and(|index| self.selection_presentations[index].selection == *selection)
+        {
+            return;
+        }
+        let provider = self
+            .providers
+            .iter()
+            .chain(self.cached_providers.iter())
+            .find(|provider| provider.provider == selection.provider);
+        let provider_display_name = provider.map_or_else(
+            || selection.provider.to_string(),
+            |provider| provider.display_name.clone(),
+        );
+        let model = provider.and_then(|provider| {
+            provider
+                .models
+                .iter()
+                .find(|model| model.id == selection.model)
+                .cloned()
+        });
+        let presentation = SelectionPresentation {
+            outlook: self.outlook.clone(),
+            selection: selection.clone(),
+            provider_display_name,
+            model,
+        };
+        if let Some(index) = existing {
+            self.selection_presentations[index] = presentation;
+        } else {
+            self.selection_presentations.push(presentation);
+        }
     }
 
     fn merge(&mut self, incoming: Vec<ProviderModels>) {

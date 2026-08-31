@@ -17,6 +17,63 @@ use suru::{
 };
 
 #[test]
+fn restored_selection_label_stays_stable_when_its_catalog_arrives() {
+    let workspace = workspace_dir();
+    let selection = AgentSelection {
+        provider: ProviderId::new("fixture-provider"),
+        model: ModelId::new("model-native-id"),
+        options: Vec::new(),
+    };
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            selected_session_snapshot(SessionId::new(), workspace.path(), selection),
+        ))
+        .expect("restore the selected Session before listing Models");
+
+    let before = rendered_application_rows_at(&application, 100, 16).join("\n");
+    assert!(before.contains("fixture-provider · model-native-id"));
+
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("opening the Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("fixture-provider"),
+                    display_name: "Fixture Provider".to_owned(),
+                    models: vec![model_descriptor(
+                        "fixture-provider",
+                        "model-native-id",
+                        "Friendly Model Name",
+                        true,
+                        ModelAvailability::Available,
+                    )],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("load matching Model catalog");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("close Model picker without changing the selection");
+
+    let after = rendered_application_rows_at(&application, 100, 16).join("\n");
+    assert!(after.contains("fixture-provider · model-native-id"));
+    assert!(!after.contains("Friendly Model Name"));
+}
+
+#[test]
 fn model_picker_hands_off_to_ordered_options_and_applies_complete_landing_selection() {
     let mut application = Application::default();
     let ApplicationTransition::ListModels(request) = application

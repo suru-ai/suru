@@ -1161,6 +1161,15 @@ impl TuiState {
             .or(projection.snapshot().session.agent_selection.as_ref())
     }
 
+    /// Captures presentation before and after every Application event. The
+    /// first capture freezes an ID fallback before a catalog response can
+    /// populate the picker; the second adopts friendly metadata only when the
+    /// event genuinely changed the Agent Selection.
+    fn remember_agent_selection_presentation(&mut self) {
+        let selection = self.agent_selection().cloned();
+        self.model_picker.remember_selection(selection.as_ref());
+    }
+
     fn selection_update_pending(&self) -> bool {
         self.pending_agent_selection.is_some() || self.queued_agent_selection.is_some()
     }
@@ -2031,6 +2040,13 @@ impl Application {
     }
 
     pub fn handle_event(&mut self, event: ApplicationEvent) -> Result<ApplicationTransition> {
+        self.state.remember_agent_selection_presentation();
+        let transition = self.handle_event_inner(event)?;
+        self.state.remember_agent_selection_presentation();
+        Ok(transition)
+    }
+
+    fn handle_event_inner(&mut self, event: ApplicationEvent) -> Result<ApplicationTransition> {
         match event {
             ApplicationEvent::Command(command) => self.handle_command(command),
             ApplicationEvent::SpinnerTick => {

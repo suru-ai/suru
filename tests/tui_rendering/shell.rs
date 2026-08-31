@@ -4,7 +4,7 @@ use crate::{
     failing_provider_support::spawn_with_failing_provider,
     support::{
         connected_application, enter_session, failed_session_snapshot, fixture_instance_id,
-        navigable_session_snapshot, ready_health, rendered_application_buffer,
+        model_descriptor, navigable_session_snapshot, ready_health, rendered_application_buffer,
         rendered_application_rows, rendered_application_rows_at, rendered_row, rendered_rows,
         text_position, type_terminal_text, workspace_dir,
     },
@@ -16,9 +16,10 @@ use suru::{
         ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus, SessionEvent,
     },
     protocol::{
-        Activity, AgentSelection, CreateSessionRequest, InitialPrompt, ModelId, PromptId,
-        ProviderId, ServerShutdown, SessionId, SessionStatus, SessionTimestamp, ShutdownReason,
-        TurnStatus, Workspace,
+        Activity, AgentSelection, CreateSessionRequest, InitialPrompt, ModelAvailability,
+        ModelCatalog, ModelId, PromptId, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
+        ServerShutdown, SessionId, SessionStatus, SessionTimestamp, ShutdownReason, TurnStatus,
+        Workspace,
     },
     server::ServerConfig,
     tui::{
@@ -122,6 +123,45 @@ fn connected_application_uses_the_persisted_landing_agent_selection() {
                 .with_landing_agent_selection(Some(selected.clone())),
         )))
         .expect("connect with persisted landing Agent Selection");
+
+    let before_catalog = rendered_application_rows_at(&application, 100, 16).join("\n");
+    assert!(before_catalog.contains("codex · gpt-remembered"));
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open the Model picker")
+    else {
+        panic!("the Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    display_name: "Codex".to_owned(),
+                    models: vec![model_descriptor(
+                        "codex",
+                        "gpt-remembered",
+                        "Remembered GPT",
+                        true,
+                        ModelAvailability::Available,
+                    )],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("load matching Model catalog");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("close the Model picker without changing the selection");
+    let after_catalog = rendered_application_rows_at(&application, 100, 16).join("\n");
+    assert!(after_catalog.contains("codex · gpt-remembered"));
+    assert!(!after_catalog.contains("Remembered GPT"));
 
     type_terminal_text(&mut application, "Use the remembered Agent");
     let ApplicationTransition::CreateSession(request) = application
