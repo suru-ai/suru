@@ -8,6 +8,7 @@ use ratatui::{
     backend::TestBackend,
     buffer::{Buffer, Cell},
     layout::Position,
+    style::Color,
 };
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
@@ -113,6 +114,31 @@ pub fn rendered_application_cursor_at(
     terminal
         .get_cursor_position()
         .expect("read rendered cursor position")
+}
+
+/// The text this frame draws on `background`, within `columns` of each row. A
+/// surface draws the row the reader is on highlighted while it holds the keys
+/// and dimly once they have gone elsewhere, so the two backgrounds tell where
+/// the selection is from where the keys are, and each is read by naming one.
+pub fn text_on(
+    application: &Application,
+    background: Color,
+    (width, height): (u16, u16),
+    columns: std::ops::Range<u16>,
+) -> String {
+    let buffer = rendered_application_buffer(application, width, height);
+    (0..height)
+        .map(|row| {
+            columns
+                .clone()
+                .filter_map(|column| buffer.cell((column, row)))
+                .filter(|cell| cell.bg == background)
+                .map(Cell::symbol)
+                .collect::<String>()
+        })
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn buffer_rows(buffer: &Buffer) -> Vec<String> {

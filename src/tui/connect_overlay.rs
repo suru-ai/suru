@@ -78,6 +78,43 @@ struct ConnectDraft {
     error: Option<String>,
 }
 
+/// The name field and the address rows are one column the arrows walk, so a
+/// reader who never reaches for Tab still arrives at the addresses, and leaves
+/// them by walking off either end. An Invite carrying no address to order
+/// leaves the keys in the name field, where the only thing left to say is the
+/// Remote's name.
+impl ConnectDraft {
+    fn select_previous(&mut self) {
+        let Some(last) = self.addresses.len().checked_sub(1) else {
+            return;
+        };
+        match self.focus {
+            ConnectFocus::Name => {
+                self.focus = ConnectFocus::Addresses;
+                self.selected = last;
+            }
+            ConnectFocus::Addresses if self.selected == 0 => self.focus = ConnectFocus::Name,
+            ConnectFocus::Addresses => self.selected -= 1,
+        }
+    }
+
+    fn select_next(&mut self) {
+        if self.addresses.is_empty() {
+            return;
+        }
+        match self.focus {
+            ConnectFocus::Name => {
+                self.focus = ConnectFocus::Addresses;
+                self.selected = 0;
+            }
+            ConnectFocus::Addresses if self.selected + 1 >= self.addresses.len() => {
+                self.focus = ConnectFocus::Name;
+            }
+            ConnectFocus::Addresses => self.selected += 1,
+        }
+    }
+}
+
 pub(super) struct ConnectDetails<'a> {
     pub(super) name: &'a str,
     pub(super) addresses: &'a [std::net::SocketAddr],
@@ -262,14 +299,7 @@ impl ConnectOverlay {
 
     pub(super) fn select_previous(&mut self) {
         match &mut self.state {
-            ConnectOverlayState::Details(draft)
-                if draft.focus == ConnectFocus::Addresses && !draft.addresses.is_empty() =>
-            {
-                draft.selected = draft
-                    .selected
-                    .checked_sub(1)
-                    .unwrap_or(draft.addresses.len() - 1);
-            }
+            ConnectOverlayState::Details(draft) => draft.select_previous(),
             ConnectOverlayState::RemotePicker { selected } => {
                 *selected = selected.checked_sub(1).unwrap_or(self.known_remotes.len());
             }
@@ -279,11 +309,7 @@ impl ConnectOverlay {
 
     pub(super) fn select_next(&mut self) {
         match &mut self.state {
-            ConnectOverlayState::Details(draft)
-                if draft.focus == ConnectFocus::Addresses && !draft.addresses.is_empty() =>
-            {
-                draft.selected = (draft.selected + 1) % draft.addresses.len();
-            }
+            ConnectOverlayState::Details(draft) => draft.select_next(),
             ConnectOverlayState::RemotePicker { selected } => {
                 *selected = (*selected + 1) % (self.known_remotes.len() + 1);
             }
@@ -291,9 +317,12 @@ impl ConnectOverlay {
         }
     }
 
+    /// Reordering acts on the marked address from either field. The cursor is
+    /// drawn whether or not the addresses hold the keys, so a reader who reads
+    /// the priority off the screen and reaches straight for Shift+↑↓ moves the
+    /// row they are looking at rather than pressing a dead key.
     pub(super) fn move_address_up(&mut self) {
         if let ConnectOverlayState::Details(draft) = &mut self.state
-            && draft.focus == ConnectFocus::Addresses
             && draft.selected > 0
         {
             draft.addresses.swap(draft.selected, draft.selected - 1);
@@ -303,7 +332,6 @@ impl ConnectOverlay {
 
     pub(super) fn move_address_down(&mut self) {
         if let ConnectOverlayState::Details(draft) = &mut self.state
-            && draft.focus == ConnectFocus::Addresses
             && draft.selected + 1 < draft.addresses.len()
         {
             draft.addresses.swap(draft.selected, draft.selected + 1);

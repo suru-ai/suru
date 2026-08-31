@@ -11,13 +11,13 @@ use crate::support::{
     ADD_WORKSPACE, SELECTOR_ROW, SIDEBAR_PRESS_HEIGHT as PRESS_HEIGHT, SIDEBAR_WIDE as WIDE,
     add_workspace, connected_application, deliver_settings, drawn_in_sidebar, enter_session,
     failed_session_snapshot, noncanonical_spelling, press_add_workspace,
-    rendered_application_buffer, rendered_application_rows_at, rendered_row, selector_label,
-    sidebar_column, type_terminal_text, workspace_dir,
+    rendered_application_rows_at, rendered_row, selector_label, sidebar_column, text_on,
+    type_terminal_text, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::{buffer::Cell, style::Color};
+use ratatui::style::Color;
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
@@ -1287,23 +1287,10 @@ fn press_sidebar_key(application: &mut Application, code: KeyCode) -> Applicatio
         .expect("press a Sidebar key")
 }
 
-/// The Sidebar text this frame draws on `background`. The row the reader is on
-/// is drawn highlighted while they are driving the Sidebar, and dimly once the
-/// keys have gone back to the composer, so the two backgrounds tell where the
-/// selection is from where the keys are.
+/// The Sidebar text this frame draws on `background`, read across the columns
+/// the Sidebar occupies so the main view beside it contributes nothing.
 fn sidebar_text_on(application: &Application, background: Color) -> String {
-    let buffer = rendered_application_buffer(application, WIDE, 20);
-    (0..20)
-        .map(|row| {
-            (0..31)
-                .filter_map(|column| buffer.cell((column, row)))
-                .filter(|cell| cell.bg == background)
-                .map(Cell::symbol)
-                .collect::<String>()
-        })
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+    text_on(application, background, (WIDE, 20), 0..31)
 }
 
 /// The Sidebar row the reader is on while they are driving the Sidebar.

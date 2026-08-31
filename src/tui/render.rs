@@ -264,13 +264,15 @@ fn render_connect_overlay(
             .iter()
             .enumerate()
             .map(|(index, address)| {
+                let selected = index == details.selected;
                 Line::styled(
-                    format!("{}. {address}", index + 1),
-                    if !details.name_focused && index == details.selected {
-                        theme.selection.focused
-                    } else {
-                        theme.text.primary
-                    },
+                    format!(
+                        "{}{}. {address}",
+                        if selected { "› " } else { "  " },
+                        index + 1
+                    ),
+                    selection_style(selected, !details.name_focused, theme)
+                        .unwrap_or(theme.text.primary),
                 )
             })
             .collect::<Vec<_>>();
@@ -283,7 +285,7 @@ fn render_connect_overlay(
             lines.push(Line::styled(error.to_owned(), theme.feedback.error));
         }
         lines.push(Line::styled(
-            "Tab field · ↑↓ choose · Shift+↑↓ reorder · Enter pair · Esc cancel",
+            "↑↓ move · Shift+↑↓ reorder · Tab field · Enter pair · Esc cancel",
             theme.text.subdued,
         ));
         render_overlay_box(frame, area, lines, " Connect ", theme);
@@ -1939,13 +1941,13 @@ fn sidebar_selector_line(
         sidebar_plain_span(
             &format!("{affordance}{}", selector.label),
             width.saturating_sub(ADD_WORKSPACE.width()),
-            sidebar_selection_style(selector.selected, focused, theme),
+            selection_style(selector.selected, focused, theme),
             theme.text.subdued,
         ),
         sidebar_plain_span(
             ADD_WORKSPACE,
             ADD_WORKSPACE.width(),
-            sidebar_selection_style(selector.adding, focused, theme),
+            selection_style(selector.adding, focused, theme),
             theme.text.subdued,
         ),
     ])
@@ -2015,7 +2017,7 @@ fn sidebar_scope_line(
     sidebar_plain_line(
         &format!("  {}", scope.label),
         width,
-        sidebar_selection_style(scope.selected, focused, theme),
+        selection_style(scope.selected, focused, theme),
         if scope.chosen {
             theme.accent.primary
         } else {
@@ -2047,7 +2049,7 @@ fn sidebar_show_more_line(
     sidebar_plain_line(
         &format!("Show {} more", more.count),
         width,
-        sidebar_selection_style(more.selected, focused, theme),
+        selection_style(more.selected, focused, theme),
         theme.text.subdued,
     )
 }
@@ -2092,7 +2094,7 @@ fn sidebar_active_row_lines(
     focused: bool,
     theme: &Theme,
 ) -> [Line<'static>; sidebar::ACTIVE_ROW_LINES] {
-    let selected = sidebar_selection_style(row.selected, focused, theme);
+    let selected = selection_style(row.selected, focused, theme);
     let workspace = workspace.map(sidebar::workspace_name).unwrap_or_default();
     let label_style = selected.unwrap_or(theme.text.subdued);
     [
@@ -2117,7 +2119,7 @@ fn sidebar_settled_row_line(
     focused: bool,
     theme: &Theme,
 ) -> Line<'static> {
-    let selected = sidebar_selection_style(row.selected, focused, theme);
+    let selected = selection_style(row.selected, focused, theme);
     sidebar_slotted_line(
         &sidebar_title(row),
         sidebar_title_style(row, selected, theme),
@@ -2189,8 +2191,9 @@ fn sidebar_slotted_line(
 /// How the row the reader is on is drawn, and `None` for every other row. A
 /// selected row is drawn whole, so it reads as one block rather than as lines
 /// that happen to be lit. It keeps its highlight when the keys are elsewhere,
-/// dimmed, because it is still the row Enter would act on once they come back.
-fn sidebar_selection_style(selected: bool, focused: bool, theme: &Theme) -> Option<Style> {
+/// dimmed, because it is still the row the reader would act on once they come
+/// back — which is what tells a list apart from one the arrows cannot reach.
+fn selection_style(selected: bool, focused: bool, theme: &Theme) -> Option<Style> {
     selected.then_some(if focused {
         theme.selection.focused
     } else {

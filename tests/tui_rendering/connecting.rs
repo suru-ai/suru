@@ -2,9 +2,10 @@
 
 use crate::support::{
     fixture_instance_id, model_descriptor, navigable_session_snapshot, ready_health,
-    rendered_application_rows, rendered_application_rows_at, type_terminal_text,
+    rendered_application_rows, rendered_application_rows_at, text_on, type_terminal_text,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::Color;
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
@@ -1064,4 +1065,144 @@ fn connect_is_semantic_and_an_empty_remote_listing_opens_invite_entry() {
     let entry = rendered_application_rows(&application).join("\n");
     assert!(entry.contains("Paste Invite"));
     assert!(entry.contains("Enter inspect"));
+}
+
+#[test]
+fn the_address_cursor_is_drawn_before_the_keys_reach_the_address_list() {
+    let application = configure_remote_draft();
+
+    let draft = rendered_application_rows(&application).join("\n");
+    assert!(
+        draft.contains("› 1. 10.0.0.8:7777"),
+        "the row Shift+↑↓ would reorder is marked while the name field has the keys"
+    );
+    assert!(draft.contains("  2. 192.168.1.24:7777"));
+    assert_eq!(
+        connect_text_on(&application, Color::DarkGray).trim(),
+        "› 1. 10.0.0.8:7777",
+        "the address cursor is dimmed while the keys are in the name field"
+    );
+    assert_eq!(
+        connect_text_on(&application, Color::Blue).trim(),
+        "> studio",
+        "the name field is lit because it is where the keys are"
+    );
+}
+
+#[test]
+fn arrows_carry_the_keys_from_the_name_field_into_the_address_list() {
+    let mut application = configure_remote_draft();
+
+    press(&mut application, KeyCode::Down);
+    assert_eq!(
+        connect_text_on(&application, Color::Blue).trim(),
+        "› 1. 10.0.0.8:7777",
+        "one Down press lights the address the cursor was already marking"
+    );
+
+    press_with(&mut application, KeyCode::Down, KeyModifiers::SHIFT);
+    let reordered = rendered_application_rows(&application).join("\n");
+    assert!(reordered.contains("  1. 192.168.1.24:7777"));
+    assert!(reordered.contains("› 2. 10.0.0.8:7777"));
+}
+
+#[test]
+fn arrows_wrap_between_the_address_list_and_the_name_field() {
+    let mut application = configure_remote_draft();
+
+    press(&mut application, KeyCode::Up);
+    assert_eq!(
+        connect_text_on(&application, Color::Blue).trim(),
+        "› 2. 192.168.1.24:7777",
+        "Up from the name field enters the address list at its last row"
+    );
+
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Char('!'));
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("> studio!"),
+        "Down past the last address hands the keys back to the name field"
+    );
+
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Up);
+    press(&mut application, KeyCode::Char('?'));
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("> studio!?"),
+        "Up from the first address hands the keys back to the name field"
+    );
+}
+
+#[test]
+fn the_priority_order_is_reorderable_before_the_keys_reach_the_address_list() {
+    let mut application = configure_remote_draft();
+
+    press_with(&mut application, KeyCode::Down, KeyModifiers::SHIFT);
+    let reordered = rendered_application_rows(&application).join("\n");
+    assert!(reordered.contains("  1. 192.168.1.24:7777"));
+    assert!(
+        reordered.contains("› 2. 10.0.0.8:7777"),
+        "Shift+↓ moves the marked address without the reader entering the list first"
+    );
+    assert_eq!(
+        connect_text_on(&application, Color::Blue).trim(),
+        "> studio",
+        "reordering leaves the keys in the name field, so the name stays typeable"
+    );
+
+    press(&mut application, KeyCode::Char('!'));
+    press_with(&mut application, KeyCode::Up, KeyModifiers::SHIFT);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::RedeemInvite(RedeemInviteRequest {
+            invite: "suru-v1-example".to_owned(),
+            name: Some("studio!".to_owned()),
+            addresses: vec![
+                "10.0.0.8:7777".parse().unwrap(),
+                "192.168.1.24:7777".parse().unwrap()
+            ],
+        })
+    );
+}
+
+#[test]
+fn the_configure_remote_screen_teaches_the_keys_it_answers() {
+    let hint = rendered_application_rows(&configure_remote_draft()).join("\n");
+
+    assert!(hint.contains("↑↓ move · Shift+↑↓ reorder · Tab field · Enter pair · Esc cancel"));
+}
+
+/// A Connect draft holding the Invite's two addresses, with the keys where the
+/// overlay leaves them: in the Remote name field.
+fn configure_remote_draft() -> Application {
+    let mut application = invite_entry();
+    application
+        .handle_terminal_event(InputEvent::Paste("suru-v1-example".to_owned()))
+        .unwrap();
+    press(&mut application, KeyCode::Enter);
+    application
+        .handle_event(ApplicationEvent::InvitePreviewed {
+            invite: "suru-v1-example".to_owned(),
+            preview: InvitePreview {
+                hostname: "studio".to_owned(),
+                fingerprint: "fingerprint".to_owned(),
+                addresses: vec![
+                    "10.0.0.8:7777".parse().unwrap(),
+                    "192.168.1.24:7777".parse().unwrap(),
+                ],
+            },
+        })
+        .unwrap();
+    press(&mut application, KeyCode::Enter);
+    application
+}
+
+/// The Connect overlay text this frame draws on `background`, read across the
+/// whole terminal because the overlay is centred in it.
+fn connect_text_on(application: &Application, background: Color) -> String {
+    text_on(application, background, (80, 24), 0..80)
 }

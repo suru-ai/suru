@@ -188,25 +188,28 @@ pub(super) fn command_for_connect_overlay_event(
         (ConnectInputMode::Picker, KeyCode::Enter, KeyModifiers::NONE) => {
             Some(CommandId::InvokeSemantic(SemanticCommandId::OutlookSelect))
         }
+        // The name field takes the arrows too, because on the Configure Remote
+        // screen it is where the keys start: a reader who reaches for Down to
+        // get at the addresses would otherwise press a dead key.
         (
-            ConnectInputMode::Picker | ConnectInputMode::Addresses,
+            ConnectInputMode::Picker | ConnectInputMode::Name | ConnectInputMode::Addresses,
             KeyCode::Up,
             KeyModifiers::NONE,
         )
         | (
-            ConnectInputMode::Picker | ConnectInputMode::Addresses,
+            ConnectInputMode::Picker | ConnectInputMode::Name | ConnectInputMode::Addresses,
             KeyCode::Char('p'),
             KeyModifiers::CONTROL,
         ) => Some(CommandId::InvokeSemantic(
             SemanticCommandId::ConnectPrevious,
         )),
         (
-            ConnectInputMode::Picker | ConnectInputMode::Addresses,
+            ConnectInputMode::Picker | ConnectInputMode::Name | ConnectInputMode::Addresses,
             KeyCode::Down,
             KeyModifiers::NONE,
         )
         | (
-            ConnectInputMode::Picker | ConnectInputMode::Addresses,
+            ConnectInputMode::Picker | ConnectInputMode::Name | ConnectInputMode::Addresses,
             KeyCode::Char('n'),
             KeyModifiers::CONTROL,
         ) => Some(CommandId::InvokeSemantic(SemanticCommandId::ConnectNext)),
@@ -217,12 +220,23 @@ pub(super) fn command_for_connect_overlay_event(
         ) => Some(CommandId::InvokeSemantic(
             SemanticCommandId::ConnectFocusNext,
         )),
-        (ConnectInputMode::Addresses, KeyCode::Up, KeyModifiers::SHIFT) => Some(
-            CommandId::InvokeSemantic(SemanticCommandId::ConnectMoveAddressUp),
-        ),
-        (ConnectInputMode::Addresses, KeyCode::Down, KeyModifiers::SHIFT) => Some(
-            CommandId::InvokeSemantic(SemanticCommandId::ConnectMoveAddressDown),
-        ),
+        // Reordering reaches the marked address from the name field too: the
+        // reader who opened the screen to fix the priority order should not
+        // have to arrive at the list before the keys that reorder it answer.
+        (
+            ConnectInputMode::Name | ConnectInputMode::Addresses,
+            KeyCode::Up,
+            KeyModifiers::SHIFT,
+        ) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::ConnectMoveAddressUp,
+        )),
+        (
+            ConnectInputMode::Name | ConnectInputMode::Addresses,
+            KeyCode::Down,
+            KeyModifiers::SHIFT,
+        ) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::ConnectMoveAddressDown,
+        )),
         (
             ConnectInputMode::Invite
             | ConnectInputMode::Confirm
