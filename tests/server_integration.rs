@@ -490,6 +490,12 @@ async fn serving_starts_and_stops_a_second_mtls_listener_without_disturbing_loca
         .await
         .expect("ask the operating system for the Serving port");
     local_client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep this lifecycle walk on the loopback address it dials");
+    local_client
         .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
         .await
         .expect("turn Serving on");
@@ -586,6 +592,62 @@ async fn serving_starts_and_stops_a_second_mtls_listener_without_disturbing_loca
     assert_logs_omit_invite_material(&config.state_dir().join("log"), &invite.invite);
 }
 
+/// An Invite advertises the machine's concrete IPv4 and IPv6 addresses, so
+/// the default bind must answer dialers of both families — including on
+/// Windows, which binds `::` v6-only unless Serving asks otherwise.
+#[tokio::test]
+async fn the_default_serving_bind_accepts_dialers_of_both_address_families() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let config = ServerConfig::new(state_dir.path(), "serving-dual-stack-test")
+        .expect("configure server")
+        .with_config_dir(config_dir.path());
+    let server = server::spawn_with_timings(
+        config,
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "serving-dual-stack-test")
+            .expect("configure local client"),
+    )
+    .await
+    .expect("attach local client");
+    receive_initial_state(&mut client).await;
+    client
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
+        .await
+        .expect("ask the operating system for a Serving port");
+    client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .expect("turn Serving on with the default bind address");
+
+    let address = server.serving_address().expect("Serving listener is ready");
+    assert_eq!(
+        address.ip(),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        "an unpinned bind address listens on every interface of both stacks"
+    );
+    for loopback in [
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ] {
+        tokio::net::TcpStream::connect((loopback, address.port()))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the default Serving bind refused a {loopback} dialer: {error}")
+            });
+    }
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
 #[tokio::test]
 async fn a_serving_server_issues_a_one_line_invite_with_its_chosen_addresses() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -613,6 +675,12 @@ async fn a_serving_server_issues_a_one_line_invite_with_its_chosen_addresses() {
         .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
         .await
         .expect("ask the operating system for a Serving port");
+    client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep this test on the loopback address it dials");
     client
         .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
         .await
@@ -661,6 +729,12 @@ async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
         .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
         .await
         .expect("ask the operating system for a Serving port");
+    serving_client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep this test on the loopback address it dials");
     serving_client
         .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
         .await
@@ -952,6 +1026,12 @@ async fn paired_servers(name: &str) -> PairedServers {
         .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
         .await
         .expect("ask the operating system for a Serving port");
+    serving_client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep this test on the loopback address it dials");
     serving_client
         .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
         .await
@@ -1621,6 +1701,12 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
         .await
         .expect("pin the Serving port");
     serving_client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep this test on the loopback address it dials");
+    serving_client
         .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
         .await
         .expect("turn Serving on");
@@ -1762,6 +1848,12 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
         .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
         .await
         .unwrap();
+    serving_client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep this test on the loopback address it dials");
     serving_client
         .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
         .await
@@ -1965,6 +2057,12 @@ async fn serving_persistence_failure_does_not_leave_an_authorized_peer() {
         .await
         .unwrap();
     serving_client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep this test on the loopback address it dials");
+    serving_client
         .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
         .await
         .unwrap();
@@ -2049,6 +2147,12 @@ async fn removing_a_peer_closes_the_connection_that_enrolled_it() {
         .await
         .unwrap();
     serving_client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep this test on the loopback address it dials");
+    serving_client
         .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
         .await
         .unwrap();
@@ -2118,6 +2222,12 @@ async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing(
         })
         .await
         .unwrap();
+    serving_client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep this test on the loopback address it dials");
     serving_client
         .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
         .await
@@ -2299,6 +2409,12 @@ async fn an_invite_address_presenting_the_wrong_server_key_fails_closed() {
         .await
         .unwrap();
     inviter_client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep this test on the loopback address it dials");
+    inviter_client
         .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
         .await
         .unwrap();
@@ -2326,6 +2442,12 @@ async fn an_invite_address_presenting_the_wrong_server_key_fails_closed() {
         .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
         .await
         .unwrap();
+    impostor_client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep this test on the loopback address it dials");
     impostor_client
         .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
         .await
@@ -2466,6 +2588,12 @@ async fn a_failed_serving_rebind_keeps_the_listener_already_in_service() {
         .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
         .await
         .expect("ask the operating system for the first Serving port");
+    local_client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep this test on the loopback address it dials");
     local_client
         .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
         .await

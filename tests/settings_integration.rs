@@ -87,11 +87,15 @@ async fn a_pinned_setting_reaches_every_connecting_client_and_the_rest_default()
 }
 
 #[tokio::test]
-async fn serving_settings_pin_from_the_config_document_with_loopback_only_defaults() {
+async fn serving_settings_pin_from_the_config_document_with_dual_stack_defaults() {
     let defaults = suru::protocol::EffectiveSettings::default().serving;
     assert!(!defaults.enabled);
     assert_eq!(defaults.port, 7777);
-    assert_eq!(defaults.bind_address, IpAddr::from([127, 0, 0, 1]));
+    assert_eq!(
+        defaults.bind_address,
+        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        "the default bind answers on every address an Invite could offer"
+    );
 
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");

@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv6Addr},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -1160,7 +1160,10 @@ impl Default for ServingSettings {
         Self {
             enabled: false,
             port: 7777,
-            bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            // Unspecified dual-stack, because an Invite advertises the
+            // machine's non-loopback addresses: a listener that cannot answer
+            // on them would strand every Invite it issues.
+            bind_address: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         }
     }
 }

@@ -542,8 +542,7 @@ impl ServingController {
             running.settings = settings;
             return Ok(());
         }
-        let listener = TcpListener::bind(requested)
-            .await
+        let listener = bind_listener(requested)
             .with_context(|| format!("bind Serving listener to {requested}"))?;
         let address = listener
             .local_addr()
@@ -859,6 +858,38 @@ impl ServingController {
         issued.state = TokenState::Spent;
         Ok(())
     }
+}
+
+/// Binds the Serving listener. An IPv6 bind clears `IPV6_V6ONLY` first so the
+/// default `::` accepts IPv4 dialers too: Linux and macOS leave the flag off,
+/// but Windows sets it, which would strand every IPv4 address an Invite
+/// offers.
+fn bind_listener(requested: SocketAddr) -> Result<TcpListener> {
+    let domain = match requested {
+        SocketAddr::V4(_) => socket2::Domain::IPV4,
+        SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+        .context("open Serving socket")?;
+    if requested.is_ipv6() {
+        socket
+            .set_only_v6(false)
+            .context("open the Serving socket to both stacks")?;
+    }
+    // Unix rebinds race the previous listener's TIME_WAIT; Windows reuse has
+    // different semantics, and its default already allows the rebind.
+    #[cfg(unix)]
+    socket
+        .set_reuse_address(true)
+        .context("allow Serving listener rebinds")?;
+    socket
+        .bind(&requested.into())
+        .context("bind Serving socket")?;
+    socket.listen(1024).context("listen on Serving socket")?;
+    socket
+        .set_nonblocking(true)
+        .context("prepare Serving socket for the async runtime")?;
+    TcpListener::from_std(socket.into()).context("adopt Serving socket into the async runtime")
 }
 
 async fn stop_active(
