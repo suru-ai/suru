@@ -1397,6 +1397,33 @@ fn an_unreadable_row_is_marked_and_subdued() {
     );
 }
 
+/// A refresh can report the very Session the reader has open as unreadable.
+/// Seeding still starts them on a row the arrows can act on, because a
+/// selection on a row the traversal excludes is one they could only escape by
+/// falling back to the top.
+#[test]
+fn seeding_passes_over_an_open_session_that_arrives_unreadable() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    deliver_initial_visibility(&mut application, SidebarVisibility::Hidden);
+    let (open_session, _) = enter_session(&mut application, workspace.path());
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![
+                unreadable_as(open_session, "Broken work", workspace.path(), 2),
+                listed("Readable work", None, workspace.path(), 1, now()),
+            ],
+        })
+        .expect("hydrate the Sidebar beside the open Session");
+
+    assert!(
+        selected_sidebar_text(&application).contains("Readable work"),
+        "the reader starts on a row that can be opened rather than on the damaged open Session"
+    );
+}
+
 /// The marker is never what truncation takes away: its columns are held back
 /// and the Title is cut instead, so a narrow row still says why it cannot be
 /// opened.

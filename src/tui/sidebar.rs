@@ -1842,7 +1842,9 @@ impl Sidebar {
     }
 
     /// Whether the Sidebar would put the reader on this Session: it is one it
-    /// lists, and one their query carries.
+    /// lists, one their query carries, and one the client could read — a
+    /// listing can report the very Session the reader has open as unreadable,
+    /// and a selection seeded there would stand on a row the arrows exclude.
     ///
     /// This is the question [`Self::holds`] cannot answer, because the settled
     /// shelf shows the row the reader is on however deep it sits — so asking
@@ -1852,7 +1854,8 @@ impl Sidebar {
         self.in_scope()
             .find(|session| session.id() == session_id)
             .is_some_and(|session| {
-                self.query.is_empty() || title_carries(&self.query, session.title())
+                session.readable().is_some()
+                    && (self.query.is_empty() || title_carries(&self.query, session.title()))
             })
     }
 
