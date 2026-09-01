@@ -459,9 +459,14 @@ impl ModelPicker {
     /// Freezes the best presentation currently available beside the durable
     /// selection. A missing catalog has an explicit ID fallback; later catalog
     /// loads can serve pickers and new selections without mutating an unchanged
-    /// one. A real selection change replaces the Outlook's presentation.
+    /// one. A real selection change replaces the Outlook's presentation, and
+    /// an interval with no selection ends it so reselecting the same Agent can
+    /// capture metadata learned in the meantime.
     pub(super) fn remember_selection(&mut self, selection: Option<&AgentSelection>) {
         let Some(selection) = selection else {
+            let outlook = self.outlook.clone();
+            self.selection_presentations
+                .retain(|presentation| presentation.outlook != outlook);
             return;
         };
         let existing = self

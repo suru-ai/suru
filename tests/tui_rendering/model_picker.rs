@@ -1,8 +1,9 @@
 //! The model picker: listing, search, focus, and selection.
 
 use crate::support::{
-    model_descriptor, rendered_application_rows, rendered_application_rows_at, rendered_row,
-    selected_session_snapshot, type_terminal_text, workspace_dir,
+    model_descriptor, navigable_session_snapshot, rendered_application_rows,
+    rendered_application_rows_at, rendered_row, selected_session_snapshot, type_terminal_text,
+    workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
@@ -71,6 +72,69 @@ fn restored_selection_label_stays_stable_when_its_catalog_arrives() {
     let after = rendered_application_rows_at(&application, 100, 16).join("\n");
     assert!(after.contains("fixture-provider · model-native-id"));
     assert!(!after.contains("Friendly Model Name"));
+}
+
+#[test]
+fn reselected_model_adopts_catalog_presentation_after_an_interval_without_an_agent() {
+    let workspace = workspace_dir();
+    let selection = AgentSelection {
+        provider: ProviderId::new("fixture-provider"),
+        model: ModelId::new("model-native-id"),
+        options: Vec::new(),
+    };
+    let mut application = Application::new(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            selected_session_snapshot(SessionId::new(), workspace.path(), selection.clone()),
+        ))
+        .expect("attach the selected Session before listing Models");
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            navigable_session_snapshot(SessionId::new(), workspace.path(), 0),
+        ))
+        .expect("attach a Session without an Agent Selection");
+
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("opening the Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("fixture-provider"),
+                    display_name: "Fixture Provider".to_owned(),
+                    models: vec![model_descriptor(
+                        "fixture-provider",
+                        "model-native-id",
+                        "Friendly Model Name",
+                        true,
+                        ModelAvailability::Available,
+                    )],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("load matching Model catalog");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("close Model picker before selecting the Model again");
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            selected_session_snapshot(SessionId::new(), workspace.path(), selection),
+        ))
+        .expect("attach a newly selected Session after the catalog arrives");
+
+    let rendered = rendered_application_rows_at(&application, 100, 16).join("\n");
+    assert!(rendered.contains("Fixture Provider · Friendly Model Name"));
 }
 
 #[test]
