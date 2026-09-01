@@ -15,8 +15,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     managed_client::SessionProjection,
     protocol::{
-        ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth, SessionSnapshot,
-        SessionStatus, SessionTimestamp,
+        ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth, SessionId,
+        SessionSnapshot, SessionStatus, SessionTimestamp,
     },
     theme::Theme,
 };
@@ -34,9 +34,9 @@ use super::{
     },
     shimmer,
     sidebar::{
-        self, ADD_WORKSPACE, Sidebar, SidebarEntry, SidebarMenuGeometry,
-        SidebarRow, SidebarScopeEntry, SidebarSelectorView, SidebarShelf, SidebarShowMore,
-        SidebarSpan, SidebarTarget, SidebarWorkspaceEntryView,
+        self, ADD_WORKSPACE, Sidebar, SidebarEntry, SidebarMenuGeometry, SidebarRow,
+        SidebarScopeEntry, SidebarSelectorView, SidebarShelf, SidebarShowMore, SidebarSpan,
+        SidebarTarget, SidebarWorkspaceEntryView,
     },
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
@@ -1643,7 +1643,7 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     let block =
         Block::default()
             .borders(Borders::RIGHT)
-            .border_style(if state.sidebar.has_focus() {
+            .border_style(if state.sidebar_owns_input() {
                 theme.border.default
             } else {
                 theme.border.subdued
@@ -1652,6 +1652,10 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     let content = horizontally_inset(inside, 1);
     frame.render_widget(block, column);
     let (lines, rows) = sidebar_lines(state, content, theme);
+    frame.render_widget(Paragraph::new(lines), content);
+    if let Some(open) = state.open_session() {
+        paint_open_rail(frame, &rows, open, inside.x, theme);
+    }
     // The columns inside the rule rather than the content's own, so the
     // padding a row is inset by presses the row it insets. The spans the body
     // narrows to a run of one line are measured from the same edges, in
@@ -1659,8 +1663,40 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     state
         .sidebar
         .record_geometry(inside.x..inside.right(), rows);
-    frame.render_widget(Paragraph::new(lines), content);
     main
+}
+
+/// Marks the open Session's row down its left edge, in the column of padding
+/// the body is inset by.
+///
+/// The rail is drawn over the lines rather than laid out among them, so it
+/// costs the rows no columns and the body reads the same width whatever is
+/// open. It is what says "open" when the row itself has given its background
+/// over to row focus; where nothing else claims the row the rail simply
+/// carries the same highlight one column further left.
+///
+/// A Session with no drawn row gets no rail: the Sidebar marks the row it has,
+/// and never stands one row in for another.
+fn paint_open_rail(
+    frame: &mut Frame<'_>,
+    spans: &[SidebarSpan],
+    open: SessionId,
+    column: u16,
+    theme: &Theme,
+) {
+    let Some(span) = spans
+        .iter()
+        .find(|span| span.target == SidebarTarget::Session(open))
+    else {
+        return;
+    };
+    let rows = span.rows.clone();
+    let buffer = frame.buffer_mut();
+    for row in rows {
+        if let Some(cell) = buffer.cell_mut(Position::new(column, row)) {
+            cell.set_style(theme.selection.open_rail);
+        }
+    }
 }
 
 /// Draws the context menu a reader opened on a Sidebar row, anchored at the
@@ -1745,7 +1781,7 @@ fn sidebar_lines(
     theme: &Theme,
 ) -> (Vec<Line<'static>>, Vec<SidebarSpan>) {
     let width = usize::from(content.width);
-    let focused = state.sidebar.has_focus();
+    let driving = state.sidebar_owns_input();
     let mut lines = vec![sidebar_search_line(state.sidebar.query(), width, theme)];
     let error = state.sidebar.error();
     if let Some(error) = error {
@@ -1764,7 +1800,7 @@ fn sidebar_lines(
     lines.push(sidebar_selector_line(
         &state.sidebar.selector(),
         width,
-        focused,
+        driving,
         theme,
     ));
     let selector_rows = selector_row..selector_row.saturating_add(1);
@@ -1795,10 +1831,9 @@ fn sidebar_lines(
         return (lines, rows);
     }
     let capacity = usize::from(content.height).saturating_sub(lines.len());
-    let entries = state.sidebar.visible_entries(
-        capacity,
-        state.session.as_ref().map(SessionProjection::session_id),
-    );
+    let entries = state
+        .sidebar
+        .visible_entries(capacity, state.open_session());
     if entries.is_empty() {
         lines.extend(
             sidebar_empty_reading(&state.sidebar)
@@ -1812,7 +1847,7 @@ fn sidebar_lines(
         .saturating_add(u16::try_from(lines.len()).unwrap_or_default());
     for entry in entries {
         let target = entry.target();
-        let drawn = sidebar_entry_lines(entry, width, now, focused, theme);
+        let drawn = sidebar_entry_lines(entry, width, now, driving, theme);
         let bottom = top.saturating_add(u16::try_from(drawn.len()).unwrap_or_default());
         if let Some(target) = target {
             rows.push(SidebarSpan {
@@ -1891,13 +1926,13 @@ fn sidebar_entry_lines(
     entry: SidebarEntry<'_>,
     width: usize,
     now: u64,
-    focused: bool,
+    driving: bool,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     match entry {
         SidebarEntry::Divider => vec![sidebar_divider_line(width, theme)],
-        SidebarEntry::ShowMore(more) => vec![sidebar_show_more_line(more, width, focused, theme)],
-        SidebarEntry::Scope(scope) => vec![sidebar_scope_line(&scope, width, focused, theme)],
+        SidebarEntry::ShowMore(more) => vec![sidebar_show_more_line(more, width, driving, theme)],
+        SidebarEntry::Scope(scope) => vec![sidebar_scope_line(&scope, width, driving, theme)],
         SidebarEntry::Row(row) => match row.shelf {
             SidebarShelf::Active {
                 workspace,
@@ -1908,13 +1943,13 @@ fn sidebar_entry_lines(
                 workspace,
                 sidebar_active_slot(working_since, updated_at, now),
                 width,
-                focused,
+                driving,
                 theme,
             )
             .to_vec(),
             SidebarShelf::Settled { ended_at } => {
                 vec![sidebar_settled_row_line(
-                    row, ended_at, width, now, focused, theme,
+                    row, ended_at, width, now, driving, theme,
                 )]
             }
         },
@@ -1933,7 +1968,7 @@ fn sidebar_entry_lines(
 fn sidebar_selector_line(
     selector: &SidebarSelectorView,
     width: usize,
-    focused: bool,
+    driving: bool,
     theme: &Theme,
 ) -> Line<'static> {
     let affordance = if selector.open { "▾ " } else { "▸ " };
@@ -1941,13 +1976,13 @@ fn sidebar_selector_line(
         sidebar_plain_span(
             &format!("{affordance}{}", selector.label),
             width.saturating_sub(ADD_WORKSPACE.width()),
-            selection_style(selector.selected, focused, theme),
+            sidebar_focus_style(selector.focused, driving, theme),
             theme.text.subdued,
         ),
         sidebar_plain_span(
             ADD_WORKSPACE,
             ADD_WORKSPACE.width(),
-            selection_style(selector.adding, focused, theme),
+            sidebar_focus_style(selector.adding, driving, theme),
             theme.text.subdued,
         ),
     ])
@@ -2011,13 +2046,13 @@ fn sidebar_workspace_entry_lines(
 fn sidebar_scope_line(
     scope: &SidebarScopeEntry,
     width: usize,
-    focused: bool,
+    driving: bool,
     theme: &Theme,
 ) -> Line<'static> {
     sidebar_plain_line(
         &format!("  {}", scope.label),
         width,
-        selection_style(scope.selected, focused, theme),
+        sidebar_focus_style(scope.focused, driving, theme),
         if scope.chosen {
             theme.accent.primary
         } else {
@@ -2043,13 +2078,13 @@ fn sidebar_divider_line(width: usize, theme: &Theme) -> Line<'static> {
 fn sidebar_show_more_line(
     more: SidebarShowMore,
     width: usize,
-    focused: bool,
+    driving: bool,
     theme: &Theme,
 ) -> Line<'static> {
     sidebar_plain_line(
         &format!("Show {} more", more.count),
         width,
-        selection_style(more.selected, focused, theme),
+        sidebar_focus_style(more.focused, driving, theme),
         theme.text.subdued,
     )
 }
@@ -2091,21 +2126,21 @@ fn sidebar_active_row_lines(
     workspace: Option<&Path>,
     slot: String,
     width: usize,
-    focused: bool,
+    driving: bool,
     theme: &Theme,
 ) -> [Line<'static>; sidebar::ACTIVE_ROW_LINES] {
-    let selected = selection_style(row.selected, focused, theme);
+    let highlight = sidebar_row_style(row, driving, theme);
     let workspace = workspace.map(sidebar::workspace_name).unwrap_or_default();
-    let label_style = selected.unwrap_or(theme.text.subdued);
+    let label_style = highlight.unwrap_or(theme.text.subdued);
     [
-        sidebar_slotted_line(&workspace, label_style, &slot, width, selected, theme),
+        sidebar_slotted_line(&workspace, label_style, &slot, width, highlight, theme),
         sidebar_plain_line(
             &sidebar_title(row, width),
             width,
             None,
-            sidebar_title_style(row, selected, theme),
+            sidebar_title_style(row, highlight, theme),
         ),
-        Line::styled(" ".repeat(width), selected.unwrap_or_default()),
+        Line::styled(" ".repeat(width), highlight.unwrap_or_default()),
     ]
 }
 
@@ -2116,17 +2151,17 @@ fn sidebar_settled_row_line(
     ended_at: SessionTimestamp,
     width: usize,
     now: u64,
-    focused: bool,
+    driving: bool,
     theme: &Theme,
 ) -> Line<'static> {
-    let selected = selection_style(row.selected, focused, theme);
+    let highlight = sidebar_row_style(row, driving, theme);
     let slot = relative_update_time_compact(ended_at, now);
     sidebar_slotted_line(
         &sidebar_title(row, width.saturating_sub(slot.width() + 1)),
-        sidebar_title_style(row, selected, theme),
+        sidebar_title_style(row, highlight, theme),
         &slot,
         width,
-        selected,
+        highlight,
         theme,
     )
 }
@@ -2189,11 +2224,27 @@ fn sidebar_slotted_line(
     ])
 }
 
-/// How the row the reader is on is drawn, and `None` for every other row. A
-/// selected row is drawn whole, so it reads as one block rather than as lines
-/// that happen to be lit. It keeps its highlight when the keys are elsewhere,
-/// dimmed, because it is still the row the reader would act on once they come
-/// back — which is what tells a list apart from one the arrows cannot reach.
+/// How a Sidebar entry the keys are on is drawn, and `None` for every other
+/// entry — including that same entry once the keys have gone.
+///
+/// Row focus is drawn whole, so it reads as one block rather than as lines
+/// that happen to be lit, and it is drawn only while the Sidebar is the
+/// surface the keys reach. There is no dim second state: a mark left standing
+/// after the reader went back to writing would be the column claiming
+/// something Enter no longer means.
+fn sidebar_focus_style(focused: bool, driving: bool, theme: &Theme) -> Option<Style> {
+    (focused && driving).then_some(theme.selection.focused)
+}
+
+/// How the selected row of a surface that keeps a selection is drawn, and
+/// `None` for every other row. It is drawn whole, so it reads as one block
+/// rather than as lit text, and it keeps a dimmed highlight while the keys are
+/// on some other part of the surface, because it is still the row they would
+/// act on once they come back — which is what tells a list apart from one the
+/// arrows cannot reach.
+///
+/// The Sidebar keeps no such selection: its row focus goes with the keys, and
+/// it is drawn through [`sidebar_focus_style`] instead.
 fn selection_style(selected: bool, focused: bool, theme: &Theme) -> Option<Style> {
     selected.then_some(if focused {
         theme.selection.focused
@@ -2222,14 +2273,31 @@ fn sidebar_title(row: SidebarRow<'_>, width: usize) -> String {
     format!("{title} {UNREADABLE_MARKER}")
 }
 
-/// How a Session's name is drawn: highlighted where the reader is on it,
-/// subdued where the client could not read it, accented where it is the
-/// Session they have open, and plain otherwise.
-fn sidebar_title_style(row: SidebarRow<'_>, selected: Option<Style>, theme: &Theme) -> Style {
-    selected.unwrap_or(if row.unreadable {
+/// How a Sidebar row is drawn, which is a reading of the two things a row can
+/// be at once: the Session the main view has open, and the row the keys are
+/// on.
+///
+/// Focus wins the row itself, because it is the state the reader is moving and
+/// the one that says what Enter would act on. The open Session keeps the rail
+/// down the row's left — drawn separately, over the padding — so a row that is
+/// both still says both. And the open highlight does not answer to who holds
+/// the keys: which Session is on screen is true whether the reader is writing
+/// into it or looking down the column.
+fn sidebar_row_style(row: SidebarRow<'_>, driving: bool, theme: &Theme) -> Option<Style> {
+    sidebar_focus_style(row.focused, driving, theme)
+        .or_else(|| row.open.then_some(theme.selection.open))
+}
+
+/// How a Session's name is drawn where no highlight covers the row: subdued
+/// for one the client could not read, because that row stands for work the
+/// reader can see and delete but never open, and plain otherwise.
+///
+/// A highlight wins either way. An open Session the listing reports unreadable
+/// keeps its highlight and its marker both: the reader is looking at it, and
+/// the row has to say why they cannot get back into it.
+fn sidebar_title_style(row: SidebarRow<'_>, highlight: Option<Style>, theme: &Theme) -> Style {
+    highlight.unwrap_or(if row.unreadable {
         theme.text.subdued
-    } else if row.current {
-        theme.accent.primary
     } else {
         theme.text.primary
     })

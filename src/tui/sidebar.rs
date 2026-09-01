@@ -156,9 +156,15 @@ pub(super) struct Sidebar {
     /// the moment they are done looking.
     query: String,
     /// The row the reader is on, held by what the row stands for rather than
-    /// by position, so a listing arriving underneath them leaves the selection
+    /// by position, so a listing arriving underneath them leaves the focus
     /// where the work is rather than where the row was.
-    selected: Option<SidebarSelection>,
+    ///
+    /// This is row focus and nothing else: it says what Enter would act on,
+    /// and it exists only while the Sidebar has the keys. Entering seeds it,
+    /// leaving gives it up, and nothing here says which Session the main view
+    /// is showing — that is the open Session, which the route decides and the
+    /// Sidebar is only told.
+    focus: Option<SidebarFocus>,
     attaching: Option<SessionId>,
     /// Whether the listing in flight is one the reader asked for by opening
     /// the Sidebar, rather than one it asked for on its own to catch up with a
@@ -179,8 +185,8 @@ pub(super) struct Sidebar {
     on_screen: Cell<bool>,
     /// The entry the column's window opens on. Only a frame knows how many
     /// lines it holds, so the window is settled at draw time and remembered
-    /// here: a selection moving to a row already in view leaves it where it
-    /// is, and only a selection moving out of view carries it along.
+    /// here: an anchor moving to a row already in view leaves it where it
+    /// is, and only an anchor moving out of view carries it along.
     window_start: Cell<usize>,
     /// Where the frame in force drew the rows, which is what a press resolves
     /// against. Rendering leaves it here, so it is held behind a cell rather
@@ -207,14 +213,14 @@ const SETTLED_SHELF_OPENING: usize = 10;
 /// back through a long history is not asking over and over.
 const SETTLED_SHELF_BATCH: usize = 25;
 
-/// What the reader is on in the Sidebar. Almost always that is a Session,
-/// named by its id so the selection follows the work rather than the row it
-/// happened to be drawn on. The rest are the Sidebar's own affordances, which
-/// stand for no Session at all: the settled shelf's next batch, the Workspace
+/// What the reader's keys are on in the Sidebar. Almost always that is a
+/// Session, named by its id so the focus follows the work rather than the row
+/// it happened to be drawn on. The rest are the Sidebar's own affordances,
+/// which stand for no Session at all: the settled shelf's next batch, the Workspace
 /// selector above the list, and — while that stands open — one of the
 /// Workspaces it offers.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum SidebarSelection {
+enum SidebarFocus {
     /// The Workspace selector's own row, which stands above the list rather
     /// than in it, and which Enter opens instead of attaching anything.
     Selector,
@@ -257,11 +263,14 @@ pub(super) struct SidebarRow<'a> {
     /// left it none, and none while the reader keeps Emojis hidden.
     pub(super) emoji: Option<&'a str>,
     pub(super) title: &'a str,
-    /// Whether this is the Session the reader has open.
-    pub(super) current: bool,
-    /// Whether this is the row the reader is on, which is the one Enter acts
-    /// on and the one the column draws highlighted.
-    pub(super) selected: bool,
+    /// Whether this is the Session the main view is showing. It is true
+    /// whoever holds the keys, because it says what the reader is looking at
+    /// rather than what they are choosing.
+    pub(super) open: bool,
+    /// Whether this is the row the keys are on, which is the one Enter acts
+    /// on. It is drawn only while the Sidebar has them: a Sidebar that has
+    /// given the keys up is pointing at nothing.
+    pub(super) focused: bool,
     /// Whether this Session is one the client could not read. Such a row is
     /// drawn subdued and marked, because it stands for work the reader can see
     /// and delete but never open.
@@ -329,10 +338,10 @@ pub(super) enum SidebarEntry<'a> {
 #[derive(Clone, Debug)]
 pub(super) struct SidebarScopeEntry {
     pub(super) label: String,
-    /// Whether this is the scope the Sidebar is narrowed to, drawn the way the
-    /// Session the reader has open is: it is where they already are.
+    /// Whether this is the scope the Sidebar is narrowed to, accented because
+    /// it is where the reader already is.
     pub(super) chosen: bool,
-    pub(super) selected: bool,
+    pub(super) focused: bool,
     /// The scope pressing this entry asks for.
     scope: WorkspaceScope,
 }
@@ -345,7 +354,7 @@ pub(super) struct SidebarSelectorView {
     pub(super) label: String,
     /// Whether the entries stand open beneath it.
     pub(super) open: bool,
-    pub(super) selected: bool,
+    pub(super) focused: bool,
     /// Whether the reader is on the add-Workspace affordance beside it, which
     /// shares the selector's line and is highlighted within its own columns of
     /// it.
@@ -359,9 +368,9 @@ pub(super) struct SidebarShowMore {
     /// is left where that is less, so the affordance never offers rows that
     /// are not there.
     pub(super) count: usize,
-    /// Whether this is the row the reader is on. The affordance is a row like
+    /// Whether this is the row the keys are on. The affordance is a row like
     /// any other in that respect: the arrows land on it and Enter acts on it.
-    pub(super) selected: bool,
+    pub(super) focused: bool,
 }
 
 impl SidebarEntry<'_> {
@@ -375,13 +384,22 @@ impl SidebarEntry<'_> {
         }
     }
 
-    /// Whether this is the entry the reader is on. The divider never is: it
-    /// is a rule rather than a row, so the arrows step over it.
-    const fn is_selected(&self) -> bool {
+    /// Whether this entry stands for the Session the main view has open, which
+    /// only a Session row ever does.
+    const fn is_open(&self) -> bool {
         match self {
-            Self::Row(row) => row.selected,
-            Self::ShowMore(more) => more.selected,
-            Self::Scope(scope) => scope.selected,
+            Self::Row(row) => row.open,
+            Self::Scope(_) | Self::Divider | Self::ShowMore(_) => false,
+        }
+    }
+
+    /// Whether this is the entry the keys are on. The divider never is: it
+    /// is a rule rather than a row, so the arrows step over it.
+    const fn is_focused(&self) -> bool {
+        match self {
+            Self::Row(row) => row.focused,
+            Self::ShowMore(more) => more.focused,
+            Self::Scope(scope) => scope.focused,
             Self::Divider => false,
         }
     }
@@ -638,7 +656,7 @@ impl Sidebar {
             ),
             settled_on_show: SETTLED_SHELF_OPENING,
             query: String::new(),
-            selected: None,
+            focus: None,
             attaching: None,
             asked_afresh: false,
             awaiting_dispatch: None,
@@ -677,19 +695,30 @@ impl Sidebar {
     /// initial-visibility Setting is not rewritten.
     ///
     /// A reader who opens the Sidebar is asking to drive it, so it takes the
-    /// keys; closing hands them back. The initial-visibility Setting's own
+    /// keys — and with them the row focus that says what Enter would act on,
+    /// seeded from the Session the main view has open. Closing hands both
+    /// back. The initial-visibility Setting's own
     /// reveal in [`Self::adopt_settings`] does neither, because a reader who has not touched the
     /// Sidebar is typing their first Prompt.
-    pub(super) fn toggle(&mut self) {
+    pub(super) fn toggle(&mut self, open: Option<SessionId>) {
         self.reveal(!self.revealed);
         if self.revealed {
-            self.focused = true;
+            self.enter(open);
         } else {
             // Closing is one of the ways out of the Sidebar, so it leaves by
             // the same door the others do — and a Sidebar nobody can see is
             // not one holding a query on the reader's behalf.
             self.hand_back_keys();
         }
+    }
+
+    /// Gives the Sidebar the keys and puts row focus where the reader is: on
+    /// the open Session where the column draws its row, and on the Workspace
+    /// selector otherwise, so entering has a starting point without the
+    /// Sidebar having to pretend some Session is selected.
+    fn enter(&mut self, open: Option<SessionId>) {
+        self.focused = true;
+        self.seed_focus(open);
     }
 
     /// Backs the reader out of the Sidebar one step at a time, which is what
@@ -728,8 +757,9 @@ impl Sidebar {
             entry.path.push_str(text);
             return;
         }
+        let before = self.focus_order_before_change();
         self.query.push_str(text);
-        self.keep_selection_drawn();
+        self.keep_focus_drawn(&before);
     }
 
     /// Takes that line back a character, widening the results to match where
@@ -739,8 +769,9 @@ impl Sidebar {
             entry.path.pop();
             return;
         }
+        let before = self.focus_order_before_change();
         self.query.pop();
-        self.keep_selection_drawn();
+        self.keep_focus_drawn(&before);
     }
 
     /// The path entry to type into, where one stands open — with whatever it
@@ -756,14 +787,19 @@ impl Sidebar {
     /// the whole list. A widening list never drops a row, so the row they were
     /// on is still there and still theirs.
     fn clear_query(&mut self) {
+        let before = self.focus_order_before_change();
         self.query.clear();
-        self.keep_selection_drawn();
+        self.keep_focus_drawn(&before);
     }
 
     /// Hands the keys to the composer, and the query goes with them: it was a
     /// way of finding a Session, and the reader is no longer looking for one.
     /// So does any menu standing open: it was opened on a row the reader has
     /// since moved on from.
+    ///
+    /// Row focus goes too. It says what Enter would act on, and nothing here
+    /// answers to Enter any more — a mark left standing would be the Sidebar
+    /// claiming a Session the reader is not in.
     fn hand_back_keys(&mut self) {
         self.focused = false;
         self.menu = None;
@@ -772,6 +808,9 @@ impl Sidebar {
         self.workspace_entry = None;
         self.close_selector();
         self.clear_query();
+        // Last, because putting the selector's entries away and giving up the
+        // query are both moves that would otherwise put focus somewhere.
+        self.focus = None;
     }
 
     /// Whether the reader is driving the Sidebar. A Sidebar the frame could not
@@ -813,7 +852,7 @@ impl Sidebar {
     /// the rows takes the press first, and a press outside it puts it away and
     /// is spent there — a reader dismissing a menu is not also acting on
     /// whatever it was covering. Otherwise the press lands on a row, which
-    /// takes the selection and is opened, or on one of the Sidebar's own
+    /// takes row focus and is opened, or on one of the Sidebar's own
     /// affordances — the settled shelf's next batch, the Workspace selector,
     /// one of the Workspaces it offers, or the affordance beside it that opens
     /// a path entry. Every one of them is what Enter already
@@ -854,14 +893,14 @@ impl Sidebar {
             return SidebarPress::Elsewhere;
         };
         // A row the client could not read spends the press without answering
-        // it: opening the Session could only fail, and carrying the reader
-        // onto a row the arrows cannot leave would strand them there.
+        // it: opening the Session could only fail, and carrying row focus onto
+        // a row the arrows cannot leave would strand it there.
         if let SidebarTarget::Session(session_id) = target
             && !self.is_readable(session_id)
         {
             return SidebarPress::Answered;
         }
-        self.select(target);
+        self.focus_on(target);
         SidebarPress::Invoke(SemanticCommandId::SidebarAttach.into())
     }
 
@@ -877,8 +916,10 @@ impl Sidebar {
     }
 
     /// Opens the context menu on the row the reader asked for one on, which
-    /// also puts them on that row: a menu acts on the Session under it, and a
-    /// selection drawn elsewhere would say otherwise.
+    /// also puts row focus on that row where the reader is driving the
+    /// Sidebar: a menu acts on the Session under it, and focus standing
+    /// elsewhere would say otherwise. A reader who is not driving it is shown
+    /// no focus either way, and the menu carries the Session it acts on.
     ///
     /// The settled shelf's affordance stands for no Session, so it offers no
     /// menu — and neither does a press out in the main view. Both put away
@@ -907,10 +948,11 @@ impl Sidebar {
         let settled = self.settlement().settles(session);
         let unreadable = session.readable().is_none();
         // A row the client could not read still gets its menu — deletion is
-        // how damaged work leaves the list — but not the selection, which
-        // stands only on rows the arrows can reach and Enter can open.
+        // how damaged work leaves the list — but never row focus, which stands
+        // only on rows the arrows can reach and Enter can open.
         if !unreadable {
-            self.select(SidebarTarget::Session(session_id));
+            self.focus_on(SidebarTarget::Session(session_id));
+            self.release_borrowed_focus();
         }
         self.menu = Some(SidebarMenu {
             session: SessionReference::new(self.listing.outlook().clone(), session_id),
@@ -986,10 +1028,10 @@ impl Sidebar {
 
     /// Acts on one menu item, answering with the command it asks for.
     ///
-    /// Pointing at an item is choosing it, so the selection follows the press
-    /// before the item acts. Settling and unsettling act at once and the menu
-    /// is done; Delete asks again the first time and acts the second, so the
-    /// menu stands until the reader has said it twice.
+    /// Pointing at an item is choosing it, so the menu's own selection follows
+    /// the press before the item acts. Settling and unsettling act at once and
+    /// the menu is done; Delete asks again the first time and acts the second,
+    /// so the menu stands until the reader has said it twice.
     fn act_on_menu_item(&mut self, index: usize) -> SidebarPress {
         let Some(menu) = &mut self.menu else {
             return SidebarPress::Answered;
@@ -1007,15 +1049,36 @@ impl Sidebar {
         SidebarPress::Invoke(item.command().on_session(session))
     }
 
-    /// Puts the reader on the row a press landed on.
-    fn select(&mut self, target: SidebarTarget) {
-        self.selected = Some(match target {
-            SidebarTarget::Session(session_id) => SidebarSelection::Session(session_id),
-            SidebarTarget::ShowMore => SidebarSelection::ShowMore,
-            SidebarTarget::Selector => SidebarSelection::Selector,
-            SidebarTarget::Scope(scope) => SidebarSelection::Scope(scope),
-            SidebarTarget::AddWorkspace => SidebarSelection::AddWorkspace,
+    /// Notes the entry a press landed on, which is how a pointer says which
+    /// entry the command it invokes should act on: activation reads row focus
+    /// and nothing else, so the two gestures act through one path.
+    ///
+    /// A pointer only borrows focus this way. Row focus belongs to the keys,
+    /// so a Sidebar that does not have them gives it back the moment the press
+    /// has been answered — see [`Self::release_borrowed_focus`].
+    fn focus_on(&mut self, target: SidebarTarget) {
+        self.focus = Some(match target {
+            SidebarTarget::Session(session_id) => SidebarFocus::Session(session_id),
+            SidebarTarget::ShowMore => SidebarFocus::ShowMore,
+            SidebarTarget::Selector => SidebarFocus::Selector,
+            SidebarTarget::Scope(scope) => SidebarFocus::Scope(scope),
+            SidebarTarget::AddWorkspace => SidebarFocus::AddWorkspace,
         });
+    }
+
+    /// Gives row focus back where a press borrowed it on a Sidebar the reader
+    /// is not driving. Focus says where the keys are; a Sidebar that has not
+    /// got them must point at nothing once the press it answered is done, or
+    /// the reader would come back to a mark a pointer left rather than to the
+    /// Session they have open.
+    ///
+    /// A press that takes the keys — the affordance opening a path entry is
+    /// the one such — keeps what it set, because by then the reader is
+    /// driving the Sidebar after all.
+    fn release_borrowed_focus(&mut self) {
+        if !self.focused {
+            self.focus = None;
+        }
     }
 
     /// Notes the Session the Sidebar has asked the server to take away, so a
@@ -1162,12 +1225,16 @@ impl Sidebar {
         self.awaiting_dispatch.take()
     }
 
+    /// Takes the Sessions the server answered with, told which one the main
+    /// view has open so a fresh listing can seed row focus the way entering
+    /// the Sidebar does.
     pub(super) fn load(
         &mut self,
         request: &SessionListRequest,
         sessions: Vec<SessionListItem>,
-        current: Option<SessionId>,
+        open: Option<SessionId>,
     ) {
+        let before = self.focus_order_before_change();
         if !self.listing.load(request, sessions) {
             return;
         }
@@ -1178,25 +1245,21 @@ impl Sidebar {
             // away rather than left pointing at whatever now stands where its
             // row did.
             self.menu = None;
-        } else {
-            // A catch-up leaves the reader in whatever they were in the middle
-            // of, so long as the Session behind it survived the listing that
-            // arrived.
-            self.forget_absent();
+            // A listing the reader asked for by opening the Sidebar is the
+            // answer to that opening, and it lands after the seeding did: the
+            // rows the Sidebar would have started them on were not there yet.
+            // So row focus is seeded again — where the reader is driving the
+            // column. A Sidebar revealed by its Setting is driving nothing and
+            // is left pointing at nothing.
+            if self.focused {
+                self.seed_focus(open);
+            }
+            return;
         }
-        // A listing the reader was already reading keeps them where they were;
-        // a fresh one starts them on the Session they have open, and failing
-        // that on the row nearest them.
-        self.selected = self
-            .selected
-            .take()
-            .filter(|selected| self.holds(selected))
-            .or_else(|| {
-                current
-                    .filter(|current| self.draws(*current))
-                    .map(SidebarSelection::Session)
-            })
-            .or_else(|| first_row(&self.selectable()));
+        // A catch-up leaves the reader in whatever they were in the middle
+        // of, so long as the Session behind it survived the listing that
+        // arrived.
+        self.forget_absent(&before);
     }
 
     pub(super) fn fail_listing(&mut self, request: &SessionListRequest, error: String) {
@@ -1204,10 +1267,11 @@ impl Sidebar {
     }
 
     pub(super) fn retitle(&mut self, session_id: SessionId, title: String, emoji: Option<String>) {
+        let before = self.focus_order_before_change();
         self.listing.retitle(session_id, title, emoji);
         // A Title is what a query is read against, so another client's retitle
-        // can carry the row the reader is on out of the results under them.
-        self.keep_selection_drawn();
+        // can carry the row the keys are on out of the results under them.
+        self.keep_focus_drawn(&before);
     }
 
     pub(super) fn settle(&mut self, session_id: SessionId, settled_at: Option<SessionTimestamp>) {
@@ -1226,23 +1290,25 @@ impl Sidebar {
     }
 
     pub(super) fn remove(&mut self, session_id: SessionId) {
+        let before = self.focus_order_before_change();
         self.listing.remove(session_id);
-        self.forget_absent();
+        self.forget_absent(&before);
     }
 
     pub(super) fn retain_catalog(&mut self, session_ids: &[SessionId]) {
+        let before = self.focus_order_before_change();
         self.listing.retain(session_ids);
-        self.forget_absent();
+        self.forget_absent(&before);
     }
 
     /// Moves the reader one row up the list, wrapping past the top.
-    pub(super) fn select_previous(&mut self) {
-        self.move_selection(-1);
+    pub(super) fn focus_previous(&mut self) {
+        self.move_focus(-1);
     }
 
     /// Moves the reader one row down the list, wrapping past the end.
-    pub(super) fn select_next(&mut self) {
-        self.move_selection(1);
+    pub(super) fn focus_next(&mut self) {
+        self.move_focus(1);
     }
 
     /// Acts on the row the reader is on, reporting the Session to attach where
@@ -1260,42 +1326,51 @@ impl Sidebar {
     /// row stands for a Session Suru could not read, or for the Session already
     /// open — in which case Enter means only that the reader is done choosing,
     /// and the composer takes the keys back.
-    pub(super) fn activate(&mut self, current: Option<SessionId>) -> SidebarActivation {
+    pub(super) fn activate(&mut self, open: Option<SessionId>) -> SidebarActivation {
+        let activation = self.act_on_focus(open);
+        self.release_borrowed_focus();
+        activation
+    }
+
+    /// What acting on the entry row focus stands over comes to, which is the
+    /// whole of [`Self::activate`] but the borrowed-focus bookkeeping around
+    /// it.
+    fn act_on_focus(&mut self, open: Option<SessionId>) -> SidebarActivation {
         if self.workspace_entry.is_some() {
             return self.offer_workspace();
         }
-        let Some(selection) = self.selected.clone() else {
+        let Some(focus) = self.focus.clone() else {
             return SidebarActivation::Answered;
         };
-        let selected = match selection {
-            SidebarSelection::Session(session_id) => session_id,
-            SidebarSelection::ShowMore => {
+        let wanted = match focus {
+            SidebarFocus::Session(session_id) => session_id,
+            SidebarFocus::ShowMore => {
                 self.show_more();
                 return SidebarActivation::Answered;
             }
-            SidebarSelection::Selector => {
+            SidebarFocus::Selector => {
                 self.toggle_selector();
                 return SidebarActivation::Answered;
             }
-            SidebarSelection::Scope(scope) => {
+            SidebarFocus::Scope(scope) => {
                 self.choose_scope(scope);
                 return SidebarActivation::Answered;
             }
-            SidebarSelection::AddWorkspace => {
+            SidebarFocus::AddWorkspace => {
                 self.open_workspace_entry();
                 return SidebarActivation::Answered;
             }
         };
-        if !self.is_readable(selected) {
+        if !self.is_readable(wanted) {
             return SidebarActivation::Answered;
         }
-        if current == Some(selected) {
+        if open == Some(wanted) {
             self.hand_back_keys();
             return SidebarActivation::Answered;
         }
         self.listing.clear_error();
-        self.attaching = Some(selected);
-        SidebarActivation::Attach(selected)
+        self.attaching = Some(wanted);
+        SidebarActivation::Attach(wanted)
     }
 
     /// Opens the path entry the affordance stands for.
@@ -1308,7 +1383,7 @@ impl Sidebar {
     fn open_workspace_entry(&mut self) {
         self.close_selector();
         self.focused = true;
-        self.selected = Some(SidebarSelection::AddWorkspace);
+        self.focus = Some(SidebarFocus::AddWorkspace);
         self.workspace_entry = Some(WorkspaceEntry::default());
     }
 
@@ -1380,7 +1455,7 @@ impl Sidebar {
     pub(super) fn adopt_outlook(&mut self, outlook: Outlook) {
         self.listing.adopt_outlook(outlook);
         self.query.clear();
-        self.selected = None;
+        self.focus = None;
         self.attaching = None;
         self.deleting = None;
         self.menu = None;
@@ -1407,14 +1482,12 @@ impl Sidebar {
     /// as it does under any other narrowing, and nothing is asked of the
     /// server — the listing is the whole body of work either way.
     ///
-    /// The row left marked is the selector, which now says where they are. It
-    /// is the dim mark rather than the lit one, because taking the Workspace
-    /// handed the keys back to the composer: it says where Enter would land
-    /// were the reader to come back, which is what that mark says everywhere
-    /// else in the column.
+    /// Nothing is left marked. Taking the Workspace handed the keys back to
+    /// the composer, and row focus went with them: what the column says now is
+    /// which Session is open and which Workspace it is narrowed to, neither of
+    /// which is a claim about where Enter would land.
     pub(super) fn narrow_to_workspace(&mut self, workspace: PathBuf) {
         self.choose_scope(WorkspaceScope::Workspace(workspace));
-        self.selected = Some(SidebarSelection::Selector);
     }
 
     /// The path entry as a frame draws it, and `None` where there is none to
@@ -1433,9 +1506,9 @@ impl Sidebar {
     /// so they land on the last row it brought up rather than on nothing.
     fn show_more(&mut self) {
         self.settled_on_show = self.settled_on_show.saturating_add(SETTLED_SHELF_BATCH);
-        let selectable = self.selectable();
-        if !selectable.contains(&SidebarSelection::ShowMore) {
-            self.selected = selectable.last().cloned();
+        let focusable = self.focusable();
+        if !focusable.contains(&SidebarFocus::ShowMore) {
+            self.focus = focusable.last().cloned();
         }
     }
 
@@ -1453,7 +1526,7 @@ impl Sidebar {
             return;
         }
         self.selector_open = true;
-        self.selected = Some(SidebarSelection::Scope(self.scope.clone()));
+        self.focus = Some(SidebarFocus::Scope(self.scope.clone()));
     }
 
     /// Puts the entries away, leaving the scope where it was and the reader on
@@ -1463,7 +1536,7 @@ impl Sidebar {
             return;
         }
         self.selector_open = false;
-        self.selected = Some(SidebarSelection::Selector);
+        self.focus = Some(SidebarFocus::Selector);
     }
 
     /// Narrows the Sidebar to one Workspace, or widens it to all of them.
@@ -1486,8 +1559,8 @@ impl Sidebar {
         SidebarSelectorView {
             label: self.scope.label(),
             open: self.selector_open,
-            selected: self.selected == Some(SidebarSelection::Selector),
-            adding: self.selected == Some(SidebarSelection::AddWorkspace),
+            focused: self.focus == Some(SidebarFocus::Selector),
+            adding: self.focus == Some(SidebarFocus::AddWorkspace),
         }
     }
 
@@ -1541,19 +1614,28 @@ impl Sidebar {
 
     /// What a column this many lines tall shows: a list longer than the Sidebar
     /// is read through a window rather than being crammed into the lines
-    /// available. The window moves only as far as it must to keep the row the
-    /// reader is on in view, so moving within it leaves every other row where
-    /// the reader last saw it, and an entry the last line cannot hold whole is
-    /// left off rather than cut in half.
+    /// available. The window moves only as far as it must to keep the row it
+    /// is anchored on in view, so moving within it leaves every other row
+    /// where the reader last saw it, and an entry the last line cannot hold
+    /// whole is left off rather than cut in half.
+    ///
+    /// The anchor is the row the keys are on while the Sidebar has them, and
+    /// the open Session's row otherwise: a column standing beside the Session
+    /// it lists opens on that Session rather than wherever the reader last
+    /// scrolled to. Neither anchor changes what the body holds, so a Session
+    /// with no row simply leaves the window where it was.
     pub(super) fn visible_entries(
         &self,
         capacity: usize,
-        current: Option<SessionId>,
+        open: Option<SessionId>,
     ) -> Vec<SidebarEntry<'_>> {
-        let entries = self.entries(current);
+        let entries = self.entries(open);
         let heights = entries.iter().map(SidebarEntry::lines).collect::<Vec<_>>();
-        let selected = entries.iter().position(SidebarEntry::is_selected);
-        let start = window_start(self.window_start.get(), selected, &heights, capacity);
+        let anchor = entries
+            .iter()
+            .position(SidebarEntry::is_focused)
+            .or_else(|| entries.iter().position(SidebarEntry::is_open));
+        let start = window_start(self.window_start.get(), anchor, &heights, capacity);
         self.window_start.set(start);
         let mut remaining = capacity;
         entries
@@ -1571,7 +1653,7 @@ impl Sidebar {
 
     /// The Sidebar's body as the frame draws it, which is [`Self::body`] with
     /// each entry given what its row says.
-    fn entries(&self, current: Option<SessionId>) -> Vec<SidebarEntry<'_>> {
+    fn entries(&self, open: Option<SessionId>) -> Vec<SidebarEntry<'_>> {
         self.body()
             .into_iter()
             .map(|entry| match entry {
@@ -1579,16 +1661,16 @@ impl Sidebar {
                 BodyEntry::Scope(scope) => SidebarEntry::Scope(SidebarScopeEntry {
                     label: scope.label(),
                     chosen: scope == self.scope,
-                    selected: self.selected == Some(SidebarSelection::Scope(scope.clone())),
+                    focused: self.focus == Some(SidebarFocus::Scope(scope.clone())),
                     scope,
                 }),
                 BodyEntry::ShowMore(count) => SidebarEntry::ShowMore(SidebarShowMore {
                     count,
-                    selected: self.selected == Some(SidebarSelection::ShowMore),
+                    focused: self.focus == Some(SidebarFocus::ShowMore),
                 }),
                 BodyEntry::Session(session, Standing::Active) => self.row(
                     session,
-                    current,
+                    open,
                     SidebarShelf::Active {
                         workspace: session
                             .workspace()
@@ -1599,7 +1681,7 @@ impl Sidebar {
                 ),
                 BodyEntry::Session(session, Standing::Settled) => self.row(
                     session,
-                    current,
+                    open,
                     SidebarShelf::Settled {
                         ended_at: ended_at(session),
                     },
@@ -1715,18 +1797,20 @@ impl Sidebar {
             .take(self.settled_on_show)
             .copied()
             .collect::<Vec<_>>();
-        // The row the reader is on stands whatever the cap says. They reach a
-        // Session from elsewhere than the shelf — the session picker, or the
-        // one they had open when it settled — and a selection drawn nowhere is
-        // one the arrows cannot step off and Enter cannot act on. The clone
-        // makes the same exception for the same reason. It stands at the foot
-        // of the shelf rather than in the order the rest keep, because it is
-        // there on the reader's account rather than on its work's.
-        if let Some(SidebarSelection::Session(selected)) = self.selected
+        // The row the keys are on stands whatever the cap says: focus that
+        // moved onto a row the shelf has since capped away would be one the
+        // arrows cannot step off and Enter cannot act on. It stands at the
+        // foot of the shelf rather than in the order the rest keep, because it
+        // is there on the reader's account rather than on its work's.
+        //
+        // Only focus earns this. The open Session does not: the shelf's cap is
+        // the reader's own reading of their history, and opening a Session
+        // deep in it must not quietly grow the shelf to say so.
+        if let Some(SidebarFocus::Session(focused)) = self.focus
             && let Some(deeper) = settled
                 .iter()
                 .skip(self.settled_on_show)
-                .find(|session| session.id() == selected)
+                .find(|session| session.id() == focused)
                 .copied()
         {
             on_show.push(deeper);
@@ -1741,15 +1825,15 @@ impl Sidebar {
     fn row<'a>(
         &self,
         session: &'a SessionListItem,
-        current: Option<SessionId>,
+        open: Option<SessionId>,
         shelf: SidebarShelf<'a>,
     ) -> SidebarEntry<'a> {
         SidebarEntry::Row(SidebarRow {
             session_id: session.id(),
             emoji: self.emoji.drawn_emoji(session.emoji()),
             title: session.title(),
-            current: current == Some(session.id()),
-            selected: self.selected == Some(SidebarSelection::Session(session.id())),
+            open: open == Some(session.id()),
+            focused: self.focus == Some(SidebarFocus::Session(session.id())),
             unreadable: session.readable().is_none(),
             shelf,
         })
@@ -1810,91 +1894,118 @@ impl Sidebar {
     /// The selector is not among them while its own entries are open: the
     /// reader is inside the control rather than on it, and Esc is the way back
     /// out.
-    fn selectable(&self) -> Vec<SidebarSelection> {
+    fn focusable(&self) -> Vec<SidebarFocus> {
         // A path entry is the one thing a reader with one open is doing, so the
         // affordance that opened it is the one place they can be: the arrows
         // have nowhere to walk while they are saying where to work.
         if self.workspace_entry.is_some() {
-            return vec![SidebarSelection::AddWorkspace];
+            return vec![SidebarFocus::AddWorkspace];
         }
         let rows = self.body().into_iter().filter_map(|entry| match entry {
             BodyEntry::Session(session, _) => session
                 .readable()
-                .map(|_| SidebarSelection::Session(session.id())),
-            BodyEntry::ShowMore(_) => Some(SidebarSelection::ShowMore),
-            BodyEntry::Scope(scope) => Some(SidebarSelection::Scope(scope)),
+                .map(|_| SidebarFocus::Session(session.id())),
+            BodyEntry::ShowMore(_) => Some(SidebarFocus::ShowMore),
+            BodyEntry::Scope(scope) => Some(SidebarFocus::Scope(scope)),
             BodyEntry::Divider => None,
         });
         if self.selector_open {
             return rows.collect();
         }
-        [SidebarSelection::Selector, SidebarSelection::AddWorkspace]
+        [SidebarFocus::Selector, SidebarFocus::AddWorkspace]
             .into_iter()
             .chain(rows)
             .collect()
     }
 
-    /// Whether the row the reader is on is one the Sidebar still draws — which
-    /// asks the body, so a Session dropped from the listing and one a query
-    /// passed over are answered by the same reading.
-    fn holds(&self, selection: &SidebarSelection) -> bool {
-        self.selectable().contains(selection)
-    }
-
-    /// Whether the Sidebar would put the reader on this Session: it is one it
-    /// lists, one their query carries, and one the client could read — a
-    /// listing can report the very Session the reader has open as unreadable,
-    /// and a selection seeded there would stand on a row the arrows exclude.
-    ///
-    /// This is the question [`Self::holds`] cannot answer, because the settled
-    /// shelf shows the row the reader is on however deep it sits — so asking
-    /// the body whether a Session they are not yet on is drawn would answer no
-    /// for the very rows the shelf would have made room for.
-    fn draws(&self, session_id: SessionId) -> bool {
-        self.in_scope()
-            .find(|session| session.id() == session_id)
-            .is_some_and(|session| {
-                session.readable().is_some()
-                    && (self.query.is_empty() || title_carries(&self.query, session.title()))
-            })
-    }
-
-    /// Puts the reader back on a row that is drawn, where the one they were on
-    /// no longer is. Narrowing the list is the ordinary way that happens: they
-    /// type another letter and the row under them steps aside. The rows are
-    /// read once and asked both questions, because reading them means walking
-    /// and sorting the whole listing.
-    fn keep_selection_drawn(&mut self) {
-        let selectable = self.selectable();
-        if self
-            .selected
-            .as_ref()
-            .is_none_or(|selected| !selectable.contains(selected))
-        {
-            self.selected = first_row(&selectable);
+    /// The entries the arrows can reach as the Sidebar draws them now, taken
+    /// before a change so that focus landing nowhere can be carried to the
+    /// nearest entry that survived. A Sidebar pointing at nothing has nothing
+    /// to reconcile, and is spared walking its whole listing to say so.
+    fn focus_order_before_change(&self) -> Vec<SidebarFocus> {
+        if self.focus.is_none() {
+            return Vec::new();
         }
+        self.focusable()
     }
 
-    fn move_selection(&mut self, distance: isize) {
-        let selectable = self.selectable();
-        if selectable.is_empty() {
-            self.selected = None;
+    /// Puts row focus back on a row that is drawn, where the one it was on no
+    /// longer is. Narrowing the list is the ordinary way that happens: the
+    /// reader types another letter and the row under them steps aside.
+    ///
+    /// Where the entry survives, focus stays on it however far the rows moved:
+    /// it is held by what it stands for. Where it does not, focus goes to the
+    /// nearest entry that did survive, read off `before` — the order the
+    /// Sidebar drew before the change — so a live update moves the reader by
+    /// one row rather than throwing them back to the top of the column.
+    ///
+    /// A Sidebar with no row focus is left with none: focus belongs to the
+    /// keys, and a listing arriving is not the reader picking them up. One
+    /// that has them is never left pointing at nothing, so a change that takes
+    /// the last row with it lands focus where entering does — on the selector
+    /// above the list.
+    fn keep_focus_drawn(&mut self, before: &[SidebarFocus]) {
+        let Some(focus) = self.focus.clone() else {
+            return;
+        };
+        let focusable = self.focusable();
+        if focusable.contains(&focus) {
             return;
         }
-        let current = self
-            .selected
+        self.focus = nearest_surviving(before, &focus, &focusable)
+            .or_else(|| first_row(&focusable))
+            .or_else(|| focusable.first().cloned());
+    }
+
+    /// Puts row focus where entering the Sidebar puts it: on the open
+    /// Session's row where the Sidebar draws one, and on the Workspace
+    /// selector otherwise.
+    ///
+    /// Nothing here reveals the open Session. A Session the query, the
+    /// Workspace scope, the settled shelf's cap, or the listing itself leaves
+    /// out has no row to stand on, and the reader starts at the top of the
+    /// column instead — the Sidebar never invents a row, and never puts focus
+    /// on some other Session as a stand-in.
+    ///
+    /// The same reading answers a listing that reports the open Session as
+    /// unreadable: such a row is not one the arrows can reach, so it is not
+    /// one focus can be seeded onto either.
+    fn seed_focus(&mut self, open: Option<SessionId>) {
+        // Read with nothing focused, so the settled shelf's exception for the
+        // focused row cannot conjure the very row this is asking after.
+        self.focus = None;
+        let focusable = self.focusable();
+        self.focus = open
+            .map(SidebarFocus::Session)
+            .filter(|open| focusable.contains(open))
+            .or_else(|| {
+                focusable
+                    .contains(&SidebarFocus::Selector)
+                    .then_some(SidebarFocus::Selector)
+            })
+            .or_else(|| focusable.first().cloned());
+    }
+
+    fn move_focus(&mut self, distance: isize) {
+        let focusable = self.focusable();
+        if focusable.is_empty() {
+            self.focus = None;
+            return;
+        }
+        let standing = self
+            .focus
             .as_ref()
-            .and_then(|selected| selectable.iter().position(|row| row == selected))
+            .and_then(|focus| focusable.iter().position(|entry| entry == focus))
             .unwrap_or(0);
-        let len = selectable.len() as isize;
-        let next = (current as isize + distance).rem_euclid(len) as usize;
-        self.selected = selectable.get(next).cloned();
+        let len = focusable.len() as isize;
+        let next = (standing as isize + distance).rem_euclid(len) as usize;
+        self.focus = focusable.get(next).cloned();
     }
 
     /// Drops what the Sidebar was pointing at once the Session behind it has
     /// left the listing, so no row is attached twice, no menu offers to act on
-    /// work that is gone, and the reader lands back on a row that is there.
-    fn forget_absent(&mut self) {
+    /// work that is gone, and row focus lands back on a row that is there.
+    fn forget_absent(&mut self, before: &[SidebarFocus]) {
         if self
             .attaching
             .is_some_and(|attaching| !self.listing.contains(attaching))
@@ -1914,7 +2025,7 @@ impl Sidebar {
         {
             self.menu = None;
         }
-        self.keep_selection_drawn();
+        self.keep_focus_drawn(before);
     }
 }
 
@@ -2003,20 +2114,20 @@ fn ended_at(session: &SessionListItem) -> SessionTimestamp {
 /// opened on and the entry the reader is now on. Entries are not all one
 /// height — an active Session takes three lines, a settled one and the divider
 /// take one — so the window is measured in lines and reported as the entry it
-/// starts at. It holds still while the selection is inside it, is carried only
-/// as far as the selection takes it, and never so far that it trails blank
+/// starts at. It holds still while its `anchor` is inside it, is carried only
+/// as far as the anchor takes it, and never so far that it trails blank
 /// lines below a list that has since grown shorter.
 ///
 /// A reader standing on the selector above the list is on no entry of the body
 /// at all, and the body holds where they left it: stepping off the top of a
 /// list is not asking to be carried back to its head.
-fn window_start(last: usize, selected: Option<usize>, heights: &[usize], capacity: usize) -> usize {
+fn window_start(last: usize, anchor: Option<usize>, heights: &[usize], capacity: usize) -> usize {
     let furthest = earliest_opening(heights, heights.len().saturating_sub(1), capacity);
-    let Some(selected) = selected else {
+    let Some(anchor) = anchor else {
         return last.min(furthest);
     };
-    let earliest = earliest_opening(heights, selected, capacity);
-    last.min(selected).min(furthest).max(earliest)
+    let earliest = earliest_opening(heights, anchor, capacity);
+    last.min(anchor).min(furthest).max(earliest)
 }
 
 /// The earliest entry a column holding `capacity` lines can open on while
@@ -2036,6 +2147,28 @@ fn earliest_opening(heights: &[usize], last_shown: usize, capacity: usize) -> us
     opening
 }
 
+/// The entry nearest where a lost one stood, read off `before` — the order the
+/// arrows walked before whatever change dropped it. The walk steps outward a
+/// row at a time, down before up at equal distance, because the list reads
+/// downward: a row deleted under the reader hands focus to the one that took
+/// its place rather than to the one above it.
+///
+/// `None` where the lost entry was not in that order at all, which leaves the
+/// caller to fall back on the head of the list.
+fn nearest_surviving(
+    before: &[SidebarFocus],
+    lost: &SidebarFocus,
+    focusable: &[SidebarFocus],
+) -> Option<SidebarFocus> {
+    let stood = before.iter().position(|entry| entry == lost)?;
+    (1..=before.len())
+        .flat_map(|step| [stood.checked_add(step), stood.checked_sub(step)])
+        .flatten()
+        .filter_map(|index| before.get(index))
+        .find(|entry| focusable.contains(entry))
+        .cloned()
+}
+
 /// Where the Sidebar puts a reader with nowhere to stand — the row they were on
 /// having gone, or their never having stood anywhere yet: the first row of the
 /// list itself.
@@ -2045,15 +2178,10 @@ fn earliest_opening(heights: &[usize], last_shown: usize, capacity: usize) -> us
 /// on their work, and reaches either by asking for it. A Sidebar listing
 /// nothing leaves them on nothing, and the arrows land them on the selector's
 /// own line, which is all there is.
-fn first_row(selectable: &[SidebarSelection]) -> Option<SidebarSelection> {
-    selectable
+fn first_row(focusable: &[SidebarFocus]) -> Option<SidebarFocus> {
+    focusable
         .iter()
-        .find(|selection| {
-            !matches!(
-                selection,
-                SidebarSelection::Selector | SidebarSelection::AddWorkspace
-            )
-        })
+        .find(|entry| !matches!(entry, SidebarFocus::Selector | SidebarFocus::AddWorkspace))
         .cloned()
 }
 
@@ -2092,9 +2220,12 @@ mod tests {
             SessionStatus, SessionSummary, SessionTimestamp, SidebarSettings, SidebarVisibility,
             Workspace,
         },
-        tui::sidebar::{
-            MINIMUM_MAIN_WIDTH, SIDEBAR_WIDTH, Sidebar, SidebarActivation, SidebarEntry,
-            width_beside, workspace_name,
+        tui::{
+            SessionListRequest,
+            sidebar::{
+                MINIMUM_MAIN_WIDTH, SIDEBAR_WIDTH, Sidebar, SidebarActivation, SidebarEntry,
+                width_beside, workspace_name,
+            },
         },
     };
 
@@ -2109,7 +2240,7 @@ mod tests {
             "a Sidebar nobody can see asks for nothing"
         );
 
-        sidebar.toggle();
+        sidebar.toggle(None);
 
         assert!(sidebar.is_revealed());
         assert!(sidebar.take_listing_request().is_some());
@@ -2176,13 +2307,13 @@ mod tests {
             "a reader who has not touched the Sidebar is typing their first Prompt"
         );
 
-        sidebar.toggle();
+        sidebar.toggle(None);
         assert!(
             !sidebar.has_focus(),
             "the toggle that closes it holds nothing"
         );
 
-        sidebar.toggle();
+        sidebar.toggle(None);
         assert!(
             sidebar.has_focus(),
             "opening the Sidebar is the reader asking to drive it"
@@ -2199,7 +2330,7 @@ mod tests {
     fn a_sidebar_the_frame_could_not_draw_holds_no_keys() {
         let mut sidebar = Sidebar::new(root());
         sidebar.adopt_settings(&launching(SidebarVisibility::Hidden));
-        sidebar.toggle();
+        sidebar.toggle(None);
         assert!(sidebar.has_focus());
 
         sidebar.forget_frame();
@@ -2223,30 +2354,32 @@ mod tests {
         let open = SessionId::new();
         let listing = vec![summary("Newest", 3, 30), identified(open, "Open", 1)];
 
-        sidebar.toggle();
+        sidebar.toggle(None);
         let request = sidebar.take_listing_request().expect("ask for Sessions");
         sidebar.load(&request, listing, Some(open));
 
-        assert_eq!(selected(&sidebar), Some("Open"));
+        assert_eq!(focused(&sidebar), Some("Open"));
     }
 
     #[test]
     fn the_selection_follows_its_session_through_a_listing_that_lands_under_it() {
-        let mut sidebar = Sidebar::new(root());
         let wanted = SessionId::new();
+        let (mut sidebar, request) = driven();
 
-        sidebar.adopt_settings(&settling_nothing());
-        let request = sidebar.take_listing_request().expect("ask for Sessions");
         sidebar.load(
             &request,
             vec![summary("Newest", 3, 30), identified(wanted, "Wanted", 1)],
             None,
         );
-        sidebar.select_next();
-        assert_eq!(selected(&sidebar), Some("Wanted"));
+        // Down the selector's line and past the first row onto the second.
+        sidebar.focus_next();
+        sidebar.focus_next();
+        sidebar.focus_next();
+        assert_eq!(focused(&sidebar), Some("Wanted"));
 
+        let again = caught_up(&mut sidebar);
         sidebar.load(
-            &request,
+            &again,
             vec![
                 summary("Newer still", 4, 40),
                 identified(wanted, "Wanted", 1),
@@ -2255,31 +2388,34 @@ mod tests {
         );
 
         assert_eq!(
-            selected(&sidebar),
+            focused(&sidebar),
             Some("Wanted"),
             "a listing arriving underneath the reader leaves them on the work, not on the row"
         );
     }
 
     #[test]
-    fn a_session_that_leaves_the_listing_takes_the_selection_off_it() {
-        let mut sidebar = Sidebar::new(root());
+    fn a_session_that_leaves_the_listing_takes_the_focus_off_it() {
         let doomed = SessionId::new();
+        let (mut sidebar, request) = driven();
 
-        sidebar.toggle();
-        let request = sidebar.take_listing_request().expect("ask for Sessions");
         sidebar.load(
             &request,
             vec![summary("Survivor", 2, 20), identified(doomed, "Doomed", 1)],
             None,
         );
-        sidebar.select_next();
+        // Down the selector's line and the first row onto the doomed one.
+        sidebar.focus_next();
+        sidebar.focus_next();
+        sidebar.focus_next();
+        assert_eq!(focused(&sidebar), Some("Doomed"));
+
         sidebar.remove(doomed);
 
         assert_eq!(
-            selected(&sidebar),
+            focused(&sidebar),
             Some("Survivor"),
-            "a Session deleted elsewhere lands the reader back on a row that is there"
+            "a Session deleted elsewhere lands the keys on the nearest row that is there"
         );
     }
 
@@ -2288,7 +2424,7 @@ mod tests {
         let mut sidebar = Sidebar::new(root());
         let open = SessionId::new();
 
-        sidebar.toggle();
+        sidebar.toggle(None);
         let request = sidebar.take_listing_request().expect("ask for Sessions");
         sidebar.load(&request, vec![identified(open, "Open", 1)], Some(open));
 
@@ -2441,14 +2577,12 @@ mod tests {
     fn the_affordance_brings_up_a_batch_at_a_time_to_the_end_of_the_shelf() {
         let mut sidebar = showing(set_aside_shelf(40));
 
-        // Past the top of the list is the selector's own line — the affordance
-        // beside it, then the selector — and past that the affordance at the
-        // shelf's foot. None of them stands for a Session; which one the reader
-        // is on is what activating says.
-        sidebar.select_previous();
-        sidebar.select_previous();
-        sidebar.select_previous();
-        assert_eq!(selected(&sidebar), None);
+        // Opening with no Session open starts the keys on the selector, and up
+        // off the top of the column wraps to the last entry of all: the
+        // affordance at the shelf's foot. It stands for no Session, which is
+        // what activating it says.
+        sidebar.focus_previous();
+        assert_eq!(focused(&sidebar), None);
 
         assert_eq!(
             sidebar.activate(None),
@@ -2471,18 +2605,57 @@ mod tests {
             "the divider and the whole shelf, with no affordance left to draw"
         );
         assert_eq!(
-            selected(&sidebar),
+            focused(&sidebar),
             Some("Settled 39"),
             "the affordance the reader was on is gone, so they land on the last row it uncovered"
         );
     }
 
-    /// A reader reaches a Session from somewhere other than the shelf — the
-    /// session picker, or the Session they had open when it settled — and the
-    /// cap must not then hide the row they are on: a selection drawn nowhere
-    /// is one the arrows cannot step off and Enter cannot act on.
+    /// Work the reader had the keys on can sink past the cap underneath them —
+    /// another client settles two Sessions, and the row they were on is the
+    /// eleventh of a shelf showing ten. The cap must not then hide it: focus
+    /// drawn nowhere is focus the arrows cannot step off and Enter cannot act
+    /// on.
     #[test]
-    fn the_shelf_shows_the_row_the_reader_is_on_however_deep_it_sits() {
+    fn the_shelf_goes_on_showing_the_row_the_keys_are_on_however_deep_it_sinks() {
+        let deep = SessionId::new();
+        let mut whole = set_aside_shelf(12);
+        let SessionListItem::Readable(deepest) = &mut whole[11] else {
+            unreachable!("the fixture builds readable Sessions");
+        };
+        deepest.session.id = deep;
+        // The shelf as it stood when the reader put the keys on its last row:
+        // ten rows, which is exactly what the cap shows.
+        let shallower = whole[2..].to_vec();
+
+        let (mut sidebar, request) = driven();
+        sidebar.load(&request, shallower, Some(deep));
+        assert_eq!(focused(&sidebar), Some("Settled 11"));
+
+        let again = caught_up(&mut sidebar);
+        sidebar.load(&again, whole, Some(deep));
+
+        let drawn = drawn(&sidebar);
+        assert_eq!(
+            drawn[11], "Settled 11",
+            "the row the keys are on stands at the foot of the shelf, on the reader's account rather than its work's: {drawn:?}"
+        );
+        assert_eq!(
+            drawn[12], "Show 1 more",
+            "and is no longer one of the rows the affordance offers: {drawn:?}"
+        );
+        assert_eq!(
+            focused(&sidebar),
+            Some("Settled 11"),
+            "so the reader can see the row they are on, and step off it"
+        );
+    }
+
+    /// The open Session earns no such exception. How deep a reader's history
+    /// is on show is their own reading of it, and opening something out of
+    /// sight must not quietly grow the shelf to say so.
+    #[test]
+    fn a_deeply_settled_open_session_is_left_under_the_shelf_cap() {
         let deep = SessionId::new();
         let mut shelf = set_aside_shelf(12);
         let SessionListItem::Readable(deepest) = &mut shelf[11] else {
@@ -2493,35 +2666,32 @@ mod tests {
         let sidebar = showing_on(shelf, Some(deep));
 
         let drawn = drawn(&sidebar);
-        assert_eq!(
-            drawn[11], "Settled 11",
-            "the row the reader is on stands at the foot of the shelf, on their account rather than its work's: {drawn:?}"
+        assert!(
+            !drawn.contains(&"Settled 11".to_owned()),
+            "the shelf shows the ten rows it opens on, whatever is open: {drawn:?}"
         );
         assert_eq!(
-            drawn[12], "Show 1 more",
-            "and is no longer one of the rows the affordance offers: {drawn:?}"
+            drawn.last().map(String::as_str),
+            Some("Show 2 more"),
+            "and goes on offering both the rows under it: {drawn:?}"
         );
         assert_eq!(
-            selected(&sidebar),
-            Some("Settled 11"),
-            "so the reader can see the row they are on, and step off it"
+            focused(&sidebar),
+            None,
+            "with no row for the open Session, the keys start on the selector rather than on some              other Session standing in for it"
         );
     }
 
     #[test]
     fn a_sidebar_asked_for_afresh_opens_the_shelf_on_its_first_rows_again() {
         let mut sidebar = showing(set_aside_shelf(12));
-        // Up off the list onto the selector's own line — the add-Workspace
-        // affordance, then the selector — and up again onto the affordance at
-        // the shelf's foot.
-        sidebar.select_previous();
-        sidebar.select_previous();
-        sidebar.select_previous();
+        // Up off the selector wraps to the affordance at the shelf's foot.
+        sidebar.focus_previous();
         let _ = sidebar.activate(None);
         assert_eq!(drawn(&sidebar).len(), 13, "the whole shelf is on show");
 
-        sidebar.toggle();
-        sidebar.toggle();
+        sidebar.toggle(None);
+        sidebar.toggle(None);
         let request = sidebar
             .take_listing_request()
             .expect("a Sidebar coming back into view asks for its Sessions");
@@ -2586,7 +2756,7 @@ mod tests {
         );
 
         sidebar.record_drawn();
-        sidebar.toggle();
+        sidebar.toggle(None);
 
         assert!(
             !sidebar.shows_live_work(),
@@ -2627,14 +2797,38 @@ mod tests {
     }
 
     /// The same, for a reader who has one of those Sessions open.
-    fn showing_on(sessions: Vec<SessionListItem>, current: Option<SessionId>) -> Sidebar {
+    fn showing_on(sessions: Vec<SessionListItem>, open: Option<SessionId>) -> Sidebar {
+        let (mut sidebar, request) = driven();
+        sidebar.load(&request, sessions, open);
+        sidebar
+    }
+
+    /// The listing a Sidebar already on screen asks for to catch up with a
+    /// catalog that moved under it, which is the ask every question about
+    /// reconciling live updates is answered through: a listing already
+    /// answered cannot be answered twice.
+    fn caught_up(sidebar: &mut Sidebar) -> SessionListRequest {
+        sidebar.catch_up();
+        sidebar
+            .take_listing_request()
+            .expect("a revealed Sidebar catching up asks again")
+    }
+
+    /// A Sidebar the reader opened themselves, with the listing it asked for
+    /// on opening still to be answered. It is the reader's own opening that
+    /// gives the Sidebar the keys, and so the row focus every question about
+    /// the arrows is asked of.
+    fn driven() -> (Sidebar, SessionListRequest) {
         let mut sidebar = Sidebar::new(root());
         sidebar.adopt_settings(&settling_nothing());
+        // The Setting revealed it without taking the keys, so the reader
+        // closes it and opens it themselves.
+        sidebar.toggle(None);
+        sidebar.toggle(None);
         let request = sidebar
             .take_listing_request()
             .expect("a revealed Sidebar asks for its Sessions");
-        sidebar.load(&request, sessions, current);
-        sidebar
+        (sidebar, request)
     }
 
     /// The Sidebar's whole body, top to bottom, as the Titles it draws — and,
@@ -2663,12 +2857,12 @@ mod tests {
     /// The Title of the row the reader is on, where they are on a Session. The
     /// settled shelf's affordance stands for none, so a reader on it is on no
     /// Title at all.
-    fn selected(sidebar: &Sidebar) -> Option<&str> {
+    fn focused(sidebar: &Sidebar) -> Option<&str> {
         sidebar
             .entries(None)
             .into_iter()
             .find_map(|entry| match entry {
-                SidebarEntry::Row(row) if row.selected => Some(row.title),
+                SidebarEntry::Row(row) if row.focused => Some(row.title),
                 _ => None,
             })
     }

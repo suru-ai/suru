@@ -914,8 +914,8 @@ fn opening_the_sidebar_takes_the_keys_from_the_composer() {
         "what they type goes to the Sidebar's own search box: {rows:?}"
     );
     assert!(
-        selected_sidebar_text(&application).contains("Listed work"),
-        "the row the reader would act on stands out from the rest of the column"
+        selected_sidebar_text(&application).contains(ALL_WORKSPACES),
+        "the entry the reader would act on stands out from the rest of the column"
     );
 }
 
@@ -932,9 +932,12 @@ fn the_arrows_move_the_selection_and_wrap_past_the_ends() {
     );
 
     assert!(
-        selected_sidebar_text(&application).contains("Newest"),
-        "an opened Sidebar starts on the row nearest the reader"
+        selected_sidebar_text(&application).contains(ALL_WORKSPACES),
+        "an opened Sidebar with no Session open starts on the Workspace selector"
     );
+
+    step_onto_the_list(&mut application);
+    assert!(selected_sidebar_text(&application).contains("Newest"));
 
     press_sidebar_key(&mut application, KeyCode::Down);
     assert!(selected_sidebar_text(&application).contains("Middle"));
@@ -983,6 +986,7 @@ fn the_column_windows_onto_the_selection_for_a_list_longer_than_it() {
         "a list longer than the column is drawn through a window, not crammed in: {opening:?}"
     );
 
+    step_onto_the_list(&mut application);
     for _ in 0..5 {
         press_sidebar_key(&mut application, KeyCode::Down);
     }
@@ -1011,6 +1015,7 @@ fn enter_attaches_the_selected_session_in_place() {
         ],
     );
 
+    step_onto_the_list(&mut application);
     press_sidebar_key(&mut application, KeyCode::Down);
 
     assert_eq!(
@@ -1035,6 +1040,7 @@ fn leaving_for_the_landing_while_a_session_is_opening_reports_the_client_letting
         workspace.path(),
         vec![listed_as(wanted, "The work wanted", workspace.path(), 1)],
     );
+    step_onto_the_list(&mut application);
     assert!(matches!(
         press_sidebar_key(&mut application, KeyCode::Enter),
         ApplicationTransition::AttachSession(_)
@@ -1067,6 +1073,7 @@ fn moving_workspace_while_a_session_is_opening_reports_the_client_letting_go() {
     let wanted = SessionId::new();
     let mut application =
         sidebar_focused(&here, vec![listed_as(wanted, "The work wanted", &here, 1)]);
+    step_onto_the_list(&mut application);
     assert!(matches!(
         press_sidebar_key(&mut application, KeyCode::Enter),
         ApplicationTransition::AttachSession(_)
@@ -1120,6 +1127,9 @@ fn a_session_being_opened_leaves_the_open_session_taking_its_own_events() {
             )],
         })
         .expect("hydrate the Sidebar beside the open Session");
+    // The open Session has no row in this listing, so opening the Sidebar
+    // starts the keys on the Workspace selector rather than on a Session.
+    step_onto_the_list(&mut application);
     assert!(
         matches!(
             press_sidebar_key(&mut application, KeyCode::Enter),
@@ -1214,9 +1224,9 @@ fn esc_hands_the_keys_back_without_hiding_the_sidebar() {
         "nothing in the column claims the keys any more"
     );
     assert!(
-        sidebar_text_on(&application, Color::DarkGray).contains("Listed work"),
-        "the row the reader left off on is still marked, dimly, because it is still the row \
-         Enter would act on"
+        !sidebar_text_on(&application, Color::DarkGray).contains("Listed work"),
+        "and nothing is left dimly marked either: row focus says what Enter would act on, and \
+         Enter no longer acts on the column"
     );
 }
 
@@ -1245,7 +1255,7 @@ fn the_toggle_closes_the_sidebar_from_inside_it() {
 }
 
 #[test]
-fn an_open_overlay_keeps_the_keys_while_the_sidebar_holds_focus() {
+fn an_open_overlay_hides_the_sidebars_row_focus_and_giving_the_keys_back_restores_it() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
@@ -1254,6 +1264,9 @@ fn an_open_overlay_keeps_the_keys_while_the_sidebar_holds_focus() {
             listed("Older work", None, workspace.path(), 1, now()),
         ],
     );
+    step_onto_the_list(&mut application);
+    assert!(selected_sidebar_text(&application).contains("Nearest work"));
+
     let ApplicationTransition::ListSessions(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
             SemanticCommandId::SessionList,
@@ -1269,11 +1282,23 @@ fn an_open_overlay_keeps_the_keys_while_the_sidebar_holds_focus() {
         })
         .expect("hydrate the picker");
 
+    assert!(
+        !selected_sidebar_text(&application).contains("Nearest work"),
+        "the overlay owns the keys, so nothing in the column claims them"
+    );
+
     press_sidebar_key(&mut application, KeyCode::Down);
 
     assert!(
+        !selected_sidebar_text(&application).contains("Older work"),
+        "and the arrows reach the overlay rather than the column behind it"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Esc);
+
+    assert!(
         selected_sidebar_text(&application).contains("Nearest work"),
-        "an overlay over the main view owns the keys, so the Sidebar's selection stays put"
+        "the keys coming back bring the Sidebar's row focus back exactly where it was"
     );
 }
 
@@ -1329,9 +1354,11 @@ fn the_arrows_pass_over_a_row_suru_cannot_read() {
         ],
     );
 
+    step_onto_the_list(&mut application);
     assert!(
         selected_sidebar_text(&application).contains("Newest"),
-        "an opened Sidebar starts on the nearest row it could open, not the damaged one above it"
+        "stepping onto the list lands on the nearest row it could open, not the damaged one \
+         above it"
     );
 
     press_sidebar_key(&mut application, KeyCode::Down);
@@ -1418,9 +1445,21 @@ fn seeding_passes_over_an_open_session_that_arrives_unreadable() {
         })
         .expect("hydrate the Sidebar beside the open Session");
 
+    let marked = selected_sidebar_text(&application);
     assert!(
-        selected_sidebar_text(&application).contains("Readable work"),
-        "the reader starts on a row that can be opened rather than on the damaged open Session"
+        !marked.contains("Broken work"),
+        "the keys never start on the damaged open Session: its row is one the arrows cannot \
+         leave and Enter cannot act on: {marked:?}"
+    );
+    assert!(
+        marked.contains(ALL_WORKSPACES),
+        "so they start where they start whenever the open Session has no openable row — on the \
+         Workspace selector: {marked:?}"
+    );
+    assert!(
+        open_sidebar_text(&application).contains("Broken work"),
+        "while the damaged row keeps the open highlight, because it is still the Session the \
+         reader is looking at"
     );
 }
 
@@ -1536,6 +1575,7 @@ fn the_keys_after_the_toggle_reach_the_sidebar_before_the_next_frame() {
         })
         .expect("hydrate the Sidebar");
 
+    step_onto_the_list(&mut application);
     press_sidebar_key(&mut application, KeyCode::Down);
 
     assert!(
@@ -1564,6 +1604,7 @@ fn the_window_holds_still_while_the_selection_moves_inside_it() {
     // settles the window — one is drawn after each run of keys, as the run
     // loop draws after each run of terminal events.
     rendered_application_rows_at(&application, WIDE, WINDOWED);
+    step_onto_the_list(&mut application);
     for _ in 0..5 {
         press_sidebar_key(&mut application, KeyCode::Down);
         rendered_application_rows_at(&application, WIDE, WINDOWED);
@@ -1604,6 +1645,14 @@ fn press_sidebar_key(application: &mut Application, code: KeyCode) -> Applicatio
         .expect("press a Sidebar key")
 }
 
+/// Steps row focus from where opening the Sidebar with no Session open leaves
+/// it — the Workspace selector — down past the affordance beside it and onto
+/// the first row of the list, which is where most of these readings begin.
+fn step_onto_the_list(application: &mut Application) {
+    press_sidebar_key(application, KeyCode::Down);
+    press_sidebar_key(application, KeyCode::Down);
+}
+
 /// The Sidebar text this frame draws on `background`, read across the columns
 /// the Sidebar occupies so the main view beside it contributes nothing.
 fn sidebar_text_on(application: &Application, background: Color) -> String {
@@ -1613,6 +1662,371 @@ fn sidebar_text_on(application: &Application, background: Color) -> String {
 /// The Sidebar row the reader is on while they are driving the Sidebar.
 fn selected_sidebar_text(application: &Application) -> String {
     sidebar_text_on(application, Color::Blue)
+}
+
+/// The Sidebar row standing for the Session the main view has open.
+fn open_sidebar_text(application: &Application) -> String {
+    sidebar_text_on(application, Color::Cyan)
+}
+
+/// The screen rows whose leftmost Sidebar column carries the open Session's
+/// rail, which is what says "open" when the row itself carries row focus.
+fn open_rail_rows(application: &Application) -> Vec<u16> {
+    let buffer = rendered_application_buffer(application, WIDE, 20);
+    (0..20)
+        .filter(|row| {
+            buffer
+                .cell((0, *row))
+                .is_some_and(|cell| cell.bg == Color::Cyan)
+        })
+        .collect()
+}
+
+/// Puts a Session in the main view without going through the Sidebar, which is
+/// what makes it the open Session the Sidebar draws its highlight on.
+fn open_session(application: &mut Application, workspace: &Path, session_id: SessionId) {
+    application
+        .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
+            session_id,
+            PromptId::new(),
+            "Initial Prompt",
+            workspace,
+        )))
+        .expect("open a Session in the main view");
+}
+
+/// Puts a Subagent's Session in the main view: a child of `parent`, which the
+/// server keeps out of every listing and so out of the Sidebar.
+fn open_subagent_session(application: &mut Application, workspace: &Path, parent: SessionId) {
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Delegated work",
+        workspace,
+    );
+    snapshot.session.parent = Some(parent);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("open a Subagent's Session in the main view");
+}
+
+/// Opens the Sidebar the way the reader does — the toggle, which takes the
+/// keys — and answers the listing that opening asks for.
+fn enter_the_sidebar(application: &mut Application, sessions: Vec<SessionListItem>) {
+    press_toggle(application);
+    let request = expect_sidebar_listing(press_toggle(application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+        .expect("hydrate the Sidebar the reader opened");
+}
+
+// The Sidebar's two states, kept apart: the persistent cyan highlight on the
+// Session the main view has open, and the transient blue focus on the row the
+// keys are on.
+
+#[test]
+fn the_landing_highlights_no_session_row() {
+    let workspace = workspace_dir();
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![listed("Listed work", None, workspace.path(), 1, now())],
+    );
+
+    assert!(
+        drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "Listed work"
+        ),
+        "the column lists the work either way"
+    );
+    assert!(
+        open_sidebar_text(&application).is_empty(),
+        "no Session is open on the Landing, so no row stands for one"
+    );
+    assert!(
+        open_rail_rows(&application).is_empty(),
+        "and nothing carries the rail either"
+    );
+}
+
+#[test]
+fn the_open_session_row_is_highlighted_whoever_holds_the_keys() {
+    let workspace = workspace_dir();
+    let open = SessionId::new();
+    let sessions = vec![
+        listed_as(SessionId::new(), "Other work", workspace.path(), 2),
+        listed_as(open, "The work open", workspace.path(), 1),
+    ];
+    let mut application = sidebar_showing(workspace.path(), sessions.clone());
+    open_session(&mut application, workspace.path(), open);
+
+    let highlighted = open_sidebar_text(&application);
+    assert!(
+        highlighted.contains("The work open"),
+        "the open Session's row is highlighted while the reader writes into it: {highlighted:?}"
+    );
+    assert!(
+        !highlighted.contains("Other work"),
+        "and no other row is: {highlighted:?}"
+    );
+
+    enter_the_sidebar(&mut application, sessions);
+
+    assert!(
+        open_rail_rows(&application).len() == 3,
+        "the keys moving to the Sidebar leave the open Session open: its row carries the rail \
+         down all three of its lines"
+    );
+    assert!(
+        selected_sidebar_text(&application).contains("The work open"),
+        "which is also where entering the Sidebar puts row focus"
+    );
+}
+
+#[test]
+fn a_row_that_is_both_open_and_focused_is_a_blue_row_with_a_cyan_rail() {
+    let workspace = workspace_dir();
+    let open = SessionId::new();
+    let sessions = vec![listed_as(open, "The work open", workspace.path(), 1)];
+    let mut application = sidebar_showing(workspace.path(), sessions.clone());
+    open_session(&mut application, workspace.path(), open);
+    enter_the_sidebar(&mut application, sessions);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let title = u16::try_from(rendered_row(&rows, "The work open")).expect("a screen row");
+
+    assert!(
+        selected_sidebar_text(&application).contains("The work open"),
+        "row focus takes the row itself, because it is the state the arrows move"
+    );
+    assert_eq!(
+        open_rail_rows(&application),
+        vec![title - 1, title, title + 1],
+        "and the open Session keeps the rail down the row's left, so neither state is hidden"
+    );
+}
+
+#[test]
+fn the_arrows_move_row_focus_without_changing_the_open_session() {
+    let workspace = workspace_dir();
+    let open = SessionId::new();
+    let sessions = vec![
+        listed_as(SessionId::new(), "Newer work", workspace.path(), 2),
+        listed_as(open, "The work open", workspace.path(), 1),
+    ];
+    let mut application = sidebar_showing(workspace.path(), sessions.clone());
+    open_session(&mut application, workspace.path(), open);
+    enter_the_sidebar(&mut application, sessions);
+
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Up),
+        ApplicationTransition::Continue,
+        "walking the column opens nothing"
+    );
+
+    assert!(
+        selected_sidebar_text(&application).contains("Newer work"),
+        "the arrows move row focus"
+    );
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let title = u16::try_from(rendered_row(&rows, "The work open")).expect("a screen row");
+    assert_eq!(
+        open_rail_rows(&application),
+        vec![title - 1, title, title + 1],
+        "and leave the open Session exactly where it was"
+    );
+    assert!(
+        open_sidebar_text(&application).contains("The work open"),
+        "whose row goes on carrying the open highlight now that focus has left it"
+    );
+}
+
+#[test]
+fn enter_on_the_open_session_hands_the_keys_back_without_opening_it_again() {
+    let workspace = workspace_dir();
+    let open = SessionId::new();
+    let sessions = vec![listed_as(open, "The work open", workspace.path(), 1)];
+    let mut application = sidebar_showing(workspace.path(), sessions.clone());
+    open_session(&mut application, workspace.path(), open);
+    enter_the_sidebar(&mut application, sessions);
+
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "the reader is already in this Session, so nothing is attached again"
+    );
+
+    type_terminal_text(&mut application, "hello");
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        rows.iter().any(|row| row.contains("hello")),
+        "Enter hands the keys to the open Session's composer: {rows:?}"
+    );
+    assert!(
+        selected_sidebar_text(&application).is_empty(),
+        "and row focus goes with them"
+    );
+    assert!(
+        open_sidebar_text(&application).contains("The work open"),
+        "while the open highlight stays, because the Session is still the one on show"
+    );
+}
+
+/// Search narrows what the Sidebar lists. It is never widened to keep an
+/// indicator on screen: a query the open Session's Title does not carry simply
+/// leaves it without a row.
+#[test]
+fn a_query_that_leaves_the_open_session_out_highlights_nothing() {
+    let workspace = workspace_dir();
+    let open = SessionId::new();
+    let sessions = vec![
+        listed_as(SessionId::new(), "Match kept", workspace.path(), 2),
+        listed_as(open, "The work open", workspace.path(), 1),
+    ];
+    let mut application = sidebar_showing(workspace.path(), sessions.clone());
+    open_session(&mut application, workspace.path(), open);
+    enter_the_sidebar(&mut application, sessions);
+    type_terminal_text(&mut application, "match");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        !drawn_in_sidebar(&rows, "The work open"),
+        "the results are the reader's query rather than the Sidebar's indicator: {rows:?}"
+    );
+    assert!(
+        open_sidebar_text(&application).is_empty(),
+        "so no row is highlighted at all"
+    );
+    assert!(
+        open_rail_rows(&application).is_empty(),
+        "and no result stands in for the Session that is open"
+    );
+}
+
+/// Narrowing to a Workspace is a claim about where work is. An open Session
+/// rooted elsewhere has no row, and none of the rows in scope stand in for it.
+#[test]
+fn a_workspace_scope_that_leaves_the_open_session_out_highlights_nothing() {
+    let workspace = workspace_dir();
+    let open = SessionId::new();
+    let mut sessions = two_workspaces(workspace.path());
+    sessions.push(listed_as(
+        open,
+        "Rooted apart",
+        &workspace.path().join("apart"),
+        5,
+    ));
+    let mut application = sidebar_showing(workspace.path(), sessions);
+    open_session(&mut application, workspace.path(), open);
+    assert!(open_sidebar_text(&application).contains("Rooted apart"));
+
+    choose_workspace(&mut application, "notes");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        !drawn_in_sidebar(&rows, "Rooted apart"),
+        "narrowing holds, whatever is open: {rows:?}"
+    );
+    assert!(
+        open_sidebar_text(&application).is_empty(),
+        "and the Workspace's own rows are not highlighted in its place"
+    );
+}
+
+/// How deep a reader's history is on show is their own reading of it. Opening
+/// something below the shelf's cap must not grow or reorder the shelf to say
+/// so.
+#[test]
+fn a_settled_open_session_below_the_shelf_cap_highlights_nothing() {
+    let workspace = workspace_dir();
+    let open = SessionId::new();
+    let mut sessions = set_aside_shelf(workspace.path(), 12);
+    let SessionListItem::Readable(deepest) = &mut sessions[11] else {
+        unreachable!("the fixture builds readable Sessions");
+    };
+    deepest.session.id = open;
+    let mut application = sidebar_showing(workspace.path(), sessions);
+
+    open_session(&mut application, workspace.path(), open);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        !drawn_in_sidebar(&rows, "Ended 11"),
+        "the shelf shows the ten rows it opens on: {rows:?}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Show 2 more"),
+        "and goes on offering both the rows under it: {rows:?}"
+    );
+    assert!(
+        open_sidebar_text(&application).is_empty(),
+        "with no row for the open Session, nothing is highlighted"
+    );
+}
+
+/// A Subagent's Session joins no listing, so opening one leaves the column
+/// with nothing to highlight — and nothing to put the keys on but the
+/// selector. It must never reach for the parent's row, or some other row, to
+/// have something to mark.
+#[test]
+fn an_open_subagent_session_highlights_nothing_and_seeds_the_selector() {
+    let workspace = workspace_dir();
+    let parent = SessionId::new();
+    let sessions = vec![listed_as(parent, "The parent work", workspace.path(), 1)];
+    let mut application = sidebar_showing(workspace.path(), sessions.clone());
+
+    open_subagent_session(&mut application, workspace.path(), parent);
+
+    assert!(
+        drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "The parent work"
+        ),
+        "the parent goes on standing in the column"
+    );
+    assert!(
+        open_sidebar_text(&application).is_empty(),
+        "but it is no stand-in for the Subagent Session that is open"
+    );
+    assert!(open_rail_rows(&application).is_empty());
+
+    enter_the_sidebar(&mut application, sessions);
+
+    assert!(
+        selected_sidebar_text(&application).contains(ALL_WORKSPACES),
+        "and entering the Sidebar starts the keys on the Workspace selector rather than \
+         inventing a selected Session"
+    );
+}
+
+/// A listing that drops the row the keys are on moves them by one row rather
+/// than throwing them back to the top of the column.
+#[test]
+fn a_listing_that_drops_the_focused_row_moves_the_keys_to_the_nearest_survivor() {
+    let workspace = workspace_dir();
+    let doomed = SessionId::new();
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed_as(SessionId::new(), "First work", workspace.path(), 3),
+            listed_as(doomed, "Second work", workspace.path(), 2),
+            listed_as(SessionId::new(), "Third work", workspace.path(), 1),
+        ],
+    );
+    step_onto_the_list(&mut application);
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(selected_sidebar_text(&application).contains("Second work"));
+
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SessionDeleted(
+            SessionDeleted { session_id: doomed },
+        )))
+        .expect("take the deletion another client made");
+
+    assert!(
+        selected_sidebar_text(&application).contains("Third work"),
+        "the row that took its place is the nearest one that survived"
+    );
 }
 
 #[test]
@@ -2093,10 +2507,8 @@ fn the_arrows_walk_across_the_divider_onto_the_settled_shelf() {
         ],
     );
 
-    assert!(
-        selected_sidebar_text(&application).contains("Still going"),
-        "an opened Sidebar starts on the row nearest the reader"
-    );
+    step_onto_the_list(&mut application);
+    assert!(selected_sidebar_text(&application).contains("Still going"));
 
     press_sidebar_key(&mut application, KeyCode::Down);
     assert!(
@@ -2155,11 +2567,8 @@ fn the_affordance_shows_twenty_five_more_and_repeats_to_the_end_of_the_shelf() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), set_aside_shelf(workspace.path(), 40));
 
-    // Past the top of the list is the selector's own line — the add-Workspace
-    // affordance beside it, then the selector — and past that the affordance
-    // closing the shelf.
-    press_sidebar_key(&mut application, KeyCode::Up);
-    press_sidebar_key(&mut application, KeyCode::Up);
+    // Opening starts on the selector, and up off the top of the column wraps
+    // to the last entry of all: the affordance closing the shelf.
     press_sidebar_key(&mut application, KeyCode::Up);
     assert_eq!(
         selected_sidebar_text(&application).trim(),
@@ -2212,11 +2621,8 @@ fn the_affordance_shows_twenty_five_more_and_repeats_to_the_end_of_the_shelf() {
 fn a_sidebar_asking_for_its_sessions_afresh_opens_the_shelf_on_its_first_rows() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), set_aside_shelf(workspace.path(), 12));
-    // Up off the list onto the selector's own line — the add-Workspace
-    // affordance, then the selector — and up again onto the affordance at the
-    // shelf's foot.
-    press_sidebar_key(&mut application, KeyCode::Up);
-    press_sidebar_key(&mut application, KeyCode::Up);
+    // Opening starts on the selector, and up off the top of the column wraps
+    // to the last entry of all: the affordance at the shelf's foot.
     press_sidebar_key(&mut application, KeyCode::Up);
     press_sidebar_key(&mut application, KeyCode::Enter);
     assert!(
@@ -2607,11 +3013,13 @@ fn enter_attaches_the_result_the_reader_is_on() {
         ],
     );
 
+    step_onto_the_list(&mut application);
     type_terminal_text(&mut application, "wanted");
 
     assert!(
         selected_sidebar_text(&application).contains("The work wanted"),
-        "a query that leaves the selection nowhere puts the reader on the first result"
+        "a query that leaves the row the keys were on out of the results carries them onto the \
+         nearest one that survived"
     );
     assert_eq!(
         press_sidebar_key(&mut application, KeyCode::Enter),
@@ -2639,6 +3047,7 @@ fn the_arrows_walk_the_results_and_wrap_within_them() {
 
     type_terminal_text(&mut application, "match");
 
+    step_onto_the_list(&mut application);
     press_sidebar_key(&mut application, KeyCode::Down);
     assert!(
         selected_sidebar_text(&application).contains("Match second"),
@@ -2703,6 +3112,7 @@ fn a_result_retitled_elsewhere_out_of_the_query_takes_the_reader_with_it() {
         ],
     );
     type_terminal_text(&mut application, "match");
+    step_onto_the_list(&mut application);
     press_sidebar_key(&mut application, KeyCode::Down);
     assert!(
         selected_sidebar_text(&application).contains("Match moving"),
@@ -2908,8 +3318,13 @@ fn a_left_press_on_a_row_suru_cannot_read_does_nothing() {
         "the press starts no attachment that is guaranteed to fail"
     );
     assert!(
-        sidebar_text_on(&application, Color::DarkGray).contains("Readable work"),
-        "and the reader is left on the row they were on"
+        selected_sidebar_text(&application).is_empty(),
+        "and it raises nothing in the column: the press said nothing the reader could act on, \
+         and the keys are in the composer either way"
+    );
+    assert!(
+        open_sidebar_text(&application).is_empty(),
+        "nor does it open anything"
     );
 }
 
@@ -3600,6 +4015,7 @@ fn the_arrows_reach_the_selector_above_the_list() {
         vec![listed("Listed work", None, workspace.path(), 1, now())],
     );
 
+    step_onto_the_list(&mut application);
     press_sidebar_key(&mut application, KeyCode::Up);
     press_sidebar_key(&mut application, KeyCode::Up);
 
@@ -3692,11 +4108,9 @@ fn two_workspaces(root: &Path) -> Vec<SessionListItem> {
 }
 
 /// Opens the selector's entries the way a reader driving the Sidebar from the
-/// keyboard does: up off the list, past the affordance sharing the selector's
-/// line, onto the selector itself, then Enter.
+/// keyboard does. Opening the Sidebar with no Session open leaves row focus on
+/// the selector itself, so Enter is the whole of it.
 fn open_selector(application: &mut Application) {
-    press_sidebar_key(application, KeyCode::Up);
-    press_sidebar_key(application, KeyCode::Up);
     press_sidebar_key(application, KeyCode::Enter);
 }
 
@@ -4159,6 +4573,7 @@ fn the_arrows_reach_the_affordance_beside_the_selector() {
         vec![listed("Listed work", None, workspace.path(), 1, now())],
     );
 
+    step_onto_the_list(&mut application);
     press_sidebar_key(&mut application, KeyCode::Up);
 
     assert_eq!(
@@ -4565,6 +4980,7 @@ fn a_catch_up_leaves_the_reader_on_the_row_they_were_on() {
             .collect::<Vec<_>>()
     };
     let mut application = sidebar_focused(workspace.path(), listing(None));
+    step_onto_the_list(&mut application);
     press_sidebar_key(&mut application, KeyCode::Down);
     assert!(
         selected_sidebar_text(&application).contains("Older work"),
@@ -4590,11 +5006,8 @@ fn a_catch_up_leaves_the_reader_on_the_row_they_were_on() {
 fn a_catch_up_leaves_the_settled_shelf_as_deep_as_the_reader_walked_it() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), set_aside_shelf(workspace.path(), 12));
-    // Up off the list onto the selector's own line — the add-Workspace
-    // affordance, then the selector — and up again onto the affordance at the
-    // shelf's foot.
-    press_sidebar_key(&mut application, KeyCode::Up);
-    press_sidebar_key(&mut application, KeyCode::Up);
+    // Opening starts on the selector, and up off the top of the column wraps
+    // to the last entry of all: the affordance at the shelf's foot.
     press_sidebar_key(&mut application, KeyCode::Up);
     press_sidebar_key(&mut application, KeyCode::Enter);
     assert!(

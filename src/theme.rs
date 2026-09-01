@@ -111,10 +111,26 @@ pub(crate) struct MarkdownRoles {
     pub(crate) list_marker: Style,
 }
 
+/// How a surface says which of its rows a reader means. The two questions are
+/// separate wherever a list stands beside the thing it lists: which row the
+/// keys would act on, and which row is the one already on show.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SelectionRoles {
+    /// The row the keys are on, drawn only while the surface holding it has
+    /// them.
     pub(crate) focused: Style,
+    /// The row a surface that has given the keys up would come back to, where
+    /// that surface keeps one. The Sidebar keeps none: its row focus goes with
+    /// the keys.
     pub(crate) unfocused: Style,
+    /// The row standing for what the main view is already showing, which is
+    /// true whoever holds the keys.
+    pub(crate) open: Style,
+    /// The column down the left of that row, which is the combined state's own
+    /// role: it is what says "open" while the row itself carries the focus
+    /// style, and so it is the one a theme has to keep legible against
+    /// [`Self::focused`] rather than against the surface behind it.
+    pub(crate) open_rail: Style,
 }
 
 impl Theme {
@@ -122,6 +138,13 @@ impl Theme {
         let accent = AccentRoles {
             primary: Style::default().fg(Color::Cyan),
         };
+        // The accent's own colour, carried into a block rather than into text:
+        // the open row is the one the accent has always stood for, and a theme
+        // that moves the accent moves it. The rail is the same block one
+        // column further left, because it stands for the same thing.
+        let open = Style::default()
+            .fg(Color::Black)
+            .bg(accent.primary.fg.unwrap_or(Color::Cyan));
         let feedback = FeedbackRoles {
             error: Style::default().fg(Color::Red),
             warning: Style::default().fg(Color::Yellow),
@@ -193,6 +216,8 @@ impl Theme {
             selection: SelectionRoles {
                 focused: Style::default().fg(Color::Black).bg(Color::Blue),
                 unfocused: Style::default().fg(Color::Reset).bg(Color::DarkGray),
+                open,
+                open_rail: open,
             },
         }
     }

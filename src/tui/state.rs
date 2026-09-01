@@ -1483,6 +1483,48 @@ impl TuiState {
         !self.sidebar.has_focus()
     }
 
+    /// The Session the main view has open, and `None` on the Landing. It is
+    /// the route the reader is looking at rather than a question about what
+    /// has loaded, which is why the Sidebar's open highlight is derived from
+    /// it and from nothing else.
+    pub(super) fn open_session(&self) -> Option<SessionId> {
+        self.session.as_ref().map(SessionProjection::session_id)
+    }
+
+    /// Whether the Sidebar is the surface the keys actually reach, which is
+    /// what its row focus says: a reader driving the Sidebar sees which row
+    /// Enter would act on, and one who has opened something over it does not,
+    /// because Enter no longer means that row.
+    ///
+    /// This is the Sidebar's own claim on the keys narrowed by every surface
+    /// that outranks it. The Sidebar's context menu is not one of them: it is
+    /// part of the column, opened on a row of it, and the row it stands on
+    /// goes on saying so.
+    pub(super) fn sidebar_owns_input(&self) -> bool {
+        self.sidebar.has_focus() && !self.overlay_owns_input()
+    }
+
+    /// Whether a surface opened over the main view holds the keys. These are
+    /// the surfaces [`Application::command_for_terminal_input`] asks before it
+    /// asks the Sidebar, so the two readings must agree — which is why that
+    /// routing asks through [`Self::sidebar_owns_input`] rather than repeating
+    /// the question.
+    ///
+    /// The Sidebar's own context menu is asked before the Sidebar too, and is
+    /// deliberately not here: it is part of the column rather than something
+    /// opened over it, and the row it stands on goes on saying which row it
+    /// acts upon.
+    fn overlay_owns_input(&self) -> bool {
+        self.model_picker.is_open()
+            || self.connect_overlay.is_open()
+            || self.serve_overlay.is_open()
+            || self.settings_panel.is_open()
+            || self.model_options.is_open()
+            || self.session_picker.is_open()
+            || self.workspace_picker.is_open()
+            || self.subagent_picker.is_open()
+    }
+
     pub(super) fn composer_border_style(&self, theme: &Theme) -> Style {
         if self.composers.skill_issue(self.composer_key()).is_some() {
             theme.form_field.invalid
@@ -2300,8 +2342,8 @@ impl Application {
                         self.state.workspace_picker.load(&request, sessions);
                     }
                     SessionListSurface::Sidebar => {
-                        let current = self.session_id();
-                        self.state.sidebar.load(&request, sessions, current);
+                        let open = self.session_id();
+                        self.state.sidebar.load(&request, sessions, open);
                     }
                 }
                 Ok(ApplicationTransition::Continue)
@@ -2832,8 +2874,8 @@ impl Application {
             return ApplicationTransition::Continue;
         }
         match command {
-            SemanticCommandId::SidebarPrevious => self.state.sidebar.select_previous(),
-            SemanticCommandId::SidebarNext => self.state.sidebar.select_next(),
+            SemanticCommandId::SidebarPrevious => self.state.sidebar.focus_previous(),
+            SemanticCommandId::SidebarNext => self.state.sidebar.focus_next(),
             SemanticCommandId::SidebarLeave => {
                 let cancelled = self
                     .state
@@ -2846,8 +2888,8 @@ impl Application {
                 }
             }
             SemanticCommandId::SidebarAttach => {
-                let current = self.session_id();
-                return match self.state.sidebar.activate(current) {
+                let open = self.session_id();
+                return match self.state.sidebar.activate(open) {
                     SidebarActivation::Answered => ApplicationTransition::Continue,
                     SidebarActivation::Attach(session_id) => ApplicationTransition::AttachSession(
                         SessionReference::new(self.state.outlook.clone(), session_id),
@@ -3601,7 +3643,7 @@ impl Application {
                 let cancelled = self
                     .state
                     .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
-                self.state.sidebar.toggle();
+                self.state.sidebar.toggle(self.session_id());
                 self.state.command_mode = CommandMode::Composer;
                 if cancelled {
                     return Ok(ApplicationTransition::CancelWorkspaceResolution(
@@ -4070,7 +4112,7 @@ impl Application {
         // surfaces: it stands beside the main view rather than over it, so an
         // overlay a reader opened is still the newer surface and owns the keys,
         // while a completion list left standing over the composer does not.
-        if self.state.sidebar.has_focus() {
+        if self.state.sidebar_owns_input() {
             return command_for_sidebar_event(event);
         }
         if self.state.composer_completion.is_visible()
@@ -4096,10 +4138,7 @@ impl Application {
     }
 
     pub(super) fn session_id(&self) -> Option<SessionId> {
-        self.state
-            .session
-            .as_ref()
-            .map(SessionProjection::session_id)
+        self.state.open_session()
     }
 
     pub(super) fn session_reference(&self) -> Option<SessionReference> {
