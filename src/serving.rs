@@ -7,13 +7,14 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
+    future::Future,
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc, Mutex as StdMutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex, RwLock, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context as TaskContext, Poll},
 };
@@ -83,6 +84,7 @@ pub(crate) struct ServingController {
     identity: Arc<StdMutex<Option<IdentityMaterial>>>,
     peers: Arc<RwLock<Vec<StoredPeer>>>,
     remotes: Arc<RwLock<Vec<StoredRemote>>>,
+    remote_clients: Arc<StdMutex<HashMap<String, Weak<PairingHttpClient>>>>,
     revocations: Arc<RwLock<HashMap<String, Arc<PeerRevocation>>>>,
 }
 
@@ -137,6 +139,8 @@ struct StoredRemote {
     #[serde(flatten)]
     remote: Remote,
     public_key: Vec<u8>,
+    #[serde(default)]
+    last_good_address: Option<SocketAddr>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -244,6 +248,21 @@ impl PairingFailure {
     }
 }
 
+impl StoredRemote {
+    fn addresses_by_recency(&self) -> Vec<SocketAddr> {
+        self.last_good_address
+            .into_iter()
+            .chain(
+                self.remote
+                    .addresses
+                    .iter()
+                    .copied()
+                    .filter(|address| Some(*address) != self.last_good_address),
+            )
+            .collect()
+    }
+}
+
 impl ServingController {
     pub(crate) fn new(
         data_dir: &Path,
@@ -278,6 +297,7 @@ impl ServingController {
             identity: Arc::new(StdMutex::new(None)),
             peers: Arc::new(RwLock::new(peers)),
             remotes: Arc::new(RwLock::new(read_records(&data_dir.join(REMOTES_FILE))?)),
+            remote_clients: Arc::new(StdMutex::new(HashMap::new())),
             revocations: Arc::new(RwLock::new(revocations)),
         })
     }
@@ -420,8 +440,11 @@ impl ServingController {
         name: &str,
     ) -> std::result::Result<RemoteHealth, PairingFailure> {
         let remote = self.stored_remote(name)?;
-        let health = match self.dial_remote(&remote).await {
-            Ok(connection) => Ok(connection.health),
+        let health = match self.probe_remote_connection(&remote).await {
+            Ok(connection) => {
+                self.record_remote_connection(name, connection.health.status, connection.address);
+                return Ok(connection.health);
+            }
             Err(error) if error.code == SessionErrorCode::PairingAuthenticationFailed => {
                 Ok(RemoteHealth {
                     protocol_version: None,
@@ -446,25 +469,6 @@ impl ServingController {
         mut request: Request<Body>,
     ) -> std::result::Result<Response, PairingFailure> {
         let remote = self.stored_remote(name)?;
-        let connection = match self.dial_remote(&remote).await {
-            Ok(connection) => connection,
-            Err(error) => {
-                if error.code == SessionErrorCode::PairingAuthenticationFailed {
-                    self.record_remote_status(name, RemoteStatus::Revoked);
-                }
-                return Err(error);
-            }
-        };
-        self.record_remote_status(name, connection.health.status);
-        if connection.health.status == RemoteStatus::ProtocolMismatch {
-            return Err(protocol_mismatch(
-                self.protocol_version,
-                connection
-                    .health
-                    .protocol_version
-                    .expect("a protocol mismatch includes the Remote's version"),
-            ));
-        }
         let path_and_query = request
             .uri()
             .path_and_query()
@@ -477,15 +481,46 @@ impl ServingController {
                     "Remote API path is invalid",
                 )
             })?;
-        let interest = connection.client.http.clone();
-        forward_request(
-            &connection.client.http,
-            format!("https://{}", connection.address),
-            request,
-            remote_forward_headers(self.protocol_version),
-            Some(interest),
-        )
-        .await
+        let (parts, body) = request.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await.map_err(|_| {
+            PairingFailure::new(
+                SessionErrorCode::PairingConnectionFailed,
+                "Remote API request body could not be read",
+            )
+        })?;
+        let client = self.pairing_client(&remote)?;
+        let attempt_client = client.clone();
+        let response = first_remote_answer(&remote, &client, move |address| {
+            let client = attempt_client.clone();
+            let mut request = Request::new(Body::from(body.clone()));
+            *request.method_mut() = parts.method.clone();
+            *request.uri_mut() = parts.uri.clone();
+            *request.headers_mut() = parts.headers.clone();
+            async move {
+                match forward_request(
+                    &client.http,
+                    format!("https://{address}"),
+                    request,
+                    remote_forward_headers(self.protocol_version),
+                    Some(client.clone()),
+                )
+                .await
+                {
+                    Ok(response) => RemoteAddressAttempt::Answered(response),
+                    Err(_) => RemoteAddressAttempt::TryNext,
+                }
+            }
+        })
+        .await;
+        match response {
+            Ok((address, response)) => self.classify_remote_response(name, address, response).await,
+            Err(error) => {
+                if error.code == SessionErrorCode::PairingAuthenticationFailed {
+                    self.record_remote_status(name, RemoteStatus::Revoked);
+                }
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn remove_peer(&self, id: &str) -> std::result::Result<(), PairingFailure> {
@@ -633,6 +668,19 @@ impl ServingController {
     }
 
     fn record_remote_status(&self, name: &str, status: RemoteStatus) {
+        self.record_remote_state(name, status, None);
+    }
+
+    fn record_remote_connection(&self, name: &str, status: RemoteStatus, address: SocketAddr) {
+        self.record_remote_state(name, status, Some(address));
+    }
+
+    fn record_remote_state(
+        &self,
+        name: &str,
+        status: RemoteStatus,
+        last_good_address: Option<SocketAddr>,
+    ) {
         let mut remotes = self
             .remotes
             .write()
@@ -640,13 +688,20 @@ impl ServingController {
         let Some(index) = remotes.iter().position(|stored| stored.remote.name == name) else {
             return;
         };
-        if remotes[index].remote.status == status {
+        let previous_status = remotes[index].remote.status;
+        let previous_address = remotes[index].last_good_address;
+        if previous_status == status
+            && last_good_address.is_none_or(|address| previous_address == Some(address))
+        {
             return;
         }
-        let previous = remotes[index].remote.status;
         remotes[index].remote.status = status;
+        if let Some(address) = last_good_address {
+            remotes[index].last_good_address = Some(address);
+        }
         if let Err(error) = write_private_json(&self.data_dir.join(REMOTES_FILE), &*remotes) {
-            remotes[index].remote.status = previous;
+            remotes[index].remote.status = previous_status;
+            remotes[index].last_good_address = previous_address;
             tracing::warn!("could not persist Remote status: {error:#}");
         }
     }
@@ -663,60 +718,105 @@ impl ServingController {
         write_private_json(&self.data_dir.join(REVOKED_PEERS_FILE), &revoked)
     }
 
-    async fn dial_remote(
+    async fn probe_remote_connection(
         &self,
         remote: &StoredRemote,
     ) -> std::result::Result<RemoteConnection, PairingFailure> {
-        let identity = self.identity().map_err(internal_pairing_failure)?;
-        let client = paired_http_client(&remote.public_key, &identity, None)
-            .map_err(internal_pairing_failure)?;
-        for address in &remote.remote.addresses {
-            let response = client
-                .http
-                .get(format!("https://{address}/health"))
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.status().is_success() => {
-                    let pairing_health = response.json::<PairingHealth>().await.map_err(|_| {
-                        PairingFailure::new(
-                            SessionErrorCode::PairingConnectionFailed,
-                            "Remote returned an invalid health response",
-                        )
-                    })?;
-                    let health = RemoteHealth {
-                        protocol_version: Some(pairing_health.protocol_version),
-                        status: if pairing_health.protocol_version == self.protocol_version {
-                            RemoteStatus::Available
-                        } else {
-                            RemoteStatus::ProtocolMismatch
-                        },
-                    };
-                    return Ok(RemoteConnection {
-                        address: *address,
-                        health,
-                        client,
-                    });
+        let client = self.pairing_client(remote)?;
+        let attempt_client = client.clone();
+        let (address, pairing_health) = first_remote_answer(remote, &client, move |address| {
+            let client = attempt_client.clone();
+            async move {
+                let response = client
+                    .http
+                    .get(format!("https://{address}/health"))
+                    .send()
+                    .await;
+                match response {
+                    Ok(response) if response.status().is_success() => {
+                        match response.json::<PairingHealth>().await {
+                            Ok(health) => RemoteAddressAttempt::Answered(health),
+                            Err(_) => RemoteAddressAttempt::Rejected(PairingFailure::new(
+                                SessionErrorCode::PairingConnectionFailed,
+                                "Remote returned an invalid health response",
+                            )),
+                        }
+                    }
+                    Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+                        RemoteAddressAttempt::Rejected(PairingFailure::new(
+                            SessionErrorCode::PairingAuthenticationFailed,
+                            "Remote refused this Server's key",
+                        ))
+                    }
+                    Ok(_) | Err(_) => RemoteAddressAttempt::TryNext,
                 }
-                Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                    return Err(PairingFailure::new(
-                        SessionErrorCode::PairingAuthenticationFailed,
-                        "Remote refused this Server's key",
-                    ));
-                }
-                Ok(_) | Err(_) => {}
             }
+        })
+        .await?;
+        let health = RemoteHealth {
+            protocol_version: Some(pairing_health.protocol_version),
+            status: if pairing_health.protocol_version == self.protocol_version {
+                RemoteStatus::Available
+            } else {
+                RemoteStatus::ProtocolMismatch
+            },
+        };
+        Ok(RemoteConnection { address, health })
+    }
+
+    fn pairing_client(
+        &self,
+        remote: &StoredRemote,
+    ) -> std::result::Result<Arc<PairingHttpClient>, PairingFailure> {
+        let mut clients = self
+            .remote_clients
+            .lock()
+            .expect("Remote client lock is not poisoned");
+        if let Some(client) = clients.get(&remote.remote.name).and_then(Weak::upgrade) {
+            return Ok(client);
         }
-        if client.server_key_rejected.load(Ordering::Acquire) {
+        let identity = self.identity().map_err(internal_pairing_failure)?;
+        let client = Arc::new(
+            paired_http_client(&remote.public_key, &identity, None)
+                .map_err(internal_pairing_failure)?,
+        );
+        clients.insert(remote.remote.name.clone(), Arc::downgrade(&client));
+        Ok(client)
+    }
+
+    async fn classify_remote_response(
+        &self,
+        name: &str,
+        address: SocketAddr,
+        response: Response,
+    ) -> std::result::Result<Response, PairingFailure> {
+        if response.status() == StatusCode::UNAUTHORIZED {
+            self.record_remote_connection(name, RemoteStatus::Revoked, address);
             return Err(PairingFailure::new(
                 SessionErrorCode::PairingAuthenticationFailed,
-                "Remote presented a key other than its pinned key",
+                "Remote refused this Server's key",
             ));
         }
-        Err(PairingFailure::new(
-            SessionErrorCode::PairingConnectionFailed,
-            "could not reach Remote at any paired address",
-        ))
+        if response.status() != StatusCode::CONFLICT {
+            self.record_remote_connection(name, RemoteStatus::Available, address);
+            return Ok(response);
+        }
+        let (parts, body) = response.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await.map_err(|_| {
+            PairingFailure::new(
+                SessionErrorCode::PairingConnectionFailed,
+                "Remote API response body could not be read",
+            )
+        })?;
+        let protocol_mismatch = serde_json::from_slice::<SessionError>(&body)
+            .is_ok_and(|error| error.code == SessionErrorCode::PairingProtocolMismatch);
+        let status = if protocol_mismatch {
+            RemoteStatus::ProtocolMismatch
+        } else {
+            RemoteStatus::Available
+        };
+        self.record_remote_connection(name, status, address);
+        Ok(Response::from_parts(parts, Body::from(body)))
     }
 
     fn is_enrolled_peer(&self, public_key: &[u8]) -> bool {
@@ -750,6 +850,7 @@ impl ServingController {
         remotes.push(StoredRemote {
             remote: remote.clone(),
             public_key: public_key.to_vec(),
+            last_good_address: None,
         });
         if let Err(error) = write_private_json(&self.data_dir.join(REMOTES_FILE), &*remotes) {
             remotes.pop();
@@ -1018,7 +1119,7 @@ async fn forward_request(
     base_url: String,
     request: Request<Body>,
     added_headers: HeaderMap,
-    interest: Option<reqwest::Client>,
+    interest: Option<Arc<PairingHttpClient>>,
 ) -> std::result::Result<Response, PairingFailure> {
     let (parts, body) = request.into_parts();
     let target = format!(
@@ -1074,10 +1175,6 @@ fn remote_forward_headers(protocol_version: u32) -> HeaderMap {
         PAIRING_PROTOCOL_HEADER,
         header::HeaderValue::from_str(&protocol_version.to_string())
             .expect("protocol versions are valid header values"),
-    );
-    headers.insert(
-        header::CONNECTION,
-        header::HeaderValue::from_static("close"),
     );
     headers
 }
@@ -1398,7 +1495,7 @@ impl ClientCertVerifier for PinnedPeers {
 
 struct PinnedServerKey {
     expected: Vec<u8>,
-    rejected: Arc<AtomicBool>,
+    rejected: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for PinnedServerKey {
@@ -1420,7 +1517,7 @@ impl ServerCertVerifier for PinnedServerKey {
         if bool::from(actual.as_slice().ct_eq(&self.expected)) {
             Ok(ServerCertVerified::assertion())
         } else {
-            self.rejected.store(true, Ordering::Release);
+            self.rejected.fetch_add(1, Ordering::AcqRel);
             Err(TlsError::InvalidCertificate(
                 rustls::CertificateError::UnknownIssuer,
             ))
@@ -1509,7 +1606,7 @@ async fn dial_enrollment(
             Err(_) => {}
         }
     }
-    if client.server_key_rejected.load(Ordering::Acquire) {
+    if client.server_key_rejections.load(Ordering::Acquire) > 0 {
         return Err(PairingFailure::new(
             SessionErrorCode::PairingAuthenticationFailed,
             "offered address presented a key other than the Invite's pinned key",
@@ -1523,13 +1620,47 @@ async fn dial_enrollment(
 
 struct PairingHttpClient {
     http: reqwest::Client,
-    server_key_rejected: Arc<AtomicBool>,
+    server_key_rejections: Arc<AtomicU64>,
+}
+
+enum RemoteAddressAttempt<T> {
+    Answered(T),
+    TryNext,
+    Rejected(PairingFailure),
+}
+
+async fn first_remote_answer<T, F, Fut>(
+    remote: &StoredRemote,
+    client: &PairingHttpClient,
+    mut attempt: F,
+) -> std::result::Result<(SocketAddr, T), PairingFailure>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: Future<Output = RemoteAddressAttempt<T>>,
+{
+    let rejected_before = client.server_key_rejections.load(Ordering::Acquire);
+    for address in remote.addresses_by_recency() {
+        match attempt(address).await {
+            RemoteAddressAttempt::Answered(response) => return Ok((address, response)),
+            RemoteAddressAttempt::TryNext => {}
+            RemoteAddressAttempt::Rejected(error) => return Err(error),
+        }
+    }
+    if client.server_key_rejections.load(Ordering::Acquire) != rejected_before {
+        return Err(PairingFailure::new(
+            SessionErrorCode::PairingAuthenticationFailed,
+            "Remote presented a key other than its pinned key",
+        ));
+    }
+    Err(PairingFailure::new(
+        SessionErrorCode::PairingConnectionFailed,
+        "could not reach Remote at any paired address",
+    ))
 }
 
 struct RemoteConnection {
     address: SocketAddr,
     health: RemoteHealth,
-    client: PairingHttpClient,
 }
 
 fn paired_http_client(
@@ -1537,7 +1668,7 @@ fn paired_http_client(
     identity: &IdentityMaterial,
     enrollment_token: Option<&str>,
 ) -> Result<PairingHttpClient> {
-    let server_key_rejected = Arc::new(AtomicBool::new(false));
+    let server_key_rejections = Arc::new(AtomicU64::new(0));
     let certificate = match enrollment_token {
         Some(token) => enrollment_certificate(identity, token)?,
         None => identity.certificate.clone(),
@@ -1548,7 +1679,7 @@ fn paired_http_client(
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedServerKey {
             expected: server_key.to_vec(),
-            rejected: server_key_rejected.clone(),
+            rejected: server_key_rejections.clone(),
         }))
         .with_client_auth_cert(
             vec![CertificateDer::from(certificate)],
@@ -1557,15 +1688,15 @@ fn paired_http_client(
         .context("configure Pairing client identity")?;
     let http = reqwest::Client::builder()
         .use_preconfigured_tls(tls)
-        // The health negotiation and API request share this one connection.
-        // The proxied response holds the client as its interest lease, so its
-        // pool and socket disappear when the response or SSE stream ends.
+        // A proxied response holds the shared client as its interest lease, so
+        // the pool and sockets disappear when the Remote's last response or
+        // SSE stream ends.
         .pool_max_idle_per_host(1)
         .build()
         .context("build Pairing HTTP client")?;
     Ok(PairingHttpClient {
         http,
-        server_key_rejected,
+        server_key_rejections,
     })
 }
 

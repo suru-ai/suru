@@ -870,6 +870,7 @@ struct PairedServers {
     serving_client: ManagedClient,
     connecting_client: ManagedClient,
     wire: ObservedTcpProxy,
+    alternate_wire: Option<ObservedTcpProxy>,
 }
 
 impl PairedServers {
@@ -1001,6 +1002,10 @@ impl Drop for ObservedTcpProxy {
 }
 
 async fn paired_servers(name: &str) -> PairedServers {
+    paired_servers_with_alternate_route(name, false).await
+}
+
+async fn paired_servers_with_alternate_route(name: &str, alternate: bool) -> PairedServers {
     let serving_state = tempfile::tempdir().expect("create Serving state directory");
     let serving_config_root = tempfile::tempdir().expect("create Serving config directory");
     let serving_channel = format!("{name}-serving");
@@ -1040,6 +1045,11 @@ async fn paired_servers(name: &str) -> PairedServers {
         .serving_address()
         .expect("Serving listener is ready");
     let mut wire = ObservedTcpProxy::start(serving_address).await;
+    let mut alternate_wire = if alternate {
+        Some(ObservedTcpProxy::start(serving_address).await)
+    } else {
+        None
+    };
 
     let connecting_state = tempfile::tempdir().expect("create connecting state directory");
     let connecting_channel = format!("{name}-connecting");
@@ -1063,7 +1073,9 @@ async fn paired_servers(name: &str) -> PairedServers {
     receive_initial_state(&mut connecting_client).await;
     let invite = serving_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![wire.address],
+            addresses: std::iter::once(wire.address)
+                .chain(alternate_wire.as_ref().map(|wire| wire.address))
+                .collect(),
         })
         .await
         .expect("issue Invite");
@@ -1076,6 +1088,9 @@ async fn paired_servers(name: &str) -> PairedServers {
         .await
         .expect("form Pairing");
     wire.wait_for_connections(0).await;
+    if let Some(alternate_wire) = &mut alternate_wire {
+        alternate_wire.wait_for_connections(0).await;
+    }
 
     PairedServers {
         _serving_state: serving_state,
@@ -1086,6 +1101,7 @@ async fn paired_servers(name: &str) -> PairedServers {
         serving_client,
         connecting_client,
         wire,
+        alternate_wire,
     }
 }
 
@@ -1296,6 +1312,74 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
 
     drop(stream);
     drop(catalog);
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn successive_remote_requests_reuse_transport_while_an_outlook_holds_interest() {
+    let mut pair = paired_servers("remote-transport-reuse").await;
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()));
+    let mut catalog = remote.subscribe_catalog();
+    timeout(Duration::from_secs(1), catalog.next())
+        .await
+        .expect("Remote catalog snapshot arrives")
+        .expect("Remote catalog interest remains live");
+    pair.wire.wait_for_connections(1).await;
+
+    remote
+        .list_sessions(None)
+        .await
+        .expect("first Remote listing succeeds");
+    let connections_after_first_listing = pair.wire.opened_connections();
+    remote
+        .list_sessions(None)
+        .await
+        .expect("second Remote listing succeeds");
+    assert_eq!(
+        pair.wire.opened_connections(),
+        connections_after_first_listing,
+        "successive requests reuse the Outlook's Pairing transport"
+    );
+
+    drop(catalog);
+    pair.wire.wait_for_connections(0).await;
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_requests_remember_the_last_route_that_answered() {
+    let mut pair = paired_servers_with_alternate_route("remote-last-good-route", true).await;
+    pair.wire.set_online(false).await;
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()));
+
+    remote
+        .list_sessions(None)
+        .await
+        .expect("Remote listing falls back to its alternate route");
+    assert!(
+        pair.alternate_wire
+            .as_ref()
+            .expect("the test Pairing has an alternate route")
+            .opened_connections()
+            > 0,
+        "the fallback route answered the first listing"
+    );
+    let preferred_attempts_after_fallback = pair.wire.opened_connections();
+    pair.wire.set_online(true).await;
+    remote
+        .list_sessions(None)
+        .await
+        .expect("Remote listing keeps using the last route that answered");
+    assert_eq!(
+        pair.wire.opened_connections(),
+        preferred_attempts_after_fallback,
+        "restoring an earlier route does not displace the last-known-good route"
+    );
+
     pair.shutdown().await;
 }
 
@@ -1668,11 +1752,6 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
 
 #[tokio::test]
 async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use() {
-    let reserved = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("reserve a stable Serving port");
-    let serving_port = reserved.local_addr().unwrap().port();
-    drop(reserved);
     let serving_state = tempfile::tempdir().expect("create Serving state directory");
     let serving_data = tempfile::tempdir().expect("create Serving data directory");
     let serving_config_root = tempfile::tempdir().expect("create Serving config directory");
@@ -1695,11 +1774,9 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
     .expect("attach Serving Client");
     receive_initial_state(&mut serving_client).await;
     serving_client
-        .mutate_setting(SettingMutation::ServingPort {
-            value: Some(serving_port),
-        })
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
         .await
-        .expect("pin the Serving port");
+        .expect("ask the operating system for a Serving port");
     serving_client
         .mutate_setting(SettingMutation::ServingBindAddress {
             value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
@@ -1713,6 +1790,12 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
     let serving_address = serving
         .serving_address()
         .expect("Serving listener is ready");
+    serving_client
+        .mutate_setting(SettingMutation::ServingPort {
+            value: Some(serving_address.port()),
+        })
+        .await
+        .expect("pin the bound port for the incompatible restart");
 
     let connecting_state = tempfile::tempdir().expect("create connecting state directory");
     let connecting = server::spawn_with_timings(
@@ -1759,17 +1842,6 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
     .await
     .expect("restart Serving Server with a newer Pairing protocol");
 
-    let status = connecting_client
-        .probe_remote("workstation")
-        .await
-        .expect("read mismatched Remote status");
-    assert_eq!(status.protocol_version, Some(PROTOCOL_VERSION + 1));
-    assert_eq!(status.status, RemoteStatus::ProtocolMismatch);
-    assert_eq!(
-        connecting_client.list_remotes().await.unwrap()[0].status,
-        RemoteStatus::ProtocolMismatch
-    );
-
     let descriptor = connecting.descriptor();
     let http = reqwest::Client::new();
     let refused = http
@@ -1790,6 +1862,18 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
             .code,
         SessionErrorCode::PairingProtocolMismatch
     );
+    assert_eq!(
+        connecting_client.list_remotes().await.unwrap()[0].status,
+        RemoteStatus::ProtocolMismatch,
+        "the refused API response marks the durable Remote status"
+    );
+
+    let status = connecting_client
+        .probe_remote("workstation")
+        .await
+        .expect("the Remotes picker can still probe a mismatched Remote");
+    assert_eq!(status.protocol_version, Some(PROTOCOL_VERSION + 1));
+    assert_eq!(status.status, RemoteStatus::ProtocolMismatch);
 
     let mut catalog = connecting_client
         .outlook(Outlook::Remote("workstation".to_owned()))
