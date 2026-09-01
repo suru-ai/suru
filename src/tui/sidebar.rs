@@ -262,6 +262,10 @@ pub(super) struct SidebarRow<'a> {
     /// Whether this is the row the reader is on, which is the one Enter acts
     /// on and the one the column draws highlighted.
     pub(super) selected: bool,
+    /// Whether this Session is one the client could not read. Such a row is
+    /// drawn subdued and marked, because it stands for work the reader can see
+    /// and delete but never open.
+    pub(super) unreadable: bool,
     pub(super) shelf: SidebarShelf<'a>,
 }
 
@@ -522,10 +526,6 @@ pub(super) enum SidebarMenuItem {
     Delete,
 }
 
-/// How many items a Sidebar row's menu offers: what its shelf asks for, and
-/// Delete.
-pub(super) const SIDEBAR_MENU_ITEMS: usize = 2;
-
 /// The context menu a reader opened on one Sidebar row.
 #[derive(Clone, Debug)]
 struct SidebarMenu {
@@ -536,6 +536,11 @@ struct SidebarMenu {
     /// opened, which is what decides whether it offers to set the Session
     /// aside or to bring it back.
     settled: bool,
+    /// Whether the client could not read the Session, read when the menu was
+    /// opened. Such a row keeps Delete and loses the rest: settling work that
+    /// cannot be opened is an operation that cannot succeed, and the menu does
+    /// not offer it.
+    unreadable: bool,
     selected: usize,
     /// Whether Delete has been asked for once. A Session and everything it
     /// owns is not something one stray press may take away, so the item asks
@@ -571,8 +576,14 @@ impl SidebarMenuItem {
 }
 
 impl SidebarMenu {
-    const fn items(&self) -> [SidebarMenuItem; SIDEBAR_MENU_ITEMS] {
-        [
+    /// What the menu offers, top to bottom: what the row's shelf asks for —
+    /// except on a row the client could not read, which no shelf operation can
+    /// act on — and Delete, which every row keeps.
+    fn items(&self) -> Vec<SidebarMenuItem> {
+        if self.unreadable {
+            return vec![SidebarMenuItem::Delete];
+        }
+        vec![
             if self.settled {
                 SidebarMenuItem::Unsettle
             } else {
@@ -585,10 +596,10 @@ impl SidebarMenu {
 
 /// The context menu as a frame draws it: where it is anchored and what each of
 /// its items says.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct SidebarMenuView {
     pub(super) anchor: Position,
-    pub(super) items: [SidebarMenuEntry; SIDEBAR_MENU_ITEMS],
+    pub(super) items: Vec<SidebarMenuEntry>,
 }
 
 /// One menu item as a frame draws it.
@@ -842,8 +853,27 @@ impl Sidebar {
         let Some(target) = hit else {
             return SidebarPress::Elsewhere;
         };
+        // A row the client could not read spends the press without answering
+        // it: opening the Session could only fail, and carrying the reader
+        // onto a row the arrows cannot leave would strand them there.
+        if let SidebarTarget::Session(session_id) = target
+            && !self.is_readable(session_id)
+        {
+            return SidebarPress::Answered;
+        }
         self.select(target);
         SidebarPress::Invoke(SemanticCommandId::SidebarAttach.into())
+    }
+
+    /// Whether this Session is one the listing in hand could read, which is
+    /// what decides whether its row can be opened at all.
+    fn is_readable(&self, session_id: SessionId) -> bool {
+        self.listing
+            .sessions()
+            .iter()
+            .find(|session| session.id() == session_id)
+            .and_then(SessionListItem::readable)
+            .is_some()
     }
 
     /// Opens the context menu on the row the reader asked for one on, which
@@ -866,19 +896,26 @@ impl Sidebar {
         let Some(SidebarTarget::Session(session_id)) = hit else {
             return;
         };
-        let Some(settled) = self
+        let Some(session) = self
             .listing
             .sessions()
             .iter()
             .find(|session| session.id() == session_id)
-            .map(|session| self.settlement().settles(session))
         else {
             return;
         };
-        self.select(SidebarTarget::Session(session_id));
+        let settled = self.settlement().settles(session);
+        let unreadable = session.readable().is_none();
+        // A row the client could not read still gets its menu — deletion is
+        // how damaged work leaves the list — but not the selection, which
+        // stands only on rows the arrows can reach and Enter can open.
+        if !unreadable {
+            self.select(SidebarTarget::Session(session_id));
+        }
         self.menu = Some(SidebarMenu {
             session: SessionReference::new(self.listing.outlook().clone(), session_id),
             settled,
+            unreadable,
             selected: 0,
             confirming_delete: false,
             anchor: position,
@@ -903,14 +940,18 @@ impl Sidebar {
             return None;
         }
         let menu = self.menu.as_ref()?;
-        let items = menu.items();
         Some(SidebarMenuView {
             anchor: menu.anchor,
-            items: std::array::from_fn(|index| SidebarMenuEntry {
-                label: items[index].label(menu.confirming_delete),
-                selected: menu.selected == index,
-                destructive: items[index] == SidebarMenuItem::Delete,
-            }),
+            items: menu
+                .items()
+                .into_iter()
+                .enumerate()
+                .map(|(index, item)| SidebarMenuEntry {
+                    label: item.label(menu.confirming_delete),
+                    selected: menu.selected == index,
+                    destructive: item == SidebarMenuItem::Delete,
+                })
+                .collect(),
         })
     }
 
@@ -926,7 +967,7 @@ impl Sidebar {
         let Some(menu) = &mut self.menu else {
             return;
         };
-        let length = SIDEBAR_MENU_ITEMS as isize;
+        let length = menu.items().len() as isize;
         menu.selected = (menu.selected as isize + distance).rem_euclid(length) as usize;
     }
 
@@ -1245,14 +1286,7 @@ impl Sidebar {
                 return SidebarActivation::Answered;
             }
         };
-        let readable = self
-            .listing
-            .sessions()
-            .iter()
-            .find(|summary| summary.id() == selected)
-            .and_then(SessionListItem::readable)
-            .is_some();
-        if !readable {
+        if !self.is_readable(selected) {
             return SidebarActivation::Answered;
         }
         if current == Some(selected) {
@@ -1716,6 +1750,7 @@ impl Sidebar {
             title: session.title(),
             current: current == Some(session.id()),
             selected: self.selected == Some(SidebarSelection::Session(session.id())),
+            unreadable: session.readable().is_none(),
             shelf,
         })
     }
@@ -1767,7 +1802,10 @@ impl Sidebar {
     /// Every row the reader can be on, in the order the Sidebar draws them,
     /// which is the order the arrows walk: the selector standing above the
     /// list and the affordance sharing its line, left to right, then the body
-    /// without the divider, which is a rule rather than a row.
+    /// without the divider, which is a rule rather than a row. A Session the
+    /// client could not read is not among them either: every row the arrows
+    /// can land on is one Enter could open, and its drawn place in the list
+    /// is what the arrows step over.
     ///
     /// The selector is not among them while its own entries are open: the
     /// reader is inside the control rather than on it, and Esc is the way back
@@ -1780,7 +1818,9 @@ impl Sidebar {
             return vec![SidebarSelection::AddWorkspace];
         }
         let rows = self.body().into_iter().filter_map(|entry| match entry {
-            BodyEntry::Session(session, _) => Some(SidebarSelection::Session(session.id())),
+            BodyEntry::Session(session, _) => session
+                .readable()
+                .map(|_| SidebarSelection::Session(session.id())),
             BodyEntry::ShowMore(_) => Some(SidebarSelection::ShowMore),
             BodyEntry::Scope(scope) => Some(SidebarSelection::Scope(scope)),
             BodyEntry::Divider => None,

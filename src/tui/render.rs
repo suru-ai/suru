@@ -34,7 +34,7 @@ use super::{
     },
     shimmer,
     sidebar::{
-        self, ADD_WORKSPACE, SIDEBAR_MENU_ITEMS, Sidebar, SidebarEntry, SidebarMenuGeometry,
+        self, ADD_WORKSPACE, Sidebar, SidebarEntry, SidebarMenuGeometry,
         SidebarRow, SidebarScopeEntry, SidebarSelectorView, SidebarShelf, SidebarShowMore,
         SidebarSpan, SidebarTarget, SidebarWorkspaceEntryView,
     },
@@ -1680,7 +1680,7 @@ fn render_sidebar_menu(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     // The label, a column of padding either side of it, and the box's own two
     // borders; likewise two borders around the items down the box.
     let width = u16::try_from(widest.saturating_add(4)).unwrap_or(u16::MAX);
-    let height = u16::try_from(SIDEBAR_MENU_ITEMS.saturating_add(2)).unwrap_or(u16::MAX);
+    let height = u16::try_from(menu.items.len().saturating_add(2)).unwrap_or(u16::MAX);
     let frame_area = frame.area();
     if frame_area.width < width || frame_area.height < height {
         return;
@@ -2100,7 +2100,7 @@ fn sidebar_active_row_lines(
     [
         sidebar_slotted_line(&workspace, label_style, &slot, width, selected, theme),
         sidebar_plain_line(
-            &sidebar_title(row),
+            &sidebar_title(row, width),
             width,
             None,
             sidebar_title_style(row, selected, theme),
@@ -2120,10 +2120,11 @@ fn sidebar_settled_row_line(
     theme: &Theme,
 ) -> Line<'static> {
     let selected = selection_style(row.selected, focused, theme);
+    let slot = relative_update_time_compact(ended_at, now);
     sidebar_slotted_line(
-        &sidebar_title(row),
+        &sidebar_title(row, width.saturating_sub(slot.width() + 1)),
         sidebar_title_style(row, selected, theme),
-        &relative_update_time_compact(ended_at, now),
+        &slot,
         width,
         selected,
         theme,
@@ -2201,19 +2202,33 @@ fn selection_style(selected: bool, focused: bool, theme: &Theme) -> Option<Style
     })
 }
 
+/// What a row says after the Title of a Session the client could not read.
+const UNREADABLE_MARKER: &str = "[unreadable]";
+
 /// What a Session is called in the Sidebar: its Emoji, where it has one, and
-/// then its Title.
-fn sidebar_title(row: SidebarRow<'_>) -> String {
-    match row.emoji {
+/// then its Title — followed, where the client could not read the Session, by
+/// the marker saying so. The marker's columns are held back before the Title
+/// is cut, so however long the Title the reason the row cannot be opened stays
+/// on show. `width` is the columns the whole name has to spend.
+fn sidebar_title(row: SidebarRow<'_>, width: usize) -> String {
+    let title = match row.emoji {
         Some(emoji) => format!("{emoji} {}", row.title),
         None => row.title.to_owned(),
+    };
+    if !row.unreadable {
+        return title;
     }
+    let title = truncate_to_width(&title, width.saturating_sub(UNREADABLE_MARKER.width() + 1));
+    format!("{title} {UNREADABLE_MARKER}")
 }
 
 /// How a Session's name is drawn: highlighted where the reader is on it,
-/// accented where it is the Session they have open, and plain otherwise.
+/// subdued where the client could not read it, accented where it is the
+/// Session they have open, and plain otherwise.
 fn sidebar_title_style(row: SidebarRow<'_>, selected: Option<Style>, theme: &Theme) -> Style {
-    selected.unwrap_or(if row.current {
+    selected.unwrap_or(if row.unreadable {
+        theme.text.subdued
+    } else if row.current {
         theme.accent.primary
     } else {
         theme.text.primary

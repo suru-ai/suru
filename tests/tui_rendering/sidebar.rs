@@ -11,8 +11,9 @@ use crate::support::{
     ADD_WORKSPACE, SELECTOR_ROW, SIDEBAR_PRESS_HEIGHT as PRESS_HEIGHT, SIDEBAR_WIDE as WIDE,
     add_workspace, answer_workspace_resolution, connected_application, deliver_settings,
     drawn_in_sidebar, enter_active_session, enter_session, failed_session_snapshot,
-    noncanonical_spelling, press_add_workspace, rendered_application_rows_at, rendered_row,
-    selector_label, sidebar_column, text_on, type_terminal_text, workspace_dir,
+    noncanonical_spelling, press_add_workspace, rendered_application_buffer,
+    rendered_application_rows_at, rendered_row, selector_label, sidebar_column, text_on,
+    text_position, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -859,6 +860,11 @@ fn the_sidebar_survives_every_terminal_the_frame_will_draw() {
                 days_ago(400),
                 days_ago(399),
             ),
+            unreadable_from(
+                "An unreadable Title long enough to crowd its own marker out",
+                workspace.path(),
+                4,
+            ),
         ],
     );
 
@@ -1271,20 +1277,158 @@ fn an_open_overlay_keeps_the_keys_while_the_sidebar_holds_focus() {
     );
 }
 
+/// A Session the client could not read, listed so the reader can see it and
+/// take it away.
+fn unreadable(title: &str, workspace: &Path) -> SessionListItem {
+    unreadable_from(title, workspace, 1)
+}
+
+/// An unreadable Session with an id the test can name, which is what asserting
+/// a deletion against it needs.
+fn unreadable_as(
+    session_id: SessionId,
+    title: &str,
+    workspace: &Path,
+    created_at: u64,
+) -> SessionListItem {
+    let SessionListItem::Unreadable(mut summary) = unreadable_from(title, workspace, created_at)
+    else {
+        unreachable!("the fixture builds an unreadable Session");
+    };
+    summary.id = session_id;
+    SessionListItem::Unreadable(summary)
+}
+
+/// The same, made at a moment the test chooses, which is what places it among
+/// the readable rows: the active list stands newest-made first.
+fn unreadable_from(title: &str, workspace: &Path, created_at: u64) -> SessionListItem {
+    SessionListItem::Unreadable(UnreadableSessionSummary {
+        id: SessionId::new(),
+        title: title.to_owned(),
+        created_at: SessionTimestamp(created_at),
+        updated_at: SessionTimestamp(now()),
+        workspace: Some(Workspace {
+            path: workspace.to_owned(),
+        }),
+    })
+}
+
+/// The arrows walk only rows Enter could open, so a row the client cannot
+/// read is passed over in either direction while everything else keeps the
+/// established order.
+#[test]
+fn the_arrows_pass_over_a_row_suru_cannot_read() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            unreadable_from("Broken work", workspace.path(), 4),
+            listed("Newest", None, workspace.path(), 3, now()),
+            unreadable_from("Also broken", workspace.path(), 2),
+            listed("Oldest", None, workspace.path(), 1, now()),
+        ],
+    );
+
+    assert!(
+        selected_sidebar_text(&application).contains("Newest"),
+        "an opened Sidebar starts on the nearest row it could open, not the damaged one above it"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(
+        selected_sidebar_text(&application).contains("Oldest"),
+        "Down steps over the row that cannot be opened"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Up);
+    assert!(
+        selected_sidebar_text(&application).contains("Newest"),
+        "and Up steps back over it the same way"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Up);
+    assert!(
+        selected_sidebar_text(&application).contains(ADD_WORKSPACE),
+        "moving off the top of the openable rows lands on the selector's line, stepping over \
+         the damaged row above them"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(
+        selected_sidebar_text(&application).contains("Newest"),
+        "and Down from there steps over it again rather than onto it"
+    );
+}
+
+/// A row the client cannot read says so where the reader can see it, and is
+/// drawn quiet so it does not read as work they could open.
+#[test]
+fn an_unreadable_row_is_marked_and_subdued() {
+    let workspace = workspace_dir();
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed("Readable work", None, workspace.path(), 2, now()),
+            unreadable("Unreadable work", workspace.path()),
+        ],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let marked = sidebar_column(&rows[rendered_row(&rows, "Unreadable work")]);
+    assert!(
+        marked.contains("Unreadable work [unreadable]"),
+        "the marker follows the Title: {marked:?}"
+    );
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let (column, row) = text_position(&buffer, "Unreadable work");
+    assert_eq!(
+        buffer.cell((column, row)).expect("the Title is drawn").fg,
+        Color::DarkGray,
+        "the row is subdued rather than drawn like work the reader could open"
+    );
+    let (column, row) = text_position(&buffer, "Readable work");
+    assert_eq!(
+        buffer
+            .cell((column, row))
+            .expect("the readable Title is drawn")
+            .fg,
+        Color::Reset,
+        "a readable row keeps its ordinary Title style"
+    );
+}
+
+/// The marker is never what truncation takes away: its columns are held back
+/// and the Title is cut instead, so a narrow row still says why it cannot be
+/// opened.
+#[test]
+fn truncation_takes_the_title_before_it_takes_the_unreadable_marker() {
+    let workspace = workspace_dir();
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![unreadable(
+            "A Title long enough to run past the Sidebar's own columns",
+            workspace.path(),
+        )],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let marked = sidebar_column(&rows[rendered_row(&rows, "[unreadable]")]);
+    assert!(
+        marked.ends_with(" [unreadable]"),
+        "the marker stands whole at the end of the row: {marked:?}"
+    );
+    assert!(
+        marked.contains('…'),
+        "it is the Title that gave up the columns: {marked:?}"
+    );
+}
+
 #[test]
 fn a_session_suru_cannot_read_is_not_attached() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
-        vec![SessionListItem::Unreadable(UnreadableSessionSummary {
-            id: SessionId::new(),
-            title: "Unreadable work".to_owned(),
-            created_at: SessionTimestamp(1),
-            updated_at: SessionTimestamp(now()),
-            workspace: Some(Workspace {
-                path: workspace.path().to_owned(),
-            }),
-        })],
+        vec![unreadable("Unreadable work", workspace.path())],
     );
 
     assert_eq!(
@@ -2718,6 +2862,30 @@ fn a_left_press_on_a_row_attaches_the_session_it_stands_on() {
     );
 }
 
+/// A row the client cannot read answers no press: opening it could only fail,
+/// so the press neither attaches nor carries the reader onto the row.
+#[test]
+fn a_left_press_on_a_row_suru_cannot_read_does_nothing() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed("Readable work", None, workspace.path(), 3, now()),
+            unreadable_from("Broken work", workspace.path(), 2),
+        ],
+    );
+
+    assert_eq!(
+        press_line(&mut application, MouseButton::Left, "Broken work"),
+        ApplicationTransition::Continue,
+        "the press starts no attachment that is guaranteed to fail"
+    );
+    assert!(
+        sidebar_text_on(&application, Color::DarkGray).contains("Readable work"),
+        "and the reader is left on the row they were on"
+    );
+}
+
 /// The affordance is a row like any other to the pointer, and acting on it
 /// brings up more of the shelf rather than opening anything.
 #[test]
@@ -2843,6 +3011,70 @@ fn a_right_press_on_a_settled_row_offers_unsettle_and_delete() {
         "a row already on the shelf is offered the way back: {items:?}"
     );
     assert!(items[1].contains("Delete"), "and the way off it: {items:?}");
+}
+
+/// A row the client cannot read keeps its way off the list and loses the
+/// rest: the menu is capability-aware, and settling a Session that cannot be
+/// opened is an operation that cannot succeed.
+#[test]
+fn a_right_press_on_a_row_suru_cannot_read_offers_only_delete() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed("Readable work", None, workspace.path(), 3, now()),
+            unreadable_from("Broken work", workspace.path(), 2),
+        ],
+    );
+
+    let anchor = open_menu_on(&mut application, "Broken work");
+
+    let rows = rendered_application_rows_at(&application, WIDE, PRESS_HEIGHT);
+    let menu = rows[usize::from(anchor)..].join("\n");
+    assert!(
+        menu.contains("Delete"),
+        "damaged work can still be taken away: {menu:?}"
+    );
+    assert!(
+        !menu.contains("Settle"),
+        "and nothing offers to settle or unsettle work that cannot be opened: {menu:?}"
+    );
+}
+
+/// Deletion is untouched by unreadability: the item asks again the way it
+/// always does, and the second press acts on the Session the menu stands on.
+#[test]
+fn the_menu_deletes_a_row_suru_cannot_read_after_asking_again() {
+    let workspace = workspace_dir();
+    let wanted = SessionId::new();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed("Readable work", None, workspace.path(), 3, now()),
+            unreadable_as(wanted, "Broken work", workspace.path(), 2),
+        ],
+    );
+
+    let anchor = open_menu_on(&mut application, "Broken work");
+
+    assert_eq!(
+        press_menu_item(&mut application, anchor, 0),
+        ApplicationTransition::Continue,
+        "the first press takes nothing away"
+    );
+    let rows = rendered_application_rows_at(&application, WIDE, PRESS_HEIGHT);
+    assert!(
+        rows[usize::from(anchor + 1)].contains("confirm"),
+        "it asks the reader to say it again: {rows:?}"
+    );
+    assert_eq!(
+        press_menu_item(&mut application, anchor, 0),
+        ApplicationTransition::DeleteSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            wanted,
+        )),
+        "and the second press takes the damaged work away"
+    );
 }
 
 #[test]
