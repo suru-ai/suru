@@ -332,7 +332,23 @@ pub struct TuiState {
     active_commands_started_at: HashMap<ActivityId, Instant>,
     presentation_clock: PresentationClock,
     pub(super) submission_error: Option<String>,
+    /// The Session the main view has open, and `None` on the Landing.
+    ///
+    /// This is the route the reader chose rather than a question about what
+    /// has loaded: opening a Session sets it on the frame they ask, and the
+    /// projection below catches up when the snapshot lands. Every reading of
+    /// *which* Session the reader is in comes from here — the Sidebar's open
+    /// highlight, the composer the keys write into, and what the Sidebar's
+    /// own Enter takes to be the Session already open.
+    pub(super) route: Option<SessionReference>,
+    /// The Session the main view draws from, present only once the route has
+    /// hydrated. A route without one is a Session still loading, and
+    /// everything a Session is read for — its header, Transcript, Working
+    /// state, usage, footer, and Prompt delivery — stands down until the
+    /// snapshot arrives rather than answering for the Session left behind.
     pub(super) session: Option<SessionProjection>,
+    /// The origin-qualified reference of the projection above, and so `Some`
+    /// exactly when it is.
     pub(super) session_reference: Option<SessionReference>,
     outlook_landing_selections: HashMap<Outlook, Option<AgentSelection>>,
     landing_agent_selection: Option<AgentSelection>,
@@ -449,6 +465,7 @@ impl TuiState {
             active_commands_started_at: HashMap::new(),
             presentation_clock: PresentationClock::default(),
             submission_error: None,
+            route: None,
             session: None,
             session_reference: None,
             outlook_landing_selections: HashMap::from([(Outlook::Local, None)]),
@@ -510,6 +527,53 @@ impl TuiState {
         self.session_picker.abandon_attachment();
     }
 
+    /// Carries the reader into `target` at once, before anything of it has
+    /// loaded.
+    ///
+    /// Opening a Session is asynchronous, and waiting on it would leave the
+    /// reader looking at the Session they have just left. So the route moves
+    /// now: the main view is the target's from this frame, the Sidebar's
+    /// highlight goes with it, and the composer the keys write into is the
+    /// target's own — a draft typed into it is kept under that Session and no
+    /// other.
+    ///
+    /// Everything a Session is read for goes with the route rather than
+    /// standing in for the target. The projection the reader was reading is
+    /// let go of rather than redrawn under a Session it is not, and no
+    /// projection is invented from the listing summary that named the target:
+    /// a summary says a Title and a timestamp, which is not a Session. The
+    /// shell holds the target's composer and nothing else until the snapshot
+    /// lands.
+    ///
+    /// The Session left behind keeps its own stream until then — the run loop
+    /// holds it open so the target's arrival is the one moment the client
+    /// swaps — and what it sends is taken and dropped rather than drawn,
+    /// because a projection under this route would be the wrong Session.
+    fn open_session_route(&mut self, target: SessionReference) {
+        self.session = None;
+        self.session_reference = None;
+        self.route = Some(target);
+        self.session_events_blocked = true;
+        // The picker browses the Session that was open, and the reader has
+        // left it; the Subagents it offered are not the target's.
+        self.subagent_picker.close();
+        self.command_mode = CommandMode::Composer;
+        self.submission_error = None;
+        self.sync_composer_completion();
+    }
+
+    /// Leaves the Session the main view had open, for the Landing or for
+    /// wherever the client is going next, and answers whether there was one.
+    ///
+    /// The route goes with the projection. A Session still loading is one the
+    /// reader is on their way to, and leaving is them saying they are not
+    /// going after all — so it is left behind exactly as a hydrated one is.
+    fn leave_session_route(&mut self) -> bool {
+        self.session = None;
+        self.session_reference = None;
+        self.route.take().is_some()
+    }
+
     fn turn_outlook(&mut self, outlook: Outlook) {
         if self.outlook == outlook {
             return;
@@ -523,8 +587,7 @@ impl TuiState {
             .get(&outlook)
             .cloned()
             .unwrap_or_else(|| PathBuf::from("."));
-        self.session = None;
-        self.session_reference = None;
+        self.leave_session_route();
         self.session_events_blocked = true;
         self.pending_submission = None;
         self.pending_steers.clear();
@@ -606,6 +669,13 @@ impl TuiState {
     }
 
     fn skill_catalog_request(&self) -> Option<SkillCatalogRequest> {
+        // A Session still loading says neither the Agent a Catalog is asked
+        // for nor the Workspace it is asked about, and the Landing it has
+        // already left answers for neither. Skill resolution waits with every
+        // other act that needs the Session.
+        if self.open_session_is_loading() {
+            return None;
+        }
         let selection = self.agent_selection()?;
         let workspace = self.session.as_ref().map_or_else(
             || self.workspace.clone(),
@@ -730,8 +800,7 @@ impl TuiState {
                         self.pending_steers
                             .retain(|steer| steer.session != reference);
                     }
-                    self.session = None;
-                    self.session_reference = None;
+                    self.leave_session_route();
                     self.pending_agent_selection = None;
                     self.queued_agent_selection = None;
                     self.confirmed_agent_selection = None;
@@ -923,8 +992,7 @@ impl TuiState {
         {
             self.confirmed_agent_selection = None;
         }
-        self.session = None;
-        self.session_reference = None;
+        self.leave_session_route();
         self.session_events_blocked = true;
         self.command_mode = CommandMode::Composer;
         self.submission_error = Some("Session ended because it was deleted".to_owned());
@@ -1000,6 +1068,10 @@ impl TuiState {
         let reference = SessionReference::new(self.outlook.clone(), snapshot.session.id);
         self.ensure_interaction(reference.clone());
         self.submission_error = None;
+        // The snapshot is the route as much as the projection: a Session
+        // reached without an optimistic opening — one just created, or one
+        // picked from an overlay — arrives as both at once.
+        self.route = Some(reference.clone());
         self.session_reference = Some(reference);
         self.session = Some(SessionProjection::new(snapshot));
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
@@ -1063,8 +1135,12 @@ impl TuiState {
         }
     }
 
+    /// The composer the keys write into, which is the one belonging to the
+    /// Session the main view has open — loaded or not. A draft is the
+    /// reader's, not the snapshot's, so it is taken and kept under the target
+    /// from the first moment.
     fn composer_key(&self) -> ComposerKey {
-        self.session_reference
+        self.route
             .clone()
             .map_or(ComposerKey::Landing, ComposerKey::Session)
     }
@@ -1488,7 +1564,15 @@ impl TuiState {
     /// has loaded, which is why the Sidebar's open highlight is derived from
     /// it and from nothing else.
     pub(super) fn open_session(&self) -> Option<SessionId> {
-        self.session.as_ref().map(SessionProjection::session_id)
+        self.route.as_ref().map(|route| route.session_id)
+    }
+
+    /// Whether the Session the main view has open is still on its way: the
+    /// reader has been carried into it and its snapshot has not landed. This
+    /// is what every act needing a Session — delivering a Prompt, choosing an
+    /// Agent for it — waits on, because there is no Session to act on yet.
+    pub(super) fn open_session_is_loading(&self) -> bool {
+        self.route.is_some() && self.session.is_none()
     }
 
     /// Whether the Sidebar is the surface the keys actually reach, which is
@@ -2891,9 +2975,14 @@ impl Application {
                 let open = self.session_id();
                 return match self.state.sidebar.activate(open) {
                     SidebarActivation::Answered => ApplicationTransition::Continue,
-                    SidebarActivation::Attach(session_id) => ApplicationTransition::AttachSession(
-                        SessionReference::new(self.state.outlook.clone(), session_id),
-                    ),
+                    // Enter and a press both arrive here, so both open the
+                    // Session the same way: the route moves now and the
+                    // attachment follows it.
+                    SidebarActivation::Attach(session_id) => {
+                        let target = SessionReference::new(self.state.outlook.clone(), session_id);
+                        self.state.open_session_route(target.clone());
+                        ApplicationTransition::AttachSession(target)
+                    }
                     // The path entry is a local act inside the Sidebar as
                     // well as a switch, so it does both: the client moves, and
                     // the column the reader typed into narrows to what they
@@ -3114,6 +3203,12 @@ impl Application {
             return ApplicationTransition::Continue;
         }
         if self.state.pending_submission.is_some() {
+            return ApplicationTransition::Continue;
+        }
+        // A Prompt is delivered to a Session, and a Session still loading is
+        // not one yet. The draft stands where the reader wrote it and the
+        // delivery waits, rather than racing a snapshot that may not come.
+        if self.state.open_session_is_loading() {
             return ApplicationTransition::Continue;
         }
         let key = self.state.composer_key();
@@ -3692,9 +3787,8 @@ impl Application {
         self.state.composers.clear(ComposerKey::Landing);
         self.state.submission_error = None;
         self.state.command_mode = CommandMode::Composer;
-        let detached = self.state.session.take().is_some();
+        let detached = self.state.leave_session_route();
         if detached {
-            self.state.session_reference = None;
             self.state.landing_agent_selection = inherited_selection.clone();
             self.state.confirmed_landing_agent_selection = inherited_selection;
             self.state.pending_landing_agent_selection = None;
@@ -3890,6 +3984,11 @@ impl Application {
         &mut self,
         selection: AgentSelection,
     ) -> Result<ApplicationTransition> {
+        // A Session still loading has no Selection to change, and the Landing
+        // it has already left is not the one to change instead.
+        if self.state.open_session_is_loading() {
+            return Ok(ApplicationTransition::Continue);
+        }
         let Some(session) = self.session_reference() else {
             self.state.landing_agent_selection = Some(selection.clone());
             if self.state.pending_landing_agent_selection.is_some() {

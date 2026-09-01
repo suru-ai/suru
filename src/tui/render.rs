@@ -64,6 +64,10 @@ const TRANSCRIPT_BOTTOM_MARGIN: u16 = 1;
 /// Columns of air the composer keeps between its border and the Prompt being
 /// typed, so text never abuts the box it is written in.
 const COMPOSER_TEXT_MARGIN: u16 = 1;
+/// The row the Session view's composer footer is drawn on. The shell an
+/// opening Session is drawn as holds it empty rather than closing the gap, so
+/// the composer stands where hydration will leave it.
+const SESSION_FOOTER_HEIGHT: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResponsiveDetail {
@@ -115,6 +119,8 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     let main = render_sidebar(frame, state, &theme);
     let composer = if state.session.is_some() {
         render_session(frame, state, main, slots, &theme)
+    } else if state.route.is_some() {
+        render_opening_session(frame, state, main, &theme)
     } else {
         render_landing(frame, state, main, slots, &theme)
     };
@@ -2433,6 +2439,75 @@ fn render_landing(
     }
 }
 
+/// The shell a Session the reader has been carried into is drawn as until its
+/// snapshot lands.
+///
+/// It holds the target's composer, standing where the Session view docks one,
+/// and nothing else. There is no header, Transcript, Working state, usage, or
+/// footer, because every one of those is read off a Session and the only
+/// Session in hand is the one the reader has left. Nor is anything built from
+/// the listing row that named the target: a summary is not a Session, and a
+/// shell furnished from one would be telling the reader something it does not
+/// know. It stays quiet — the `Loading` the Working Indicator's shimmer draws
+/// arrives with <https://github.com/jake-tucker/suru/issues/225>.
+fn render_opening_session(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    area: Rect,
+    theme: &Theme,
+) -> RenderedComposer {
+    let content_column = session_content_area(area, state);
+    let content_width = content_column.width;
+    let key = ComposerKey::Session(
+        state
+            .route
+            .clone()
+            .expect("the opening shell is drawn for the Session the route names"),
+    );
+    let composer_text = state.composers.text(key.clone());
+    let composer_cursor = state.composers.cursor(key.clone());
+    let skill_markers = state.composers.skill_markers(key);
+    let desired_composer_height =
+        composer_block_height(area.height, content_width, composer_text, composer_cursor);
+    // What the Session view keeps below its Transcript and above its composer:
+    // the footer's row and the Transcript's bottom margin, plus the one row of
+    // Transcript the layout never squeezes away. The shell holds them all
+    // empty, so a composer that grows as the reader types stops where it would
+    // in the view, and the draft in it does not jump a line when the snapshot
+    // lands.
+    let reserved_height = SESSION_FOOTER_HEIGHT
+        .saturating_add(TRANSCRIPT_BOTTOM_MARGIN)
+        .saturating_add(1);
+    let composer_height =
+        desired_composer_height.min(area.height.saturating_sub(reserved_height).max(1));
+    let [_, _, _, _, _, _, composer_area, _] = session_areas(
+        area,
+        0,
+        0,
+        0,
+        0,
+        composer_height,
+        SESSION_FOOTER_HEIGHT.min(area.height.saturating_sub(composer_height)),
+    );
+    let composer_area = in_column(composer_area, content_column);
+    let cursor = Some(render_composer(
+        frame,
+        composer_area,
+        ComposerContent {
+            text: composer_text,
+            cursor: composer_cursor,
+            skill_markers: &skill_markers,
+        },
+        state.composer_border_style(theme),
+        ResponsiveDetail::for_width(content_width),
+        theme,
+    ));
+    RenderedComposer {
+        area: composer_area,
+        cursor,
+    }
+}
+
 fn render_session(
     frame: &mut Frame<'_>,
     state: &TuiState,
@@ -2447,8 +2522,7 @@ fn render_session(
         .snapshot();
     let padding = horizontal_padding(area.width);
     let normally_padded = horizontally_inset(area, padding);
-    let content_column =
-        session_content_column(normally_padded, state.settings().session.content_width);
+    let content_column = session_content_area(area, state);
     let content_width = content_column.width;
     let content_detail = ResponsiveDetail::for_width(content_width);
     let header_detail = ResponsiveDetail::for_width(normally_padded.width);
@@ -2903,6 +2977,17 @@ fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String
             .model_picker
             .selection_summary(selection, detail.shows_secondary()),
     }
+}
+
+/// The columns a Session's content is drawn in: the frame's own padding, then
+/// the Session Content Width the reader has chosen. The Session view and the
+/// shell one opens into read it the same way, so a composer keeps its columns
+/// across hydration as well as its row.
+fn session_content_area(area: Rect, state: &TuiState) -> Rect {
+    session_content_column(
+        horizontally_inset(area, horizontal_padding(area.width)),
+        state.settings().session.content_width,
+    )
 }
 
 fn session_areas(

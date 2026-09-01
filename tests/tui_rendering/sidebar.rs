@@ -1102,69 +1102,6 @@ fn moving_workspace_while_a_session_is_opening_reports_the_client_letting_go() {
     );
 }
 
-/// The Session on screen goes on taking and drawing its own events while
-/// another is being opened. Nothing about the target has arrived yet, so
-/// shutting the open Session's events out would leave the reader watching work
-/// that has stopped moving. (The stream carrying those events is the run
-/// loop's, and beginning an attachment leaves it alone; this is the reading of
-/// it the Application answers for.)
-#[test]
-fn a_session_being_opened_leaves_the_open_session_taking_its_own_events() {
-    let workspace = workspace_dir();
-    let mut application = connected_application(workspace.path());
-    deliver_initial_visibility(&mut application, SidebarVisibility::Hidden);
-    let (open_session, snapshot, turn_id) =
-        enter_active_session(&mut application, workspace.path());
-    let request = expect_sidebar_listing(press_toggle(&mut application));
-    application
-        .handle_event(ApplicationEvent::SessionsListed {
-            request,
-            sessions: vec![listed_as(
-                SessionId::new(),
-                "The work wanted",
-                workspace.path(),
-                1,
-            )],
-        })
-        .expect("hydrate the Sidebar beside the open Session");
-    // The open Session has no row in this listing, so opening the Sidebar
-    // starts the keys on the Workspace selector rather than on a Session.
-    step_onto_the_list(&mut application);
-    assert!(
-        matches!(
-            press_sidebar_key(&mut application, KeyCode::Enter),
-            ApplicationTransition::AttachSession(_)
-        ),
-        "the reader chose another Session to open"
-    );
-
-    application
-        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
-            SessionUpdate {
-                session_id: open_session,
-                revision: SessionRevision(snapshot.revision.0 + 1),
-                changes: vec![SessionChange::MessageAdded {
-                    message: Message {
-                        id: MessageId::new(),
-                        turn_id,
-                        role: MessageRole::Agent,
-                        status: MessageStatus::Completed,
-                        content: "Still answering the reader".to_owned(),
-                        truncated: false,
-                        skill_invocations: Vec::new(),
-                    },
-                }],
-            },
-        )))
-        .expect("the open Session keeps streaming while another is opening");
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20).join("\n");
-    assert!(
-        rows.contains("Still answering the reader"),
-        "the open Session stopped taking its own events the moment another began opening: {rows}"
-    );
-}
-
 #[test]
 fn the_attached_session_hands_the_keys_back_to_the_composer() {
     let workspace = workspace_dir();
@@ -5232,4 +5169,550 @@ fn create_elsewhere(application: &mut Application, session_id: SessionId) -> App
             SessionCreated { session_id },
         )))
         .expect("take the Session another client made")
+}
+
+// Opening a Session from the Sidebar is optimistic. The reader is carried
+// into the Session they chose on the frame they choose it, and the Session
+// itself catches up.
+
+/// The Transcript of the Session the reader is reading when they choose
+/// another, which is how a frame still drawing it is recognized.
+const ALREADY_ON_SCREEN: &str = "The work already on screen";
+/// The Title of the row the reader opens, which the Sidebar draws and the
+/// main view must not: a listing summary is not a Session.
+const WANTED: &str = "The work wanted";
+/// The Title of the row standing for the Session the reader is leaving.
+const BEING_READ: &str = "The work being read";
+/// The first column of the main view, past the Sidebar's own columns and the
+/// divider closing them, so a row listed in the column is never mistaken for
+/// one drawn beside it.
+const MAIN_VIEW_COLUMN: usize = 32;
+
+/// The two rows every optimistic-opening reading works over: the Session the
+/// reader is leaving, and the one above it they open.
+fn listing_both(workspace: &Path, open: SessionId, target: SessionId) -> Vec<SessionListItem> {
+    vec![
+        listed_as(target, WANTED, workspace, 2),
+        listed_as(open, BEING_READ, workspace, 1),
+    ]
+}
+
+/// A Session open in the main view, with the Sidebar beside it listing that
+/// Session and another to open, and the keys in the column: what the reader
+/// has in front of them the moment before they open a Session.
+fn reading_one_and_listing_another(
+    workspace: &Path,
+    open: SessionId,
+    target: SessionId,
+) -> Application {
+    let sessions = listing_both(workspace, open, target);
+    let mut application = reading_one(workspace, open, sessions.clone());
+    enter_the_sidebar(&mut application, sessions);
+    application
+}
+
+/// The same, with the keys left in the composer: a pointer needs no column to
+/// be driving it.
+fn reading_one(workspace: &Path, open: SessionId, sessions: Vec<SessionListItem>) -> Application {
+    let mut application = sidebar_showing(workspace, sessions);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
+            open,
+            PromptId::new(),
+            ALREADY_ON_SCREEN,
+            workspace,
+        )))
+        .expect("open a Session in the main view");
+    application
+}
+
+/// Moves row focus from the open Session's row — where entering the Sidebar
+/// seeds it — up onto the row above, which is the Session these readings open.
+fn step_onto_the_wanted_row(application: &mut Application) {
+    assert_eq!(
+        press_sidebar_key(application, KeyCode::Up),
+        ApplicationTransition::Continue,
+        "walking the column opens nothing"
+    );
+}
+
+/// A key press the composer takes, as opposed to one the Sidebar does.
+fn press_composer_key(application: &mut Application, code: KeyCode) {
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+        .expect("press a composer key");
+}
+
+/// Opens the row focus stands on, which is the reader committing to it.
+fn open_the_focused_row(application: &mut Application) -> SessionId {
+    let ApplicationTransition::AttachSession(target) =
+        press_sidebar_key(application, KeyCode::Enter)
+    else {
+        panic!("Enter on a readable row opens the Session it stands for");
+    };
+    target.session_id
+}
+
+/// What the main view draws, row by row, with the Sidebar's own columns cut
+/// away.
+fn main_view_rows(application: &Application) -> Vec<String> {
+    rendered_application_rows_at(application, WIDE, 20)
+        .iter()
+        .map(|row| row.chars().skip(MAIN_VIEW_COLUMN).collect::<String>())
+        .collect()
+}
+
+fn main_view(application: &Application) -> String {
+    main_view_rows(application).join("\n")
+}
+
+/// The screen row the composer's box opens on, which is the bottom-most box
+/// the main view draws: a Transcript above it may draw boxes of its own.
+fn composer_top_row(application: &Application) -> usize {
+    main_view_rows(application)
+        .iter()
+        .rposition(|row| row.contains('\u{250c}'))
+        .expect("the main view draws a composer")
+}
+
+#[test]
+fn opening_a_session_carries_the_reader_into_it_before_its_snapshot_lands() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let mut application = reading_one_and_listing_another(workspace.path(), open, target);
+    step_onto_the_wanted_row(&mut application);
+
+    assert_eq!(
+        open_the_focused_row(&mut application),
+        target,
+        "the reader committed to the row they were on"
+    );
+
+    let highlighted = open_sidebar_text(&application);
+    assert!(
+        highlighted.contains(WANTED),
+        "the target is the open Session from this frame, snapshot or no snapshot: {highlighted:?}"
+    );
+    assert!(
+        !highlighted.contains("The work being read"),
+        "and the Session left behind is no longer open: {highlighted:?}"
+    );
+}
+
+#[test]
+fn opening_a_session_takes_away_what_the_last_one_put_on_screen() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let mut application = reading_one_and_listing_another(workspace.path(), open, target);
+    assert!(
+        main_view(&application).contains(ALREADY_ON_SCREEN),
+        "the Session being read is on screen to begin with"
+    );
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+
+    let main = main_view(&application);
+    assert!(
+        !main.contains(ALREADY_ON_SCREEN),
+        "the Transcript of the Session left behind is still drawn under the target: {main}"
+    );
+    assert!(!main.contains("Workspace"), "and so is its header: {main}");
+    assert!(
+        !main.contains("Agent"),
+        "and the footer it read its Agent and usage off: {main}"
+    );
+}
+
+/// The shell holds the target's composer and nothing else. A listing summary
+/// says a Title and a timestamp; it is not a Session, and nothing is invented
+/// from it.
+#[test]
+fn the_shell_a_session_opens_into_fabricates_nothing_from_its_listing_row() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let mut application = reading_one_and_listing_another(workspace.path(), open, target);
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+
+    let main = main_view(&application);
+    assert!(
+        main.contains('┌'),
+        "the target's composer stands ready in the main view: {main}"
+    );
+    assert!(
+        !main.contains(WANTED),
+        "the listing's Title is drawn as though it were the Session's own: {main}"
+    );
+    assert!(
+        !main.contains("What would you like to work on?"),
+        "and a Session being opened is not the Landing: {main}"
+    );
+}
+
+#[test]
+fn the_target_composer_takes_the_keys_the_moment_the_session_opens() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let mut application = reading_one_and_listing_another(workspace.path(), open, target);
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+
+    type_terminal_text(&mut application, "drafting ahead");
+
+    let main = main_view(&application);
+    assert!(
+        main.contains("drafting ahead"),
+        "the reader can write into the Session they just opened: {main}"
+    );
+    assert!(
+        selected_sidebar_text(&application).is_empty(),
+        "and the column keeps no row focus once it has handed the keys over"
+    );
+}
+
+/// A draft belongs to the Session it was written for, and optimistic opening
+/// never moves text between Sessions: the target opens on whatever was left
+/// under it, and the Session left behind keeps what was left under that.
+#[test]
+fn each_session_keeps_its_own_draft_through_an_optimistic_switch() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let mut application = reading_one_and_listing_another(workspace.path(), open, target);
+    press_sidebar_key(&mut application, KeyCode::Enter);
+    type_terminal_text(&mut application, "written for the first");
+    // The caret is left inside the draft rather than at its end, so what comes
+    // back is a place in the text and not merely the text.
+    for _ in 0.."for the first".len() {
+        press_composer_key(&mut application, KeyCode::Left);
+    }
+
+    enter_the_sidebar(
+        &mut application,
+        listing_both(workspace.path(), open, target),
+    );
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+
+    assert!(
+        !main_view(&application).contains("written for the first"),
+        "the draft of the Session left behind followed the reader into the target"
+    );
+    type_terminal_text(&mut application, "written for the second");
+    assert!(
+        main_view(&application).contains("written for the second"),
+        "the target keeps a draft of its own before it has loaded"
+    );
+
+    enter_the_sidebar(
+        &mut application,
+        listing_both(workspace.path(), open, target),
+    );
+    press_sidebar_key(&mut application, KeyCode::Down);
+    open_the_focused_row(&mut application);
+
+    let main = main_view(&application);
+    assert!(
+        main.contains("written for the first"),
+        "and the Session opened again opens on the draft left under it: {main}"
+    );
+    assert!(
+        !main.contains("written for the second"),
+        "with nothing of the other's: {main}"
+    );
+
+    type_terminal_text(&mut application, "carried on ");
+    assert!(
+        main_view(&application).contains("written carried on for the first"),
+        "the caret comes back where the reader left it rather than at the end of the draft"
+    );
+}
+
+/// The reader's newest choice is the only one that can still be right, so a
+/// second Session opened while the first is still loading supersedes it whole:
+/// the route, the highlight, and the composer are the newest target's.
+#[test]
+fn opening_a_second_session_while_the_first_loads_supersedes_it() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let newer = SessionId::new();
+    let mut sessions = vec![listed_as(newer, "The newest work", workspace.path(), 3)];
+    sessions.extend(listing_both(workspace.path(), open, target));
+    let mut application = reading_one(workspace.path(), open, sessions.clone());
+    enter_the_sidebar(&mut application, sessions.clone());
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+    type_terminal_text(&mut application, "written for the first target");
+
+    enter_the_sidebar(&mut application, sessions);
+    press_sidebar_key(&mut application, KeyCode::Up);
+    assert_eq!(
+        open_the_focused_row(&mut application),
+        newer,
+        "the reader changed their mind before the first target arrived"
+    );
+
+    let highlighted = open_sidebar_text(&application);
+    assert!(
+        highlighted.contains("The newest work"),
+        "the newest choice is the open Session: {highlighted:?}"
+    );
+    assert!(
+        !highlighted.contains(WANTED),
+        "and the target it superseded is not: {highlighted:?}"
+    );
+    assert!(
+        !main_view(&application).contains("written for the first target"),
+        "nor does its draft follow the reader into the Session they opened instead"
+    );
+}
+
+/// The Landing is the reader saying they are not going after all, so the shell
+/// they were carried into gives way to it rather than standing over a Session
+/// nobody is waiting for.
+#[test]
+fn opening_the_landing_while_a_session_loads_leaves_the_shell_behind() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let mut application = reading_one_and_listing_another(workspace.path(), open, target);
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SessionNew,
+            )))
+            .expect("open the Landing while a Session is loading"),
+        ApplicationTransition::DetachSession,
+        "the client lets go of the Session it was opening"
+    );
+    assert!(
+        main_view(&application).contains("What would you like to work on?"),
+        "and the reader is on the Landing"
+    );
+    assert!(
+        open_sidebar_text(&application).is_empty(),
+        "which highlights no Session at all"
+    );
+}
+
+/// A Prompt is delivered to a Session, and a Session still loading is not one
+/// yet. The draft stands; the delivery waits.
+#[test]
+fn a_prompt_cannot_be_delivered_before_the_session_arrives() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let mut application = reading_one_and_listing_another(workspace.path(), open, target);
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+    type_terminal_text(&mut application, "asked too early");
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("submit into a Session that has not arrived"),
+        ApplicationTransition::Continue,
+        "a Prompt cannot race a Session that has not loaded"
+    );
+    assert!(
+        main_view(&application).contains("asked too early"),
+        "and the draft is left exactly where the reader wrote it"
+    );
+}
+
+#[test]
+fn the_session_arriving_hydrates_the_shell_without_taking_the_draft() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let mut application = reading_one_and_listing_another(workspace.path(), open, target);
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+    type_terminal_text(&mut application, "written while it loaded");
+
+    application
+        .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
+            target,
+            PromptId::new(),
+            "The work that arrived",
+            workspace.path(),
+        )))
+        .expect("the Session the reader opened arrives");
+
+    let main = main_view(&application);
+    assert!(
+        main.contains("The work that arrived"),
+        "the shell adopts the Session it was opened for: {main}"
+    );
+    assert!(
+        main.contains("written while it loaded"),
+        "and the draft written into it is still there: {main}"
+    );
+    assert!(
+        open_sidebar_text(&application).contains(WANTED),
+        "the highlight it opened with stays where it was"
+    );
+    assert!(
+        matches!(
+            application
+                .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+                .expect("submit into the Session that arrived"),
+            ApplicationTransition::AdmitPrompt { session, .. } if session.session_id == target
+        ),
+        "and delivery answers again, to the Session the reader is in"
+    );
+}
+
+/// Delivering a Prompt is not the only act that needs a Session. Setting one
+/// aside acts on the Session the reader is in, and while it is loading there
+/// is none to act on — the metadata of the one they left must not stand in.
+#[test]
+fn a_session_dependent_command_is_inert_before_the_session_arrives() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let mut application = reading_one_and_listing_another(workspace.path(), open, target);
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SessionSettle,
+            )))
+            .expect("set aside a Session that has not arrived"),
+        ApplicationTransition::Continue,
+        "there is no Session to set aside, and the one left behind is not it"
+    );
+
+    application
+        .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
+            target,
+            PromptId::new(),
+            "The work that arrived",
+            workspace.path(),
+        )))
+        .expect("the Session the reader opened arrives");
+
+    assert!(
+        matches!(
+            application
+                .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                    SemanticCommandId::SessionSettle,
+                )))
+                .expect("set aside the Session that arrived"),
+            ApplicationTransition::SettleSession { session, settled: true }
+                if session.session_id == target
+        ),
+        "and the command answers again once there is a Session to act on"
+    );
+}
+
+/// The composer is where the reader is already writing when the snapshot
+/// lands, so adopting the Session must not move it out from under them.
+#[test]
+fn the_session_arriving_leaves_the_composer_where_the_draft_was_written() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let mut application = reading_one_and_listing_another(workspace.path(), open, target);
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+    type_terminal_text(&mut application, "written while it loaded");
+    let opened_on = composer_top_row(&application);
+
+    application
+        .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
+            target,
+            PromptId::new(),
+            "The work that arrived",
+            workspace.path(),
+        )))
+        .expect("the Session the reader opened arrives");
+
+    assert_eq!(
+        composer_top_row(&application),
+        opened_on,
+        "the composer jumped a line as the Session landed under it"
+    );
+}
+
+/// A press opens a Session the way Enter does, and says nothing about where
+/// the keys are: the Sidebar has not got them, so no row focus is raised.
+#[test]
+fn a_press_opens_a_session_the_way_enter_does_and_raises_no_row_focus() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let mut application = reading_one(
+        workspace.path(),
+        open,
+        listing_both(workspace.path(), open, target),
+    );
+
+    assert_eq!(
+        press_line(&mut application, MouseButton::Left, WANTED),
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            target,
+        )),
+        "the press opens the Session under it"
+    );
+    assert!(
+        open_sidebar_text(&application).contains(WANTED),
+        "and carries the reader into it at once, as Enter does"
+    );
+    assert!(
+        !main_view(&application).contains(ALREADY_ON_SCREEN),
+        "taking away what the Session left behind had on screen"
+    );
+    assert!(
+        selected_sidebar_text(&application).is_empty(),
+        "a pointer says which row, not where the keys are, so no row focus is raised"
+    );
+}
+
+/// The Session left behind keeps its own stream until the target hydrates, so
+/// what it sends must land somewhere safe — but never on screen, where it
+/// would be read as the Session the reader is now in.
+#[test]
+fn the_session_left_behind_is_never_drawn_under_the_one_being_opened() {
+    let workspace = workspace_dir();
+    let target = SessionId::new();
+    let mut application = connected_application(workspace.path());
+    deliver_initial_visibility(&mut application, SidebarVisibility::Hidden);
+    let (open, snapshot, turn_id) = enter_active_session(&mut application, workspace.path());
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![listed_as(target, WANTED, workspace.path(), 1)],
+        })
+        .expect("hydrate the Sidebar beside the open Session");
+    // The open Session has no row in this listing, so opening the Sidebar
+    // starts the keys on the Workspace selector rather than on a Session.
+    step_onto_the_list(&mut application);
+    open_the_focused_row(&mut application);
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id: open,
+                revision: SessionRevision(snapshot.revision.0 + 1),
+                changes: vec![SessionChange::MessageAdded {
+                    message: Message {
+                        id: MessageId::new(),
+                        turn_id,
+                        role: MessageRole::Agent,
+                        status: MessageStatus::Completed,
+                        content: "Still answering the reader".to_owned(),
+                        truncated: false,
+                        skill_invocations: Vec::new(),
+                    },
+                }],
+            },
+        )))
+        .expect("the Session left behind keeps sending while another is opening");
+
+    let main = main_view(&application);
+    assert!(
+        !main.contains("Still answering the reader"),
+        "the Session left behind is drawn under the Session being opened: {main}"
+    );
 }

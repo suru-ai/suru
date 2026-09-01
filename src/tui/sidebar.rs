@@ -1370,6 +1370,10 @@ impl Sidebar {
         }
         self.listing.clear_error();
         self.attaching = Some(wanted);
+        // The reader is done choosing the moment they choose: opening is
+        // optimistic, so the keys go to the Session's composer now rather
+        // than when its snapshot lands.
+        self.hand_back_keys();
         SidebarActivation::Attach(wanted)
     }
 
@@ -1579,12 +1583,11 @@ impl Sidebar {
         self.attaching.is_some()
     }
 
-    /// The Session the Sidebar asked for is on screen. The reader is done
-    /// choosing, so the composer takes the keys back and they can prompt what
-    /// they just opened.
+    /// The Session the Sidebar asked for is on screen. The keys went to its
+    /// composer when the reader chose it, so nothing moves here — and a
+    /// reader who has since come back to the column keeps them.
     pub(super) fn finish_attachment(&mut self) {
         self.attaching = None;
-        self.hand_back_keys();
     }
 
     /// The client left the Session the Sidebar was opening, for the Landing or
