@@ -85,7 +85,7 @@ pub(crate) struct ServingController {
     peers: Arc<RwLock<Vec<StoredPeer>>>,
     remotes: Arc<RwLock<Vec<StoredRemote>>>,
     remote_clients: Arc<StdMutex<HashMap<String, Weak<PairingHttpClient>>>>,
-    revocations: Arc<RwLock<HashMap<String, Arc<PeerRevocation>>>>,
+    revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
 }
 
 #[derive(Clone)]
@@ -99,6 +99,7 @@ struct ActiveServing {
     settings: ServingSettings,
     address: SocketAddr,
     task: JoinHandle<()>,
+    connections: Arc<ServingConnections>,
 }
 
 #[derive(Default)]
@@ -275,10 +276,10 @@ impl ServingController {
         let peers: Vec<StoredPeer> = read_records(&data_dir.join(PEERS_FILE))?;
         let mut revocations = peers
             .iter()
-            .map(|peer| (peer.id.clone(), Arc::new(PeerRevocation::default())))
+            .map(|peer| (peer.id.clone(), Arc::new(ConnectionRevocation::default())))
             .collect::<HashMap<_, _>>();
         for id in read_records::<Vec<String>>(&data_dir.join(REVOKED_PEERS_FILE))? {
-            let revocation = Arc::new(PeerRevocation::default());
+            let revocation = Arc::new(ConnectionRevocation::default());
             revocation.revoke();
             revocations.insert(id, revocation);
         }
@@ -585,11 +586,13 @@ impl ServingController {
         let tls = Arc::new(self.server_tls_config()?);
         self.discard_invites();
         stop_active(&mut active, &self.address).await;
-        let task = tokio::spawn(serve(listener, tls, self.clone()));
+        let connections = Arc::new(ServingConnections::default());
+        let task = tokio::spawn(serve(listener, tls, connections.clone(), self.clone()));
         *active = Some(ActiveServing {
             settings,
             address,
             task,
+            connections,
         });
         self.address.send_replace(Some(address));
         tracing::info!(%address, "Serving listener ready");
@@ -948,9 +951,9 @@ impl ServingController {
         if was_existing {
             revocations
                 .entry(id)
-                .or_insert_with(|| Arc::new(PeerRevocation::default()));
+                .or_insert_with(|| Arc::new(ConnectionRevocation::default()));
         } else {
-            revocations.insert(id, Arc::new(PeerRevocation::default()));
+            revocations.insert(id, Arc::new(ConnectionRevocation::default()));
         }
         drop(revocations);
         if let Err(error) = self.persist_revoked_peer_ids() {
@@ -1001,15 +1004,22 @@ async fn stop_active(
     if let Some(running) = active.take() {
         running.task.abort();
         let _ = running.task.await;
+        running.connections.revoke_all();
         tracing::info!("Serving listener stopped");
     }
 }
 
-async fn serve(listener: TcpListener, tls: Arc<ServerConfig>, controller: ServingController) {
+async fn serve(
+    listener: TcpListener,
+    tls: Arc<ServerConfig>,
+    connections: Arc<ServingConnections>,
+    controller: ServingController,
+) {
     let listener = PairingTlsListener {
         listener,
         acceptor: TlsAcceptor::from(tls),
         revocations: controller.revocations.clone(),
+        connections,
     };
     let protocol_version = controller.protocol_version;
     let state = ServingState {
@@ -1246,7 +1256,8 @@ async fn enroll_peer(
 struct PairingTlsListener {
     listener: TcpListener,
     acceptor: TlsAcceptor,
-    revocations: Arc<RwLock<HashMap<String, Arc<PeerRevocation>>>>,
+    revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
+    connections: Arc<ServingConnections>,
 }
 
 impl Listener for PairingTlsListener {
@@ -1265,6 +1276,7 @@ impl Listener for PairingTlsListener {
             };
             match self.acceptor.accept(stream).await {
                 Ok(stream) => {
+                    let connection_revocation = self.connections.register();
                     let peer_key = stream
                         .get_ref()
                         .1
@@ -1284,6 +1296,7 @@ impl Listener for PairingTlsListener {
                             stream,
                             peer_id: revocable_peer_id,
                             revocations: self.revocations.clone(),
+                            connection_revocation,
                         },
                         ServingConnectionInfo {
                             _network_address: network_address,
@@ -1309,35 +1322,73 @@ impl Listener for PairingTlsListener {
 struct RevocableTlsStream {
     stream: TlsStream<TcpStream>,
     peer_id: Option<String>,
-    revocations: Arc<RwLock<HashMap<String, Arc<PeerRevocation>>>>,
+    revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
+    connection_revocation: Arc<ConnectionRevocation>,
 }
 
 impl RevocableTlsStream {
     fn poll_revoked(&self, context: &mut TaskContext<'_>) -> bool {
-        self.peer_id
-            .as_deref()
-            .and_then(|peer_id| {
-                self.revocations
-                    .read()
-                    .expect("Peer revocation lock is not poisoned")
-                    .get(peer_id)
-                    .cloned()
-            })
-            .is_some_and(|revoked| revoked.poll(context))
+        self.connection_revocation.poll(context)
+            || self
+                .peer_id
+                .as_deref()
+                .and_then(|peer_id| {
+                    self.revocations
+                        .read()
+                        .expect("Peer revocation lock is not poisoned")
+                        .get(peer_id)
+                        .cloned()
+                })
+                .is_some_and(|revoked| revoked.poll(context))
     }
 
     fn revoked_error() -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Peer was removed")
+        std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "Pairing connection was revoked",
+        )
     }
 }
 
 #[derive(Default)]
-struct PeerRevocation {
+struct ServingConnections {
+    revocations: StdMutex<Vec<Weak<ConnectionRevocation>>>,
+}
+
+impl ServingConnections {
+    fn register(&self) -> Arc<ConnectionRevocation> {
+        let revocation = Arc::new(ConnectionRevocation::default());
+        let mut revocations = self
+            .revocations
+            .lock()
+            .expect("Serving connection lock is not poisoned");
+        revocations.retain(|revocation| revocation.strong_count() > 0);
+        revocations.push(Arc::downgrade(&revocation));
+        revocation
+    }
+
+    fn revoke_all(&self) {
+        let revocations = std::mem::take(
+            &mut *self
+                .revocations
+                .lock()
+                .expect("Serving connection lock is not poisoned"),
+        );
+        for revocation in revocations {
+            if let Some(revocation) = revocation.upgrade() {
+                revocation.revoke();
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConnectionRevocation {
     revoked: AtomicBool,
     waker: AtomicWaker,
 }
 
-impl PeerRevocation {
+impl ConnectionRevocation {
     fn poll(&self, context: &TaskContext<'_>) -> bool {
         self.waker.register(context.waker());
         self.revoked.load(Ordering::Acquire)
@@ -1406,7 +1457,7 @@ impl axum::extract::connect_info::Connected<IncomingStream<'_, PairingTlsListene
 struct PinnedPeers {
     peers: Arc<RwLock<Vec<StoredPeer>>>,
     invites: Arc<StdMutex<InviteLedger>>,
-    revocations: Arc<RwLock<HashMap<String, Arc<PeerRevocation>>>>,
+    revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
 }
 
 impl std::fmt::Debug for PinnedPeers {

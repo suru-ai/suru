@@ -865,6 +865,7 @@ struct PairedServers {
     _serving_state: tempfile::TempDir,
     _serving_config_root: tempfile::TempDir,
     _connecting_state: tempfile::TempDir,
+    connecting_identity_path: std::path::PathBuf,
     serving: server::RunningServer,
     connecting: server::RunningServer,
     serving_client: ManagedClient,
@@ -1053,9 +1054,11 @@ async fn paired_servers_with_alternate_route(name: &str, alternate: bool) -> Pai
 
     let connecting_state = tempfile::tempdir().expect("create connecting state directory");
     let connecting_channel = format!("{name}-connecting");
+    let connecting_config = ServerConfig::new(connecting_state.path(), &connecting_channel)
+        .expect("configure connecting Server");
+    let connecting_identity_path = connecting_config.data_dir().join("server-identity.pk8");
     let connecting = server::spawn_with_timings(
-        ServerConfig::new(connecting_state.path(), &connecting_channel)
-            .expect("configure connecting Server"),
+        connecting_config,
         ServerTimings {
             shutdown_grace: Duration::from_millis(5),
             ..ServerTimings::default()
@@ -1096,6 +1099,7 @@ async fn paired_servers_with_alternate_route(name: &str, alternate: bool) -> Pai
         _serving_state: serving_state,
         _serving_config_root: serving_config_root,
         _connecting_state: connecting_state,
+        connecting_identity_path,
         serving,
         connecting,
         serving_client,
@@ -1242,6 +1246,127 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
 
     drop(events);
     pair.wire.wait_for_connections(0).await;
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn disabling_serving_ends_a_live_peer_stream_without_disturbing_local_clients() {
+    let mut pair = paired_servers("serving-disable-live-peer").await;
+    let serving_address = pair
+        .serving
+        .serving_address()
+        .expect("Serving listener is ready");
+    pair.serving_client
+        .mutate_setting(SettingMutation::ServingPort {
+            value: Some(serving_address.port()),
+        })
+        .await
+        .expect("keep the Serving address stable across re-enabling");
+    let workspace = tempfile::tempdir().expect("create Serving Workspace");
+    let created = pair
+        .serving_client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Hold this Session stream open".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create a Session on the Serving Server");
+    let descriptor = pair.connecting.descriptor();
+    let remote_api = format!("{}/v1/remotes/workstation", descriptor.base_url);
+    let http = reqwest::Client::new();
+    let response = http
+        .get(format!(
+            "{remote_api}/v1/sessions/{}/events",
+            created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("open the enrolled Peer's proxied Session stream")
+        .error_for_status()
+        .expect("the proxied Session stream succeeds");
+    let mut events = response.bytes_stream().eventsource();
+    let snapshot = timeout(Duration::from_secs(1), events.next())
+        .await
+        .expect("Remote Session snapshot arrives")
+        .expect("Remote Session stream remains open")
+        .expect("decode Remote Session snapshot event");
+    assert_eq!(snapshot.event, SESSION_SNAPSHOT_EVENT);
+    pair.wire.wait_for_connections(1).await;
+    let (_, serving_certificate) = dial_with_unknown_certificate(serving_address).await;
+    let mut in_flight_request = open_paired_health_connection(
+        serving_address,
+        &pair.connecting_identity_path,
+        public_key_from_certificate(&serving_certificate),
+    )
+    .await;
+    in_flight_request
+        .write_all(
+            format!(
+                "POST /v1/pairing/proxy/v1/sessions HTTP/1.1\r\nHost: localhost\r\nx-suru-protocol-version: {PROTOCOL_VERSION}\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{{"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("begin an ordinary proxied request with an incomplete body");
+    let mut byte = [0_u8];
+    assert!(
+        timeout(Duration::from_millis(25), in_flight_request.read(&mut byte))
+            .await
+            .is_err(),
+        "the incomplete request body keeps the ordinary request in flight"
+    );
+
+    pair.serving_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(false) })
+        .await
+        .expect("turn Serving off through the local Client");
+    match timeout(Duration::from_millis(100), events.next()).await {
+        Ok(None | Some(Err(_))) => {}
+        Ok(Some(Ok(event))) => panic!(
+            "disabled Serving produced an unexpected {} event",
+            event.event
+        ),
+        Err(_) => panic!("disabled Serving left the proxied Session request in flight"),
+    }
+    match timeout(
+        Duration::from_millis(100),
+        in_flight_request.read(&mut byte),
+    )
+    .await
+    .expect("disabled Serving ends the ordinary proxied request")
+    {
+        Ok(0) | Err(_) => {}
+        Ok(read) => panic!("disabled Serving produced {read} unexpected response bytes"),
+    }
+    pair.wire.wait_for_connections(0).await;
+    assert_eq!(
+        pair.serving_client
+            .list_sessions(None)
+            .await
+            .expect("the local Client remains attached after Serving stops")[0]
+            .id(),
+        created.session.id
+    );
+
+    pair.serving_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .expect("turn Serving back on through the same local Client");
+    assert_eq!(pair.serving.serving_address(), Some(serving_address));
+    pair.connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()))
+        .list_sessions(None)
+        .await
+        .expect("the existing Pairing authenticates against the reused Server identity");
+
     pair.shutdown().await;
 }
 
