@@ -9,23 +9,25 @@ use std::{
 
 use crate::support::{
     ADD_WORKSPACE, SELECTOR_ROW, SIDEBAR_PRESS_HEIGHT as PRESS_HEIGHT, SIDEBAR_WIDE as WIDE,
-    add_workspace, connected_application, deliver_settings, drawn_in_sidebar, enter_session,
-    failed_session_snapshot, noncanonical_spelling, press_add_workspace,
-    rendered_application_rows_at, rendered_row, selector_label, sidebar_column, text_on,
-    type_terminal_text, workspace_dir,
+    add_workspace, answer_workspace_resolution, connected_application, deliver_settings,
+    drawn_in_sidebar, enter_active_session, enter_session, failed_session_snapshot,
+    noncanonical_spelling, press_add_workspace, rendered_application_rows_at, rendered_row,
+    selector_label, sidebar_column, text_on, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::style::Color;
 use suru::{
-    managed_client::ManagedEvent,
+    managed_client::{ManagedEvent, SessionEvent},
     protocol::{
-        AutoSettle, EffectiveSettings, EmojiVisibility, ModelAvailability, PromptId, Session,
-        SessionCatalogRevision, SessionCatalogSnapshot, SessionCreated, SessionDeleted, SessionId,
-        SessionListItem, SessionSettings, SessionSettlementChanged, SessionStatus, SessionSummary,
-        SessionTimestamp, SessionTitleChanged, SessionWorkingChanged, SidebarScope,
-        SidebarSettings, SidebarVisibility, TitleSettings, UnreadableSessionSummary, Workspace,
+        AutoSettle, EffectiveSettings, EmojiVisibility, Message, MessageId, MessageRole,
+        MessageStatus, ModelAvailability, PromptId, Session, SessionCatalogRevision,
+        SessionCatalogSnapshot, SessionChange, SessionCreated, SessionDeleted, SessionId,
+        SessionListItem, SessionRevision, SessionSettings, SessionSettlementChanged, SessionStatus,
+        SessionSummary, SessionTimestamp, SessionTitleChanged, SessionUpdate,
+        SessionWorkingChanged, SidebarScope, SidebarSettings, SidebarVisibility, TitleSettings,
+        UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -725,6 +727,18 @@ fn press_toggle(application: &mut Application) -> ApplicationTransition {
         .expect("press Ctrl+B")
 }
 
+/// The Workspace Picker's own listing, told apart from the Sidebar's by the
+/// surface that asked for it.
+fn expect_workspace_picker_listing(
+    transition: ApplicationTransition,
+) -> suru::tui::SessionListRequest {
+    let ApplicationTransition::ListSessions(request) = transition else {
+        panic!("opening the Workspace Picker asks for its Sessions, not {transition:?}");
+    };
+    assert_eq!(request.surface(), SessionListSurface::WorkspacePicker);
+    request
+}
+
 fn expect_sidebar_listing(transition: ApplicationTransition) -> suru::tui::SessionListRequest {
     let ApplicationTransition::ListSessions(request) = transition else {
         panic!("a Sidebar coming into view asks for its Sessions, not {transition:?}");
@@ -1000,6 +1014,138 @@ fn enter_attaches_the_selected_session_in_place() {
             wanted,
         )),
         "Enter attaches the Session the reader has selected"
+    );
+}
+
+/// Opening a Session is asynchronous, and the reader does not wait for it.
+/// Leaving for the Landing is them saying they are not going after all, so the
+/// client reports that it has let go — the run loop's cue to stop the
+/// attachment it started and refuse whatever it answers with.
+#[test]
+fn leaving_for_the_landing_while_a_session_is_opening_reports_the_client_letting_go() {
+    let workspace = workspace_dir();
+    let wanted = SessionId::new();
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![listed_as(wanted, "The work wanted", workspace.path(), 1)],
+    );
+    assert!(matches!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::AttachSession(_)
+    ));
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SessionNew,
+            )))
+            .expect("open the Landing while a Session is opening"),
+        ApplicationTransition::DetachSession,
+        "the Landing is the reader leaving the Session the client was opening"
+    );
+}
+
+/// Moving Workspace opens the Landing of the Workspace chosen, which is the
+/// same leaving: a Session being opened in the Workspace left behind is no
+/// longer where the reader is.
+#[test]
+fn moving_workspace_while_a_session_is_opening_reports_the_client_letting_go() {
+    let root = workspace_dir();
+    let here = root.path().join("here");
+    let atlas = root.path().join("atlas");
+    for workspace in [&here, &atlas] {
+        std::fs::create_dir(workspace).expect("create the Workspace fixture");
+    }
+    let here = std::fs::canonicalize(&here).expect("canonicalize the Workspace fixture");
+    let atlas = std::fs::canonicalize(&atlas).expect("canonicalize the Workspace fixture");
+    let wanted = SessionId::new();
+    let mut application =
+        sidebar_focused(&here, vec![listed_as(wanted, "The work wanted", &here, 1)]);
+    assert!(matches!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::AttachSession(_)
+    ));
+
+    let listing = expect_workspace_picker_listing(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::WorkspaceList,
+            )))
+            .expect("open the Workspace Picker"),
+    );
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request: listing,
+            sessions: vec![listed_as(SessionId::new(), "Elsewhere", &atlas, 2)],
+        })
+        .expect("hydrate the Workspace Picker");
+    press_sidebar_key(&mut application, KeyCode::Down);
+
+    let chosen = press_sidebar_key(&mut application, KeyCode::Enter);
+    assert_eq!(
+        answer_workspace_resolution(&mut application, chosen),
+        ApplicationTransition::DetachSession,
+        "moving Workspace leaves the Session the client was opening behind with it"
+    );
+}
+
+/// The Session on screen goes on taking and drawing its own events while
+/// another is being opened. Nothing about the target has arrived yet, so
+/// shutting the open Session's events out would leave the reader watching work
+/// that has stopped moving. (The stream carrying those events is the run
+/// loop's, and beginning an attachment leaves it alone; this is the reading of
+/// it the Application answers for.)
+#[test]
+fn a_session_being_opened_leaves_the_open_session_taking_its_own_events() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    deliver_initial_visibility(&mut application, SidebarVisibility::Hidden);
+    let (open_session, snapshot, turn_id) =
+        enter_active_session(&mut application, workspace.path());
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![listed_as(
+                SessionId::new(),
+                "The work wanted",
+                workspace.path(),
+                1,
+            )],
+        })
+        .expect("hydrate the Sidebar beside the open Session");
+    assert!(
+        matches!(
+            press_sidebar_key(&mut application, KeyCode::Enter),
+            ApplicationTransition::AttachSession(_)
+        ),
+        "the reader chose another Session to open"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id: open_session,
+                revision: SessionRevision(snapshot.revision.0 + 1),
+                changes: vec![SessionChange::MessageAdded {
+                    message: Message {
+                        id: MessageId::new(),
+                        turn_id,
+                        role: MessageRole::Agent,
+                        status: MessageStatus::Completed,
+                        content: "Still answering the reader".to_owned(),
+                        truncated: false,
+                        skill_invocations: Vec::new(),
+                    },
+                }],
+            },
+        )))
+        .expect("the open Session keeps streaming while another is opening");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20).join("\n");
+    assert!(
+        rows.contains("Still answering the reader"),
+        "the open Session stopped taking its own events the moment another began opening: {rows}"
     );
 }
 

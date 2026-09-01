@@ -1480,6 +1480,16 @@ impl Sidebar {
         self.hand_back_keys();
     }
 
+    /// The client left the Session the Sidebar was opening, for the Landing or
+    /// for another Workspace. The attachment behind it has been let go of, so
+    /// the Sidebar stops waiting on an answer that is never coming, without
+    /// reporting a refusal that never happened. Turning toward another Outlook
+    /// leaves it through [`Self::adopt_outlook`], which puts the whole column
+    /// down rather than only what it was opening.
+    pub(super) fn abandon_attachment(&mut self) {
+        self.attaching = None;
+    }
+
     /// The server refused the attachment. The reader keeps the keys and the
     /// list, and the refusal is drawn above it.
     pub(super) fn fail_attachment(&mut self, error: String) {

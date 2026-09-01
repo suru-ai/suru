@@ -502,6 +502,14 @@ impl TuiState {
         self.sidebar.adopt_workspace(workspace);
     }
 
+    /// Stops waiting on a Session being opened, on every surface that can be
+    /// waiting. The work itself is the run loop's to let go of; this is the
+    /// presentation that went with it.
+    fn abandon_pending_attachment(&mut self) {
+        self.sidebar.abandon_attachment();
+        self.session_picker.abandon_attachment();
+    }
+
     fn turn_outlook(&mut self, outlook: Outlook) {
         if self.outlook == outlook {
             return;
@@ -3652,12 +3660,14 @@ impl Application {
             self.state.confirmed_agent_selection = None;
         }
         self.state.session_events_blocked = detached;
+        self.state.abandon_pending_attachment();
         self.state.sync_composer_completion();
-        if detached {
-            ApplicationTransition::DetachSession
-        } else {
-            ApplicationTransition::Continue
-        }
+        // Detaching whether or not a Session was on screen: a Session being
+        // opened is one the reader is on their way to, and the Landing is
+        // them saying they are not going. The client has to let go of it here
+        // or its answer arrives as an answer to a question they stopped
+        // asking.
+        ApplicationTransition::DetachSession
     }
 
     /// Handles the settings panel commands routed here; any other semantic

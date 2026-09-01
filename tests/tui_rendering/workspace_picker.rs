@@ -416,9 +416,9 @@ fn enter_closes_the_picker_and_shows_the_landing_of_the_workspace_chosen() {
 
     assert_eq!(
         choose(&mut application),
-        ApplicationTransition::Continue,
-        "with no Session open there is nothing to leave behind, and the switch \
-         itself asks the server for nothing"
+        ApplicationTransition::DetachSession,
+        "moving Workspace opens the Landing, which is the client letting go of \
+         whatever it was on or on its way to"
     );
 
     // Wide enough for the footer to spell the Workspace rather than truncate it.
@@ -500,7 +500,11 @@ fn a_workspace_whose_directory_is_gone_is_refused_in_place_and_moves_nothing() {
 
     press(&mut application, KeyCode::Down);
     assert_eq!(selected_row(&application), "atlas");
-    assert_eq!(choose(&mut application), ApplicationTransition::Continue);
+    assert_eq!(
+        choose(&mut application),
+        ApplicationTransition::DetachSession,
+        "a valid pick opens the Landing, which is the client leaving whatever it was on"
+    );
     let switched = rendered_application_rows_at(&application, 120, 20).join("\n");
     assert!(
         switched.contains("What would you like to work on?"),
@@ -783,7 +787,11 @@ fn choosing_the_workspace_the_client_is_already_in_opens_the_landing() {
         "the picker opens on the Workspace the reader is in"
     );
 
-    assert_eq!(choose(&mut application), ApplicationTransition::Continue);
+    assert_eq!(
+        choose(&mut application),
+        ApplicationTransition::DetachSession,
+        "opening the Landing is the client leaving whatever it was on"
+    );
 
     let landing = rendered_application_rows_at(&application, 120, 20).join("\n");
     assert!(

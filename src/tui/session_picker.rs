@@ -160,6 +160,13 @@ impl SessionPicker {
         self.confirming_delete = None;
     }
 
+    /// The client left the Session the picker was opening. The attachment
+    /// behind it has been let go of, so the picker stops waiting on an answer
+    /// that is never coming.
+    pub(super) fn abandon_attachment(&mut self) {
+        self.attaching = None;
+    }
+
     pub(super) fn fail_attachment(&mut self, error: String) -> SessionListRequest {
         self.listing.report_error(error);
         self.begin_listing()

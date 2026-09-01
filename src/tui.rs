@@ -1,5 +1,6 @@
 //! Ratatui view state and terminal lifecycle.
 
+mod attachment;
 mod commands;
 mod completion;
 mod composer;

@@ -37,6 +37,7 @@ use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc::UnboundedSender;
 
+use super::attachment::{AttachmentOperationId, AttachmentOutcome, SessionAttachment};
 use super::shimmer;
 use super::state::{
     Application, ApplicationEvent, ApplicationTransition, ModelListRequest, SessionListRequest,
@@ -67,7 +68,9 @@ enum Exit {
 struct SessionTasks {
     subscription: Option<SessionSubscription>,
     subscribing: Option<(SessionReference, tokio::task::JoinHandle<()>)>,
-    attaching: Option<(SessionReference, tokio::task::JoinHandle<()>)>,
+    /// The Session attachment the reader is waiting on, correlated so that
+    /// only their newest choice can land.
+    attachment: SessionAttachment,
     /// One in-flight Session listing per surface that lists Sessions: the
     /// picker and the Sidebar list at once, and a fresh request from either
     /// must replace only that surface's own.
@@ -88,19 +91,26 @@ impl SessionTasks {
 
     /// Drops the live subscription along with any attempt to re-establish it,
     /// so nothing reconnects to a Session left behind.
+    ///
+    /// Attachment is left alone: this is also the housekeeping a client with
+    /// no Session open does, and a reader attaching one from the Landing has
+    /// no Session open yet.
     fn detach(&mut self) {
         self.end_subscription();
         self.abort_subscribing();
     }
 
-    fn abort_subscribing(&mut self) {
-        if let Some((_, task)) = self.subscribing.take() {
-            task.abort();
-        }
+    /// The reader left the Session they were on — for the Landing, another
+    /// Workspace, or another Outlook. Nothing that was being loaded for them
+    /// is still an answer to where they are, so the attachment goes with the
+    /// subscription.
+    fn leave_session(&mut self) {
+        self.detach();
+        self.attachment.abandon();
     }
 
-    fn abort_attaching(&mut self) {
-        if let Some((_, task)) = self.attaching.take() {
+    fn abort_subscribing(&mut self) {
+        if let Some((_, task)) = self.subscribing.take() {
             task.abort();
         }
     }
@@ -240,28 +250,26 @@ impl SessionTasks {
         }
     }
 
-    /// Attaches to `session_id` unless an attachment is already in flight; the
-    /// picker stays on the original Session until the target hydrates.
+    /// Attaches to `reference`, superseding whatever attachment was already in
+    /// flight: the Session the reader just chose is the one they are waiting
+    /// on. The live subscription is left alone until the target hydrates, so
+    /// the Session on screen keeps its stream throughout.
     fn attach(
         &mut self,
         commands: SessionCommandClient,
         reference: SessionReference,
         results: &UnboundedSender<SessionPickerResult>,
     ) {
-        if self.attaching.is_none() {
-            let task = spawn_session_attachment(commands, reference.clone(), results.clone());
-            self.attaching = Some((reference, task));
-        }
+        let results = results.clone();
+        self.attachment.begin(reference, |target, operation| {
+            spawn_session_attachment(commands, target, operation, results)
+        });
     }
 
-    fn finish_attaching(&mut self, reference: &SessionReference) {
-        if self
-            .attaching
-            .as_ref()
-            .is_some_and(|(attaching, _)| attaching == reference)
-        {
-            self.attaching = None;
-        }
+    /// Whether a finished attachment is still the one the reader is waiting
+    /// on, forgetting it when it is.
+    fn settle_attachment(&mut self, operation: AttachmentOperationId) -> AttachmentOutcome {
+        self.attachment.settle(operation)
     }
 
     fn finish_listing_sessions(&mut self, request: &SessionListRequest) {
@@ -557,7 +565,7 @@ impl RunLoop {
             ApplicationTransition::Continue => {}
             ApplicationTransition::Exit => return ControlFlow::Break(Exit::Now),
             ApplicationTransition::SessionEnded => self.tasks.end_subscription(),
-            ApplicationTransition::DetachSession => self.tasks.detach(),
+            ApplicationTransition::DetachSession => self.tasks.leave_session(),
             ApplicationTransition::CreateSession(request) => {
                 let outlook = self.application.outlook().clone();
                 spawn_session_creation(
@@ -699,8 +707,7 @@ impl RunLoop {
                 );
             }
             ApplicationTransition::TurnOutlook(outlook) => {
-                self.tasks.detach();
-                self.tasks.abort_attaching();
+                self.tasks.leave_session();
                 self.tasks.reset_skill_listing();
                 self.tasks.reset_outlook_catalog();
                 self.tasks.reset_workspace_resolutions();
@@ -1162,6 +1169,16 @@ impl RunLoop {
     ) -> Result<ControlFlow<Exit>> {
         let result =
             result.ok_or_else(|| anyhow!("Session picker task channel stopped unexpectedly"))?;
+        // An attachment the reader moved on from is dropped whole, before
+        // anything reads it: its snapshot never becomes the open Session, its
+        // subscription goes with it rather than replacing the one still on
+        // screen, and its failure is never drawn at them.
+        if let SessionPickerResult::Attached { operation, .. }
+        | SessionPickerResult::AttachmentFailed { operation, .. } = &result
+            && !self.tasks.settle_attachment(*operation).is_current()
+        {
+            return Ok(ControlFlow::Continue(()));
+        }
         // A Sidebar catching up with a change it had already taken in place is
         // answered with the listing it is already drawing, and a straggler
         // lands nowhere at all. Neither is worth a frame to an idle TUI
@@ -1192,8 +1209,8 @@ impl RunLoop {
                 reference,
                 snapshot,
                 subscription,
+                ..
             } => {
-                self.tasks.finish_attaching(&reference);
                 self.application
                     .handle_event(ApplicationEvent::OriginSessionAttached {
                         reference: reference.clone(),
@@ -1204,8 +1221,9 @@ impl RunLoop {
                     self.tasks.abort_subscribing();
                 }
             }
-            SessionPickerResult::AttachmentFailed { reference, error } => {
-                self.tasks.finish_attaching(&reference);
+            SessionPickerResult::AttachmentFailed {
+                reference, error, ..
+            } => {
                 let transition = self.application.handle_event(
                     ApplicationEvent::OriginSessionAttachmentFailed { reference, error },
                 )?;
@@ -1827,11 +1845,13 @@ enum SessionPickerResult {
     },
     Attached {
         reference: SessionReference,
+        operation: AttachmentOperationId,
         snapshot: Box<SessionSnapshot>,
         subscription: SessionSubscription,
     },
     AttachmentFailed {
         reference: SessionReference,
+        operation: AttachmentOperationId,
         error: String,
     },
 }
@@ -1880,9 +1900,13 @@ fn spawn_session_listing(
     })
 }
 
+/// Attaches `reference`, reporting the `operation` that asked for it on both
+/// the answer and the refusal so the run loop can tell the navigation the
+/// reader is still waiting on from the one they left.
 fn spawn_session_attachment(
     commands: SessionCommandClient,
     reference: SessionReference,
+    operation: AttachmentOperationId,
     results: UnboundedSender<SessionPickerResult>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1898,6 +1922,7 @@ fn spawn_session_attachment(
             };
             Ok::<_, anyhow::Error>(SessionPickerResult::Attached {
                 reference: reference.clone(),
+                operation,
                 snapshot,
                 subscription,
             })
@@ -1905,6 +1930,7 @@ fn spawn_session_attachment(
         .await
         .unwrap_or_else(|error| SessionPickerResult::AttachmentFailed {
             reference,
+            operation,
             error: error.to_string(),
         });
         let _ = results.send(result);
