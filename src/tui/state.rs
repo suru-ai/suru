@@ -65,6 +65,9 @@ use super::{
 /// Rows scrolled per mouse wheel tick, matching common terminal conventions.
 const WHEEL_SCROLL_ROWS: usize = 3;
 const INTERRUPT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an optimistic Session shell stays visually quiet before it asks
+/// the reader to wait. This is fixed presentation behavior, not a Setting.
+const OPEN_SESSION_LOADING_DELAY: Duration = Duration::from_millis(300);
 
 #[derive(Clone)]
 struct PresentationClock(Arc<dyn Fn() -> Instant + Send + Sync>);
@@ -85,6 +88,14 @@ impl std::fmt::Debug for PresentationClock {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PresentationClock(..)")
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum OpeningLoadingState {
+    #[default]
+    Inactive,
+    WaitingUntil(Instant),
+    Visible,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -341,6 +352,10 @@ pub struct TuiState {
     /// highlight, the composer the keys write into, and what the Sidebar's
     /// own Enter takes to be the Session already open.
     pub(super) route: Option<SessionReference>,
+    /// The optimistic shell's fixed quiet period and visible feedback. A
+    /// reached deadline remains `WaitingUntil` until its wakeup wins selection,
+    /// so another ready event cannot silently cancel the redraw it is owed.
+    opening_loading: OpeningLoadingState,
     /// The Session the main view draws from, present only once the route has
     /// hydrated. A route without one is a Session still loading, and
     /// everything a Session is read for — its header, Transcript, Working
@@ -466,6 +481,7 @@ impl TuiState {
             presentation_clock: PresentationClock::default(),
             submission_error: None,
             route: None,
+            opening_loading: OpeningLoadingState::Inactive,
             session: None,
             session_reference: None,
             outlook_landing_selections: HashMap::from([(Outlook::Local, None)]),
@@ -553,6 +569,12 @@ impl TuiState {
         self.session = None;
         self.session_reference = None;
         self.route = Some(target);
+        let deadline = self
+            .presentation_clock
+            .now()
+            .checked_add(OPEN_SESSION_LOADING_DELAY)
+            .expect("the opening loading delay fits a monotonic clock");
+        self.opening_loading = OpeningLoadingState::WaitingUntil(deadline);
         self.session_events_blocked = true;
         // The picker browses the Session that was open, and the reader has
         // left it; the Subagents it offered are not the target's.
@@ -571,7 +593,12 @@ impl TuiState {
     fn leave_session_route(&mut self) -> bool {
         self.session = None;
         self.session_reference = None;
+        self.stop_opening_loading();
         self.route.take().is_some()
+    }
+
+    fn stop_opening_loading(&mut self) {
+        self.opening_loading = OpeningLoadingState::Inactive;
     }
 
     fn turn_outlook(&mut self, outlook: Outlook) {
@@ -845,6 +872,7 @@ impl TuiState {
             }
             ManagedEvent::RemoteFailed { message, .. } => self.settle_remote_failure(message),
             ManagedEvent::ServerShutdown(shutdown) => {
+                self.stop_opening_loading();
                 if shutdown.reason == ShutdownReason::Manual {
                     self.recovery = None;
                     self.reconnect_overlay_visible = false;
@@ -1072,6 +1100,7 @@ impl TuiState {
         // reached without an optimistic opening — one just created, or one
         // picked from an overlay — arrives as both at once.
         self.route = Some(reference.clone());
+        self.stop_opening_loading();
         self.session_reference = Some(reference);
         self.session = Some(SessionProjection::new(snapshot));
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
@@ -1575,6 +1604,19 @@ impl TuiState {
         self.route.is_some() && self.session.is_none()
     }
 
+    /// Whether the optimistic shell has waited long enough to draw its
+    /// loading feedback. Time is read only at presentation boundaries, so the
+    /// run loop stays idle until the one-shot threshold wakeup.
+    pub(super) fn opening_loading_is_visible(&self) -> bool {
+        match self.opening_loading {
+            OpeningLoadingState::Inactive => false,
+            OpeningLoadingState::WaitingUntil(deadline) => {
+                self.presentation_clock.now() >= deadline
+            }
+            OpeningLoadingState::Visible => true,
+        }
+    }
+
     /// Whether the Sidebar is the surface the keys actually reach, which is
     /// what its row focus says: a reader driving the Sidebar sees which row
     /// Enter would act on, and one who has opened something over it does not,
@@ -1871,6 +1913,9 @@ pub enum ApplicationEvent {
     /// The run loop's presentation-only wakeup. Kept as an event so headless
     /// rendering tests can drive latency behavior through the same boundary.
     SpinnerTick,
+    /// The optimistic shell's quiet-period wakeup. Kept explicit so another
+    /// ready event cannot consume the deadline without dirtying a frame.
+    OpeningLoadingDelayElapsed,
     ReconnectGraceElapsed,
     Managed(ManagedEvent),
     OutlookCatalog {
@@ -2173,6 +2218,21 @@ impl Application {
         self
     }
 
+    /// The one-shot delay remaining before an optimistic Session shell should
+    /// reveal `Loading`. A reached but unobserved threshold returns zero; `None`
+    /// means the run loop has observed it or the opening was cancelled.
+    pub fn opening_loading_wakeup(&self) -> Option<Duration> {
+        self.opening_loading_deadline()
+            .map(|deadline| deadline.saturating_duration_since(self.state.presentation_clock.now()))
+    }
+
+    pub(super) fn opening_loading_deadline(&self) -> Option<Instant> {
+        match self.state.opening_loading {
+            OpeningLoadingState::WaitingUntil(deadline) => Some(deadline),
+            OpeningLoadingState::Inactive | OpeningLoadingState::Visible => None,
+        }
+    }
+
     pub fn handle_event(&mut self, event: ApplicationEvent) -> Result<ApplicationTransition> {
         self.state.remember_agent_selection_presentation();
         let transition = self.handle_event_inner(event)?;
@@ -2185,6 +2245,12 @@ impl Application {
             ApplicationEvent::Command(command) => self.handle_command(command),
             ApplicationEvent::SpinnerTick => {
                 self.advance_spinner();
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::OpeningLoadingDelayElapsed => {
+                if self.state.opening_loading_is_visible() {
+                    self.state.opening_loading = OpeningLoadingState::Visible;
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::ReconnectGraceElapsed => Ok(self.elapse_reconnect_grace()),
@@ -2221,6 +2287,7 @@ impl Application {
                 if self.state.sidebar.is_attaching() {
                     // The Sidebar keeps its list and the reader keeps the keys:
                     // the refusal is drawn above the rows they are still on.
+                    self.state.stop_opening_loading();
                     self.state.sidebar.fail_attachment(error);
                     Ok(ApplicationTransition::Continue)
                 } else {
@@ -2231,6 +2298,9 @@ impl Application {
             ApplicationEvent::OriginSessionAttachmentFailed { reference, error } => {
                 if reference.origin != self.state.outlook {
                     return Ok(ApplicationTransition::Continue);
+                }
+                if self.state.route.as_ref() == Some(&reference) {
+                    self.state.stop_opening_loading();
                 }
                 if self.state.sidebar.is_attaching() {
                     self.state.sidebar.fail_attachment(error);
@@ -4266,7 +4336,7 @@ impl Application {
     /// Whether anything on screen has live presentation, so the run loop
     /// ticks only while animation can be drawn and an idle TUI schedules zero
     /// wakeups.
-    pub(super) fn wants_spinner(&self) -> bool {
+    pub fn wants_spinner(&self) -> bool {
         // A Provider's Availability being read is live work like any other, and
         // the row showing it animates only while the tick is armed.
         self.state.settings_panel.is_reading(&self.state.settings)

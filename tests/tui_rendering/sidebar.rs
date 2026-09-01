@@ -4,14 +4,15 @@
 
 use std::{
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::support::{
     ADD_WORKSPACE, SELECTOR_ROW, SIDEBAR_PRESS_HEIGHT as PRESS_HEIGHT, SIDEBAR_WIDE as WIDE,
     add_workspace, answer_workspace_resolution, connected_application, deliver_settings,
     drawn_in_sidebar, enter_active_session, enter_session, failed_session_snapshot,
-    noncanonical_spelling, press_add_workspace, rendered_application_buffer,
+    fixture_instance_id, noncanonical_spelling, press_add_workspace, rendered_application_buffer,
     rendered_application_rows_at, rendered_row, selector_label, sidebar_column, text_on,
     text_position, type_terminal_text, workspace_dir,
 };
@@ -23,12 +24,12 @@ use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
         AutoSettle, EffectiveSettings, EmojiVisibility, Message, MessageId, MessageRole,
-        MessageStatus, ModelAvailability, PromptId, Session, SessionCatalogRevision,
-        SessionCatalogSnapshot, SessionChange, SessionCreated, SessionDeleted, SessionId,
-        SessionListItem, SessionRevision, SessionSettings, SessionSettlementChanged, SessionStatus,
-        SessionSummary, SessionTimestamp, SessionTitleChanged, SessionUpdate,
-        SessionWorkingChanged, SidebarScope, SidebarSettings, SidebarVisibility, TitleSettings,
-        UnreadableSessionSummary, Workspace,
+        MessageStatus, ModelAvailability, PromptId, ServerShutdown, Session,
+        SessionCatalogRevision, SessionCatalogSnapshot, SessionChange, SessionCreated,
+        SessionDeleted, SessionId, SessionListItem, SessionRevision, SessionSettings,
+        SessionSettlementChanged, SessionStatus, SessionSummary, SessionTimestamp,
+        SessionTitleChanged, SessionUpdate, SessionWorkingChanged, ShutdownReason, SidebarScope,
+        SidebarSettings, SidebarVisibility, TitleSettings, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -5275,6 +5276,22 @@ fn composer_top_row(application: &Application) -> usize {
         .expect("the main view draws a composer")
 }
 
+/// Gives the optimistic shell a monotonic clock the test can move without
+/// waiting for presentation-scale timeouts.
+fn opening_clock(application: Application) -> (Application, Arc<Mutex<Instant>>) {
+    let now = Arc::new(Mutex::new(Instant::now()));
+    let clock = Arc::clone(&now);
+    (
+        application.with_presentation_clock(move || *clock.lock().expect("read the opening clock")),
+        now,
+    )
+}
+
+fn advance_opening_clock(now: &Arc<Mutex<Instant>>, by: Duration) {
+    let mut now = now.lock().expect("advance the opening clock");
+    *now += by;
+}
+
 #[test]
 fn opening_a_session_carries_the_reader_into_it_before_its_snapshot_lands() {
     let workspace = workspace_dir();
@@ -5296,6 +5313,212 @@ fn opening_a_session_carries_the_reader_into_it_before_its_snapshot_lands() {
     assert!(
         !highlighted.contains("The work being read"),
         "and the Session left behind is no longer open: {highlighted:?}"
+    );
+}
+
+#[test]
+fn loading_waits_for_the_quiet_threshold_then_appears() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let (mut application, now) = opening_clock(reading_one_and_listing_another(
+        workspace.path(),
+        open,
+        target,
+    ));
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+
+    assert!(
+        !main_view(&application).contains("Loading"),
+        "the optimistic shell is quiet on its opening frame"
+    );
+    advance_opening_clock(&now, Duration::from_millis(299));
+    assert!(
+        !main_view(&application).contains("Loading"),
+        "the frame immediately before the threshold is still quiet"
+    );
+
+    advance_opening_clock(&now, Duration::from_millis(1));
+    assert!(
+        main_view(&application).contains("Loading"),
+        "the threshold frame shows the loading label"
+    );
+    advance_opening_clock(&now, Duration::from_millis(1));
+    assert!(
+        main_view(&application).contains("Loading"),
+        "the loading label remains after the threshold"
+    );
+}
+
+#[test]
+fn the_quiet_threshold_requests_one_wakeup_without_polling() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let (mut application, now) = opening_clock(reading_one_and_listing_another(
+        workspace.path(),
+        open,
+        target,
+    ));
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+
+    assert_eq!(
+        application.opening_loading_wakeup(),
+        Some(Duration::from_millis(300)),
+        "the quiet shell asks for its threshold once, not for animation ticks"
+    );
+    advance_opening_clock(&now, Duration::from_millis(299));
+    assert_eq!(
+        application.opening_loading_wakeup(),
+        Some(Duration::from_millis(1)),
+        "the wakeup remains pinned to the original threshold"
+    );
+    advance_opening_clock(&now, Duration::from_millis(1));
+    assert_eq!(
+        application.opening_loading_wakeup(),
+        Some(Duration::ZERO),
+        "the reached threshold keeps its immediate wakeup until the run loop observes it"
+    );
+    application
+        .handle_event(ApplicationEvent::OpeningLoadingDelayElapsed)
+        .expect("observe the threshold wakeup");
+    assert_eq!(
+        application.opening_loading_wakeup(),
+        None,
+        "once observed, Loading is driven by the shared shimmer tick"
+    );
+}
+
+#[test]
+fn attachment_failure_stops_loading_feedback() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let (mut application, now) = opening_clock(reading_one_and_listing_another(
+        workspace.path(),
+        open,
+        target,
+    ));
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+    advance_opening_clock(&now, Duration::from_millis(300));
+    assert!(main_view(&application).contains("Loading"));
+
+    application
+        .handle_event(ApplicationEvent::OriginSessionAttachmentFailed {
+            reference: suru::protocol::SessionReference::new(
+                suru::protocol::Outlook::Local,
+                target,
+            ),
+            error: "the Session could not be loaded".to_owned(),
+        })
+        .expect("refuse the optimistic attachment");
+
+    assert!(
+        !main_view(&application).contains("Loading"),
+        "a failed attachment no longer presents itself as loading"
+    );
+    assert_eq!(
+        application.opening_loading_wakeup(),
+        None,
+        "the failed attachment asks for no further presentation wakeup"
+    );
+}
+
+#[test]
+fn shutdown_stops_loading_before_the_final_frame() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let (mut application, now) = opening_clock(reading_one_and_listing_another(
+        workspace.path(),
+        open,
+        target,
+    ));
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+    advance_opening_clock(&now, Duration::from_millis(300));
+    assert!(main_view(&application).contains("Loading"));
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Managed(ManagedEvent::ServerShutdown(
+                ServerShutdown {
+                    instance_id: fixture_instance_id(),
+                    reason: ShutdownReason::Manual,
+                },
+            )))
+            .expect("stop the server while a Session loads"),
+        ApplicationTransition::Exit
+    );
+
+    assert!(
+        !main_view(&application).contains("Loading"),
+        "the final shutdown frame has no loading presentation"
+    );
+    assert_eq!(application.opening_loading_wakeup(), None);
+    assert!(!application.wants_spinner());
+}
+
+#[test]
+fn loading_shimmers_and_requests_ticks_only_while_drawn() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let (mut application, now) = opening_clock(reading_one_and_listing_another(
+        workspace.path(),
+        open,
+        target,
+    ));
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+    let _ = main_view(&application);
+    assert!(
+        !application.wants_spinner(),
+        "a quiet optimistic shell requests no animation ticks"
+    );
+
+    advance_opening_clock(&now, Duration::from_millis(300));
+    let before = rendered_application_buffer(&application, WIDE, 20);
+    let (loading_x, loading_y) = text_position(&before, "Loading");
+    let loading_before = (0.."Loading".len())
+        .map(|offset| {
+            before
+                .cell((loading_x + offset as u16, loading_y))
+                .expect("read Loading style")
+                .style()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        application.wants_spinner(),
+        "visible Loading joins the shared presentation tick"
+    );
+
+    for _ in 0..10 {
+        application
+            .handle_event(ApplicationEvent::SpinnerTick)
+            .expect("advance the Loading shimmer");
+    }
+    let after = rendered_application_buffer(&application, WIDE, 20);
+    let loading_after = (0.."Loading".len())
+        .map(|offset| {
+            after
+                .cell((loading_x + offset as u16, loading_y))
+                .expect("read advanced Loading style")
+                .style()
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(
+        loading_after, loading_before,
+        "Loading advances with the Working Indicator shimmer cadence"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionNew,
+        )))
+        .expect("navigate away from the optimistic shell");
+    let _ = main_view(&application);
+    assert!(
+        !application.wants_spinner(),
+        "navigation away stops the shimmer tick demand"
     );
 }
 
@@ -5437,11 +5660,13 @@ fn opening_a_second_session_while_the_first_loads_supersedes_it() {
     let newer = SessionId::new();
     let mut sessions = vec![listed_as(newer, "The newest work", workspace.path(), 3)];
     sessions.extend(listing_both(workspace.path(), open, target));
-    let mut application = reading_one(workspace.path(), open, sessions.clone());
+    let (mut application, now) =
+        opening_clock(reading_one(workspace.path(), open, sessions.clone()));
     enter_the_sidebar(&mut application, sessions.clone());
     step_onto_the_wanted_row(&mut application);
     open_the_focused_row(&mut application);
     type_terminal_text(&mut application, "written for the first target");
+    advance_opening_clock(&now, Duration::from_millis(299));
 
     enter_the_sidebar(&mut application, sessions);
     press_sidebar_key(&mut application, KeyCode::Up);
@@ -5463,6 +5688,16 @@ fn opening_a_second_session_while_the_first_loads_supersedes_it() {
     assert!(
         !main_view(&application).contains("written for the first target"),
         "nor does its draft follow the reader into the Session they opened instead"
+    );
+    advance_opening_clock(&now, Duration::from_millis(1));
+    assert!(
+        !main_view(&application).contains("Loading"),
+        "the superseded route's threshold does not reveal Loading under the newer route"
+    );
+    assert_eq!(
+        application.opening_loading_wakeup(),
+        Some(Duration::from_millis(299)),
+        "the newer route receives a fresh quiet period"
     );
 }
 
@@ -5559,6 +5794,42 @@ fn the_session_arriving_hydrates_the_shell_without_taking_the_draft() {
             ApplicationTransition::AdmitPrompt { session, .. } if session.session_id == target
         ),
         "and delivery answers again, to the Session the reader is in"
+    );
+}
+
+#[test]
+fn hydration_before_the_threshold_never_flashes_loading() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let (mut application, now) = opening_clock(reading_one_and_listing_another(
+        workspace.path(),
+        open,
+        target,
+    ));
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+    advance_opening_clock(&now, Duration::from_millis(299));
+
+    application
+        .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
+            target,
+            PromptId::new(),
+            "The fast work",
+            workspace.path(),
+        )))
+        .expect("hydrate before loading feedback appears");
+    advance_opening_clock(&now, Duration::from_millis(1));
+
+    let main = main_view(&application);
+    assert!(main.contains("The fast work"), "the Session has hydrated");
+    assert!(
+        !main.contains("Loading"),
+        "hydration before the threshold causes no loading flash"
+    );
+    assert_eq!(application.opening_loading_wakeup(), None);
+    assert!(
+        !application.wants_spinner(),
+        "fast hydration leaves no presentation work behind"
     );
 }
 

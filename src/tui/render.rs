@@ -2448,8 +2448,8 @@ fn render_landing(
 /// Session in hand is the one the reader has left. Nor is anything built from
 /// the listing row that named the target: a summary is not a Session, and a
 /// shell furnished from one would be telling the reader something it does not
-/// know. It stays quiet — the `Loading` the Working Indicator's shimmer draws
-/// arrives with <https://github.com/jake-tucker/suru/issues/225>.
+/// know. It stays quiet for the opening threshold; after that, the loading
+/// label uses the Working Indicator's shimmer until the snapshot lands.
 fn render_opening_session(
     frame: &mut Frame<'_>,
     state: &TuiState,
@@ -2480,7 +2480,7 @@ fn render_opening_session(
         .saturating_add(1);
     let composer_height =
         desired_composer_height.min(area.height.saturating_sub(reserved_height).max(1));
-    let [_, _, _, _, _, _, composer_area, _] = session_areas(
+    let [_, transcript_area, _, _, _, _, composer_area, _] = session_areas(
         area,
         0,
         0,
@@ -2489,7 +2489,19 @@ fn render_opening_session(
         composer_height,
         SESSION_FOOTER_HEIGHT.min(area.height.saturating_sub(composer_height)),
     );
+    let transcript_area = in_column(transcript_area, content_column);
     let composer_area = in_column(composer_area, content_column);
+    if state.opening_loading_is_visible() {
+        frame.render_widget(
+            Paragraph::new(Line::from(shimmered_label_spans(
+                "Loading",
+                state.spinner_frame,
+                theme.text.primary,
+            ))),
+            transcript_area,
+        );
+        state.session_animation_on_screen.set(true);
+    }
     let cursor = Some(render_composer(
         frame,
         composer_area,
@@ -2895,10 +2907,9 @@ fn working_indicator_line(
             format!(" ({elapsed} • {interrupt_binding} again to interrupt)")
         }
     };
-    let label = label
-        .chars()
-        .zip(shimmer::styles(label, animation_frame, theme.text.primary))
-        .map(|(character, style)| SlotText::new(character.to_string(), style));
+    let label = shimmered_label_spans(label, animation_frame, theme.text.primary)
+        .into_iter()
+        .map(|span| SlotText::new(span.content.into_owned(), span.style));
     Line::from(
         truncate_slot_text(
             label
@@ -2910,6 +2921,14 @@ fn working_indicator_line(
         .map(|item| Span::styled(item.text, item.style))
         .collect::<Vec<_>>(),
     )
+}
+
+fn shimmered_label_spans(label: &str, animation_frame: usize, base: Style) -> Vec<Span<'static>> {
+    label
+        .chars()
+        .zip(shimmer::styles(label, animation_frame, base))
+        .map(|(character, style)| Span::styled(character.to_string(), style))
+        .collect()
 }
 
 /// Codex's compact elapsed form: seconds, then zero-padded seconds below an

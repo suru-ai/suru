@@ -10,7 +10,7 @@ use std::{
     ops::ControlFlow,
     path::PathBuf,
     pin::Pin,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -389,6 +389,9 @@ struct RunLoop {
     tasks: SessionTasks,
     channels: TaskChannels,
     reconnect_grace: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// The optimistic shell's one-shot quiet-period wakeup, paired with its
+    /// absolute deadline so a superseding route can replace it exactly once.
+    opening_loading_delay: Option<(Instant, Pin<Box<tokio::time::Sleep>>)>,
     /// Armed only while something on screen animates, so an idle TUI schedules
     /// zero wakeups (ADR 0009). Re-armed on every fire.
     spinner_tick: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -425,6 +428,7 @@ async fn run_loop(
             outlook_catalog,
         },
         reconnect_grace: None,
+        opening_loading_delay: None,
         spinner_tick: None,
         needs_redraw: true,
     };
@@ -438,6 +442,7 @@ async fn run_loop(
         }
         // Rendering records which animation is actually visible, including a
         // Working Indicator that may have scrolled out of the viewport.
+        run.sync_opening_loading_delay();
         run.sync_spinner_tick();
         // Every arm reports through ControlFlow so the two events that can end
         // the run -- a Provider shutdown and the exit command -- leave by the
@@ -446,6 +451,9 @@ async fn run_loop(
             managed_event = run.client.next() => run.receive_managed_event(managed_event)?,
             () = wait_for_reconnect_grace(&mut run.reconnect_grace) => {
                 run.expire_reconnect_grace()?
+            }
+            () = wait_for_opening_loading_delay(&mut run.opening_loading_delay) => {
+                run.reveal_opening_loading()
             }
             () = wait_for_spinner_tick(&mut run.spinner_tick) => run.advance_spinner(),
             session_event = next_session_event(&mut run.tasks.subscription) => {
@@ -845,6 +853,37 @@ impl RunLoop {
             self.tasks.detach();
         }
         Ok(ControlFlow::Continue(()))
+    }
+
+    /// Keeps exactly one wakeup at the optimistic route's loading threshold.
+    /// Ordinary events do not move the deadline, while success, cancellation,
+    /// and superseding navigation respectively drop or replace it.
+    fn sync_opening_loading_delay(&mut self) {
+        let wanted = self.application.opening_loading_deadline();
+        let armed = self
+            .opening_loading_delay
+            .as_ref()
+            .map(|(deadline, _)| *deadline);
+        if armed == wanted {
+            return;
+        }
+        self.opening_loading_delay = wanted.map(|deadline| {
+            (
+                deadline,
+                Box::pin(tokio::time::sleep_until(deadline.into())),
+            )
+        });
+    }
+
+    fn reveal_opening_loading(&mut self) -> ControlFlow<Exit> {
+        self.opening_loading_delay = None;
+        self.needs_redraw = true;
+        let transition = self
+            .application
+            .handle_event(ApplicationEvent::OpeningLoadingDelayElapsed)
+            .expect("the opening loading delay is presentation-only");
+        debug_assert_eq!(transition, ApplicationTransition::Continue);
+        ControlFlow::Continue(())
     }
 
     /// Arms the presentation tick while anything on screen animates and drops it
@@ -2104,6 +2143,15 @@ async fn next_session_event(
 async fn wait_for_reconnect_grace(grace: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
     match grace {
         Some(grace) => grace.as_mut().await,
+        None => pending().await,
+    }
+}
+
+async fn wait_for_opening_loading_delay(
+    delay: &mut Option<(Instant, Pin<Box<tokio::time::Sleep>>)>,
+) {
+    match delay {
+        Some((_, delay)) => delay.as_mut().await,
         None => pending().await,
     }
 }
