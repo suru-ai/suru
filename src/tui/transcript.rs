@@ -2291,6 +2291,29 @@ fn render_activity(
     }
 }
 
+/// Draws client-local failures in the same register as a Transcript Error
+/// Activity without manufacturing one. The caller owns where these lines
+/// live; this function contributes presentation only.
+pub(super) fn client_error_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut links = Vec::new();
+    let mut projection = ActivityProjection {
+        lines: &mut lines,
+        links: &mut links,
+    };
+    push_styled_prefixed_lines(
+        &mut projection,
+        ContentGutter {
+            lead: "  Error: ",
+            indent: "  ",
+        },
+        text,
+        theme.feedback.error,
+        theme,
+    );
+    lines
+}
+
 /// Projects a Group, which each groupable kind words and opens in its own way.
 /// What every kind shares is the shape: a header row that stands in for the
 /// run while collapsed and heads it while expanded, being the one row the

@@ -1326,8 +1326,12 @@ impl Sidebar {
     /// row stands for a Session Suru could not read, or for the Session already
     /// open — in which case Enter means only that the reader is done choosing,
     /// and the composer takes the keys back.
-    pub(super) fn activate(&mut self, open: Option<SessionId>) -> SidebarActivation {
-        let activation = self.act_on_focus(open);
+    pub(super) fn activate(
+        &mut self,
+        open: Option<SessionId>,
+        retry_open: bool,
+    ) -> SidebarActivation {
+        let activation = self.act_on_focus(open, retry_open);
         self.release_borrowed_focus();
         activation
     }
@@ -1335,7 +1339,7 @@ impl Sidebar {
     /// What acting on the entry row focus stands over comes to, which is the
     /// whole of [`Self::activate`] but the borrowed-focus bookkeeping around
     /// it.
-    fn act_on_focus(&mut self, open: Option<SessionId>) -> SidebarActivation {
+    fn act_on_focus(&mut self, open: Option<SessionId>, retry_open: bool) -> SidebarActivation {
         if self.workspace_entry.is_some() {
             return self.offer_workspace();
         }
@@ -1364,7 +1368,7 @@ impl Sidebar {
         if !self.is_readable(wanted) {
             return SidebarActivation::Answered;
         }
-        if open == Some(wanted) {
+        if open == Some(wanted) && !retry_open {
             self.hand_back_keys();
             return SidebarActivation::Answered;
         }
@@ -1601,10 +1605,10 @@ impl Sidebar {
     }
 
     /// The server refused the attachment. The reader keeps the keys and the
-    /// list, and the refusal is drawn above it.
-    pub(super) fn fail_attachment(&mut self, error: String) {
+    /// list; the open shell owns the refusal because it is where the reader
+    /// went, while the listing remains a valid route back to a retry.
+    pub(super) fn fail_attachment(&mut self) {
         self.attaching = None;
-        self.listing.report_error(error);
     }
 
     pub(super) const fn is_loading(&self) -> bool {
@@ -2431,7 +2435,10 @@ mod tests {
         let request = sidebar.take_listing_request().expect("ask for Sessions");
         sidebar.load(&request, vec![identified(open, "Open", 1)], Some(open));
 
-        assert_eq!(sidebar.activate(Some(open)), SidebarActivation::Answered);
+        assert_eq!(
+            sidebar.activate(Some(open), false),
+            SidebarActivation::Answered
+        );
         assert!(
             !sidebar.has_focus(),
             "the reader is already in this Session, so Enter means only that they are done"
@@ -2588,7 +2595,7 @@ mod tests {
         assert_eq!(focused(&sidebar), None);
 
         assert_eq!(
-            sidebar.activate(None),
+            sidebar.activate(None, false),
             SidebarActivation::Answered,
             "asking for more of the shelf attaches nothing"
         );
@@ -2600,7 +2607,7 @@ mod tests {
         );
         assert_eq!(revealed[36], "Show 5 more");
 
-        let _ = sidebar.activate(None);
+        let _ = sidebar.activate(None, false);
 
         assert_eq!(
             drawn(&sidebar).len(),
@@ -2690,7 +2697,7 @@ mod tests {
         let mut sidebar = showing(set_aside_shelf(12));
         // Up off the selector wraps to the affordance at the shelf's foot.
         sidebar.focus_previous();
-        let _ = sidebar.activate(None);
+        let _ = sidebar.activate(None, false);
         assert_eq!(drawn(&sidebar).len(), 13, "the whole shelf is on show");
 
         sidebar.toggle(None);

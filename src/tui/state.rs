@@ -362,6 +362,13 @@ pub struct TuiState {
     /// state, usage, footer, and Prompt delivery — stands down until the
     /// snapshot arrives rather than answering for the Session left behind.
     pub(super) session: Option<SessionProjection>,
+    /// Why the open route could not hydrate, if its newest attachment failed.
+    ///
+    /// This is client presentation, not Session history: it never enters a
+    /// snapshot, Activity, Turn, or protocol event. Keeping it beside the
+    /// optimistic route lets that route retain its composer while the main
+    /// content speaks the refusal in the Transcript's visual language.
+    pub(super) opening_error: Option<String>,
     /// The origin-qualified reference of the projection above, and so `Some`
     /// exactly when it is.
     pub(super) session_reference: Option<SessionReference>,
@@ -483,6 +490,7 @@ impl TuiState {
             route: None,
             opening_loading: OpeningLoadingState::Inactive,
             session: None,
+            opening_error: None,
             session_reference: None,
             outlook_landing_selections: HashMap::from([(Outlook::Local, None)]),
             landing_agent_selection: None,
@@ -569,6 +577,7 @@ impl TuiState {
         self.session = None;
         self.session_reference = None;
         self.route = Some(target);
+        self.opening_error = None;
         let deadline = self
             .presentation_clock
             .now()
@@ -593,12 +602,20 @@ impl TuiState {
     fn leave_session_route(&mut self) -> bool {
         self.session = None;
         self.session_reference = None;
+        self.opening_error = None;
         self.stop_opening_loading();
         self.route.take().is_some()
     }
 
     fn stop_opening_loading(&mut self) {
         self.opening_loading = OpeningLoadingState::Inactive;
+    }
+
+    /// Keeps the optimistic route open while replacing its progress feedback
+    /// with the client-local reason it could not hydrate.
+    fn fail_opening_session(&mut self, error: String) {
+        self.stop_opening_loading();
+        self.opening_error = Some(format!("Could not load Session: {error}"));
     }
 
     fn turn_outlook(&mut self, outlook: Outlook) {
@@ -1101,6 +1118,7 @@ impl TuiState {
         // picked from an overlay — arrives as both at once.
         self.route = Some(reference.clone());
         self.stop_opening_loading();
+        self.opening_error = None;
         self.session_reference = Some(reference);
         self.session = Some(SessionProjection::new(snapshot));
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
@@ -1594,6 +1612,14 @@ impl TuiState {
     /// it and from nothing else.
     pub(super) fn open_session(&self) -> Option<SessionId> {
         self.route.as_ref().map(|route| route.session_id)
+    }
+
+    /// Whether activating the open Sidebar row means retry rather than merely
+    /// handing the keys back. Only a failed optimistic shell has that meaning:
+    /// an attachment still in flight must not be duplicated, and a hydrated
+    /// Session is already open.
+    fn open_session_can_retry(&self) -> bool {
+        self.opening_error.is_some()
     }
 
     /// Whether the Session the main view has open is still on its way: the
@@ -2285,11 +2311,9 @@ impl Application {
             }
             ApplicationEvent::SessionAttachmentFailed(error) => {
                 if self.state.sidebar.is_attaching() {
-                    // The Sidebar keeps its list and the reader keeps the keys:
-                    // the refusal is drawn above the rows they are still on.
-                    self.state.stop_opening_loading();
-                    self.state.sidebar.fail_attachment(error);
-                    Ok(ApplicationTransition::Continue)
+                    // The target remains the route and the refusal belongs to
+                    // its main content, not to the listing that led there.
+                    Ok(self.fail_open_session_attachment(error))
                 } else {
                     let request = self.state.session_picker.fail_attachment(error);
                     Ok(ApplicationTransition::ListSessions(request))
@@ -2299,12 +2323,8 @@ impl Application {
                 if reference.origin != self.state.outlook {
                     return Ok(ApplicationTransition::Continue);
                 }
-                if self.state.route.as_ref() == Some(&reference) {
-                    self.state.stop_opening_loading();
-                }
-                if self.state.sidebar.is_attaching() {
-                    self.state.sidebar.fail_attachment(error);
-                    Ok(ApplicationTransition::Continue)
+                if self.state.route.as_ref() == Some(&reference) && self.state.session.is_none() {
+                    Ok(self.fail_open_session_attachment(error))
                 } else {
                     let request = self.state.session_picker.fail_attachment(error);
                     Ok(ApplicationTransition::ListSessions(request))
@@ -3043,7 +3063,8 @@ impl Application {
             }
             SemanticCommandId::SidebarAttach => {
                 let open = self.session_id();
-                return match self.state.sidebar.activate(open) {
+                let retry_open = self.state.open_session_can_retry();
+                return match self.state.sidebar.activate(open, retry_open) {
                     SidebarActivation::Answered => ApplicationTransition::Continue,
                     // Enter and a press both arrive here, so both open the
                     // Session the same way: the route moves now and the
@@ -3413,6 +3434,12 @@ impl Application {
             self.state.sidebar.finish_attachment();
         }
         Ok(ApplicationTransition::Continue)
+    }
+
+    fn fail_open_session_attachment(&mut self, error: String) -> ApplicationTransition {
+        self.state.fail_opening_session(error);
+        self.state.sidebar.fail_attachment();
+        ApplicationTransition::Continue
     }
 
     fn load_model_catalog(

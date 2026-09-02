@@ -24,10 +24,10 @@ use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
         AutoSettle, EffectiveSettings, EmojiVisibility, Message, MessageId, MessageRole,
-        MessageStatus, ModelAvailability, PromptId, ServerShutdown, Session,
+        MessageStatus, ModelAvailability, Outlook, PromptId, ServerShutdown, Session,
         SessionCatalogRevision, SessionCatalogSnapshot, SessionChange, SessionCreated,
-        SessionDeleted, SessionId, SessionListItem, SessionRevision, SessionSettings,
-        SessionSettlementChanged, SessionStatus, SessionSummary, SessionTimestamp,
+        SessionDeleted, SessionId, SessionListItem, SessionReference, SessionRevision,
+        SessionSettings, SessionSettlementChanged, SessionStatus, SessionSummary, SessionTimestamp,
         SessionTitleChanged, SessionUpdate, SessionWorkingChanged, ShutdownReason, SidebarScope,
         SidebarSettings, SidebarVisibility, TitleSettings, UnreadableSessionSummary, Workspace,
     },
@@ -5292,6 +5292,19 @@ fn advance_opening_clock(now: &Arc<Mutex<Instant>>, by: Duration) {
     *now += by;
 }
 
+fn local_session(session_id: SessionId) -> SessionReference {
+    SessionReference::new(Outlook::Local, session_id)
+}
+
+fn fail_opening_session(application: &mut Application, target: SessionId, error: &str) {
+    application
+        .handle_event(ApplicationEvent::OriginSessionAttachmentFailed {
+            reference: local_session(target),
+            error: error.to_owned(),
+        })
+        .expect("fail the optimistic Session attachment");
+}
+
 #[test]
 fn opening_a_session_carries_the_reader_into_it_before_its_snapshot_lands() {
     let workspace = workspace_dir();
@@ -5390,7 +5403,202 @@ fn the_quiet_threshold_requests_one_wakeup_without_polling() {
 }
 
 #[test]
-fn attachment_failure_stops_loading_feedback() {
+fn attachment_failure_immediately_keeps_the_target_shell_and_draws_a_transcript_error() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let (mut application, now) = opening_clock(reading_one_and_listing_another(
+        workspace.path(),
+        open,
+        target,
+    ));
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+    type_terminal_text(&mut application, "draft kept through failure");
+    advance_opening_clock(&now, Duration::from_millis(299));
+    assert!(!main_view(&application).contains("Loading"));
+
+    fail_opening_session(
+        &mut application,
+        target,
+        "the remote transport refused attachment because the Session disappeared",
+    );
+    type_terminal_text(&mut application, " and remains focused");
+
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let rows = main_view_rows(&application);
+    let screen = rows.join("\n");
+    assert!(
+        screen.contains("Error: Could not load Session: the remote transport refused"),
+        "the failed shell immediately uses the Transcript error language: {screen}"
+    );
+    assert!(
+        screen.contains("attachment because the Session disappeared"),
+        "the attachment detail wraps instead of being truncated: {screen}"
+    );
+    assert_eq!(
+        buffer
+            .cell(text_position(&buffer, "Error:"))
+            .expect("read the failure label")
+            .fg,
+        Color::Red,
+        "the client-local failure uses the Transcript error style"
+    );
+    let composer_row = composer_top_row(&application);
+    let error_row = rows
+        .iter()
+        .position(|row| row.contains("Error:"))
+        .expect("draw the failure in the main view");
+    assert!(
+        error_row + 1 < composer_row,
+        "the error keeps Transcript spacing above the composer: {rows:?}"
+    );
+    assert!(
+        screen.contains("draft kept through failure and remains focused"),
+        "the target composer and its draft remain in the failed shell: {screen}"
+    );
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("try to deliver from the failed shell"),
+        ApplicationTransition::Continue,
+        "Prompt delivery remains disabled without a snapshot"
+    );
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SessionSettle,
+            )))
+            .expect("try a snapshot-dependent command in the failed shell"),
+        ApplicationTransition::Continue,
+        "other Session commands remain disabled without a snapshot"
+    );
+    assert!(
+        open_sidebar_text(&application).contains(WANTED),
+        "the failed target stays cyan-highlighted as the open route"
+    );
+    assert!(
+        !rendered_application_rows_at(&application, WIDE, 20)
+            .iter()
+            .any(|row| sidebar_column(row).contains("remote transport")),
+        "the client-local attachment error does not become a Sidebar listing error"
+    );
+    assert!(
+        !screen.contains("Loading"),
+        "a pre-threshold failure replaces every loading presentation"
+    );
+    assert_eq!(
+        application.opening_loading_wakeup(),
+        None,
+        "the failed attachment asks for no further presentation wakeup"
+    );
+}
+
+#[test]
+fn enter_on_the_failed_open_row_retries_with_a_fresh_quiet_window() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let sessions = listing_both(workspace.path(), open, target);
+    let (mut application, now) = opening_clock(reading_one_and_listing_another(
+        workspace.path(),
+        open,
+        target,
+    ));
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+    type_terminal_text(&mut application, "draft survives the retry");
+    advance_opening_clock(&now, Duration::from_millis(175));
+    fail_opening_session(&mut application, target, "connection closed");
+
+    enter_the_sidebar(&mut application, sessions);
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::AttachSession(local_session(target)),
+        "Enter on the failed target dispatches another correlated attachment"
+    );
+
+    let main = main_view(&application);
+    assert!(
+        !main.contains("Could not load Session"),
+        "retry clears the client-local error immediately: {main}"
+    );
+    assert!(
+        !main.contains("Loading"),
+        "retry begins quietly rather than inheriting elapsed time: {main}"
+    );
+    assert!(
+        main.contains("draft survives the retry"),
+        "retry reuses the target-keyed composer: {main}"
+    );
+    assert_eq!(
+        application.opening_loading_wakeup(),
+        Some(Duration::from_millis(300)),
+        "retry receives the whole quiet window"
+    );
+
+    application
+        .handle_event(ApplicationEvent::OriginSessionAttached {
+            reference: local_session(target),
+            snapshot: failed_session_snapshot(
+                target,
+                PromptId::new(),
+                "The retry succeeded",
+                workspace.path(),
+            ),
+        })
+        .expect("hydrate the existing shell on retry");
+
+    let hydrated = main_view(&application);
+    assert!(
+        hydrated.contains("The retry succeeded"),
+        "the successful retry hydrates the open shell: {hydrated}"
+    );
+    assert!(
+        hydrated.contains("draft survives the retry"),
+        "hydration leaves its target-keyed draft in place: {hydrated}"
+    );
+    assert!(
+        !hydrated.contains("Could not load Session"),
+        "the client-local error never enters hydrated Session history: {hydrated}"
+    );
+}
+
+#[test]
+fn a_pointer_press_on_the_failed_open_row_retries_without_taking_keyboard_focus() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let (mut application, now) = opening_clock(reading_one(
+        workspace.path(),
+        open,
+        listing_both(workspace.path(), open, target),
+    ));
+    assert_eq!(
+        press_line(&mut application, MouseButton::Left, WANTED),
+        ApplicationTransition::AttachSession(local_session(target))
+    );
+    advance_opening_clock(&now, Duration::from_millis(300));
+    fail_opening_session(&mut application, target, "connection closed");
+
+    assert_eq!(
+        press_line(&mut application, MouseButton::Left, WANTED),
+        ApplicationTransition::AttachSession(local_session(target)),
+        "pressing the failed target row retries its attachment"
+    );
+    assert!(
+        !main_view(&application).contains("Could not load Session"),
+        "pointer retry clears the failure immediately"
+    );
+    assert_eq!(
+        application.opening_loading_wakeup(),
+        Some(Duration::from_millis(300))
+    );
+    assert!(
+        selected_sidebar_text(&application).is_empty(),
+        "a retrying pointer press does not invent blue keyboard focus"
+    );
+}
+
+#[test]
+fn failure_after_loading_replaces_it_with_the_transcript_error() {
     let workspace = workspace_dir();
     let (open, target) = (SessionId::new(), SessionId::new());
     let (mut application, now) = opening_clock(reading_one_and_listing_another(
@@ -5403,24 +5611,48 @@ fn attachment_failure_stops_loading_feedback() {
     advance_opening_clock(&now, Duration::from_millis(300));
     assert!(main_view(&application).contains("Loading"));
 
-    application
-        .handle_event(ApplicationEvent::OriginSessionAttachmentFailed {
-            reference: suru::protocol::SessionReference::new(
-                suru::protocol::Outlook::Local,
-                target,
-            ),
-            error: "the Session could not be loaded".to_owned(),
-        })
-        .expect("refuse the optimistic attachment");
+    fail_opening_session(&mut application, target, "connection closed");
+
+    let failed = main_view(&application);
+    assert!(
+        !failed.contains("Loading"),
+        "failure replaces Loading: {failed}"
+    );
+    assert!(
+        failed.contains("Error: Could not load Session: connection closed"),
+        "failure takes its place immediately: {failed}"
+    );
+    assert_eq!(application.opening_loading_wakeup(), None);
+    assert!(!application.wants_spinner());
+}
+
+#[test]
+fn a_failed_shell_stays_open_when_its_sidebar_row_disappears() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let mut application = reading_one_and_listing_another(workspace.path(), open, target);
+    step_onto_the_wanted_row(&mut application);
+    open_the_focused_row(&mut application);
+    type_terminal_text(&mut application, "draft without a retry row");
+    fail_opening_session(&mut application, target, "Session was deleted");
+
+    enter_the_sidebar(
+        &mut application,
+        vec![listed_as(open, BEING_READ, workspace.path(), 1)],
+    );
 
     assert!(
-        !main_view(&application).contains("Loading"),
-        "a failed attachment no longer presents itself as loading"
+        open_sidebar_text(&application).is_empty(),
+        "no replacement row is fabricated for an unlisted failed target"
     );
-    assert_eq!(
-        application.opening_loading_wakeup(),
-        None,
-        "the failed attachment asks for no further presentation wakeup"
+    let main = main_view(&application);
+    assert!(
+        main.contains("Error: Could not load Session: Session was deleted"),
+        "the failed route remains open without a retry row: {main}"
+    );
+    assert!(
+        main.contains("draft without a retry row"),
+        "its target-keyed composer remains available: {main}"
     );
 }
 

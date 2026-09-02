@@ -48,7 +48,7 @@ use super::{
     state::{CommandId, CommandMode, QueuedPrompt, TranscriptViewport, TuiState},
     subagent_picker::working_subagents,
     text_layout::TextLayout,
-    transcript::TranscriptDisclosure,
+    transcript::{TranscriptDisclosure, client_error_lines},
     usage::{compact_cost, compact_count},
     workspace_picker::WorkspacePickerRow,
 };
@@ -2491,7 +2491,12 @@ fn render_opening_session(
     );
     let transcript_area = in_column(transcript_area, content_column);
     let composer_area = in_column(composer_area, content_column);
-    if state.opening_loading_is_visible() {
+    if let Some(error) = state.opening_error.as_deref() {
+        frame.render_widget(
+            Paragraph::new(client_error_lines(error, theme)).wrap(Wrap { trim: false }),
+            transcript_area,
+        );
+    } else if state.opening_loading_is_visible() {
         frame.render_widget(
             Paragraph::new(Line::from(shimmered_label_spans(
                 "Loading",
