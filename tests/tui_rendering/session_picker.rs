@@ -25,7 +25,7 @@ use suru::{
 #[test]
 fn sessions_command_opens_a_loading_picker_for_the_current_workspace() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     type_terminal_text(&mut application, "/sessions");
 
     assert!(
@@ -55,7 +55,7 @@ fn sessions_command_opens_a_loading_picker_for_the_current_workspace() {
 #[test]
 fn the_current_workspace_scope_asks_in_the_servers_reading_of_the_launch_directory() {
     let workspace = workspace_dir();
-    let mut application = Application::new(noncanonical_spelling(&workspace));
+    let mut application = Application::new(noncanonical_spelling(&workspace), Default::default());
     type_terminal_text(&mut application, "/sessions");
 
     expect_session_list_request(
@@ -72,7 +72,7 @@ fn the_current_workspace_scope_asks_in_the_servers_reading_of_the_launch_directo
 #[test]
 fn session_picker_orders_marks_focuses_and_wraps_live_sessions() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (current_id, _, _) = enter_active_session(&mut application, workspace.path());
     let newest_id = SessionId::new();
     let oldest_id = SessionId::new();
@@ -276,7 +276,7 @@ fn reconnect_catalog_removes_a_missed_current_session_deletion() {
 #[test]
 fn session_attachment_failure_preserves_the_original_until_target_hydration() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (original_id, original_snapshot, _) =
         enter_active_session(&mut application, workspace.path());
     application
@@ -424,7 +424,7 @@ fn session_attachment_failure_preserves_the_original_until_target_hydration() {
 #[test]
 fn session_picker_searches_titles_and_remembers_all_workspace_scope() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::Char('x'),
@@ -553,7 +553,7 @@ fn session_picker_switching_restores_each_transcript_viewport() {
     let first_snapshot = navigable_session_snapshot(first_id, workspace.path(), 8);
     let second_id = SessionId::new();
     let second_snapshot = navigable_session_snapshot(second_id, workspace.path(), 3);
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(first_snapshot.clone()))
         .expect("attach first Session");
@@ -649,7 +649,7 @@ fn session_picker_switching_restores_each_transcript_viewport() {
 #[test]
 fn session_picker_stays_searchable_at_supported_small_terminal_sizes() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let request = expect_session_list_request(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
@@ -702,7 +702,7 @@ fn session_picker_stays_searchable_at_supported_small_terminal_sizes() {
 #[test]
 fn session_picker_scroll_window_keeps_the_current_session_visible() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let current_id = SessionId::new();
     application
         .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
@@ -762,7 +762,7 @@ fn session_picker_scroll_window_keeps_the_current_session_visible() {
 #[test]
 fn unreadable_session_picker_rows_remain_navigable_without_attachment() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let mut sessions = vec![session_summary(
         SessionId::new(),
         workspace.path(),
@@ -813,7 +813,7 @@ fn unreadable_session_picker_rows_remain_navigable_without_attachment() {
 fn session_picker_reserves_required_metadata_before_truncating_long_titles() {
     let workspace = workspace_dir();
     let current_id = SessionId::new();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let mut snapshot = failed_session_snapshot(
         current_id,
         PromptId::new(),
@@ -888,7 +888,7 @@ fn session_picker_reserves_required_metadata_before_truncating_long_titles() {
 #[test]
 fn session_picker_consumes_input_before_hidden_composer_actions() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (session_id, _, _) = enter_active_session(&mut application, workspace.path());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -1025,7 +1025,7 @@ fn a_session_picker_row_draws_its_emoji_only_where_the_setting_shows_them() {
         )]
     };
 
-    let mut hidden = Application::new(workspace.path());
+    let mut hidden = Application::new(workspace.path(), Default::default());
     open_session_picker_with(&mut hidden, sessions());
     let drawn = rendered_application_rows(&hidden);
     let row = drawn
@@ -1059,7 +1059,7 @@ fn a_session_picker_row_draws_its_emoji_only_where_the_setting_shows_them() {
 #[test]
 fn session_picker_search_matches_the_words_of_a_title_and_never_the_emoji_beside_it() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     open_session_picker_with(
         &mut application,
         vec![
@@ -1272,7 +1272,7 @@ fn emoji_session_summary(
 /// until the Setting says it does. The Sidebar is left down, so the picker is
 /// the only thing on screen listing Sessions.
 fn client_showing_emojis(workspace: &std::path::Path) -> Application {
-    let mut application = Application::new(workspace);
+    let mut application = Application::new(workspace, Default::default());
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
             SettingsSnapshot {

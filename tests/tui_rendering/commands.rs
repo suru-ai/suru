@@ -14,7 +14,7 @@ use suru::{
 #[test]
 fn slash_autocomplete_invokes_new_session_from_a_description_match() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (_, _, _) = enter_active_session(&mut application, workspace.path());
 
     type_terminal_text(&mut application, "/fresh");
@@ -42,7 +42,7 @@ fn slash_autocomplete_invokes_new_session_from_a_description_match() {
 #[test]
 fn slash_settle_sets_the_open_session_aside() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (session_id, _, _) = enter_active_session(&mut application, workspace.path());
 
     type_terminal_text(&mut application, "/settle");
@@ -307,7 +307,7 @@ fn slash_autocomplete_keeps_the_landing_composer_visible_at_minimum_size() {
 #[test]
 fn dismissed_alias_is_submitted_literally_before_turn_interruption() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (_, _, _) = enter_active_session(&mut application, workspace.path());
     type_terminal_text(&mut application, "/clear");
     let canonical_result = rendered_application_rows(&application).join("\n");
@@ -407,7 +407,7 @@ fn pasted_multiline_and_unmatched_slash_text_remain_literal_prompts() {
 #[test]
 fn autocomplete_navigation_and_tab_invoke_the_canonical_alias_target() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (_, _, _) = enter_active_session(&mut application, workspace.path());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -445,7 +445,7 @@ fn autocomplete_navigation_and_tab_invoke_the_canonical_alias_target() {
 #[test]
 fn autocomplete_selection_precedes_an_open_scoped_command_mode() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (_, _, _) = enter_active_session(&mut application, workspace.path());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -473,7 +473,7 @@ fn autocomplete_selection_precedes_an_open_scoped_command_mode() {
 #[test]
 fn autocomplete_tracks_the_active_composer_when_a_session_attaches() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
             "/".to_owned(),

@@ -15,6 +15,7 @@ mod sessions;
 pub mod settings;
 mod skill_catalog;
 mod storage;
+mod terminal;
 mod theme;
 pub mod tui;
 

@@ -1245,7 +1245,7 @@ fn working(title: &str, session_id: SessionId, workspace: &Path) -> SessionListI
 /// A client whose Landing has an Agent chosen, which is what it takes for a
 /// Skill Catalog to be asked for at all.
 fn application_choosing_skills(workspace: &Path) -> Application {
-    let mut application = Application::new(workspace);
+    let mut application = Application::new(workspace, Default::default());
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
             ready_health(fixture_instance_id(), 42_424).with_landing_agent_selection(Some(

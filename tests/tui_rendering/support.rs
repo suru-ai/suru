@@ -19,7 +19,7 @@ use suru::{
         SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
         SessionTimestamp, SettingsSnapshot, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
-    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId},
+    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, TerminalFacts},
 };
 use uuid::Uuid;
 
@@ -184,8 +184,15 @@ pub fn fixture_instance_id() -> Uuid {
 }
 
 pub fn connected_application(workspace: &std::path::Path) -> Application {
+    connected_application_with_terminal_facts(workspace, TerminalFacts::default())
+}
+
+pub fn connected_application_with_terminal_facts(
+    workspace: &std::path::Path,
+    terminal_facts: TerminalFacts,
+) -> Application {
     let instance_id = fixture_instance_id();
-    let mut application = Application::new(workspace);
+    let mut application = Application::new(workspace, terminal_facts);
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
             ready_health(instance_id, 42_424),

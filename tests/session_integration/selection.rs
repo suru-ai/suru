@@ -555,7 +555,7 @@ async fn rapid_reasoning_cycles_serialize_coalesce_and_converge_across_clients()
     }
 
     // Drive the first client's TUI: warm the catalog, then cycle rapidly.
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(created))
         .expect("attach the driving TUI client");

@@ -23,7 +23,7 @@ use suru::{
 #[test]
 fn new_session_keybinding_defers_creation_until_the_next_prompt() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (_, old_snapshot, _) = enter_active_session(&mut application, workspace.path());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -92,7 +92,7 @@ fn new_session_keybinding_defers_creation_until_the_next_prompt() {
 #[test]
 fn new_session_releases_a_detached_prompt_after_its_admission_succeeds() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (_, _, _) = enter_active_session(&mut application, workspace.path());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -139,7 +139,7 @@ fn new_session_releases_a_detached_prompt_after_its_admission_succeeds() {
 #[test]
 fn provisional_steer_is_immediate_single_and_reconciles_in_place() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (session_id, initial_snapshot) = enter_session(&mut application, workspace.path());
 
     application
@@ -200,7 +200,7 @@ fn provisional_steer_is_immediate_single_and_reconciles_in_place() {
 #[test]
 fn admitted_active_steer_stays_visible_while_the_composer_accepts_another_prompt() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (session_id, snapshot, _) = enter_active_session(&mut application, workspace.path());
 
     application
@@ -255,7 +255,7 @@ fn admitted_active_steer_stays_visible_while_the_composer_accepts_another_prompt
 #[test]
 fn queued_prompt_docks_immediately_and_scoped_mode_preserves_the_draft() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (session_id, snapshot, _) = enter_active_session(&mut application, workspace.path());
 
     application
@@ -378,10 +378,10 @@ fn queued_prompt_docks_immediately_and_scoped_mode_preserves_the_draft() {
 #[test]
 fn escape_confirmation_is_local_and_targets_the_observed_active_turn() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (expected_session_id, snapshot, _active_turn_id) =
         enter_active_session(&mut application, workspace.path());
-    let mut observer = Application::new(workspace.path());
+    let mut observer = Application::new(workspace.path(), Default::default());
     observer
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a second local observer");
@@ -427,9 +427,10 @@ fn escape_confirmation_expires_after_five_seconds() {
     let workspace = workspace_dir();
     let now = Arc::new(Mutex::new(Instant::now()));
     let clock = Arc::clone(&now);
-    let mut application = Application::new(workspace.path()).with_presentation_clock(move || {
-        *clock.lock().expect("presentation clock remains readable")
-    });
+    let mut application = Application::new(workspace.path(), Default::default())
+        .with_presentation_clock(move || {
+            *clock.lock().expect("presentation clock remains readable")
+        });
     enter_active_session(&mut application, workspace.path());
 
     assert_eq!(
@@ -470,7 +471,7 @@ fn escape_confirmation_expires_after_five_seconds() {
 #[test]
 fn failed_admission_restores_stable_prompt_and_saves_intervening_input_to_history() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     enter_session(&mut application, workspace.path());
 
     application
@@ -541,7 +542,7 @@ fn failed_admission_restores_stable_prompt_and_saves_intervening_input_to_histor
 #[test]
 fn an_admission_result_from_another_origin_cannot_settle_the_pending_prompt() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     enter_session(&mut application, workspace.path());
     type_terminal_text(&mut application, "Keep this origin");
     let ApplicationTransition::AdmitPrompt { session, request } = application
@@ -590,7 +591,7 @@ fn an_admission_result_from_another_origin_cannot_settle_the_pending_prompt() {
 #[test]
 fn authoritative_delivery_after_an_ambiguous_failure_removes_the_restored_retry() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (session_id, snapshot) = enter_session(&mut application, workspace.path());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(

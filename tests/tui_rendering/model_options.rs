@@ -407,7 +407,7 @@ fn session_options_preserve_other_dimensions_and_roll_back_one_atomic_update() {
             },
         ],
     };
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(
             selected_session_snapshot(session_id, workspace.path(), authoritative.clone()),
@@ -588,7 +588,7 @@ fn refreshed_options_keep_invalidated_choice_visible_and_disable_apply() {
             },
         ],
     };
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(
             selected_session_snapshot(session_id, workspace.path(), current),

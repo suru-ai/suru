@@ -159,7 +159,7 @@ fn timed(label: &str, iterations: u32, mut body: impl FnMut()) {
 #[ignore = "timing harness, run manually with --release"]
 fn transcript_render_timings() {
     let workspace = tempfile::tempdir().expect("create Workspace");
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let mut snapshot = large_session_snapshot(workspace.path());
     // Streaming appends must target a streaming message.
     snapshot

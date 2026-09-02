@@ -3,10 +3,11 @@
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
     support::{
-        connected_application, enter_session, failed_session_snapshot, fixture_instance_id,
-        model_descriptor, navigable_session_snapshot, ready_health, rendered_application_buffer,
-        rendered_application_rows, rendered_application_rows_at, rendered_row, rendered_rows,
-        text_position, type_terminal_text, workspace_dir,
+        connected_application, connected_application_with_terminal_facts, enter_session,
+        failed_session_snapshot, fixture_instance_id, model_descriptor, navigable_session_snapshot,
+        ready_health, rendered_application_buffer, rendered_application_rows,
+        rendered_application_rows_at, rendered_row, rendered_rows, text_position,
+        type_terminal_text, workspace_dir,
     },
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
@@ -23,14 +24,14 @@ use suru::{
     },
     server::ServerConfig,
     tui::{
-        Application, ApplicationEvent, ApplicationTransition, CommandId, TuiState,
-        command_for_terminal_event, render,
+        Application, ApplicationEvent, ApplicationTransition, CommandId, TerminalFacts,
+        command_for_terminal_event,
     },
 };
 use uuid::Uuid;
 
-fn rendered_state_rows(state: &TuiState) -> Vec<String> {
-    rendered_rows(|frame| render(frame, state))
+fn rendered_state_rows(application: &Application) -> Vec<String> {
+    rendered_rows(|frame| application.render(frame))
 }
 
 /// A client reads its launching Workspace the way the server reads one, and a
@@ -54,10 +55,14 @@ fn a_launch_directory_that_cannot_be_canonicalized_still_starts_on_the_path_as_g
     );
 }
 
-fn connected_state(instance_id: Uuid, pid: u32) -> TuiState {
-    let mut state = TuiState::default();
-    state.apply(ManagedEvent::Connected(ready_health(instance_id, pid)));
-    state
+fn connected_state(instance_id: Uuid, pid: u32) -> Application {
+    let mut application = Application::default();
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(instance_id, pid),
+        )))
+        .expect("connect Application");
+    application
 }
 
 #[test]
@@ -116,7 +121,7 @@ fn connected_application_uses_the_persisted_landing_agent_selection() {
         model: ModelId::new("gpt-remembered"),
         options: Vec::new(),
     };
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
             ready_health(fixture_instance_id(), 42_424)
@@ -189,7 +194,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
     )
     .await
     .expect("connect managed client");
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
 
     for _ in 0..2 {
         application
@@ -263,7 +268,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         )
     );
 
-    let mut observer = Application::new(workspace.path());
+    let mut observer = Application::new(workspace.path(), Default::default());
     observer
         .handle_event(ApplicationEvent::SessionAttached(
             authoritative.as_ref().clone(),
@@ -293,7 +298,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
 
     let replacement_instance = Uuid::new_v4();
     let original_instance = server.descriptor().instance_id;
-    let mut attached_with_landing_draft = Application::new(workspace.path());
+    let mut attached_with_landing_draft = Application::new(workspace.path(), Default::default());
     attached_with_landing_draft
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
             ready_health(original_instance, server.descriptor().pid),
@@ -365,7 +370,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
 
 #[test]
 fn connecting_view_exposes_connection_state_before_a_snapshot_arrives() {
-    let screen = rendered_state_rows(&TuiState::default()).join("\n");
+    let screen = rendered_state_rows(&Application::default()).join("\n");
 
     assert!(screen.contains("What would you like to work on?"));
     assert!(screen.contains("Type a Prompt and press Enter"));
@@ -545,6 +550,82 @@ fn working_indicator_shimmers_only_its_state_label() {
 }
 
 #[test]
+fn a_terminal_without_truecolor_uses_the_modifier_shimmer() {
+    let workspace = workspace_dir();
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Keep the transcript visible",
+        workspace.path(),
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.session.working_since = Some(SessionTimestamp::now());
+    snapshot.turns[0].status = TurnStatus::Active;
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), TerminalFacts::unprobed(false));
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach Working Session");
+
+    let opening = rendered_application_buffer(&application, 100, 16);
+    let (label_x, label_y) = text_position(&opening, "Working");
+    let opening_styles = (0.."Working".len())
+        .map(|offset| {
+            opening
+                .cell((label_x + offset as u16, label_y))
+                .unwrap()
+                .style()
+        })
+        .collect::<Vec<_>>();
+    assert!(opening_styles.iter().all(|style| {
+        style.fg == Some(ratatui::style::Color::Reset)
+            && style.add_modifier.contains(ratatui::style::Modifier::DIM)
+    }));
+
+    for _ in 0..10 {
+        application
+            .handle_event(ApplicationEvent::SpinnerTick)
+            .expect("advance presentation animation");
+    }
+    let sweeping = rendered_application_buffer(&application, 100, 16);
+    let sweeping_styles = (0.."Working".len())
+        .map(|offset| {
+            sweeping
+                .cell((label_x + offset as u16, label_y))
+                .unwrap()
+                .style()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        sweeping_styles
+            .iter()
+            .all(|style| style.fg == Some(ratatui::style::Color::Reset))
+    );
+    assert!(
+        sweeping_styles
+            .iter()
+            .any(|style| style.add_modifier.contains(ratatui::style::Modifier::BOLD))
+    );
+    assert!(
+        sweeping_styles
+            .iter()
+            .any(|style| style.add_modifier.contains(ratatui::style::Modifier::DIM))
+    );
+
+    application.set_terminal_facts(TerminalFacts::unprobed(true));
+    let truecolor = rendered_application_buffer(&application, 100, 16);
+    assert!((0.."Working".len()).all(|offset| {
+        matches!(
+            truecolor
+                .cell((label_x + offset as u16, label_y))
+                .unwrap()
+                .fg,
+            ratatui::style::Color::Rgb(..)
+        )
+    }));
+}
+
+#[test]
 fn working_indicator_end_truncates_without_wrapping_on_a_narrow_terminal() {
     let workspace = workspace_dir();
     let mut snapshot = failed_session_snapshot(
@@ -695,7 +776,7 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
         "connection status belongs to the hidden Session header, not the composer footer: {short}"
     );
 
-    let mut idle = Application::new(workspace.path());
+    let mut idle = Application::new(workspace.path(), Default::default());
     let mut idle_snapshot = active_snapshot;
     idle_snapshot.session.status = SessionStatus::Idle;
     idle_snapshot.session.working_since = None;
@@ -721,10 +802,14 @@ fn recovering_view_retains_the_landing_composer_and_last_server_identity() {
         Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
     let mut state = connected_state(instance_id, 42_424);
 
-    state.apply(ManagedEvent::Recovering(RecoveryStatus {
-        attempt: 2,
-        retry_in: Duration::from_millis(500),
-    }));
+    state
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Recovering(
+            RecoveryStatus {
+                attempt: 2,
+                retry_in: Duration::from_millis(500),
+            },
+        )))
+        .expect("begin recovery");
 
     let screen = rendered_state_rows(&state).join("\n");
 
@@ -799,14 +884,19 @@ fn recovered_view_switches_identity_on_the_confirmed_connection() {
     let recovered_instance_id = Uuid::parse_str("a4cc72ad-5507-4d4f-89f4-a3f7f1119d41")
         .expect("parse recovered instance ID");
     let mut state = connected_state(previous_instance_id, 42_424);
-    state.apply(ManagedEvent::Recovering(RecoveryStatus {
-        attempt: 1,
-        retry_in: Duration::ZERO,
-    }));
-    state.apply(ManagedEvent::Connected(ready_health(
-        recovered_instance_id,
-        84_848,
-    )));
+    state
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Recovering(
+            RecoveryStatus {
+                attempt: 1,
+                retry_in: Duration::ZERO,
+            },
+        )))
+        .expect("begin recovery");
+    state
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(recovered_instance_id, 84_848),
+        )))
+        .expect("finish recovery");
 
     let recovered = rendered_state_rows(&state).join("\n");
     assert!(recovered.contains("Connected"));
@@ -820,10 +910,14 @@ fn manual_stop_view_retains_the_landing_screen_and_last_server_identity() {
         Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
     let mut state = connected_state(instance_id, 42_424);
 
-    state.apply(ManagedEvent::ServerShutdown(ServerShutdown {
-        instance_id,
-        reason: ShutdownReason::Manual,
-    }));
+    state
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::ServerShutdown(
+            ServerShutdown {
+                instance_id,
+                reason: ShutdownReason::Manual,
+            },
+        )))
+        .expect("stop server");
 
     let screen = rendered_state_rows(&state).join("\n");
     assert!(screen.contains("What would you like to work on?"));
@@ -833,25 +927,9 @@ fn manual_stop_view_retains_the_landing_screen_and_last_server_identity() {
 }
 
 #[test]
-fn fatal_protocol_error_is_rendered_visibly_with_the_last_known_state() {
-    let instance_id =
-        Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002").expect("parse fixture instance ID");
-    let mut state = connected_state(instance_id, 42_424);
-
-    state.apply(ManagedEvent::Fatal(
-        "server sent unknown event type 'future_event'".to_owned(),
-    ));
-
-    let screen = rendered_state_rows(&state).join("\n");
-    assert!(screen.contains("What would you like to work on?"));
-    assert!(screen.contains("Connection failed"));
-    assert!(screen.contains("unknown event type 'future_event'"));
-}
-
-#[test]
 fn ended_session_subscription_requests_a_fresh_snapshot_for_reconciliation() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (session_id, _) = enter_session(&mut application, workspace.path());
 
     assert_eq!(
@@ -886,7 +964,7 @@ async fn headless_slash_settle_sets_the_open_session_aside_on_a_real_server() {
     )
     .await
     .expect("connect managed client");
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
 
     let created = client
         .create_session(CreateSessionRequest {

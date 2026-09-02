@@ -76,7 +76,7 @@ fn text_cell<'a>(buffer: &'a Buffer, needle: &str) -> &'a Cell {
 #[test]
 fn wrapped_transcript_lines_keep_source_and_list_indentation() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
     set_turn_in_flight(&mut snapshot, turn_id);
@@ -136,7 +136,7 @@ async fn apply_next_session_event(
 #[test]
 fn terminal_input_capabilities_map_mouse_wheel_to_transcript_navigation() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(
             navigable_session_snapshot(SessionId::new(), workspace.path(), 8),
@@ -174,7 +174,7 @@ fn terminal_input_capabilities_map_mouse_wheel_to_transcript_navigation() {
 #[test]
 fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
     set_turn_in_flight(&mut snapshot, turn_id);
@@ -244,7 +244,7 @@ fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
 #[test]
 fn all_base_ansi_foregrounds_and_backgrounds_render_through_the_theme_palette() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
     set_turn_in_flight(&mut snapshot, turn_id);
@@ -315,7 +315,7 @@ fn all_base_ansi_foregrounds_and_backgrounds_render_through_the_theme_palette() 
 #[test]
 fn escape_laden_transcript_stays_clean_after_scroll_and_session_switch() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let mut escaped = navigable_session_snapshot(SessionId::new(), workspace.path(), 8);
     let turn_id = escaped.turns[7].id;
     set_turn_in_flight(&mut escaped, turn_id);
@@ -375,7 +375,7 @@ fn escape_laden_transcript_stays_clean_after_scroll_and_session_switch() {
 #[test]
 fn activity_sgr_styles_patch_over_each_activity_base_style() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
     set_turn_in_flight(&mut snapshot, turn_id);
@@ -456,7 +456,7 @@ fn activity_sgr_styles_patch_over_each_activity_base_style() {
 #[test]
 fn command_output_osc_8_hyperlinks_render_with_link_style() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
     set_turn_in_flight(&mut snapshot, turn_id);
@@ -508,7 +508,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
     )
     .await
     .expect("connect managed client");
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     for _ in 0..2 {
         application
             .handle_event(ApplicationEvent::Managed(
@@ -1053,7 +1053,7 @@ fn streaming_command_updates_reuse_one_folded_projected_transcript_row() {
 #[test]
 fn page_up_exposes_latest_and_end_resumes_following_the_transcript() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(
             navigable_session_snapshot(SessionId::new(), workspace.path(), 8),
@@ -1138,11 +1138,11 @@ fn a_scrolled_message_anchor_survives_streaming_and_terminal_resize_per_client()
         })
         .expect("fixture has a final Agent Message");
 
-    let mut reader = Application::new(workspace.path());
+    let mut reader = Application::new(workspace.path(), Default::default());
     reader
         .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
         .expect("attach historical reader");
-    let mut observer = Application::new(workspace.path());
+    let mut observer = Application::new(workspace.path(), Default::default());
     observer
         .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
         .expect("attach tail-following observer");
@@ -1239,7 +1239,7 @@ fn a_scrolled_message_anchor_survives_streaming_and_terminal_resize_per_client()
 #[test]
 fn resize_that_reveals_the_whole_transcript_resumes_following() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(
             navigable_session_snapshot(SessionId::new(), workspace.path(), 4),
@@ -1270,7 +1270,7 @@ fn resize_that_reveals_the_whole_transcript_resumes_following() {
 #[test]
 fn transcript_navigation_remains_correct_beyond_the_terminal_scroll_limit() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let prompt_id = PromptId::new();
     let content = format!("{}TAIL beyond u16", "x\n".repeat(65_700));
     application
@@ -1311,7 +1311,7 @@ fn transcript_navigation_remains_correct_beyond_the_terminal_scroll_limit() {
 #[test]
 fn transcript_navigation_reaches_tail_of_one_oversized_wrapped_line() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let terminal_width = 28;
     let transcript_width = terminal_width - 2;
@@ -1359,7 +1359,7 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
     let workspace = workspace_dir();
     let session_id = SessionId::new();
     let snapshot = navigable_session_snapshot(session_id, workspace.path(), 8);
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
         .expect("attach a long Session");
@@ -3243,9 +3243,10 @@ fn an_active_command_is_promoted_to_its_live_tail_after_the_configured_latency()
     let elapsed_ms = Arc::new(AtomicU64::new(0));
     let observed_elapsed_ms = Arc::clone(&elapsed_ms);
     let origin = Instant::now();
-    let mut application = Application::new(workspace.path()).with_presentation_clock(move || {
-        origin + Duration::from_millis(observed_elapsed_ms.load(Ordering::Relaxed))
-    });
+    let mut application = Application::new(workspace.path(), Default::default())
+        .with_presentation_clock(move || {
+            origin + Duration::from_millis(observed_elapsed_ms.load(Ordering::Relaxed))
+        });
     deliver_settings(
         &mut application,
         EffectiveSettings {

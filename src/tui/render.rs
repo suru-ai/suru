@@ -93,12 +93,13 @@ impl ResponsiveDetail {
     }
 }
 
-pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
-    render_with_slots(frame, state, &RenderSlots::builtins());
-}
-
-pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: &RenderSlots) {
-    let theme = Theme::system();
+pub(super) fn render_with_slots(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    slots: &RenderSlots,
+    theme: &Theme,
+    truecolor: bool,
+) {
     // The settings panel is pointable, and only a frame that drew it can say
     // where. Every frame starts by giving up what the last one recorded, so the
     // geometry a click resolves against is always the one on screen.
@@ -113,16 +114,16 @@ pub(super) fn render_with_slots(frame: &mut Frame<'_>, state: &TuiState, slots: 
     // Session in the abstract: its transient tail may have scrolled away.
     state.session_animation_on_screen.set(false);
     if terminal_is_too_small(frame.area()) {
-        render_terminal_too_small(frame, &theme);
+        render_terminal_too_small(frame, theme);
         return;
     }
-    let main = render_sidebar(frame, state, &theme);
+    let main = render_sidebar(frame, state, theme);
     let composer = if state.session.is_some() {
-        render_session(frame, state, main, slots, &theme)
+        render_session(frame, state, main, slots, theme, truecolor)
     } else if state.route.is_some() {
-        render_opening_session(frame, state, main, &theme)
+        render_opening_session(frame, state, main, theme, truecolor)
     } else {
-        render_landing(frame, state, main, slots, &theme)
+        render_landing(frame, state, main, slots, theme)
     };
     if state.composer_completion.is_visible() && !state.reconnect_overlay_visible {
         render_composer_completion(frame, state, composer.area, &theme);
@@ -2455,6 +2456,7 @@ fn render_opening_session(
     state: &TuiState,
     area: Rect,
     theme: &Theme,
+    truecolor: bool,
 ) -> RenderedComposer {
     let content_column = session_content_area(area, state);
     let content_width = content_column.width;
@@ -2502,6 +2504,8 @@ fn render_opening_session(
                 "Loading",
                 state.spinner_frame,
                 theme.text.primary,
+                theme.text.subdued,
+                truecolor,
             ))),
             transcript_area,
         );
@@ -2531,6 +2535,7 @@ fn render_session(
     area: Rect,
     slots: &RenderSlots,
     theme: &Theme,
+    truecolor: bool,
 ) -> RenderedComposer {
     let snapshot = state
         .session
@@ -2597,6 +2602,7 @@ fn render_session(
                 binding_label(&CommandId::RequestInterrupt),
                 state.spinner_frame,
                 theme,
+                truecolor,
             );
             slots.working_indicator(&context, default)
         });
@@ -2897,6 +2903,7 @@ fn working_indicator_line(
     interrupt_binding: &str,
     animation_frame: usize,
     theme: &Theme,
+    truecolor: bool,
 ) -> Line<'static> {
     let label = match context.state {
         WorkingIndicatorState::Working => "Working",
@@ -2912,9 +2919,15 @@ fn working_indicator_line(
             format!(" ({elapsed} • {interrupt_binding} again to interrupt)")
         }
     };
-    let label = shimmered_label_spans(label, animation_frame, theme.text.primary)
-        .into_iter()
-        .map(|span| SlotText::new(span.content.into_owned(), span.style));
+    let label = shimmered_label_spans(
+        label,
+        animation_frame,
+        theme.text.primary,
+        theme.text.subdued,
+        truecolor,
+    )
+    .into_iter()
+    .map(|span| SlotText::new(span.content.into_owned(), span.style));
     Line::from(
         truncate_slot_text(
             label
@@ -2928,10 +2941,22 @@ fn working_indicator_line(
     )
 }
 
-fn shimmered_label_spans(label: &str, animation_frame: usize, base: Style) -> Vec<Span<'static>> {
+fn shimmered_label_spans(
+    label: &str,
+    animation_frame: usize,
+    primary: Style,
+    subdued: Style,
+    truecolor: bool,
+) -> Vec<Span<'static>> {
     label
         .chars()
-        .zip(shimmer::styles(label, animation_frame, base))
+        .zip(shimmer::styles(
+            label,
+            animation_frame,
+            primary,
+            subdued,
+            truecolor,
+        ))
         .map(|(character, style)| Span::styled(character.to_string(), style))
         .collect()
 }
@@ -3445,6 +3470,7 @@ mod tests {
         buffer::{Buffer, Cell},
         style::{Color, Style},
     };
+    use uuid::Uuid;
 
     use super::super::{
         slots::{
@@ -3457,9 +3483,9 @@ mod tests {
     use crate::{
         managed_client::{ManagedEvent, SessionEvent},
         protocol::{
-            EffectiveSettings, ModelAvailability, Session, SessionContentWidth, SessionId,
-            SessionRevision, SessionSettings, SessionSnapshot, SessionStatus, SessionTimestamp,
-            SettingsSnapshot, Workspace,
+            EffectiveSettings, Health, LifecycleState, ModelAvailability, ServerIdentity, Session,
+            SessionContentWidth, SessionId, SessionRevision, SessionSettings, SessionSnapshot,
+            SessionStatus, SessionTimestamp, SettingsSnapshot, Workspace,
         },
     };
 
@@ -3491,6 +3517,30 @@ mod tests {
             .chunks(buffer.area.width as usize)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect()
+    }
+
+    #[test]
+    fn fatal_protocol_error_is_rendered_visibly_with_the_last_known_state() {
+        let instance_id = Uuid::parse_str("c2f03bd2-b177-4e73-b33a-1fb4f3a8d002")
+            .expect("parse fixture instance ID");
+        let mut application = Application::default();
+        application.state.apply(ManagedEvent::Connected(Health::new(
+            ServerIdentity {
+                instance_id,
+                pid: 42_424,
+                protocol_version: 1,
+                build_identity: "suru@test".to_owned(),
+            },
+            LifecycleState::Ready,
+        )));
+        application.state.apply(ManagedEvent::Fatal(
+            "server sent unknown event type 'future_event'".to_owned(),
+        ));
+
+        let screen = rendered_rows(&application).join("\n");
+        assert!(screen.contains("What would you like to work on?"));
+        assert!(screen.contains("Connection failed"));
+        assert!(screen.contains("unknown event type 'future_event'"));
     }
 
     /// The canonical form a client and the server hold on Windows is verbatim,

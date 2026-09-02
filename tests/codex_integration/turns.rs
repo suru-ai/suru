@@ -327,7 +327,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         .expect("Session feed remains open")
         .expect("Session snapshot is valid");
     assert!(matches!(initial_event, SessionEvent::Snapshot(_)));
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::Session(initial_event))
         .expect("initial SSE snapshot hydrates the client projection");

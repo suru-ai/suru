@@ -26,6 +26,7 @@ use crate::{
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
+    terminal::TerminalFacts,
     theme::Theme,
 };
 
@@ -1917,6 +1918,8 @@ pub(super) struct QueuedPrompt<'a> {
 pub struct Application {
     pub(super) state: TuiState,
     pub(super) slots: RenderSlots,
+    pub(super) terminal_facts: TerminalFacts,
+    pub(super) theme: Theme,
 }
 
 impl std::fmt::Debug for Application {
@@ -1930,10 +1933,7 @@ impl std::fmt::Debug for Application {
 
 impl Default for Application {
     fn default() -> Self {
-        Self {
-            state: TuiState::default(),
-            slots: RenderSlots::builtins(),
-        }
+        Self::from_state(TuiState::default(), TerminalFacts::default())
     }
 }
 
@@ -2220,11 +2220,28 @@ pub enum ApplicationTransition {
 }
 
 impl Application {
-    pub fn new(workspace: impl AsRef<Path>) -> Self {
+    pub fn new(workspace: impl AsRef<Path>, terminal_facts: TerminalFacts) -> Self {
+        Self::from_state(TuiState::new(workspace), terminal_facts)
+    }
+
+    fn from_state(state: TuiState, terminal_facts: TerminalFacts) -> Self {
         Self {
-            state: TuiState::new(workspace),
+            state,
             slots: RenderSlots::builtins(),
+            terminal_facts,
+            theme: Theme::resolve(&terminal_facts),
         }
+    }
+
+    /// Re-resolves presentation from a fresh reading of the attached
+    /// terminal. Startup supplies the first reading; live re-detection may
+    /// replace it through the same boundary later.
+    pub fn set_terminal_facts(&mut self, terminal_facts: TerminalFacts) {
+        if self.terminal_facts == terminal_facts {
+            return;
+        }
+        self.terminal_facts = terminal_facts;
+        self.theme = Theme::resolve(&terminal_facts);
     }
 
     pub(super) fn pending_workspace_resolution(
@@ -4189,7 +4206,13 @@ impl Application {
     }
 
     pub fn render(&self, frame: &mut Frame<'_>) {
-        render_with_slots(frame, &self.state, &self.slots);
+        render_with_slots(
+            frame,
+            &self.state,
+            &self.slots,
+            &self.theme,
+            self.terminal_facts.truecolor,
+        );
     }
 
     pub fn handle_terminal_event(&mut self, event: InputEvent) -> Result<ApplicationTransition> {

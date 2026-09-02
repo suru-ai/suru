@@ -67,7 +67,7 @@ fn session_composer_footer_sums_persisted_usage_across_all_turn_outcomes() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
         .expect("open the measured Session");
     let current_screen = rendered_application_rows(&current_client).join("\n");
-    let mut reloaded_client = Application::new(workspace.path());
+    let mut reloaded_client = Application::new(workspace.path(), Default::default());
     reloaded_client
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("restore the persisted Session in a fresh client");
@@ -95,7 +95,7 @@ fn session_composer_footer_sums_persisted_usage_across_all_turn_outcomes() {
 #[test]
 fn session_composer_footer_updates_with_active_turn_usage_and_hides_unknown_cost() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (session_id, snapshot, turn_id) = enter_active_session(&mut application, workspace.path());
     let without_usage = rendered_application_rows(&application).join("\n");
     assert!(!without_usage.contains("tokens"));
@@ -242,7 +242,7 @@ fn skill_completion_replaces_only_the_query_binds_it_and_keeps_the_prompt_open()
         model: ModelId::new("gpt-fixture"),
         options: Vec::new(),
     };
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
             ready_health(Uuid::new_v4(), 42).with_landing_agent_selection(Some(selection)),
@@ -978,7 +978,7 @@ fn skill_completion_shows_live_catalog_states_and_retries_failed_discovery() {
         model: ModelId::new("gpt-fixture"),
         options: Vec::new(),
     };
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
             ready_health(Uuid::new_v4(), 42).with_landing_agent_selection(Some(selection)),
@@ -1355,7 +1355,7 @@ fn composer_grows_to_one_third_of_the_terminal_then_scrolls_internally() {
 #[test]
 fn text_entered_while_the_first_session_is_created_becomes_its_draft() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
             "Initial Prompt".to_owned(),
@@ -1402,7 +1402,7 @@ fn text_entered_while_the_first_session_is_created_becomes_its_draft() {
 #[test]
 fn multiline_history_is_boundary_aware_and_session_drafts_keep_their_cursor() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let (first_session, first_snapshot) = enter_session(&mut application, workspace.path());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
@@ -1548,7 +1548,7 @@ fn application_with_skills(
         model: ModelId::new("gpt-fixture"),
         options: Vec::new(),
     };
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
             ready_health(Uuid::new_v4(), 42).with_landing_agent_selection(Some(selection)),

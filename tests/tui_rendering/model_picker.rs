@@ -25,7 +25,7 @@ fn restored_selection_label_stays_stable_when_its_catalog_arrives() {
         model: ModelId::new("model-native-id"),
         options: Vec::new(),
     };
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(
             selected_session_snapshot(SessionId::new(), workspace.path(), selection),
@@ -82,7 +82,7 @@ fn reselected_model_adopts_catalog_presentation_after_an_interval_without_an_age
         model: ModelId::new("model-native-id"),
         options: Vec::new(),
     };
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(
             selected_session_snapshot(SessionId::new(), workspace.path(), selection.clone()),
@@ -643,7 +643,7 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
         options: Vec::new(),
     };
     let snapshot = selected_session_snapshot(session_id, workspace.path(), authoritative.clone());
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
         .expect("attach selected Session");
@@ -850,7 +850,7 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
         ApplicationTransition::Continue
     );
 
-    let mut other_client = Application::new(workspace.path());
+    let mut other_client = Application::new(workspace.path(), Default::default());
     other_client
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach another client");
@@ -885,7 +885,7 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
 #[test]
 fn landing_model_selection_and_new_session_inherit_complete_agent_selection() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let ApplicationTransition::ListModels(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
             suru::tui::SemanticCommandId::ModelList,
@@ -979,7 +979,7 @@ fn landing_model_selection_and_new_session_inherit_complete_agent_selection() {
             },
         }],
     };
-    let mut attached = Application::new(workspace.path());
+    let mut attached = Application::new(workspace.path(), Default::default());
     attached
         .handle_event(ApplicationEvent::SessionAttached(
             selected_session_snapshot(SessionId::new(), workspace.path(), inherited.clone()),
@@ -1017,7 +1017,7 @@ fn open_model_picker_refocuses_on_an_authoritative_multi_client_update() {
         model: ModelId::new("new"),
         options: Vec::new(),
     };
-    let mut observer = Application::new(workspace.path());
+    let mut observer = Application::new(workspace.path(), Default::default());
     observer
         .handle_event(ApplicationEvent::SessionAttached(
             selected_session_snapshot(session_id, workspace.path(), old),

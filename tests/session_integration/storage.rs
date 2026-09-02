@@ -111,7 +111,7 @@ async fn safe_skill_invocations_are_readable_after_a_server_restart() {
     assert_eq!(restored.messages[0].content, "$review persisted work");
     assert_eq!(restored.messages[0].skill_invocations, vec![invocation]);
 
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(restored)))
         .expect("hydrate restored Skill-bearing Session");
@@ -828,7 +828,7 @@ async fn an_undecodable_stored_session_does_not_block_startup_and_remains_listed
     assert_eq!(unreadable.id, created.session.id);
     assert_eq!(unreadable.title, "Keep this damaged Session visible");
 
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     let ApplicationTransition::ListSessions(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
             SemanticCommandId::SessionList,

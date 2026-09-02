@@ -155,7 +155,7 @@ fn a_revoked_remote_returns_to_the_local_landing_with_the_session_composer_recov
 #[test]
 fn choosing_local_again_restores_the_local_outlook_and_workspace() {
     let local_workspace = std::env::current_dir().expect("read local Workspace");
-    let mut application = Application::new(&local_workspace);
+    let mut application = Application::new(&local_workspace, Default::default());
     type_terminal_text(&mut application, "/connect");
     press(&mut application, KeyCode::Enter);
     application

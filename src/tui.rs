@@ -28,11 +28,11 @@ mod transcript;
 mod usage;
 mod workspace_picker;
 
+pub use crate::terminal::{TerminalColor, TerminalColorProbe, TerminalFacts};
 pub use commands::{NumericDigit, SemanticCommandId};
 pub use completion::CompletionMode;
 pub use event_loop::run;
 pub use keymap::command_for_terminal_event;
-pub use render::render;
 pub use state::{
     Application, ApplicationEvent, ApplicationTransition, CommandId, ModelListRequest,
     SessionListRequest, SessionListScope, SessionListSurface, TuiState, WorkspaceResolutionSurface,

@@ -255,7 +255,7 @@ fn reasoning_cycle_reports_unavailable_effort_without_mutation() {
 #[test]
 fn reasoning_cycle_without_a_cached_catalog_requests_models_and_reports() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(
             selected_session_snapshot(SessionId::new(), workspace.path(), cycling_selection("low")),
@@ -282,7 +282,7 @@ fn reasoning_cycle_without_a_cached_catalog_requests_models_and_reports() {
 fn rapid_reasoning_cycles_coalesce_to_one_serialized_latest_selection() {
     let workspace = workspace_dir();
     let session_id = SessionId::new();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(
             selected_session_snapshot(session_id, workspace.path(), cycling_selection("low")),
@@ -382,7 +382,7 @@ fn rapid_reasoning_cycles_coalesce_to_one_serialized_latest_selection() {
 fn stale_selection_results_cannot_overwrite_newer_intent_or_roll_back() {
     let workspace = workspace_dir();
     let session_id = SessionId::new();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(
             selected_session_snapshot(session_id, workspace.path(), cycling_selection("low")),
@@ -485,7 +485,7 @@ fn stale_selection_results_cannot_overwrite_newer_intent_or_roll_back() {
 fn authoritative_updates_slide_beneath_the_optimistic_overlay_until_settled() {
     let workspace = workspace_dir();
     let session_id = SessionId::new();
-    let mut application = Application::new(workspace.path());
+    let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::SessionAttached(
             selected_session_snapshot(session_id, workspace.path(), cycling_selection("low")),

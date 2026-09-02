@@ -31,6 +31,7 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{DisableBracketedPaste, EnableBracketedPaste, Event as InputEvent, EventStream},
     execute,
+    style::available_color_count,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures_util::StreamExt;
@@ -43,6 +44,7 @@ use super::state::{
     Application, ApplicationEvent, ApplicationTransition, ModelListRequest, SessionListRequest,
     SessionListSurface, WorkspaceResolutionSurface,
 };
+use crate::terminal::TerminalFacts;
 
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
@@ -50,7 +52,8 @@ pub async fn run(client: ManagedClient) -> Result<()> {
     let workspace =
         std::env::current_dir().map_err(|error| anyhow!("read current Workspace: {error}"))?;
     let mut session = TerminalSession::enter()?;
-    run_loop(&mut session.terminal, client, workspace).await
+    let terminal_facts = TerminalFacts::unprobed(available_color_count() == u16::MAX);
+    run_loop(&mut session.terminal, client, workspace, terminal_facts).await
 }
 
 /// How the run loop leaves the screen when an event ends the run.
@@ -404,6 +407,7 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     client: ManagedClient,
     workspace: PathBuf,
+    terminal_facts: TerminalFacts,
 ) -> Result<()> {
     let (submissions, mut submission_rx) = tokio::sync::mpsc::unbounded_channel();
     let (subscriptions, mut subscription_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -415,7 +419,7 @@ async fn run_loop(
     let (outlook_catalog, mut outlook_catalog_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut run = RunLoop {
         client,
-        application: Application::new(workspace),
+        application: Application::new(workspace, terminal_facts),
         tasks: SessionTasks::default(),
         channels: TaskChannels {
             submissions,

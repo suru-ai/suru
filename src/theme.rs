@@ -2,6 +2,8 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::terminal::TerminalFacts;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Theme {
     pub(crate) text: TextRoles,
@@ -134,6 +136,10 @@ pub(crate) struct SelectionRoles {
 }
 
 impl Theme {
+    pub(crate) fn resolve(_terminal_facts: &TerminalFacts) -> Self {
+        Self::system()
+    }
+
     pub(crate) fn system() -> Self {
         let accent = AccentRoles {
             primary: Style::default().fg(Color::Cyan),
