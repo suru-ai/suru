@@ -17,7 +17,7 @@ use crate::protocol::{
 use super::{
     SessionListRequest, SessionListScope, SessionListSurface,
     commands::{SemanticCommandId, SemanticInvocation},
-    session_listing::SessionListing,
+    session_listing::{ListedSession, SessionListing},
 };
 
 /// The columns the Sidebar occupies, cloning t3 code's own fixed column. There
@@ -165,7 +165,7 @@ pub(super) struct Sidebar {
     /// is showing — that is the open Session, which the route decides and the
     /// Sidebar is only told.
     focus: Option<SidebarFocus>,
-    attaching: Option<SessionId>,
+    attaching: Option<SessionReference>,
     /// Whether the listing in flight is one the reader asked for by opening
     /// the Sidebar, rather than one it asked for on its own to catch up with a
     /// catalog another client moved. Their own ask is them looking again, so
@@ -197,7 +197,7 @@ pub(super) struct Sidebar {
     /// The Session the Sidebar asked the server to take away, held so a
     /// refusal is drawn by the surface that asked rather than by whichever
     /// other one happens to be listing the same work.
-    deleting: Option<SessionId>,
+    deleting: Option<SessionReference>,
 }
 
 /// The lines one active Sidebar row takes, the third of them saying nothing
@@ -229,7 +229,7 @@ enum SidebarFocus {
     /// The affordance beside the selector, which Enter opens a path entry from
     /// rather than attaching anything.
     AddWorkspace,
-    Session(SessionId),
+    Session(SessionReference),
     ShowMore,
 }
 
@@ -258,7 +258,7 @@ pub(super) struct SidebarRow<'a> {
     /// The Session this row stands for, which is what a frame records against
     /// the screen rows it draws so a press lands on the work rather than on
     /// the position.
-    pub(super) session_id: SessionId,
+    pub(super) reference: &'a SessionReference,
     /// The Emoji this row draws for its Session: none where the derivation
     /// left it none, and none while the reader keeps Emojis hidden.
     pub(super) emoji: Option<&'a str>,
@@ -408,7 +408,7 @@ impl SidebarEntry<'_> {
     /// a rule rather than a row and so answers no press.
     pub(super) fn target(&self) -> Option<SidebarTarget> {
         match self {
-            Self::Row(row) => Some(SidebarTarget::Session(row.session_id)),
+            Self::Row(row) => Some(SidebarTarget::Session(row.reference.clone())),
             Self::ShowMore(_) => Some(SidebarTarget::ShowMore),
             Self::Scope(scope) => Some(SidebarTarget::Scope(scope.scope.clone())),
             Self::Divider => None,
@@ -452,7 +452,7 @@ pub(super) struct SidebarSpan {
 /// beside the selector that opens a path entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SidebarTarget {
-    Session(SessionId),
+    Session(SessionReference),
     ShowMore,
     Selector,
     Scope(WorkspaceScope),
@@ -527,7 +527,7 @@ pub(super) enum SidebarActivation {
     /// opened or narrowed, a path was refused, or the reader was already on
     /// the Session they asked for.
     Answered,
-    Attach(SessionId),
+    Attach(SessionReference),
     /// The reader named a directory to work in. It is the client's current
     /// Workspace from here: the root of the Sessions they make next, and what
     /// current-Workspace scope comes to mean.
@@ -700,7 +700,7 @@ impl Sidebar {
     /// back. The initial-visibility Setting's own
     /// reveal in [`Self::adopt_settings`] does neither, because a reader who has not touched the
     /// Sidebar is typing their first Prompt.
-    pub(super) fn toggle(&mut self, open: Option<SessionId>) {
+    pub(super) fn toggle(&mut self, open: Option<&SessionReference>) {
         self.reveal(!self.revealed);
         if self.revealed {
             self.enter(open);
@@ -716,7 +716,7 @@ impl Sidebar {
     /// the open Session where the column draws its row, and on the Workspace
     /// selector otherwise, so entering has a starting point without the
     /// Sidebar having to pretend some Session is selected.
-    fn enter(&mut self, open: Option<SessionId>) {
+    fn enter(&mut self, open: Option<&SessionReference>) {
         self.focused = true;
         self.seed_focus(open);
     }
@@ -895,8 +895,8 @@ impl Sidebar {
         // A row the client could not read spends the press without answering
         // it: opening the Session could only fail, and carrying row focus onto
         // a row the arrows cannot leave would strand it there.
-        if let SidebarTarget::Session(session_id) = target
-            && !self.is_readable(session_id)
+        if let SidebarTarget::Session(reference) = &target
+            && !self.is_readable(reference)
         {
             return SidebarPress::Answered;
         }
@@ -906,12 +906,12 @@ impl Sidebar {
 
     /// Whether this Session is one the listing in hand could read, which is
     /// what decides whether its row can be opened at all.
-    fn is_readable(&self, session_id: SessionId) -> bool {
+    fn is_readable(&self, reference: &SessionReference) -> bool {
         self.listing
             .sessions()
             .iter()
-            .find(|session| session.id() == session_id)
-            .and_then(SessionListItem::readable)
+            .find(|session| session.reference() == reference)
+            .and_then(|session| session.readable())
             .is_some()
     }
 
@@ -934,14 +934,14 @@ impl Sidebar {
         }
         let hit = self.geometry.borrow().hit(position);
         self.menu = None;
-        let Some(SidebarTarget::Session(session_id)) = hit else {
+        let Some(SidebarTarget::Session(reference)) = hit else {
             return;
         };
         let Some(session) = self
             .listing
             .sessions()
             .iter()
-            .find(|session| session.id() == session_id)
+            .find(|session| session.reference() == &reference)
         else {
             return;
         };
@@ -951,11 +951,11 @@ impl Sidebar {
         // how damaged work leaves the list — but never row focus, which stands
         // only on rows the arrows can reach and Enter can open.
         if !unreadable {
-            self.focus_on(SidebarTarget::Session(session_id));
+            self.focus_on(SidebarTarget::Session(reference.clone()));
             self.release_borrowed_focus();
         }
         self.menu = Some(SidebarMenu {
-            session: SessionReference::new(self.listing.outlook().clone(), session_id),
+            session: reference,
             settled,
             unreadable,
             selected: 0,
@@ -1058,7 +1058,7 @@ impl Sidebar {
     /// has been answered — see [`Self::release_borrowed_focus`].
     fn focus_on(&mut self, target: SidebarTarget) {
         self.focus = Some(match target {
-            SidebarTarget::Session(session_id) => SidebarFocus::Session(session_id),
+            SidebarTarget::Session(reference) => SidebarFocus::Session(reference),
             SidebarTarget::ShowMore => SidebarFocus::ShowMore,
             SidebarTarget::Selector => SidebarFocus::Selector,
             SidebarTarget::Scope(scope) => SidebarFocus::Scope(scope),
@@ -1085,15 +1085,15 @@ impl Sidebar {
     /// refusal is drawn here rather than by some other surface listing the
     /// same work. The listing's own complaint goes with it: the reader is
     /// being answered afresh.
-    pub(super) fn begin_deletion(&mut self, session_id: SessionId) {
-        self.deleting = Some(session_id);
+    pub(super) fn begin_deletion(&mut self, reference: SessionReference) {
+        self.deleting = Some(reference);
         self.listing.clear_error();
     }
 
     /// Takes the server's refusal to delete, where it was this Sidebar that
     /// asked. Answering `false` leaves the refusal for whichever surface did.
-    pub(super) fn fail_deletion(&mut self, session_id: SessionId, error: String) -> bool {
-        if self.deleting != Some(session_id) {
+    pub(super) fn fail_deletion(&mut self, reference: &SessionReference, error: String) -> bool {
+        if self.deleting.as_ref() != Some(reference) {
             return false;
         }
         self.deleting = None;
@@ -1232,7 +1232,7 @@ impl Sidebar {
         &mut self,
         request: &SessionListRequest,
         sessions: Vec<SessionListItem>,
-        open: Option<SessionId>,
+        open: Option<&SessionReference>,
     ) {
         let before = self.focus_order_before_change();
         if !self.listing.load(request, sessions) {
@@ -1328,7 +1328,7 @@ impl Sidebar {
     /// and the composer takes the keys back.
     pub(super) fn activate(
         &mut self,
-        open: Option<SessionId>,
+        open: Option<&SessionReference>,
         retry_open: bool,
     ) -> SidebarActivation {
         let activation = self.act_on_focus(open, retry_open);
@@ -1339,7 +1339,11 @@ impl Sidebar {
     /// What acting on the entry row focus stands over comes to, which is the
     /// whole of [`Self::activate`] but the borrowed-focus bookkeeping around
     /// it.
-    fn act_on_focus(&mut self, open: Option<SessionId>, retry_open: bool) -> SidebarActivation {
+    fn act_on_focus(
+        &mut self,
+        open: Option<&SessionReference>,
+        retry_open: bool,
+    ) -> SidebarActivation {
         if self.workspace_entry.is_some() {
             return self.offer_workspace();
         }
@@ -1347,7 +1351,7 @@ impl Sidebar {
             return SidebarActivation::Answered;
         };
         let wanted = match focus {
-            SidebarFocus::Session(session_id) => session_id,
+            SidebarFocus::Session(reference) => reference,
             SidebarFocus::ShowMore => {
                 self.show_more();
                 return SidebarActivation::Answered;
@@ -1365,15 +1369,15 @@ impl Sidebar {
                 return SidebarActivation::Answered;
             }
         };
-        if !self.is_readable(wanted) {
+        if !self.is_readable(&wanted) {
             return SidebarActivation::Answered;
         }
-        if open == Some(wanted) && !retry_open {
+        if open == Some(&wanted) && !retry_open {
             self.hand_back_keys();
             return SidebarActivation::Answered;
         }
         self.listing.clear_error();
-        self.attaching = Some(wanted);
+        self.attaching = Some(wanted.clone());
         // The reader is done choosing the moment they choose: opening is
         // optimistic, so the keys go to the Session's composer now rather
         // than when its snapshot lands.
@@ -1579,8 +1583,8 @@ impl Sidebar {
         self.scope != WorkspaceScope::AllWorkspaces
     }
 
-    pub(super) fn attaching_to(&self, session_id: SessionId) -> bool {
-        self.attaching == Some(session_id)
+    pub(super) fn attaching_to(&self, reference: &SessionReference) -> bool {
+        self.attaching.as_ref() == Some(reference)
     }
 
     pub(super) const fn is_attaching(&self) -> bool {
@@ -1611,7 +1615,7 @@ impl Sidebar {
         self.attaching = None;
     }
 
-    pub(super) const fn is_loading(&self) -> bool {
+    pub(super) fn is_loading(&self) -> bool {
         self.listing.is_loading()
     }
 
@@ -1634,7 +1638,7 @@ impl Sidebar {
     pub(super) fn visible_entries(
         &self,
         capacity: usize,
-        open: Option<SessionId>,
+        open: Option<&SessionReference>,
     ) -> Vec<SidebarEntry<'_>> {
         let entries = self.entries(open);
         let heights = entries.iter().map(SidebarEntry::lines).collect::<Vec<_>>();
@@ -1660,7 +1664,7 @@ impl Sidebar {
 
     /// The Sidebar's body as the frame draws it, which is [`Self::body`] with
     /// each entry given what its row says.
-    fn entries(&self, open: Option<SessionId>) -> Vec<SidebarEntry<'_>> {
+    fn entries(&self, open: Option<&SessionReference>) -> Vec<SidebarEntry<'_>> {
         self.body()
             .into_iter()
             .map(|entry| match entry {
@@ -1813,11 +1817,11 @@ impl Sidebar {
         // Only focus earns this. The open Session does not: the shelf's cap is
         // the reader's own reading of their history, and opening a Session
         // deep in it must not quietly grow the shelf to say so.
-        if let Some(SidebarFocus::Session(focused)) = self.focus
+        if let Some(SidebarFocus::Session(focused)) = &self.focus
             && let Some(deeper) = settled
                 .iter()
                 .skip(self.settled_on_show)
-                .find(|session| session.id() == focused)
+                .find(|session| session.reference() == focused)
                 .copied()
         {
             on_show.push(deeper);
@@ -1831,16 +1835,17 @@ impl Sidebar {
 
     fn row<'a>(
         &self,
-        session: &'a SessionListItem,
-        open: Option<SessionId>,
+        session: &'a ListedSession,
+        open: Option<&SessionReference>,
         shelf: SidebarShelf<'a>,
     ) -> SidebarEntry<'a> {
         SidebarEntry::Row(SidebarRow {
-            session_id: session.id(),
+            reference: session.reference(),
             emoji: self.emoji.drawn_emoji(session.emoji()),
             title: session.title(),
-            open: open == Some(session.id()),
-            focused: self.focus == Some(SidebarFocus::Session(session.id())),
+            open: open == Some(session.reference()),
+            focused: self.focus.as_ref()
+                == Some(&SidebarFocus::Session(session.reference().clone())),
             unreadable: session.readable().is_none(),
             shelf,
         })
@@ -1860,7 +1865,7 @@ impl Sidebar {
     /// The active Sessions in scope: newest created first, and never reordered
     /// by activity, so a row a reader has their eye on holds its place while
     /// the work behind it moves.
-    fn active(&self, settlement: Settlement) -> Vec<&SessionListItem> {
+    fn active(&self, settlement: Settlement) -> Vec<&ListedSession> {
         let mut sessions = self
             .in_scope()
             .filter(|session| !settlement.settles(session))
@@ -1872,7 +1877,7 @@ impl Sidebar {
     /// The Sessions in scope that are set aside, ordered by when the work ended
     /// rather than by when it began, so what wrapped up most recently is
     /// nearest the divider.
-    fn settled(&self, settlement: Settlement) -> Vec<&SessionListItem> {
+    fn settled(&self, settlement: Settlement) -> Vec<&ListedSession> {
         let mut sessions = self
             .in_scope()
             .filter(|session| settlement.settles(session))
@@ -1883,7 +1888,7 @@ impl Sidebar {
 
     /// The Sessions the selector's scope draws, which is every one the listing
     /// holds until the reader narrows to a Workspace.
-    fn in_scope(&self) -> impl Iterator<Item = &SessionListItem> {
+    fn in_scope(&self) -> impl Iterator<Item = &ListedSession> {
         self.listing
             .sessions()
             .iter()
@@ -1911,7 +1916,7 @@ impl Sidebar {
         let rows = self.body().into_iter().filter_map(|entry| match entry {
             BodyEntry::Session(session, _) => session
                 .readable()
-                .map(|_| SidebarFocus::Session(session.id())),
+                .map(|_| SidebarFocus::Session(session.reference().clone())),
             BodyEntry::ShowMore(_) => Some(SidebarFocus::ShowMore),
             BodyEntry::Scope(scope) => Some(SidebarFocus::Scope(scope)),
             BodyEntry::Divider => None,
@@ -1977,12 +1982,13 @@ impl Sidebar {
     /// The same reading answers a listing that reports the open Session as
     /// unreadable: such a row is not one the arrows can reach, so it is not
     /// one focus can be seeded onto either.
-    fn seed_focus(&mut self, open: Option<SessionId>) {
+    fn seed_focus(&mut self, open: Option<&SessionReference>) {
         // Read with nothing focused, so the settled shelf's exception for the
         // focused row cannot conjure the very row this is asking after.
         self.focus = None;
         let focusable = self.focusable();
         self.focus = open
+            .cloned()
             .map(SidebarFocus::Session)
             .filter(|open| focusable.contains(open))
             .or_else(|| {
@@ -2015,12 +2021,14 @@ impl Sidebar {
     fn forget_absent(&mut self, before: &[SidebarFocus]) {
         if self
             .attaching
+            .as_ref()
             .is_some_and(|attaching| !self.listing.contains(attaching))
         {
             self.attaching = None;
         }
         if self
             .deleting
+            .as_ref()
             .is_some_and(|deleting| !self.listing.contains(deleting))
         {
             self.deleting = None;
@@ -2028,7 +2036,7 @@ impl Sidebar {
         if self
             .menu
             .as_ref()
-            .is_some_and(|menu| !self.listing.contains(menu.session.session_id))
+            .is_some_and(|menu| !self.listing.contains(&menu.session))
         {
             self.menu = None;
         }
@@ -2039,7 +2047,7 @@ impl Sidebar {
 /// One entry of the Sidebar's body, before a frame gives it anything to say.
 #[derive(Clone, Debug)]
 enum BodyEntry<'a> {
-    Session(&'a SessionListItem, Standing),
+    Session(&'a ListedSession, Standing),
     /// One Workspace the open selector offers.
     Scope(WorkspaceScope),
     Divider,
@@ -2061,7 +2069,7 @@ enum Standing {
 #[derive(Debug)]
 struct DrawnShelf<'a> {
     /// The rows on show, top to bottom.
-    on_show: Vec<&'a SessionListItem>,
+    on_show: Vec<&'a ListedSession>,
     /// How many rows the affordance under them brings up, and `None` where the
     /// whole shelf is up and there is no affordance to draw.
     batch: Option<usize>,
@@ -2223,18 +2231,67 @@ mod tests {
 
     use crate::{
         protocol::{
-            AutoSettle, EffectiveSettings, ModelAvailability, Session, SessionId, SessionListItem,
-            SessionStatus, SessionSummary, SessionTimestamp, SidebarSettings, SidebarVisibility,
-            Workspace,
+            AutoSettle, EffectiveSettings, ModelAvailability, Outlook, Session, SessionId,
+            SessionListItem, SessionReference, SessionStatus, SessionSummary, SessionTimestamp,
+            SidebarSettings, SidebarVisibility, Workspace,
         },
         tui::{
             SessionListRequest,
+            commands::SemanticCommandId,
             sidebar::{
                 MINIMUM_MAIN_WIDTH, SIDEBAR_WIDTH, Sidebar, SidebarActivation, SidebarEntry,
-                width_beside, workspace_name,
+                SidebarPress, SidebarSpan, SidebarTarget, width_beside, workspace_name,
             },
         },
     };
+
+    #[test]
+    fn a_row_highlights_and_acts_on_its_own_origin() {
+        let session_id = SessionId::new();
+        let studio = Outlook::Remote("studio".to_owned());
+        let reference = SessionReference::new(studio.clone(), session_id);
+        let local_twin = SessionReference::new(Outlook::Local, session_id);
+        let (mut sidebar, _) = driven();
+        sidebar.adopt_outlook(studio);
+        let request = sidebar
+            .take_listing_request()
+            .expect("turning the visible Sidebar asks its new Origin");
+        sidebar.load(
+            &request,
+            vec![identified(session_id, "Remote work", 1)],
+            None,
+        );
+
+        let local_entry = sidebar.entries(Some(&local_twin));
+        assert!(
+            matches!(&local_entry[0], SidebarEntry::Row(row) if !row.open),
+            "an equal Session ID from another Origin is not the open row"
+        );
+        let remote_entry = sidebar.entries(Some(&reference));
+        assert!(matches!(&remote_entry[0], SidebarEntry::Row(row) if row.open));
+
+        sidebar.record_geometry(
+            0..32,
+            vec![SidebarSpan {
+                rows: 1..4,
+                columns: None,
+                target: SidebarTarget::Session(reference.clone()),
+            }],
+        );
+        sidebar.open_menu_at(ratatui::layout::Position::new(1, 1));
+        assert_eq!(
+            sidebar.activate_menu_item(),
+            SidebarPress::Invoke(SemanticCommandId::SessionSettle.on_session(reference.clone())),
+            "the context menu carries the row's Origin"
+        );
+
+        sidebar.focus_on(SidebarTarget::Session(reference.clone()));
+        assert_eq!(
+            sidebar.activate(None, false),
+            SidebarActivation::Attach(reference),
+            "row activation carries the same Origin"
+        );
+    }
 
     #[test]
     fn the_initial_visibility_setting_has_its_say_once_and_the_toggle_has_it_after() {
@@ -2363,7 +2420,8 @@ mod tests {
 
         sidebar.toggle(None);
         let request = sidebar.take_listing_request().expect("ask for Sessions");
-        sidebar.load(&request, listing, Some(open));
+        let open = SessionReference::new(Outlook::Local, open);
+        sidebar.load(&request, listing, Some(&open));
 
         assert_eq!(focused(&sidebar), Some("Open"));
     }
@@ -2433,10 +2491,15 @@ mod tests {
 
         sidebar.toggle(None);
         let request = sidebar.take_listing_request().expect("ask for Sessions");
-        sidebar.load(&request, vec![identified(open, "Open", 1)], Some(open));
+        let reference = SessionReference::new(Outlook::Local, open);
+        sidebar.load(
+            &request,
+            vec![identified(open, "Open", 1)],
+            Some(&reference),
+        );
 
         assert_eq!(
-            sidebar.activate(Some(open), false),
+            sidebar.activate(Some(&reference), false),
             SidebarActivation::Answered
         );
         assert!(
@@ -2639,11 +2702,12 @@ mod tests {
         let shallower = whole[2..].to_vec();
 
         let (mut sidebar, request) = driven();
-        sidebar.load(&request, shallower, Some(deep));
+        let deep = SessionReference::new(Outlook::Local, deep);
+        sidebar.load(&request, shallower, Some(&deep));
         assert_eq!(focused(&sidebar), Some("Settled 11"));
 
         let again = caught_up(&mut sidebar);
-        sidebar.load(&again, whole, Some(deep));
+        sidebar.load(&again, whole, Some(&deep));
 
         let drawn = drawn(&sidebar);
         assert_eq!(
@@ -2809,7 +2873,8 @@ mod tests {
     /// The same, for a reader who has one of those Sessions open.
     fn showing_on(sessions: Vec<SessionListItem>, open: Option<SessionId>) -> Sidebar {
         let (mut sidebar, request) = driven();
-        sidebar.load(&request, sessions, open);
+        let open = open.map(|session_id| SessionReference::new(Outlook::Local, session_id));
+        sidebar.load(&request, sessions, open.as_ref());
         sidebar
     }
 

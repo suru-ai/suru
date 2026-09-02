@@ -1042,7 +1042,7 @@ impl RunLoop {
                 }
                 self.application
                     .handle_event(ApplicationEvent::SessionDeletionFailed {
-                        session_id: session.session_id,
+                        reference: session,
                         error,
                     })?;
             }

@@ -4,22 +4,27 @@
 
 use std::{
     cmp::Reverse,
+    collections::HashMap,
+    ops::Deref,
     path::{Path, PathBuf},
 };
 
-use crate::protocol::{Outlook, SessionId, SessionListItem, SessionSummary, SessionTimestamp};
+use crate::protocol::{
+    Outlook, SessionId, SessionListItem, SessionReference, SessionSummary, SessionTimestamp,
+};
 
 use super::{SessionListRequest, SessionListScope, SessionListSurface};
 
-/// One surface's view of the Sessions the server holds.
+/// One surface's view of the Sessions its Origin servers hold.
 ///
 /// A listing owns the conversation with the server — it numbers each request
 /// so a reply to a superseded one is dropped, remembers which Workspace scope
 /// the reader asked for, and keeps what it holds true as the session-catalog
-/// stream reports retitles, deletions, and reconciliations. What it does not
-/// own is how those Sessions read: it keeps them in one order — the most
-/// recently updated first — and a surface that wants another sections and
-/// sorts what it derives from them.
+/// stream reports retitles, deletions, and reconciliations. Each Origin owns
+/// its request sequence, reply validity, rows, and loading result. What the
+/// listing does not own is how those Sessions read: within each Origin it
+/// keeps them most recently updated first, and a surface that wants another
+/// order sections and sorts what it derives from them.
 #[derive(Clone, Debug)]
 pub(super) struct SessionListing {
     /// The surface this listing belongs to, stamped on every request it makes
@@ -30,11 +35,47 @@ pub(super) struct SessionListing {
     /// it needs nothing from the caller.
     current_workspace: PathBuf,
     scope: SessionListScope,
+    origins: HashMap<Outlook, OriginListing>,
+}
+
+/// One row held by a Client listing: the wire item together with the Origin
+/// that gives its Session identity meaning. The server has no merged-listing
+/// concept, so the Client stamps this reference when it accepts a reply.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ListedSession {
+    reference: SessionReference,
+    item: SessionListItem,
+}
+
+impl ListedSession {
+    fn new(origin: Outlook, item: SessionListItem) -> Self {
+        let reference = SessionReference::new(origin, item.id());
+        Self { reference, item }
+    }
+
+    pub(super) fn reference(&self) -> &SessionReference {
+        &self.reference
+    }
+}
+
+impl Deref for ListedSession {
+    type Target = SessionListItem;
+
+    fn deref(&self) -> &Self::Target {
+        &self.item
+    }
+}
+
+/// The rows and request conversation belonging to one Origin. Keeping the
+/// sequence beside the rows prevents a reply for one Server from superseding
+/// or validating a reply for another.
+#[derive(Clone, Debug, Default)]
+struct OriginListing {
     request_sequence: u64,
     /// The request whose reply this listing is waiting for. Any other reply is
     /// a straggler from a listing the reader has already moved past.
     pending_request: Option<SessionListRequest>,
-    sessions: Vec<SessionListItem>,
+    sessions: Vec<ListedSession>,
     loading: bool,
     error: Option<String>,
 }
@@ -58,11 +99,7 @@ impl SessionListing {
             outlook: Outlook::Local,
             scope,
             current_workspace,
-            request_sequence: 0,
-            pending_request: None,
-            sessions: Vec::new(),
-            loading: false,
-            error: None,
+            origins: HashMap::new(),
         }
     }
 
@@ -72,8 +109,9 @@ impl SessionListing {
     /// `fail` when the answer arrives.
     pub(super) fn refresh(&mut self) -> SessionListRequest {
         let request = self.catch_up();
-        self.sessions.clear();
-        self.loading = true;
+        let origin = self.current_origin_mut();
+        origin.sessions.clear();
+        origin.loading = true;
         request
     }
 
@@ -83,19 +121,14 @@ impl SessionListing {
     /// and the answer replaces them whole. Numbering the request is what
     /// supersedes whatever this listing was waiting for before.
     pub(super) fn catch_up(&mut self) -> SessionListRequest {
-        self.request_sequence = self.request_sequence.wrapping_add(1);
-        let request = SessionListRequest::new(
-            self.surface,
-            self.request_sequence,
-            self.outlook.clone(),
-            self.scope.clone(),
-        );
-        self.pending_request = Some(request.clone());
+        let surface = self.surface;
+        let outlook = self.outlook.clone();
+        let scope = self.scope.clone();
+        let origin = self.current_origin_mut();
+        origin.request_sequence = origin.request_sequence.wrapping_add(1);
+        let request = SessionListRequest::new(surface, origin.request_sequence, outlook, scope);
+        origin.pending_request = Some(request.clone());
         request
-    }
-
-    pub(super) fn outlook(&self) -> &Outlook {
-        &self.outlook
     }
 
     /// Widens the listing to every Workspace, or narrows it back to this
@@ -103,13 +136,15 @@ impl SessionListing {
     /// goes with it, because the reader is no longer looking at that listing.
     pub(super) fn toggle_scope(&mut self) -> SessionListRequest {
         self.scope = self.scope.toggled(&self.current_workspace);
-        self.error = None;
+        self.clear_error();
         self.refresh()
     }
 
-    /// Takes a listing the server answered with, most recently updated Session
-    /// first, reporting whether it was the one this listing awaited — a caller with selection of its own reads the
-    /// answer to know whether the Sessions beneath it moved.
+    /// Takes a listing the server answered with, stamping every row with the
+    /// request's Outlook and keeping the most recently updated Session first.
+    /// Reports whether the accepted reply belongs to the Origin on show — a
+    /// caller with selection of its own reads that to know whether the rows
+    /// beneath it moved.
     pub(super) fn load(
         &mut self,
         request: &SessionListRequest,
@@ -119,10 +154,18 @@ impl SessionListing {
             return false;
         }
         Self::order(&mut sessions);
-        self.sessions = sessions;
-        self.loading = false;
-        self.pending_request = None;
-        true
+        let rows = sessions
+            .into_iter()
+            .map(|session| ListedSession::new(request.outlook().clone(), session))
+            .collect();
+        let origin = self
+            .origins
+            .get_mut(request.outlook())
+            .expect("an awaited request has an Origin listing");
+        origin.sessions = rows;
+        origin.loading = false;
+        origin.pending_request = None;
+        request.outlook() == &self.outlook
     }
 
     /// Whether a reply the server sent would move anything this listing holds.
@@ -137,14 +180,22 @@ impl SessionListing {
         if !self.awaits(request) {
             return false;
         }
+        if request.outlook() != &self.outlook {
+            return false;
+        }
+        let origin = self.current_origin();
         // A listing still on its way, or one that failed, says so on screen,
         // so the answer moves the frame whatever Sessions it carries.
-        if self.loading || self.error.is_some() {
+        if origin.is_some_and(|origin| origin.loading || origin.error.is_some()) {
             return true;
         }
         let mut arriving = sessions.to_vec();
         Self::order(&mut arriving);
-        arriving != self.sessions
+        let arriving = arriving
+            .into_iter()
+            .map(|session| ListedSession::new(request.outlook().clone(), session))
+            .collect::<Vec<_>>();
+        arriving != self.sessions()
     }
 
     /// The one order a listing keeps: the most recently updated Session first.
@@ -156,24 +207,32 @@ impl SessionListing {
     }
 
     /// Takes the server's refusal of a listing, reporting whether it answered
-    /// the request this listing awaited.
+    /// the request for the Origin on show.
     pub(super) fn fail(&mut self, request: &SessionListRequest, error: String) -> bool {
         if !self.awaits(request) {
             return false;
         }
-        self.loading = false;
-        self.error = Some(error);
-        self.pending_request = None;
-        true
+        let origin = self
+            .origins
+            .get_mut(request.outlook())
+            .expect("an awaited request has an Origin listing");
+        origin.loading = false;
+        origin.error = Some(error);
+        origin.pending_request = None;
+        request.outlook() == &self.outlook
     }
 
-    /// Drops everything this listing holds and everything it awaits, so a
-    /// surface closing over it leaves no reply to land behind its back.
+    /// Drops every Origin's rows, result, and pending request, so a surface
+    /// closing over it leaves no reply to land behind its back. Request
+    /// sequences survive: reopening must never make a pre-close request valid
+    /// again.
     pub(super) fn clear(&mut self) {
-        self.sessions.clear();
-        self.loading = false;
-        self.error = None;
-        self.pending_request = None;
+        for origin in self.origins.values_mut() {
+            origin.sessions.clear();
+            origin.loading = false;
+            origin.error = None;
+            origin.pending_request = None;
+        }
     }
 
     /// Takes a Session's newly derived Title and Emoji into a listing already
@@ -215,28 +274,35 @@ impl SessionListing {
     /// one Session in place. A Session Suru could not read carries no summary
     /// to revise, so it is passed over rather than reported missing.
     fn readable_mut(&mut self, session_id: SessionId) -> Option<&mut SessionSummary> {
-        self.sessions.iter_mut().find_map(|session| match session {
-            SessionListItem::Readable(summary) if summary.session.id == session_id => {
-                Some(summary.as_mut())
-            }
-            _ => None,
-        })
+        self.current_origin_mut()
+            .sessions
+            .iter_mut()
+            .find_map(|session| match &mut session.item {
+                SessionListItem::Readable(summary) if summary.session.id == session_id => {
+                    Some(summary.as_mut())
+                }
+                _ => None,
+            })
     }
 
     /// Drops a Session the server reports deleted.
     pub(super) fn remove(&mut self, session_id: SessionId) {
-        self.sessions.retain(|summary| summary.id() != session_id);
+        self.current_origin_mut()
+            .sessions
+            .retain(|summary| summary.id() != session_id);
     }
 
     /// Keeps only the Sessions a catalog reconciliation names, which is how a
     /// listing catches up on deletions it missed while disconnected.
     pub(super) fn retain(&mut self, session_ids: &[SessionId]) {
-        self.sessions
+        self.current_origin_mut()
+            .sessions
             .retain(|summary| session_ids.contains(&summary.id()));
     }
 
-    pub(super) fn sessions(&self) -> &[SessionListItem] {
-        &self.sessions
+    pub(super) fn sessions(&self) -> &[ListedSession] {
+        self.current_origin()
+            .map_or(&[], |origin| origin.sessions.as_slice())
     }
 
     /// The Workspaces this listing puts on offer: every one its Sessions are
@@ -256,7 +322,7 @@ impl SessionListing {
     /// own to date it, comes last where the listing does not already name it.
     pub(super) fn workspaces(&self) -> Vec<PathBuf> {
         let mut workspaces = Vec::new();
-        for session in &self.sessions {
+        for session in self.sessions() {
             let Some(workspace) = session.workspace() else {
                 continue;
             };
@@ -270,10 +336,13 @@ impl SessionListing {
         workspaces
     }
 
-    pub(super) fn contains(&self, session_id: SessionId) -> bool {
-        self.sessions
-            .iter()
-            .any(|summary| summary.id() == session_id)
+    pub(super) fn contains(&self, reference: &SessionReference) -> bool {
+        self.origins.get(&reference.origin).is_some_and(|origin| {
+            origin
+                .sessions
+                .iter()
+                .any(|summary| summary.reference() == reference)
+        })
     }
 
     pub(super) fn scope(&self) -> &SessionListScope {
@@ -299,38 +368,47 @@ impl SessionListing {
         self.current_workspace = workspace;
     }
 
-    /// Turns this listing toward another Server. Rows and in-flight replies
-    /// belong to the old Outlook and cannot cross into the new one.
+    /// Turns this listing toward another Origin. Its rows and request state
+    /// become the ones the surface reads; every other Origin's state remains
+    /// held separately and no reply can cross between them.
     pub(super) fn adopt_outlook(&mut self, outlook: Outlook) {
-        if self.outlook == outlook {
-            return;
-        }
         self.outlook = outlook;
-        self.clear();
     }
 
-    pub(super) const fn is_loading(&self) -> bool {
-        self.loading
+    pub(super) fn is_loading(&self) -> bool {
+        self.current_origin().is_some_and(|origin| origin.loading)
     }
 
     pub(super) fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+        self.current_origin()
+            .and_then(|origin| origin.error.as_deref())
     }
 
     /// Reports a failure that did not come from a listing request — an
     /// attachment the server refused, say — beside the Sessions on show.
     pub(super) fn report_error(&mut self, error: String) {
-        self.error = Some(error);
+        self.current_origin_mut().error = Some(error);
     }
 
     pub(super) fn clear_error(&mut self) {
-        self.error = None;
+        self.current_origin_mut().error = None;
     }
 
     /// Whether this listing is still waiting for the reply to `request`. Any
     /// other reply is a straggler from a listing the reader has moved past.
     pub(super) fn awaits(&self, request: &SessionListRequest) -> bool {
-        self.pending_request.as_ref() == Some(request)
+        self.origins
+            .get(request.outlook())
+            .and_then(|origin| origin.pending_request.as_ref())
+            == Some(request)
+    }
+
+    fn current_origin(&self) -> Option<&OriginListing> {
+        self.origins.get(&self.outlook)
+    }
+
+    fn current_origin_mut(&mut self) -> &mut OriginListing {
+        self.origins.entry(self.outlook.clone()).or_default()
     }
 }
 
@@ -340,8 +418,8 @@ mod tests {
 
     use crate::{
         protocol::{
-            ModelAvailability, Session, SessionId, SessionListItem, SessionStatus, SessionSummary,
-            SessionTimestamp, UnreadableSessionSummary, Workspace,
+            ModelAvailability, Outlook, Session, SessionId, SessionListItem, SessionReference,
+            SessionStatus, SessionSummary, SessionTimestamp, UnreadableSessionSummary, Workspace,
         },
         tui::{SessionListScope, SessionListSurface, session_listing::SessionListing},
     };
@@ -364,6 +442,36 @@ mod tests {
         assert!(listing.load(&current, vec![summary("Fresh", 3)]));
         assert_eq!(titles(&listing), vec!["Fresh"]);
         assert!(!listing.is_loading(), "the reply ended the wait");
+    }
+
+    #[test]
+    fn each_origin_keeps_its_own_rows_and_reply_sequence() {
+        let workspace = tempfile::tempdir().expect("create Workspace");
+        let mut listing = SessionListing::new(
+            SessionListSurface::SessionPicker,
+            workspace.path().to_owned(),
+        );
+        let local = listing.refresh();
+        let studio = crate::protocol::Outlook::Remote("studio".to_owned());
+        listing.adopt_outlook(studio.clone());
+        let remote = listing.refresh();
+
+        assert!(listing.load(&remote, vec![summary("Remote", 2)]));
+        assert_eq!(titles(&listing), vec!["Remote"]);
+        assert_eq!(listing.sessions()[0].reference().origin, studio);
+
+        assert!(
+            !listing.load(&local, vec![summary("Local", 1)]),
+            "a valid reply for another Origin does not move the Origin on show"
+        );
+        assert_eq!(titles(&listing), vec!["Remote"]);
+
+        listing.adopt_outlook(crate::protocol::Outlook::Local);
+        assert_eq!(titles(&listing), vec!["Local"]);
+        assert_eq!(
+            listing.sessions()[0].reference().origin,
+            crate::protocol::Outlook::Local
+        );
     }
 
     #[test]
@@ -519,7 +627,7 @@ mod tests {
         listing.remove(deleted);
 
         assert_eq!(titles(&listing), vec!["Kept"]);
-        assert!(!listing.contains(deleted));
+        assert!(!listing.contains(&SessionReference::new(Outlook::Local, deleted)));
     }
 
     #[test]
@@ -555,10 +663,32 @@ mod tests {
         assert!(listing.sessions().is_empty());
         assert!(listing.error().is_none());
         assert!(!listing.is_loading());
+        let reopened = listing.refresh();
         assert!(
             !listing.load(&in_flight, vec![summary("Late", 1)]),
-            "a reply to a listing nobody is waiting for lands nowhere"
+            "a pre-close reply cannot collide with the request made after reopening"
         );
+        assert!(listing.load(&reopened, vec![summary("Reopened", 2)]));
+        assert_eq!(titles(&listing), vec!["Reopened"]);
+    }
+
+    #[test]
+    fn reopening_does_not_reuse_the_request_sequence_from_before_clear() {
+        let workspace = tempfile::tempdir().expect("create Workspace");
+        let mut listing = SessionListing::new(
+            SessionListSurface::SessionPicker,
+            workspace.path().to_owned(),
+        );
+        let before_close = listing.refresh();
+
+        listing.clear();
+        let after_reopen = listing.refresh();
+
+        assert!(
+            !listing.load(&before_close, vec![summary("Late", 1)]),
+            "the old request ID is not valid again after reopening"
+        );
+        assert!(listing.load(&after_reopen, vec![summary("Current", 2)]));
     }
 
     #[test]
@@ -660,7 +790,7 @@ mod tests {
         listing
             .sessions()
             .iter()
-            .map(SessionListItem::title)
+            .map(|session| session.title())
             .collect()
     }
 

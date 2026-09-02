@@ -15,7 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     managed_client::SessionProjection,
     protocol::{
-        ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth, SessionId,
+        ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth, SessionReference,
         SessionSnapshot, SessionStatus, SessionTimestamp,
     },
     theme::Theme,
@@ -556,7 +556,7 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     if state.session_picker.is_loading() && lines.len() < usize::from(content_height) {
         lines.push(Line::styled("Loading Sessions…", theme.text.subdued));
     } else {
-        let current = state.session.as_ref().map(SessionProjection::session_id);
+        let current = state.open_session_reference();
         let footer_rows = usize::from(shows_search_and_footer);
         let row_capacity = usize::from(content_height).saturating_sub(lines.len() + footer_rows);
         let now = SessionTimestamp::now().0;
@@ -1659,7 +1659,7 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     frame.render_widget(block, column);
     let (lines, rows) = sidebar_lines(state, content, theme);
     frame.render_widget(Paragraph::new(lines), content);
-    if let Some(open) = state.open_session() {
+    if let Some(open) = state.open_session_reference() {
         paint_open_rail(frame, &rows, open, inside.x, theme);
     }
     // The columns inside the rule rather than the content's own, so the
@@ -1686,13 +1686,13 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
 fn paint_open_rail(
     frame: &mut Frame<'_>,
     spans: &[SidebarSpan],
-    open: SessionId,
+    open: &SessionReference,
     column: u16,
     theme: &Theme,
 ) {
     let Some(span) = spans
         .iter()
-        .find(|span| span.target == SidebarTarget::Session(open))
+        .find(|span| span.target == SidebarTarget::Session(open.clone()))
     else {
         return;
     };
@@ -1839,7 +1839,7 @@ fn sidebar_lines(
     let capacity = usize::from(content.height).saturating_sub(lines.len());
     let entries = state
         .sidebar
-        .visible_entries(capacity, state.open_session());
+        .visible_entries(capacity, state.open_session_reference());
     if entries.is_empty() {
         lines.extend(
             sidebar_empty_reading(&state.sidebar)

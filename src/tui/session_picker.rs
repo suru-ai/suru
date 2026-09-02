@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use crate::protocol::{
-    EffectiveSettings, EmojiVisibility, Outlook, SessionId, SessionListItem, SessionStatus,
-    SessionTimestamp,
+    EffectiveSettings, EmojiVisibility, Outlook, SessionId, SessionListItem, SessionReference,
+    SessionStatus, SessionTimestamp,
 };
 
 use super::{
@@ -23,10 +23,10 @@ pub(super) struct SessionPicker {
     /// governs every frame from the moment the Setting lands.
     emoji: EmojiVisibility,
     query: String,
-    selected: Option<SessionId>,
-    attaching: Option<SessionId>,
-    confirming_delete: Option<SessionId>,
-    deleting: Option<SessionId>,
+    selected: Option<SessionReference>,
+    attaching: Option<SessionReference>,
+    confirming_delete: Option<SessionReference>,
+    deleting: Option<SessionReference>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -116,7 +116,7 @@ impl SessionPicker {
         &mut self,
         request: &SessionListRequest,
         sessions: Vec<SessionListItem>,
-        current: Option<SessionId>,
+        current: Option<&SessionReference>,
     ) {
         if !self.listing.load(request, sessions) {
             return;
@@ -124,8 +124,9 @@ impl SessionPicker {
         self.attaching = None;
         self.confirming_delete = None;
         self.selected = current
-            .filter(|current| self.visible_ids().contains(current))
-            .or_else(|| self.visible_ids().first().copied());
+            .filter(|current| self.visible_references().contains(current))
+            .cloned()
+            .or_else(|| self.visible_references().first().cloned());
     }
 
     pub(super) fn retitle(&mut self, session_id: SessionId, title: String, emoji: Option<String>) {
@@ -205,15 +206,15 @@ impl SessionPicker {
         self.move_selection(10);
     }
 
-    pub(super) fn begin_attachment(&mut self) -> Option<SessionId> {
+    pub(super) fn begin_attachment(&mut self) -> Option<SessionReference> {
         self.confirming_delete = None;
-        let selected = self.selected?;
+        let selected = self.selected.clone()?;
         self.listing
             .sessions()
             .iter()
-            .find(|summary| summary.id() == selected)?
+            .find(|summary| summary.reference() == &selected)?
             .readable()?;
-        self.attaching = Some(selected);
+        self.attaching = Some(selected.clone());
         self.listing.clear_error();
         Some(selected)
     }
@@ -230,18 +231,18 @@ impl SessionPicker {
         self.is_attaching() || self.is_deleting()
     }
 
-    pub(super) fn begin_deletion(&mut self) -> Option<SessionId> {
+    pub(super) fn begin_deletion(&mut self) -> Option<SessionReference> {
         if self.deleting.is_some() {
             return None;
         }
-        let selected = self.selected?;
-        if self.confirming_delete != Some(selected) {
-            self.confirming_delete = Some(selected);
+        let selected = self.selected.clone()?;
+        if self.confirming_delete.as_ref() != Some(&selected) {
+            self.confirming_delete = Some(selected.clone());
             self.listing.clear_error();
             return None;
         }
         self.confirming_delete = None;
-        self.deleting = Some(selected);
+        self.deleting = Some(selected.clone());
         Some(selected)
     }
 
@@ -255,19 +256,22 @@ impl SessionPicker {
         self.forget_absent();
     }
 
-    pub(super) fn fail_deletion(&mut self, session_id: SessionId, error: String) {
-        if self.deleting != Some(session_id) {
+    pub(super) fn fail_deletion(&mut self, reference: &SessionReference, error: String) {
+        if self.deleting.as_ref() != Some(reference) {
             return;
         }
         self.deleting = None;
         self.listing.report_error(error);
     }
 
-    pub(super) fn attaching_to(&self, session_id: SessionId) -> bool {
-        self.attaching == Some(session_id)
+    pub(super) fn attaching_to(&self, reference: &SessionReference) -> bool {
+        self.attaching.as_ref() == Some(reference)
     }
 
-    fn rows(&self, current: Option<SessionId>) -> impl Iterator<Item = SessionPickerRow<'_>> {
+    fn rows(
+        &self,
+        current: Option<&SessionReference>,
+    ) -> impl Iterator<Item = SessionPickerRow<'_>> {
         let all_workspaces = matches!(self.listing.scope(), SessionListScope::AllWorkspaces);
         self.listing
             .sessions()
@@ -278,8 +282,8 @@ impl SessionPicker {
                 SessionPickerRow {
                     title: summary.title(),
                     emoji: self.emoji.drawn_emoji(summary.emoji()),
-                    selected: self.selected == Some(summary.id()),
-                    current: readable.is_some() && current == Some(summary.id()),
+                    selected: self.selected.as_ref() == Some(summary.reference()),
+                    current: readable.is_some() && current == Some(summary.reference()),
                     active: readable
                         .is_some_and(|summary| summary.session.status == SessionStatus::Active),
                     unreadable: readable.is_none(),
@@ -291,7 +295,7 @@ impl SessionPicker {
                                 .map(|workspace| workspace.path.as_path())
                         })
                         .flatten(),
-                    confirming_delete: self.confirming_delete == Some(summary.id()),
+                    confirming_delete: self.confirming_delete.as_ref() == Some(summary.reference()),
                 }
             })
     }
@@ -299,7 +303,7 @@ impl SessionPicker {
     pub(super) fn visible_rows(
         &self,
         capacity: usize,
-        current: Option<SessionId>,
+        current: Option<&SessionReference>,
     ) -> impl Iterator<Item = SessionPickerRow<'_>> {
         let rows = self.rows(current).collect::<Vec<_>>();
         let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
@@ -308,31 +312,32 @@ impl SessionPicker {
     }
 
     fn select_first_visible(&mut self) {
-        self.selected = self.visible_ids().first().copied();
+        self.selected = self.visible_references().first().cloned();
     }
 
     fn move_selection(&mut self, distance: isize) {
         self.confirming_delete = None;
-        let visible = self.visible_ids();
+        let visible = self.visible_references();
         if visible.is_empty() {
             self.selected = None;
             return;
         }
         let current = self
             .selected
-            .and_then(|selected| visible.iter().position(|id| *id == selected))
+            .as_ref()
+            .and_then(|selected| visible.iter().position(|reference| reference == selected))
             .unwrap_or(0);
         let len = visible.len() as isize;
         let next = (current as isize + distance).rem_euclid(len) as usize;
-        self.selected = Some(visible[next]);
+        self.selected = Some(visible[next].clone());
     }
 
-    fn visible_ids(&self) -> Vec<SessionId> {
+    fn visible_references(&self) -> Vec<SessionReference> {
         self.listing
             .sessions()
             .iter()
             .filter(|summary| fuzzy_matches(&self.query, summary.title()))
-            .map(SessionListItem::id)
+            .map(|summary| summary.reference().clone())
             .collect()
     }
 
@@ -353,17 +358,21 @@ impl SessionPicker {
     /// Drops what the picker was pointing at once the Sessions behind it have
     /// left the listing, so no row is confirmed, attached, or deleted twice.
     fn forget_absent(&mut self) {
-        for session_id in [
+        for reference in [
             &mut self.confirming_delete,
             &mut self.attaching,
             &mut self.deleting,
         ] {
-            if session_id.is_some_and(|session_id| !self.listing.contains(session_id)) {
-                *session_id = None;
+            if reference
+                .as_ref()
+                .is_some_and(|reference| !self.listing.contains(reference))
+            {
+                *reference = None;
             }
         }
         if self
             .selected
+            .as_ref()
             .is_some_and(|selected| !self.listing.contains(selected))
         {
             self.select_first_visible();

@@ -82,7 +82,7 @@ impl WorkspacePicker {
         self.open
     }
 
-    pub(super) const fn is_loading(&self) -> bool {
+    pub(super) fn is_loading(&self) -> bool {
         self.listing.is_loading()
     }
 

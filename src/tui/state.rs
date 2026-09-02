@@ -1614,6 +1614,10 @@ impl TuiState {
         self.route.as_ref().map(|route| route.session_id)
     }
 
+    pub(super) fn open_session_reference(&self) -> Option<&SessionReference> {
+        self.route.as_ref()
+    }
+
     /// Whether activating the open Sidebar row means retry rather than merely
     /// handing the keys back. Only a failed optimistic shell has that meaning:
     /// an attachment still in flight must not be duplicated, and a hydrated
@@ -2012,7 +2016,7 @@ pub enum ApplicationEvent {
         error: String,
     },
     SessionDeletionFailed {
-        session_id: SessionId,
+        reference: SessionReference,
         error: String,
     },
     SessionCreated(SessionSnapshot),
@@ -2297,7 +2301,11 @@ impl Application {
                 self.state.apply_created_session(snapshot)?;
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::SessionAttached(snapshot) => self.attach_session(snapshot),
+            ApplicationEvent::SessionAttached(snapshot) => {
+                let reference =
+                    SessionReference::new(self.state.outlook.clone(), snapshot.session.id);
+                self.attach_session(reference, snapshot)
+            }
             ApplicationEvent::OriginSessionAttached {
                 reference,
                 snapshot,
@@ -2307,7 +2315,7 @@ impl Application {
                 {
                     return Ok(ApplicationTransition::Continue);
                 }
-                self.attach_session(snapshot)
+                self.attach_session(reference, snapshot)
             }
             ApplicationEvent::SessionAttachmentFailed(error) => {
                 if self.state.sidebar.is_attaching() {
@@ -2330,11 +2338,11 @@ impl Application {
                     Ok(ApplicationTransition::ListSessions(request))
                 }
             }
-            ApplicationEvent::SessionDeletionFailed { session_id, error } => {
+            ApplicationEvent::SessionDeletionFailed { reference, error } => {
                 // Whichever surface asked is the one that answers, so the
                 // refusal is drawn where the reader was looking.
-                if !self.state.sidebar.fail_deletion(session_id, error.clone()) {
-                    self.state.session_picker.fail_deletion(session_id, error);
+                if !self.state.sidebar.fail_deletion(&reference, error.clone()) {
+                    self.state.session_picker.fail_deletion(&reference, error);
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -2509,15 +2517,17 @@ impl Application {
             ApplicationEvent::SessionsListed { request, sessions } => {
                 match request.surface() {
                     SessionListSurface::SessionPicker => {
-                        let current = self.session_id();
-                        self.state.session_picker.load(&request, sessions, current);
+                        let current = self.state.route.clone();
+                        self.state
+                            .session_picker
+                            .load(&request, sessions, current.as_ref());
                     }
                     SessionListSurface::WorkspacePicker => {
                         self.state.workspace_picker.load(&request, sessions);
                     }
                     SessionListSurface::Sidebar => {
-                        let open = self.session_id();
-                        self.state.sidebar.load(&request, sessions, open);
+                        let open = self.state.route.clone();
+                        self.state.sidebar.load(&request, sessions, open.as_ref());
                     }
                 }
                 Ok(ApplicationTransition::Continue)
@@ -2999,12 +3009,7 @@ impl Application {
             CommandId::SelectSession => {
                 return self.state.session_picker.begin_attachment().map_or(
                     ApplicationTransition::Continue,
-                    |session_id| {
-                        ApplicationTransition::AttachSession(SessionReference::new(
-                            self.state.outlook.clone(),
-                            session_id,
-                        ))
-                    },
+                    ApplicationTransition::AttachSession,
                 );
             }
             CommandId::CloseSessionPicker => self.edit_session_picker(SessionPicker::close),
@@ -3062,15 +3067,14 @@ impl Application {
                 }
             }
             SemanticCommandId::SidebarAttach => {
-                let open = self.session_id();
+                let open = self.state.route.clone();
                 let retry_open = self.state.open_session_can_retry();
-                return match self.state.sidebar.activate(open, retry_open) {
+                return match self.state.sidebar.activate(open.as_ref(), retry_open) {
                     SidebarActivation::Answered => ApplicationTransition::Continue,
                     // Enter and a press both arrive here, so both open the
                     // Session the same way: the route moves now and the
                     // attachment follows it.
-                    SidebarActivation::Attach(session_id) => {
-                        let target = SessionReference::new(self.state.outlook.clone(), session_id);
+                    SidebarActivation::Attach(target) => {
                         self.state.open_session_route(target.clone());
                         ApplicationTransition::AttachSession(target)
                     }
@@ -3423,9 +3427,13 @@ impl Application {
         }
     }
 
-    fn attach_session(&mut self, snapshot: SessionSnapshot) -> Result<ApplicationTransition> {
-        let closes_picker = self.state.session_picker.attaching_to(snapshot.session.id);
-        let answers_sidebar = self.state.sidebar.attaching_to(snapshot.session.id);
+    fn attach_session(
+        &mut self,
+        reference: SessionReference,
+        snapshot: SessionSnapshot,
+    ) -> Result<ApplicationTransition> {
+        let closes_picker = self.state.session_picker.attaching_to(&reference);
+        let answers_sidebar = self.state.sidebar.attaching_to(&reference);
         self.state.apply_attached_session(snapshot)?;
         if closes_picker {
             self.state.session_picker.close();
@@ -3835,7 +3843,8 @@ impl Application {
                 let cancelled = self
                     .state
                     .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
-                self.state.sidebar.toggle(self.session_id());
+                let open = self.state.route.clone();
+                self.state.sidebar.toggle(open.as_ref());
                 self.state.command_mode = CommandMode::Composer;
                 if cancelled {
                     return Ok(ApplicationTransition::CancelWorkspaceResolution(
@@ -3853,17 +3862,12 @@ impl Application {
             // picker is on, which asks there.
             SemanticCommandId::SessionDelete => {
                 if let SemanticSubject::Session(session) = invocation.subject {
-                    self.state.sidebar.begin_deletion(session.session_id);
+                    self.state.sidebar.begin_deletion(session.clone());
                     return Ok(ApplicationTransition::DeleteSession(session));
                 }
                 Ok(self.state.session_picker.begin_deletion().map_or(
                     ApplicationTransition::Continue,
-                    |session_id| {
-                        ApplicationTransition::DeleteSession(SessionReference::new(
-                            self.state.outlook.clone(),
-                            session_id,
-                        ))
-                    },
+                    ApplicationTransition::DeleteSession,
                 ))
             }
             SemanticCommandId::SessionNew => Ok(self.open_landing()),
