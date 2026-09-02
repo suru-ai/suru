@@ -1842,14 +1842,16 @@ fn project_turn_start_failure(
     });
 }
 
+/// The Skill delivery of a Prompt that begins a Turn of its own.
+///
+/// Only started Prompts come here; a Prompt admitted as a steer on an idle
+/// Session still starts its own Turn, so its requested delivery does not make
+/// it a steer.
 fn skill_prompt_delivery(prompt: &Prompt) -> SkillPromptDelivery {
     if prompt.admission_order == PromptOrder::INITIAL {
         SkillPromptDelivery::Initial
     } else {
-        match prompt.delivery {
-            PromptDelivery::Queue => SkillPromptDelivery::Queue,
-            PromptDelivery::Steer => SkillPromptDelivery::Steer,
-        }
+        SkillPromptDelivery::Queue
     }
 }
 

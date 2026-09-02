@@ -1349,7 +1349,9 @@ async fn admit_prompt(
             .as_ref()
             .map(|selection| selection.provider.clone())
             .or_else(|| state.hosted_providers.first().cloned());
-        let delivery = match request.delivery {
+        // The client's Enter always asks to steer, but an idle Session starts
+        // the Prompt as a Turn of its own; judge the delivery it will get.
+        let delivery = match crate::sessions::effective_delivery(&snapshot, request.delivery) {
             crate::protocol::PromptDelivery::Queue => SkillPromptDelivery::Queue,
             crate::protocol::PromptDelivery::Steer => SkillPromptDelivery::Steer,
         };

@@ -1333,3 +1333,146 @@ async fn disabled_providers_are_not_discovered_and_native_discovery_errors_are_r
 
     server.shutdown().await.expect("shut down server");
 }
+
+#[tokio::test]
+async fn steer_skill_prompt_on_idle_session_starts_as_a_queued_delivery() {
+    for provider_name in ["codex", "copilot", "claude"] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let workspace = tempfile::tempdir().expect("create Workspace");
+        let canonical_workspace =
+            std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+        let provider_id = ProviderId::new(provider_name);
+        let model_id = format!("{provider_name}-model");
+        let (runtime, mut provider) = ControlledProvider::with_provider(
+            provider_id.clone(),
+            vec![hosted_model(provider_name, &model_id)],
+        );
+        let skill = SkillDescriptor {
+            id: SkillId::new(format!("{provider_name}-idle-review")),
+            name: "review".to_owned(),
+            description: "Review the current change".to_owned(),
+            scope: Some("Workspace".to_owned()),
+        };
+        // The Provider steers no Skills: only a queued delivery is offered.
+        runtime.offer_skills(SkillCatalog {
+            provider: provider_id.clone(),
+            workspace: Workspace {
+                path: canonical_workspace.clone(),
+            },
+            skills: vec![skill.clone()],
+            capabilities: SkillCatalogCapabilities {
+                max_distinct_invocations: Some(1),
+                supported_deliveries: vec![SkillPromptDelivery::Queue],
+            },
+            status: SkillCatalogStatus::Fresh { warning: None },
+        });
+        let channel = format!("{provider_name}-idle-steer-skill");
+        let server = server::spawn_with_provider(
+            ServerConfig::new(state_dir.path(), &channel).expect("configure server"),
+            Arc::new((*runtime).clone()),
+        )
+        .await
+        .expect("spawn server");
+        let mut client = ManagedClient::connect(
+            ManagedClientConfig::new(state_dir.path(), &channel).expect("configure client"),
+        )
+        .await
+        .expect("connect client");
+        crate::support::receive_managed_client_initial_state(&mut client).await;
+        let loading = client
+            .list_skills(SkillCatalogRequest {
+                provider: provider_id.clone(),
+                workspace: Workspace {
+                    path: workspace.path().to_owned(),
+                },
+            })
+            .await
+            .expect("prefetch Skill Catalog");
+        assert!(matches!(loading.status, SkillCatalogStatus::Loading));
+        assert_eq!(
+            next_fresh_catalog(&mut client).await.skills.as_slice(),
+            std::slice::from_ref(&skill)
+        );
+
+        let created = client
+            .create_session(CreateSessionRequest {
+                agent_selection: Some(hosted_selection(provider_name, &model_id)),
+                workspace: Workspace {
+                    path: workspace.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Finish this Turn".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+            })
+            .await
+            .expect("create Session");
+        let start = provider.next_start().await;
+        let mut provider_session = start.succeed(AgentIdentity {
+            agent: AgentId::new(format!("{provider_name}-agent")),
+            selection: hosted_selection(provider_name, &model_id),
+        });
+        provider_session.next_turn().await.succeed();
+        provider_session.emit(suru::provider::ProviderEvent::TurnCompleted);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = client
+                    .read_session(created.session.id)
+                    .await
+                    .expect("read Session while its Turn settles");
+                if snapshot.session.status == SessionStatus::Idle {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{provider_name} Session becomes idle"));
+
+        // Enter submits with a Steer delivery whether or not a Turn runs. With
+        // no Turn to join, the Prompt starts one of its own, so a Provider that
+        // steers no Skills must still accept it.
+        let invocation = SkillInvocation {
+            skill_id: skill.id.clone(),
+            name: skill.name.clone(),
+            scope: skill.scope.clone(),
+            marker: SkillMarkerSpan { start: 6, end: 13 },
+        };
+        let admitted = client
+            .admit_prompt(
+                created.session.id,
+                AdmitPromptRequest {
+                    prompt: InitialPrompt {
+                        id: PromptId::new(),
+                        text: "Start $review now".to_owned(),
+                        skill_invocations: vec![invocation.clone()],
+                    },
+                    delivery: PromptDelivery::Steer,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{provider_name} admits a Skill steer on an idle Session: {error:?}")
+            });
+        assert_eq!(admitted.status, PromptStatus::Pending);
+
+        let turn = timeout(Duration::from_secs(1), provider_session.next_turn())
+            .await
+            .unwrap_or_else(|_| panic!("{provider_name} starts a Turn for the Skill Prompt"));
+        assert_eq!(turn.prompt(), "Start $review now");
+        assert_eq!(turn.skill_invocations().len(), 1);
+        turn.succeed();
+        assert!(
+            timeout(Duration::from_millis(20), provider_session.next_steer())
+                .await
+                .is_err(),
+            "{provider_name} receives no native steer call"
+        );
+
+        provider_session.emit(suru::provider::ProviderEvent::TurnCompleted);
+        drop(provider_session);
+        drop(client);
+        server.shutdown().await.expect("shut down server");
+    }
+}

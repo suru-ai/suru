@@ -37,7 +37,7 @@ pub(crate) use output::{
 };
 pub(crate) use prompts::{
     AdmitPromptError, CreateSessionError, DeliveredTurn, DeliveredTurnStatus,
-    PromptAdmissionDisposition, PromptMutationError, earliest_pending_prompt,
+    PromptAdmissionDisposition, PromptMutationError, earliest_pending_prompt, effective_delivery,
 };
 pub(crate) use selection::AgentSelectionMutationError;
 pub(crate) use settled::SettleSessionError;

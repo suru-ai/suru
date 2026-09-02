@@ -102,6 +102,38 @@ pub(super) enum PromptOrigin {
     Admission(PromptDelivery),
 }
 
+/// The delivery a Prompt admitted right now would actually receive.
+///
+/// A Steer joins the active Turn, but a Session running no Turn has nothing
+/// to join, and a Continuation is settled by the next delivered Prompt rather
+/// than steered. In both cases the Prompt begins a Turn of its own, which is a
+/// queued delivery whatever the client asked for. Skill validation must judge
+/// that effective delivery: a Provider that steers no Skills still starts
+/// them.
+pub(crate) fn effective_delivery(
+    snapshot: &SessionSnapshot,
+    requested: PromptDelivery,
+) -> PromptDelivery {
+    if requested == PromptDelivery::Steer && steerable_turn(snapshot).is_some() {
+        PromptDelivery::Steer
+    } else {
+        PromptDelivery::Queue
+    }
+}
+
+/// The active Turn a steer would join, if the Session is running one.
+///
+/// A Continuation is settled by the next delivered Prompt rather than
+/// steered, so it is never the answer.
+fn steerable_turn(snapshot: &SessionSnapshot) -> Option<TurnId> {
+    let turn_id = active_turn_id(snapshot).ok().flatten()?;
+    snapshot
+        .turns
+        .iter()
+        .find(|turn| turn.id == turn_id && !turn.is_continuation())
+        .map(|turn| turn.id)
+}
+
 impl SessionStore {
     pub(crate) fn create(
         &self,
@@ -302,24 +334,14 @@ impl SessionStore {
         );
         let active_turn = active_turn_id(&record.snapshot)
             .expect("stored Sessions preserve the one-active-Turn invariant");
-        // A Continuation is settled by the next delivered Prompt rather than
-        // steered, so a Prompt admitted while one runs begins a Turn of its
-        // own instead of joining it.
-        let active_continuation = active_turn.is_some_and(|turn_id| {
-            record
-                .snapshot
-                .turns
-                .iter()
-                .any(|turn| turn.id == turn_id && turn.is_continuation())
-        });
         let (disposition, steer_target) = match (active_turn, request.delivery) {
             (None, _) => (PromptAdmissionDisposition::StartImmediately, None),
-            (Some(_), PromptDelivery::Steer) if active_continuation => {
-                (PromptAdmissionDisposition::StartImmediately, None)
-            }
-            (Some(turn_id), PromptDelivery::Steer) => {
-                (PromptAdmissionDisposition::SteerActive, Some(turn_id))
-            }
+            // A steer with no steerable Turn to join begins a Turn of its own
+            // rather than waiting behind the Continuation that is running.
+            (Some(_), PromptDelivery::Steer) => match steerable_turn(&record.snapshot) {
+                Some(turn_id) => (PromptAdmissionDisposition::SteerActive, Some(turn_id)),
+                None => (PromptAdmissionDisposition::StartImmediately, None),
+            },
             (Some(_), PromptDelivery::Queue) => (PromptAdmissionDisposition::RemainPending, None),
         };
         let prompt = Prompt {
