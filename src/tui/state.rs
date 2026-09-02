@@ -2039,6 +2039,17 @@ pub enum ApplicationEvent {
     PeerRemoved(String),
     RemotesListed(Vec<crate::protocol::Remote>),
     RemoteListingFailed(String),
+    /// The paired-Remote list requested specifically for an Everywhere
+    /// Sidebar listing. It is distinct from the Connect overlay's listing,
+    /// which also probes the Remotes it presents.
+    EverywhereRemotesListed {
+        request_id: u64,
+        remotes: Vec<crate::protocol::Remote>,
+    },
+    EverywhereRemoteListingFailed {
+        request_id: u64,
+        error: String,
+    },
     InvitePreviewed {
         invite: String,
         preview: crate::protocol::InvitePreview,
@@ -2187,6 +2198,9 @@ pub enum ApplicationTransition {
     SubscribeSession(SessionReference),
     AttachSession(SessionReference),
     ListSessions(SessionListRequest),
+    /// Independent listing requests for every Origin participating in an
+    /// Everywhere scope.
+    ListSessionOrigins(Vec<SessionListRequest>),
     ListModels(ModelListRequest),
     RefreshSkills(SkillCatalogRequest),
     ConfirmLandingAgentSelection(AgentSelection),
@@ -2207,6 +2221,9 @@ pub enum ApplicationTransition {
     CopyToClipboard(String),
     RemovePeer(String),
     BeginConnecting,
+    /// Ask the local Server for paired Remotes without opening or refreshing
+    /// the Connect overlay.
+    ListEverywhereRemotes(u64),
     PreviewInvite(String),
     RedeemInvite(crate::protocol::RedeemInviteRequest),
     /// Turn to one Server and name the Remote catalog streams the run loop
@@ -2418,6 +2435,26 @@ impl Application {
                 self.state.connect_overlay.fail_invite_entry(error);
                 Ok(ApplicationTransition::Continue)
             }
+            ApplicationEvent::EverywhereRemotesListed {
+                request_id,
+                remotes,
+            } => {
+                let requests = self
+                    .state
+                    .sidebar
+                    .load_everywhere_remotes(request_id, remotes);
+                Ok(
+                    requests.map_or(ApplicationTransition::Continue, |requests| {
+                        ApplicationTransition::ListSessionOrigins(requests)
+                    }),
+                )
+            }
+            ApplicationEvent::EverywhereRemoteListingFailed { request_id, error } => {
+                self.state
+                    .sidebar
+                    .fail_everywhere_remotes(request_id, error);
+                Ok(ApplicationTransition::Continue)
+            }
             ApplicationEvent::InvitePreviewed { invite, preview } => {
                 self.state.connect_overlay.show_preview(invite, preview);
                 Ok(ApplicationTransition::Continue)
@@ -2455,10 +2492,7 @@ impl Application {
                         match surface {
                             WorkspaceResolutionSurface::Outlook => {
                                 self.state.sidebar.refresh_after_outlook_workspace();
-                                Ok(self.state.sidebar.take_listing_request().map_or(
-                                    ApplicationTransition::Continue,
-                                    ApplicationTransition::ListSessions,
-                                ))
+                                Ok(self.take_sidebar_listing_transition())
                             }
                             WorkspaceResolutionSurface::WorkspacePicker => {
                                 self.state.workspace_picker.close();
@@ -3095,6 +3129,14 @@ impl Application {
                 let retry_open = self.state.open_session_can_retry();
                 return match self.state.sidebar.activate(open.as_ref(), retry_open) {
                     SidebarActivation::Answered => ApplicationTransition::Continue,
+                    SidebarActivation::ListEverywhereRemotes => {
+                        ApplicationTransition::ListEverywhereRemotes(
+                            self.state
+                                .sidebar
+                                .take_everywhere_remote_request()
+                                .expect("choosing Everywhere queues its Remote discovery"),
+                        )
+                    }
                     // Enter and a press both arrive here, so both open the
                     // Session the same way: the route moves now and the
                     // attachment follows it.
@@ -3392,10 +3434,7 @@ impl Application {
                 if had_session && self.state.session.is_none() {
                     Ok(ApplicationTransition::SessionEnded)
                 } else {
-                    Ok(self.state.sidebar.take_listing_request().map_or(
-                        ApplicationTransition::Continue,
-                        ApplicationTransition::ListSessions,
-                    ))
+                    Ok(self.take_sidebar_listing_transition())
                 }
             }
         }
@@ -3447,10 +3486,7 @@ impl Application {
         if had_session && self.state.session.is_none() {
             Ok(ApplicationTransition::SessionEnded)
         } else {
-            Ok(self.state.sidebar.take_listing_request().map_or(
-                ApplicationTransition::Continue,
-                ApplicationTransition::ListSessions,
-            ))
+            Ok(self.take_sidebar_listing_transition())
         }
     }
 
@@ -3885,10 +3921,7 @@ impl Application {
                         WorkspaceResolutionSurface::Sidebar,
                     ));
                 }
-                Ok(self.state.sidebar.take_listing_request().map_or(
-                    ApplicationTransition::Continue,
-                    ApplicationTransition::ListSessions,
-                ))
+                Ok(self.take_sidebar_listing_transition())
             }
             // A command naming a Session takes that one away: the surface
             // that named it has already had the reader say it twice, which is
@@ -4251,13 +4284,24 @@ impl Application {
         is_reader_interaction(event) && self.state.landing_notice.dismiss()
     }
 
-    /// The listing a surface has asked for and nobody has dispatched yet. One
-    /// managed event can both end the open Session and leave the Sidebar
-    /// asking to catch up — another client deleting that Session does exactly
-    /// that — and one transition cannot say both, so the caller drains what
-    /// the transition did not carry.
-    pub fn take_listing_request(&mut self) -> Option<SessionListRequest> {
-        self.state.sidebar.take_listing_request()
+    /// Drains whichever first step the Sidebar's current scope needs. An
+    /// ordinary scope already knows its one Origin; Everywhere must first ask
+    /// the local Server which paired Remotes participate.
+    pub fn take_sidebar_listing_transition(&mut self) -> ApplicationTransition {
+        if let Some(request_id) = self.state.sidebar.take_everywhere_remote_request() {
+            return ApplicationTransition::ListEverywhereRemotes(request_id);
+        }
+        match self.state.sidebar.take_listing_requests() {
+            requests if requests.is_empty() => ApplicationTransition::Continue,
+            mut requests if requests.len() == 1 => {
+                ApplicationTransition::ListSessions(requests.pop().expect("one request"))
+            }
+            requests => ApplicationTransition::ListSessionOrigins(requests),
+        }
+    }
+
+    pub(super) fn accepts_everywhere_remotes(&self, request_id: u64) -> bool {
+        self.state.sidebar.accepts_everywhere_remotes(request_id)
     }
 
     /// Whether a listing the server answered with would move anything on

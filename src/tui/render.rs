@@ -2141,12 +2141,7 @@ fn sidebar_active_row_lines(
     let label_style = highlight.unwrap_or(theme.text.subdued);
     [
         sidebar_slotted_line(&workspace, label_style, &slot, width, highlight, theme),
-        sidebar_plain_line(
-            &sidebar_title(row, width),
-            width,
-            None,
-            sidebar_title_style(row, highlight, theme),
-        ),
+        sidebar_title_line(row, width, highlight, theme),
         Line::styled(" ".repeat(width), highlight.unwrap_or_default()),
     ]
 }
@@ -2163,14 +2158,7 @@ fn sidebar_settled_row_line(
 ) -> Line<'static> {
     let highlight = sidebar_row_style(row, driving, theme);
     let slot = relative_update_time_compact(ended_at, now);
-    sidebar_slotted_line(
-        &sidebar_title(row, width.saturating_sub(slot.width() + 1)),
-        sidebar_title_style(row, highlight, theme),
-        &slot,
-        width,
-        highlight,
-        theme,
-    )
+    sidebar_slotted_title_line(row, &slot, width, highlight, theme)
 }
 
 /// What an active row's right slot reads. Working comes first, because live
@@ -2268,16 +2256,70 @@ const UNREADABLE_MARKER: &str = "[unreadable]";
 /// the marker saying so. The marker's columns are held back before the Title
 /// is cut, so however long the Title the reason the row cannot be opened stays
 /// on show. `width` is the columns the whole name has to spend.
-fn sidebar_title(row: SidebarRow<'_>, width: usize) -> String {
+fn sidebar_title_parts(row: SidebarRow<'_>, width: usize) -> (String, Vec<String>) {
     let title = match row.emoji {
         Some(emoji) => format!("{emoji} {}", row.title),
         None => row.title.to_owned(),
     };
-    if !row.unreadable {
-        return title;
+    let mut tags = row
+        .remote
+        .map(|remote| format!("[{remote}]"))
+        .into_iter()
+        .collect::<Vec<_>>();
+    if row.unreadable {
+        tags.push(UNREADABLE_MARKER.to_owned());
     }
-    let title = truncate_to_width(&title, width.saturating_sub(UNREADABLE_MARKER.width() + 1));
-    format!("{title} {UNREADABLE_MARKER}")
+    let tags_width = tags.iter().map(|tag| tag.width() + 1).sum::<usize>();
+    (
+        truncate_to_width(&title, width.saturating_sub(tags_width)),
+        tags,
+    )
+}
+
+/// A Session Title and its fixed tags. Tags spend their columns before the
+/// Title, so narrowing a frame can shorten the name but never erase the
+/// Origin or unreadable marker that explains the row.
+fn sidebar_title_line(
+    row: SidebarRow<'_>,
+    width: usize,
+    highlight: Option<Style>,
+    theme: &Theme,
+) -> Line<'static> {
+    let title_style = sidebar_title_style(row, highlight, theme);
+    let tag_style = highlight.unwrap_or_default().patch(theme.text.subdued);
+    let (title, tags) = sidebar_title_parts(row, width);
+    let used = title.width() + tags.iter().map(|tag| tag.width() + 1).sum::<usize>();
+    let mut spans = vec![Span::styled(title, title_style)];
+    spans.extend(
+        tags.into_iter()
+            .map(|tag| Span::styled(format!(" {tag}"), tag_style)),
+    );
+    spans.push(Span::styled(
+        " ".repeat(width.saturating_sub(used)),
+        highlight.unwrap_or_default(),
+    ));
+    Line::from(spans)
+}
+
+fn sidebar_slotted_title_line(
+    row: SidebarRow<'_>,
+    slot: &str,
+    width: usize,
+    highlight: Option<Style>,
+    theme: &Theme,
+) -> Line<'static> {
+    let label_width = width.saturating_sub(slot.width() + 1);
+    let mut line = sidebar_title_line(row, label_width, highlight, theme);
+    let label_width = line.width();
+    line.spans.push(Span::styled(
+        " ".repeat(width.saturating_sub(label_width + slot.width())),
+        highlight.unwrap_or_default(),
+    ));
+    line.spans.push(Span::styled(
+        slot.to_owned(),
+        highlight.unwrap_or(theme.text.subdued),
+    ));
+    line
 }
 
 /// How a Sidebar row is drawn, which is a reading of the two things a row can

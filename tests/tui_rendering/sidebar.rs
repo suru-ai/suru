@@ -24,8 +24,8 @@ use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
         AutoSettle, EffectiveSettings, EmojiVisibility, Message, MessageId, MessageRole,
-        MessageStatus, ModelAvailability, Outlook, PromptId, ServerShutdown, Session,
-        SessionCatalogRevision, SessionCatalogSnapshot, SessionChange, SessionCreated,
+        MessageStatus, ModelAvailability, Outlook, PromptId, Remote, RemoteStatus, ServerShutdown,
+        Session, SessionCatalogRevision, SessionCatalogSnapshot, SessionChange, SessionCreated,
         SessionDeleted, SessionId, SessionListItem, SessionReference, SessionRevision,
         SessionSettings, SessionSettlementChanged, SessionStatus, SessionSummary, SessionTimestamp,
         SessionTitleChanged, SessionUpdate, SessionWorkingChanged, ShutdownReason, SidebarScope,
@@ -3658,9 +3658,40 @@ fn a_right_press_inside_the_menu_leaves_it_where_it_is() {
     );
 }
 
-/// The words the selector's first entry stands for, which is the whole body of
-/// work rather than any one Workspace.
+/// The words for every Workspace on the Outlook, below Everywhere and above
+/// the individual Workspace entries.
 const ALL_WORKSPACES: &str = "All Workspaces";
+const EVERYWHERE: &str = "Everywhere";
+
+fn remote(name: &str, status: RemoteStatus) -> Remote {
+    Remote {
+        name: name.to_owned(),
+        fingerprint: format!("{name}-fingerprint"),
+        addresses: Vec::new(),
+        status,
+    }
+}
+
+fn choose_everywhere(
+    application: &mut Application,
+    remotes: Vec<Remote>,
+) -> Vec<suru::tui::SessionListRequest> {
+    let ApplicationTransition::ListEverywhereRemotes(request_id) =
+        choose_workspace(application, EVERYWHERE)
+    else {
+        panic!("choosing Everywhere should first ask which Remotes are paired");
+    };
+    let ApplicationTransition::ListSessionOrigins(requests) = application
+        .handle_event(ApplicationEvent::EverywhereRemotesListed {
+            request_id,
+            remotes,
+        })
+        .expect("take the paired Remotes into the Everywhere listing")
+    else {
+        panic!("the paired Remote list should yield one listing request per Origin");
+    };
+    requests
+}
 
 /// The Workspace selector stands between the search box and the list it
 /// governs, saying what the Sidebar is narrowed to before it says anything
@@ -3686,7 +3717,7 @@ fn the_selector_stands_under_the_search_box_and_says_what_is_in_scope() {
 /// client itself runs in — which stands whether or not there is work in it
 /// yet, because it is where the next Session will be.
 #[test]
-fn the_selector_lists_all_workspaces_first_then_the_workspaces_it_has_work_in() {
+fn the_selector_lists_everywhere_then_all_workspaces_then_the_outlooks_workspaces() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
@@ -3701,12 +3732,323 @@ fn the_selector_lists_all_workspaces_first_then_the_workspaces_it_has_work_in() 
     assert_eq!(
         selector_entries(&application),
         vec![
+            EVERYWHERE.to_owned(),
             ALL_WORKSPACES.to_owned(),
             workspace_name(workspace.path()),
             "notes".to_owned(),
             "suru".to_owned(),
         ],
         "every Workspace the reader has work in, and the one they are standing in"
+    );
+}
+
+#[test]
+fn everywhere_asks_each_non_terminal_origin_and_merges_both_shelves_by_reported_recency() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![listed(
+            "Previous local work",
+            None,
+            workspace.path(),
+            1,
+            now(),
+        )],
+    );
+
+    let requests = choose_everywhere(
+        &mut application,
+        vec![
+            remote("studio", RemoteStatus::Available),
+            remote("sleeping", RemoteStatus::Unavailable),
+            remote("revoked", RemoteStatus::Revoked),
+            remote("old-version", RemoteStatus::ProtocolMismatch),
+        ],
+    );
+    let origins = requests
+        .iter()
+        .map(|request| request.outlook().clone())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        origins,
+        std::collections::HashSet::from([
+            Outlook::Local,
+            Outlook::Remote("studio".to_owned()),
+            Outlook::Remote("sleeping".to_owned()),
+        ]),
+        "terminal Remotes are not asked, while an unavailable Pairing may answer again"
+    );
+    assert!(requests.iter().all(|request| {
+        request.surface() == SessionListSurface::Sidebar
+            && request.scope() == &SessionListScope::AllWorkspaces
+    }));
+
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => vec![
+                listed("Local newest", None, workspace.path(), 40, minutes_ago(1)),
+                settled(
+                    "Local history",
+                    None,
+                    workspace.path(),
+                    10,
+                    hours_ago(4),
+                    hours_ago(3),
+                ),
+            ],
+            Outlook::Remote(name) if name == "studio" => vec![
+                listed(
+                    "Studio older",
+                    None,
+                    &workspace.path().join("foreign-studio"),
+                    30,
+                    minutes_ago(2),
+                ),
+                settled(
+                    "Studio history",
+                    None,
+                    &workspace.path().join("foreign-history"),
+                    20,
+                    hours_ago(2),
+                    minutes_ago(2),
+                ),
+            ],
+            Outlook::Remote(name) if name == "sleeping" => Vec::new(),
+            other => panic!("unexpected listing Origin: {other:?}"),
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+            .expect("take one Origin's listing into the merged Sidebar");
+    }
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(rendered_row(&rows, "Local newest") < rendered_row(&rows, "Studio older"));
+    let divider = sidebar_divider(&rows);
+    assert!(rendered_row(&rows, "Studio older") < divider);
+    assert!(divider < rendered_row(&rows, "Studio history"));
+    assert!(rendered_row(&rows, "Studio history") < rendered_row(&rows, "Local history"));
+}
+
+#[test]
+fn everywhere_tags_only_foreign_rows_and_keeps_the_tag_when_the_title_is_cut() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let requests = choose_everywhere(
+        &mut application,
+        vec![remote("studio", RemoteStatus::Available)],
+    );
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => vec![listed("Local work", None, workspace.path(), 2, now())],
+            Outlook::Remote(_) => vec![listed(
+                "A foreign Title long enough that the Sidebar must truncate it",
+                None,
+                &workspace.path().join("remote"),
+                1,
+                now(),
+            )],
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+            .expect("take the Origin listing");
+    }
+
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let rows = crate::support::buffer_rows(&buffer);
+    let local = sidebar_column(&rows[rendered_row(&rows, "Local work")]);
+    assert_eq!(local, "Local work", "local rows carry no Origin tag");
+    let foreign = sidebar_column(&rows[rendered_row(&rows, "[studio]")]);
+    assert!(
+        foreign.ends_with("[studio]") && !foreign.contains("truncate it"),
+        "the Title gives way before the Remote tag: {foreign:?}"
+    );
+    let (column, row) = text_position(&buffer, "[studio]");
+    assert_eq!(
+        buffer.cell((column, row)).expect("the tag is drawn").fg,
+        Color::DarkGray,
+        "the Remote's name is a dim tag"
+    );
+}
+
+#[test]
+fn everywhere_searches_one_flat_tagged_list_then_a_workspace_returns_to_the_outlook_alone() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let requests = choose_everywhere(
+        &mut application,
+        vec![remote("studio", RemoteStatus::Available)],
+    );
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => vec![
+                listed("Matching local", None, workspace.path(), 4, now()),
+                listed("Other local", None, workspace.path(), 2, now()),
+            ],
+            Outlook::Remote(_) => vec![
+                listed(
+                    "Matching foreign",
+                    None,
+                    &workspace.path().join("foreign-only"),
+                    3,
+                    now(),
+                ),
+                listed(
+                    "Other foreign",
+                    None,
+                    &workspace.path().join("foreign-apart"),
+                    1,
+                    now(),
+                ),
+            ],
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+            .expect("take the Origin listing");
+    }
+
+    type_terminal_text(&mut application, "matching");
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(drawn_in_sidebar(&rows, "Matching local"));
+    assert!(drawn_in_sidebar(&rows, "Matching foreign [studio]"));
+    assert!(!drawn_in_sidebar(&rows, "Other local"));
+    assert!(!drawn_in_sidebar(&rows, "Other foreign"));
+    assert!(
+        sidebar_divider_row(&rows).is_none(),
+        "search is one flat list"
+    );
+
+    while !selector_entries(&application).is_empty() {
+        press_sidebar_key(&mut application, KeyCode::Esc);
+    }
+    press_sidebar_key(&mut application, KeyCode::Esc);
+    open_selector(&mut application);
+    assert_eq!(
+        selector_entries(&application),
+        vec![
+            EVERYWHERE.to_owned(),
+            ALL_WORKSPACES.to_owned(),
+            workspace_name(workspace.path()),
+        ],
+        "the selector never offers a foreign Workspace"
+    );
+    assert_eq!(
+        choose_workspace(&mut application, &workspace_name(workspace.path())),
+        ApplicationTransition::Continue,
+        "narrowing uses the Outlook listing already in hand"
+    );
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(drawn_in_sidebar(&rows, "Matching local"));
+    assert!(!drawn_in_sidebar(&rows, "Matching foreign"));
+}
+
+#[test]
+fn reopening_everywhere_refreshes_the_remote_set_and_every_origin_listing() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let first = choose_everywhere(
+        &mut application,
+        vec![remote("studio", RemoteStatus::Available)],
+    );
+    for request in first {
+        application
+            .handle_event(ApplicationEvent::SessionsListed {
+                request,
+                sessions: Vec::new(),
+            })
+            .expect("finish the first Everywhere listing");
+    }
+
+    assert_eq!(
+        press_toggle(&mut application),
+        ApplicationTransition::Continue
+    );
+    let ApplicationTransition::ListEverywhereRemotes(request_id) = press_toggle(&mut application)
+    else {
+        panic!("the Sidebar's ordinary reveal path starts Everywhere afresh");
+    };
+    let ApplicationTransition::ListSessionOrigins(second) = application
+        .handle_event(ApplicationEvent::EverywhereRemotesListed {
+            request_id,
+            remotes: vec![remote("studio", RemoteStatus::Available)],
+        })
+        .expect("refresh the paired Remote set")
+    else {
+        panic!("the refreshed Remote set should yield fresh Origin listings");
+    };
+    assert_eq!(second.len(), 2);
+    assert!(second.iter().all(|request| {
+        request.surface() == SessionListSurface::Sidebar
+            && request.scope() == &SessionListScope::AllWorkspaces
+    }));
+}
+
+#[test]
+fn a_catalog_change_catches_up_every_origin_while_everywhere_is_chosen() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let requests = choose_everywhere(
+        &mut application,
+        vec![remote("studio", RemoteStatus::Available)],
+    );
+    for request in requests {
+        application
+            .handle_event(ApplicationEvent::SessionsListed {
+                request,
+                sessions: Vec::new(),
+            })
+            .expect("finish the first Everywhere listing");
+    }
+
+    let ApplicationTransition::ListSessionOrigins(requests) =
+        create_elsewhere(&mut application, SessionId::new())
+    else {
+        panic!("a catalog change should re-ask every Everywhere Origin");
+    };
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.outlook().clone())
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([Outlook::Local, Outlook::Remote("studio".to_owned()),]),
+        "the existing catch-up path keeps every Origin current"
+    );
+}
+
+#[test]
+fn a_superseded_everywhere_discovery_cannot_replace_the_newer_remote_set() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let ApplicationTransition::ListEverywhereRemotes(first) =
+        choose_workspace(&mut application, EVERYWHERE)
+    else {
+        panic!("the first Everywhere choice starts Remote discovery");
+    };
+    choose_workspace(&mut application, ALL_WORKSPACES);
+    let ApplicationTransition::ListEverywhereRemotes(second) =
+        choose_workspace(&mut application, EVERYWHERE)
+    else {
+        panic!("choosing Everywhere again starts fresh Remote discovery");
+    };
+    assert_ne!(first, second);
+
+    let current = application
+        .handle_event(ApplicationEvent::EverywhereRemotesListed {
+            request_id: second,
+            remotes: vec![remote("studio", RemoteStatus::Available)],
+        })
+        .expect("take the current discovery reply");
+    assert!(matches!(
+        current,
+        ApplicationTransition::ListSessionOrigins(_)
+    ));
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::EverywhereRemotesListed {
+                request_id: first,
+                remotes: vec![remote("stale", RemoteStatus::Available)],
+            })
+            .expect("ignore the superseded discovery reply"),
+        ApplicationTransition::Continue
     );
 }
 
@@ -3726,7 +4068,11 @@ fn the_selector_lists_one_entry_for_the_launch_workspace_however_it_was_spelled(
 
     assert_eq!(
         selector_entries(&application),
-        vec![ALL_WORKSPACES.to_owned(), workspace_name(workspace.path())],
+        vec![
+            EVERYWHERE.to_owned(),
+            ALL_WORKSPACES.to_owned(),
+            workspace_name(workspace.path()),
+        ],
         "the Workspace the client runs in and the one the server lists its \
          Sessions under are the same entry"
     );
@@ -3921,7 +4267,7 @@ fn a_press_on_the_selector_opens_it_and_a_press_on_an_entry_chooses_it() {
     );
     assert_eq!(
         selector_entries(&application).first(),
-        Some(&ALL_WORKSPACES.to_owned()),
+        Some(&EVERYWHERE.to_owned()),
         "the entries stand open under the selector"
     );
 
@@ -3965,7 +4311,7 @@ fn the_arrows_reach_the_selector_above_the_list() {
     press_sidebar_key(&mut application, KeyCode::Enter);
     assert_eq!(
         selector_entries(&application).first(),
-        Some(&ALL_WORKSPACES.to_owned()),
+        Some(&EVERYWHERE.to_owned()),
         "which Enter opens rather than attaching anything"
     );
 }
@@ -4251,6 +4597,7 @@ fn the_workspace_the_reader_added_stands_among_the_selectors_entries() {
     assert_eq!(
         selector_entries(&application),
         vec![
+            EVERYWHERE.to_owned(),
             ALL_WORKSPACES.to_owned(),
             "notes".to_owned(),
             "suru".to_owned(),

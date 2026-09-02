@@ -10,8 +10,9 @@ use std::{
 use ratatui::layout::Position;
 
 use crate::protocol::{
-    AutoSettle, EffectiveSettings, EmojiVisibility, Outlook, ResolveWorkspaceRequest, SessionId,
-    SessionListItem, SessionReference, SessionTimestamp, SidebarScope, SidebarVisibility,
+    AutoSettle, EffectiveSettings, EmojiVisibility, Outlook, Remote, RemoteStatus,
+    ResolveWorkspaceRequest, SessionId, SessionListItem, SessionReference, SessionTimestamp,
+    SidebarScope as InitialSidebarScope, SidebarVisibility,
 };
 
 use super::{
@@ -43,9 +44,10 @@ pub(super) const fn width_beside(frame_width: u16) -> Option<u16> {
     }
 }
 
-/// What the selector's first entry says, standing for the whole body of work
-/// rather than for any one Workspace.
+/// What the selector calls every Workspace on the current Outlook, as distinct
+/// from Everywhere's wider set of Origin servers.
 const ALL_WORKSPACES: &str = "All Workspaces";
+const EVERYWHERE: &str = "Everywhere";
 
 /// The affordance beside the selector, opening the path entry a reader names a
 /// Workspace in. It shares the selector's line, so it is drawn — and pressed —
@@ -55,8 +57,8 @@ pub(super) const ADD_WORKSPACE: &str = " + ";
 /// What the path entry says when the reader offers it nothing.
 const NAME_A_DIRECTORY: &str = "Name a directory";
 
-/// The Workspaces the Sidebar draws: every one the reader has work in, or a
-/// single one of them.
+/// The population the Sidebar draws: every reachable Origin, every Workspace
+/// on the Outlook, or one Workspace on it.
 ///
 /// This is the reader's own view of their work rather than a question for the
 /// server, which is why it is not the [`SessionListScope`] a listing asks with:
@@ -67,16 +69,18 @@ const NAME_A_DIRECTORY: &str = "Name a directory";
 /// selector would empty itself the first time it was used. The initial-scope
 /// Setting seeds it and the selector moves it; nothing writes it back.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum WorkspaceScope {
+pub(super) enum SidebarListingScope {
+    Everywhere,
     AllWorkspaces,
     Workspace(PathBuf),
 }
 
-impl WorkspaceScope {
+impl SidebarListingScope {
     /// What the selector calls this scope: the Workspace by the name a row
     /// gives it, or the words for all of them.
     fn label(&self) -> String {
         match self {
+            Self::Everywhere => EVERYWHERE.to_owned(),
             Self::AllWorkspaces => ALL_WORKSPACES.to_owned(),
             Self::Workspace(workspace) => workspace_name(workspace),
         }
@@ -93,7 +97,7 @@ impl WorkspaceScope {
     /// is one narrowing must not be the thing that hides.
     fn holds(&self, session: &SessionListItem) -> bool {
         match self {
-            Self::AllWorkspaces => true,
+            Self::Everywhere | Self::AllWorkspaces => true,
             Self::Workspace(workspace) => session
                 .workspace()
                 .is_none_or(|rooted| rooted.path == *workspace),
@@ -131,9 +135,9 @@ pub(super) struct Sidebar {
     /// Whether a row draws the Emoji derived beside its Session's Title, which
     /// governs every frame from the moment the Setting lands.
     emoji: EmojiVisibility,
-    /// The Workspaces the Sidebar draws, seeded once from the initial-scope
-    /// Setting and moved by the selector afterwards.
-    scope: WorkspaceScope,
+    /// The Session population the Sidebar draws, seeded once from the
+    /// initial-scope Setting and moved by the selector afterwards.
+    scope: SidebarListingScope,
     /// Whether the selector's entries stand open under it. While they do they
     /// are the list: the reader is choosing a Workspace rather than a Session,
     /// so both shelves stand down as they do under a query.
@@ -144,6 +148,9 @@ pub(super) struct Sidebar {
     /// — and it takes what they type, because a path is not a query.
     workspace_entry: Option<WorkspaceEntry>,
     listing: SessionListing,
+    /// The Origins participating in Everywhere, local first and followed by
+    /// each paired non-terminal Remote in the order the local Server named it.
+    everywhere_origins: Vec<Outlook>,
     /// How much of the settled shelf is on show. History is the longest part
     /// of a body of work and the least of what a reader is choosing between,
     /// so the shelf opens on its first rows and the tail stands behind an
@@ -177,7 +184,15 @@ pub(super) struct Sidebar {
     /// did — the initial-visibility Setting reveals it too — so the request
     /// waits here for
     /// the next caller able to carry it.
-    awaiting_dispatch: Option<SessionListRequest>,
+    awaiting_dispatch: Vec<SessionListRequest>,
+    /// Sequence used to supersede paired-Remote discovery when Everywhere is
+    /// chosen again before an older answer lands.
+    everywhere_remote_sequence: u64,
+    /// Whether the current discovery request still needs handing to the run
+    /// loop. Its identity remains in `pending_everywhere_remotes` afterwards
+    /// so only that request's answer can alter the merged listing.
+    everywhere_remote_dispatch_pending: bool,
+    pending_everywhere_remotes: Option<u64>,
     /// Whether the last frame had the columns to draw the Sidebar. Only a
     /// frame can answer that, so each one records it here and input routing
     /// reads it back: a Sidebar squeezed off a narrow terminal keeps the
@@ -225,7 +240,7 @@ enum SidebarFocus {
     /// than in it, and which Enter opens instead of attaching anything.
     Selector,
     /// One entry of the open selector, named by the scope it stands for.
-    Scope(WorkspaceScope),
+    Scope(SidebarListingScope),
     /// The affordance beside the selector, which Enter opens a path entry from
     /// rather than attaching anything.
     AddWorkspace,
@@ -263,6 +278,9 @@ pub(super) struct SidebarRow<'a> {
     /// left it none, and none while the reader keeps Emojis hidden.
     pub(super) emoji: Option<&'a str>,
     pub(super) title: &'a str,
+    /// The dim Origin tag following a foreign row's Title. Local rows carry
+    /// none so the ordinary one-machine reading stays quiet.
+    pub(super) remote: Option<&'a str>,
     /// Whether this is the Session the main view is showing. It is true
     /// whoever holds the keys, because it says what the reader is looking at
     /// rather than what they are choosing.
@@ -343,7 +361,7 @@ pub(super) struct SidebarScopeEntry {
     pub(super) chosen: bool,
     pub(super) focused: bool,
     /// The scope pressing this entry asks for.
-    scope: WorkspaceScope,
+    scope: SidebarListingScope,
 }
 
 /// The Workspace selector as a frame draws it, standing between the search box
@@ -455,7 +473,7 @@ pub(super) enum SidebarTarget {
     Session(SessionReference),
     ShowMore,
     Selector,
-    Scope(WorkspaceScope),
+    Scope(SidebarListingScope),
     AddWorkspace,
 }
 
@@ -527,6 +545,7 @@ pub(super) enum SidebarActivation {
     /// opened or narrowed, a path was refused, or the reader was already on
     /// the Session they asked for.
     Answered,
+    ListEverywhereRemotes,
     Attach(SessionReference),
     /// The reader named a directory to work in. It is the client's current
     /// Workspace from here: the root of the Sessions they make next, and what
@@ -646,7 +665,7 @@ impl Sidebar {
             seeded: false,
             auto_settle: AutoSettle::default(),
             emoji: EmojiVisibility::default(),
-            scope: WorkspaceScope::AllWorkspaces,
+            scope: SidebarListingScope::AllWorkspaces,
             selector_open: false,
             workspace_entry: None,
             listing: SessionListing::scoped(
@@ -654,12 +673,16 @@ impl Sidebar {
                 current_workspace,
                 SessionListScope::AllWorkspaces,
             ),
+            everywhere_origins: Vec::new(),
             settled_on_show: SETTLED_SHELF_OPENING,
             query: String::new(),
             focus: None,
             attaching: None,
             asked_afresh: false,
-            awaiting_dispatch: None,
+            awaiting_dispatch: Vec::new(),
+            everywhere_remote_sequence: 0,
+            everywhere_remote_dispatch_pending: false,
+            pending_everywhere_remotes: None,
             // Until a frame says otherwise, which it does before anything the
             // reader types can reach a surface.
             on_screen: Cell::new(true),
@@ -674,7 +697,7 @@ impl Sidebar {
     /// auto-settle and how a Session is named govern every frame from here on,
     /// while the two initial Settings have their say once and are then the
     /// reader's to overrule. Returns nothing: a Sidebar that wants its Sessions
-    /// leaves the request in [`Self::take_listing_request`].
+    /// leaves the requests in [`Self::take_listing_requests`].
     pub(super) fn adopt_settings(&mut self, settings: &EffectiveSettings) {
         self.auto_settle = settings.sidebar.auto_settle;
         self.emoji = settings.session.title.emoji;
@@ -683,9 +706,9 @@ impl Sidebar {
         }
         self.seeded = true;
         self.scope = match settings.sidebar.initial_scope {
-            SidebarScope::AllWorkspaces => WorkspaceScope::AllWorkspaces,
-            SidebarScope::CurrentWorkspace => {
-                WorkspaceScope::Workspace(self.listing.current_workspace().to_owned())
+            InitialSidebarScope::AllWorkspaces => SidebarListingScope::AllWorkspaces,
+            InitialSidebarScope::CurrentWorkspace => {
+                SidebarListingScope::Workspace(self.listing.current_workspace().to_owned())
             }
         };
         self.reveal(settings.sidebar.initial_visibility == SidebarVisibility::Shown);
@@ -1151,7 +1174,16 @@ impl Sidebar {
     fn ask_for_sessions(&mut self) {
         self.settled_on_show = SETTLED_SHELF_OPENING;
         self.asked_afresh = true;
-        self.awaiting_dispatch = Some(self.listing.refresh());
+        if self.scope == SidebarListingScope::Everywhere {
+            self.awaiting_dispatch.clear();
+            self.everywhere_remote_sequence = self.everywhere_remote_sequence.wrapping_add(1);
+            self.pending_everywhere_remotes = Some(self.everywhere_remote_sequence);
+            self.everywhere_remote_dispatch_pending = true;
+            return;
+        }
+        self.everywhere_remote_dispatch_pending = false;
+        self.pending_everywhere_remotes = None;
+        self.awaiting_dispatch = vec![self.listing.refresh()];
     }
 
     /// Asks for the Sessions again because the session-catalog stream reported
@@ -1173,7 +1205,11 @@ impl Sidebar {
             return;
         }
         self.asked_afresh = false;
-        self.awaiting_dispatch = Some(self.listing.catch_up());
+        self.awaiting_dispatch = if self.scope == SidebarListingScope::Everywhere {
+            self.listing.catch_up_origins(&self.everywhere_origins)
+        } else {
+            vec![self.listing.catch_up()]
+        };
     }
 
     /// Whether a listing the server answered with would move anything the
@@ -1183,7 +1219,11 @@ impl Sidebar {
         request: &SessionListRequest,
         sessions: &[SessionListItem],
     ) -> bool {
-        self.listing.would_move(request, sessions)
+        if self.scope == SidebarListingScope::Everywhere {
+            self.listing.would_move_across(request, sessions)
+        } else {
+            self.listing.would_move(request, sessions)
+        }
     }
 
     /// Whether a reply the server sent answers the listing this surface is
@@ -1219,10 +1259,62 @@ impl Sidebar {
             })
     }
 
-    /// The listing the Sidebar is waiting on, handed over exactly once so the
-    /// caller that can dispatch it does so and no later caller repeats it.
-    pub(super) fn take_listing_request(&mut self) -> Option<SessionListRequest> {
-        self.awaiting_dispatch.take()
+    /// The listings the Sidebar is waiting on, handed over exactly once so the
+    /// caller that can dispatch them does so and no later caller repeats them.
+    pub(super) fn take_listing_requests(&mut self) -> Vec<SessionListRequest> {
+        std::mem::take(&mut self.awaiting_dispatch)
+    }
+
+    #[cfg(test)]
+    fn take_listing_request(&mut self) -> Option<SessionListRequest> {
+        let requests = self.take_listing_requests();
+        assert!(requests.len() <= 1, "expected at most one listing request");
+        requests.into_iter().next()
+    }
+
+    pub(super) fn take_everywhere_remote_request(&mut self) -> Option<u64> {
+        std::mem::take(&mut self.everywhere_remote_dispatch_pending)
+            .then_some(self.pending_everywhere_remotes?)
+    }
+
+    /// Whether a paired-Remote reply still belongs to the scope on show.
+    pub(super) fn accepts_everywhere_remotes(&self, request_id: u64) -> bool {
+        self.scope == SidebarListingScope::Everywhere
+            && self.pending_everywhere_remotes == Some(request_id)
+    }
+
+    /// Begins one fresh listing per reachable Origin from the durable Remote
+    /// list returned by the local Server. Revoked and incompatible Pairings
+    /// are terminal and contribute neither requests nor stale rows.
+    pub(super) fn load_everywhere_remotes(
+        &mut self,
+        request_id: u64,
+        remotes: Vec<Remote>,
+    ) -> Option<Vec<SessionListRequest>> {
+        if !self.accepts_everywhere_remotes(request_id) {
+            return None;
+        }
+        self.pending_everywhere_remotes = None;
+        let mut origins = vec![Outlook::Local];
+        origins.extend(remotes.into_iter().filter_map(|remote| {
+            (!matches!(
+                remote.status,
+                RemoteStatus::Revoked | RemoteStatus::ProtocolMismatch
+            ))
+            .then_some(Outlook::Remote(remote.name))
+        }));
+        self.listing.retain_origins(&origins);
+        self.everywhere_origins = origins;
+        Some(self.listing.refresh_origins(&self.everywhere_origins))
+    }
+
+    pub(super) fn fail_everywhere_remotes(&mut self, request_id: u64, error: String) -> bool {
+        if !self.accepts_everywhere_remotes(request_id) {
+            return false;
+        }
+        self.pending_everywhere_remotes = None;
+        self.listing.report_error(error);
+        true
     }
 
     /// Takes the Sessions the server answered with, told which one the main
@@ -1235,7 +1327,11 @@ impl Sidebar {
         open: Option<&SessionReference>,
     ) {
         let before = self.focus_order_before_change();
-        if !self.listing.load(request, sessions) {
+        let awaited = self.listing.awaits(request);
+        let shown = self.scope == SidebarListingScope::Everywhere
+            || request.outlook() == self.listing.outlook();
+        self.listing.load(request, sessions);
+        if !awaited || !shown {
             return;
         }
         if std::mem::take(&mut self.asked_afresh) {
@@ -1361,7 +1457,13 @@ impl Sidebar {
                 return SidebarActivation::Answered;
             }
             SidebarFocus::Scope(scope) => {
+                let enters_everywhere = scope == SidebarListingScope::Everywhere
+                    && self.scope != SidebarListingScope::Everywhere;
                 self.choose_scope(scope);
+                if enters_everywhere {
+                    self.ask_for_sessions();
+                    return SidebarActivation::ListEverywhereRemotes;
+                }
                 return SidebarActivation::Answered;
             }
             SidebarFocus::AddWorkspace => {
@@ -1472,7 +1574,9 @@ impl Sidebar {
         self.deleting = None;
         self.menu = None;
         self.workspace_entry = None;
-        self.awaiting_dispatch = None;
+        self.awaiting_dispatch.clear();
+        self.everywhere_remote_dispatch_pending = false;
+        self.pending_everywhere_remotes = None;
         if self.revealed {
             self.ask_for_sessions();
         }
@@ -1499,7 +1603,7 @@ impl Sidebar {
     /// which Session is open and which Workspace it is narrowed to, neither of
     /// which is a claim about where Enter would land.
     pub(super) fn narrow_to_workspace(&mut self, workspace: PathBuf) {
-        self.choose_scope(WorkspaceScope::Workspace(workspace));
+        self.choose_scope(SidebarListingScope::Workspace(workspace));
     }
 
     /// The path entry as a frame draws it, and `None` where there is none to
@@ -1557,12 +1661,16 @@ impl Sidebar {
     /// either way, and the scope decides which of it the shelves draw. The
     /// settled shelf opens on its first rows again, because how deep a reader
     /// walked into one Workspace's history says nothing about another's.
-    fn choose_scope(&mut self, scope: WorkspaceScope) {
+    fn choose_scope(&mut self, scope: SidebarListingScope) {
         self.close_selector();
         if self.scope == scope {
             return;
         }
         self.scope = scope;
+        if self.scope != SidebarListingScope::Everywhere {
+            self.everywhere_remote_dispatch_pending = false;
+            self.pending_everywhere_remotes = None;
+        }
         self.settled_on_show = SETTLED_SHELF_OPENING;
     }
 
@@ -1580,7 +1688,7 @@ impl Sidebar {
     /// reader's whole body of work, which is what an empty column means by
     /// nothing being here.
     pub(super) fn is_narrowed(&self) -> bool {
-        self.scope != WorkspaceScope::AllWorkspaces
+        matches!(self.scope, SidebarListingScope::Workspace(_))
     }
 
     pub(super) fn attaching_to(&self, reference: &SessionReference) -> bool {
@@ -1616,7 +1724,12 @@ impl Sidebar {
     }
 
     pub(super) fn is_loading(&self) -> bool {
-        self.listing.is_loading()
+        if self.scope == SidebarListingScope::Everywhere {
+            self.pending_everywhere_remotes.is_some()
+                || self.listing.is_loading_across(&self.everywhere_origins)
+        } else {
+            self.listing.is_loading()
+        }
     }
 
     pub(super) fn error(&self) -> Option<&str> {
@@ -1750,17 +1863,16 @@ impl Sidebar {
         body
     }
 
-    /// The Workspaces the selector offers: all of them first, because the whole
-    /// body of work is what a Sidebar opens on, then every Workspace the
-    /// listing has work rooted in and the one this client itself runs in —
-    /// which stands whether or not there is work in it yet, being where the
-    /// reader's next Session will be.
+    /// The selector offers Everywhere first, then every Workspace on the
+    /// Outlook collectively, then each such Workspace the listing has work
+    /// rooted in and the one this client itself runs in — which stands whether
+    /// or not there is work in it yet, being where the next Session will be.
     ///
     /// They are read off the whole listing rather than off the Sessions in
     /// scope, so narrowing to one Workspace never takes the others off the
     /// selector: a reader who narrowed has to be able to widen again, and to
     /// step straight across to a third.
-    fn scopes(&self) -> Vec<WorkspaceScope> {
+    fn scopes(&self) -> Vec<SidebarListingScope> {
         let mut workspaces = self.listing.workspaces();
         // Ordered by path, so the entries hold their places between one
         // listing and the next. The Workspace Picker orders the same
@@ -1768,9 +1880,13 @@ impl Sidebar {
         // deliberate — a persistent list wants entries that stay put, a
         // choose-and-dismiss picker wants the likeliest target near the top.
         workspaces.sort_unstable();
-        std::iter::once(WorkspaceScope::AllWorkspaces)
-            .chain(workspaces.into_iter().map(WorkspaceScope::Workspace))
-            .collect()
+        [
+            SidebarListingScope::Everywhere,
+            SidebarListingScope::AllWorkspaces,
+        ]
+        .into_iter()
+        .chain(workspaces.into_iter().map(SidebarListingScope::Workspace))
+        .collect()
     }
 
     /// What a query narrows the Sidebar to: the Sessions whose Titles carry it,
@@ -1843,6 +1959,11 @@ impl Sidebar {
             reference: session.reference(),
             emoji: self.emoji.drawn_emoji(session.emoji()),
             title: session.title(),
+            remote: if self.scope == SidebarListingScope::Everywhere {
+                session.reference().origin.remote_name()
+            } else {
+                None
+            },
             open: open == Some(session.reference()),
             focused: self.focus.as_ref()
                 == Some(&SidebarFocus::Session(session.reference().clone())),
@@ -1889,9 +2010,13 @@ impl Sidebar {
     /// The Sessions the selector's scope draws, which is every one the listing
     /// holds until the reader narrows to a Workspace.
     fn in_scope(&self) -> impl Iterator<Item = &ListedSession> {
-        self.listing
-            .sessions()
-            .iter()
+        let sessions = if self.scope == SidebarListingScope::Everywhere {
+            self.listing.sessions_across(&self.everywhere_origins)
+        } else {
+            self.listing.sessions().iter().collect()
+        };
+        sessions
+            .into_iter()
             .filter(|session| self.scope.holds(session))
     }
 
@@ -2049,7 +2174,7 @@ impl Sidebar {
 enum BodyEntry<'a> {
     Session(&'a ListedSession, Standing),
     /// One Workspace the open selector offers.
-    Scope(WorkspaceScope),
+    Scope(SidebarListingScope),
     Divider,
     /// The affordance closing a capped settled shelf, and how many rows acting
     /// on it brings up.
@@ -2268,7 +2393,10 @@ mod tests {
             "an equal Session ID from another Origin is not the open row"
         );
         let remote_entry = sidebar.entries(Some(&reference));
-        assert!(matches!(&remote_entry[0], SidebarEntry::Row(row) if row.open));
+        assert!(matches!(
+            &remote_entry[0],
+            SidebarEntry::Row(row) if row.open && row.remote.is_none()
+        ));
 
         sidebar.record_geometry(
             0..32,

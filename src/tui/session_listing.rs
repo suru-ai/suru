@@ -115,8 +115,14 @@ impl SessionListing {
     /// caller hands the returned request to the runtime and back to `load` or
     /// `fail` when the answer arrives.
     pub(super) fn refresh(&mut self) -> SessionListRequest {
-        let request = self.catch_up();
-        let origin = self.current_origin_mut();
+        self.refresh_origin(self.outlook.clone())
+    }
+
+    /// Asks one named Origin for its Sessions, leaving every other Origin's
+    /// request conversation and rows alone.
+    pub(super) fn refresh_origin(&mut self, outlook: Outlook) -> SessionListRequest {
+        let request = self.catch_up_origin(outlook);
+        let origin = self.origin_mut(request.outlook().clone());
         origin.sessions.clear();
         origin.loading = true;
         request
@@ -128,14 +134,39 @@ impl SessionListing {
     /// and the answer replaces them whole. Numbering the request is what
     /// supersedes whatever this listing was waiting for before.
     pub(super) fn catch_up(&mut self) -> SessionListRequest {
+        self.catch_up_origin(self.outlook.clone())
+    }
+
+    /// Asks one named Origin again without disturbing rows held for any
+    /// Origin, including the one being refreshed.
+    pub(super) fn catch_up_origin(&mut self, outlook: Outlook) -> SessionListRequest {
         let surface = self.surface;
-        let outlook = self.outlook.clone();
         let scope = self.scope.clone();
-        let origin = self.current_origin_mut();
+        let origin = self.origin_mut(outlook.clone());
         origin.request_sequence = origin.request_sequence.wrapping_add(1);
         let request = SessionListRequest::new(surface, origin.request_sequence, outlook, scope);
         origin.pending_request = Some(request.clone());
         request
+    }
+
+    /// Starts one fresh listing conversation per Origin. The caller dispatches
+    /// the returned requests independently, so a slow Server cannot hold up or
+    /// invalidate any other Server's answer.
+    pub(super) fn refresh_origins(&mut self, origins: &[Outlook]) -> Vec<SessionListRequest> {
+        origins
+            .iter()
+            .cloned()
+            .map(|origin| self.refresh_origin(origin))
+            .collect()
+    }
+
+    /// Catches up every named Origin without clearing any rows already drawn.
+    pub(super) fn catch_up_origins(&mut self, origins: &[Outlook]) -> Vec<SessionListRequest> {
+        origins
+            .iter()
+            .cloned()
+            .map(|origin| self.catch_up_origin(origin))
+            .collect()
     }
 
     /// Widens the listing to every Workspace, or narrows it back to this
@@ -183,7 +214,25 @@ impl SessionListing {
         if request.outlook() != &self.outlook {
             return false;
         }
-        let origin = self.current_origin();
+        self.would_move_origin(request, sessions)
+    }
+
+    /// The same movement reading for a surface currently drawing more than
+    /// one Origin at once.
+    pub(super) fn would_move_across(
+        &self,
+        request: &SessionListRequest,
+        sessions: &[SessionListItem],
+    ) -> bool {
+        self.awaits(request) && self.would_move_origin(request, sessions)
+    }
+
+    fn would_move_origin(
+        &self,
+        request: &SessionListRequest,
+        sessions: &[SessionListItem],
+    ) -> bool {
+        let origin = self.origins.get(request.outlook());
         // A listing still on its way, or one that failed, says so on screen,
         // so the answer moves the frame whatever Sessions it carries.
         if origin.is_some_and(|origin| origin.loading || origin.error.is_some()) {
@@ -192,7 +241,7 @@ impl SessionListing {
         let mut arriving = sessions.to_vec();
         Self::order(&mut arriving);
         let arriving = ListedSession::stamp_all(request.outlook(), arriving);
-        arriving != self.sessions()
+        origin.is_none_or(|origin| arriving != origin.sessions)
     }
 
     /// The one order a listing keeps: the most recently updated Session first.
@@ -299,6 +348,22 @@ impl SessionListing {
             .map_or(&[], |origin| origin.sessions.as_slice())
     }
 
+    /// Rows held for the named Origins, in Origin order. Surfaces merging
+    /// these rows impose their own shelf order afterwards.
+    pub(super) fn sessions_across(&self, origins: &[Outlook]) -> Vec<&ListedSession> {
+        origins
+            .iter()
+            .filter_map(|origin| self.origins.get(origin))
+            .flat_map(|origin| origin.sessions.iter())
+            .collect()
+    }
+
+    /// Forgets Origins no longer belonging to a merged listing, including any
+    /// reply still in flight for one of them.
+    pub(super) fn retain_origins(&mut self, origins: &[Outlook]) {
+        self.origins.retain(|origin, _| origins.contains(origin));
+    }
+
     /// The Workspaces this listing puts on offer: every one its Sessions are
     /// rooted in, and the one this client works in — which stands whether or
     /// not there is work in it yet, being where the reader's next Session
@@ -343,6 +408,10 @@ impl SessionListing {
         &self.scope
     }
 
+    pub(super) fn outlook(&self) -> &Outlook {
+        &self.outlook
+    }
+
     /// The Workspace this client runs in, which is what `CurrentWorkspace`
     /// scope means and what a surface narrowing to "where I am" narrows to.
     pub(super) fn current_workspace(&self) -> &Path {
@@ -371,6 +440,14 @@ impl SessionListing {
 
     pub(super) fn is_loading(&self) -> bool {
         self.current_origin().is_some_and(|origin| origin.loading)
+    }
+
+    pub(super) fn is_loading_across(&self, origins: &[Outlook]) -> bool {
+        origins.iter().any(|origin| {
+            self.origins
+                .get(origin)
+                .is_some_and(|listing| listing.loading)
+        })
     }
 
     pub(super) fn error(&self) -> Option<&str> {
@@ -409,6 +486,10 @@ impl SessionListing {
 
     fn current_origin_mut(&mut self) -> &mut OriginListing {
         self.origins.entry(self.outlook.clone()).or_default()
+    }
+
+    fn origin_mut(&mut self, outlook: Outlook) -> &mut OriginListing {
+        self.origins.entry(outlook).or_default()
     }
 }
 
