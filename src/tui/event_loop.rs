@@ -3,7 +3,7 @@
 //! carry out the transitions the Application returns.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::{Future, pending},
     io::{Stdout, stdout},
     net::{IpAddr, SocketAddr, SocketAddrV6},
@@ -81,7 +81,7 @@ struct SessionTasks {
         HashMap<SessionListSurface, (SessionListRequest, tokio::task::JoinHandle<()>)>,
     listing_models: Option<(ModelListRequest, tokio::task::JoinHandle<()>)>,
     listing_skills: Option<((Outlook, SkillCatalogRequest), tokio::task::JoinHandle<()>)>,
-    outlook_catalog: Option<tokio::task::JoinHandle<()>>,
+    outlook_catalogs: HashMap<Outlook, tokio::task::JoinHandle<()>>,
     resolving_workspaces: HashMap<WorkspaceResolutionSurface, (u64, tokio::task::JoinHandle<()>)>,
 }
 
@@ -124,25 +124,31 @@ impl SessionTasks {
         }
     }
 
-    fn watch_outlook_catalog(
+    fn reconcile_outlook_catalogs(
         &mut self,
-        commands: SessionCommandClient,
-        outlook: Outlook,
+        client: &ManagedClient,
+        wanted: HashSet<Outlook>,
         events: &UnboundedSender<OutlookCatalogEvent>,
     ) {
-        if let Some(task) = self.outlook_catalog.take() {
-            task.abort();
-        }
-        self.outlook_catalog = Some(spawn_outlook_catalog_forwarder(
-            commands.subscribe_catalog(),
-            outlook,
-            events.clone(),
-        ));
-    }
-
-    fn reset_outlook_catalog(&mut self) {
-        if let Some(task) = self.outlook_catalog.take() {
-            task.abort();
+        self.outlook_catalogs.retain(|outlook, task| {
+            let keep = wanted.contains(outlook);
+            if !keep {
+                task.abort();
+            }
+            keep
+        });
+        for outlook in wanted {
+            self.outlook_catalogs
+                .entry(outlook.clone())
+                .or_insert_with(|| {
+                    spawn_outlook_catalog_forwarder(
+                        client
+                            .session_commands_for(outlook.clone())
+                            .subscribe_catalog(),
+                        outlook,
+                        events.clone(),
+                    )
+                });
         }
     }
 
@@ -718,20 +724,22 @@ impl RunLoop {
                     self.channels.pairing.clone(),
                 );
             }
-            ApplicationTransition::TurnOutlook(outlook) => {
+            ApplicationTransition::TurnOutlook {
+                outlook,
+                catalog_outlooks,
+            } => {
                 self.tasks.leave_session();
                 self.tasks.reset_skill_listing();
-                self.tasks.reset_outlook_catalog();
+                self.tasks.reconcile_outlook_catalogs(
+                    &self.client,
+                    catalog_outlooks,
+                    &self.channels.outlook_catalog,
+                );
                 self.tasks.reset_workspace_resolutions();
                 if let Some(request) = self.application.take_listing_request() {
                     self.list_sessions(request);
                 }
                 if matches!(outlook, Outlook::Remote(_)) {
-                    self.tasks.watch_outlook_catalog(
-                        self.client.session_commands_for(outlook.clone()),
-                        outlook.clone(),
-                        &self.channels.outlook_catalog,
-                    );
                     self.tasks.resolve_workspace(
                         self.client.session_commands_for(outlook.clone()),
                         outlook,
@@ -842,7 +850,7 @@ impl RunLoop {
             | ApplicationTransition::BeginConnecting
             | ApplicationTransition::PreviewInvite(_)
             | ApplicationTransition::RedeemInvite(_)
-            | ApplicationTransition::TurnOutlook(_)
+            | ApplicationTransition::TurnOutlook { .. }
             | ApplicationTransition::ResolveWorkspace { .. }
             | ApplicationTransition::CancelWorkspaceResolution(_) => {
                 unreachable!("managed events issue no other Session command");

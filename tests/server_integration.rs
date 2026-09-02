@@ -1474,6 +1474,143 @@ async fn successive_remote_requests_reuse_transport_while_an_outlook_holds_inter
 }
 
 #[tokio::test]
+async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
+    let mut pair = paired_servers("independent-remote-catalog-interest").await;
+
+    let laptop_state = tempfile::tempdir().expect("create laptop state directory");
+    let laptop_config_root = tempfile::tempdir().expect("create laptop config directory");
+    let laptop_channel = "independent-remote-catalog-interest-laptop";
+    let laptop = server::spawn_with_timings(
+        ServerConfig::new(laptop_state.path(), laptop_channel)
+            .expect("configure laptop Server")
+            .with_config_dir(laptop_config_root.path()),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .expect("spawn laptop Server");
+    let mut laptop_client = ManagedClient::connect(
+        ManagedClientConfig::new(laptop_state.path(), laptop_channel)
+            .expect("configure laptop Client"),
+    )
+    .await
+    .expect("attach laptop Client");
+    receive_initial_state(&mut laptop_client).await;
+    laptop_client
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
+        .await
+        .expect("ask the operating system for a laptop Serving port");
+    laptop_client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep the laptop route on loopback");
+    laptop_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .expect("turn laptop Serving on");
+    let mut laptop_wire = ObservedTcpProxy::start(
+        laptop
+            .serving_address()
+            .expect("laptop Serving listener is ready"),
+    )
+    .await;
+    let invite = laptop_client
+        .issue_invite(IssueInviteRequest {
+            addresses: vec![laptop_wire.address],
+        })
+        .await
+        .expect("issue laptop Invite");
+    pair.connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: invite.invite,
+            name: Some("laptop".to_owned()),
+            addresses: Vec::new(),
+        })
+        .await
+        .expect("pair the connecting Server with the laptop");
+    laptop_wire.wait_for_connections(0).await;
+
+    let mut workstation_catalog = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()))
+        .subscribe_catalog();
+    let laptop_outlook = pair
+        .connecting_client
+        .outlook(Outlook::Remote("laptop".to_owned()));
+    let mut laptop_catalog = laptop_outlook.subscribe_catalog();
+    for catalog in [&mut workstation_catalog, &mut laptop_catalog] {
+        assert!(matches!(
+            timeout(Duration::from_secs(1), catalog.next())
+                .await
+                .expect("Remote catalog snapshot arrives"),
+            Some(ManagedEvent::SessionCatalogReconciled(_))
+        ));
+    }
+    pair.wire.wait_for_connections(1).await;
+    laptop_wire.wait_for_connections(1).await;
+
+    pair.wire.set_online(false).await;
+    assert!(matches!(
+        timeout(Duration::from_secs(1), workstation_catalog.next())
+            .await
+            .expect("workstation catalog announces recovery"),
+        Some(ManagedEvent::Recovering(_))
+    ));
+    laptop_wire.wait_for_connections(1).await;
+    let workspace = tempfile::tempdir().expect("create laptop Workspace");
+    let created = laptop_outlook
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Keep the second catalog live".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create a Session while the other Remote recovers");
+    assert!(matches!(
+        timeout(Duration::from_secs(1), laptop_catalog.next())
+            .await
+            .expect("the undisturbed laptop catalog reports its update"),
+        Some(ManagedEvent::SessionCreated(event)) if event.session_id == created.session.id
+    ));
+
+    pair.wire.set_online(true).await;
+    let recovered = timeout(Duration::from_secs(1), async {
+        loop {
+            match workstation_catalog.next().await {
+                Some(ManagedEvent::Recovering(_)) => {}
+                event => return event,
+            }
+        }
+    })
+    .await
+    .expect("workstation catalog reconnects independently");
+    assert!(matches!(
+        recovered,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+    pair.wire.wait_for_connections(1).await;
+
+    drop(workstation_catalog);
+    pair.wire.wait_for_connections(0).await;
+    drop(laptop_catalog);
+    laptop_wire.wait_for_connections(0).await;
+
+    drop(laptop_client);
+    laptop.shutdown().await.expect("stop laptop Server");
+    pair.shutdown().await;
+}
+
+#[tokio::test]
 async fn remote_requests_remember_the_last_route_that_answered() {
     let mut pair = paired_servers_with_alternate_route("remote-last-good-route", true).await;
     pair.wire.set_online(false).await;

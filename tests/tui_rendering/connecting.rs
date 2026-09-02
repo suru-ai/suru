@@ -1,5 +1,7 @@
 //! The connecting user's `/connect` command and Pairing surfaces.
 
+use std::collections::HashSet;
+
 use crate::support::{
     fixture_instance_id, model_descriptor, navigable_session_snapshot, ready_health,
     rendered_application_rows, rendered_application_rows_at, text_on, type_terminal_text,
@@ -50,7 +52,10 @@ fn choosing_a_remote_turns_the_outlook_and_the_footer_names_it() {
     press(&mut application, KeyCode::Down);
     assert_eq!(
         press(&mut application, KeyCode::Enter),
-        ApplicationTransition::TurnOutlook(Outlook::Remote("studio".to_owned()))
+        ApplicationTransition::TurnOutlook {
+            outlook: Outlook::Remote("studio".to_owned()),
+            catalog_outlooks: HashSet::from([Outlook::Remote("studio".to_owned())]),
+        }
     );
 
     let landing = rendered_application_rows(&application).join("\n");
@@ -143,7 +148,10 @@ fn a_revoked_remote_returns_to_the_local_landing_with_the_session_composer_recov
                 },
             })
             .unwrap(),
-        ApplicationTransition::TurnOutlook(Outlook::Local)
+        ApplicationTransition::TurnOutlook {
+            outlook: Outlook::Local,
+            catalog_outlooks: HashSet::new(),
+        }
     );
 
     let landing = rendered_application_rows(&application).join("\n");
@@ -201,7 +209,10 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
 
     assert_eq!(
         press(&mut application, KeyCode::Enter),
-        ApplicationTransition::TurnOutlook(Outlook::Local)
+        ApplicationTransition::TurnOutlook {
+            outlook: Outlook::Local,
+            catalog_outlooks: HashSet::new(),
+        }
     );
     assert!(
         !rendered_application_rows(&application)
@@ -284,7 +295,10 @@ fn returning_to_an_outlook_restores_its_stable_selection_presentation() {
     press(&mut application, KeyCode::Up);
     assert_eq!(
         press(&mut application, KeyCode::Enter),
-        ApplicationTransition::TurnOutlook(Outlook::Local)
+        ApplicationTransition::TurnOutlook {
+            outlook: Outlook::Local,
+            catalog_outlooks: HashSet::new(),
+        }
     );
 
     let local_again = rendered_application_rows_at(&application, 100, 16).join("\n");
@@ -352,7 +366,10 @@ fn equal_session_ids_in_different_outlooks_keep_separate_drafts() {
     press(&mut application, KeyCode::Up);
     assert_eq!(
         press(&mut application, KeyCode::Enter),
-        ApplicationTransition::TurnOutlook(Outlook::Local)
+        ApplicationTransition::TurnOutlook {
+            outlook: Outlook::Local,
+            catalog_outlooks: HashSet::new(),
+        }
     );
     application
         .handle_event(ApplicationEvent::SessionAttached(
@@ -647,7 +664,10 @@ fn application_looking_at_studio() -> Application {
     press(&mut application, KeyCode::Down);
     assert_eq!(
         press(&mut application, KeyCode::Enter),
-        ApplicationTransition::TurnOutlook(Outlook::Remote("studio".to_owned()))
+        ApplicationTransition::TurnOutlook {
+            outlook: Outlook::Remote("studio".to_owned()),
+            catalog_outlooks: HashSet::from([Outlook::Remote("studio".to_owned())]),
+        }
     );
     application
 }
@@ -686,7 +706,10 @@ fn turn_to_studio(application: &mut Application) {
     press(application, KeyCode::Down);
     assert_eq!(
         press(application, KeyCode::Enter),
-        ApplicationTransition::TurnOutlook(Outlook::Remote("studio".to_owned()))
+        ApplicationTransition::TurnOutlook {
+            outlook: Outlook::Remote("studio".to_owned()),
+            catalog_outlooks: HashSet::from([Outlook::Remote("studio".to_owned())]),
+        }
     );
 }
 

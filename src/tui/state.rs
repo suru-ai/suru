@@ -2209,7 +2209,14 @@ pub enum ApplicationTransition {
     BeginConnecting,
     PreviewInvite(String),
     RedeemInvite(crate::protocol::RedeemInviteRequest),
-    TurnOutlook(Outlook),
+    /// Turn to one Server and name the Remote catalog streams the run loop
+    /// should keep open after the turn. Keeping the desired set in the
+    /// transition lets headless clients observe the same ownership decision
+    /// without establishing a network connection.
+    TurnOutlook {
+        outlook: Outlook,
+        catalog_outlooks: HashSet<Outlook>,
+    },
     CancelWorkspaceResolution(WorkspaceResolutionSurface),
     ResolveWorkspace {
         outlook: Outlook,
@@ -3429,7 +3436,10 @@ impl Application {
             self.state.turn_outlook(Outlook::Local);
             self.state.settle_remote_failure(message);
             self.state.sync_composer_completion();
-            return Ok(ApplicationTransition::TurnOutlook(Outlook::Local));
+            return Ok(ApplicationTransition::TurnOutlook {
+                outlook: Outlook::Local,
+                catalog_outlooks: HashSet::new(),
+            });
         }
         let had_session = self.state.session.is_some();
         self.state.apply_outlook_catalog(&outlook, event);
@@ -3675,7 +3685,14 @@ impl Application {
                     self.state
                         .begin_workspace_resolution(WorkspaceResolutionSurface::Outlook);
                 }
-                Ok(ApplicationTransition::TurnOutlook(outlook))
+                let catalog_outlooks = match &outlook {
+                    Outlook::Local => HashSet::new(),
+                    Outlook::Remote(_) => HashSet::from([outlook.clone()]),
+                };
+                Ok(ApplicationTransition::TurnOutlook {
+                    outlook,
+                    catalog_outlooks,
+                })
             }
             SemanticCommandId::ConnectMoveAddressUp => {
                 self.state.connect_overlay.move_address_up();
