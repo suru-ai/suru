@@ -53,6 +53,13 @@ impl ListedSession {
         Self { reference, item }
     }
 
+    fn stamp_all(origin: &Outlook, sessions: Vec<SessionListItem>) -> Vec<Self> {
+        sessions
+            .into_iter()
+            .map(|session| Self::new(origin.clone(), session))
+            .collect()
+    }
+
     pub(super) fn reference(&self) -> &SessionReference {
         &self.reference
     }
@@ -150,22 +157,15 @@ impl SessionListing {
         request: &SessionListRequest,
         mut sessions: Vec<SessionListItem>,
     ) -> bool {
-        if !self.awaits(request) {
+        let is_current = request.outlook() == &self.outlook;
+        let Some(origin) = self.awaited_origin_mut(request) else {
             return false;
-        }
+        };
         Self::order(&mut sessions);
-        let rows = sessions
-            .into_iter()
-            .map(|session| ListedSession::new(request.outlook().clone(), session))
-            .collect();
-        let origin = self
-            .origins
-            .get_mut(request.outlook())
-            .expect("an awaited request has an Origin listing");
-        origin.sessions = rows;
+        origin.sessions = ListedSession::stamp_all(request.outlook(), sessions);
         origin.loading = false;
         origin.pending_request = None;
-        request.outlook() == &self.outlook
+        is_current
     }
 
     /// Whether a reply the server sent would move anything this listing holds.
@@ -191,10 +191,7 @@ impl SessionListing {
         }
         let mut arriving = sessions.to_vec();
         Self::order(&mut arriving);
-        let arriving = arriving
-            .into_iter()
-            .map(|session| ListedSession::new(request.outlook().clone(), session))
-            .collect::<Vec<_>>();
+        let arriving = ListedSession::stamp_all(request.outlook(), arriving);
         arriving != self.sessions()
     }
 
@@ -209,17 +206,14 @@ impl SessionListing {
     /// Takes the server's refusal of a listing, reporting whether it answered
     /// the request for the Origin on show.
     pub(super) fn fail(&mut self, request: &SessionListRequest, error: String) -> bool {
-        if !self.awaits(request) {
+        let is_current = request.outlook() == &self.outlook;
+        let Some(origin) = self.awaited_origin_mut(request) else {
             return false;
-        }
-        let origin = self
-            .origins
-            .get_mut(request.outlook())
-            .expect("an awaited request has an Origin listing");
+        };
         origin.loading = false;
         origin.error = Some(error);
         origin.pending_request = None;
-        request.outlook() == &self.outlook
+        is_current
     }
 
     /// Drops every Origin's rows, result, and pending request, so a surface
@@ -401,6 +395,12 @@ impl SessionListing {
             .get(request.outlook())
             .and_then(|origin| origin.pending_request.as_ref())
             == Some(request)
+    }
+
+    fn awaited_origin_mut(&mut self, request: &SessionListRequest) -> Option<&mut OriginListing> {
+        self.origins
+            .get_mut(request.outlook())
+            .filter(|origin| origin.pending_request.as_ref() == Some(request))
     }
 
     fn current_origin(&self) -> Option<&OriginListing> {
