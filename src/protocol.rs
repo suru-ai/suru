@@ -880,6 +880,8 @@ pub enum SidebarScope {
     AllWorkspaces,
     /// Only the Workspace the client itself runs in.
     CurrentWorkspace,
+    /// Every Workspace on every Origin the client can reach.
+    Everywhere,
 }
 
 /// When a Session settles on its own, having been left alone long enough.

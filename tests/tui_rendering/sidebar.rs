@@ -4570,6 +4570,53 @@ fn the_initial_scope_setting_narrows_the_sidebar_a_tui_launches_with() {
     );
 }
 
+#[test]
+fn an_everywhere_initial_scope_launches_into_the_merged_listing() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let ApplicationTransition::ListEverywhereRemotes(request_id) = deliver_sidebar_settings(
+        &mut application,
+        SidebarSettings {
+            initial_visibility: SidebarVisibility::Shown,
+            initial_scope: SidebarScope::Everywhere,
+            ..SidebarSettings::default()
+        },
+    ) else {
+        panic!("an Everywhere Sidebar starts by discovering its paired Remotes");
+    };
+    let ApplicationTransition::ReconcileCatalogOrigins { requests, .. } = application
+        .handle_event(ApplicationEvent::EverywhereRemotesListed {
+            request_id,
+            remotes: vec![remote("studio", RemoteStatus::Available)],
+        })
+        .expect("take the paired Remotes into the starting listing")
+    else {
+        panic!("the starting scope should ask every Origin for its Sessions");
+    };
+
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => vec![listed("Local work", None, workspace.path(), 2, now())],
+            Outlook::Remote(name) if name == "studio" => vec![listed(
+                "Studio work",
+                None,
+                &workspace.path().join("studio"),
+                1,
+                minutes_ago(1),
+            )],
+            other => panic!("unexpected listing Origin: {other:?}"),
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+            .expect("take one Origin's listing into the starting Sidebar");
+    }
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert_eq!(selector_label(&rows), format!("▸ {EVERYWHERE}"));
+    assert!(drawn_in_sidebar(&rows, "Local work"));
+    assert!(drawn_in_sidebar(&rows, "Studio work [studio]"));
+}
+
 /// The reader's own choice is view state: it is not written back, and a later
 /// snapshot carrying some other Setting's edit does not undo it.
 #[test]

@@ -24,8 +24,8 @@ use suru::{
         ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
         ModelOptionRole, ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
         ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
-        SessionId, SessionSettings, SettingMutation, SettingScope, SettingsSnapshot, TitleErrand,
-        TitleSettings, TranscriptSettings,
+        SessionId, SessionSettings, SettingMutation, SettingScope, SettingsSnapshot, SidebarScope,
+        SidebarSettings, TitleErrand, TitleSettings, TranscriptSettings,
     },
     settings::SettingGroup,
     tui::{
@@ -97,6 +97,16 @@ fn with_content_width(content_width: SessionContentWidth) -> EffectiveSettings {
         session: SessionSettings {
             content_width,
             ..SessionSettings::default()
+        },
+        ..EffectiveSettings::default()
+    }
+}
+
+fn with_sidebar_scope(initial_scope: SidebarScope) -> EffectiveSettings {
+    EffectiveSettings {
+        sidebar: SidebarSettings {
+            initial_scope,
+            ..SidebarSettings::default()
         },
         ..EffectiveSettings::default()
     }
@@ -1844,6 +1854,44 @@ fn space_cycles_a_setting_forward_and_wraps_past_the_last_value() {
             value: Some(ReasoningVisibility::Hidden),
         }),
         "stepping on from the last value wraps to the first"
+    );
+}
+
+#[test]
+fn the_sidebar_scope_row_cycles_through_all_workspaces_current_workspace_and_everywhere() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "sidebar.initialScope");
+
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::SidebarInitialScope {
+            value: Some(SidebarScope::CurrentWorkspace),
+        })
+    );
+    deliver_snapshot(
+        &mut application,
+        with_sidebar_scope(SidebarScope::CurrentWorkspace),
+        &["sidebar.initialScope"],
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::SidebarInitialScope {
+            value: Some(SidebarScope::Everywhere),
+        })
+    );
+    deliver_snapshot(
+        &mut application,
+        with_sidebar_scope(SidebarScope::Everywhere),
+        &["sidebar.initialScope"],
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::SidebarInitialScope {
+            value: Some(SidebarScope::AllWorkspaces),
+        }),
+        "the third value wraps to the first"
     );
 }
 

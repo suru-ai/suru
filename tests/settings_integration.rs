@@ -277,14 +277,14 @@ async fn a_hidden_sidebar_pins_from_a_document_and_resets_to_the_shown_default()
 }
 
 #[tokio::test]
-async fn a_sidebar_narrowed_at_launch_pins_from_a_document_and_resets_to_every_workspace() {
+async fn an_everywhere_sidebar_at_launch_pins_from_a_document_and_resets_to_every_workspace() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
     std::fs::write(
         config_dir.path().join("suru.jsonc"),
         r#"{
-            // One directory at a time is how I work.
-            "sidebar": { "initialScope": "current_workspace" },
+            // Every Origin is where I look for work.
+            "sidebar": { "initialScope": "everywhere" },
         }"#,
     )
     .expect("write Config Document");
@@ -299,10 +299,36 @@ async fn a_sidebar_narrowed_at_launch_pins_from_a_document_and_resets_to_every_w
     let (client, opening) = attach(state_dir.path(), "settings-sidebar-scope").await;
     assert_eq!(
         opening.settings.sidebar.initial_scope,
-        SidebarScope::CurrentWorkspace
+        SidebarScope::Everywhere
     );
     assert_eq!(opening.pinned, ["sidebar.initialScope"]);
     assert_eq!(opening.diagnostics, []);
+
+    let narrowed = client
+        .mutate_setting(SettingMutation::SidebarInitialScope {
+            value: Some(SidebarScope::CurrentWorkspace),
+        })
+        .await
+        .expect("narrow the starting scope");
+    assert_eq!(
+        narrowed.settings.sidebar.initial_scope,
+        SidebarScope::CurrentWorkspace
+    );
+    let everywhere = client
+        .mutate_setting(SettingMutation::SidebarInitialScope {
+            value: Some(SidebarScope::Everywhere),
+        })
+        .await
+        .expect("pin Everywhere again");
+    assert_eq!(
+        everywhere.settings.sidebar.initial_scope,
+        SidebarScope::Everywhere,
+        "Everywhere survives the round trip through the Config Document"
+    );
+    assert!(
+        config_document(config_dir.path()).contains(r#""initialScope": "everywhere""#),
+        "the Setting keeps the schema's spelling in the document"
+    );
 
     let answered = client
         .mutate_setting(SettingMutation::SidebarInitialScope { value: None })
@@ -316,6 +342,43 @@ async fn a_sidebar_narrowed_at_launch_pins_from_a_document_and_resets_to_every_w
     assert_eq!(answered.pinned, [] as [String; 0]);
 
     drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn an_invalid_sidebar_scope_names_all_three_accepted_values() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{ "sidebar": { "initialScope": "nearby" } }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-sidebar-scope-invalid")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let snapshot = attach(state_dir.path(), "settings-sidebar-scope-invalid")
+        .await
+        .1;
+    assert_eq!(
+        snapshot.settings.sidebar.initial_scope,
+        SidebarScope::AllWorkspaces,
+        "the rejected value leaves the built-in default in force"
+    );
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one diagnostic, got {:?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.key.as_deref(), Some("sidebar.initialScope"));
+    assert_eq!(
+        diagnostic.message,
+        "ignored because its value is not one of \"all_workspaces\", \"current_workspace\", or \"everywhere\""
+    );
+
     server.shutdown().await.expect("shut down server");
 }
 

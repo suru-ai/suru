@@ -713,6 +713,7 @@ impl Sidebar {
         }
         self.seeded = true;
         self.scope = match settings.sidebar.initial_scope {
+            InitialSidebarScope::Everywhere => SidebarListingScope::Everywhere,
             InitialSidebarScope::AllWorkspaces => SidebarListingScope::AllWorkspaces,
             InitialSidebarScope::CurrentWorkspace => {
                 SidebarListingScope::Workspace(self.listing.current_workspace().to_owned())

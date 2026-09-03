@@ -706,6 +706,12 @@ pub const SCHEMA: &[SettingDescriptor] = &[
                     value: Some(SidebarScope::CurrentWorkspace),
                 },
             },
+            SettingChoice {
+                value: "everywhere",
+                pin: SettingMutation::SidebarInitialScope {
+                    value: Some(SidebarScope::Everywhere),
+                },
+            },
         ]),
         reset: SettingMutation::SidebarInitialScope { value: None },
         apply: |settings, value| {
@@ -1655,7 +1661,7 @@ mod tests {
                 // can and describes the rest, in the same breath.
                 "one of \"session\", \"off\", or an Agent Selection".to_owned(),
                 "one of \"shown\" or \"hidden\"".to_owned(),
-                "one of \"all_workspaces\" or \"current_workspace\"".to_owned(),
+                "one of \"all_workspaces\", \"current_workspace\", or \"everywhere\"".to_owned(),
                 "one of \"off\" or a whole number of days, at least 1".to_owned(),
                 // A boolean Setting is diagnosed as accepting `true` or
                 // `false`, unquoted, because that is what the reader must type.
