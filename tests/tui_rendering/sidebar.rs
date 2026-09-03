@@ -767,7 +767,18 @@ fn listed_as(
     workspace: &Path,
     created_at: u64,
 ) -> SessionListItem {
-    let SessionListItem::Readable(mut summary) = listed(title, None, workspace, created_at, now())
+    listed_with_id_and_updated_at(session_id, title, workspace, created_at, now())
+}
+
+fn listed_with_id_and_updated_at(
+    session_id: SessionId,
+    title: &str,
+    workspace: &Path,
+    created_at: u64,
+    updated_at: u64,
+) -> SessionListItem {
+    let SessionListItem::Readable(mut summary) =
+        listed(title, None, workspace, created_at, updated_at)
     else {
         unreachable!("the fixture builds a readable Session");
     };
@@ -3701,6 +3712,38 @@ fn choose_everywhere(application: &mut Application, remotes: Vec<Remote>) -> Eve
     }
 }
 
+fn everywhere_with_studio(
+    workspace: &Path,
+    local_sessions: Vec<SessionListItem>,
+    studio_sessions: Vec<SessionListItem>,
+) -> (Application, std::collections::HashSet<Outlook>) {
+    let mut application = sidebar_focused(workspace, Vec::new());
+    let EverywhereListing {
+        catalog_origins,
+        requests,
+    } = choose_everywhere(
+        &mut application,
+        vec![remote("studio", RemoteStatus::Available)],
+    );
+    let mut local_sessions = Some(local_sessions);
+    let mut studio_sessions = Some(studio_sessions);
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => local_sessions
+                .take()
+                .expect("Everywhere asks the local Origin once"),
+            Outlook::Remote(name) if name == "studio" => {
+                studio_sessions.take().expect("Everywhere asks studio once")
+            }
+            other => panic!("unexpected listing Origin: {other:?}"),
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+            .expect("take one Origin's listing into Everywhere");
+    }
+    (application, catalog_origins)
+}
+
 /// The Workspace selector stands between the search box and the list it
 /// governs, saying what the Sidebar is narrowed to before it says anything
 /// about the work itself.
@@ -3886,6 +3929,219 @@ fn everywhere_tags_only_foreign_rows_and_keeps_the_tag_when_the_title_is_cut() {
         buffer.cell((column, row)).expect("the tag is drawn").fg,
         Color::DarkGray,
         "the Remote's name is a dim tag"
+    );
+}
+
+#[test]
+fn enter_on_a_foreign_row_turns_then_opens_it_without_disturbing_everywhere() {
+    let workspace = workspace_dir();
+    let foreign_workspace = workspace.path().join("studio-work");
+    let local = SessionId::new();
+    let foreign = SessionId::new();
+    let (mut application, catalog_origins) = everywhere_with_studio(
+        workspace.path(),
+        vec![listed_with_id_and_updated_at(
+            local,
+            "Local work",
+            workspace.path(),
+            1,
+            minutes_ago(2),
+        )],
+        vec![listed_with_id_and_updated_at(
+            foreign,
+            "Studio work",
+            &foreign_workspace,
+            2,
+            minutes_ago(1),
+        )],
+    );
+
+    step_onto_the_list(&mut application);
+    assert!(
+        selected_sidebar_text(&application).contains("Studio work"),
+        "Enter is poised over the foreign row: {:?}",
+        selected_sidebar_text(&application)
+    );
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::TurnOutlookAndAttach {
+            session: SessionReference::new(Outlook::Remote("studio".to_owned()), foreign),
+            catalog_origins,
+        },
+        "the Outlook turn and attachment are one ordered client transition"
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert_eq!(selector_label(&rows), format!("▸ {EVERYWHERE}"));
+    assert!(drawn_in_sidebar(&rows, "Local work"));
+    assert!(drawn_in_sidebar(&rows, "Studio work [studio]"));
+    assert!(
+        open_sidebar_text(&application).contains("Studio work [studio]"),
+        "the open highlight lands on the foreign row"
+    );
+    let reference = SessionReference::new(Outlook::Remote("studio".to_owned()), foreign);
+    application
+        .handle_event(ApplicationEvent::OriginSessionAttached {
+            reference,
+            snapshot: failed_session_snapshot(
+                foreign,
+                PromptId::new(),
+                "Studio work",
+                &foreign_workspace,
+            ),
+        })
+        .expect("hydrate the foreign Session");
+    let session = rendered_application_rows_at(&application, WIDE, 20).join("\n");
+    assert!(
+        session.contains("Outlook studio"),
+        "the hydrated Session's header names the Remote: {session:?}"
+    );
+}
+
+#[test]
+fn a_pointer_turn_uses_the_sessions_workspace_then_remembers_it_for_that_outlook() {
+    let workspace = workspace_dir();
+    let first_workspace = workspace.path().join("first-studio-work");
+    let second_workspace = workspace.path().join("second-studio-work");
+    let local = SessionId::new();
+    let first = SessionId::new();
+    let second = SessionId::new();
+    let (mut application, catalog_origins) = everywhere_with_studio(
+        workspace.path(),
+        vec![listed_with_id_and_updated_at(
+            local,
+            "Local work",
+            workspace.path(),
+            1,
+            minutes_ago(3),
+        )],
+        vec![
+            listed_with_id_and_updated_at(
+                first,
+                "First studio work",
+                &first_workspace,
+                3,
+                minutes_ago(1),
+            ),
+            listed_with_id_and_updated_at(
+                second,
+                "Second studio work",
+                &second_workspace,
+                2,
+                minutes_ago(2),
+            ),
+        ],
+    );
+
+    assert_eq!(
+        press_line(&mut application, MouseButton::Left, "First studio work"),
+        ApplicationTransition::TurnOutlookAndAttach {
+            session: SessionReference::new(Outlook::Remote("studio".to_owned()), first),
+            catalog_origins: catalog_origins.clone(),
+        }
+    );
+    let ApplicationTransition::ListSessions(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionList,
+        )))
+        .expect("open the Session picker")
+    else {
+        panic!("the Session picker observes the Workspace adopted from the foreign row");
+    };
+    assert_eq!(
+        request.scope(),
+        &SessionListScope::CurrentWorkspace(first_workspace.clone())
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::CloseSessionPicker))
+        .expect("close the Session picker");
+
+    assert_eq!(
+        press_line(&mut application, MouseButton::Left, "Local work"),
+        ApplicationTransition::TurnOutlookAndAttach {
+            session: SessionReference::new(Outlook::Local, local),
+            catalog_origins: catalog_origins.clone(),
+        }
+    );
+    assert_eq!(
+        press_line(&mut application, MouseButton::Left, "Second studio work"),
+        ApplicationTransition::TurnOutlookAndAttach {
+            session: SessionReference::new(Outlook::Remote("studio".to_owned()), second),
+            catalog_origins,
+        }
+    );
+    let ApplicationTransition::ListSessions(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionList,
+        )))
+        .expect("open the Session picker after returning to studio")
+    else {
+        panic!("the Session picker observes the remembered studio Workspace");
+    };
+    assert_eq!(
+        request.scope(),
+        &SessionListScope::CurrentWorkspace(first_workspace),
+        "returning to an Outlook keeps its remembered Workspace instead of adopting another row's"
+    );
+}
+
+#[test]
+fn foreign_row_menu_actions_keep_the_rows_origin_and_delete_still_confirms() {
+    let workspace = workspace_dir();
+    let active = SessionId::new();
+    let settled_id = SessionId::new();
+    let (mut application, _) = everywhere_with_studio(
+        workspace.path(),
+        Vec::new(),
+        vec![
+            listed_with_id_and_updated_at(
+                active,
+                "Foreign active",
+                workspace.path(),
+                2,
+                minutes_ago(1),
+            ),
+            set_aside(
+                listed_with_id_and_updated_at(
+                    settled_id,
+                    "Foreign settled",
+                    workspace.path(),
+                    1,
+                    minutes_ago(2),
+                ),
+                minutes_ago(1),
+            ),
+        ],
+    );
+    let studio = Outlook::Remote("studio".to_owned());
+
+    let active_anchor = open_menu_on(&mut application, "Foreign active");
+    assert_eq!(
+        press_menu_item(&mut application, active_anchor, 0),
+        ApplicationTransition::SettleSession {
+            session: SessionReference::new(studio.clone(), active),
+            settled: true,
+        }
+    );
+
+    let settled_anchor = open_menu_on(&mut application, "Foreign settled");
+    assert_eq!(
+        press_menu_item(&mut application, settled_anchor, 0),
+        ApplicationTransition::SettleSession {
+            session: SessionReference::new(studio.clone(), settled_id),
+            settled: false,
+        }
+    );
+
+    let active_anchor = open_menu_on(&mut application, "Foreign active");
+    assert_eq!(
+        press_menu_item(&mut application, active_anchor, 1),
+        ApplicationTransition::Continue,
+        "the first delete press only asks for confirmation"
+    );
+    assert_eq!(
+        press_menu_item(&mut application, active_anchor, 1),
+        ApplicationTransition::DeleteSession(SessionReference::new(studio, active))
     );
 }
 

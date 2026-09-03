@@ -741,14 +741,7 @@ impl RunLoop {
                 outlook,
                 catalog_origins,
             } => {
-                self.tasks.leave_session();
-                self.tasks.reset_skill_listing();
-                self.tasks.reconcile_catalog_origins(
-                    &self.client,
-                    catalog_origins,
-                    &self.channels.origin_catalog,
-                );
-                self.tasks.reset_workspace_resolutions();
+                self.prepare_outlook_turn(catalog_origins);
                 match self.application.take_sidebar_listing_transition() {
                     ApplicationTransition::ListSessions(request) => self.list_sessions(request),
                     ApplicationTransition::ReconcileCatalogOrigins {
@@ -783,6 +776,14 @@ impl RunLoop {
                     );
                 }
             }
+            ApplicationTransition::TurnOutlookAndAttach {
+                session,
+                catalog_origins,
+            } => {
+                self.prepare_outlook_turn(catalog_origins);
+                let commands = self.client.session_commands_for(session.origin.clone());
+                self.tasks.attach(commands, session, &self.channels.pickers);
+            }
             ApplicationTransition::ResolveWorkspace {
                 outlook,
                 surface,
@@ -815,6 +816,17 @@ impl RunLoop {
             operation,
             self.channels.submissions.clone(),
         );
+    }
+
+    fn prepare_outlook_turn(&mut self, catalog_origins: HashSet<Outlook>) {
+        self.tasks.leave_session();
+        self.tasks.reset_skill_listing();
+        self.tasks.reconcile_catalog_origins(
+            &self.client,
+            catalog_origins,
+            &self.channels.origin_catalog,
+        );
+        self.tasks.reset_workspace_resolutions();
     }
 
     fn list_sessions(&mut self, request: SessionListRequest) {
@@ -905,6 +917,7 @@ impl RunLoop {
             | ApplicationTransition::PreviewInvite(_)
             | ApplicationTransition::RedeemInvite(_)
             | ApplicationTransition::TurnOutlook { .. }
+            | ApplicationTransition::TurnOutlookAndAttach { .. }
             | ApplicationTransition::ResolveWorkspace { .. }
             | ApplicationTransition::CancelWorkspaceResolution(_) => {
                 unreachable!("managed events issue no other Session command");

@@ -403,6 +403,11 @@ pub struct TuiState {
     pub(super) settings_panel: SettingsPanel,
 }
 
+enum OutlookTurn {
+    Deliberate,
+    SidebarRow { fallback_workspace: PathBuf },
+}
+
 #[derive(Clone, Debug)]
 struct PendingSubmission {
     source: ComposerKey,
@@ -620,9 +625,39 @@ impl TuiState {
     }
 
     fn turn_outlook(&mut self, outlook: Outlook) {
+        self.turn_outlook_with(outlook, OutlookTurn::Deliberate);
+    }
+
+    /// Turns toward the Origin of a Session already present in the merged
+    /// Sidebar, then carries the reader into its optimistic route. The row's
+    /// Workspace is authoritative when this Client has not visited that
+    /// Outlook before; unlike a deliberate Connect turn, no resolution is
+    /// needed because the listing already came from that Origin.
+    fn turn_outlook_for_session(&mut self, target: SessionReference, workspace: PathBuf) {
+        let remembers_workspace = self.outlook_workspaces.contains_key(&target.origin);
+        self.turn_outlook_with(
+            target.origin.clone(),
+            OutlookTurn::SidebarRow {
+                fallback_workspace: workspace,
+            },
+        );
+        if !remembers_workspace {
+            self.outlook_workspaces
+                .insert(target.origin.clone(), self.workspace.clone());
+        }
+        self.open_session_route(target);
+    }
+
+    fn turn_outlook_with(&mut self, outlook: Outlook, turn: OutlookTurn) {
         if self.outlook == outlook {
             return;
         }
+        let (fallback_workspace, adopt_sidebar): (PathBuf, fn(&mut Sidebar, Outlook)) = match turn {
+            OutlookTurn::Deliberate => (PathBuf::from("."), Sidebar::adopt_outlook),
+            OutlookTurn::SidebarRow { fallback_workspace } => {
+                (fallback_workspace, Sidebar::adopt_outlook_from_row)
+            }
+        };
         self.outlook_landing_selections
             .insert(self.outlook.clone(), self.landing_agent_selection.clone());
         self.outlook = outlook.clone();
@@ -631,7 +666,7 @@ impl TuiState {
             .outlook_workspaces
             .get(&outlook)
             .cloned()
-            .unwrap_or_else(|| PathBuf::from("."));
+            .unwrap_or(fallback_workspace);
         self.leave_session_route();
         self.session_events_blocked = true;
         self.pending_submission = None;
@@ -657,7 +692,7 @@ impl TuiState {
         self.sidebar.adopt_workspace(self.workspace.clone());
         self.session_picker.adopt_outlook(outlook.clone());
         self.workspace_picker.adopt_outlook(outlook.clone());
-        self.sidebar.adopt_outlook(outlook);
+        adopt_sidebar(&mut self.sidebar, outlook);
         self.command_mode = CommandMode::Composer;
         self.submission_error = None;
         self.sync_composer_completion();
@@ -2277,6 +2312,12 @@ pub enum ApplicationTransition {
         outlook: Outlook,
         catalog_origins: HashSet<Outlook>,
     },
+    /// Turn to a foreign Sidebar row's Origin and attach it, in that order,
+    /// while retaining the merged Sidebar which supplied the row.
+    TurnOutlookAndAttach {
+        session: SessionReference,
+        catalog_origins: HashSet<Outlook>,
+    },
     CancelWorkspaceResolution(WorkspaceResolutionSurface),
     ResolveWorkspace {
         outlook: Outlook,
@@ -3204,9 +3245,18 @@ impl Application {
                     // Enter and a press both arrive here, so both open the
                     // Session the same way: the route moves now and the
                     // attachment follows it.
-                    SidebarActivation::Attach(target) => {
-                        self.state.open_session_route(target.clone());
-                        ApplicationTransition::AttachSession(target)
+                    SidebarActivation::Attach { session, workspace } => {
+                        if session.origin == self.state.outlook {
+                            self.state.open_session_route(session.clone());
+                            ApplicationTransition::AttachSession(session)
+                        } else {
+                            self.state
+                                .turn_outlook_for_session(session.clone(), workspace);
+                            ApplicationTransition::TurnOutlookAndAttach {
+                                catalog_origins: self.state.sidebar.catalog_origins(),
+                                session,
+                            }
+                        }
                     }
                     // The path entry is a local act inside the Sidebar as
                     // well as a switch, so it does both: the client moves, and

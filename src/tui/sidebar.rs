@@ -550,7 +550,10 @@ pub(super) enum SidebarActivation {
     /// Narrowing from Everywhere changes which catalog streams the Client
     /// owns even though the listing already in hand needs no fresh request.
     CatalogOriginsChanged,
-    Attach(SessionReference),
+    Attach {
+        session: SessionReference,
+        workspace: PathBuf,
+    },
     /// The reader named a directory to work in. It is the client's current
     /// Workspace from here: the root of the Sessions they make next, and what
     /// current-Workspace scope comes to mean.
@@ -934,12 +937,23 @@ impl Sidebar {
     /// Whether this Session is one the listing in hand could read, which is
     /// what decides whether its row can be opened at all.
     fn is_readable(&self, reference: &SessionReference) -> bool {
+        self.listed_session(reference)
+            .and_then(|session| session.readable())
+            .is_some()
+    }
+
+    fn listed_session(&self, reference: &SessionReference) -> Option<&ListedSession> {
+        if self.scope == SidebarListingScope::Everywhere {
+            return self
+                .listing
+                .sessions_across(&self.everywhere_origins)
+                .into_iter()
+                .find(|session| session.reference() == reference);
+        }
         self.listing
             .sessions()
             .iter()
             .find(|session| session.reference() == reference)
-            .and_then(|session| session.readable())
-            .is_some()
     }
 
     /// Opens the context menu on the row the reader asked for one on, which
@@ -964,12 +978,7 @@ impl Sidebar {
         let Some(SidebarTarget::Session(reference)) = hit else {
             return;
         };
-        let Some(session) = self
-            .listing
-            .sessions()
-            .iter()
-            .find(|session| session.reference() == &reference)
-        else {
+        let Some(session) = self.listed_session(&reference) else {
             return;
         };
         let settled = self.settlement().settles(session);
@@ -1527,13 +1536,21 @@ impl Sidebar {
             self.hand_back_keys();
             return SidebarActivation::Answered;
         }
+        let workspace = self
+            .listed_session(&wanted)
+            .and_then(|session| session.workspace())
+            .map(|workspace| workspace.path.clone())
+            .expect("a readable Sidebar Session carries its Workspace");
         self.listing.clear_error();
         self.attaching = Some(wanted.clone());
         // The reader is done choosing the moment they choose: opening is
         // optimistic, so the keys go to the Session's composer now rather
         // than when its snapshot lands.
         self.hand_back_keys();
-        SidebarActivation::Attach(wanted)
+        SidebarActivation::Attach {
+            session: wanted,
+            workspace,
+        }
     }
 
     /// Opens the path entry the affordance stands for.
@@ -1635,6 +1652,14 @@ impl Sidebar {
         if self.revealed {
             self.ask_for_sessions();
         }
+    }
+
+    /// Turns the listing's ordinary single-Origin reading while preserving an
+    /// Everywhere view that supplied the Session being opened. Its merged
+    /// rows and stream interests already describe the new Outlook, so opening
+    /// one of them needs no refresh.
+    pub(super) fn adopt_outlook_from_row(&mut self, outlook: Outlook) {
+        self.listing.adopt_outlook(outlook);
     }
 
     /// Re-asks after a newly chosen Outlook has named its canonical Workspace.
@@ -2469,9 +2494,11 @@ mod tests {
         );
 
         sidebar.focus_on(SidebarTarget::Session(reference.clone()));
-        assert_eq!(
-            sidebar.activate(None, false),
-            SidebarActivation::Attach(reference),
+        assert!(
+            matches!(
+                sidebar.activate(None, false),
+                SidebarActivation::Attach { session, .. } if session == reference
+            ),
             "row activation carries the same Origin"
         );
     }
