@@ -41,8 +41,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::attachment::{AttachmentOperationId, AttachmentOutcome, SessionAttachment};
 use super::shimmer;
 use super::state::{
-    Application, ApplicationEvent, ApplicationTransition, ModelListRequest, SessionListRequest,
-    SessionListSurface, WorkspaceResolutionSurface,
+    Application, ApplicationEvent, ApplicationTransition, EverywhereListRequest, ModelListRequest,
+    SessionListRequest, SessionListSurface, WorkspaceResolutionSurface,
 };
 use crate::terminal::TerminalFacts;
 
@@ -772,24 +772,7 @@ impl RunLoop {
                 catalog_origins,
             } => {
                 self.prepare_outlook_turn(catalog_origins);
-                match self.application.take_sidebar_listing_transition() {
-                    ApplicationTransition::ListSessions(request) => self.list_sessions(request),
-                    ApplicationTransition::ReconcileCatalogOrigins {
-                        catalog_origins,
-                        requests,
-                    } => self.reconcile_catalog_origins(catalog_origins, requests),
-                    ApplicationTransition::ListEverywhereRemotes(request_id) => {
-                        spawn_everywhere_remote_listing(
-                            self.client.session_commands(),
-                            request_id,
-                            self.channels.pairing.clone(),
-                        );
-                    }
-                    ApplicationTransition::Continue => {}
-                    other => unreachable!(
-                        "a Sidebar pending after an Outlook turn only lists Sessions: {other:?}"
-                    ),
-                }
+                self.dispatch_pending_listing_after_turn();
                 if matches!(outlook, Outlook::Remote(_)) {
                     self.tasks.resolve_workspace(
                         self.client.session_commands_for(outlook.clone()),
@@ -811,6 +794,7 @@ impl RunLoop {
                 catalog_origins,
             } => {
                 self.prepare_outlook_turn(catalog_origins);
+                self.dispatch_pending_listing_after_turn();
                 let commands = self.client.session_commands_for(session.origin.clone());
                 self.tasks.attach(commands, session, &self.channels.pickers);
             }
@@ -857,6 +841,27 @@ impl RunLoop {
             &self.channels.origin_catalog,
         );
         self.tasks.reset_workspace_resolutions();
+    }
+
+    fn dispatch_pending_listing_after_turn(&mut self) {
+        match self.application.take_session_listing_transition() {
+            ApplicationTransition::ListSessions(request) => self.list_sessions(request),
+            ApplicationTransition::ReconcileCatalogOrigins {
+                catalog_origins,
+                requests,
+            } => self.reconcile_catalog_origins(catalog_origins, requests),
+            ApplicationTransition::ListEverywhereRemotes(request) => {
+                spawn_everywhere_remote_listing(
+                    self.client.session_commands(),
+                    request,
+                    self.channels.pairing.clone(),
+                );
+            }
+            ApplicationTransition::Continue => {}
+            other => unreachable!(
+                "a Sidebar pending after an Outlook turn only lists Sessions: {other:?}"
+            ),
+        }
     }
 
     fn list_sessions(&mut self, request: SessionListRequest) {
@@ -958,7 +963,7 @@ impl RunLoop {
         }
         // The transition carries at most one Session command, and the Sidebar
         // can ask to catch up on an event that already produced another one.
-        let pending = self.application.take_sidebar_listing_transition();
+        let pending = self.application.take_session_listing_transition();
         if pending != ApplicationTransition::Continue {
             let _ = self.dispatch_transition(pending);
         }
@@ -1379,9 +1384,7 @@ impl RunLoop {
                 let transition = self.application.handle_event(
                     ApplicationEvent::OriginSessionAttachmentFailed { reference, error },
                 )?;
-                if let ApplicationTransition::ListSessions(request) = transition {
-                    self.list_sessions(request);
-                }
+                return Ok(self.dispatch_transition(transition));
             }
         }
         Ok(ControlFlow::Continue(()))
@@ -1393,9 +1396,9 @@ impl RunLoop {
     ) -> Result<ControlFlow<Exit>> {
         let result = result.ok_or_else(|| anyhow!("Pairing task channel stopped unexpectedly"))?;
         self.needs_redraw |= match &result {
-            PairingResult::EverywhereRemotesListed { request_id, .. }
-            | PairingResult::EverywhereRemoteListingFailed { request_id, .. } => {
-                self.application.accepts_everywhere_remotes(*request_id)
+            PairingResult::EverywhereRemotesListed { request, .. }
+            | PairingResult::EverywhereRemoteListingFailed { request, .. } => {
+                self.application.accepts_everywhere_remotes(*request)
             }
             _ => true,
         };
@@ -1418,15 +1421,11 @@ impl RunLoop {
             PairingResult::RemoteListingFailed(error) => {
                 ApplicationEvent::RemoteListingFailed(error)
             }
-            PairingResult::EverywhereRemotesListed {
-                request_id,
-                remotes,
-            } => ApplicationEvent::EverywhereRemotesListed {
-                request_id,
-                remotes,
-            },
-            PairingResult::EverywhereRemoteListingFailed { request_id, error } => {
-                ApplicationEvent::EverywhereRemoteListingFailed { request_id, error }
+            PairingResult::EverywhereRemotesListed { request, remotes } => {
+                ApplicationEvent::EverywhereRemotesListed { request, remotes }
+            }
+            PairingResult::EverywhereRemoteListingFailed { request, error } => {
+                ApplicationEvent::EverywhereRemoteListingFailed { request, error }
             }
             PairingResult::InvitePreviewed { invite, preview } => {
                 ApplicationEvent::InvitePreviewed { invite, preview }
@@ -1580,11 +1579,11 @@ enum PairingResult {
     RemotesListed(Vec<crate::protocol::Remote>),
     RemoteListingFailed(String),
     EverywhereRemotesListed {
-        request_id: u64,
+        request: EverywhereListRequest,
         remotes: Vec<crate::protocol::Remote>,
     },
     EverywhereRemoteListingFailed {
-        request_id: u64,
+        request: EverywhereListRequest,
         error: String,
     },
     InvitePreviewed {
@@ -1676,17 +1675,14 @@ fn spawn_remote_listing(commands: SessionCommandClient, results: UnboundedSender
 
 fn spawn_everywhere_remote_listing(
     commands: SessionCommandClient,
-    request_id: u64,
+    request: EverywhereListRequest,
     results: UnboundedSender<PairingResult>,
 ) {
     tokio::spawn(async move {
         let result = match commands.list_remotes().await {
-            Ok(remotes) => PairingResult::EverywhereRemotesListed {
-                request_id,
-                remotes,
-            },
+            Ok(remotes) => PairingResult::EverywhereRemotesListed { request, remotes },
             Err(error) => PairingResult::EverywhereRemoteListingFailed {
-                request_id,
+                request,
                 error: error.to_string(),
             },
         };

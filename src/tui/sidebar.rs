@@ -11,15 +11,15 @@ use std::{
 use ratatui::layout::Position;
 
 use crate::protocol::{
-    AutoSettle, EffectiveSettings, EmojiVisibility, Outlook, Remote, RemoteStatus,
-    ResolveWorkspaceRequest, SessionId, SessionListItem, SessionReference, SessionTimestamp,
+    AutoSettle, EffectiveSettings, EmojiVisibility, Outlook, Remote, ResolveWorkspaceRequest,
+    SessionId, SessionListItem, SessionReference, SessionTimestamp,
     SidebarScope as InitialSidebarScope, SidebarVisibility,
 };
 
 use super::{
-    SessionListRequest, SessionListScope, SessionListSurface,
+    EverywhereListRequest, SessionListRequest, SessionListScope, SessionListSurface,
     commands::{SemanticCommandId, SemanticInvocation},
-    session_listing::{ListedSession, SessionListing},
+    session_listing::{ListedSession, SessionListing, everywhere_origins},
 };
 
 /// The columns the Sidebar occupies, cloning t3 code's own fixed column. There
@@ -1345,15 +1345,20 @@ impl Sidebar {
         requests.into_iter().next()
     }
 
-    pub(super) fn take_everywhere_remote_request(&mut self) -> Option<u64> {
-        std::mem::take(&mut self.everywhere_remote_dispatch_pending)
-            .then_some(self.pending_everywhere_remotes?)
+    pub(super) fn take_everywhere_remote_request(&mut self) -> Option<EverywhereListRequest> {
+        std::mem::take(&mut self.everywhere_remote_dispatch_pending).then_some(
+            EverywhereListRequest::new(
+                SessionListSurface::Sidebar,
+                self.pending_everywhere_remotes?,
+            ),
+        )
     }
 
     /// Whether a paired-Remote reply still belongs to the scope on show.
-    pub(super) fn accepts_everywhere_remotes(&self, request_id: u64) -> bool {
-        self.scope == SidebarListingScope::Everywhere
-            && self.pending_everywhere_remotes == Some(request_id)
+    pub(super) fn accepts_everywhere_remotes(&self, request: EverywhereListRequest) -> bool {
+        request.surface() == SessionListSurface::Sidebar
+            && self.scope == SidebarListingScope::Everywhere
+            && self.pending_everywhere_remotes == Some(request.id())
     }
 
     /// Begins one fresh listing per reachable Origin from the durable Remote
@@ -1361,21 +1366,14 @@ impl Sidebar {
     /// are terminal and contribute neither requests nor stale rows.
     pub(super) fn load_everywhere_remotes(
         &mut self,
-        request_id: u64,
+        request: EverywhereListRequest,
         remotes: Vec<Remote>,
     ) -> Option<Vec<SessionListRequest>> {
-        if !self.accepts_everywhere_remotes(request_id) {
+        if !self.accepts_everywhere_remotes(request) {
             return None;
         }
         self.pending_everywhere_remotes = None;
-        let mut origins = vec![Outlook::Local];
-        origins.extend(remotes.into_iter().filter_map(|remote| {
-            (!matches!(
-                remote.status,
-                RemoteStatus::Revoked | RemoteStatus::ProtocolMismatch
-            ))
-            .then_some(Outlook::Remote(remote.name))
-        }));
+        let origins = everywhere_origins(remotes);
         self.listing.retain_origins(&origins);
         self.recovering_origins
             .retain(|outlook| origins.contains(outlook));
@@ -1445,8 +1443,12 @@ impl Sidebar {
         self.scope == SidebarListingScope::Everywhere && self.everywhere_origins.contains(outlook)
     }
 
-    pub(super) fn fail_everywhere_remotes(&mut self, request_id: u64, error: String) -> bool {
-        if !self.accepts_everywhere_remotes(request_id) {
+    pub(super) fn fail_everywhere_remotes(
+        &mut self,
+        request: EverywhereListRequest,
+        error: String,
+    ) -> bool {
+        if !self.accepts_everywhere_remotes(request) {
             return false;
         }
         self.pending_everywhere_remotes = None;
@@ -1759,12 +1761,17 @@ impl Sidebar {
         }
     }
 
-    /// Turns the listing's ordinary single-Origin reading while preserving an
-    /// Everywhere view that supplied the Session being opened. Its merged
-    /// rows and stream interests already describe the new Outlook, so opening
-    /// one of them needs no refresh.
+    /// Turns the listing after a cross-Origin Session row was chosen. An
+    /// Everywhere Sidebar supplied that row itself, so its merged view already
+    /// describes the new Outlook and remains untouched. A row chosen in
+    /// another surface leaves this Sidebar's own scope intact while refreshing
+    /// that scope against the new Outlook.
     pub(super) fn adopt_outlook_from_row(&mut self, outlook: Outlook) {
-        self.listing.adopt_outlook(outlook);
+        if self.scope == SidebarListingScope::Everywhere {
+            self.listing.adopt_outlook(outlook);
+        } else {
+            self.adopt_outlook(outlook);
+        }
     }
 
     /// Re-asks after a newly chosen Outlook has named its canonical Workspace.

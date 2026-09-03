@@ -7,18 +7,19 @@ use crate::support::{
     type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::Color;
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        EffectiveSettings, EmojiVisibility, ModelAvailability, PromptId, Session,
-        SessionCatalogRevision, SessionCatalogSnapshot, SessionDeleted, SessionId, SessionListItem,
-        SessionSettings, SessionStatus, SessionSummary, SessionTimestamp, SessionTitleChanged,
-        SettingsSnapshot, SidebarSettings, SidebarVisibility, TitleSettings,
-        UnreadableSessionSummary, Workspace,
+        EffectiveSettings, EmojiVisibility, ModelAvailability, Outlook, PromptId, Remote,
+        RemoteStatus, Session, SessionCatalogRevision, SessionCatalogSnapshot, SessionCreated,
+        SessionDeleted, SessionId, SessionListItem, SessionSettings, SessionStatus, SessionSummary,
+        SessionTimestamp, SessionTitleChanged, SettingsSnapshot, SidebarSettings,
+        SidebarVisibility, TitleSettings, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SessionListRequest,
-        SessionListScope,
+        SessionListScope, SessionListSurface,
     },
 };
 
@@ -543,6 +544,510 @@ fn session_picker_searches_titles_and_remembers_all_workspace_scope() {
             )))
             .expect("invoke /continue alias"),
         SessionListScope::AllWorkspaces,
+    );
+}
+
+#[test]
+fn session_picker_scope_cycles_through_current_all_and_everywhere() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+
+    let current = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::SessionList,
+        )))
+        .expect("open the Session picker");
+    expect_session_list_request(
+        current,
+        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Current Workspace")
+    );
+
+    let all = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("widen to all Workspaces");
+    expect_session_list_request(all, SessionListScope::AllWorkspaces);
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("All Workspaces")
+    );
+
+    let ApplicationTransition::ListEverywhereRemotes(request) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("widen to Everywhere")
+    else {
+        panic!("Everywhere first discovers the paired Remotes");
+    };
+    assert_eq!(request.surface(), SessionListSurface::SessionPicker);
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Everywhere")
+    );
+
+    let ApplicationTransition::ReconcileCatalogOrigins {
+        catalog_origins,
+        requests,
+    } = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("narrow to the current Workspace")
+    else {
+        panic!("leaving Everywhere reconciles its Origin interests");
+    };
+    assert!(catalog_origins.is_empty());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].outlook(), &Outlook::Local);
+    assert_eq!(
+        requests[0].scope(),
+        &SessionListScope::CurrentWorkspace(workspace.path().to_owned())
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Current Workspace")
+    );
+}
+
+#[test]
+fn everywhere_picker_asks_each_origin_and_draws_one_tagged_recency_order() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let current = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::SessionList,
+        )))
+        .expect("open the Session picker");
+    expect_session_list_request(
+        current,
+        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+    );
+    expect_session_list_request(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+            )))
+            .expect("widen to all Workspaces"),
+        SessionListScope::AllWorkspaces,
+    );
+    let ApplicationTransition::ListEverywhereRemotes(discovery) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("widen to Everywhere")
+    else {
+        panic!("Everywhere first discovers its Origins");
+    };
+
+    let ApplicationTransition::ReconcileCatalogOrigins {
+        catalog_origins,
+        requests,
+    } = application
+        .handle_event(ApplicationEvent::EverywhereRemotesListed {
+            request: discovery,
+            remotes: vec![
+                remote("studio", RemoteStatus::Available),
+                remote("sleeping", RemoteStatus::Unavailable),
+                remote("revoked", RemoteStatus::Revoked),
+            ],
+        })
+        .expect("discover the picker's Origins")
+    else {
+        panic!("one Session listing should be requested per participating Origin");
+    };
+    assert_eq!(
+        catalog_origins,
+        std::collections::HashSet::from([
+            Outlook::Remote("studio".to_owned()),
+            Outlook::Remote("sleeping".to_owned()),
+        ])
+    );
+    assert_eq!(requests.len(), 3);
+    assert!(requests.iter().all(|request| {
+        request.surface() == SessionListSurface::SessionPicker
+            && request.scope() == &SessionListScope::AllWorkspaces
+    }));
+
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => vec![session_summary(
+                SessionId::new(),
+                workspace.path(),
+                "Local middle",
+                SessionStatus::Idle,
+                20,
+            )],
+            Outlook::Remote(name) if name == "studio" => vec![session_summary(
+                SessionId::new(),
+                &workspace.path().join("studio"),
+                "X [studio]",
+                SessionStatus::Idle,
+                30,
+            )],
+            Outlook::Remote(name) if name == "sleeping" => vec![session_summary(
+                SessionId::new(),
+                &workspace.path().join("sleeping"),
+                "Sleeping oldest",
+                SessionStatus::Idle,
+                10,
+            )],
+            outlook => panic!("unexpected Origin: {outlook:?}"),
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+            .expect("merge one Origin's Session listing");
+    }
+
+    let rows = rendered_application_rows_at(&application, 120, 24);
+    assert!(rendered_row(&rows, "X [studio]") < rendered_row(&rows, "Local middle"));
+    assert!(rendered_row(&rows, "Local middle") < rendered_row(&rows, "Sleeping oldest"));
+    let studio_row = rows
+        .iter()
+        .find(|row| row.contains("X [studio]"))
+        .expect("draw the studio Session");
+    assert_eq!(studio_row.matches("[studio]").count(), 2);
+    assert!(
+        studio_row.contains('›'),
+        "the newest merged row is the initial navigation selection: {studio_row:?}"
+    );
+    assert!(
+        rows.iter()
+            .find(|row| row.contains("Sleeping oldest"))
+            .expect("draw the sleeping Session")
+            .contains("[sleeping]")
+    );
+    assert!(
+        !rows
+            .iter()
+            .find(|row| row.contains("Local middle"))
+            .expect("draw the local Session")
+            .contains("[local]")
+    );
+    let buffer = rendered_application_buffer(&application, 120, 24);
+    let row = rendered_row(&rows, "X [studio]") as u16;
+    let tag_columns = rows[usize::from(row)]
+        .match_indices("[studio]")
+        .map(|(column, _)| column as u16)
+        .collect::<Vec<_>>();
+    assert_ne!(
+        buffer
+            .cell((tag_columns[0], row))
+            .expect("draw the Origin-like text in the title")
+            .fg,
+        Color::DarkGray,
+        "title text that resembles an Origin tag keeps the row style"
+    );
+    assert_eq!(
+        buffer
+            .cell((tag_columns[1], row))
+            .expect("draw the actual Origin tag")
+            .fg,
+        Color::DarkGray,
+        "the foreign Origin tag is subdued independently of row focus"
+    );
+    assert_eq!(
+        buffer
+            .cell((tag_columns[1], row))
+            .expect("draw the actual Origin tag")
+            .bg,
+        buffer
+            .cell((tag_columns[0], row))
+            .expect("draw the selected row title")
+            .bg,
+        "the subdued tag keeps the selected row's highlight"
+    );
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("move to the visually next merged row");
+    let moved = rendered_application_rows_at(&application, 120, 24);
+    assert!(
+        moved
+            .iter()
+            .find(|row| row.contains("Local middle"))
+            .expect("draw the local Session")
+            .contains('›'),
+        "navigation follows the same recency order the picker draws: {moved:?}"
+    );
+
+    let transition = application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::RemoteFailed {
+                status: RemoteStatus::Revoked,
+                message: "Pairing revoked".to_owned(),
+            },
+        })
+        .expect("end the studio Origin");
+    let ApplicationTransition::ReconcileCatalogOrigins {
+        catalog_origins, ..
+    } = transition
+    else {
+        panic!("ending a background Origin reconciles catalog ownership");
+    };
+    assert!(!catalog_origins.contains(&Outlook::Remote("studio".to_owned())));
+    assert!(
+        !rendered_application_rows_at(&application, 120, 24)
+            .join("\n")
+            .contains("X [studio]"),
+        "an ended Origin takes its picker rows with it"
+    );
+}
+
+#[test]
+fn choosing_a_foreign_picker_row_turns_and_opens_without_moving_sidebar_scope() {
+    let workspace = workspace_dir();
+    let foreign_workspace = workspace.path().join("studio-work");
+    let target = SessionId::new();
+    let mut application = Application::new(workspace.path(), Default::default());
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
+                settings: EffectiveSettings {
+                    sidebar: SidebarSettings {
+                        initial_visibility: SidebarVisibility::Shown,
+                        ..SidebarSettings::default()
+                    },
+                    ..EffectiveSettings::default()
+                },
+                pinned: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+        )))
+        .expect("show the Sidebar on its default all-Workspaces scope");
+
+    let current = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::SessionList,
+        )))
+        .expect("open the Session picker");
+    expect_session_list_request(
+        current,
+        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+    );
+    expect_session_list_request(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+            )))
+            .expect("widen to all Workspaces"),
+        SessionListScope::AllWorkspaces,
+    );
+    let ApplicationTransition::ListEverywhereRemotes(discovery) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("widen the picker to Everywhere")
+    else {
+        panic!("Everywhere first discovers its Origins");
+    };
+    let before = rendered_application_rows_at(&application, 120, 24);
+    assert!(before.iter().any(|row| row.contains("▸ All Workspaces")));
+    assert!(before.join("\n").contains("Everywhere"));
+
+    let ApplicationTransition::ReconcileCatalogOrigins { requests, .. } = application
+        .handle_event(ApplicationEvent::EverywhereRemotesListed {
+            request: discovery,
+            remotes: vec![remote("studio", RemoteStatus::Available)],
+        })
+        .expect("discover the studio Origin")
+    else {
+        panic!("the discovered Origins should each be listed");
+    };
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => Vec::new(),
+            Outlook::Remote(name) if name == "studio" => vec![session_summary(
+                target,
+                &foreign_workspace,
+                "Foreign work",
+                SessionStatus::Idle,
+                20,
+            )],
+            outlook => panic!("unexpected Origin: {outlook:?}"),
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+            .expect("merge the Origin's Sessions");
+    }
+
+    let reference =
+        suru::protocol::SessionReference::new(Outlook::Remote("studio".to_owned()), target);
+    let picker = rendered_application_rows_at(&application, 120, 24);
+    assert!(
+        picker
+            .iter()
+            .find(|row| row.contains("Foreign work"))
+            .expect("draw the foreign row")
+            .contains('›'),
+        "the only row is selected: {picker:?}"
+    );
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("choose the foreign Session"),
+        ApplicationTransition::TurnOutlookAndAttach {
+            catalog_origins: std::collections::HashSet::from([Outlook::Remote(
+                "studio".to_owned(),
+            )]),
+            session: reference.clone(),
+        }
+    );
+    let after = rendered_application_rows_at(&application, 120, 24);
+    assert!(
+        after.iter().any(|row| row.contains("▸ All Workspaces")),
+        "the Sidebar keeps its own scope when the picker turns the Outlook: {after:?}"
+    );
+    let ApplicationTransition::ListEverywhereRemotes(reopened) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::SessionList,
+        )))
+        .expect("reopen the Session picker")
+    else {
+        panic!("the Session picker keeps its own Everywhere scope across the turn");
+    };
+    assert_eq!(reopened.surface(), SessionListSurface::SessionPicker);
+}
+
+#[test]
+fn an_open_everywhere_picker_catches_up_only_the_origin_whose_catalog_moved() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::SessionList,
+        )))
+        .expect("open the Session picker");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("advance to all Workspaces");
+    let ApplicationTransition::ListEverywhereRemotes(discovery) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("advance the Session picker to Everywhere")
+    else {
+        panic!("Everywhere first discovers its Origins");
+    };
+    let ApplicationTransition::ReconcileCatalogOrigins { requests, .. } = application
+        .handle_event(ApplicationEvent::EverywhereRemotesListed {
+            request: discovery,
+            remotes: vec![remote("studio", RemoteStatus::Available)],
+        })
+        .expect("discover the studio Origin")
+    else {
+        panic!("the picker should list every discovered Origin");
+    };
+    for request in requests {
+        application
+            .handle_event(ApplicationEvent::SessionsListed {
+                request,
+                sessions: Vec::new(),
+            })
+            .expect("finish the initial merged listing");
+    }
+
+    let ApplicationTransition::ListSessions(request) = application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::SessionCreated(SessionCreated {
+                session_id: SessionId::new(),
+            }),
+        })
+        .expect("take a background catalog change")
+    else {
+        panic!("the picker should catch up the changed Origin");
+    };
+    assert_eq!(request.surface(), SessionListSurface::SessionPicker);
+    assert_eq!(request.outlook(), &Outlook::Remote("studio".to_owned()));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: Vec::new(),
+        })
+        .expect("finish the catch-up");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("hide the Everywhere picker");
+
+    let ApplicationTransition::ListSessions(hidden_request) = application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::SessionCreated(SessionCreated {
+                session_id: SessionId::new(),
+            }),
+        })
+        .expect("take a catalog change while the picker is hidden")
+    else {
+        panic!("chosen Everywhere scope keeps its hidden catalog current");
+    };
+    assert_eq!(hidden_request.surface(), SessionListSurface::SessionPicker);
+    assert_eq!(
+        hidden_request.outlook(),
+        &Outlook::Remote("studio".to_owned())
+    );
+}
+
+#[test]
+fn a_terminal_remote_failure_does_not_touch_an_independently_scoped_picker() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    open_session_picker_with(
+        &mut application,
+        vec![session_summary(
+            SessionId::new(),
+            workspace.path(),
+            "Keep local",
+            SessionStatus::Idle,
+            10,
+        )],
+    );
+
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::RemoteFailed {
+                status: RemoteStatus::Revoked,
+                message: "Pairing revoked".to_owned(),
+            },
+        })
+        .expect("end an unrelated Remote");
+
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Keep local"),
+        "an ended Remote removes only its own rows"
     );
 }
 
@@ -1241,6 +1746,15 @@ fn session_summary(
         created_at: SessionTimestamp(1),
         updated_at: SessionTimestamp(updated_at),
     }))
+}
+
+fn remote(name: &str, status: RemoteStatus) -> Remote {
+    Remote {
+        name: name.to_owned(),
+        fingerprint: format!("{name}-fingerprint"),
+        addresses: Vec::new(),
+        status,
+    }
 }
 
 /// A Session listing entry whose derivation already landed, so it carries an

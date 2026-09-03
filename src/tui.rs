@@ -34,6 +34,7 @@ pub use completion::CompletionMode;
 pub use event_loop::run;
 pub use keymap::command_for_terminal_event;
 pub use state::{
-    Application, ApplicationEvent, ApplicationTransition, CommandId, ModelListRequest,
-    SessionListRequest, SessionListScope, SessionListSurface, TuiState, WorkspaceResolutionSurface,
+    Application, ApplicationEvent, ApplicationTransition, CommandId, EverywhereListRequest,
+    ModelListRequest, SessionListRequest, SessionListScope, SessionListSurface, TuiState,
+    WorkspaceResolutionSurface,
 };

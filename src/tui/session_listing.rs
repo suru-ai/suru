@@ -10,7 +10,8 @@ use std::{
 };
 
 use crate::protocol::{
-    Outlook, SessionId, SessionListItem, SessionReference, SessionSummary, SessionTimestamp,
+    Outlook, Remote, RemoteStatus, SessionId, SessionListItem, SessionReference, SessionSummary,
+    SessionTimestamp,
 };
 
 use super::{SessionListRequest, SessionListScope, SessionListSurface};
@@ -87,6 +88,21 @@ struct OriginListing {
     error: Option<String>,
 }
 
+/// The Origins an Everywhere surface asks, preserving the local Server first
+/// and the durable Remote order after it. Ended Pairings cannot answer and do
+/// not participate; an unavailable one may recover and remains included.
+pub(super) fn everywhere_origins(remotes: Vec<Remote>) -> Vec<Outlook> {
+    let mut origins = vec![Outlook::Local];
+    origins.extend(remotes.into_iter().filter_map(|remote| {
+        (!matches!(
+            remote.status,
+            RemoteStatus::Revoked | RemoteStatus::ProtocolMismatch
+        ))
+        .then_some(Outlook::Remote(remote.name))
+    }));
+    origins
+}
+
 impl SessionListing {
     /// A listing scoped, as it opens, to the Workspace this client runs in.
     pub(super) fn new(surface: SessionListSurface, current_workspace: PathBuf) -> Self {
@@ -159,10 +175,26 @@ impl SessionListing {
     /// Widens the listing to every Workspace, or narrows it back to this
     /// client's own, and asks again. A failure the previous scope reported
     /// goes with it, because the reader is no longer looking at that listing.
+    #[cfg(test)]
     pub(super) fn toggle_scope(&mut self) -> SessionListRequest {
         self.scope = self.scope.toggled(&self.current_workspace);
         self.clear_error();
         self.refresh()
+    }
+
+    /// Moves to an explicitly chosen server listing scope and asks the
+    /// Outlook again. Surfaces with more than two presentation scopes use
+    /// this instead of the listing's two-state convenience toggle.
+    pub(super) fn refresh_in(&mut self, scope: SessionListScope) -> SessionListRequest {
+        self.scope = scope;
+        self.refresh()
+    }
+
+    /// Changes the server scope without beginning a listing conversation.
+    /// Everywhere surfaces use this while paired-Remote discovery is the
+    /// first request still in flight.
+    pub(super) fn adopt_scope(&mut self, scope: SessionListScope) {
+        self.scope = scope;
     }
 
     /// Takes a listing the server answered with, stamping every row with the
@@ -377,10 +409,21 @@ impl SessionListing {
             .collect()
     }
 
-    /// Forgets Origins no longer belonging to a merged listing, including any
-    /// reply still in flight for one of them.
+    /// Forgets the rows and in-flight reply validity of Origins no longer in a
+    /// merged listing, while retaining their monotonically increasing request
+    /// sequence. A Remote can leave and later rejoin discovery; its next ask
+    /// must not reuse an id that a delayed reply from its previous membership
+    /// still carries.
     pub(super) fn retain_origins(&mut self, origins: &[Outlook]) {
-        self.origins.retain(|origin, _| origins.contains(origin));
+        for (outlook, origin) in &mut self.origins {
+            if origins.contains(outlook) {
+                continue;
+            }
+            origin.pending_request = None;
+            origin.sessions.clear();
+            origin.loading = false;
+            origin.error = None;
+        }
     }
 
     /// Forgets one Origin's rows and any request still in flight for it.
@@ -428,6 +471,7 @@ impl SessionListing {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn scope(&self) -> &SessionListScope {
         &self.scope
     }
@@ -477,6 +521,14 @@ impl SessionListing {
     pub(super) fn error(&self) -> Option<&str> {
         self.current_origin()
             .and_then(|origin| origin.error.as_deref())
+    }
+
+    pub(super) fn error_across(&self, origins: &[Outlook]) -> Option<&str> {
+        origins.iter().find_map(|origin| {
+            self.origins
+                .get(origin)
+                .and_then(|listing| listing.error.as_deref())
+        })
     }
 
     /// Reports a failure that did not come from a listing request — an
@@ -794,6 +846,32 @@ mod tests {
             "the old request ID is not valid again after reopening"
         );
         assert!(listing.load(&after_reopen, vec![summary("Current", 2)]));
+    }
+
+    #[test]
+    fn an_origin_returning_to_everywhere_does_not_reuse_its_old_request_sequence() {
+        let workspace = tempfile::tempdir().expect("create Workspace");
+        let mut listing = SessionListing::new(
+            SessionListSurface::SessionPicker,
+            workspace.path().to_owned(),
+        );
+        let remote = Outlook::Remote("studio".to_owned());
+        let stale = listing.refresh_origin(remote.clone());
+
+        listing.retain_origins(&[Outlook::Local]);
+        let current = listing.refresh_origin(remote);
+
+        assert!(
+            !listing.load(&stale, vec![summary("Stale", 1)]),
+            "a reply from before the Origin left Everywhere cannot validate again"
+        );
+        listing.load(&current, vec![summary("Current", 2)]);
+        assert!(
+            !listing.awaits(&current),
+            "the current reply lands even though another Origin is on show"
+        );
+        listing.adopt_outlook(Outlook::Remote("studio".to_owned()));
+        assert_eq!(titles(&listing), vec!["Current"]);
     }
 
     #[test]

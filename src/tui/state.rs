@@ -51,7 +51,7 @@ use super::{
     notice::{LandingNotice, Notice},
     render::render_with_slots,
     serve_overlay::ServeOverlay,
-    session_picker::SessionPicker,
+    session_picker::{SessionPicker, SessionPickerListing},
     settings_panel::{AvailabilityRead, SettingsPanel},
     sidebar::{Sidebar, SidebarActivation, SidebarPress},
     slots::RenderSlots,
@@ -116,17 +116,11 @@ impl SessionListScope {
     /// Widens this scope to every Workspace, or narrows it back to the one
     /// the client runs in — the flip a reader makes when a listing scoped to
     /// where they stand is too narrow, or too wide, for what they are after.
+    #[cfg(test)]
     pub(super) fn toggled(&self, current_workspace: &Path) -> Self {
         match self {
             Self::CurrentWorkspace(_) => Self::AllWorkspaces,
             Self::AllWorkspaces => Self::CurrentWorkspace(current_workspace.to_owned()),
-        }
-    }
-
-    pub(super) fn label(&self) -> &'static str {
-        match self {
-            Self::CurrentWorkspace(_) => "Current Workspace",
-            Self::AllWorkspaces => "All Workspaces",
         }
     }
 }
@@ -144,6 +138,30 @@ pub enum SessionListSurface {
     SessionPicker,
     WorkspacePicker,
     Sidebar,
+}
+
+/// One surface's request for the local Server's paired Remotes, used before
+/// an Everywhere listing can ask each resulting Origin for its Sessions.
+/// The surface is part of the identity because the Sidebar and Session picker
+/// own independent scope and request sequences.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EverywhereListRequest {
+    surface: SessionListSurface,
+    id: u64,
+}
+
+impl EverywhereListRequest {
+    pub(super) const fn new(surface: SessionListSurface, id: u64) -> Self {
+        Self { surface, id }
+    }
+
+    pub fn surface(self) -> SessionListSurface {
+        self.surface
+    }
+
+    pub(super) const fn id(self) -> u64 {
+        self.id
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -405,7 +423,7 @@ pub struct TuiState {
 
 enum OutlookTurn {
     Deliberate,
-    SidebarRow { fallback_workspace: PathBuf },
+    SessionRow { fallback_workspace: PathBuf },
 }
 
 #[derive(Clone, Debug)]
@@ -628,8 +646,8 @@ impl TuiState {
         self.turn_outlook_with(outlook, OutlookTurn::Deliberate);
     }
 
-    /// Turns toward the Origin of a Session already present in the merged
-    /// Sidebar, then carries the reader into its optimistic route. The row's
+    /// Turns toward the Origin of a Session already present in a merged
+    /// listing, then carries the reader into its optimistic route. The row's
     /// Workspace is authoritative when this Client has not visited that
     /// Outlook before; unlike a deliberate Connect turn, no resolution is
     /// needed because the listing already came from that Origin.
@@ -637,7 +655,7 @@ impl TuiState {
         let remembers_workspace = self.outlook_workspaces.contains_key(&target.origin);
         self.turn_outlook_with(
             target.origin.clone(),
-            OutlookTurn::SidebarRow {
+            OutlookTurn::SessionRow {
                 fallback_workspace: workspace,
             },
         );
@@ -654,7 +672,7 @@ impl TuiState {
         }
         let (fallback_workspace, adopt_sidebar): (PathBuf, fn(&mut Sidebar, Outlook)) = match turn {
             OutlookTurn::Deliberate => (PathBuf::from("."), Sidebar::adopt_outlook),
-            OutlookTurn::SidebarRow { fallback_workspace } => {
+            OutlookTurn::SessionRow { fallback_workspace } => {
                 (fallback_workspace, Sidebar::adopt_outlook_from_row)
             }
         };
@@ -696,6 +714,15 @@ impl TuiState {
         self.command_mode = CommandMode::Composer;
         self.submission_error = None;
         self.sync_composer_completion();
+    }
+
+    /// The union of Remote catalog streams required by independently scoped
+    /// Session surfaces. One surface narrowing must not release another
+    /// surface's Everywhere interest.
+    fn catalog_origins(&self) -> HashSet<Outlook> {
+        let mut origins = self.sidebar.catalog_origins();
+        origins.extend(self.session_picker.catalog_origins());
+        origins
     }
 
     fn begin_workspace_resolution(&mut self, surface: WorkspaceResolutionSurface) -> u64 {
@@ -831,8 +858,13 @@ impl TuiState {
             && (event.moves_the_session_catalog()
                 || matches!(&event, ManagedEvent::SkillCatalogUpdated(_)))
         {
-            if event.moves_the_session_catalog() && self.sidebar.includes_origin(&Outlook::Local) {
-                self.apply_sidebar_catalog_event(&Outlook::Local, &event);
+            if event.moves_the_session_catalog() {
+                if self.sidebar.includes_origin(&Outlook::Local) {
+                    self.apply_sidebar_catalog_event(&Outlook::Local, &event);
+                }
+                if self.session_picker.includes_origin(&Outlook::Local) {
+                    self.apply_session_picker_catalog_event(&Outlook::Local, &event);
+                }
             }
             return;
         }
@@ -851,8 +883,13 @@ impl TuiState {
         }
         if outlook == &self.outlook {
             self.apply_managed_event(event);
-        } else if event.moves_the_session_catalog() && self.sidebar.includes_origin(outlook) {
-            self.apply_sidebar_catalog_event(outlook, &event);
+        } else if event.moves_the_session_catalog() {
+            if self.sidebar.includes_origin(outlook) {
+                self.apply_sidebar_catalog_event(outlook, &event);
+            }
+            if self.session_picker.includes_origin(outlook) {
+                self.apply_session_picker_catalog_event(outlook, &event);
+            }
         }
     }
 
@@ -871,6 +908,9 @@ impl TuiState {
         // moves as a Session is unsettled, most of all.
         let outlook = self.outlook.clone();
         self.apply_sidebar_catalog_event(&outlook, &event);
+        if event.moves_the_session_catalog() {
+            self.session_picker.catch_up_origin(outlook);
+        }
         match event {
             ManagedEvent::Connecting => {
                 self.skill_catalog = None;
@@ -1019,6 +1059,46 @@ impl TuiState {
             ),
             ManagedEvent::SessionCatalogReconciled(snapshot) => self
                 .sidebar
+                .retain_origin_catalog(outlook.clone(), &snapshot.session_ids),
+            ManagedEvent::Connecting
+            | ManagedEvent::Connected(_)
+            | ManagedEvent::SettingsSnapshot(_)
+            | ManagedEvent::SkillCatalogUpdated(_)
+            | ManagedEvent::Recovering(_)
+            | ManagedEvent::RemoteRecovered
+            | ManagedEvent::RemoteFailed { .. }
+            | ManagedEvent::ServerShutdown(_)
+            | ManagedEvent::Fatal(_) => {}
+        }
+    }
+
+    /// Applies the catalog facts a Session picker already on screen can take
+    /// in place for one Origin. Creation and Usage carry no row presentation,
+    /// and Working is not drawn by this picker.
+    fn apply_session_picker_catalog_event(&mut self, outlook: &Outlook, event: &ManagedEvent) {
+        if event.moves_the_session_catalog() {
+            self.session_picker.catch_up_origin(outlook.clone());
+        }
+        match event {
+            ManagedEvent::SessionCreated(_)
+            | ManagedEvent::SessionWorkingChanged(_)
+            | ManagedEvent::SessionUsageChanged(_) => {}
+            ManagedEvent::SessionDeleted(deleted) => self
+                .session_picker
+                .remove_origin(outlook.clone(), deleted.session_id),
+            ManagedEvent::SessionTitleChanged(retitled) => self.session_picker.retitle_origin(
+                outlook.clone(),
+                retitled.session_id,
+                retitled.title.clone(),
+                retitled.emoji.clone(),
+            ),
+            ManagedEvent::SessionSettlementChanged(settled) => self.session_picker.settle_origin(
+                outlook.clone(),
+                settled.session_id,
+                settled.settled_at,
+            ),
+            ManagedEvent::SessionCatalogReconciled(snapshot) => self
+                .session_picker
                 .retain_origin_catalog(outlook.clone(), &snapshot.session_ids),
             ManagedEvent::Connecting
             | ManagedEvent::Connected(_)
@@ -2124,14 +2204,14 @@ pub enum ApplicationEvent {
     RemotesListed(Vec<crate::protocol::Remote>),
     RemoteListingFailed(String),
     /// The paired-Remote list requested specifically for an Everywhere
-    /// Sidebar listing. It is distinct from the Connect overlay's listing,
+    /// Session surface. It is distinct from the Connect overlay's listing,
     /// which also probes the Remotes it presents.
     EverywhereRemotesListed {
-        request_id: u64,
+        request: EverywhereListRequest,
         remotes: Vec<crate::protocol::Remote>,
     },
     EverywhereRemoteListingFailed {
-        request_id: u64,
+        request: EverywhereListRequest,
         error: String,
     },
     InvitePreviewed {
@@ -2313,7 +2393,7 @@ pub enum ApplicationTransition {
     BeginConnecting,
     /// Ask the local Server for paired Remotes without opening or refreshing
     /// the Connect overlay.
-    ListEverywhereRemotes(u64),
+    ListEverywhereRemotes(EverywhereListRequest),
     PreviewInvite(String),
     RedeemInvite(crate::protocol::RedeemInviteRequest),
     /// Turn to one Server and name the Remote catalog streams the run loop
@@ -2324,8 +2404,8 @@ pub enum ApplicationTransition {
         outlook: Outlook,
         catalog_origins: HashSet<Outlook>,
     },
-    /// Turn to a foreign Sidebar row's Origin and attach it, in that order,
-    /// while retaining the merged Sidebar which supplied the row.
+    /// Turn to a foreign Session row's Origin and attach it, in that order,
+    /// while retaining the independent scopes of the listing surfaces.
     TurnOutlookAndAttach {
         session: SessionReference,
         catalog_origins: HashSet<Outlook>,
@@ -2460,8 +2540,9 @@ impl Application {
                     // its main content, not to the listing that led there.
                     Ok(self.fail_open_session_attachment(error))
                 } else {
-                    let request = self.state.session_picker.fail_attachment(error);
-                    Ok(ApplicationTransition::ListSessions(request))
+                    Ok(Self::session_picker_listing_transition(
+                        self.state.session_picker.fail_attachment(error),
+                    ))
                 }
             }
             ApplicationEvent::OriginSessionAttachmentFailed { reference, error } => {
@@ -2471,8 +2552,9 @@ impl Application {
                 if self.state.route.as_ref() == Some(&reference) && self.state.session.is_none() {
                     Ok(self.fail_open_session_attachment(error))
                 } else {
-                    let request = self.state.session_picker.fail_attachment(error);
-                    Ok(ApplicationTransition::ListSessions(request))
+                    Ok(Self::session_picker_listing_transition(
+                        self.state.session_picker.fail_attachment(error),
+                    ))
                 }
             }
             ApplicationEvent::SessionDeletionFailed { reference, error } => {
@@ -2531,27 +2613,38 @@ impl Application {
                 self.state.connect_overlay.fail_invite_entry(error);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::EverywhereRemotesListed {
-                request_id,
-                remotes,
-            } => {
-                let requests = self
-                    .state
-                    .sidebar
-                    .load_everywhere_remotes(request_id, remotes);
+            ApplicationEvent::EverywhereRemotesListed { request, remotes } => {
+                let requests = match request.surface() {
+                    SessionListSurface::SessionPicker => self
+                        .state
+                        .session_picker
+                        .load_everywhere_remotes(request, remotes),
+                    SessionListSurface::Sidebar => {
+                        self.state.sidebar.load_everywhere_remotes(request, remotes)
+                    }
+                    SessionListSurface::WorkspacePicker => None,
+                };
                 Ok(
                     requests.map_or(ApplicationTransition::Continue, |requests| {
                         ApplicationTransition::ReconcileCatalogOrigins {
-                            catalog_origins: self.state.sidebar.catalog_origins(),
+                            catalog_origins: self.state.catalog_origins(),
                             requests,
                         }
                     }),
                 )
             }
-            ApplicationEvent::EverywhereRemoteListingFailed { request_id, error } => {
-                self.state
-                    .sidebar
-                    .fail_everywhere_remotes(request_id, error);
+            ApplicationEvent::EverywhereRemoteListingFailed { request, error } => {
+                match request.surface() {
+                    SessionListSurface::SessionPicker => {
+                        self.state
+                            .session_picker
+                            .fail_everywhere_remotes(request, error);
+                    }
+                    SessionListSurface::Sidebar => {
+                        self.state.sidebar.fail_everywhere_remotes(request, error);
+                    }
+                    SessionListSurface::WorkspacePicker => {}
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::InvitePreviewed { invite, preview } => {
@@ -2591,7 +2684,7 @@ impl Application {
                         match surface {
                             WorkspaceResolutionSurface::Outlook => {
                                 self.state.sidebar.refresh_after_outlook_workspace();
-                                Ok(self.take_sidebar_listing_transition())
+                                Ok(self.take_session_listing_transition())
                             }
                             WorkspaceResolutionSurface::WorkspacePicker => {
                                 self.state.workspace_picker.close();
@@ -2601,7 +2694,7 @@ impl Application {
                                 match self.state.sidebar.accept_workspace(workspace.path) {
                                     SidebarActivation::CatalogOriginsChanged => {
                                         Ok(ApplicationTransition::ReconcileCatalogOrigins {
-                                            catalog_origins: self.state.sidebar.catalog_origins(),
+                                            catalog_origins: self.state.catalog_origins(),
                                             requests: Vec::new(),
                                         })
                                     }
@@ -3152,6 +3245,15 @@ impl Application {
 
     /// Handles the Session picker commands routed here; any other command
     /// leaves the picker alone.
+    fn session_picker_listing_transition(listing: SessionPickerListing) -> ApplicationTransition {
+        match listing {
+            SessionPickerListing::Origin(request) => ApplicationTransition::ListSessions(request),
+            SessionPickerListing::Everywhere(request) => {
+                ApplicationTransition::ListEverywhereRemotes(request)
+            }
+        }
+    }
+
     fn handle_session_picker_command(&mut self, command: CommandId) -> ApplicationTransition {
         match command {
             CommandId::InsertSessionSearch(text) => {
@@ -3172,14 +3274,33 @@ impl Application {
                 if self.state.session_picker.is_busy() {
                     return ApplicationTransition::Continue;
                 }
-                let request = self.state.session_picker.toggle_scope();
-                return ApplicationTransition::ListSessions(request);
+                let left_everywhere = self.state.session_picker.is_everywhere();
+                return match self.state.session_picker.toggle_scope() {
+                    SessionPickerListing::Origin(request) if left_everywhere => {
+                        ApplicationTransition::ReconcileCatalogOrigins {
+                            catalog_origins: self.state.catalog_origins(),
+                            requests: vec![request],
+                        }
+                    }
+                    listing => Self::session_picker_listing_transition(listing),
+                };
             }
             CommandId::SelectSession => {
-                return self.state.session_picker.begin_attachment().map_or(
-                    ApplicationTransition::Continue,
-                    ApplicationTransition::AttachSession,
-                );
+                let Some(target) = self.state.session_picker.begin_attachment() else {
+                    return ApplicationTransition::Continue;
+                };
+                if target.origin == self.state.outlook {
+                    return ApplicationTransition::AttachSession(target);
+                }
+                let Some(workspace) = self.state.session_picker.workspace_of(&target) else {
+                    return ApplicationTransition::Continue;
+                };
+                self.state
+                    .turn_outlook_for_session(target.clone(), workspace);
+                return ApplicationTransition::TurnOutlookAndAttach {
+                    catalog_origins: self.state.catalog_origins(),
+                    session: target,
+                };
             }
             CommandId::CloseSessionPicker => self.edit_session_picker(SessionPicker::close),
             _ => {}
@@ -3250,7 +3371,7 @@ impl Application {
                     }
                     SidebarActivation::CatalogOriginsChanged => {
                         ApplicationTransition::ReconcileCatalogOrigins {
-                            catalog_origins: self.state.sidebar.catalog_origins(),
+                            catalog_origins: self.state.catalog_origins(),
                             requests: Vec::new(),
                         }
                     }
@@ -3563,7 +3684,7 @@ impl Application {
                 if had_session && self.state.session.is_none() {
                     Ok(ApplicationTransition::SessionEnded)
                 } else {
-                    Ok(self.take_sidebar_listing_transition())
+                    Ok(self.take_session_listing_transition())
                 }
             }
         }
@@ -3577,9 +3698,10 @@ impl Application {
         if let ManagedEvent::RemoteFailed { status, message } = &event {
             let is_current = outlook == self.state.outlook;
             self.state.sidebar.end_origin(&outlook);
+            self.state.session_picker.end_origin(&outlook);
             if !is_current {
                 return Ok(ApplicationTransition::ReconcileCatalogOrigins {
-                    catalog_origins: self.state.sidebar.catalog_origins(),
+                    catalog_origins: self.state.catalog_origins(),
                     requests: Vec::new(),
                 });
             }
@@ -3611,7 +3733,7 @@ impl Application {
             self.state.sync_composer_completion();
             return Ok(ApplicationTransition::TurnOutlook {
                 outlook: Outlook::Local,
-                catalog_origins: self.state.sidebar.catalog_origins(),
+                catalog_origins: self.state.catalog_origins(),
             });
         }
         let had_session = self.state.session.is_some();
@@ -3620,7 +3742,7 @@ impl Application {
         if had_session && self.state.session.is_none() {
             Ok(ApplicationTransition::SessionEnded)
         } else {
-            Ok(self.take_sidebar_listing_transition())
+            Ok(self.take_session_listing_transition())
         }
     }
 
@@ -3629,15 +3751,17 @@ impl Application {
     /// only while Everywhere includes it, for catalog movement and the Remote
     /// reachability transitions represented beside its cached rows.
     pub(super) fn accepts_catalog_event(&self, outlook: &Outlook, event: &ManagedEvent) -> bool {
+        let listed_by_sidebar = self.state.sidebar.includes_origin(outlook);
+        let listed_by_picker = self.state.session_picker.includes_origin(outlook);
         outlook == &self.state.outlook
-            || (self.state.sidebar.includes_origin(outlook)
-                && (event.moves_the_session_catalog()
-                    || matches!(
-                        event,
-                        ManagedEvent::Recovering(_)
-                            | ManagedEvent::RemoteRecovered
-                            | ManagedEvent::RemoteFailed { .. }
-                    )))
+            || (event.moves_the_session_catalog() && (listed_by_sidebar || listed_by_picker))
+            || ((listed_by_sidebar || listed_by_picker)
+                && matches!(event, ManagedEvent::RemoteFailed { .. }))
+            || (listed_by_sidebar
+                && matches!(
+                    event,
+                    ManagedEvent::Recovering(_) | ManagedEvent::RemoteRecovered
+                ))
     }
 
     fn attach_session(
@@ -3871,7 +3995,7 @@ impl Application {
                     self.state
                         .begin_workspace_resolution(WorkspaceResolutionSurface::Outlook);
                 }
-                let catalog_origins = self.state.sidebar.catalog_origins();
+                let catalog_origins = self.state.catalog_origins();
                 Ok(ApplicationTransition::TurnOutlook {
                     outlook,
                     catalog_origins,
@@ -3970,9 +4094,9 @@ impl Application {
                 Ok(self.handle_settings_panel_command(command))
             }
             SemanticCommandId::SessionList => {
-                let request = self.state.session_picker.open();
+                let listing = self.state.session_picker.open();
                 self.state.command_mode = CommandMode::Composer;
-                Ok(ApplicationTransition::ListSessions(request))
+                Ok(Self::session_picker_listing_transition(listing))
             }
             SemanticCommandId::WorkspaceList => {
                 let request = self.state.workspace_picker.open();
@@ -4074,7 +4198,7 @@ impl Application {
                         WorkspaceResolutionSurface::Sidebar,
                     ));
                 }
-                Ok(self.take_sidebar_listing_transition())
+                Ok(self.take_session_listing_transition())
             }
             SemanticCommandId::RemoteRetry => Ok(match invocation.subject {
                 SemanticSubject::Origin(outlook) => {
@@ -4448,27 +4572,37 @@ impl Application {
         is_reader_interaction(event) && self.state.landing_notice.dismiss()
     }
 
-    /// Drains whichever first step the Sidebar's current scope needs. An
-    /// ordinary scope already knows its one Origin; Everywhere must first ask
-    /// the local Server which paired Remotes participate.
-    pub fn take_sidebar_listing_transition(&mut self) -> ApplicationTransition {
+    /// Drains listing work queued by the independent Session surfaces. The
+    /// Sidebar can first need Remote discovery; otherwise every queued
+    /// per-Origin request is dispatched together without collapsing either
+    /// surface's scope or catalog ownership.
+    pub fn take_session_listing_transition(&mut self) -> ApplicationTransition {
         if let Some(request_id) = self.state.sidebar.take_everywhere_remote_request() {
             return ApplicationTransition::ListEverywhereRemotes(request_id);
         }
-        match self.state.sidebar.take_listing_requests() {
+        let mut requests = self.state.sidebar.take_listing_requests();
+        requests.extend(self.state.session_picker.take_listing_requests());
+        match requests {
             requests if requests.is_empty() => ApplicationTransition::Continue,
             mut requests if requests.len() == 1 => {
                 ApplicationTransition::ListSessions(requests.pop().expect("one request"))
             }
             requests => ApplicationTransition::ReconcileCatalogOrigins {
-                catalog_origins: self.state.sidebar.catalog_origins(),
+                catalog_origins: self.state.catalog_origins(),
                 requests,
             },
         }
     }
 
-    pub(super) fn accepts_everywhere_remotes(&self, request_id: u64) -> bool {
-        self.state.sidebar.accepts_everywhere_remotes(request_id)
+    pub(super) fn accepts_everywhere_remotes(&self, request: EverywhereListRequest) -> bool {
+        match request.surface() {
+            SessionListSurface::SessionPicker => self
+                .state
+                .session_picker
+                .accepts_everywhere_remotes(request),
+            SessionListSurface::Sidebar => self.state.sidebar.accepts_everywhere_remotes(request),
+            SessionListSurface::WorkspacePicker => false,
+        }
     }
 
     /// Whether a listing the server answered with would move anything on

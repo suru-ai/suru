@@ -564,19 +564,7 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         let rows = state
             .session_picker
             .visible_rows(row_capacity, current)
-            .map(|row| {
-                let content = session_picker_row_text(row, usize::from(content_width), now);
-                Line::styled(
-                    content,
-                    if row.selected {
-                        theme.selection.focused
-                    } else if row.unreadable {
-                        theme.text.subdued
-                    } else {
-                        theme.text.primary
-                    },
-                )
-            })
+            .map(|row| session_picker_row_line(row, usize::from(content_width), now, theme))
             .collect::<Vec<_>>();
         if rows.is_empty() && lines.len() < usize::from(content_height).saturating_sub(footer_rows)
         {
@@ -586,7 +574,7 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         }
     }
     if shows_search_and_footer && lines.len() < usize::from(content_height) {
-        let scope = state.session_picker.scope().label();
+        let scope = state.session_picker.scope_label();
         let status = if state.session_picker.is_attaching() {
             "Attaching…"
         } else if state.session_picker.is_deleting() {
@@ -1294,10 +1282,17 @@ fn model_picker_row_text(
     truncate_to_width(&format!("{marker}{}", fields.join(separator)), width)
 }
 
-fn session_picker_row_text(row: SessionPickerRow<'_>, width: usize, now: u64) -> String {
+fn session_picker_row_text(
+    row: SessionPickerRow<'_>,
+    width: usize,
+    now: u64,
+) -> (String, Option<(usize, usize)>) {
     let marker = if row.selected { "› " } else { "  " };
     if row.confirming_delete {
-        return truncate_to_width(&format!("{marker}Press Ctrl+D again to confirm"), width);
+        return (
+            truncate_to_width(&format!("{marker}Press Ctrl+D again to confirm"), width),
+            None,
+        );
     }
     let compact = width < usize::from(NARROW_TERMINAL_WIDTH);
     let status = if row.unreadable {
@@ -1323,7 +1318,14 @@ fn session_picker_row_text(row: SessionPickerRow<'_>, width: usize, now: u64) ->
         relative_update_time(row.updated_at, now)
     };
     let separator = if compact { " " } else { " · " };
-    let mut metadata = status.into_iter().chain([age]).collect::<Vec<_>>();
+    let remote_tag = row.remote.map(|remote| format!("[{remote}]"));
+    let mut metadata = remote_tag
+        .iter()
+        .cloned()
+        .into_iter()
+        .chain(status)
+        .chain([age])
+        .collect::<Vec<_>>();
     // The Emoji's own columns, and the space parting it from the Title, come
     // out of what the Title has to spend. A Session with no Emoji holds no cell
     // open in front of its Title and spends the lot.
@@ -1355,10 +1357,43 @@ fn session_picker_row_text(row: SessionPickerRow<'_>, width: usize, now: u64) ->
         .saturating_sub(metadata.width())
         .saturating_sub(separator.width());
     let title = truncate_to_width(row.title, title_width);
-    truncate_to_width(
+    let tag_start = remote_tag
+        .as_ref()
+        .map(|_| marker.len() + emoji.len() + title.len() + separator.len());
+    let content = truncate_to_width(
         &format!("{marker}{emoji}{title}{separator}{metadata}"),
         width,
-    )
+    );
+    let tag_range = tag_start.and_then(|start| {
+        let end = start + remote_tag.as_ref()?.len();
+        (content.get(start..end) == remote_tag.as_deref()).then_some((start, end))
+    });
+    (content, tag_range)
+}
+
+fn session_picker_row_line(
+    row: SessionPickerRow<'_>,
+    width: usize,
+    now: u64,
+    theme: &Theme,
+) -> Line<'static> {
+    let (content, remote_tag) = session_picker_row_text(row, width, now);
+    let row_style = if row.selected {
+        theme.selection.focused
+    } else if row.unreadable {
+        theme.text.subdued
+    } else {
+        theme.text.primary
+    };
+    let Some((start, end)) = remote_tag else {
+        return Line::styled(content, row_style);
+    };
+    let tag_style = row_style.patch(theme.text.subdued);
+    Line::from(vec![
+        Span::styled(content[..start].to_owned(), row_style),
+        Span::styled(content[start..end].to_owned(), tag_style),
+        Span::styled(content[end..].to_owned(), row_style),
+    ])
 }
 
 fn truncate_from_left_to_width(value: &str, width: usize) -> String {

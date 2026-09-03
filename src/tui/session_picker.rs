@@ -1,16 +1,55 @@
 //! Session switcher state and the query that narrows it.
 
-use std::path::Path;
+use std::{
+    cmp::Reverse,
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use crate::protocol::{
-    EffectiveSettings, EmojiVisibility, Outlook, SessionId, SessionListItem, SessionReference,
-    SessionStatus, SessionTimestamp,
+    EffectiveSettings, EmojiVisibility, Outlook, Remote, SessionId, SessionListItem,
+    SessionReference, SessionStatus, SessionTimestamp,
 };
 
 use super::{
-    SessionListRequest, SessionListScope, SessionListSurface, fuzzy::fuzzy_matches,
-    session_listing::SessionListing,
+    EverywhereListRequest, SessionListRequest, SessionListScope, SessionListSurface,
+    fuzzy::fuzzy_matches,
+    session_listing::{ListedSession, SessionListing, everywhere_origins},
 };
+
+const CURRENT_WORKSPACE: &str = "Current Workspace";
+const ALL_WORKSPACES: &str = "All Workspaces";
+const EVERYWHERE: &str = "Everywhere";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionPickerScope {
+    CurrentWorkspace,
+    AllWorkspaces,
+    Everywhere,
+}
+
+impl SessionPickerScope {
+    fn next(self) -> Self {
+        match self {
+            Self::CurrentWorkspace => Self::AllWorkspaces,
+            Self::AllWorkspaces => Self::Everywhere,
+            Self::Everywhere => Self::CurrentWorkspace,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::CurrentWorkspace => CURRENT_WORKSPACE,
+            Self::AllWorkspaces => ALL_WORKSPACES,
+            Self::Everywhere => EVERYWHERE,
+        }
+    }
+}
+
+pub(super) enum SessionPickerListing {
+    Origin(SessionListRequest),
+    Everywhere(EverywhereListRequest),
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct SessionPicker {
@@ -19,6 +58,13 @@ pub(super) struct SessionPicker {
     /// them true. The picker holds only what it does with them: the query it
     /// filters by and the row the reader is on.
     listing: SessionListing,
+    scope: SessionPickerScope,
+    /// The Origins participating in Everywhere, local first and followed by
+    /// each paired non-terminal Remote in the local Server's order.
+    everywhere_origins: Vec<Outlook>,
+    everywhere_remote_sequence: u64,
+    pending_everywhere_remotes: Option<u64>,
+    awaiting_dispatch: Vec<SessionListRequest>,
     /// Whether a row draws the Emoji derived beside its Session's Title, which
     /// governs every frame from the moment the Setting lands.
     emoji: EmojiVisibility,
@@ -44,14 +90,20 @@ pub(super) struct SessionPickerRow<'a> {
     pub(super) unreadable: bool,
     pub(super) updated_at: SessionTimestamp,
     pub(super) workspace: Option<&'a Path>,
+    pub(super) remote: Option<&'a str>,
     pub(super) confirming_delete: bool,
 }
 
 impl SessionPicker {
-    pub(super) fn new(current_workspace: std::path::PathBuf) -> Self {
+    pub(super) fn new(current_workspace: PathBuf) -> Self {
         Self {
             open: false,
             listing: SessionListing::new(SessionListSurface::SessionPicker, current_workspace),
+            scope: SessionPickerScope::CurrentWorkspace,
+            everywhere_origins: Vec::new(),
+            everywhere_remote_sequence: 0,
+            pending_everywhere_remotes: None,
+            awaiting_dispatch: Vec::new(),
             emoji: EmojiVisibility::default(),
             query: String::new(),
             selected: None,
@@ -61,7 +113,7 @@ impl SessionPicker {
         }
     }
 
-    pub(super) fn open(&mut self) -> SessionListRequest {
+    pub(super) fn open(&mut self) -> SessionPickerListing {
         self.open = true;
         self.query.clear();
         self.listing.clear_error();
@@ -76,7 +128,7 @@ impl SessionPicker {
 
     /// Takes the Workspace this client has moved to, so the picker's own
     /// narrowing to "where I am" narrows to where the reader now is.
-    pub(super) fn adopt_workspace(&mut self, workspace: std::path::PathBuf) {
+    pub(super) fn adopt_workspace(&mut self, workspace: PathBuf) {
         self.listing.adopt_current_workspace(workspace);
     }
 
@@ -88,7 +140,11 @@ impl SessionPicker {
     pub(super) fn close(&mut self) {
         self.open = false;
         self.query.clear();
-        self.listing.clear();
+        if self.scope != SessionPickerScope::Everywhere {
+            self.listing.clear();
+        }
+        self.pending_everywhere_remotes = None;
+        self.awaiting_dispatch.clear();
         self.forget_selection();
     }
 
@@ -97,7 +153,12 @@ impl SessionPicker {
     }
 
     pub(super) fn is_loading(&self) -> bool {
-        self.listing.is_loading()
+        if self.scope == SessionPickerScope::Everywhere {
+            self.pending_everywhere_remotes.is_some()
+                || self.listing.is_loading_across(&self.everywhere_origins)
+        } else {
+            self.listing.is_loading()
+        }
     }
 
     pub(super) fn query(&self) -> &str {
@@ -105,11 +166,17 @@ impl SessionPicker {
     }
 
     pub(super) fn error(&self) -> Option<&str> {
-        self.listing.error()
+        if self.scope == SessionPickerScope::Everywhere {
+            self.listing
+                .error_across(&self.everywhere_origins)
+                .or_else(|| self.listing.error())
+        } else {
+            self.listing.error()
+        }
     }
 
-    pub(super) fn scope(&self) -> &SessionListScope {
-        self.listing.scope()
+    pub(super) fn scope_label(&self) -> &'static str {
+        self.scope.label()
     }
 
     pub(super) fn load(
@@ -118,7 +185,13 @@ impl SessionPicker {
         sessions: Vec<SessionListItem>,
         current: Option<&SessionReference>,
     ) {
-        if !self.listing.load(request, sessions) {
+        let shown = self.scope == SessionPickerScope::Everywhere
+            || request.outlook() == self.listing.outlook();
+        if !self.listing.awaits(request) {
+            return;
+        }
+        self.listing.load(request, sessions);
+        if !shown {
             return;
         }
         self.attaching = None;
@@ -144,7 +217,11 @@ impl SessionPicker {
         request: &SessionListRequest,
         sessions: &[SessionListItem],
     ) -> bool {
-        self.listing.would_move(request, sessions)
+        if self.scope == SessionPickerScope::Everywhere {
+            self.listing.would_move_across(request, sessions)
+        } else {
+            self.listing.would_move(request, sessions)
+        }
     }
 
     /// Whether a reply the server sent answers the listing this surface is
@@ -154,7 +231,13 @@ impl SessionPicker {
     }
 
     pub(super) fn fail_listing(&mut self, request: &SessionListRequest, error: String) {
-        if !self.listing.fail(request, error) {
+        let shown = self.scope == SessionPickerScope::Everywhere
+            || request.outlook() == self.listing.outlook();
+        if !self.listing.awaits(request) {
+            return;
+        }
+        self.listing.fail(request, error);
+        if !shown {
             return;
         }
         self.attaching = None;
@@ -168,7 +251,7 @@ impl SessionPicker {
         self.attaching = None;
     }
 
-    pub(super) fn fail_attachment(&mut self, error: String) -> SessionListRequest {
+    pub(super) fn fail_attachment(&mut self, error: String) -> SessionPickerListing {
         self.listing.report_error(error);
         self.begin_listing()
     }
@@ -185,9 +268,95 @@ impl SessionPicker {
         self.select_first_visible();
     }
 
-    pub(super) fn toggle_scope(&mut self) -> SessionListRequest {
+    pub(super) fn toggle_scope(&mut self) -> SessionPickerListing {
         self.forget_selection();
-        self.listing.toggle_scope()
+        self.listing.clear_error();
+        self.scope = self.scope.next();
+        self.begin_listing()
+    }
+
+    pub(super) fn accepts_everywhere_remotes(&self, request: EverywhereListRequest) -> bool {
+        request.surface() == SessionListSurface::SessionPicker
+            && self.scope == SessionPickerScope::Everywhere
+            && self.pending_everywhere_remotes == Some(request.id())
+    }
+
+    pub(super) fn load_everywhere_remotes(
+        &mut self,
+        request: EverywhereListRequest,
+        remotes: Vec<Remote>,
+    ) -> Option<Vec<SessionListRequest>> {
+        if !self.accepts_everywhere_remotes(request) {
+            return None;
+        }
+        self.pending_everywhere_remotes = None;
+        let origins = everywhere_origins(remotes);
+        self.listing.retain_origins(&origins);
+        self.everywhere_origins = origins;
+        Some(self.listing.refresh_origins(&self.everywhere_origins))
+    }
+
+    pub(super) fn fail_everywhere_remotes(
+        &mut self,
+        request: EverywhereListRequest,
+        error: String,
+    ) -> bool {
+        if !self.accepts_everywhere_remotes(request) {
+            return false;
+        }
+        self.pending_everywhere_remotes = None;
+        self.listing.report_error(error);
+        true
+    }
+
+    pub(super) fn catalog_origins(&self) -> HashSet<Outlook> {
+        if self.scope != SessionPickerScope::Everywhere {
+            return HashSet::new();
+        }
+        self.everywhere_origins
+            .iter()
+            .filter(|outlook| matches!(outlook, Outlook::Remote(_)))
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn is_everywhere(&self) -> bool {
+        self.scope == SessionPickerScope::Everywhere
+    }
+
+    pub(super) fn includes_origin(&self, outlook: &Outlook) -> bool {
+        self.scope == SessionPickerScope::Everywhere && self.everywhere_origins.contains(outlook)
+    }
+
+    /// Re-asks only the Origin whose catalog moved, keeping the rows already
+    /// held until its replacement arrives. Everywhere is a chosen scope even
+    /// while the overlay is hidden, so its listing stays current for the next
+    /// time the reader shows it.
+    pub(super) fn catch_up_origin(&mut self, outlook: Outlook) {
+        let participates = if self.scope == SessionPickerScope::Everywhere {
+            self.everywhere_origins.contains(&outlook)
+        } else {
+            outlook == *self.listing.outlook()
+        };
+        if participates && (self.open || self.scope == SessionPickerScope::Everywhere) {
+            self.awaiting_dispatch = vec![self.listing.catch_up_origin(outlook)];
+        }
+    }
+
+    /// Ends one Remote's participation and takes all of its rows away without
+    /// allowing a delayed reply from that membership to validate if the same
+    /// Remote name is paired again later.
+    pub(super) fn end_origin(&mut self, outlook: &Outlook) {
+        if !self.includes_origin(outlook) {
+            return;
+        }
+        self.everywhere_origins.retain(|origin| origin != outlook);
+        self.listing.retain_origins(&self.everywhere_origins);
+        self.forget_absent();
+    }
+
+    pub(super) fn take_listing_requests(&mut self) -> Vec<SessionListRequest> {
+        std::mem::take(&mut self.awaiting_dispatch)
     }
 
     pub(super) fn select_previous(&mut self) {
@@ -207,16 +376,26 @@ impl SessionPicker {
     }
 
     pub(super) fn begin_attachment(&mut self) -> Option<SessionReference> {
+        if self.is_loading() {
+            return None;
+        }
         self.confirming_delete = None;
         let selected = self.selected.clone()?;
-        self.listing
-            .sessions()
-            .iter()
+        self.sessions()
+            .into_iter()
             .find(|summary| summary.reference() == &selected)?
             .readable()?;
         self.attaching = Some(selected.clone());
         self.listing.clear_error();
         Some(selected)
+    }
+
+    pub(super) fn workspace_of(&self, reference: &SessionReference) -> Option<PathBuf> {
+        self.sessions()
+            .into_iter()
+            .find(|session| session.reference() == reference)
+            .and_then(|session| session.workspace())
+            .map(|workspace| workspace.path.clone())
     }
 
     pub(super) fn is_attaching(&self) -> bool {
@@ -232,7 +411,7 @@ impl SessionPicker {
     }
 
     pub(super) fn begin_deletion(&mut self) -> Option<SessionReference> {
-        if self.deleting.is_some() {
+        if self.is_loading() || self.deleting.is_some() {
             return None;
         }
         let selected = self.selected.clone()?;
@@ -251,9 +430,39 @@ impl SessionPicker {
         self.forget_absent();
     }
 
+    pub(super) fn remove_origin(&mut self, outlook: Outlook, session_id: SessionId) {
+        self.listing.remove_origin(outlook, session_id);
+        self.forget_absent();
+    }
+
     pub(super) fn retain_catalog(&mut self, session_ids: &[SessionId]) {
         self.listing.retain(session_ids);
         self.forget_absent();
+    }
+
+    pub(super) fn retain_origin_catalog(&mut self, outlook: Outlook, session_ids: &[SessionId]) {
+        self.listing.retain_origin(outlook, session_ids);
+        self.forget_absent();
+    }
+
+    pub(super) fn retitle_origin(
+        &mut self,
+        outlook: Outlook,
+        session_id: SessionId,
+        title: String,
+        emoji: Option<String>,
+    ) {
+        self.listing
+            .retitle_origin(outlook, session_id, title, emoji);
+    }
+
+    pub(super) fn settle_origin(
+        &mut self,
+        outlook: Outlook,
+        session_id: SessionId,
+        settled_at: Option<SessionTimestamp>,
+    ) {
+        self.listing.settle_origin(outlook, session_id, settled_at);
     }
 
     pub(super) fn fail_deletion(&mut self, reference: &SessionReference, error: String) {
@@ -272,10 +481,10 @@ impl SessionPicker {
         &self,
         current: Option<&SessionReference>,
     ) -> impl Iterator<Item = SessionPickerRow<'_>> {
-        let all_workspaces = matches!(self.listing.scope(), SessionListScope::AllWorkspaces);
-        self.listing
-            .sessions()
-            .iter()
+        let wide = self.scope != SessionPickerScope::CurrentWorkspace;
+        let everywhere = self.scope == SessionPickerScope::Everywhere;
+        self.sessions()
+            .into_iter()
             .filter(|summary| fuzzy_matches(&self.query, summary.title()))
             .map(move |summary| {
                 let readable = summary.readable();
@@ -288,12 +497,15 @@ impl SessionPicker {
                         .is_some_and(|summary| summary.session.status == SessionStatus::Active),
                     unreadable: readable.is_none(),
                     updated_at: summary.updated_at(),
-                    workspace: all_workspaces
+                    workspace: wide
                         .then(|| {
                             summary
                                 .workspace()
                                 .map(|workspace| workspace.path.as_path())
                         })
+                        .flatten(),
+                    remote: everywhere
+                        .then(|| summary.reference().origin.remote_name())
                         .flatten(),
                     confirming_delete: self.confirming_delete.as_ref() == Some(summary.reference()),
                 }
@@ -333,19 +545,47 @@ impl SessionPicker {
     }
 
     fn visible_references(&self) -> Vec<SessionReference> {
-        self.listing
-            .sessions()
-            .iter()
+        self.sessions()
+            .into_iter()
             .filter(|summary| fuzzy_matches(&self.query, summary.title()))
             .map(|summary| summary.reference().clone())
             .collect()
     }
 
+    fn sessions(&self) -> Vec<&ListedSession> {
+        let mut sessions = if self.scope == SessionPickerScope::Everywhere {
+            self.listing.sessions_across(&self.everywhere_origins)
+        } else {
+            self.listing.sessions().iter().collect()
+        };
+        sessions.sort_by_key(|summary| Reverse(summary.updated_at()));
+        sessions
+    }
+
     /// Asks the listing again and puts the picker back where a fresh listing
     /// leaves it: nothing selected, nothing in flight.
-    fn begin_listing(&mut self) -> SessionListRequest {
+    fn begin_listing(&mut self) -> SessionPickerListing {
         self.forget_selection();
-        self.listing.refresh()
+        self.awaiting_dispatch.clear();
+        match self.scope {
+            SessionPickerScope::CurrentWorkspace => {
+                let scope =
+                    SessionListScope::CurrentWorkspace(self.listing.current_workspace().to_owned());
+                SessionPickerListing::Origin(self.listing.refresh_in(scope))
+            }
+            SessionPickerScope::AllWorkspaces => SessionPickerListing::Origin(
+                self.listing.refresh_in(SessionListScope::AllWorkspaces),
+            ),
+            SessionPickerScope::Everywhere => {
+                self.listing.adopt_scope(SessionListScope::AllWorkspaces);
+                self.everywhere_remote_sequence = self.everywhere_remote_sequence.wrapping_add(1);
+                self.pending_everywhere_remotes = Some(self.everywhere_remote_sequence);
+                SessionPickerListing::Everywhere(EverywhereListRequest::new(
+                    SessionListSurface::SessionPicker,
+                    self.everywhere_remote_sequence,
+                ))
+            }
+        }
     }
 
     fn forget_selection(&mut self) {

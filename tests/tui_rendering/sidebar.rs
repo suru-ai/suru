@@ -3699,7 +3699,7 @@ fn choose_everywhere(application: &mut Application, remotes: Vec<Remote>) -> Eve
         requests,
     } = application
         .handle_event(ApplicationEvent::EverywhereRemotesListed {
-            request_id,
+            request: request_id,
             remotes,
         })
         .expect("take the paired Remotes into the Everywhere listing")
@@ -4606,7 +4606,7 @@ fn reopening_everywhere_refreshes_the_remote_set_and_every_origin_listing() {
         requests: second,
     } = application
         .handle_event(ApplicationEvent::EverywhereRemotesListed {
-            request_id,
+            request: request_id,
             remotes: vec![remote("studio", RemoteStatus::Available)],
         })
         .expect("refresh the paired Remote set")
@@ -4718,7 +4718,7 @@ fn a_superseded_everywhere_discovery_cannot_replace_the_newer_remote_set() {
 
     let current = application
         .handle_event(ApplicationEvent::EverywhereRemotesListed {
-            request_id: second,
+            request: second,
             remotes: vec![remote("studio", RemoteStatus::Available)],
         })
         .expect("take the current discovery reply");
@@ -4729,7 +4729,7 @@ fn a_superseded_everywhere_discovery_cannot_replace_the_newer_remote_set() {
     assert_eq!(
         application
             .handle_event(ApplicationEvent::EverywhereRemotesListed {
-                request_id: first,
+                request: first,
                 remotes: vec![remote("stale", RemoteStatus::Available)],
             })
             .expect("ignore the superseded discovery reply"),
@@ -4898,7 +4898,7 @@ fn an_everywhere_initial_scope_launches_into_the_merged_listing() {
     };
     let ApplicationTransition::ReconcileCatalogOrigins { requests, .. } = application
         .handle_event(ApplicationEvent::EverywhereRemotesListed {
-            request_id,
+            request: request_id,
             remotes: vec![remote("studio", RemoteStatus::Available)],
         })
         .expect("take the paired Remotes into the starting listing")
