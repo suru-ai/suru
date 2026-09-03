@@ -82,7 +82,7 @@ struct SessionTasks {
         HashMap<(SessionListSurface, Outlook), (SessionListRequest, tokio::task::JoinHandle<()>)>,
     listing_models: Option<(ModelListRequest, tokio::task::JoinHandle<()>)>,
     listing_skills: Option<((Outlook, SkillCatalogRequest), tokio::task::JoinHandle<()>)>,
-    outlook_catalogs: HashMap<Outlook, tokio::task::JoinHandle<()>>,
+    catalog_origins: HashMap<Outlook, tokio::task::JoinHandle<()>>,
     resolving_workspaces: HashMap<WorkspaceResolutionSurface, (u64, tokio::task::JoinHandle<()>)>,
 }
 
@@ -125,13 +125,13 @@ impl SessionTasks {
         }
     }
 
-    fn reconcile_outlook_catalogs(
+    fn reconcile_catalog_origins(
         &mut self,
         client: &ManagedClient,
         wanted: HashSet<Outlook>,
-        events: &UnboundedSender<OutlookCatalogEvent>,
+        events: &UnboundedSender<OriginCatalogEvent>,
     ) {
-        self.outlook_catalogs.retain(|outlook, task| {
+        self.catalog_origins.retain(|outlook, task| {
             let keep = wanted.contains(outlook);
             if !keep {
                 task.abort();
@@ -139,10 +139,10 @@ impl SessionTasks {
             keep
         });
         for outlook in wanted {
-            self.outlook_catalogs
+            self.catalog_origins
                 .entry(outlook.clone())
                 .or_insert_with(|| {
-                    spawn_outlook_catalog_forwarder(
+                    spawn_origin_catalog_forwarder(
                         client
                             .session_commands_for(outlook.clone())
                             .subscribe_catalog(),
@@ -388,7 +388,7 @@ struct TaskChannels {
     skills: UnboundedSender<SkillCatalogResult>,
     pairing: UnboundedSender<PairingResult>,
     workspaces: UnboundedSender<WorkspaceResolutionResult>,
-    outlook_catalog: UnboundedSender<OutlookCatalogEvent>,
+    origin_catalog: UnboundedSender<OriginCatalogEvent>,
 }
 
 /// The run loop's mutable world: the Application it feeds, the client it sends
@@ -424,7 +424,7 @@ async fn run_loop(
     let (skills, mut skill_rx) = tokio::sync::mpsc::unbounded_channel();
     let (pairing, mut pairing_rx) = tokio::sync::mpsc::unbounded_channel();
     let (workspaces, mut workspace_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (outlook_catalog, mut outlook_catalog_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (origin_catalog, mut origin_catalog_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut run = RunLoop {
         client,
         application: Application::new(workspace, terminal_facts),
@@ -437,7 +437,7 @@ async fn run_loop(
             skills,
             pairing,
             workspaces,
-            outlook_catalog,
+            origin_catalog,
         },
         reconnect_grace: None,
         opening_loading_delay: None,
@@ -478,7 +478,7 @@ async fn run_loop(
             picker = picker_rx.recv() => run.receive_session_picker(picker)?,
             pairing = pairing_rx.recv() => run.receive_pairing_result(pairing)?,
             workspace = workspace_rx.recv() => run.receive_workspace_result(workspace)?,
-            catalog = outlook_catalog_rx.recv() => run.receive_outlook_catalog(catalog)?,
+            catalog = origin_catalog_rx.recv() => run.receive_origin_catalog(catalog)?,
             input_event = input.next() => match input_event {
                 Some(Ok(event)) => {
                     let mut output = TerminalOutput(terminal.backend_mut());
@@ -645,11 +645,10 @@ impl RunLoop {
                     .attach(commands, reference, &self.channels.pickers);
             }
             ApplicationTransition::ListSessions(request) => self.list_sessions(request),
-            ApplicationTransition::ListSessionOrigins(requests) => {
-                for request in requests {
-                    self.list_sessions(request);
-                }
-            }
+            ApplicationTransition::ReconcileCatalogOrigins {
+                catalog_origins,
+                requests,
+            } => self.reconcile_catalog_origins(catalog_origins, requests),
             ApplicationTransition::ListModels(request) => {
                 let commands = self.client.session_commands_for(request.outlook().clone());
                 self.tasks
@@ -740,18 +739,22 @@ impl RunLoop {
             }
             ApplicationTransition::TurnOutlook {
                 outlook,
-                catalog_outlooks,
+                catalog_origins,
             } => {
                 self.tasks.leave_session();
                 self.tasks.reset_skill_listing();
-                self.tasks.reconcile_outlook_catalogs(
+                self.tasks.reconcile_catalog_origins(
                     &self.client,
-                    catalog_outlooks,
-                    &self.channels.outlook_catalog,
+                    catalog_origins,
+                    &self.channels.origin_catalog,
                 );
                 self.tasks.reset_workspace_resolutions();
                 match self.application.take_sidebar_listing_transition() {
                     ApplicationTransition::ListSessions(request) => self.list_sessions(request),
+                    ApplicationTransition::ReconcileCatalogOrigins {
+                        catalog_origins,
+                        requests,
+                    } => self.reconcile_catalog_origins(catalog_origins, requests),
                     ApplicationTransition::ListEverywhereRemotes(request_id) => {
                         spawn_everywhere_remote_listing(
                             self.client.session_commands(),
@@ -820,6 +823,21 @@ impl RunLoop {
             .list_sessions(commands, request, &self.channels.pickers);
     }
 
+    fn reconcile_catalog_origins(
+        &mut self,
+        catalog_origins: HashSet<Outlook>,
+        requests: Vec<SessionListRequest>,
+    ) {
+        self.tasks.reconcile_catalog_origins(
+            &self.client,
+            catalog_origins,
+            &self.channels.origin_catalog,
+        );
+        for request in requests {
+            self.list_sessions(request);
+        }
+    }
+
     fn outlook_commands(&self) -> SessionCommandClient {
         self.client
             .session_commands_for(self.application.outlook().clone())
@@ -853,11 +871,10 @@ impl RunLoop {
             // snapshot decides whether the Sidebar opens, and a Sidebar that
             // opens wants the Sessions it lists.
             ApplicationTransition::ListSessions(request) => self.list_sessions(request),
-            ApplicationTransition::ListSessionOrigins(requests) => {
-                for request in requests {
-                    self.list_sessions(request);
-                }
-            }
+            ApplicationTransition::ReconcileCatalogOrigins {
+                catalog_origins,
+                requests,
+            } => self.reconcile_catalog_origins(catalog_origins, requests),
             ApplicationTransition::ListEverywhereRemotes(request_id) => {
                 spawn_everywhere_remote_listing(
                     self.client.session_commands(),
@@ -983,7 +1000,7 @@ impl RunLoop {
                 if let Some(event) =
                     remote_failure_from_session_error(self.application.outlook().clone(), &error)
                 {
-                    return self.receive_outlook_catalog(Some(event));
+                    return self.receive_origin_catalog(Some(event));
                 }
                 if !error.is_recoverable() {
                     return Err(error.into());
@@ -1406,19 +1423,22 @@ impl RunLoop {
         Ok(self.dispatch_transition(transition))
     }
 
-    fn receive_outlook_catalog(
+    fn receive_origin_catalog(
         &mut self,
-        event: Option<OutlookCatalogEvent>,
+        event: Option<OriginCatalogEvent>,
     ) -> Result<ControlFlow<Exit>> {
-        let event = event.ok_or_else(|| anyhow!("Outlook catalog task channel stopped"))?;
-        if self.application.outlook() != &event.outlook {
+        let event = event.ok_or_else(|| anyhow!("Origin catalog task channel stopped"))?;
+        if !self
+            .application
+            .accepts_catalog_event(&event.outlook, &event.event)
+        {
             return Ok(ControlFlow::Continue(()));
         }
         self.needs_redraw |= event.event.is_drawn_on_arrival();
         let was_recovering = self.application.is_recovering();
         let transition = self
             .application
-            .handle_event(ApplicationEvent::OutlookCatalog {
+            .handle_event(ApplicationEvent::OriginCatalog {
                 outlook: event.outlook,
                 event: event.event,
             })?;
@@ -1433,7 +1453,7 @@ impl RunLoop {
     }
 }
 
-struct OutlookCatalogEvent {
+struct OriginCatalogEvent {
     outlook: Outlook,
     event: ManagedEvent,
 }
@@ -1441,8 +1461,8 @@ struct OutlookCatalogEvent {
 fn remote_failure_from_session_error(
     outlook: Outlook,
     error: &SessionStreamError,
-) -> Option<OutlookCatalogEvent> {
-    error.remote_status().map(|status| OutlookCatalogEvent {
+) -> Option<OriginCatalogEvent> {
+    error.remote_status().map(|status| OriginCatalogEvent {
         outlook,
         event: ManagedEvent::RemoteFailed {
             status,
@@ -1451,15 +1471,15 @@ fn remote_failure_from_session_error(
     })
 }
 
-fn spawn_outlook_catalog_forwarder(
+fn spawn_origin_catalog_forwarder(
     mut subscription: SessionCatalogSubscription,
     outlook: Outlook,
-    events: UnboundedSender<OutlookCatalogEvent>,
+    events: UnboundedSender<OriginCatalogEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = subscription.next().await {
             if events
-                .send(OutlookCatalogEvent {
+                .send(OriginCatalogEvent {
                     outlook: outlook.clone(),
                     event,
                 })
@@ -2485,14 +2505,24 @@ mod tests {
     use crossterm::Command;
 
     use super::{
-        DisableMouseButtonReporting, EnableMouseButtonReporting, PopModifiedKeyReporting,
-        PushModifiedKeyReporting, TerminalSink, copy_to_clipboard, enter_terminal_display,
-        ignore_unsupported, leave_terminal_display, remote_failure_from_session_error,
+        Application, DisableMouseButtonReporting, EnableMouseButtonReporting,
+        PopModifiedKeyReporting, PushModifiedKeyReporting, TerminalSink, copy_to_clipboard,
+        enter_terminal_display, ignore_unsupported, leave_terminal_display,
+        remote_failure_from_session_error,
     };
     use crate::{
         managed_client::{ManagedEvent, SessionStreamError},
         protocol::{Outlook, RemoteStatus},
     };
+
+    #[test]
+    fn an_ignored_background_lifecycle_event_does_not_request_a_frame() {
+        let application = Application::default();
+        let event = ManagedEvent::RemoteRecovered;
+
+        assert!(!application.accepts_catalog_event(&Outlook::Remote("studio".to_owned()), &event,));
+        assert!(application.accepts_catalog_event(&Outlook::Local, &event));
+    }
 
     #[test]
     fn a_terminal_remote_session_failure_uses_the_outlook_ejection_path() {

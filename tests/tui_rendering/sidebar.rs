@@ -3672,16 +3672,21 @@ fn remote(name: &str, status: RemoteStatus) -> Remote {
     }
 }
 
-fn choose_everywhere(
-    application: &mut Application,
-    remotes: Vec<Remote>,
-) -> Vec<suru::tui::SessionListRequest> {
+struct EverywhereListing {
+    catalog_origins: std::collections::HashSet<Outlook>,
+    requests: Vec<suru::tui::SessionListRequest>,
+}
+
+fn choose_everywhere(application: &mut Application, remotes: Vec<Remote>) -> EverywhereListing {
     let ApplicationTransition::ListEverywhereRemotes(request_id) =
         choose_workspace(application, EVERYWHERE)
     else {
         panic!("choosing Everywhere should first ask which Remotes are paired");
     };
-    let ApplicationTransition::ListSessionOrigins(requests) = application
+    let ApplicationTransition::ReconcileCatalogOrigins {
+        catalog_origins,
+        requests,
+    } = application
         .handle_event(ApplicationEvent::EverywhereRemotesListed {
             request_id,
             remotes,
@@ -3690,7 +3695,10 @@ fn choose_everywhere(
     else {
         panic!("the paired Remote list should yield one listing request per Origin");
     };
-    requests
+    EverywhereListing {
+        catalog_origins,
+        requests,
+    }
 }
 
 /// The Workspace selector stands between the search box and the list it
@@ -3756,7 +3764,10 @@ fn everywhere_asks_each_non_terminal_origin_and_merges_both_shelves_by_reported_
         )],
     );
 
-    let requests = choose_everywhere(
+    let EverywhereListing {
+        catalog_origins,
+        requests,
+    } = choose_everywhere(
         &mut application,
         vec![
             remote("studio", RemoteStatus::Available),
@@ -3777,6 +3788,14 @@ fn everywhere_asks_each_non_terminal_origin_and_merges_both_shelves_by_reported_
             Outlook::Remote("sleeping".to_owned()),
         ]),
         "terminal Remotes are not asked, while an unavailable Pairing may answer again"
+    );
+    assert_eq!(
+        catalog_origins,
+        std::collections::HashSet::from([
+            Outlook::Remote("studio".to_owned()),
+            Outlook::Remote("sleeping".to_owned()),
+        ]),
+        "Everywhere watches every paired, non-terminal Remote"
     );
     assert!(requests.iter().all(|request| {
         request.surface() == SessionListSurface::Sidebar
@@ -3833,7 +3852,7 @@ fn everywhere_asks_each_non_terminal_origin_and_merges_both_shelves_by_reported_
 fn everywhere_tags_only_foreign_rows_and_keeps_the_tag_when_the_title_is_cut() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), Vec::new());
-    let requests = choose_everywhere(
+    let EverywhereListing { requests, .. } = choose_everywhere(
         &mut application,
         vec![remote("studio", RemoteStatus::Available)],
     );
@@ -3874,7 +3893,7 @@ fn everywhere_tags_only_foreign_rows_and_keeps_the_tag_when_the_title_is_cut() {
 fn everywhere_searches_one_flat_tagged_list_then_a_workspace_returns_to_the_outlook_alone() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), Vec::new());
-    let requests = choose_everywhere(
+    let EverywhereListing { requests, .. } = choose_everywhere(
         &mut application,
         vec![remote("studio", RemoteStatus::Available)],
     );
@@ -3933,8 +3952,11 @@ fn everywhere_searches_one_flat_tagged_list_then_a_workspace_returns_to_the_outl
     );
     assert_eq!(
         choose_workspace(&mut application, &workspace_name(workspace.path())),
-        ApplicationTransition::Continue,
-        "narrowing uses the Outlook listing already in hand"
+        ApplicationTransition::ReconcileCatalogOrigins {
+            catalog_origins: std::collections::HashSet::new(),
+            requests: Vec::new(),
+        },
+        "narrowing uses the Outlook listing already in hand and watches the local Outlook alone"
     );
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     assert!(drawn_in_sidebar(&rows, "Matching local"));
@@ -3942,10 +3964,40 @@ fn everywhere_searches_one_flat_tagged_list_then_a_workspace_returns_to_the_outl
 }
 
 #[test]
+fn resolving_a_workspace_from_everywhere_returns_to_the_outlooks_catalog_alone() {
+    let workspace = workspace_dir();
+    let added = workspace.path().join("notes");
+    std::fs::create_dir(&added).expect("create the Workspace the reader adds");
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let EverywhereListing { requests, .. } = choose_everywhere(
+        &mut application,
+        vec![remote("studio", RemoteStatus::Available)],
+    );
+    for request in requests {
+        application
+            .handle_event(ApplicationEvent::SessionsListed {
+                request,
+                sessions: Vec::new(),
+            })
+            .expect("finish the Everywhere listing");
+    }
+
+    assert_eq!(
+        add_workspace(&mut application, &added.to_string_lossy()),
+        ApplicationTransition::ReconcileCatalogOrigins {
+            catalog_origins: std::collections::HashSet::new(),
+            requests: Vec::new(),
+        }
+    );
+}
+
+#[test]
 fn reopening_everywhere_refreshes_the_remote_set_and_every_origin_listing() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), Vec::new());
-    let first = choose_everywhere(
+    let EverywhereListing {
+        requests: first, ..
+    } = choose_everywhere(
         &mut application,
         vec![remote("studio", RemoteStatus::Available)],
     );
@@ -3962,11 +4014,29 @@ fn reopening_everywhere_refreshes_the_remote_set_and_every_origin_listing() {
         press_toggle(&mut application),
         ApplicationTransition::Continue
     );
+    let ApplicationTransition::ListSessions(hidden_refresh) = application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::SessionCreated(SessionCreated {
+                session_id: SessionId::new(),
+            }),
+        })
+        .expect("keep the hidden Everywhere listing live")
+    else {
+        panic!("hiding the Sidebar must not release or stop its Everywhere catalog interests");
+    };
+    assert_eq!(
+        hidden_refresh.outlook(),
+        &Outlook::Remote("studio".to_owned())
+    );
     let ApplicationTransition::ListEverywhereRemotes(request_id) = press_toggle(&mut application)
     else {
         panic!("the Sidebar's ordinary reveal path starts Everywhere afresh");
     };
-    let ApplicationTransition::ListSessionOrigins(second) = application
+    let ApplicationTransition::ReconcileCatalogOrigins {
+        catalog_origins,
+        requests: second,
+    } = application
         .handle_event(ApplicationEvent::EverywhereRemotesListed {
             request_id,
             remotes: vec![remote("studio", RemoteStatus::Available)],
@@ -3975,6 +4045,10 @@ fn reopening_everywhere_refreshes_the_remote_set_and_every_origin_listing() {
     else {
         panic!("the refreshed Remote set should yield fresh Origin listings");
     };
+    assert_eq!(
+        catalog_origins,
+        std::collections::HashSet::from([Outlook::Remote("studio".to_owned())])
+    );
     assert_eq!(second.len(), 2);
     assert!(second.iter().all(|request| {
         request.surface() == SessionListSurface::Sidebar
@@ -3983,10 +4057,10 @@ fn reopening_everywhere_refreshes_the_remote_set_and_every_origin_listing() {
 }
 
 #[test]
-fn a_catalog_change_catches_up_every_origin_while_everywhere_is_chosen() {
+fn a_remote_catalog_change_catches_up_only_its_origin_while_everywhere_is_chosen() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), Vec::new());
-    let requests = choose_everywhere(
+    let EverywhereListing { requests, .. } = choose_everywhere(
         &mut application,
         vec![remote("studio", RemoteStatus::Available)],
     );
@@ -3999,19 +4073,62 @@ fn a_catalog_change_catches_up_every_origin_while_everywhere_is_chosen() {
             .expect("finish the first Everywhere listing");
     }
 
-    let ApplicationTransition::ListSessionOrigins(requests) =
-        create_elsewhere(&mut application, SessionId::new())
+    let ApplicationTransition::ListSessions(request) = application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::SessionCreated(SessionCreated {
+                session_id: SessionId::new(),
+            }),
+        })
+        .expect("take a catalog change from a background Remote")
     else {
-        panic!("a catalog change should re-ask every Everywhere Origin");
+        panic!("a Remote catalog change should re-ask only that Origin");
     };
     assert_eq!(
-        requests
-            .iter()
-            .map(|request| request.outlook().clone())
-            .collect::<std::collections::HashSet<_>>(),
-        std::collections::HashSet::from([Outlook::Local, Outlook::Remote("studio".to_owned()),]),
-        "the existing catch-up path keeps every Origin current"
+        request.outlook(),
+        &Outlook::Remote("studio".to_owned()),
+        "the unrelated local Origin is undisturbed"
     );
+}
+
+#[test]
+fn a_remote_catalog_change_updates_only_that_origins_rows() {
+    let workspace = workspace_dir();
+    let shared_id = SessionId::new();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let EverywhereListing { requests, .. } = choose_everywhere(
+        &mut application,
+        vec![remote("studio", RemoteStatus::Available)],
+    );
+    for request in requests {
+        let title = match request.outlook() {
+            Outlook::Local => "Local title",
+            Outlook::Remote(_) => "Remote title",
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed {
+                request,
+                sessions: vec![listed_as(shared_id, title, workspace.path(), 1)],
+            })
+            .expect("load the same Origin-local identity from both Servers");
+    }
+
+    let transition = application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::SessionTitleChanged(SessionTitleChanged {
+                session_id: shared_id,
+                title: "Retitled remotely".to_owned(),
+                emoji: None,
+            }),
+        })
+        .expect("take the Remote retitle");
+
+    assert!(matches!(transition, ApplicationTransition::ListSessions(_)));
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(drawn_in_sidebar(&rows, "Local title"));
+    assert!(drawn_in_sidebar(&rows, "Retitled remotely [studio]"));
+    assert!(!drawn_in_sidebar(&rows, "Remote title"));
 }
 
 #[test]
@@ -4039,7 +4156,7 @@ fn a_superseded_everywhere_discovery_cannot_replace_the_newer_remote_set() {
         .expect("take the current discovery reply");
     assert!(matches!(
         current,
-        ApplicationTransition::ListSessionOrigins(_)
+        ApplicationTransition::ReconcileCatalogOrigins { .. }
     ));
     assert_eq!(
         application

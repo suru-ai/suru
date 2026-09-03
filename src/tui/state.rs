@@ -790,19 +790,25 @@ impl TuiState {
 
     pub fn apply(&mut self, event: ManagedEvent) {
         // The managed catalog stream belongs to the local Server. A Remote
-        // Outlook has its own listings and must never be moved by local work.
+        // Outlook has its own main view and pickers, but Everywhere still
+        // keeps the local Origin's Sidebar rows live in the background.
         if self.outlook != Outlook::Local
             && (event.moves_the_session_catalog()
                 || matches!(&event, ManagedEvent::SkillCatalogUpdated(_)))
         {
+            if event.moves_the_session_catalog() && self.sidebar.includes_origin(&Outlook::Local) {
+                self.apply_sidebar_catalog_event(&Outlook::Local, &event);
+            }
             return;
         }
         self.apply_managed_event(event);
     }
 
-    fn apply_outlook_catalog(&mut self, outlook: &Outlook, event: ManagedEvent) {
+    fn apply_origin_catalog(&mut self, outlook: &Outlook, event: ManagedEvent) {
         if outlook == &self.outlook {
             self.apply_managed_event(event);
+        } else if event.moves_the_session_catalog() && self.sidebar.includes_origin(outlook) {
+            self.apply_sidebar_catalog_event(outlook, &event);
         }
     }
 
@@ -819,9 +825,8 @@ impl TuiState {
         // the ask is what carries everything the change does not say — a new
         // Session's Title and Workspace, and the last activity the server
         // moves as a Session is unsettled, most of all.
-        if event.moves_the_session_catalog() {
-            self.sidebar.catch_up();
-        }
+        let outlook = self.outlook.clone();
+        self.apply_sidebar_catalog_event(&outlook, &event);
         match event {
             ManagedEvent::Connecting => {
                 self.skill_catalog = None;
@@ -904,7 +909,6 @@ impl TuiState {
             ManagedEvent::SessionCreated(_) => {}
             ManagedEvent::SessionDeleted(deleted) => {
                 self.session_picker.remove(deleted.session_id);
-                self.sidebar.remove(deleted.session_id);
                 self.remove_deleted_session(deleted.session_id);
             }
             ManagedEvent::SessionTitleChanged(retitled) => {
@@ -913,28 +917,21 @@ impl TuiState {
                     retitled.title.clone(),
                     retitled.emoji.clone(),
                 );
-                self.sidebar
-                    .retitle(retitled.session_id, retitled.title, retitled.emoji);
             }
             ManagedEvent::SessionSettlementChanged(settled) => {
                 self.session_picker
                     .settle(settled.session_id, settled.settled_at);
-                self.sidebar.settle(settled.session_id, settled.settled_at);
             }
             // The picker takes nothing in place: it draws no Working label, so
             // what the change carries is nothing it shows — and it asks for a
             // fresh listing every time it opens.
-            ManagedEvent::SessionWorkingChanged(working) => {
-                self.sidebar
-                    .set_working(working.session_id, working.working_since);
-            }
+            ManagedEvent::SessionWorkingChanged(_) => {}
             // Neither listing surface states a Session's total yet — the
             // footer of the Session in view reads its own — so the roll-up
             // the catalog announces moves nothing this client draws.
             ManagedEvent::SessionUsageChanged(_) => {}
             ManagedEvent::SessionCatalogReconciled(snapshot) => {
                 self.session_picker.retain_catalog(&snapshot.session_ids);
-                self.sidebar.retain_catalog(&snapshot.session_ids);
                 if let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id)
                     && !snapshot.session_ids.contains(&session_id)
                 {
@@ -945,6 +942,49 @@ impl TuiState {
                 self.reconnect_overlay_visible = false;
                 self.fatal_error = Some(error);
             }
+        }
+    }
+
+    /// Applies the part of a catalog event that belongs to the merged Sidebar.
+    /// The Origin is explicit because Session ids are only unique within it.
+    fn apply_sidebar_catalog_event(&mut self, outlook: &Outlook, event: &ManagedEvent) {
+        if !event.moves_the_session_catalog() {
+            return;
+        }
+        self.sidebar.catch_up_origin(outlook.clone());
+        match event {
+            ManagedEvent::SessionCreated(_) | ManagedEvent::SessionUsageChanged(_) => {}
+            ManagedEvent::SessionDeleted(deleted) => {
+                self.sidebar
+                    .remove_origin(outlook.clone(), deleted.session_id);
+            }
+            ManagedEvent::SessionTitleChanged(retitled) => self.sidebar.retitle_origin(
+                outlook.clone(),
+                retitled.session_id,
+                retitled.title.clone(),
+                retitled.emoji.clone(),
+            ),
+            ManagedEvent::SessionSettlementChanged(settled) => {
+                self.sidebar
+                    .settle_origin(outlook.clone(), settled.session_id, settled.settled_at)
+            }
+            ManagedEvent::SessionWorkingChanged(working) => self.sidebar.set_working_origin(
+                outlook.clone(),
+                working.session_id,
+                working.working_since,
+            ),
+            ManagedEvent::SessionCatalogReconciled(snapshot) => self
+                .sidebar
+                .retain_origin_catalog(outlook.clone(), &snapshot.session_ids),
+            ManagedEvent::Connecting
+            | ManagedEvent::Connected(_)
+            | ManagedEvent::SettingsSnapshot(_)
+            | ManagedEvent::SkillCatalogUpdated(_)
+            | ManagedEvent::Recovering(_)
+            | ManagedEvent::RemoteRecovered
+            | ManagedEvent::RemoteFailed { .. }
+            | ManagedEvent::ServerShutdown(_)
+            | ManagedEvent::Fatal(_) => {}
         }
     }
 
@@ -1948,7 +1988,7 @@ pub enum ApplicationEvent {
     OpeningLoadingDelayElapsed,
     ReconnectGraceElapsed,
     Managed(ManagedEvent),
-    OutlookCatalog {
+    OriginCatalog {
         outlook: Outlook,
         event: ManagedEvent,
     },
@@ -2198,9 +2238,12 @@ pub enum ApplicationTransition {
     SubscribeSession(SessionReference),
     AttachSession(SessionReference),
     ListSessions(SessionListRequest),
-    /// Independent listing requests for every Origin participating in an
-    /// Everywhere scope.
-    ListSessionOrigins(Vec<SessionListRequest>),
+    /// Reconcile the Remote catalog streams owned by the run loop and dispatch
+    /// any initial listings whose Origins established that desired set.
+    ReconcileCatalogOrigins {
+        catalog_origins: HashSet<Outlook>,
+        requests: Vec<SessionListRequest>,
+    },
     ListModels(ModelListRequest),
     RefreshSkills(SkillCatalogRequest),
     ConfirmLandingAgentSelection(AgentSelection),
@@ -2232,7 +2275,7 @@ pub enum ApplicationTransition {
     /// without establishing a network connection.
     TurnOutlook {
         outlook: Outlook,
-        catalog_outlooks: HashSet<Outlook>,
+        catalog_origins: HashSet<Outlook>,
     },
     CancelWorkspaceResolution(WorkspaceResolutionSurface),
     ResolveWorkspace {
@@ -2326,8 +2369,8 @@ impl Application {
             }
             ApplicationEvent::ReconnectGraceElapsed => Ok(self.elapse_reconnect_grace()),
             ApplicationEvent::Managed(event) => self.handle_managed_event(event),
-            ApplicationEvent::OutlookCatalog { outlook, event } => {
-                self.handle_outlook_catalog(outlook, event)
+            ApplicationEvent::OriginCatalog { outlook, event } => {
+                self.handle_origin_catalog(outlook, event)
             }
             ApplicationEvent::Session(event) => {
                 self.state.apply_session(event)?;
@@ -2445,7 +2488,10 @@ impl Application {
                     .load_everywhere_remotes(request_id, remotes);
                 Ok(
                     requests.map_or(ApplicationTransition::Continue, |requests| {
-                        ApplicationTransition::ListSessionOrigins(requests)
+                        ApplicationTransition::ReconcileCatalogOrigins {
+                            catalog_origins: self.state.sidebar.catalog_origins(),
+                            requests,
+                        }
                     }),
                 )
             }
@@ -2499,8 +2545,20 @@ impl Application {
                                 Ok(self.open_landing())
                             }
                             WorkspaceResolutionSurface::Sidebar => {
-                                self.state.sidebar.accept_workspace(workspace.path);
-                                Ok(ApplicationTransition::Continue)
+                                match self.state.sidebar.accept_workspace(workspace.path) {
+                                    SidebarActivation::CatalogOriginsChanged => {
+                                        Ok(ApplicationTransition::ReconcileCatalogOrigins {
+                                            catalog_origins: self.state.sidebar.catalog_origins(),
+                                            requests: Vec::new(),
+                                        })
+                                    }
+                                    SidebarActivation::Answered => {
+                                        Ok(ApplicationTransition::Continue)
+                                    }
+                                    activation => unreachable!(
+                                        "accepting a resolved Sidebar Workspace cannot yield {activation:?}"
+                                    ),
+                                }
                             }
                         }
                     }
@@ -3137,6 +3195,12 @@ impl Application {
                                 .expect("choosing Everywhere queues its Remote discovery"),
                         )
                     }
+                    SidebarActivation::CatalogOriginsChanged => {
+                        ApplicationTransition::ReconcileCatalogOrigins {
+                            catalog_origins: self.state.sidebar.catalog_origins(),
+                            requests: Vec::new(),
+                        }
+                    }
                     // Enter and a press both arrive here, so both open the
                     // Session the same way: the route moves now and the
                     // attachment follows it.
@@ -3440,15 +3504,14 @@ impl Application {
         }
     }
 
-    fn handle_outlook_catalog(
+    fn handle_origin_catalog(
         &mut self,
         outlook: Outlook,
         event: ManagedEvent,
     ) -> Result<ApplicationTransition> {
-        if outlook != self.state.outlook {
-            return Ok(ApplicationTransition::Continue);
-        }
-        if let ManagedEvent::RemoteFailed { status, message } = event {
+        if outlook == self.state.outlook
+            && let ManagedEvent::RemoteFailed { status, message } = event
+        {
             let Some(name) = outlook.remote_name().map(str::to_owned) else {
                 return Ok(ApplicationTransition::Continue);
             };
@@ -3477,17 +3540,26 @@ impl Application {
             self.state.sync_composer_completion();
             return Ok(ApplicationTransition::TurnOutlook {
                 outlook: Outlook::Local,
-                catalog_outlooks: HashSet::new(),
+                catalog_origins: self.state.sidebar.catalog_origins(),
             });
         }
         let had_session = self.state.session.is_some();
-        self.state.apply_outlook_catalog(&outlook, event);
+        self.state.apply_origin_catalog(&outlook, event);
         self.state.reconcile_command_mode();
         if had_session && self.state.session.is_none() {
             Ok(ApplicationTransition::SessionEnded)
         } else {
             Ok(self.take_sidebar_listing_transition())
         }
+    }
+
+    /// Whether an Origin-stamped catalog event can change client state now.
+    /// The current Outlook takes every event; a background Origin participates
+    /// only while Everywhere includes it, and only when its Session catalog
+    /// moves. Background lifecycle events have no represented state yet.
+    pub(super) fn accepts_catalog_event(&self, outlook: &Outlook, event: &ManagedEvent) -> bool {
+        outlook == &self.state.outlook
+            || (event.moves_the_session_catalog() && self.state.sidebar.includes_origin(outlook))
     }
 
     fn attach_session(
@@ -3721,13 +3793,10 @@ impl Application {
                     self.state
                         .begin_workspace_resolution(WorkspaceResolutionSurface::Outlook);
                 }
-                let catalog_outlooks = match &outlook {
-                    Outlook::Local => HashSet::new(),
-                    Outlook::Remote(_) => HashSet::from([outlook.clone()]),
-                };
+                let catalog_origins = self.state.sidebar.catalog_origins();
                 Ok(ApplicationTransition::TurnOutlook {
                     outlook,
-                    catalog_outlooks,
+                    catalog_origins,
                 })
             }
             SemanticCommandId::ConnectMoveAddressUp => {
@@ -4296,7 +4365,10 @@ impl Application {
             mut requests if requests.len() == 1 => {
                 ApplicationTransition::ListSessions(requests.pop().expect("one request"))
             }
-            requests => ApplicationTransition::ListSessionOrigins(requests),
+            requests => ApplicationTransition::ReconcileCatalogOrigins {
+                catalog_origins: self.state.sidebar.catalog_origins(),
+                requests,
+            },
         }
     }
 

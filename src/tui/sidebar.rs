@@ -3,6 +3,7 @@
 use std::{
     cell::{Cell, RefCell},
     cmp::Reverse,
+    collections::HashSet,
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -546,6 +547,9 @@ pub(super) enum SidebarActivation {
     /// the Session they asked for.
     Answered,
     ListEverywhereRemotes,
+    /// Narrowing from Everywhere changes which catalog streams the Client
+    /// owns even though the listing already in hand needs no fresh request.
+    CatalogOriginsChanged,
     Attach(SessionReference),
     /// The reader named a directory to work in. It is the client's current
     /// Workspace from here: the root of the Sessions they make next, and what
@@ -1200,16 +1204,21 @@ impl Sidebar {
     /// catch-up is not the reader looking again either, so the rows stand
     /// until the answer arrives, the settled shelf stays as deep as they
     /// walked it, and the row they are on stays under them.
-    pub(super) fn catch_up(&mut self) {
-        if !self.revealed {
+    /// Re-asks only the Origin whose catalog moved. Everywhere owns its
+    /// interest independently of visibility, so a hidden Sidebar keeps the
+    /// merged listing warm; an ordinary hidden Sidebar still refreshes when
+    /// it is next revealed.
+    pub(super) fn catch_up_origin(&mut self, outlook: Outlook) {
+        let participates = if self.scope == SidebarListingScope::Everywhere {
+            self.everywhere_origins.contains(&outlook)
+        } else {
+            outlook == *self.listing.outlook()
+        };
+        if !participates || (!self.revealed && self.scope != SidebarListingScope::Everywhere) {
             return;
         }
         self.asked_afresh = false;
-        self.awaiting_dispatch = if self.scope == SidebarListingScope::Everywhere {
-            self.listing.catch_up_origins(&self.everywhere_origins)
-        } else {
-            vec![self.listing.catch_up()]
-        };
+        self.awaiting_dispatch = vec![self.listing.catch_up_origin(outlook)];
     }
 
     /// Whether a listing the server answered with would move anything the
@@ -1308,6 +1317,27 @@ impl Sidebar {
         Some(self.listing.refresh_origins(&self.everywhere_origins))
     }
 
+    /// Remote streams the run loop must own for the chosen scope. The local
+    /// Server's catalog is already carried by the ManagedClient itself.
+    pub(super) fn catalog_origins(&self) -> HashSet<Outlook> {
+        if self.scope == SidebarListingScope::Everywhere {
+            return self
+                .everywhere_origins
+                .iter()
+                .filter(|outlook| matches!(outlook, Outlook::Remote(_)))
+                .cloned()
+                .collect();
+        }
+        match self.listing.outlook() {
+            Outlook::Local => HashSet::new(),
+            outlook @ Outlook::Remote(_) => HashSet::from([outlook.clone()]),
+        }
+    }
+
+    pub(super) fn includes_origin(&self, outlook: &Outlook) -> bool {
+        self.scope == SidebarListingScope::Everywhere && self.everywhere_origins.contains(outlook)
+    }
+
     pub(super) fn fail_everywhere_remotes(&mut self, request_id: u64, error: String) -> bool {
         if !self.accepts_everywhere_remotes(request_id) {
             return false;
@@ -1362,38 +1392,52 @@ impl Sidebar {
         self.listing.fail(request, error);
     }
 
-    pub(super) fn retitle(&mut self, session_id: SessionId, title: String, emoji: Option<String>) {
+    pub(super) fn retitle_origin(
+        &mut self,
+        outlook: Outlook,
+        session_id: SessionId,
+        title: String,
+        emoji: Option<String>,
+    ) {
         let before = self.focus_order_before_change();
-        self.listing.retitle(session_id, title, emoji);
+        self.listing
+            .retitle_origin(outlook, session_id, title, emoji);
         // A Title is what a query is read against, so another client's retitle
         // can carry the row the keys are on out of the results under them.
         self.keep_focus_drawn(&before);
     }
 
-    pub(super) fn settle(&mut self, session_id: SessionId, settled_at: Option<SessionTimestamp>) {
-        self.listing.settle(session_id, settled_at);
+    pub(super) fn settle_origin(
+        &mut self,
+        outlook: Outlook,
+        session_id: SessionId,
+        settled_at: Option<SessionTimestamp>,
+    ) {
+        self.listing.settle_origin(outlook, session_id, settled_at);
     }
 
     /// Takes a Turn the server reports starting or settling into the listing
     /// in hand, so the row's Working label — and the tick
     /// [`Self::shows_live_work`] arms off it — is true between listings.
-    pub(super) fn set_working(
+    pub(super) fn set_working_origin(
         &mut self,
+        outlook: Outlook,
         session_id: SessionId,
         working_since: Option<SessionTimestamp>,
     ) {
-        self.listing.set_working(session_id, working_since);
+        self.listing
+            .set_working_origin(outlook, session_id, working_since);
     }
 
-    pub(super) fn remove(&mut self, session_id: SessionId) {
+    pub(super) fn remove_origin(&mut self, outlook: Outlook, session_id: SessionId) {
         let before = self.focus_order_before_change();
-        self.listing.remove(session_id);
+        self.listing.remove_origin(outlook, session_id);
         self.forget_absent(&before);
     }
 
-    pub(super) fn retain_catalog(&mut self, session_ids: &[SessionId]) {
+    pub(super) fn retain_origin_catalog(&mut self, outlook: Outlook, session_ids: &[SessionId]) {
         let before = self.focus_order_before_change();
-        self.listing.retain(session_ids);
+        self.listing.retain_origin(outlook, session_ids);
         self.forget_absent(&before);
     }
 
@@ -1459,10 +1503,15 @@ impl Sidebar {
             SidebarFocus::Scope(scope) => {
                 let enters_everywhere = scope == SidebarListingScope::Everywhere
                     && self.scope != SidebarListingScope::Everywhere;
+                let leaves_everywhere = self.scope == SidebarListingScope::Everywhere
+                    && scope != SidebarListingScope::Everywhere;
                 self.choose_scope(scope);
                 if enters_everywhere {
                     self.ask_for_sessions();
                     return SidebarActivation::ListEverywhereRemotes;
+                }
+                if leaves_everywhere {
+                    return SidebarActivation::CatalogOriginsChanged;
                 }
                 return SidebarActivation::Answered;
             }
@@ -1544,10 +1593,16 @@ impl Sidebar {
         SidebarActivation::Answered
     }
 
-    pub(super) fn accept_workspace(&mut self, workspace: PathBuf) {
+    pub(super) fn accept_workspace(&mut self, workspace: PathBuf) -> SidebarActivation {
+        let left_everywhere = self.scope == SidebarListingScope::Everywhere;
         self.hand_back_keys();
         self.adopt_workspace(workspace.clone());
         self.narrow_to_workspace(workspace);
+        if left_everywhere {
+            SidebarActivation::CatalogOriginsChanged
+        } else {
+            SidebarActivation::Answered
+        }
     }
 
     pub(super) fn fail_workspace_resolution(&mut self, error: String) {
@@ -2603,7 +2658,7 @@ mod tests {
         sidebar.focus_next();
         assert_eq!(focused(&sidebar), Some("Doomed"));
 
-        sidebar.remove(doomed);
+        sidebar.remove_origin(Outlook::Local, doomed);
 
         assert_eq!(
             focused(&sidebar),
@@ -2976,14 +3031,14 @@ mod tests {
         let mut sidebar = showing(vec![identified(idle, "Quiet", 1)]);
         assert!(!sidebar.shows_live_work());
 
-        sidebar.set_working(idle, Some(SessionTimestamp(5)));
+        sidebar.set_working_origin(Outlook::Local, idle, Some(SessionTimestamp(5)));
 
         assert!(
             sidebar.shows_live_work(),
             "a Turn starting in a listed Session arms the tick its Working duration rises on"
         );
 
-        sidebar.set_working(idle, None);
+        sidebar.set_working_origin(Outlook::Local, idle, None);
 
         assert!(
             !sidebar.shows_live_work(),
@@ -3011,7 +3066,7 @@ mod tests {
     /// reconciling live updates is answered through: a listing already
     /// answered cannot be answered twice.
     fn caught_up(sidebar: &mut Sidebar) -> SessionListRequest {
-        sidebar.catch_up();
+        sidebar.catch_up_origin(Outlook::Local);
         sidebar
             .take_listing_request()
             .expect("a revealed Sidebar catching up asks again")

@@ -54,7 +54,7 @@ fn choosing_a_remote_turns_the_outlook_and_the_footer_names_it() {
         press(&mut application, KeyCode::Enter),
         ApplicationTransition::TurnOutlook {
             outlook: Outlook::Remote("studio".to_owned()),
-            catalog_outlooks: HashSet::from([Outlook::Remote("studio".to_owned())]),
+            catalog_origins: HashSet::from([Outlook::Remote("studio".to_owned())]),
         }
     );
 
@@ -93,7 +93,7 @@ fn a_transient_remote_drop_reconnects_over_the_existing_view_and_preserves_its_c
     type_terminal_text(&mut application, "unfinished thought");
 
     application
-        .handle_event(ApplicationEvent::OutlookCatalog {
+        .handle_event(ApplicationEvent::OriginCatalog {
             outlook: Outlook::Remote("studio".to_owned()),
             event: ManagedEvent::Recovering(suru::managed_client::RecoveryStatus {
                 attempt: 1,
@@ -112,7 +112,7 @@ fn a_transient_remote_drop_reconnects_over_the_existing_view_and_preserves_its_c
     );
 
     application
-        .handle_event(ApplicationEvent::OutlookCatalog {
+        .handle_event(ApplicationEvent::OriginCatalog {
             outlook: Outlook::Remote("studio".to_owned()),
             event: ManagedEvent::RemoteRecovered,
         })
@@ -140,7 +140,7 @@ fn a_revoked_remote_returns_to_the_local_landing_with_the_session_composer_recov
 
     assert_eq!(
         application
-            .handle_event(ApplicationEvent::OutlookCatalog {
+            .handle_event(ApplicationEvent::OriginCatalog {
                 outlook: Outlook::Remote("studio".to_owned()),
                 event: ManagedEvent::RemoteFailed {
                     status: RemoteStatus::Revoked,
@@ -150,7 +150,7 @@ fn a_revoked_remote_returns_to_the_local_landing_with_the_session_composer_recov
             .unwrap(),
         ApplicationTransition::TurnOutlook {
             outlook: Outlook::Local,
-            catalog_outlooks: HashSet::new(),
+            catalog_origins: HashSet::new(),
         }
     );
 
@@ -211,7 +211,7 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
         press(&mut application, KeyCode::Enter),
         ApplicationTransition::TurnOutlook {
             outlook: Outlook::Local,
-            catalog_outlooks: HashSet::new(),
+            catalog_origins: HashSet::new(),
         }
     );
     assert!(
@@ -297,7 +297,7 @@ fn returning_to_an_outlook_restores_its_stable_selection_presentation() {
         press(&mut application, KeyCode::Enter),
         ApplicationTransition::TurnOutlook {
             outlook: Outlook::Local,
-            catalog_outlooks: HashSet::new(),
+            catalog_origins: HashSet::new(),
         }
     );
 
@@ -368,7 +368,7 @@ fn equal_session_ids_in_different_outlooks_keep_separate_drafts() {
         press(&mut application, KeyCode::Enter),
         ApplicationTransition::TurnOutlook {
             outlook: Outlook::Local,
-            catalog_outlooks: HashSet::new(),
+            catalog_origins: HashSet::new(),
         }
     );
     application
@@ -404,7 +404,7 @@ fn a_remote_catalog_change_refreshes_the_remote_sidebar() {
         .unwrap();
 
     let ApplicationTransition::ListSessions(refresh) = application
-        .handle_event(ApplicationEvent::OutlookCatalog {
+        .handle_event(ApplicationEvent::OriginCatalog {
             outlook: Outlook::Remote("studio".to_owned()),
             event: ManagedEvent::SessionCreated(SessionCreated {
                 session_id: SessionId::new(),
@@ -666,7 +666,7 @@ fn application_looking_at_studio() -> Application {
         press(&mut application, KeyCode::Enter),
         ApplicationTransition::TurnOutlook {
             outlook: Outlook::Remote("studio".to_owned()),
-            catalog_outlooks: HashSet::from([Outlook::Remote("studio".to_owned())]),
+            catalog_origins: HashSet::from([Outlook::Remote("studio".to_owned())]),
         }
     );
     application
@@ -708,7 +708,7 @@ fn turn_to_studio(application: &mut Application) {
         press(application, KeyCode::Enter),
         ApplicationTransition::TurnOutlook {
             outlook: Outlook::Remote("studio".to_owned()),
-            catalog_outlooks: HashSet::from([Outlook::Remote("studio".to_owned())]),
+            catalog_origins: HashSet::from([Outlook::Remote("studio".to_owned())]),
         }
     );
 }

@@ -133,10 +133,6 @@ impl SessionListing {
     /// moved: the rows the reader is reading stand until the answer arrives,
     /// and the answer replaces them whole. Numbering the request is what
     /// supersedes whatever this listing was waiting for before.
-    pub(super) fn catch_up(&mut self) -> SessionListRequest {
-        self.catch_up_origin(self.outlook.clone())
-    }
-
     /// Asks one named Origin again without disturbing rows held for any
     /// Origin, including the one being refreshed.
     pub(super) fn catch_up_origin(&mut self, outlook: Outlook) -> SessionListRequest {
@@ -157,15 +153,6 @@ impl SessionListing {
             .iter()
             .cloned()
             .map(|origin| self.refresh_origin(origin))
-            .collect()
-    }
-
-    /// Catches up every named Origin without clearing any rows already drawn.
-    pub(super) fn catch_up_origins(&mut self, origins: &[Outlook]) -> Vec<SessionListRequest> {
-        origins
-            .iter()
-            .cloned()
-            .map(|origin| self.catch_up_origin(origin))
             .collect()
     }
 
@@ -282,7 +269,17 @@ impl SessionListing {
     /// drawn, so a Title landing while a surface shows it moves the row it is
     /// on rather than waiting for the reader to ask for the listing again.
     pub(super) fn retitle(&mut self, session_id: SessionId, title: String, emoji: Option<String>) {
-        if let Some(summary) = self.readable_mut(session_id) {
+        self.retitle_origin(self.outlook.clone(), session_id, title, emoji);
+    }
+
+    pub(super) fn retitle_origin(
+        &mut self,
+        outlook: Outlook,
+        session_id: SessionId,
+        title: String,
+        emoji: Option<String>,
+    ) {
+        if let Some(summary) = self.readable_mut(&outlook, session_id) {
             summary.title = title;
             summary.emoji = emoji;
         }
@@ -292,7 +289,16 @@ impl SessionListing {
     /// brought back. The order this listing keeps is by when a Session was last
     /// updated, which settling does not touch, so nothing moves.
     pub(super) fn settle(&mut self, session_id: SessionId, settled_at: Option<SessionTimestamp>) {
-        if let Some(summary) = self.readable_mut(session_id) {
+        self.settle_origin(self.outlook.clone(), session_id, settled_at);
+    }
+
+    pub(super) fn settle_origin(
+        &mut self,
+        outlook: Outlook,
+        session_id: SessionId,
+        settled_at: Option<SessionTimestamp>,
+    ) {
+        if let Some(summary) = self.readable_mut(&outlook, session_id) {
             summary.settled_at = settled_at;
         }
     }
@@ -303,12 +309,13 @@ impl SessionListing {
     /// Turn. The order this listing keeps is by when a Session was last
     /// updated, which this change does not carry, so nothing moves until the
     /// next listing lands.
-    pub(super) fn set_working(
+    pub(super) fn set_working_origin(
         &mut self,
+        outlook: Outlook,
         session_id: SessionId,
         working_since: Option<SessionTimestamp>,
     ) {
-        if let Some(summary) = self.readable_mut(session_id) {
+        if let Some(summary) = self.readable_mut(&outlook, session_id) {
             summary.session.working_since = working_since;
         }
     }
@@ -316,8 +323,12 @@ impl SessionListing {
     /// The listed summary a catalog change names, for the changes that revise
     /// one Session in place. A Session Suru could not read carries no summary
     /// to revise, so it is passed over rather than reported missing.
-    fn readable_mut(&mut self, session_id: SessionId) -> Option<&mut SessionSummary> {
-        self.current_origin_mut()
+    fn readable_mut(
+        &mut self,
+        outlook: &Outlook,
+        session_id: SessionId,
+    ) -> Option<&mut SessionSummary> {
+        self.origin_mut(outlook.clone())
             .sessions
             .iter_mut()
             .find_map(|session| match &mut session.item {
@@ -330,7 +341,11 @@ impl SessionListing {
 
     /// Drops a Session the server reports deleted.
     pub(super) fn remove(&mut self, session_id: SessionId) {
-        self.current_origin_mut()
+        self.remove_origin(self.outlook.clone(), session_id);
+    }
+
+    pub(super) fn remove_origin(&mut self, outlook: Outlook, session_id: SessionId) {
+        self.origin_mut(outlook)
             .sessions
             .retain(|summary| summary.id() != session_id);
     }
@@ -338,7 +353,11 @@ impl SessionListing {
     /// Keeps only the Sessions a catalog reconciliation names, which is how a
     /// listing catches up on deletions it missed while disconnected.
     pub(super) fn retain(&mut self, session_ids: &[SessionId]) {
-        self.current_origin_mut()
+        self.retain_origin(self.outlook.clone(), session_ids);
+    }
+
+    pub(super) fn retain_origin(&mut self, outlook: Outlook, session_ids: &[SessionId]) {
+        self.origin_mut(outlook)
             .sessions
             .retain(|summary| session_ids.contains(&summary.id()));
     }
@@ -675,7 +694,7 @@ mod tests {
         listing.load(&request, vec![summary("Newer", 2), summary("Working", 1)]);
         let session_id = listing.sessions()[1].id();
 
-        listing.set_working(session_id, Some(SessionTimestamp(9)));
+        listing.set_working_origin(Outlook::Local, session_id, Some(SessionTimestamp(9)));
 
         assert_eq!(titles(&listing), vec!["Newer", "Working"]);
         assert_eq!(
@@ -685,7 +704,7 @@ mod tests {
         );
         assert_eq!(listing.sessions()[0].working_since(), None);
 
-        listing.set_working(session_id, None);
+        listing.set_working_origin(Outlook::Local, session_id, None);
 
         assert_eq!(
             listing.sessions()[1].working_since(),
