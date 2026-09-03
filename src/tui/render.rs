@@ -126,50 +126,50 @@ pub(super) fn render_with_slots(
         render_landing(frame, state, main, slots, theme)
     };
     if state.composer_completion.is_visible() && !state.reconnect_overlay_visible {
-        render_composer_completion(frame, state, composer.area, &theme);
+        render_composer_completion(frame, state, composer.area, theme);
     }
     // The Subagent Picker docks over the composer the way the completion list
     // does: it belongs to the composer's place on screen, not to the main
     // view's center.
     if state.subagent_picker.is_open() && !state.reconnect_overlay_visible {
-        render_subagent_picker(frame, state, composer.area, &theme);
+        render_subagent_picker(frame, state, composer.area, theme);
     }
     // The Sidebar's own context menu, drawn over the column and whatever of
     // the main view it runs into, because it stands in front of the row it was
     // opened on.
     if !state.reconnect_overlay_visible {
-        render_sidebar_menu(frame, state, &theme);
+        render_sidebar_menu(frame, state, theme);
     }
     // Every overlay is centered on the main view rather than the whole frame:
     // the Sidebar sits beside them and is neither opened over nor obscured.
     if state.session_picker.is_open() && !state.reconnect_overlay_visible {
-        render_session_picker(frame, state, main, &theme);
+        render_session_picker(frame, state, main, theme);
     }
     if state.workspace_picker.is_open() && !state.reconnect_overlay_visible {
-        render_workspace_picker(frame, state, main, &theme);
+        render_workspace_picker(frame, state, main, theme);
     }
     if state.model_options.is_open() && !state.reconnect_overlay_visible {
-        render_model_options(frame, state, main, &theme);
+        render_model_options(frame, state, main, theme);
     }
     if state.settings_panel.is_open() && !state.reconnect_overlay_visible {
-        render_settings_panel(frame, state, main, &theme);
+        render_settings_panel(frame, state, main, theme);
         if state.settings_panel.numeric_editor().is_some() {
-            render_numeric_editor(frame, state, main, &theme);
+            render_numeric_editor(frame, state, main, theme);
         }
     }
     // Last of the overlays, because a settings panel row opens it: the picker
     // is what the reader is answering, so it is drawn over whatever asked.
     if state.model_picker.is_open() && !state.reconnect_overlay_visible {
-        render_model_picker(frame, state, main, &theme);
+        render_model_picker(frame, state, main, theme);
     }
     if state.serve_overlay.is_open() && !state.reconnect_overlay_visible {
-        render_serve_overlay(frame, state, main, &theme);
+        render_serve_overlay(frame, state, main, theme);
     }
     if state.connect_overlay.is_open() && !state.reconnect_overlay_visible {
-        render_connect_overlay(frame, &state.connect_overlay, main, &theme);
+        render_connect_overlay(frame, &state.connect_overlay, main, theme);
     }
     if state.reconnect_overlay_visible {
-        render_reconnect_overlay(frame, &theme);
+        render_reconnect_overlay(frame, theme);
     } else if !state.session_picker.is_open()
         && !state.workspace_picker.is_open()
         && !state.model_picker.is_open()
