@@ -18,6 +18,7 @@ use crate::support::{
     enter_session, rendered_application_buffer, rendered_application_rows, text_position,
     workspace_dir,
 };
+use crate::transcript::{application_with_ansi_palette_output, assert_ansi_palette};
 
 fn themed(name: &str) -> EffectiveSettings {
     EffectiveSettings {
@@ -39,6 +40,23 @@ fn open_theme_picker(application: &mut Application) -> ApplicationTransition {
 fn truecolor_application() -> Application {
     let mut application = Application::default();
     application.set_terminal_facts(TerminalFacts::unprobed(true));
+    application
+}
+
+fn probed_system_application(background: TerminalColor, foreground: TerminalColor) -> Application {
+    let workspace = workspace_dir();
+    let mut application = connected_application_with_terminal_facts(
+        workspace.path(),
+        TerminalFacts::new(
+            Some(TerminalColorProbe::new(
+                [None; 16],
+                Some(foreground),
+                Some(background),
+            )),
+            true,
+        ),
+    );
+    deliver_settings(&mut application, EffectiveSettings::default());
     application
 }
 
@@ -396,6 +414,126 @@ fn a_named_theme_paints_ordinary_text_with_its_own_foreground() {
             .fg,
         Color::Rgb(205, 214, 244)
     );
+}
+
+#[test]
+fn system_paints_light_terminal_surfaces_borders_and_muted_text_light() {
+    let application = probed_system_application(
+        TerminalColor::new(255, 255, 255),
+        TerminalColor::new(34, 34, 34),
+    );
+    let buffer = rendered_application_buffer(&application, 100, 20);
+    let placeholder = text_position(&buffer, "Type a Prompt and press Enter");
+    let composer_corner = (placeholder.0 - 2, placeholder.1 - 1);
+
+    assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Rgb(238, 238, 238));
+    assert_eq!(buffer.cell(placeholder).unwrap().fg, Color::Rgb(75, 75, 75));
+    assert_eq!(
+        buffer.cell(composer_corner).unwrap().fg,
+        Color::Rgb(187, 187, 187)
+    );
+    assert_eq!(buffer.cell((99, 0)).unwrap().bg, Color::Reset);
+}
+
+#[test]
+fn system_paints_dark_terminal_surfaces_borders_and_muted_text_dark() {
+    let application = probed_system_application(
+        TerminalColor::new(0, 0, 0),
+        TerminalColor::new(238, 238, 238),
+    );
+    let buffer = rendered_application_buffer(&application, 100, 20);
+    let placeholder = text_position(&buffer, "Type a Prompt and press Enter");
+    let composer_corner = (placeholder.0 - 2, placeholder.1 - 1);
+
+    assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Rgb(17, 17, 17));
+    assert_eq!(
+        buffer.cell(placeholder).unwrap().fg,
+        Color::Rgb(180, 180, 180)
+    );
+    assert_eq!(
+        buffer.cell(composer_corner).unwrap().fg,
+        Color::Rgb(68, 68, 68)
+    );
+    assert_eq!(buffer.cell((99, 0)).unwrap().bg, Color::Reset);
+}
+
+#[test]
+fn an_unprobed_system_renders_with_the_original_terminal_colors() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    deliver_settings(&mut application, EffectiveSettings::default());
+    let buffer = rendered_application_buffer(&application, 100, 20);
+    let placeholder = text_position(&buffer, "Type a Prompt and press Enter");
+    let composer_corner = (placeholder.0 - 2, placeholder.1 - 1);
+
+    assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Black);
+    assert_eq!(buffer.cell(placeholder).unwrap().fg, Color::DarkGray);
+    assert_eq!(buffer.cell(composer_corner).unwrap().fg, Color::Cyan);
+    assert_eq!(buffer.cell((99, 0)).unwrap().bg, Color::Reset);
+}
+
+#[test]
+fn system_keeps_the_original_theme_when_no_background_was_observed() {
+    let workspace = workspace_dir();
+    let mut palette = [None; 16];
+    palette[1] = Some(TerminalColor::new(12, 34, 56));
+    let facts = TerminalFacts::new(
+        Some(TerminalColorProbe::new(
+            palette,
+            Some(TerminalColor::new(238, 238, 238)),
+            None,
+        )),
+        true,
+    );
+    let mut application = connected_application_with_terminal_facts(workspace.path(), facts);
+    deliver_settings(&mut application, EffectiveSettings::default());
+    let buffer = rendered_application_buffer(&application, 100, 20);
+    let placeholder = text_position(&buffer, "Type a Prompt and press Enter");
+    let composer_corner = (placeholder.0 - 2, placeholder.1 - 1);
+
+    assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Black);
+    assert_eq!(buffer.cell(placeholder).unwrap().fg, Color::DarkGray);
+    assert_eq!(buffer.cell(composer_corner).unwrap().fg, Color::Cyan);
+    assert_eq!(buffer.cell((99, 0)).unwrap().bg, Color::Reset);
+}
+
+#[test]
+fn unreported_system_palette_slots_keep_the_static_ansi_colors() {
+    let workspace = workspace_dir();
+    let mut palette = [None; 16];
+    palette[1] = Some(TerminalColor::new(12, 34, 56));
+    let facts = TerminalFacts::new(
+        Some(TerminalColorProbe::new(
+            palette,
+            Some(TerminalColor::new(238, 238, 238)),
+            Some(TerminalColor::new(0, 0, 0)),
+        )),
+        true,
+    );
+    let application = application_with_ansi_palette_output(workspace.path(), facts);
+    let buffer = rendered_application_buffer(&application, 160, 30);
+    let normal = [
+        Color::Black,
+        Color::Rgb(12, 34, 56),
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Gray,
+    ];
+    let bright = [
+        Color::DarkGray,
+        Color::LightRed,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::LightCyan,
+        Color::White,
+    ];
+
+    assert_ansi_palette(&buffer, &normal, &bright);
 }
 
 #[test]

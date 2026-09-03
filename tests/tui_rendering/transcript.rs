@@ -317,7 +317,7 @@ fn named_theme_base_ansi_foregrounds_and_backgrounds_use_its_derived_palette() {
     assert_ansi_palette(&buffer, &derived, &derived);
 }
 
-fn application_with_ansi_palette_output(
+pub(super) fn application_with_ansi_palette_output(
     workspace: &std::path::Path,
     terminal_facts: TerminalFacts,
 ) -> Application {
@@ -360,7 +360,7 @@ fn application_with_ansi_palette_output(
     application
 }
 
-fn assert_ansi_palette(buffer: &Buffer, normal: &[Color; 8], bright: &[Color; 8]) {
+pub(super) fn assert_ansi_palette(buffer: &Buffer, normal: &[Color; 8], bright: &[Color; 8]) {
     for (index, expected) in normal.iter().copied().enumerate() {
         assert_eq!(text_cell(buffer, &format!("nfg{index}")).fg, expected);
         assert_eq!(text_cell(buffer, &format!("nbg{index}")).bg, expected);

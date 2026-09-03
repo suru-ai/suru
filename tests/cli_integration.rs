@@ -1153,6 +1153,36 @@ fn answer_cursor_position_report(shown: &[u8], terminal: &Mutex<Box<dyn std::io:
     let _ = terminal.flush();
 }
 
+/// Answers Suru's one-shot Unix palette probe with a complete light-terminal
+/// palette. The real pseudo-terminal is deliberately otherwise inert, so this
+/// is the terminal-emulator half of the startup boundary under test.
+#[cfg(unix)]
+fn answer_terminal_color_queries(
+    shown: &[u8],
+    terminal: &Mutex<Box<dyn std::io::Write + Send>>,
+    answered: &mut bool,
+) {
+    const LAST_QUERY: &[u8] = b"\x1b]11;?\x1b\\";
+    if *answered
+        || !shown
+            .windows(LAST_QUERY.len())
+            .any(|window| window == LAST_QUERY)
+    {
+        return;
+    }
+    *answered = true;
+    let mut reply = Vec::new();
+    for index in 0..16 {
+        reply.extend_from_slice(
+            format!("\x1b]4;{index};rgb:{index:04x}/{index:04x}/{index:04x}\x07").as_bytes(),
+        );
+    }
+    reply.extend_from_slice(b"\x1b]10;rgb:2222/2222/2222\x1b\\\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
+    let mut terminal = terminal.lock().expect("answer the pseudo-terminal");
+    let _ = terminal.write_all(&reply);
+    let _ = terminal.flush();
+}
+
 /// A TUI attached to a real pseudo-terminal: a ConPTY pseudo-console on Windows
 /// and an `openpty` pair everywhere else. The TUI is launched through
 /// [`attached_tui_terminal_mode_probe`] so that the terminal mode is sampled
@@ -1199,6 +1229,8 @@ impl AttachedTui {
         command.env("SURU_DATA_DIR", state_dir);
         command.env("SURU_CONFIG_DIR", state_dir);
         command.env("SURU_CHANNEL", channel);
+        command.env_remove("NO_COLOR");
+        command.env("COLORTERM", "truecolor");
         let child = pair
             .slave
             .spawn_command(command)
@@ -1225,12 +1257,21 @@ impl AttachedTui {
         let responder = Arc::clone(&input);
         std::thread::spawn(move || {
             let mut chunk = [0u8; 4096];
+            #[cfg(unix)]
+            let mut shown_so_far = Vec::new();
+            #[cfg(unix)]
+            let mut answered_colors = false;
             while let Ok(read) = std::io::Read::read(&mut reader, &mut chunk) {
                 if read == 0 {
                     break;
                 }
                 let shown = &chunk[..read];
                 answer_cursor_position_report(shown, &responder);
+                #[cfg(unix)]
+                if !answered_colors {
+                    shown_so_far.extend_from_slice(shown);
+                    answer_terminal_color_queries(&shown_so_far, &responder, &mut answered_colors);
+                }
                 recorder
                     .lock()
                     .expect("record what the terminal showed")
@@ -1498,6 +1539,20 @@ async fn clean_tui_exit_restores_the_terminal() {
     );
     outcome.assert_display_was_restored();
     outcome.assert_terminal_mode_restored();
+    #[cfg(unix)]
+    {
+        let query = outcome.position_of("\u{1b}]11;?\u{1b}\\");
+        let first_frame = outcome.position_of("Suru");
+        assert!(
+            query < first_frame,
+            "the first frame preceded the terminal probe"
+        );
+        assert!(
+            outcome.screen[..first_frame].contains("48;2;238;238;238"),
+            "the first frame did not use the probed light panel: {:?}",
+            outcome.screen
+        );
+    }
 
     stop_test_server(state_dir.path(), channel);
 }

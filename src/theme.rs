@@ -546,7 +546,18 @@ static RESOLVED_BUILT_INS: OnceLock<Vec<(&'static str, Result<Theme, ThemeError>
 impl Theme {
     pub(crate) fn resolve(name: &str, terminal_facts: &TerminalFacts) -> Result<Self, ThemeError> {
         if name == "system" {
-            return Ok(Self::system());
+            let Some(probe) = terminal_facts.probe else {
+                return Ok(Self::system());
+            };
+            if probe.background.is_none() && probe.palette[0].is_none() {
+                return Ok(Self::system());
+            }
+            let theme = Self::from_terminal_probe(probe);
+            return Ok(if terminal_facts.truecolor {
+                theme
+            } else {
+                theme.quantized(&IndexedPalette::from_terminal_facts(terminal_facts))
+            });
         }
         Self::named(name)
             .unwrap_or_else(|| Err(ThemeError(format!("Theme {name:?} was not found"))))
@@ -644,6 +655,117 @@ impl Theme {
                 unfocused: Style::default().fg(Color::Reset).bg(Color::DarkGray),
                 open,
                 open_rail: open,
+            },
+        }
+    }
+
+    fn from_terminal_probe(probe: crate::terminal::TerminalColorProbe) -> Self {
+        let fallback = Self::system();
+        let reported = |index: usize, fallback: Color| {
+            probe.palette[index]
+                .map(|color| Color::Rgb(color.red, color.green, color.blue))
+                .unwrap_or(fallback)
+        };
+        let background_rgb = probe
+            .background
+            .or(probe.palette[0])
+            .unwrap_or(TerminalColor::new(0, 0, 0));
+        let foreground = probe
+            .foreground
+            .map(|color| Color::Rgb(color.red, color.green, color.blue))
+            .or_else(|| {
+                probe.palette[7].map(|color| Color::Rgb(color.red, color.green, color.blue))
+            })
+            .unwrap_or(fallback.ansi.normal.white);
+        let background = Color::Rgb(
+            background_rgb.red,
+            background_rgb.green,
+            background_rgb.blue,
+        );
+        let luminance = terminal_luminance(background_rgb);
+        let dark = luminance <= 127.5;
+        let grays = terminal_grays(background_rgb, luminance, dark);
+        let muted = terminal_muted(luminance, dark);
+        let primary = reported(6, fallback.accent.primary.fg.unwrap_or(Color::Cyan));
+        let red = reported(1, fallback.ansi.normal.red);
+        let green = reported(2, fallback.ansi.normal.green);
+        let yellow = reported(3, fallback.ansi.normal.yellow);
+        let blue = reported(4, fallback.ansi.normal.blue);
+        let magenta = reported(5, fallback.ansi.normal.magenta);
+        let style = |color| Style::default().fg(color);
+        let surface = |color| Style::default().bg(color);
+        let ansi = AnsiPalette {
+            normal: AnsiColors {
+                black: reported(0, fallback.ansi.normal.black),
+                red,
+                green,
+                yellow,
+                blue,
+                magenta,
+                cyan: primary,
+                white: reported(7, fallback.ansi.normal.white),
+            },
+            bright: AnsiColors {
+                black: reported(8, fallback.ansi.bright.black),
+                red: reported(9, fallback.ansi.bright.red),
+                green: reported(10, fallback.ansi.bright.green),
+                yellow: reported(11, fallback.ansi.bright.yellow),
+                blue: reported(12, fallback.ansi.bright.blue),
+                magenta: reported(13, fallback.ansi.bright.magenta),
+                cyan: reported(14, fallback.ansi.bright.cyan),
+                white: reported(15, fallback.ansi.bright.white),
+            },
+        };
+        let feedback = FeedbackRoles {
+            error: style(red),
+            warning: style(yellow),
+            success: style(green),
+            info: style(primary),
+        };
+        let open = style(background).bg(primary);
+        Self {
+            text: TextRoles {
+                primary: style(foreground),
+                subdued: style(muted),
+            },
+            surface: SurfaceRoles {
+                base: surface(Color::Reset),
+                elevated: surface(grays.panel()),
+                overlay: surface(grays.element()),
+            },
+            accent: AccentRoles {
+                primary: style(primary),
+            },
+            ansi,
+            action: ActionRoles {
+                primary: style(primary).add_modifier(Modifier::BOLD),
+                disabled: style(muted),
+            },
+            form_field: FormFieldRoles {
+                text: style(foreground),
+                placeholder: style(muted),
+                border: style(grays.border_active()),
+                invalid: style(red),
+            },
+            feedback,
+            border: BorderRoles {
+                default: style(grays.border()),
+                subdued: style(grays.border_subtle()),
+            },
+            markdown: MarkdownRoles {
+                heading: style(foreground).add_modifier(Modifier::BOLD),
+                emphasis: style(yellow).add_modifier(Modifier::ITALIC),
+                strong: style(foreground).add_modifier(Modifier::BOLD),
+                link: style(blue).add_modifier(Modifier::UNDERLINED),
+                inline_code: style(green),
+                code_block: style(foreground),
+                list_marker: style(blue),
+            },
+            selection: SelectionRoles {
+                focused: style(background).bg(primary),
+                unfocused: style(foreground).bg(grays.element()),
+                open,
+                open_rail: surface(primary),
             },
         }
     }
@@ -763,6 +885,76 @@ impl Theme {
             .find(|(built_in, _)| *built_in == name)
             .map(|(_, theme)| theme.clone())
     }
+}
+
+fn terminal_luminance(color: TerminalColor) -> f64 {
+    0.299 * f64::from(color.red) + 0.587 * f64::from(color.green) + 0.114 * f64::from(color.blue)
+}
+
+#[derive(Clone, Copy)]
+struct TerminalGrayRamp([Color; 12]);
+
+impl TerminalGrayRamp {
+    fn panel(self) -> Color {
+        self.0[1]
+    }
+
+    fn element(self) -> Color {
+        self.0[2]
+    }
+
+    fn border_subtle(self) -> Color {
+        self.0[5]
+    }
+
+    fn border(self) -> Color {
+        self.0[6]
+    }
+
+    fn border_active(self) -> Color {
+        self.0[7]
+    }
+}
+
+fn terminal_grays(background: TerminalColor, luminance: f64, dark: bool) -> TerminalGrayRamp {
+    TerminalGrayRamp(std::array::from_fn(|index| {
+        let factor = (index + 1) as f64 / 12.0;
+        let gray = if dark && luminance < 10.0 {
+            (factor * 0.4 * 255.0).floor() as u8
+        } else if !dark && luminance > 245.0 {
+            (255.0 - factor * 0.4 * 255.0).floor() as u8
+        } else {
+            let next = if dark {
+                luminance + (255.0 - luminance) * factor * 0.4
+            } else {
+                luminance * (1.0 - factor * 0.4)
+            };
+            let ratio = next / luminance;
+            let channel =
+                |channel: u8| (f64::from(channel) * ratio).clamp(0.0, 255.0).floor() as u8;
+            return Color::Rgb(
+                channel(background.red),
+                channel(background.green),
+                channel(background.blue),
+            );
+        };
+        Color::Rgb(gray, gray, gray)
+    }))
+}
+
+fn terminal_muted(luminance: f64, dark: bool) -> Color {
+    let gray = if dark {
+        if luminance < 10.0 {
+            180
+        } else {
+            (160.0 + luminance * 0.3).floor().min(200.0) as u8
+        }
+    } else if luminance > 245.0 {
+        75
+    } else {
+        (100.0 - (255.0 - luminance) * 0.2).floor().max(60.0) as u8
+    };
+    Color::Rgb(gray, gray, gray)
 }
 
 #[cfg(test)]

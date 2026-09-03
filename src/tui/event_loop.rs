@@ -3,13 +3,14 @@
 //! carry out the transitions the Application returns.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::{Future, pending},
-    io::{Stdout, stdout},
+    io::{self, Stdout, stdout},
     net::{IpAddr, SocketAddr, SocketAddrV6},
     ops::ControlFlow,
     path::PathBuf,
     pin::Pin,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -34,7 +35,7 @@ use crossterm::{
     style::available_color_count,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -44,16 +45,234 @@ use super::state::{
     Application, ApplicationEvent, ApplicationTransition, EverywhereListRequest, ModelListRequest,
     SessionListRequest, SessionListSurface, WorkspaceResolutionSurface,
 };
-use crate::terminal::TerminalFacts;
+use crate::terminal::{
+    DEFAULT_TERMINAL_PROBE_BUDGET, LateTerminalColorResponse, TerminalFacts,
+    could_be_terminal_color_response, is_terminal_color_response, probe_terminal_colors,
+};
 
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
+const MAX_LATE_COLOR_RESPONSE_CHARS: usize = 64 * 1024;
+
+/// Filters a valid OSC color response that missed the startup probe's budget.
+/// Crossterm 0.28 projects an OSC sequence into Alt+] followed by ordinary key
+/// events, so the Application must not see those bytes as something the reader
+/// typed. Invalid lookalikes are replayed unchanged.
+#[derive(Default)]
+struct LateColorReplyFilter {
+    candidate: Option<LateColorReplyCandidate>,
+    awaiting_osc_open: bool,
+    enabled: bool,
+}
+
+struct LateColorReplyCandidate {
+    events: Vec<InputEvent>,
+    payload: String,
+    awaiting_st_end: bool,
+}
+
+impl LateColorReplyFilter {
+    fn new(late_response: LateTerminalColorResponse) -> Self {
+        match late_response {
+            LateTerminalColorResponse::Disabled => Self::default(),
+            LateTerminalColorResponse::AwaitingResponse => Self {
+                candidate: None,
+                awaiting_osc_open: false,
+                enabled: true,
+            },
+            LateTerminalColorResponse::Escape => Self {
+                candidate: None,
+                awaiting_osc_open: true,
+                enabled: true,
+            },
+            LateTerminalColorResponse::Osc {
+                payload,
+                escape_terminator,
+            } => Self {
+                candidate: Some(LateColorReplyCandidate {
+                    events: Vec::new(),
+                    payload,
+                    awaiting_st_end: escape_terminator,
+                }),
+                awaiting_osc_open: false,
+                enabled: true,
+            },
+        }
+    }
+
+    fn push(&mut self, event: InputEvent) -> Vec<InputEvent> {
+        if !self.enabled {
+            return vec![event];
+        }
+        if self.awaiting_osc_open {
+            self.awaiting_osc_open = false;
+            if is_plain_character(&event, ']') {
+                self.candidate = Some(LateColorReplyCandidate {
+                    events: Vec::new(),
+                    payload: String::new(),
+                    awaiting_st_end: false,
+                });
+                return Vec::new();
+            }
+            return vec![event];
+        }
+
+        let Some(candidate) = &mut self.candidate else {
+            if is_osc_open(&event) {
+                self.candidate = Some(LateColorReplyCandidate {
+                    events: vec![event],
+                    payload: String::new(),
+                    awaiting_st_end: false,
+                });
+                return Vec::new();
+            }
+            return vec![event];
+        };
+
+        candidate.events.push(event.clone());
+        if candidate.awaiting_st_end {
+            let candidate = self.candidate.take().expect("candidate is present");
+            return if is_plain_character(&event, '\\')
+                && is_terminal_color_response(&candidate.payload)
+            {
+                Vec::new()
+            } else {
+                candidate.events
+            };
+        }
+        if is_osc_end(&event) {
+            let candidate = self.candidate.take().expect("candidate is present");
+            return if is_terminal_color_response(&candidate.payload) {
+                Vec::new()
+            } else {
+                candidate.events
+            };
+        }
+        let Some(character) = plain_terminal_character(&event) else {
+            return self.take_candidate();
+        };
+        candidate.payload.push(character);
+        if candidate.payload.len() > MAX_LATE_COLOR_RESPONSE_CHARS
+            || !could_be_terminal_color_response(&candidate.payload)
+        {
+            return self.take_candidate();
+        }
+        Vec::new()
+    }
+
+    fn finish(&mut self) -> Vec<InputEvent> {
+        self.take_candidate()
+    }
+
+    fn take_candidate(&mut self) -> Vec<InputEvent> {
+        self.candidate
+            .take()
+            .map_or_else(Vec::new, |candidate| candidate.events)
+    }
+}
+
+fn is_osc_open(event: &InputEvent) -> bool {
+    matches!(
+        event,
+        InputEvent::Key(key)
+            if key.code == crossterm::event::KeyCode::Char(']')
+                && key.modifiers == crossterm::event::KeyModifiers::ALT
+    )
+}
+
+fn is_osc_end(event: &InputEvent) -> bool {
+    matches!(
+        event,
+        InputEvent::Key(key)
+            if (key.code == crossterm::event::KeyCode::Char('g')
+                && key.modifiers == crossterm::event::KeyModifiers::CONTROL)
+                || (key.code == crossterm::event::KeyCode::Char('\\')
+                    && key.modifiers == crossterm::event::KeyModifiers::ALT)
+    )
+}
+
+fn plain_terminal_character(event: &InputEvent) -> Option<char> {
+    let InputEvent::Key(key) = event else {
+        return None;
+    };
+    matches!(
+        key.modifiers,
+        crossterm::event::KeyModifiers::NONE | crossterm::event::KeyModifiers::SHIFT
+    )
+    .then_some(())?;
+    let crossterm::event::KeyCode::Char(character) = key.code else {
+        return None;
+    };
+    Some(character)
+}
+
+fn is_plain_character(event: &InputEvent, expected: char) -> bool {
+    plain_terminal_character(event) == Some(expected)
+}
+
+struct TerminalEvents {
+    source: EventStream,
+    filter: LateColorReplyFilter,
+    ready: VecDeque<io::Result<InputEvent>>,
+    source_done: bool,
+}
+
+impl TerminalEvents {
+    fn new(late_response: LateTerminalColorResponse) -> Self {
+        Self {
+            source: EventStream::new(),
+            filter: LateColorReplyFilter::new(late_response),
+            ready: VecDeque::new(),
+            source_done: false,
+        }
+    }
+}
+
+impl Stream for TerminalEvents {
+    type Item = io::Result<InputEvent>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(event) = this.ready.pop_front() {
+                return Poll::Ready(Some(event));
+            }
+            if this.source_done {
+                return Poll::Ready(None);
+            }
+            match Pin::new(&mut this.source).poll_next(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(event))) => {
+                    this.ready
+                        .extend(this.filter.push(event).into_iter().map(Ok));
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    this.ready.extend(this.filter.finish().into_iter().map(Ok));
+                    this.ready.push_back(Err(error));
+                }
+                Poll::Ready(None) => {
+                    this.ready.extend(this.filter.finish().into_iter().map(Ok));
+                    this.source_done = true;
+                }
+            }
+        }
+    }
+}
 
 pub async fn run(client: ManagedClient) -> Result<()> {
     let workspace =
         std::env::current_dir().map_err(|error| anyhow!("read current Workspace: {error}"))?;
     let mut session = TerminalSession::enter()?;
-    let terminal_facts = TerminalFacts::unprobed(available_color_count() == u16::MAX);
-    run_loop(&mut session.terminal, client, workspace, terminal_facts).await
+    let terminal_probe = probe_terminal_colors(DEFAULT_TERMINAL_PROBE_BUDGET);
+    let terminal_facts =
+        TerminalFacts::new(terminal_probe.probe, available_color_count() == u16::MAX);
+    run_loop(
+        &mut session.terminal,
+        client,
+        workspace,
+        terminal_facts,
+        terminal_probe.late_response,
+    )
+    .await
 }
 
 /// How the run loop leaves the screen when an event ends the run.
@@ -437,6 +656,7 @@ async fn run_loop(
     client: ManagedClient,
     workspace: PathBuf,
     terminal_facts: TerminalFacts,
+    late_terminal_response: LateTerminalColorResponse,
 ) -> Result<()> {
     let (submissions, mut submission_rx) = tokio::sync::mpsc::unbounded_channel();
     let (subscriptions, mut subscription_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -465,7 +685,7 @@ async fn run_loop(
         spinner_tick: None,
         needs_redraw: true,
     };
-    let mut input = EventStream::new();
+    let mut input = TerminalEvents::new(late_terminal_response);
 
     loop {
         run.sync_skill_catalog();
@@ -2544,17 +2764,21 @@ impl Drop for TerminalSession {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::Command;
+    use crossterm::{
+        Command,
+        event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers},
+    };
 
     use super::{
         Application, ApplicationEvent, DisableMouseButtonReporting, EnableMouseButtonReporting,
-        PopModifiedKeyReporting, PushModifiedKeyReporting, TerminalSink, copy_to_clipboard,
-        enter_terminal_display, ignore_unsupported, leave_terminal_display,
+        LateColorReplyFilter, PopModifiedKeyReporting, PushModifiedKeyReporting, TerminalSink,
+        copy_to_clipboard, enter_terminal_display, ignore_unsupported, leave_terminal_display,
         remote_failure_from_session_error,
     };
     use crate::{
         managed_client::{ManagedEvent, SessionStreamError},
         protocol::{EffectiveSettings, Outlook, RemoteStatus, SettingsSnapshot},
+        terminal::LateTerminalColorResponse,
     };
 
     #[test]
@@ -2644,6 +2868,129 @@ mod tests {
             AnsiTranscript::record(|output| copy_to_clipboard(output, "suru-v1-example"));
 
         assert_eq!(transcript, "\x1b]52;c;c3VydS12MS1leGFtcGxl\x07");
+    }
+
+    #[test]
+    fn a_late_terminal_color_reply_never_becomes_reader_key_events() {
+        let key = |character, modifiers| {
+            InputEvent::Key(KeyEvent::new(KeyCode::Char(character), modifiers))
+        };
+        let mut filter = LateColorReplyFilter::new(LateTerminalColorResponse::AwaitingResponse);
+        let mut observed = Vec::new();
+        for event in std::iter::once(key(']', KeyModifiers::ALT))
+            .chain("11;rgb:ffff/ffff/ffff".chars().map(|character| {
+                key(
+                    character,
+                    if character.is_uppercase() {
+                        KeyModifiers::SHIFT
+                    } else {
+                        KeyModifiers::NONE
+                    },
+                )
+            }))
+            .chain(std::iter::once(key('\\', KeyModifiers::ALT)))
+        {
+            observed.extend(filter.push(event));
+        }
+
+        assert!(observed.is_empty());
+        assert_eq!(
+            filter.push(key('x', KeyModifiers::NONE)),
+            vec![key('x', KeyModifiers::NONE)],
+            "ordinary input after the late response is untouched"
+        );
+    }
+
+    #[test]
+    fn an_alt_bracket_that_is_not_a_color_reply_is_replayed_unchanged() {
+        let alt_bracket = InputEvent::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT));
+        let typed = InputEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut filter = LateColorReplyFilter::new(LateTerminalColorResponse::AwaitingResponse);
+
+        assert!(filter.push(alt_bracket.clone()).is_empty());
+        assert_eq!(filter.push(typed.clone()), vec![alt_bracket, typed]);
+    }
+
+    #[test]
+    fn a_color_reply_split_across_the_probe_budget_never_becomes_key_events() {
+        let key = |character| {
+            InputEvent::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+        };
+        let mut filter = LateColorReplyFilter::new(LateTerminalColorResponse::Osc {
+            payload: "11;rgb:ff".to_owned(),
+            escape_terminator: false,
+        });
+        let mut observed = Vec::new();
+        for event in "/ff/ff"
+            .chars()
+            .map(key)
+            .chain(std::iter::once(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('g'),
+                KeyModifiers::CONTROL,
+            ))))
+        {
+            observed.extend(filter.push(event));
+        }
+
+        assert!(observed.is_empty());
+        assert_eq!(filter.push(key('x')), vec![key('x')]);
+    }
+
+    #[test]
+    fn a_split_st_terminator_finishes_the_late_color_reply() {
+        let key = |character| {
+            InputEvent::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+        };
+        let mut filter = LateColorReplyFilter::new(LateTerminalColorResponse::Osc {
+            payload: "10;rgb:ffff/ffff/ffff".to_owned(),
+            escape_terminator: true,
+        });
+
+        assert!(filter.push(key('\\')).is_empty());
+        assert_eq!(filter.push(key('x')), vec![key('x')]);
+    }
+
+    #[test]
+    fn a_batched_palette_reply_larger_than_a_short_key_sequence_is_filtered() {
+        let key = |character, modifiers| {
+            InputEvent::Key(KeyEvent::new(KeyCode::Char(character), modifiers))
+        };
+        let mut payload = String::from("4");
+        for index in 0..16 {
+            payload.push_str(&format!(";{index};rgb:ffff/aaaa/0000"));
+        }
+        assert!(payload.len() > 64);
+        let mut filter = LateColorReplyFilter::new(LateTerminalColorResponse::AwaitingResponse);
+        let mut observed = filter.push(key(']', KeyModifiers::ALT));
+        for character in payload.chars() {
+            observed.extend(filter.push(key(character, KeyModifiers::NONE)));
+        }
+        observed.extend(filter.push(key('g', KeyModifiers::CONTROL)));
+
+        assert!(observed.is_empty());
+    }
+
+    #[test]
+    fn osc_shaped_input_passes_through_when_no_probe_was_sent() {
+        let key = |character, modifiers| {
+            InputEvent::Key(KeyEvent::new(KeyCode::Char(character), modifiers))
+        };
+        let input = [
+            key(']', KeyModifiers::ALT),
+            key('1', KeyModifiers::NONE),
+            key('1', KeyModifiers::NONE),
+            key(';', KeyModifiers::NONE),
+            key('g', KeyModifiers::CONTROL),
+        ];
+        let mut filter = LateColorReplyFilter::new(LateTerminalColorResponse::Disabled);
+
+        let observed = input
+            .iter()
+            .cloned()
+            .flat_map(|event| filter.push(event))
+            .collect::<Vec<_>>();
+
+        assert_eq!(observed, input);
     }
 
     /// The screen has to be taken before the input features are turned on: a
