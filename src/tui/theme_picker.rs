@@ -1,6 +1,9 @@
 //! Searchable Theme picker state and client-local preview ownership.
 
-use crate::{protocol::SettingMutation, theme::built_in_themes};
+use crate::{
+    protocol::SettingMutation,
+    theme::{ThemeCatalog, ThemeChoice, ThemeSource},
+};
 
 use super::fuzzy::fuzzy_matches;
 
@@ -9,7 +12,7 @@ pub(super) struct ThemePicker {
     open: bool,
     original: String,
     query: String,
-    themes: Vec<&'static str>,
+    themes: Vec<ThemeChoice>,
     selected: usize,
     preview: Option<String>,
     awaiting_snapshot: bool,
@@ -19,36 +22,31 @@ pub(super) struct ThemePicker {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ThemePickerRow<'a> {
     pub(super) name: &'a str,
+    pub(super) source: ThemeSource,
     pub(super) selected: bool,
     pub(super) current: bool,
 }
 
 impl ThemePicker {
-    pub(super) fn open(&mut self, current: &str, pin: fn(String) -> SettingMutation) {
+    pub(super) fn open(
+        &mut self,
+        current: &str,
+        pin: fn(String) -> SettingMutation,
+        catalog: &ThemeCatalog,
+    ) {
         let current = if self.awaiting_snapshot {
             self.preview.as_deref().unwrap_or(current).to_owned()
         } else {
             current.to_owned()
         };
-        let mut themes = built_in_themes()
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<Vec<_>>();
-        themes.sort_by(|left, right| {
-            left.to_lowercase()
-                .cmp(&right.to_lowercase())
-                .then_with(|| left.cmp(right))
-        });
-        themes.insert(0, "system");
-
         self.open = true;
         self.original = current;
         self.query.clear();
-        self.themes = themes;
+        self.themes = catalog.choices();
         self.selected = self
             .themes
             .iter()
-            .position(|theme| *theme == self.original)
+            .position(|theme| theme.name == self.original)
             .unwrap_or(0);
         self.preview = Some(self.original.clone());
         self.awaiting_snapshot = false;
@@ -78,7 +76,7 @@ impl ThemePicker {
             self.selected = self
                 .themes
                 .iter()
-                .position(|theme| *theme == self.original)
+                .position(|theme| theme.name == self.original)
                 .unwrap_or(0);
             self.preview = Some(self.original.clone());
         } else {
@@ -116,7 +114,7 @@ impl ThemePicker {
         if !self.visible_indices().contains(&self.selected) {
             return None;
         }
-        let theme = self.themes.get(self.selected)?.to_string();
+        let theme = self.themes.get(self.selected)?.name.clone();
         let pin = self.pin?;
         self.open = false;
         self.query.clear();
@@ -142,11 +140,12 @@ impl ThemePicker {
             .unwrap_or(0);
         let start = selected.saturating_add(1).saturating_sub(capacity);
         visible.into_iter().skip(start).take(capacity).map(|index| {
-            let name = self.themes[index];
+            let theme = &self.themes[index];
             ThemePickerRow {
-                name,
+                name: &theme.name,
+                source: theme.source,
                 selected: index == self.selected,
-                current: name == self.original,
+                current: theme.name == self.original,
             }
         })
     }
@@ -158,7 +157,7 @@ impl ThemePicker {
     fn select_first_visible(&mut self) {
         if let Some(index) = self.visible_indices().first().copied() {
             self.selected = index;
-            self.preview = Some(self.themes[index].to_owned());
+            self.preview = Some(self.themes[index].name.clone());
         } else {
             self.preview = None;
         }
@@ -175,14 +174,14 @@ impl ThemePicker {
             .unwrap_or(0);
         let next = (current as isize + distance).rem_euclid(visible.len() as isize) as usize;
         self.selected = visible[next];
-        self.preview = Some(self.themes[self.selected].to_owned());
+        self.preview = Some(self.themes[self.selected].name.clone());
     }
 
     fn visible_indices(&self) -> Vec<usize> {
         self.themes
             .iter()
             .enumerate()
-            .filter_map(|(index, theme)| fuzzy_matches(&self.query, theme).then_some(index))
+            .filter_map(|(index, theme)| fuzzy_matches(&self.query, &theme.name).then_some(index))
             .collect()
     }
 }

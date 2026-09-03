@@ -9,13 +9,14 @@
 //! the Log for the rest.
 
 use std::cell::Cell;
+use std::path::Path;
 
 use ratatui::style::Style;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
     protocol::{SettingsDiagnostic, SettingsDiagnosticSeverity},
-    theme::Theme,
+    theme::{Theme, ThemeDiagnostic},
 };
 
 use super::slots::truncate_to_width;
@@ -36,6 +37,8 @@ pub(super) struct ApplicationNotice {
     /// Conditions whose Notice the reader already saw and dismissed. This is
     /// cumulative so A, then B, cannot make A new again.
     dismissed: Vec<NoticeIdentity>,
+    settings_diagnostics: Vec<SettingsDiagnostic>,
+    theme_diagnostics: Vec<ThemeDiagnostic>,
 }
 
 impl ApplicationNotice {
@@ -46,15 +49,16 @@ impl ApplicationNotice {
     /// Takes what a freshly received effective-settings snapshot found at
     /// startup. The same startup Notice stays dismissed.
     pub(super) fn receive(&mut self, diagnostics: &[SettingsDiagnostic]) {
-        let Some(notice) = Notice::for_diagnostics(diagnostics) else {
-            self.showing = None;
-            return;
-        };
-        if self.dismissed.contains(&NoticeIdentity::StartupDiagnostics) {
-            self.showing = None;
-            return;
-        }
-        self.showing = Some(notice);
+        self.settings_diagnostics = diagnostics.to_vec();
+        self.refresh_diagnostics();
+    }
+
+    /// Replaces the result of the Client's latest scan of its own Theme
+    /// directory. A repaired file disappears from the Notice, while a newly
+    /// broken file can still speak after an earlier one was dismissed.
+    pub(super) fn receive_theme_diagnostics(&mut self, diagnostics: Vec<ThemeDiagnostic>) {
+        self.theme_diagnostics = diagnostics;
+        self.refresh_diagnostics();
     }
 
     /// Reports a valid open Setting whose runtime value names no available
@@ -106,12 +110,63 @@ impl ApplicationNotice {
         self.showing = None;
         true
     }
+
+    fn refresh_diagnostics(&mut self) {
+        let mut diagnostics = Vec::new();
+        let mut identities = Vec::new();
+        if !self.settings_diagnostics.is_empty()
+            && !self.dismissed.contains(&NoticeIdentity::StartupDiagnostics)
+        {
+            diagnostics.extend(self.settings_diagnostics.iter().map(NoticeDiagnostic::from));
+            identities.push(NoticeIdentity::StartupDiagnostics);
+        }
+        for diagnostic in &self.theme_diagnostics {
+            let identity = NoticeIdentity::ThemeFile(diagnostic.clone());
+            if self.dismissed.contains(&identity) {
+                continue;
+            }
+            diagnostics.push(NoticeDiagnostic::from(diagnostic));
+            identities.push(identity);
+        }
+        self.showing = Notice::for_diagnostics(&diagnostics, identities);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum NoticeIdentity {
     StartupDiagnostics,
+    ThemeFile(ThemeDiagnostic),
     ThemeFallback(String),
+}
+
+#[derive(Clone, Copy)]
+struct NoticeDiagnostic<'a> {
+    severity: SettingsDiagnosticSeverity,
+    file: &'a Path,
+    key: Option<&'a str>,
+    message: &'a str,
+}
+
+impl<'a> From<&'a SettingsDiagnostic> for NoticeDiagnostic<'a> {
+    fn from(diagnostic: &'a SettingsDiagnostic) -> Self {
+        Self {
+            severity: diagnostic.severity,
+            file: &diagnostic.file,
+            key: diagnostic.key.as_deref(),
+            message: &diagnostic.message,
+        }
+    }
+}
+
+impl<'a> From<&'a ThemeDiagnostic> for NoticeDiagnostic<'a> {
+    fn from(diagnostic: &'a ThemeDiagnostic) -> Self {
+        Self {
+            severity: SettingsDiagnosticSeverity::Error,
+            file: &diagnostic.file,
+            key: None,
+            message: &diagnostic.message,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,7 +180,10 @@ pub(super) struct Notice {
 impl Notice {
     /// The Notice a startup's diagnostics earn, or `None` when it found
     /// nothing to report and the Landing stays as it was.
-    fn for_diagnostics(diagnostics: &[SettingsDiagnostic]) -> Option<Self> {
+    fn for_diagnostics(
+        diagnostics: &[NoticeDiagnostic<'_>],
+        identities: Vec<NoticeIdentity>,
+    ) -> Option<Self> {
         // A whole Config Document being ignored is worded first and in full,
         // loudest severity leading; the keys ignored one at a time are worded
         // once, as a count.
@@ -138,13 +196,7 @@ impl Notice {
         });
         let mut clauses = documents
             .into_iter()
-            .map(|diagnostic| {
-                format!(
-                    "{} {}",
-                    file_name(diagnostic),
-                    headline(&diagnostic.message)
-                )
-            })
+            .map(|diagnostic| format!("{} {}", file_name(diagnostic), headline(diagnostic.message)))
             .collect::<Vec<_>>();
         clauses.extend(ignored_keys_clause(diagnostics));
         if clauses.is_empty() {
@@ -162,7 +214,7 @@ impl Notice {
                 SettingsDiagnosticSeverity::Warning
             },
             summary: clauses.join("; "),
-            identities: vec![NoticeIdentity::StartupDiagnostics],
+            identities,
             shown: Cell::new(false),
         })
     }
@@ -204,7 +256,7 @@ impl Notice {
 
 /// How many keys a startup ignored one at a time, named with their Config
 /// Document while they all come from the same one.
-fn ignored_keys_clause(diagnostics: &[SettingsDiagnostic]) -> Option<String> {
+fn ignored_keys_clause(diagnostics: &[NoticeDiagnostic<'_>]) -> Option<String> {
     let keyed = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.key.is_some())
@@ -231,7 +283,7 @@ fn headline(message: &str) -> &str {
 
 /// Config Documents are named by their file alone. The Log carries the path
 /// the Notice has no room for.
-fn file_name(diagnostic: &SettingsDiagnostic) -> String {
+fn file_name(diagnostic: &NoticeDiagnostic<'_>) -> String {
     diagnostic
         .file
         .file_name()

@@ -658,6 +658,7 @@ async fn run_loop(
     terminal_facts: TerminalFacts,
     late_terminal_response: LateTerminalColorResponse,
 ) -> Result<()> {
+    let config_root = client.config_dir().map(PathBuf::from);
     let (submissions, mut submission_rx) = tokio::sync::mpsc::unbounded_channel();
     let (subscriptions, mut subscription_rx) = tokio::sync::mpsc::unbounded_channel();
     let (pickers, mut picker_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -666,9 +667,14 @@ async fn run_loop(
     let (pairing, mut pairing_rx) = tokio::sync::mpsc::unbounded_channel();
     let (workspaces, mut workspace_rx) = tokio::sync::mpsc::unbounded_channel();
     let (origin_catalog, mut origin_catalog_rx) = tokio::sync::mpsc::unbounded_channel();
+    let application = Application::new(workspace, terminal_facts);
+    let application = match config_root {
+        Some(config_root) => application.with_config_root(config_root),
+        None => application,
+    };
     let mut run = RunLoop {
         client,
-        application: Application::new(workspace, terminal_facts),
+        application,
         tasks: SessionTasks::default(),
         channels: TaskChannels {
             submissions,

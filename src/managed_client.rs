@@ -242,6 +242,7 @@ pub struct ManagedClient {
     descriptor: watch::Receiver<RuntimeDescriptor>,
     initial_recovery_backoff: Duration,
     max_recovery_backoff: Duration,
+    config_dir: Option<PathBuf>,
     task: JoinHandle<()>,
 }
 
@@ -312,6 +313,10 @@ impl ManagedClient {
 
     pub async fn next(&mut self) -> Option<ManagedEvent> {
         self.events.recv().await
+    }
+
+    pub(crate) fn config_dir(&self) -> Option<&Path> {
+        self.config_dir.as_deref()
     }
 
     pub fn outlook(&self, outlook: Outlook) -> OutlookClient {

@@ -1,12 +1,15 @@
 //! A pinned built-in Theme paints the whole Application and changes on the
 //! settings snapshot boundary shared by every attached Client.
 
+use std::fs;
+
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Color;
+use serde_json::json;
 use suru::{
     protocol::{
-        AppearanceMode, AppearanceSettings, EffectiveSettings, SettingMutation, SidebarSettings,
-        SidebarVisibility,
+        AppearanceMode, AppearanceSettings, EffectiveSettings, Outlook, Remote, RemoteHealth,
+        RemoteStatus, SettingMutation, SidebarSettings, SidebarVisibility,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -16,8 +19,8 @@ use suru::{
 
 use crate::support::{
     connected_application, connected_application_with_terminal_facts, deliver_settings,
-    enter_session, rendered_application_buffer, rendered_application_rows, text_position,
-    workspace_dir,
+    enter_session, rendered_application_buffer, rendered_application_rows,
+    rendered_application_rows_at, text_position, type_terminal_text, workspace_dir,
 };
 use crate::transcript::{application_with_ansi_palette_output, assert_ansi_palette};
 
@@ -90,6 +93,278 @@ fn picker_orders_system_first_then_the_built_ins_alphabetically() {
     let ayu = picker.find("ayu").expect("Ayu row");
     let carbonfox = picker.find("carbonfox").expect("Carbonfox row");
     assert!(system < aura && aura < ayu && ayu < carbonfox, "{picker}");
+}
+
+#[test]
+fn a_user_theme_is_tagged_previewed_and_pinned_by_its_basename() {
+    let workspace = workspace_dir();
+    let config_root = tempfile::tempdir().expect("create config root");
+    let themes = config_root.path().join("themes");
+    fs::create_dir(&themes).expect("create themes directory");
+    fs::write(
+        themes.join("reader.json"),
+        include_str!("../../src/theme/assets/aura.json"),
+    )
+    .expect("write user Theme");
+    let mut application = Application::new(workspace.path(), TerminalFacts::unprobed(true))
+        .with_config_root(config_root.path());
+    deliver_settings(&mut application, EffectiveSettings::default());
+
+    open_theme_picker(&mut application);
+    for character in "reader".chars() {
+        press(
+            &mut application,
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+        );
+    }
+
+    let rows = rendered_application_rows(&application).join("\n");
+    assert!(rows.contains("reader · [user]"), "{rows}");
+    let preview = rendered_application_buffer(&application, 100, 20);
+    assert_eq!(preview.cell((0, 0)).unwrap().bg, Color::Rgb(21, 20, 27));
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::AppearanceTheme {
+            value: Some("reader".to_owned()),
+        })
+    );
+}
+
+#[test]
+fn a_user_theme_shadows_a_built_in_with_the_same_basename() {
+    let workspace = workspace_dir();
+    let config_root = tempfile::tempdir().expect("create config root");
+    let themes = config_root.path().join("themes");
+    fs::create_dir(&themes).expect("create themes directory");
+    fs::write(
+        themes.join("catppuccin.json"),
+        include_str!("../../src/theme/assets/aura.json"),
+    )
+    .expect("write shadowing user Theme");
+    let mut application = Application::new(workspace.path(), TerminalFacts::unprobed(true))
+        .with_config_root(config_root.path());
+    deliver_settings(&mut application, EffectiveSettings::default());
+
+    open_theme_picker(&mut application);
+    for character in "catppuccin".chars() {
+        press(
+            &mut application,
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+        );
+    }
+
+    let rows = rendered_application_rows(&application).join("\n");
+    assert_eq!(rows.matches("catppuccin ·").count(), 1, "{rows}");
+    assert!(rows.contains("catppuccin · [user]"), "{rows}");
+    let preview = rendered_application_buffer(&application, 100, 20);
+    assert_eq!(preview.cell((0, 0)).unwrap().bg, Color::Rgb(21, 20, 27));
+}
+
+#[test]
+fn rejected_user_theme_files_are_noticed_without_blocking_the_directory() {
+    let workspace = workspace_dir();
+    let config_root = tempfile::tempdir().expect("create config root");
+    let themes = config_root.path().join("themes");
+    fs::create_dir(&themes).expect("create themes directory");
+    let aura = include_str!("../../src/theme/assets/aura.json");
+    fs::write(themes.join("aad-valid.json"), aura).expect("write valid user Theme");
+    fs::write(themes.join("aaa-broken.json"), "{").expect("write broken user Theme");
+    let mut unresolved: serde_json::Value = serde_json::from_str(aura).expect("parse fixture");
+    unresolved["theme"]["primary"] = json!("does-not-exist");
+    fs::write(themes.join("aab-unresolved.json"), unresolved.to_string())
+        .expect("write unresolved user Theme");
+    let mut version_two: serde_json::Value = serde_json::from_str(aura).expect("parse fixture");
+    version_two["version"] = json!(2);
+    fs::write(themes.join("aac-future.json"), version_two.to_string())
+        .expect("write future user Theme");
+    let mut application = Application::new(workspace.path(), TerminalFacts::unprobed(true))
+        .with_config_root(config_root.path());
+    deliver_settings(
+        &mut application,
+        EffectiveSettings {
+            sidebar: SidebarSettings {
+                initial_visibility: SidebarVisibility::Hidden,
+                ..SidebarSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+    );
+
+    let notice = rendered_application_rows_at(&application, 240, 15)[0].clone();
+    assert!(
+        notice.contains("aaa-broken.json") && notice.contains("not valid JSON"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("aab-unresolved.json")
+            && notice.contains("colors could not be resolved")
+            && !notice.contains("does-not-exist"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("aac-future.json") && notice.contains("version 2"),
+        "{notice}"
+    );
+
+    open_theme_picker(&mut application);
+    let picker = rendered_application_rows_at(&application, 120, 20).join("\n");
+    assert!(picker.contains("aad-valid · [user]"), "{picker}");
+    assert!(!picker.contains("aaa-broken · [user]"), "{picker}");
+    assert!(!picker.contains("aab-unresolved · [user]"), "{picker}");
+    assert!(!picker.contains("aac-future · [user]"), "{picker}");
+}
+
+#[test]
+fn a_user_file_cannot_replace_the_terminal_derived_system_theme() {
+    let workspace = workspace_dir();
+    let config_root = tempfile::tempdir().expect("create config root");
+    let themes = config_root.path().join("themes");
+    fs::create_dir(&themes).expect("create themes directory");
+    fs::write(
+        themes.join("system.json"),
+        include_str!("../../src/theme/assets/aura.json"),
+    )
+    .expect("write reserved user Theme");
+    let mut application = Application::new(workspace.path(), TerminalFacts::unprobed(true))
+        .with_config_root(config_root.path());
+    deliver_settings(
+        &mut application,
+        EffectiveSettings {
+            sidebar: SidebarSettings {
+                initial_visibility: SidebarVisibility::Hidden,
+                ..SidebarSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+    );
+
+    let notice = rendered_application_rows_at(&application, 120, 15)[0].clone();
+    assert!(
+        notice.contains("system.json") && notice.contains("System is reserved"),
+        "{notice}"
+    );
+    open_theme_picker(&mut application);
+    let picker = rendered_application_rows(&application).join("\n");
+    assert_eq!(picker.matches("System ·").count(), 1, "{picker}");
+    assert!(!picker.contains("System · [user]"), "{picker}");
+    let system = rendered_application_buffer(&application, 100, 20);
+    assert!(
+        system
+            .content()
+            .iter()
+            .all(|cell| !matches!(cell.bg, Color::Rgb(_, _, _)))
+    );
+}
+
+#[test]
+fn opening_the_picker_finds_a_new_file_and_restores_its_fallen_back_pin() {
+    let workspace = workspace_dir();
+    let config_root = tempfile::tempdir().expect("create config root");
+    let themes = config_root.path().join("themes");
+    fs::create_dir(&themes).expect("create themes directory");
+    let mut application = Application::new(workspace.path(), TerminalFacts::unprobed(true))
+        .with_config_root(config_root.path());
+    deliver_settings(&mut application, themed("restored"));
+
+    let fallback = rendered_application_buffer(&application, 100, 20);
+    assert!(
+        fallback
+            .content()
+            .iter()
+            .all(|cell| !matches!(cell.bg, Color::Rgb(_, _, _)))
+    );
+    assert!(
+        rendered_application_rows(&application)[0].contains("restored"),
+        "the missing pin is noticed before its file returns"
+    );
+
+    fs::write(
+        themes.join("restored.json"),
+        include_str!("../../src/theme/assets/aura.json"),
+    )
+    .expect("restore pinned user Theme");
+    open_theme_picker(&mut application);
+
+    let picker = rendered_application_rows(&application).join("\n");
+    assert!(picker.contains("restored · [user] · [current]"), "{picker}");
+    let restored = rendered_application_buffer(&application, 100, 20);
+    assert_eq!(restored.cell((0, 0)).unwrap().bg, Color::Rgb(21, 20, 27));
+}
+
+#[test]
+fn a_remote_outlook_keeps_reading_the_clients_config_root() {
+    let workspace = workspace_dir();
+    let config_root = tempfile::tempdir().expect("create config root");
+    let local_themes = config_root.path().join("themes");
+    fs::create_dir(&local_themes).expect("create local themes directory");
+    fs::write(
+        local_themes.join("local-reader.json"),
+        include_str!("../../src/theme/assets/aura.json"),
+    )
+    .expect("write local user Theme");
+    let other_themes = workspace.path().join("themes");
+    fs::create_dir(&other_themes).expect("create unrelated themes directory");
+    fs::write(
+        other_themes.join("remote-reader.json"),
+        include_str!("../../src/theme/assets/ayu.json"),
+    )
+    .expect("write unrelated Theme");
+    let mut application = Application::new(workspace.path(), TerminalFacts::unprobed(true))
+        .with_config_root(config_root.path());
+    deliver_settings(&mut application, EffectiveSettings::default());
+
+    type_terminal_text(&mut application, "/connect");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    application
+        .handle_event(ApplicationEvent::RemotesListed(vec![Remote {
+            name: "studio".to_owned(),
+            fingerprint: "studio-fingerprint".to_owned(),
+            addresses: vec!["10.0.0.8:7777".parse().expect("parse remote address")],
+            status: RemoteStatus::Available,
+        }]))
+        .expect("list Remotes");
+    application
+        .handle_event(ApplicationEvent::RemoteProbed {
+            name: "studio".to_owned(),
+            result: Ok(RemoteHealth {
+                protocol_version: Some(1),
+                status: RemoteStatus::Available,
+            }),
+        })
+        .expect("probe Remote");
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert!(matches!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::TurnOutlook {
+            outlook: Outlook::Remote(name),
+            ..
+        } if name == "studio"
+    ));
+
+    open_theme_picker(&mut application);
+    for character in "local-reader".chars() {
+        press(
+            &mut application,
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+        );
+    }
+    let local = rendered_application_rows(&application).join("\n");
+    assert!(local.contains("local-reader · [user]"), "{local}");
+
+    press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+    open_theme_picker(&mut application);
+    for character in "remote-reader".chars() {
+        press(
+            &mut application,
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+        );
+    }
+    let remote = rendered_application_rows(&application).join("\n");
+    assert!(remote.contains("No Themes found"), "{remote}");
 }
 
 #[test]

@@ -1,6 +1,11 @@
 //! Semantic terminal styles used by built-in renderers.
 
-use std::{collections::HashMap, fmt, sync::OnceLock};
+use std::{
+    collections::HashMap,
+    fmt, fs,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
@@ -155,6 +160,18 @@ impl fmt::Display for ThemeError {
 }
 
 impl std::error::Error for ThemeError {}
+
+impl ThemeError {
+    fn user_file_message(&self) -> String {
+        if self.0.starts_with("Theme document is not valid JSON:")
+            || self.0.starts_with("Theme version ")
+        {
+            format!("ignored because {self}")
+        } else {
+            format!("ignored because its colors could not be resolved: {self}")
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct ThemeDocument {
@@ -581,6 +598,147 @@ struct ResolvedThemeVariants {
     light: Result<Theme, ThemeError>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThemeChoice {
+    pub(crate) name: String,
+    pub(crate) source: ThemeSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ThemeSource {
+    BuiltIn,
+    User,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThemeDiagnostic {
+    pub(crate) file: PathBuf,
+    pub(crate) message: String,
+}
+
+#[derive(Default)]
+pub(crate) struct ThemeCatalog {
+    user_themes: Vec<UserTheme>,
+}
+
+struct UserTheme {
+    name: String,
+    variants: ResolvedThemeVariants,
+}
+
+impl ThemeCatalog {
+    pub(crate) fn scan(config_root: Option<&Path>) -> (Self, Vec<ThemeDiagnostic>) {
+        let Some(directory) = config_root.map(|root| root.join("themes")) else {
+            return (Self::default(), Vec::new());
+        };
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return (Self::default(), Vec::new());
+            }
+            Err(error) => {
+                tracing::warn!(path = %directory.display(), %error, "could not read user Themes");
+                return (Self::default(), Vec::new());
+            }
+        };
+        let mut paths = entries
+            .filter_map(|entry| match entry {
+                Ok(entry) => Some(entry.path()),
+                Err(error) => {
+                    tracing::warn!(path = %directory.display(), %error, "could not read a user Theme directory entry");
+                    None
+                }
+            })
+            .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+            .collect::<Vec<_>>();
+        paths.sort();
+
+        let mut catalog = Self::default();
+        let mut diagnostics = Vec::new();
+        for path in paths {
+            let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+                diagnostics.push(ThemeDiagnostic {
+                    file: path,
+                    message: "ignored because its basename is not valid Unicode".to_owned(),
+                });
+                continue;
+            };
+            let name = name.to_owned();
+            if name == "system" {
+                diagnostics.push(ThemeDiagnostic {
+                    file: path,
+                    message: "ignored because System is reserved for terminal-derived colors"
+                        .to_owned(),
+                });
+                continue;
+            }
+            let source = match fs::read_to_string(&path) {
+                Ok(source) => source,
+                Err(error) => {
+                    diagnostics.push(ThemeDiagnostic {
+                        file: path,
+                        message: format!("ignored because it could not be read: {error}"),
+                    });
+                    continue;
+                }
+            };
+            match ResolvedThemeVariants::try_from_document(&source) {
+                Ok(variants) => catalog.user_themes.push(UserTheme { name, variants }),
+                Err(error) => diagnostics.push(ThemeDiagnostic {
+                    file: path,
+                    message: error.user_file_message(),
+                }),
+            }
+        }
+        (catalog, diagnostics)
+    }
+
+    pub(crate) fn choices(&self) -> Vec<ThemeChoice> {
+        let mut choices = built_in_themes()
+            .iter()
+            .filter(|(name, _)| !self.user_themes.iter().any(|user| user.name == *name))
+            .map(|(name, _)| ThemeChoice {
+                name: (*name).to_owned(),
+                source: ThemeSource::BuiltIn,
+            })
+            .chain(self.user_themes.iter().map(|theme| ThemeChoice {
+                name: theme.name.clone(),
+                source: ThemeSource::User,
+            }))
+            .collect::<Vec<_>>();
+        choices.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        choices.insert(
+            0,
+            ThemeChoice {
+                name: "system".to_owned(),
+                source: ThemeSource::BuiltIn,
+            },
+        );
+        choices
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        name: &str,
+        mode: AppearanceMode,
+        terminal_facts: &TerminalFacts,
+    ) -> Result<Theme, ThemeError> {
+        let variant = ThemeVariant::for_mode(mode, terminal_facts);
+        if let Some(theme) = self.user_themes.iter().find(|theme| theme.name == name) {
+            return theme
+                .variants
+                .get(variant)
+                .map(|theme| theme.for_terminal_capabilities(terminal_facts));
+        }
+        Theme::resolve(name, mode, terminal_facts)
+    }
+}
+
 impl ResolvedThemeVariants {
     fn from_document(source: &str) -> Self {
         Self {
@@ -594,6 +752,13 @@ impl ResolvedThemeVariants {
             ThemeVariant::Dark => self.dark.clone(),
             ThemeVariant::Light => self.light.clone(),
         }
+    }
+
+    fn try_from_document(source: &str) -> Result<Self, ThemeError> {
+        let themes = Self::from_document(source);
+        themes.dark.clone()?;
+        themes.light.clone()?;
+        Ok(themes)
     }
 }
 
@@ -614,21 +779,19 @@ impl Theme {
                 return Ok(Self::system());
             }
             let theme = Self::from_terminal_probe(probe, variant);
-            return Ok(if terminal_facts.truecolor {
-                theme
-            } else {
-                theme.quantized(&IndexedPalette::from_terminal_facts(terminal_facts))
-            });
+            return Ok(theme.for_terminal_capabilities(terminal_facts));
         }
         Self::named(name, variant)
             .unwrap_or_else(|| Err(ThemeError(format!("Theme {name:?} was not found"))))
-            .map(|theme| {
-                if terminal_facts.truecolor {
-                    theme
-                } else {
-                    theme.quantized(&IndexedPalette::from_terminal_facts(terminal_facts))
-                }
-            })
+            .map(|theme| theme.for_terminal_capabilities(terminal_facts))
+    }
+
+    fn for_terminal_capabilities(self, terminal_facts: &TerminalFacts) -> Self {
+        if terminal_facts.truecolor {
+            self
+        } else {
+            self.quantized(&IndexedPalette::from_terminal_facts(terminal_facts))
+        }
     }
 
     pub(crate) fn system() -> Self {

@@ -27,7 +27,7 @@ use crate::{
     provider::built_in_providers,
     settings::SettingChoiceSurface,
     terminal::TerminalFacts,
-    theme::Theme,
+    theme::{Theme, ThemeCatalog},
 };
 
 use super::{
@@ -2093,6 +2093,8 @@ pub struct Application {
     pub(super) slots: RenderSlots,
     pub(super) terminal_facts: TerminalFacts,
     pub(super) theme: Theme,
+    pub(super) config_root: Option<PathBuf>,
+    pub(super) theme_catalog: ThemeCatalog,
 }
 
 impl std::fmt::Debug for Application {
@@ -2447,9 +2449,37 @@ impl Application {
             slots: RenderSlots::builtins(),
             terminal_facts,
             theme: Theme::system(),
+            config_root: None,
+            theme_catalog: ThemeCatalog::default(),
         };
         application.resolve_theme();
         application
+    }
+
+    /// Points this Client at its machine's Config root and reads user Themes
+    /// before its first frame. The same root remains in force across Outlook
+    /// changes because appearance belongs to the Client, not the Server being
+    /// viewed.
+    pub fn with_config_root(mut self, config_root: impl AsRef<Path>) -> Self {
+        self.config_root = Some(config_root.as_ref().to_path_buf());
+        self.refresh_user_themes();
+        self.resolve_theme();
+        self
+    }
+
+    fn refresh_user_themes(&mut self) {
+        let (catalog, diagnostics) = ThemeCatalog::scan(self.config_root.as_deref());
+        for diagnostic in &diagnostics {
+            tracing::warn!(
+                path = %diagnostic.file.display(),
+                reason = %diagnostic.message,
+                "ignored user Theme"
+            );
+        }
+        self.theme_catalog = catalog;
+        self.state
+            .application_notice
+            .receive_theme_diagnostics(diagnostics);
     }
 
     /// Re-resolves presentation from a fresh reading of the attached
@@ -2474,7 +2504,7 @@ impl Application {
     }
 
     fn resolve_theme_name(&mut self, name: &str) {
-        match Theme::resolve(
+        match self.theme_catalog.resolve(
             name,
             self.state.settings.appearance.mode,
             &self.terminal_facts,
@@ -4190,12 +4220,14 @@ impl Application {
                 Ok(ApplicationTransition::ListModels(request))
             }
             SemanticCommandId::ThemeList => {
+                self.refresh_user_themes();
                 let current = self.state.settings.appearance.theme.clone();
-                self.state
-                    .theme_picker
-                    .open(&current, |theme| SettingMutation::AppearanceTheme {
-                        value: Some(theme),
-                    });
+                self.state.theme_picker.open(
+                    &current,
+                    |theme| SettingMutation::AppearanceTheme { value: Some(theme) },
+                    &self.theme_catalog,
+                );
+                self.resolve_theme();
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::Continue)
             }
@@ -4451,8 +4483,12 @@ impl Application {
                                 .open_numeric_editor(choice, &self.state.settings);
                         }
                         SettingChoiceSurface::Theme { current, pin } => {
+                            self.refresh_user_themes();
                             let current = current(&self.state.settings);
-                            self.state.theme_picker.open(&current, pin);
+                            self.state
+                                .theme_picker
+                                .open(&current, pin, &self.theme_catalog);
+                            self.resolve_theme();
                         }
                     }
                 }

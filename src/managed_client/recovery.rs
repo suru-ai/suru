@@ -67,6 +67,7 @@ pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient
     let managed_http = http.clone();
     let initial_recovery_backoff = config.initial_recovery_backoff;
     let max_recovery_backoff = config.max_recovery_backoff;
+    let config_dir = config.runtime.config_dir().map(ToOwned::to_owned);
     let task = tokio::spawn(run_managed_client(
         config,
         managed_http,
@@ -80,6 +81,7 @@ pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient
         descriptor: descriptor_rx,
         initial_recovery_backoff,
         max_recovery_backoff,
+        config_dir,
         task,
     })
 }

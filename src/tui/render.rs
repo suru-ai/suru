@@ -891,15 +891,21 @@ fn render_theme_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
     lines.extend(state.theme_picker.visible_rows(row_capacity).map(
         |ThemePickerRow {
              name,
+             source,
              selected,
              current,
          }| {
             let marker = if selected { "› " } else { "  " };
             let current = if current { " · [current]" } else { "" };
+            let source = if matches!(source, crate::theme::ThemeSource::User) {
+                " · [user]"
+            } else {
+                ""
+            };
             let display_name = if name == "system" { "System" } else { name };
             Line::styled(
                 truncate_to_width(
-                    &format!("{marker}{display_name}{current}"),
+                    &format!("{marker}{display_name}{source}{current}"),
                     usize::from(content_width),
                 ),
                 if selected {
