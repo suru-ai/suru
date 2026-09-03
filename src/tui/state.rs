@@ -3389,7 +3389,7 @@ impl Application {
                             self.state
                                 .turn_outlook_for_session(session.clone(), workspace);
                             ApplicationTransition::TurnOutlookAndAttach {
-                                catalog_origins: self.state.sidebar.catalog_origins(),
+                                catalog_origins: self.state.catalog_origins(),
                                 session,
                             }
                         }

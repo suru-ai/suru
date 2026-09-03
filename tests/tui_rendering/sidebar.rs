@@ -3932,6 +3932,86 @@ fn everywhere_tags_only_foreign_rows_and_keeps_the_tag_when_the_title_is_cut() {
     );
 }
 
+/// The catalog streams a foreign-row turn names are the union of every
+/// surface's Everywhere interest: a Remote only the Session picker discovered
+/// must not lose its stream because the Sidebar opened a row elsewhere.
+#[test]
+fn opening_a_foreign_row_keeps_the_pickers_everywhere_streams() {
+    let workspace = workspace_dir();
+    let foreign_workspace = workspace.path().join("studio-work");
+    let foreign = SessionId::new();
+    let (mut application, sidebar_origins) = everywhere_with_studio(
+        workspace.path(),
+        Vec::new(),
+        vec![listed_with_id_and_updated_at(
+            foreign,
+            "Studio work",
+            &foreign_workspace,
+            2,
+            minutes_ago(1),
+        )],
+    );
+    assert_eq!(
+        sidebar_origins,
+        std::collections::HashSet::from([Outlook::Remote("studio".to_owned())])
+    );
+
+    // The Session picker widens to Everywhere on its own and learns of a
+    // laptop the Sidebar's earlier discovery never saw, then closes with
+    // that interest still held.
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::SessionList,
+        )))
+        .expect("open the Session picker");
+    let picker_ctrl_a = |application: &mut Application| {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+            )))
+            .expect("cycle the picker scope")
+    };
+    picker_ctrl_a(&mut application);
+    let ApplicationTransition::ListEverywhereRemotes(discovery) = picker_ctrl_a(&mut application)
+    else {
+        panic!("the picker's Everywhere first discovers its Origins");
+    };
+    application
+        .handle_event(ApplicationEvent::EverywhereRemotesListed {
+            request: discovery,
+            remotes: vec![
+                remote("studio", RemoteStatus::Available),
+                remote("laptop", RemoteStatus::Available),
+            ],
+        })
+        .expect("the picker takes both Remotes as Origins");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("close the picker");
+
+    step_onto_the_list(&mut application);
+    assert!(
+        selected_sidebar_text(&application).contains("Studio work"),
+        "Enter is poised over the foreign row: {:?}",
+        selected_sidebar_text(&application)
+    );
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::TurnOutlookAndAttach {
+            session: SessionReference::new(Outlook::Remote("studio".to_owned()), foreign),
+            catalog_origins: std::collections::HashSet::from([
+                Outlook::Remote("studio".to_owned()),
+                Outlook::Remote("laptop".to_owned()),
+            ]),
+        },
+        "the turn keeps the laptop stream the picker alone is interested in"
+    );
+}
+
 #[test]
 fn enter_on_a_foreign_row_turns_then_opens_it_without_disturbing_everywhere() {
     let workspace = workspace_dir();
