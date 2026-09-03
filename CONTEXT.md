@@ -256,6 +256,10 @@ _Avoid_: Color scheme, skin, palette (for the user-facing choice)
 The Theme that paints with the terminal's own colors and leaves its background to the terminal, so Suru looks like whatever the terminal already is. It is the Theme every Client starts with.
 _Avoid_: Default theme, terminal theme, no theme
 
+**Code Block**:
+A fenced region of an agent's message or reasoning, painted by the language its fence names using the Theme's syntax colors, and painted plainly when the fence names nothing Suru knows. Shell output and file changes are not Code Blocks.
+_Avoid_: Snippet, code fence, highlighted code
+
 **Setting**:
 One user-tunable value governing Suru's behavior, carrying a built-in default that applies whenever no Config Document pins it. Every Setting declares a scope: a **Client Setting** governs a client's presentation, and a machine-local Config Document may one day overlay it, while a **Server Setting** governs server or Provider behavior and follows only the server's own Config Documents. Every Setting also declares what it accepts: a **Fixed Setting** — almost all of them — accepts a set of values named up front, which is what lets a reader cycle one through them and lets Suru say exactly what to type where a value is rejected, while an **Open Setting** holds something Suru only discovers while running, such as an Agent Selection, and so names the values it can and describes the rest. Every Setting also declares the **group** it keeps company with, which is the whole of what it says about its own presentation: a client maps a group to the tab that lists it, and the group of **Experimental** Settings holds the ones still finding their shape, so a reader meets them knowing as much. Distinct from a Model Option, which is Provider-advertised rather than user-authored.
 _Avoid_: Option, preference, config value
