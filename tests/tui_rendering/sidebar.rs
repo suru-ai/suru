@@ -21,7 +21,7 @@ use crossterm::event::{
 };
 use ratatui::style::Color;
 use suru::{
-    managed_client::{ManagedEvent, SessionEvent},
+    managed_client::{ManagedEvent, RecoveryStatus, SessionEvent},
     protocol::{
         AutoSettle, EffectiveSettings, EmojiVisibility, Message, MessageId, MessageRole,
         MessageStatus, ModelAvailability, Outlook, PromptId, Remote, RemoteStatus, ServerShutdown,
@@ -4086,6 +4086,242 @@ fn a_pointer_turn_uses_the_sessions_workspace_then_remembers_it_for_that_outlook
 }
 
 #[test]
+fn a_transient_remote_drop_dims_only_its_rows_and_marks_it_unreachable() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let EverywhereListing { requests, .. } = choose_everywhere(
+        &mut application,
+        vec![
+            remote("studio", RemoteStatus::Available),
+            remote("laptop", RemoteStatus::Available),
+        ],
+    );
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => vec![settled(
+                "Local history",
+                None,
+                workspace.path(),
+                1,
+                minutes_ago(2),
+                minutes_ago(1),
+            )],
+            Outlook::Remote(name) if name == "studio" => vec![listed(
+                "Studio work",
+                None,
+                &workspace.path().join("studio"),
+                3,
+                now(),
+            )],
+            Outlook::Remote(name) if name == "laptop" => vec![listed(
+                "Laptop work",
+                None,
+                &workspace.path().join("laptop"),
+                2,
+                now(),
+            )],
+            other => panic!("unexpected listing Origin: {other:?}"),
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+            .expect("take the Origin listing");
+    }
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::OriginCatalog {
+                outlook: Outlook::Remote("studio".to_owned()),
+                event: ManagedEvent::Recovering(RecoveryStatus {
+                    attempt: 1,
+                    retry_in: Duration::from_secs(5),
+                }),
+            })
+            .expect("take the transient Remote drop"),
+        ApplicationTransition::Continue,
+        "reachability changes presentation without disturbing another Origin's listing"
+    );
+
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let rows = crate::support::buffer_rows(&buffer);
+    let unreachable = rendered_row(&rows, "studio [unreachable]");
+    assert!(
+        rendered_row(&rows, "Studio work") < unreachable && unreachable < sidebar_divider(&rows),
+        "the slim unreachable row stands at the foot of the active list: {rows:?}"
+    );
+    let studio = text_position(&buffer, "Studio work");
+    assert_eq!(
+        buffer.cell(studio).expect("draw the Studio row").fg,
+        Color::DarkGray,
+        "cached rows from the dropped Remote are dimmed"
+    );
+    let laptop = text_position(&buffer, "Laptop work");
+    assert_eq!(
+        buffer.cell(laptop).expect("draw the Laptop row").fg,
+        Color::Reset,
+        "another Remote's rows are untouched"
+    );
+}
+
+#[test]
+fn enter_on_an_unreachable_remote_restarts_its_stream_and_listing_now() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let EverywhereListing { requests, .. } = choose_everywhere(
+        &mut application,
+        vec![remote("studio", RemoteStatus::Available)],
+    );
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => Vec::new(),
+            Outlook::Remote(_) => vec![listed(
+                "Studio work",
+                None,
+                &workspace.path().join("studio"),
+                1,
+                now(),
+            )],
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+            .expect("take the Origin listing");
+    }
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::Recovering(RecoveryStatus {
+                attempt: 1,
+                retry_in: Duration::from_secs(5),
+            }),
+        })
+        .expect("take the transient Remote drop");
+
+    step_onto_the_list(&mut application);
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(
+        selected_sidebar_text(&application).contains("studio [unreachable]"),
+        "row focus walks onto the unreachable row like any other"
+    );
+
+    let ApplicationTransition::RetryCatalogOrigin(request) =
+        press_sidebar_key(&mut application, KeyCode::Enter)
+    else {
+        panic!("Enter should retry the unreachable Remote immediately");
+    };
+    assert_eq!(request.outlook(), &Outlook::Remote("studio".to_owned()));
+    assert_eq!(request.surface(), SessionListSurface::Sidebar);
+    assert_eq!(request.scope(), &SessionListScope::AllWorkspaces);
+}
+
+#[test]
+fn an_unreachable_remotes_context_menu_retries_it_now() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let EverywhereListing { requests, .. } = choose_everywhere(
+        &mut application,
+        vec![remote("studio", RemoteStatus::Available)],
+    );
+    for request in requests {
+        application
+            .handle_event(ApplicationEvent::SessionsListed {
+                request,
+                sessions: Vec::new(),
+            })
+            .expect("take the Origin listing");
+    }
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::Recovering(RecoveryStatus {
+                attempt: 1,
+                retry_in: Duration::from_secs(5),
+            }),
+        })
+        .expect("take the transient Remote drop");
+
+    let anchor = open_menu_on(&mut application, "studio [unreachable]");
+    let rows = rendered_application_rows_at(&application, WIDE, PRESS_HEIGHT);
+    assert!(
+        rows[usize::from(anchor + 1)].contains("Try again now"),
+        "the unreachable row's only menu item offers an immediate retry: {rows:?}"
+    );
+
+    let ApplicationTransition::RetryCatalogOrigin(request) =
+        press_menu_item(&mut application, anchor, 0)
+    else {
+        panic!("the menu should retry the unreachable Remote immediately");
+    };
+    assert_eq!(request.outlook(), &Outlook::Remote("studio".to_owned()));
+}
+
+#[test]
+fn a_fresh_remote_snapshot_clears_its_unreachable_presentation() {
+    let workspace = workspace_dir();
+    let remote_session = SessionId::new();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let EverywhereListing { requests, .. } = choose_everywhere(
+        &mut application,
+        vec![remote("studio", RemoteStatus::Available)],
+    );
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => Vec::new(),
+            Outlook::Remote(_) => vec![listed_as(
+                remote_session,
+                "Studio work",
+                &workspace.path().join("studio"),
+                1,
+            )],
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+            .expect("take the Origin listing");
+    }
+    let remote = Outlook::Remote("studio".to_owned());
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: remote.clone(),
+            event: ManagedEvent::Recovering(RecoveryStatus {
+                attempt: 1,
+                retry_in: Duration::from_secs(5),
+            }),
+        })
+        .expect("take the transient Remote drop");
+    let _ = open_menu_on(&mut application, "studio [unreachable]");
+
+    assert!(matches!(
+        application
+            .handle_event(ApplicationEvent::OriginCatalog {
+                outlook: remote,
+                event: ManagedEvent::SessionCatalogReconciled(SessionCatalogSnapshot {
+                    revision: SessionCatalogRevision(2),
+                    session_ids: vec![remote_session],
+                }),
+            })
+            .expect("take the fresh Remote snapshot"),
+        ApplicationTransition::ListSessions(_)
+    ));
+
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let rows = crate::support::buffer_rows(&buffer);
+    assert!(
+        !rows.iter().any(|row| row.contains("[unreachable]")),
+        "the fresh snapshot removes the Remote's unreachable row: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("Try again now")),
+        "the context menu leaves with the recovered row: {rows:?}"
+    );
+    assert_ne!(
+        buffer
+            .cell(text_position(&buffer, "Studio work"))
+            .expect("draw the recovered row")
+            .fg,
+        Color::DarkGray,
+        "the fresh snapshot stops subduing the Remote's rows"
+    );
+}
+
+#[test]
 fn foreign_row_menu_actions_keep_the_rows_origin_and_delete_still_confirms() {
     let workspace = workspace_dir();
     let active = SessionId::new();
@@ -4142,6 +4378,82 @@ fn foreign_row_menu_actions_keep_the_rows_origin_and_delete_still_confirms() {
     assert_eq!(
         press_menu_item(&mut application, active_anchor, 1),
         ApplicationTransition::DeleteSession(SessionReference::new(studio, active))
+    );
+}
+
+#[test]
+fn a_terminal_background_remote_failure_removes_only_that_origin() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let EverywhereListing { requests, .. } = choose_everywhere(
+        &mut application,
+        vec![
+            remote("studio", RemoteStatus::Available),
+            remote("laptop", RemoteStatus::Available),
+        ],
+    );
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => vec![listed("Local work", None, workspace.path(), 3, now())],
+            Outlook::Remote(name) if name == "studio" => vec![listed(
+                "Studio work",
+                None,
+                &workspace.path().join("studio"),
+                2,
+                now(),
+            )],
+            Outlook::Remote(name) if name == "laptop" => vec![listed(
+                "Laptop work",
+                None,
+                &workspace.path().join("laptop"),
+                1,
+                now(),
+            )],
+            other => panic!("unexpected listing Origin: {other:?}"),
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+            .expect("take the Origin listing");
+    }
+    let failed = Outlook::Remote("studio".to_owned());
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: failed.clone(),
+            event: ManagedEvent::Recovering(RecoveryStatus {
+                attempt: 1,
+                retry_in: Duration::from_secs(5),
+            }),
+        })
+        .expect("take the transient drop before the terminal answer");
+
+    let ApplicationTransition::ReconcileCatalogOrigins {
+        catalog_origins,
+        requests,
+    } = application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: failed,
+            event: ManagedEvent::RemoteFailed {
+                status: RemoteStatus::Revoked,
+                message: "Studio revoked this Pairing".to_owned(),
+            },
+        })
+        .expect("take the terminal Remote failure")
+    else {
+        panic!("a terminal Remote failure should release its catalog interest");
+    };
+    assert!(requests.is_empty());
+    assert_eq!(
+        catalog_origins,
+        std::collections::HashSet::from([Outlook::Remote("laptop".to_owned())])
+    );
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(drawn_in_sidebar(&rows, "Local work"));
+    assert!(drawn_in_sidebar(&rows, "Laptop work"));
+    assert!(!drawn_in_sidebar(&rows, "Studio work"));
+    assert!(!rows.iter().any(|row| row.contains("[unreachable]")));
+    assert!(
+        !rows.iter().any(|row| row.contains("Studio revoked")),
+        "a background failure does not put an error in the current Outlook: {rows:?}"
     );
 }
 

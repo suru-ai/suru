@@ -153,6 +153,27 @@ impl SessionTasks {
         }
     }
 
+    /// Replaces one Remote's recovering subscription so a reader's explicit
+    /// retry does not wait for the current backoff delay.
+    fn retry_catalog_origin(
+        &mut self,
+        client: &ManagedClient,
+        outlook: Outlook,
+        events: &UnboundedSender<OriginCatalogEvent>,
+    ) {
+        if let Some(task) = self.catalog_origins.remove(&outlook) {
+            task.abort();
+        }
+        let task = spawn_origin_catalog_forwarder(
+            client
+                .session_commands_for(outlook.clone())
+                .subscribe_catalog(),
+            outlook.clone(),
+            events.clone(),
+        );
+        self.catalog_origins.insert(outlook, task);
+    }
+
     fn resolve_workspace(
         &mut self,
         commands: SessionCommandClient,
@@ -649,6 +670,15 @@ impl RunLoop {
                 catalog_origins,
                 requests,
             } => self.reconcile_catalog_origins(catalog_origins, requests),
+            ApplicationTransition::RetryCatalogOrigin(request) => {
+                let outlook = request.outlook().clone();
+                self.tasks.retry_catalog_origin(
+                    &self.client,
+                    outlook,
+                    &self.channels.origin_catalog,
+                );
+                self.list_sessions(request);
+            }
             ApplicationTransition::ListModels(request) => {
                 let commands = self.client.session_commands_for(request.outlook().clone());
                 self.tasks
@@ -887,6 +917,9 @@ impl RunLoop {
                 catalog_origins,
                 requests,
             } => self.reconcile_catalog_origins(catalog_origins, requests),
+            ApplicationTransition::RetryCatalogOrigin(_) => {
+                unreachable!("managed events cannot explicitly retry a Remote")
+            }
             ApplicationTransition::ListEverywhereRemotes(request_id) => {
                 spawn_everywhere_remote_listing(
                     self.client.session_commands(),

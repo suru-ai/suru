@@ -840,6 +840,15 @@ impl TuiState {
     }
 
     fn apply_origin_catalog(&mut self, outlook: &Outlook, event: ManagedEvent) {
+        if self.sidebar.includes_origin(outlook) {
+            match &event {
+                ManagedEvent::Recovering(_) => self.sidebar.mark_origin_recovering(outlook.clone()),
+                ManagedEvent::RemoteRecovered | ManagedEvent::SessionCatalogReconciled(_) => {
+                    self.sidebar.mark_origin_catalog_current(outlook)
+                }
+                _ => {}
+            }
+        }
         if outlook == &self.outlook {
             self.apply_managed_event(event);
         } else if event.moves_the_session_catalog() && self.sidebar.includes_origin(outlook) {
@@ -2279,6 +2288,9 @@ pub enum ApplicationTransition {
         catalog_origins: HashSet<Outlook>,
         requests: Vec<SessionListRequest>,
     },
+    /// Restart one recovering Remote catalog stream immediately and re-ask
+    /// the listing whose cached rows remain on show.
+    RetryCatalogOrigin(SessionListRequest),
     ListModels(ModelListRequest),
     RefreshSkills(SkillCatalogRequest),
     ConfirmLandingAgentSelection(AgentSelection),
@@ -3242,6 +3254,9 @@ impl Application {
                             requests: Vec::new(),
                         }
                     }
+                    SidebarActivation::RetryCatalogOrigin(request) => {
+                        ApplicationTransition::RetryCatalogOrigin(request)
+                    }
                     // Enter and a press both arrive here, so both open the
                     // Session the same way: the route moves now and the
                     // attachment follows it.
@@ -3559,9 +3574,15 @@ impl Application {
         outlook: Outlook,
         event: ManagedEvent,
     ) -> Result<ApplicationTransition> {
-        if outlook == self.state.outlook
-            && let ManagedEvent::RemoteFailed { status, message } = event
-        {
+        if let ManagedEvent::RemoteFailed { status, message } = &event {
+            let is_current = outlook == self.state.outlook;
+            self.state.sidebar.end_origin(&outlook);
+            if !is_current {
+                return Ok(ApplicationTransition::ReconcileCatalogOrigins {
+                    catalog_origins: self.state.sidebar.catalog_origins(),
+                    requests: Vec::new(),
+                });
+            }
             let Some(name) = outlook.remote_name().map(str::to_owned) else {
                 return Ok(ApplicationTransition::Continue);
             };
@@ -3584,9 +3605,9 @@ impl Application {
                     .recover_session_to_landing(reference.clone());
                 self.state.session_interactions.remove(&reference);
             }
-            self.state.connect_overlay.remote_failed(&name, status);
+            self.state.connect_overlay.remote_failed(&name, *status);
             self.state.turn_outlook(Outlook::Local);
-            self.state.settle_remote_failure(message);
+            self.state.settle_remote_failure(message.clone());
             self.state.sync_composer_completion();
             return Ok(ApplicationTransition::TurnOutlook {
                 outlook: Outlook::Local,
@@ -3605,11 +3626,18 @@ impl Application {
 
     /// Whether an Origin-stamped catalog event can change client state now.
     /// The current Outlook takes every event; a background Origin participates
-    /// only while Everywhere includes it, and only when its Session catalog
-    /// moves. Background lifecycle events have no represented state yet.
+    /// only while Everywhere includes it, for catalog movement and the Remote
+    /// reachability transitions represented beside its cached rows.
     pub(super) fn accepts_catalog_event(&self, outlook: &Outlook, event: &ManagedEvent) -> bool {
         outlook == &self.state.outlook
-            || (event.moves_the_session_catalog() && self.state.sidebar.includes_origin(outlook))
+            || (self.state.sidebar.includes_origin(outlook)
+                && (event.moves_the_session_catalog()
+                    || matches!(
+                        event,
+                        ManagedEvent::Recovering(_)
+                            | ManagedEvent::RemoteRecovered
+                            | ManagedEvent::RemoteFailed { .. }
+                    )))
     }
 
     fn attach_session(
@@ -3974,7 +4002,9 @@ impl Application {
             // that names none has nothing to open and leaves the view put.
             SemanticCommandId::SubagentOpen => Ok(match invocation.subject {
                 SemanticSubject::Session(session) => ApplicationTransition::AttachSession(session),
-                SemanticSubject::View | SemanticSubject::Turn(_) => ApplicationTransition::Continue,
+                SemanticSubject::View | SemanticSubject::Turn(_) | SemanticSubject::Origin(_) => {
+                    ApplicationTransition::Continue
+                }
             }),
             // Stopping a Subagent is interrupting its child Session, on the
             // same subject terms as opening one.
@@ -3982,7 +4012,9 @@ impl Application {
                 SemanticSubject::Session(session) => {
                     ApplicationTransition::InterruptSession { session }
                 }
-                SemanticSubject::View | SemanticSubject::Turn(_) => ApplicationTransition::Continue,
+                SemanticSubject::View | SemanticSubject::Turn(_) | SemanticSubject::Origin(_) => {
+                    ApplicationTransition::Continue
+                }
             }),
             // Leaving acts on the Session the reader is in: only a Subagent's
             // Session has a parent to return to, so anywhere else the command
@@ -4014,7 +4046,9 @@ impl Application {
                 let settled = command == SemanticCommandId::SessionSettle;
                 let named = match invocation.subject {
                     SemanticSubject::Session(session) => Some(session),
-                    SemanticSubject::View | SemanticSubject::Turn(_) => self.session_reference(),
+                    SemanticSubject::View
+                    | SemanticSubject::Turn(_)
+                    | SemanticSubject::Origin(_) => self.session_reference(),
                 };
                 Ok(named.map_or(ApplicationTransition::Continue, |session| {
                     ApplicationTransition::SettleSession { session, settled }
@@ -4042,6 +4076,17 @@ impl Application {
                 }
                 Ok(self.take_sidebar_listing_transition())
             }
+            SemanticCommandId::RemoteRetry => Ok(match invocation.subject {
+                SemanticSubject::Origin(outlook) => {
+                    self.state.sidebar.retry_origin(outlook).map_or(
+                        ApplicationTransition::Continue,
+                        ApplicationTransition::RetryCatalogOrigin,
+                    )
+                }
+                SemanticSubject::View | SemanticSubject::Turn(_) | SemanticSubject::Session(_) => {
+                    ApplicationTransition::Continue
+                }
+            }),
             // A command naming a Session takes that one away: the surface
             // that named it has already had the reader say it twice, which is
             // what asking again is for. Naming none means the row the session

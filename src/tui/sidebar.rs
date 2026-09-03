@@ -152,6 +152,9 @@ pub(super) struct Sidebar {
     /// The Origins participating in Everywhere, local first and followed by
     /// each paired non-terminal Remote in the order the local Server named it.
     everywhere_origins: Vec<Outlook>,
+    /// Participating Remotes whose catalog streams are waiting for a fresh
+    /// snapshot. Their last rows remain visible but stale in the meantime.
+    recovering_origins: HashSet<Outlook>,
     /// How much of the settled shelf is on show. History is the longest part
     /// of a body of work and the least of what a reader is choosing between,
     /// so the shelf opens on its first rows and the tail stands behind an
@@ -246,6 +249,7 @@ enum SidebarFocus {
     /// rather than attaching anything.
     AddWorkspace,
     Session(SessionReference),
+    Unreachable(Outlook),
     ShowMore,
 }
 
@@ -294,7 +298,17 @@ pub(super) struct SidebarRow<'a> {
     /// drawn subdued and marked, because it stands for work the reader can see
     /// and delete but never open.
     pub(super) unreadable: bool,
+    /// Whether this is a cached row from a recovering Remote.
+    pub(super) recovering: bool,
     pub(super) shelf: SidebarShelf<'a>,
+}
+
+/// One recovering Remote, drawn as a slim row beneath the active Sessions.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SidebarUnreachable<'a> {
+    pub(super) outlook: &'a Outlook,
+    pub(super) name: &'a str,
+    pub(super) focused: bool,
 }
 
 /// Which of the Sidebar's two shelves a Session stands on, carrying what that
@@ -336,11 +350,13 @@ impl SidebarShelf<'_> {
     }
 }
 
-/// The Sidebar's body, top to bottom: the active Sessions, then — where there
-/// is a settled shelf to open — the divider, then the settled ones.
+/// The Sidebar's body, top to bottom: the active Sessions, recovering Remotes,
+/// then — where there is a settled shelf to open — the divider and settled
+/// Sessions.
 #[derive(Clone, Debug)]
 pub(super) enum SidebarEntry<'a> {
     Row(SidebarRow<'a>),
+    Unreachable(SidebarUnreachable<'a>),
     /// One Workspace the open selector offers, which stands in place of the
     /// shelves while the reader is choosing between them.
     Scope(SidebarScopeEntry),
@@ -399,7 +415,7 @@ impl SidebarEntry<'_> {
     const fn lines(&self) -> usize {
         match self {
             Self::Row(row) => row.shelf.lines(),
-            Self::Divider | Self::ShowMore(_) | Self::Scope(_) => 1,
+            Self::Unreachable(_) | Self::Divider | Self::ShowMore(_) | Self::Scope(_) => 1,
         }
     }
 
@@ -408,7 +424,7 @@ impl SidebarEntry<'_> {
     const fn is_open(&self) -> bool {
         match self {
             Self::Row(row) => row.open,
-            Self::Scope(_) | Self::Divider | Self::ShowMore(_) => false,
+            Self::Unreachable(_) | Self::Scope(_) | Self::Divider | Self::ShowMore(_) => false,
         }
     }
 
@@ -419,6 +435,7 @@ impl SidebarEntry<'_> {
             Self::Row(row) => row.focused,
             Self::ShowMore(more) => more.focused,
             Self::Scope(scope) => scope.focused,
+            Self::Unreachable(remote) => remote.focused,
             Self::Divider => false,
         }
     }
@@ -430,6 +447,7 @@ impl SidebarEntry<'_> {
             Self::Row(row) => Some(SidebarTarget::Session(row.reference.clone())),
             Self::ShowMore(_) => Some(SidebarTarget::ShowMore),
             Self::Scope(scope) => Some(SidebarTarget::Scope(scope.scope.clone())),
+            Self::Unreachable(remote) => Some(SidebarTarget::Unreachable(remote.outlook.clone())),
             Self::Divider => None,
         }
     }
@@ -465,13 +483,12 @@ pub(super) struct SidebarSpan {
     pub(super) target: SidebarTarget,
 }
 
-/// What a drawn entry stands for. Most of them stand for a Session; the rest
-/// stand for the Sidebar's own affordances — the settled shelf's next batch,
-/// the Workspace selector, one of the Workspaces it offers, and the affordance
-/// beside the selector that opens a path entry.
+/// What a drawn entry stands for. Most stand for a Session; the rest stand for
+/// a recovering Remote or one of the Sidebar's own affordances.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SidebarTarget {
     Session(SessionReference),
+    Unreachable(Outlook),
     ShowMore,
     Selector,
     Scope(SidebarListingScope),
@@ -550,6 +567,7 @@ pub(super) enum SidebarActivation {
     /// Narrowing from Everywhere changes which catalog streams the Client
     /// owns even though the listing already in hand needs no fresh request.
     CatalogOriginsChanged,
+    RetryCatalogOrigin(SessionListRequest),
     Attach {
         session: SessionReference,
         workspace: PathBuf,
@@ -560,11 +578,11 @@ pub(super) enum SidebarActivation {
     ResolveWorkspace(ResolveWorkspaceRequest),
 }
 
-/// The items a Sidebar row's context menu offers. Which of the first two it
-/// carries follows the shelf the row stands on: a settled Session is brought
-/// back where an active one is set aside.
+/// The items a Sidebar row's context menu offers. A recovering Remote offers
+/// only a retry; a Session offers its shelf action and deletion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SidebarMenuItem {
+    TryAgain,
     Settle,
     Unsettle,
     Delete,
@@ -573,18 +591,7 @@ pub(super) enum SidebarMenuItem {
 /// The context menu a reader opened on one Sidebar row.
 #[derive(Clone, Debug)]
 struct SidebarMenu {
-    /// The Session the menu stands on, named rather than positioned so a
-    /// listing arriving underneath it acts on the work the reader pointed at.
-    session: SessionReference,
-    /// Whether that row stands on the settled shelf, read when the menu was
-    /// opened, which is what decides whether it offers to set the Session
-    /// aside or to bring it back.
-    settled: bool,
-    /// Whether the client could not read the Session, read when the menu was
-    /// opened. Such a row keeps Delete and loses the rest: settling work that
-    /// cannot be opened is an operation that cannot succeed, and the menu does
-    /// not offer it.
-    unreadable: bool,
+    subject: SidebarMenuSubject,
     selected: usize,
     /// Whether Delete has been asked for once. A Session and everything it
     /// owns is not something one stray press may take away, so the item asks
@@ -595,12 +602,25 @@ struct SidebarMenu {
     anchor: Position,
 }
 
+/// What the context menu was opened on, held by identity so a listing moving
+/// behind the menu cannot retarget the action.
+#[derive(Clone, Debug)]
+enum SidebarMenuSubject {
+    Session {
+        reference: SessionReference,
+        settled: bool,
+        unreadable: bool,
+    },
+    Unreachable(Outlook),
+}
+
 impl SidebarMenuItem {
     /// What this item says on the row it is drawn on. Delete says something
     /// else while it is waiting to be confirmed, because the reader has to be
     /// able to see that pressing again is what acts.
     const fn label(self, confirming_delete: bool) -> &'static str {
         match self {
+            Self::TryAgain => "Try again now",
             Self::Settle => "Settle",
             Self::Unsettle => "Unsettle",
             Self::Delete if confirming_delete => "Delete — confirm",
@@ -612,6 +632,7 @@ impl SidebarMenuItem {
     /// slash and the keys reach and never one minted for the menu.
     const fn command(self) -> SemanticCommandId {
         match self {
+            Self::TryAgain => SemanticCommandId::RemoteRetry,
             Self::Settle => SemanticCommandId::SessionSettle,
             Self::Unsettle => SemanticCommandId::SessionUnsettle,
             Self::Delete => SemanticCommandId::SessionDelete,
@@ -624,17 +645,34 @@ impl SidebarMenu {
     /// except on a row the client could not read, which no shelf operation can
     /// act on — and Delete, which every row keeps.
     fn items(&self) -> Vec<SidebarMenuItem> {
-        if self.unreadable {
-            return vec![SidebarMenuItem::Delete];
+        match &self.subject {
+            SidebarMenuSubject::Unreachable(_) => vec![SidebarMenuItem::TryAgain],
+            SidebarMenuSubject::Session {
+                unreadable: true, ..
+            } => vec![SidebarMenuItem::Delete],
+            SidebarMenuSubject::Session { settled, .. } => vec![
+                if *settled {
+                    SidebarMenuItem::Unsettle
+                } else {
+                    SidebarMenuItem::Settle
+                },
+                SidebarMenuItem::Delete,
+            ],
         }
-        vec![
-            if self.settled {
-                SidebarMenuItem::Unsettle
-            } else {
-                SidebarMenuItem::Settle
-            },
-            SidebarMenuItem::Delete,
-        ]
+    }
+
+    fn session(&self) -> Option<&SessionReference> {
+        match &self.subject {
+            SidebarMenuSubject::Session { reference, .. } => Some(reference),
+            SidebarMenuSubject::Unreachable(_) => None,
+        }
+    }
+
+    fn unreachable_origin(&self) -> Option<&Outlook> {
+        match &self.subject {
+            SidebarMenuSubject::Unreachable(outlook) => Some(outlook),
+            SidebarMenuSubject::Session { .. } => None,
+        }
     }
 }
 
@@ -681,6 +719,7 @@ impl Sidebar {
                 SessionListScope::AllWorkspaces,
             ),
             everywhere_origins: Vec::new(),
+            recovering_origins: HashSet::new(),
             settled_on_show: SETTLED_SHELF_OPENING,
             query: String::new(),
             focus: None,
@@ -957,11 +996,9 @@ impl Sidebar {
             .find(|session| session.reference() == reference)
     }
 
-    /// Opens the context menu on the row the reader asked for one on, which
-    /// also puts row focus on that row where the reader is driving the
-    /// Sidebar: a menu acts on the Session under it, and focus standing
-    /// elsewhere would say otherwise. A reader who is not driving it is shown
-    /// no focus either way, and the menu carries the Session it acts on.
+    /// Opens the context menu on the Session or unreachable Remote row the
+    /// reader asked for, carrying the row's identity so a listing moving
+    /// behind it cannot retarget the action.
     ///
     /// The settled shelf's affordance stands for no Session, so it offers no
     /// menu — and neither does a press out in the main view. Both put away
@@ -976,25 +1013,35 @@ impl Sidebar {
         }
         let hit = self.geometry.borrow().hit(position);
         self.menu = None;
-        let Some(SidebarTarget::Session(reference)) = hit else {
-            return;
+        let subject = match hit {
+            Some(SidebarTarget::Session(reference)) => {
+                let Some(session) = self.listed_session(&reference) else {
+                    return;
+                };
+                let settled = self.settlement().settles(session);
+                let unreadable = session.readable().is_none();
+                // A row the client could not read still gets its menu —
+                // deletion is how damaged work leaves the list — but never
+                // row focus, which stands only on rows the arrows can reach.
+                if !unreadable {
+                    self.focus_on(SidebarTarget::Session(reference.clone()));
+                    self.release_borrowed_focus();
+                }
+                SidebarMenuSubject::Session {
+                    reference,
+                    settled,
+                    unreadable,
+                }
+            }
+            Some(SidebarTarget::Unreachable(outlook)) => {
+                self.focus_on(SidebarTarget::Unreachable(outlook.clone()));
+                self.release_borrowed_focus();
+                SidebarMenuSubject::Unreachable(outlook)
+            }
+            _ => return,
         };
-        let Some(session) = self.listed_session(&reference) else {
-            return;
-        };
-        let settled = self.settlement().settles(session);
-        let unreadable = session.readable().is_none();
-        // A row the client could not read still gets its menu — deletion is
-        // how damaged work leaves the list — but never row focus, which stands
-        // only on rows the arrows can reach and Enter can open.
-        if !unreadable {
-            self.focus_on(SidebarTarget::Session(reference.clone()));
-            self.release_borrowed_focus();
-        }
         self.menu = Some(SidebarMenu {
-            session: reference,
-            settled,
-            unreadable,
+            subject,
             selected: 0,
             confirming_delete: false,
             anchor: position,
@@ -1081,9 +1128,12 @@ impl Sidebar {
             menu.confirming_delete = true;
             return SidebarPress::Answered;
         }
-        let session = menu.session.clone();
+        let subject = menu.subject.clone();
         self.menu = None;
-        SidebarPress::Invoke(item.command().on_session(session))
+        SidebarPress::Invoke(match subject {
+            SidebarMenuSubject::Session { reference, .. } => item.command().on_session(reference),
+            SidebarMenuSubject::Unreachable(outlook) => item.command().on_origin(outlook),
+        })
     }
 
     /// Notes the entry a press landed on, which is how a pointer says which
@@ -1096,6 +1146,7 @@ impl Sidebar {
     fn focus_on(&mut self, target: SidebarTarget) {
         self.focus = Some(match target {
             SidebarTarget::Session(reference) => SidebarFocus::Session(reference),
+            SidebarTarget::Unreachable(outlook) => SidebarFocus::Unreachable(outlook),
             SidebarTarget::ShowMore => SidebarFocus::ShowMore,
             SidebarTarget::Selector => SidebarFocus::Selector,
             SidebarTarget::Scope(scope) => SidebarFocus::Scope(scope),
@@ -1274,7 +1325,10 @@ impl Sidebar {
             && self.on_screen.get()
             && self.body().into_iter().any(|entry| match entry {
                 BodyEntry::Session(session, _) => session.working_since().is_some(),
-                BodyEntry::Scope(_) | BodyEntry::Divider | BodyEntry::ShowMore(_) => false,
+                BodyEntry::Unreachable(_)
+                | BodyEntry::Scope(_)
+                | BodyEntry::Divider
+                | BodyEntry::ShowMore(_) => false,
             })
     }
 
@@ -1323,8 +1377,51 @@ impl Sidebar {
             .then_some(Outlook::Remote(remote.name))
         }));
         self.listing.retain_origins(&origins);
+        self.recovering_origins
+            .retain(|outlook| origins.contains(outlook));
         self.everywhere_origins = origins;
         Some(self.listing.refresh_origins(&self.everywhere_origins))
+    }
+
+    /// Keeps a Remote's last catalog visible but marks it stale while its
+    /// stream follows the recovery schedule.
+    pub(super) fn mark_origin_recovering(&mut self, outlook: Outlook) {
+        if self.includes_origin(&outlook) {
+            self.recovering_origins.insert(outlook);
+        }
+    }
+
+    /// A fresh catalog snapshot makes a Remote's cached rows current again.
+    pub(super) fn mark_origin_catalog_current(&mut self, outlook: &Outlook) {
+        let before = self.focus_order_before_change();
+        self.recovering_origins.remove(outlook);
+        if self.menu.as_ref().and_then(SidebarMenu::unreachable_origin) == Some(outlook) {
+            self.menu = None;
+        }
+        self.keep_focus_drawn(&before);
+    }
+
+    /// Ends one Remote's participation and removes every cached row it owned.
+    pub(super) fn end_origin(&mut self, outlook: &Outlook) {
+        let before = self.focus_order_before_change();
+        self.everywhere_origins.retain(|origin| origin != outlook);
+        self.recovering_origins.remove(outlook);
+        self.listing.remove_origin_catalog(outlook);
+        if self.menu.as_ref().and_then(SidebarMenu::unreachable_origin) == Some(outlook) {
+            self.menu = None;
+        }
+        self.forget_absent(&before);
+    }
+
+    /// Begins one reader-requested retry while leaving the stale presentation
+    /// in place until the replacement stream supplies a fresh snapshot.
+    pub(super) fn retry_origin(&mut self, outlook: Outlook) -> Option<SessionListRequest> {
+        if !self.recovering_origins.contains(&outlook) {
+            return None;
+        }
+        self.asked_afresh = false;
+        self.listing.clear_error();
+        Some(self.listing.catch_up_origin(outlook))
     }
 
     /// Remote streams the run loop must own for the chosen scope. The local
@@ -1475,7 +1572,8 @@ impl Sidebar {
     /// selector opens the path entry. Nor is there anything to attach when the
     /// row stands for a Session Suru could not read, or for the Session already
     /// open — in which case Enter means only that the reader is done choosing,
-    /// and the composer takes the keys back.
+    /// and the composer takes the keys back. An unreachable Remote row retries
+    /// that Origin immediately and remains until a fresh snapshot arrives.
     pub(super) fn activate(
         &mut self,
         open: Option<&SessionReference>,
@@ -1502,6 +1600,12 @@ impl Sidebar {
         };
         let wanted = match focus {
             SidebarFocus::Session(reference) => reference,
+            SidebarFocus::Unreachable(outlook) => {
+                return self.retry_origin(outlook).map_or(
+                    SidebarActivation::Answered,
+                    SidebarActivation::RetryCatalogOrigin,
+                );
+            }
             SidebarFocus::ShowMore => {
                 self.show_more();
                 return SidebarActivation::Answered;
@@ -1863,6 +1967,13 @@ impl Sidebar {
             .into_iter()
             .map(|entry| match entry {
                 BodyEntry::Divider => SidebarEntry::Divider,
+                BodyEntry::Unreachable(outlook) => SidebarEntry::Unreachable(SidebarUnreachable {
+                    outlook,
+                    name: outlook
+                        .remote_name()
+                        .expect("an unreachable Origin is always a Remote"),
+                    focused: self.focus == Some(SidebarFocus::Unreachable(outlook.clone())),
+                }),
                 BodyEntry::Scope(scope) => SidebarEntry::Scope(SidebarScopeEntry {
                     label: scope.label(),
                     chosen: scope == self.scope,
@@ -1895,12 +2006,11 @@ impl Sidebar {
             .collect()
     }
 
-    /// The Sidebar's body top to bottom: the active Sessions, then the divider
-    /// and as much of the settled shelf as is on show — or, while the reader is
-    /// searching, the results in place of both; while they are choosing a
-    /// Workspace, the selector's own entries in place of everything; and while
-    /// they are naming one, nothing at all, the path entry the frame draws
-    /// there standing for no work.
+    /// The Sidebar's body top to bottom: the active Sessions, recovering
+    /// Remotes, then the divider and as much of the settled shelf as is on show
+    /// — or, while the reader is searching, the results in place of both;
+    /// while they are choosing a Workspace, the selector's own entries in
+    /// place of everything; and while they are naming one, nothing at all.
     ///
     /// Everything the Sidebar has to say about what stands where is said here
     /// and nowhere else, so the rows the frame draws and the rows the arrows
@@ -1929,6 +2039,13 @@ impl Sidebar {
             .into_iter()
             .map(|session| BodyEntry::Session(session, Standing::Active))
             .collect::<Vec<_>>();
+        if self.scope == SidebarListingScope::Everywhere {
+            body.extend(self.everywhere_origins.iter().filter_map(|outlook| {
+                self.recovering_origins
+                    .contains(outlook)
+                    .then_some(BodyEntry::Unreachable(outlook))
+            }));
+        }
         let shelf = self.shelf(settlement);
         if shelf.on_show.is_empty() {
             return body;
@@ -2049,6 +2166,9 @@ impl Sidebar {
             focused: self.focus.as_ref()
                 == Some(&SidebarFocus::Session(session.reference().clone())),
             unreadable: session.readable().is_none(),
+            recovering: self
+                .recovering_origins
+                .contains(&session.reference().origin),
             shelf,
         })
     }
@@ -2125,6 +2245,7 @@ impl Sidebar {
                 .map(|_| SidebarFocus::Session(session.reference().clone())),
             BodyEntry::ShowMore(_) => Some(SidebarFocus::ShowMore),
             BodyEntry::Scope(scope) => Some(SidebarFocus::Scope(scope)),
+            BodyEntry::Unreachable(outlook) => Some(SidebarFocus::Unreachable(outlook.clone())),
             BodyEntry::Divider => None,
         });
         if self.selector_open {
@@ -2242,7 +2363,8 @@ impl Sidebar {
         if self
             .menu
             .as_ref()
-            .is_some_and(|menu| !self.listing.contains(&menu.session))
+            .and_then(SidebarMenu::session)
+            .is_some_and(|session| !self.listing.contains(session))
         {
             self.menu = None;
         }
@@ -2254,6 +2376,7 @@ impl Sidebar {
 #[derive(Clone, Debug)]
 enum BodyEntry<'a> {
     Session(&'a ListedSession, Standing),
+    Unreachable(&'a Outlook),
     /// One Workspace the open selector offers.
     Scope(SidebarListingScope),
     Divider,
@@ -3133,6 +3256,9 @@ mod tests {
             .into_iter()
             .map(|entry| match entry {
                 SidebarEntry::Row(row) => row.title.to_owned(),
+                SidebarEntry::Unreachable(remote) => {
+                    format!("{} [unreachable]", remote.name)
+                }
                 SidebarEntry::Divider => DIVIDER.to_owned(),
                 SidebarEntry::ShowMore(more) => format!("Show {} more", more.count),
                 SidebarEntry::Scope(scope) => scope.label,

@@ -383,6 +383,11 @@ impl SessionListing {
         self.origins.retain(|origin, _| origins.contains(origin));
     }
 
+    /// Forgets one Origin's rows and any request still in flight for it.
+    pub(super) fn remove_origin_catalog(&mut self, outlook: &Outlook) {
+        self.origins.remove(outlook);
+    }
+
     /// The Workspaces this listing puts on offer: every one its Sessions are
     /// rooted in, and the one this client works in — which stands whether or
     /// not there is work in it yet, being where the reader's next Session

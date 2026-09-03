@@ -36,7 +36,7 @@ use super::{
     sidebar::{
         self, ADD_WORKSPACE, Sidebar, SidebarEntry, SidebarMenuGeometry, SidebarRow,
         SidebarScopeEntry, SidebarSelectorView, SidebarShelf, SidebarShowMore, SidebarSpan,
-        SidebarTarget, SidebarWorkspaceEntryView,
+        SidebarTarget, SidebarUnreachable, SidebarWorkspaceEntryView,
     },
     slots::{
         LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
@@ -1927,8 +1927,8 @@ fn sidebar_empty_reading(sidebar: &Sidebar) -> Option<&'static str> {
     })
 }
 
-/// One entry of the Sidebar's body: a Session on either shelf, or the rule
-/// between the two.
+/// One entry of the Sidebar's body: a Session, recovering Remote, affordance,
+/// or the rule between the two shelves.
 fn sidebar_entry_lines(
     entry: SidebarEntry<'_>,
     width: usize,
@@ -1938,6 +1938,9 @@ fn sidebar_entry_lines(
 ) -> Vec<Line<'static>> {
     match entry {
         SidebarEntry::Divider => vec![sidebar_divider_line(width, theme)],
+        SidebarEntry::Unreachable(remote) => {
+            vec![sidebar_unreachable_line(remote, width, driving, theme)]
+        }
         SidebarEntry::ShowMore(more) => vec![sidebar_show_more_line(more, width, driving, theme)],
         SidebarEntry::Scope(scope) => vec![sidebar_scope_line(&scope, width, driving, theme)],
         SidebarEntry::Row(row) => match row.shelf {
@@ -1961,6 +1964,20 @@ fn sidebar_entry_lines(
             }
         },
     }
+}
+
+fn sidebar_unreachable_line(
+    remote: SidebarUnreachable<'_>,
+    width: usize,
+    driving: bool,
+    theme: &Theme,
+) -> Line<'static> {
+    sidebar_plain_line(
+        &format!("{} [unreachable]", remote.name),
+        width,
+        sidebar_focus_style(remote.focused, driving, theme),
+        theme.text.subdued,
+    )
 }
 
 /// The Workspace selector: what the Sidebar is narrowed to, with the affordance
@@ -2338,14 +2355,14 @@ fn sidebar_row_style(row: SidebarRow<'_>, driving: bool, theme: &Theme) -> Optio
 }
 
 /// How a Session's name is drawn where no highlight covers the row: subdued
-/// for one the client could not read, because that row stands for work the
-/// reader can see and delete but never open, and plain otherwise.
+/// for one the client could not read or whose Remote is recovering, and plain
+/// otherwise.
 ///
 /// A highlight wins either way. An open Session the listing reports unreadable
 /// keeps its highlight and its marker both: the reader is looking at it, and
 /// the row has to say why they cannot get back into it.
 fn sidebar_title_style(row: SidebarRow<'_>, highlight: Option<Style>, theme: &Theme) -> Style {
-    highlight.unwrap_or(if row.unreadable {
+    highlight.unwrap_or(if row.unreadable || row.recovering {
         theme.text.subdued
     } else {
         theme.text.primary

@@ -2,7 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::protocol::{SessionReference, TurnId};
+use crate::protocol::{Outlook, SessionReference, TurnId};
 
 pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
 
@@ -49,6 +49,7 @@ pub enum SemanticCommandId {
     SidebarMenuNext,
     SidebarMenuSelect,
     SidebarMenuClose,
+    RemoteRetry,
     SettingsOpen,
     SettingsPrevious,
     SettingsNext,
@@ -146,6 +147,7 @@ impl NumericDigit {
 pub(super) enum SemanticSubject {
     View,
     Turn(TurnId),
+    Origin(Outlook),
     /// One Session, which is what a reader names by acting on its row rather
     /// than on the Session they have open.
     Session(SessionReference),
@@ -185,6 +187,15 @@ impl SemanticCommandId {
         SemanticInvocation {
             id: self,
             subject: SemanticSubject::Session(session),
+        }
+    }
+
+    /// This command invoked against one Origin, which is what an unreachable
+    /// Remote row names when the reader retries it.
+    pub(super) fn on_origin(self, outlook: Outlook) -> SemanticInvocation {
+        SemanticInvocation {
+            id: self,
+            subject: SemanticSubject::Origin(outlook),
         }
     }
 
@@ -231,6 +242,7 @@ impl SemanticCommandId {
             Self::SidebarMenuNext => "sidebar.menu.next",
             Self::SidebarMenuSelect => "sidebar.menu.select",
             Self::SidebarMenuClose => "sidebar.menu.close",
+            Self::RemoteRetry => "remote.retry",
             Self::SettingsOpen => "settings.open",
             Self::SettingsPrevious => "settings.previous",
             Self::SettingsNext => "settings.next",
@@ -698,7 +710,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         // the reader is on, so this is what Enter comes to there as well as on
         // a Session, and the account of the command names the rest of them.
         description: "Open the Session the Sidebar has selected, show more of the settled shelf, \
-                      or act on the Workspace selector",
+                      retry an unreachable Remote, or act on the Workspace selector",
         slash: None,
         keybinding: None,
     },
@@ -740,6 +752,13 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::SidebarMenuClose,
         title: "Close Sidebar Menu",
         description: "Dismiss the Sidebar's context menu, leaving its row alone",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::RemoteRetry,
+        title: "Retry Remote",
+        description: "Restart an unreachable Remote's catalog stream and refresh its Sessions",
         slash: None,
         keybinding: None,
     },
