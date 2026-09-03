@@ -6,9 +6,9 @@
 //! the server is what moves a row — the panel never shows a value the Config
 //! Document does not yet carry.
 //!
-//! Three tabs split the listing. General and Experimental are the schema
-//! filtered to their own group, so a Setting added to either appears with no
-//! work. Providers is hand-built from the built-in Provider list rather than
+//! Four tabs split the listing. Appearance, General and Experimental are the
+//! schema filtered to their own group, so a Setting added to any appears with
+//! no work. Providers is hand-built from the built-in Provider list rather than
 //! from the schema: one row per Provider, always and in the built-in order,
 //! each row standing for that Provider's Enablement. Which tab a Setting lands
 //! on is the Setting's own declaration in the schema, so the panel maps groups
@@ -68,6 +68,7 @@ const UNNAMED_VALUE: &str = "unknown";
 pub(super) enum SettingsTab {
     #[default]
     General,
+    Appearance,
     Providers,
     Experimental,
 }
@@ -75,11 +76,17 @@ pub(super) enum SettingsTab {
 impl SettingsTab {
     /// Every tab, in the order the tab bar draws them and Left and Right walk
     /// them. The default is where an opening panel lands.
-    pub(super) const ALL: &'static [Self] = &[Self::General, Self::Providers, Self::Experimental];
+    pub(super) const ALL: &'static [Self] = &[
+        Self::General,
+        Self::Providers,
+        Self::Appearance,
+        Self::Experimental,
+    ];
 
     pub(super) fn title(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Appearance => "Appearance",
             Self::Providers => "Providers",
             Self::Experimental => "Experimental",
         }
@@ -89,6 +96,7 @@ impl SettingsTab {
     fn group(self) -> SettingGroup {
         match self {
             Self::General => SettingGroup::General,
+            Self::Appearance => SettingGroup::Appearance,
             Self::Providers => SettingGroup::Providers,
             Self::Experimental => SettingGroup::Experimental,
         }
@@ -737,7 +745,7 @@ impl SettingsPanel {
     pub(super) fn cycle(&mut self, settings: &EffectiveSettings) -> Option<SettingMutation> {
         self.error = None;
         let descriptor = self.selected_descriptor()?;
-        Some(descriptor.next_choice(settings)?.pin.clone())
+        Some(descriptor.next_choice(settings)?.mutation())
     }
 
     /// Takes the focused Setting's pin out of the Config Document. The reset
@@ -757,7 +765,7 @@ impl SettingsPanel {
     fn entries(&self) -> Vec<PanelEntry> {
         let tab = self.tab;
         match tab {
-            SettingsTab::General | SettingsTab::Experimental => SCHEMA
+            SettingsTab::General | SettingsTab::Appearance | SettingsTab::Experimental => SCHEMA
                 .iter()
                 .filter(|descriptor| descriptor.group == tab.group())
                 .map(|descriptor| PanelEntry {

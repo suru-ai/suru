@@ -32,10 +32,10 @@ impl SlotText {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct LandingNoticeSlotContext {
+pub(super) struct ApplicationNoticeSlotContext {
     pub(super) width: u16,
-    /// The Notice the Landing has to carry, or `None` when startup found
-    /// nothing to report and the built-in content is no row at all.
+    /// The Notice the open view has to carry, or `None` when there is nothing
+    /// to report and the built-in content is no row at all.
     pub(super) notice: Option<SlotText>,
 }
 
@@ -190,7 +190,7 @@ struct FooterItem {
 }
 
 pub(super) struct RenderSlots {
-    landing_notice: Slot<LandingNoticeSlotContext, Line<'static>>,
+    application_notice: Slot<ApplicationNoticeSlotContext, Line<'static>>,
     landing_footer: Slot<LandingFooterSlotContext, Line<'static>>,
     session_composer_top: Slot<SessionComposerTopSlotContext, Line<'static>>,
     working_indicator: Slot<WorkingIndicatorSlotContext, Line<'static>>,
@@ -201,7 +201,7 @@ pub(super) struct RenderSlots {
 impl Default for RenderSlots {
     fn default() -> Self {
         Self {
-            landing_notice: Slot::new("landing.notice"),
+            application_notice: Slot::new("application.notice"),
             landing_footer: Slot::new("landing.footer"),
             session_composer_top: Slot::new("session.composer.top"),
             working_indicator: Slot::new("session.working_indicator"),
@@ -216,16 +216,16 @@ impl RenderSlots {
         Self::default()
     }
 
-    pub(super) fn landing_notice(
+    pub(super) fn application_notice(
         &self,
-        context: &LandingNoticeSlotContext,
+        context: &ApplicationNoticeSlotContext,
     ) -> RenderedSlot<Line<'static>> {
         let default = context
             .notice
             .iter()
             .map(|notice| one_line(context.width, notice))
             .collect();
-        self.landing_notice.compose(context, default)
+        self.application_notice.compose(context, default)
     }
 
     pub(super) fn landing_footer(
@@ -431,7 +431,7 @@ pub(super) struct TestContribution {
 
 #[cfg(test)]
 enum TestSlot {
-    LandingNotice,
+    ApplicationNotice,
     LandingFooter,
     SessionComposerTop,
     PromptFooter,
@@ -441,12 +441,12 @@ enum TestSlot {
 
 #[cfg(test)]
 impl TestContribution {
-    pub(super) fn landing_notice(
+    pub(super) fn application_notice(
         placement: Placement,
         result: Result<&'static str, &'static str>,
     ) -> Self {
         Self {
-            slot: TestSlot::LandingNotice,
+            slot: TestSlot::ApplicationNotice,
             placement,
             result,
             style: Style::default(),
@@ -527,9 +527,9 @@ impl RenderSlots {
             let result = contribution.result;
             let style = contribution.style;
             match contribution.slot {
-                TestSlot::LandingNotice => {
+                TestSlot::ApplicationNotice => {
                     slots
-                        .landing_notice
+                        .application_notice
                         .contribute(contribution.placement, move |_| match result {
                             Ok(text) => Ok(vec![Line::styled(text, style)]),
                             Err(message) => Err(message.to_owned()),

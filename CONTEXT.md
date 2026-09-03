@@ -233,7 +233,7 @@ The operator-facing diagnostic record a Suru process writes about its own run. A
 _Avoid_: Diagnostics, telemetry, trace
 
 **Notice**:
-A transient, one-line message a client shows about Suru's own behavior rather than about a Session. A Notice is dismissed by the reader's next interaction and never returns for the rest of the run, and it points at the Log rather than carrying the detail itself.
+A transient, one-line message a client shows about Suru's own behavior rather than about a Session. The reader's next interaction dismisses that Notice and it does not return, while a distinct runtime condition may raise a new Notice; each points at the Log rather than carrying the detail itself.
 _Avoid_: Banner, toast, alert, diagnostic
 
 **Theme**:

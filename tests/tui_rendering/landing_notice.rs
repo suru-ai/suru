@@ -242,6 +242,7 @@ fn an_interaction_the_landing_makes_nothing_of_still_dismisses_the_notice() {
     for interaction in [unbound_key, click] {
         let workspace = workspace_dir();
         let mut application = landing_showing(workspace.path(), vec![unreadable_document()]);
+        rendered_application_rows(&application);
 
         application
             .handle_terminal_event(interaction.clone())

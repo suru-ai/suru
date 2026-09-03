@@ -48,7 +48,7 @@ use super::{
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
-    notice::{LandingNotice, Notice},
+    notice::{ApplicationNotice, Notice},
     render::render_with_slots,
     serve_overlay::ServeOverlay,
     session_picker::{SessionPicker, SessionPickerListing},
@@ -339,13 +339,16 @@ pub struct TuiState {
     /// Client Settings govern presentation from here. The snapshot leads the
     /// lifecycle stream, so it is in hand before any Session view opens.
     settings: EffectiveSettings,
+    /// The first frame waits for the server's authoritative Settings rather
+    /// than briefly painting built-in defaults before the leading snapshot.
+    settings_received: bool,
     /// The dotted keys a Config Document pins, from the same snapshot, so the
     /// settings panel can tell the reader's own choice from a built-in default.
     pinned_settings: Vec<String>,
     /// What the Landing has to say about the configuration problems startup
     /// found. It is a Notice, not state the run depends on: the reader's next
     /// interaction takes it away for good.
-    landing_notice: LandingNotice,
+    application_notice: ApplicationNotice,
     pub(super) transcript_cache: TranscriptCache,
     /// Bumped whenever the Session projection is replaced wholesale, so the
     /// transcript cache never trusts a revision across snapshot swaps.
@@ -502,8 +505,9 @@ impl TuiState {
             composers: ComposerMemory::default(),
             session_interactions: HashMap::new(),
             settings: EffectiveSettings::default(),
+            settings_received: false,
             pinned_settings: Vec::new(),
-            landing_notice: LandingNotice::default(),
+            application_notice: ApplicationNotice::default(),
             transcript_cache: TranscriptCache::default(),
             transcript_generation: 0,
             spinner_frame: 0,
@@ -1120,6 +1124,7 @@ impl TuiState {
         // default is what a view starts from, not something that reaches back
         // and moves what the reader is looking at.
         self.settings = snapshot.settings;
+        self.settings_received = true;
         self.pinned_settings = snapshot.pinned;
         if self
             .settings
@@ -1137,7 +1142,7 @@ impl TuiState {
         // because the frames they govern may be on screen already.
         self.sidebar.adopt_settings(&self.settings);
         self.session_picker.adopt_settings(&self.settings);
-        self.landing_notice.receive(&snapshot.diagnostics);
+        self.application_notice.receive(&snapshot.diagnostics);
     }
 
     pub(super) fn settings(&self) -> &EffectiveSettings {
@@ -1148,8 +1153,8 @@ impl TuiState {
         &self.pinned_settings
     }
 
-    pub(super) fn landing_notice(&self) -> Option<&Notice> {
-        self.landing_notice.showing()
+    pub(super) fn application_notice(&self) -> Option<&Notice> {
+        self.application_notice.showing()
     }
 
     fn remove_deleted_session(&mut self, deleted_session_id: SessionId) {
@@ -2425,12 +2430,14 @@ impl Application {
     }
 
     fn from_state(state: TuiState, terminal_facts: TerminalFacts) -> Self {
-        Self {
+        let mut application = Self {
             state,
             slots: RenderSlots::builtins(),
             terminal_facts,
-            theme: Theme::resolve(&terminal_facts),
-        }
+            theme: Theme::system(),
+        };
+        application.resolve_theme();
+        application
     }
 
     /// Re-resolves presentation from a fresh reading of the attached
@@ -2441,7 +2448,22 @@ impl Application {
             return;
         }
         self.terminal_facts = terminal_facts;
-        self.theme = Theme::resolve(&terminal_facts);
+        self.resolve_theme();
+    }
+
+    fn resolve_theme(&mut self) {
+        let name = self.state.settings.appearance.theme.clone();
+        match Theme::resolve(&name, &self.terminal_facts) {
+            Ok(theme) => self.theme = theme,
+            Err(_) => {
+                self.theme = Theme::system();
+                self.state.application_notice.receive_theme_fallback(&name);
+            }
+        }
+    }
+
+    pub(super) fn first_frame_ready(&self) -> bool {
+        self.state.settings_received
     }
 
     pub(super) fn pending_workspace_resolution(
@@ -2481,8 +2503,21 @@ impl Application {
     }
 
     pub fn handle_event(&mut self, event: ApplicationEvent) -> Result<ApplicationTransition> {
+        let carries_settings = matches!(
+            &event,
+            ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(_))
+                | ApplicationEvent::SettingMutated(_)
+                | ApplicationEvent::ServingPrepared {
+                    settings: Some(_),
+                    ..
+                }
+        );
+        let theme_name = self.state.settings.appearance.theme.clone();
         self.state.remember_agent_selection_presentation();
         let transition = self.handle_event_inner(event)?;
+        if carries_settings || self.state.settings.appearance.theme != theme_name {
+            self.resolve_theme();
+        }
         self.state.remember_agent_selection_presentation();
         Ok(transition)
     }
@@ -2851,7 +2886,7 @@ impl Application {
         // Every command is an interaction, whatever surface raised it and even
         // where an overlay is about to swallow it: the reader looked away from
         // the Notice either way.
-        self.state.landing_notice.dismiss();
+        self.state.application_notice.dismiss();
         if self.state.reconnect_overlay_visible || self.defers_for_agent_selection(&command) {
             return Ok(ApplicationTransition::Continue);
         }
@@ -4563,13 +4598,13 @@ impl Application {
 
     /// Records that the reader touched the terminal, whether or not the active
     /// input mode makes a command of it: an unbound key and a click on nothing
-    /// are still interactions, and the Landing's Notice is dismissed by any of
+    /// are still interactions, and the Application's Notice is dismissed by any of
     /// them. A resize, a focus change, and the mouse merely passing over the
     /// window are the terminal's doing rather than the reader's, so they leave
     /// the Notice standing. Reports whether anything on screen changed, so a
     /// caller that draws on demand knows to redraw.
     pub fn note_interaction(&mut self, event: &InputEvent) -> bool {
-        is_reader_interaction(event) && self.state.landing_notice.dismiss()
+        is_reader_interaction(event) && self.state.application_notice.dismiss()
     }
 
     /// Drains listing work queued by the independent Session surfaces. The

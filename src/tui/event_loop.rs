@@ -469,7 +469,7 @@ async fn run_loop(
 
     loop {
         run.sync_skill_catalog();
-        if run.needs_redraw {
+        if run.needs_redraw && run.application.first_frame_ready() {
             terminal.draw(|frame| run.application.render(frame))?;
             run.needs_redraw = false;
         }
@@ -2547,15 +2547,33 @@ mod tests {
     use crossterm::Command;
 
     use super::{
-        Application, DisableMouseButtonReporting, EnableMouseButtonReporting,
+        Application, ApplicationEvent, DisableMouseButtonReporting, EnableMouseButtonReporting,
         PopModifiedKeyReporting, PushModifiedKeyReporting, TerminalSink, copy_to_clipboard,
         enter_terminal_display, ignore_unsupported, leave_terminal_display,
         remote_failure_from_session_error,
     };
     use crate::{
         managed_client::{ManagedEvent, SessionStreamError},
-        protocol::{Outlook, RemoteStatus},
+        protocol::{EffectiveSettings, Outlook, RemoteStatus, SettingsSnapshot},
     };
+
+    #[test]
+    fn the_first_frame_waits_until_the_initial_settings_snapshot_is_applied() {
+        let mut application = Application::default();
+        assert!(!application.first_frame_ready());
+
+        application
+            .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+                SettingsSnapshot {
+                    settings: EffectiveSettings::default(),
+                    pinned: Vec::new(),
+                    diagnostics: Vec::new(),
+                },
+            )))
+            .expect("apply the initial settings snapshot");
+
+        assert!(application.first_frame_ready());
+    }
 
     #[test]
     fn an_ignored_background_lifecycle_event_does_not_request_a_frame() {

@@ -19,13 +19,14 @@ use crate::support::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AgentSelection, AutoSettle, CodexSettings, CopilotSettings, EffectiveSettings,
-        EmojiVisibility, FoldPosture, ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice,
-        ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
-        ModelOptionRole, ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
-        ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
-        SessionId, SessionSettings, SettingMutation, SettingScope, SettingsSnapshot, SidebarScope,
-        SidebarSettings, TitleErrand, TitleSettings, TranscriptSettings,
+        AgentSelection, AppearanceSettings, AutoSettle, CodexSettings, CopilotSettings,
+        EffectiveSettings, EmojiVisibility, FoldPosture, ModelAvailability, ModelCatalog, ModelId,
+        ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
+        ModelOptionKind, ModelOptionRole, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
+        ProviderSettings, ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility,
+        SessionContentWidth, SessionId, SessionSettings, SettingMutation, SettingScope,
+        SettingsSnapshot, SidebarScope, SidebarSettings, TitleErrand, TitleSettings,
+        TranscriptSettings,
     },
     settings::SettingGroup,
     tui::{
@@ -389,11 +390,19 @@ fn the_tab_bar_names_every_tab_and_left_and_right_switch_between_them_with_wrap(
     );
 
     press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    let appearance = rendered_application_buffer(&application, 80, 15);
+    assert_eq!(
+        styling(&appearance, "Appearance"),
+        active,
+        "Right moves on again, to Appearance"
+    );
+
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
     let last = rendered_application_buffer(&application, 80, 15);
     assert_eq!(
         styling(&last, "Experimental"),
         active,
-        "Right moves on again, to the tab standing past the Providers"
+        "Right moves on again, to the last tab"
     );
 
     press(&mut application, KeyCode::Right, KeyModifiers::NONE);
@@ -411,6 +420,35 @@ fn the_tab_bar_names_every_tab_and_left_and_right_switch_between_them_with_wrap(
         active,
         "Left before the first tab wraps to the last"
     );
+}
+
+#[test]
+fn the_appearance_tab_lists_the_effective_theme_and_opening_it_waits_for_the_picker() {
+    let workspace = workspace_dir();
+    let settings = EffectiveSettings {
+        appearance: AppearanceSettings {
+            theme: "catppuccin".to_owned(),
+        },
+        ..EffectiveSettings::default()
+    };
+    let mut application = client_showing(workspace.path(), settings, &["appearance.theme"]);
+    open_panel(&mut application);
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+
+    let theme = row(&application, "Theme");
+    assert!(
+        theme.contains("catppuccin [pinned]"),
+        "the row shows the effective open Setting value: {theme:?}"
+    );
+    assert_eq!(focused_key(&application), "appearance.theme");
+    let before = rendered_application_rows(&application);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "the row opens nothing until the Theme picker lands"
+    );
+    assert_eq!(rendered_application_rows(&application), before);
 }
 
 /// The Experimental tab is the last of the bar, past the Providers, and it is
@@ -812,6 +850,13 @@ fn entering_the_providers_tab_reads_availability_every_time() {
         press(&mut application, KeyCode::Left, KeyModifiers::NONE),
         ApplicationTransition::Continue,
         "wrapping backwards off the first tab lands on one presenting no Provider"
+    );
+    assert!(
+        matches!(
+            press(&mut application, KeyCode::Left, KeyModifiers::NONE),
+            ApplicationTransition::Continue
+        ),
+        "crossing Appearance reads no Provider"
     );
     assert!(
         matches!(

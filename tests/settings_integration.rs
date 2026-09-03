@@ -47,6 +47,91 @@ async fn next_snapshot(client: &mut ManagedClient) -> SettingsSnapshot {
 }
 
 #[tokio::test]
+async fn appearance_theme_round_trips_byte_preservingly_and_reaches_every_client() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let original = concat!(
+        "{\n",
+        "  // Keep the terminal looking delicious.\n",
+        "  \"appearance\": { \"theme\":    \"catppuccin\" },\n",
+        "  \"transcript\": { \"reasoningVisibility\": \"shown\" },\n",
+        "}\n",
+    );
+    std::fs::write(config_dir.path().join("suru.jsonc"), original).expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-theme")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    let (mut editor, opening) = attach(state_dir.path(), "settings-theme").await;
+    let (mut onlooker, _) = attach(state_dir.path(), "settings-theme").await;
+
+    assert_eq!(opening.settings.appearance.theme, "catppuccin");
+    assert_eq!(
+        opening.pinned,
+        ["appearance.theme", "transcript.reasoningVisibility"]
+    );
+    assert_eq!(opening.diagnostics, []);
+
+    let answered = editor
+        .mutate_setting(SettingMutation::AppearanceTheme {
+            value: Some("gruvbox".to_owned()),
+        })
+        .await
+        .expect("pin another Theme");
+    assert_eq!(answered.settings.appearance.theme, "gruvbox");
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, answered);
+    }
+    assert_eq!(
+        config_document(config_dir.path()),
+        original.replace("\"catppuccin\"", "\"gruvbox\""),
+        "only the Theme pin's bytes change"
+    );
+
+    drop(editor);
+    drop(onlooker);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn an_unknown_theme_name_is_a_valid_open_setting_pin() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            "appearance": { "theme": "my-missing-theme" },
+            "transcript": { "reasoningVisibility": "shown" }
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-open-theme")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (_, snapshot) = attach(state_dir.path(), "settings-open-theme").await;
+    assert_eq!(snapshot.settings.appearance.theme, "my-missing-theme");
+    assert_eq!(
+        snapshot.pinned,
+        ["appearance.theme", "transcript.reasoningVisibility"]
+    );
+    assert_eq!(
+        snapshot.diagnostics,
+        [],
+        "runtime Theme discovery, not the schema, decides whether a name resolves"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn a_pinned_setting_reaches_every_connecting_client_and_the_rest_default() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");

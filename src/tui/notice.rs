@@ -1,4 +1,4 @@
-//! The Notice the Landing carries when startup found configuration problems.
+//! The Notice the Application carries when startup found configuration problems.
 //!
 //! The server hands every client the startup diagnostics on the
 //! effective-settings snapshot, each one already naming its file, its key path,
@@ -7,6 +7,8 @@
 //! so it collapses the whole set into one line: the loudest failures first,
 //! whole files ahead of single keys, the keys merely counted, and a pointer to
 //! the Log for the rest.
+
+use std::cell::Cell;
 
 use ratatui::style::Style;
 use unicode_width::UnicodeWidthStr;
@@ -25,36 +27,64 @@ const WARNING_GLYPH: &str = "!";
 /// Where the diagnostics the Notice had no room for live.
 const LOG_POINTER: &str = "see the Log";
 
-/// What the Landing has to say about startup, and whether it has already said
-/// it. Modelled as one value because the two facts constrain each other: a
-/// Notice the reader dismissed is gone for the run, so a snapshot arriving
-/// later — after a reconnect, or after an edit of a Setting — cannot put the
-/// same startup problems back in front of them.
+/// What the Application has to say, and whether the reader has seen it. The
+/// identity of a dismissed Notice keeps that condition from returning without
+/// suppressing a distinct runtime problem.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) enum LandingNotice {
-    /// Startup found nothing to report, or the snapshot has not landed yet.
-    #[default]
-    Quiet,
-    Showing(Notice),
-    /// The reader saw a Notice and moved on.
-    Dismissed,
+pub(super) struct ApplicationNotice {
+    showing: Option<Notice>,
+    /// Conditions whose Notice the reader already saw and dismissed. This is
+    /// cumulative so A, then B, cannot make A new again.
+    dismissed: Vec<NoticeIdentity>,
 }
 
-impl LandingNotice {
+impl ApplicationNotice {
     pub(super) fn showing(&self) -> Option<&Notice> {
-        match self {
-            Self::Showing(notice) => Some(notice),
-            Self::Quiet | Self::Dismissed => None,
-        }
+        self.showing.as_ref()
     }
 
     /// Takes what a freshly received effective-settings snapshot found at
-    /// startup. A notice already dismissed stays dismissed.
+    /// startup. The same startup Notice stays dismissed.
     pub(super) fn receive(&mut self, diagnostics: &[SettingsDiagnostic]) {
-        if matches!(self, Self::Dismissed) {
+        let Some(notice) = Notice::for_diagnostics(diagnostics) else {
+            self.showing = None;
+            return;
+        };
+        if self.dismissed.contains(&NoticeIdentity::StartupDiagnostics) {
+            self.showing = None;
             return;
         }
-        *self = Notice::for_diagnostics(diagnostics).map_or(Self::Quiet, Self::Showing);
+        self.showing = Some(notice);
+    }
+
+    /// Reports a valid open Setting whose runtime value names no available
+    /// Theme. The pin remains valid configuration; only this Client's
+    /// resolution falls back for the run.
+    pub(super) fn receive_theme_fallback(&mut self, name: &str) {
+        let identity = NoticeIdentity::ThemeFallback(name.to_owned());
+        if self.dismissed.contains(&identity) {
+            return;
+        }
+        let fallback = format!("Theme {name:?} was not found; using System");
+        match self.showing.as_mut() {
+            Some(notice) => {
+                if notice.identities.contains(&identity) {
+                    return;
+                }
+                notice.summary.push_str("; ");
+                notice.summary.push_str(&fallback);
+                notice.identities.push(identity);
+                notice.shown.set(false);
+            }
+            None => {
+                self.showing = Some(Notice {
+                    severity: SettingsDiagnosticSeverity::Warning,
+                    summary: fallback,
+                    identities: vec![identity],
+                    shown: Cell::new(false),
+                });
+            }
+        }
     }
 
     /// Takes the Notice away on the reader's first interaction with it, and
@@ -62,18 +92,34 @@ impl LandingNotice {
     /// a Notice was actually showing, so interacting before the snapshot lands
     /// cannot suppress one the reader never got.
     pub(super) fn dismiss(&mut self) -> bool {
-        if !matches!(self, Self::Showing(_)) {
+        let Some(notice) = self.showing.as_ref() else {
+            return false;
+        };
+        if !notice.shown.get() {
             return false;
         }
-        *self = Self::Dismissed;
+        for identity in &notice.identities {
+            if !self.dismissed.contains(identity) {
+                self.dismissed.push(identity.clone());
+            }
+        }
+        self.showing = None;
         true
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum NoticeIdentity {
+    StartupDiagnostics,
+    ThemeFallback(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Notice {
     severity: SettingsDiagnosticSeverity,
     summary: String,
+    identities: Vec<NoticeIdentity>,
+    shown: Cell<bool>,
 }
 
 impl Notice {
@@ -116,7 +162,15 @@ impl Notice {
                 SettingsDiagnosticSeverity::Warning
             },
             summary: clauses.join("; "),
+            identities: vec![NoticeIdentity::StartupDiagnostics],
+            shown: Cell::new(false),
         })
+    }
+
+    /// Records that a frame carried this Notice. Input coalesced behind the
+    /// event that created it cannot dismiss words that never reached screen.
+    pub(super) fn mark_shown(&self) {
+        self.shown.set(true);
     }
 
     /// The Notice's one line at the width it has. The glyph and the pointer at

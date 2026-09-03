@@ -39,7 +39,7 @@ use super::{
         SidebarTarget, SidebarUnreachable, SidebarWorkspaceEntryView,
     },
     slots::{
-        LandingFooterSlotContext, LandingNoticeSlotContext, PromptContextSlotContext,
+        ApplicationNoticeSlotContext, LandingFooterSlotContext, PromptContextSlotContext,
         PromptFooterSlotContext, RenderSlots, RenderedSlot, SessionComposerTopSlotContext,
         SlotText, WorkingIndicatorInterrupt, WorkingIndicatorSlotContext, WorkingIndicatorState,
         truncate_slot_text, truncate_to_width,
@@ -100,6 +100,13 @@ pub(super) fn render_with_slots(
     theme: &Theme,
     truecolor: bool,
 ) {
+    // A named Theme owns the entire canvas. For System and transparent Themes
+    // the base uses Reset, so this same fill deliberately exposes the
+    // terminal's background instead.
+    frame.render_widget(
+        Block::default().style(theme.surface.base.patch(theme.text.primary)),
+        frame.area(),
+    );
     // The settings panel is pointable, and only a frame that drew it can say
     // where. Every frame starts by giving up what the last one recorded, so the
     // geometry a click resolves against is always the one on screen.
@@ -118,6 +125,7 @@ pub(super) fn render_with_slots(
         return;
     }
     let main = render_sidebar(frame, state, theme);
+    let main = render_application_notice(frame, state, main, slots, theme);
     let composer = if state.session.is_some() {
         render_session(frame, state, main, slots, theme, truecolor)
     } else if state.route.is_some() {
@@ -187,6 +195,32 @@ pub(super) fn render_with_slots(
     {
         frame.set_cursor_position(cursor);
     }
+}
+
+/// Draws configuration and runtime fallback Notices above whichever view is
+/// open. A Notice must stay visible until the reader has had a frame in which
+/// to see it; keeping it outside the route renderers prevents a Session from
+/// hiding a Theme fallback that arrived with a settings snapshot.
+fn render_application_notice(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    area: Rect,
+    slots: &RenderSlots,
+    theme: &Theme,
+) -> Rect {
+    let inset = horizontal_padding(area.width);
+    let width = area.width.saturating_sub(inset.saturating_mul(2));
+    let notice = slots.application_notice(&ApplicationNoticeSlotContext {
+        width,
+        notice: state.application_notice().map(|notice| {
+            notice.mark_shown();
+            SlotText::new(notice.text(width), notice.style(theme))
+        }),
+    });
+    let [notice_area, main] =
+        Layout::vertical([Constraint::Length(notice.height()), Constraint::Min(1)]).areas(area);
+    render_slot(frame, horizontally_inset(notice_area, inset), notice, theme);
+    main
 }
 
 fn render_connect_overlay(
@@ -1682,19 +1716,19 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
         Layout::horizontal([Constraint::Length(width), Constraint::Min(1)]).areas(frame_area);
     // The Sidebar's edge stands out while the reader is driving it, which is
     // the same account of focus the composer's own border gives.
-    let block =
-        Block::default()
-            .borders(Borders::RIGHT)
-            .border_style(if state.sidebar_owns_input() {
-                theme.border.default
-            } else {
-                theme.border.subdued
-            });
+    let block = Block::default()
+        .style(theme.surface.elevated)
+        .borders(Borders::RIGHT)
+        .border_style(if state.sidebar_owns_input() {
+            theme.border.default
+        } else {
+            theme.border.subdued
+        });
     let inside = block.inner(column);
     let content = horizontally_inset(inside, 1);
     frame.render_widget(block, column);
     let (lines, rows) = sidebar_lines(state, content, theme);
-    frame.render_widget(Paragraph::new(lines), content);
+    frame.render_widget(Paragraph::new(lines).style(theme.surface.elevated), content);
     if let Some(open) = state.open_session_reference() {
         paint_open_rail(frame, &rows, open, inside.x, theme);
     }
@@ -2434,12 +2468,6 @@ fn render_landing(
     } else {
         agent
     };
-    let notice = slots.landing_notice(&LandingNoticeSlotContext {
-        width: footer_width,
-        notice: state
-            .landing_notice()
-            .map(|notice| SlotText::new(notice.text(footer_width), notice.style(theme))),
-    });
     let footer = slots.landing_footer(&LandingFooterSlotContext {
         width: footer_width,
         context: SlotText::new(context, theme.text.subdued),
@@ -2448,12 +2476,8 @@ fn render_landing(
             status_style(state, theme),
         ),
     });
-    let [notice_area, main, footer_area] = Layout::vertical([
-        Constraint::Length(notice.height()),
-        Constraint::Min(1),
-        Constraint::Length(footer.height()),
-    ])
-    .areas(area);
+    let [main, footer_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(footer.height())]).areas(area);
     let content = horizontally_inset(main, horizontal_padding(area.width));
     let key = ComposerKey::Landing;
     let composer_text = state.composers.text(key.clone());
@@ -2516,12 +2540,6 @@ fn render_landing(
         theme,
     ));
 
-    render_slot(
-        frame,
-        horizontally_inset(notice_area, horizontal_padding(area.width)),
-        notice,
-        theme,
-    );
     render_slot(
         frame,
         horizontally_inset(footer_area, horizontal_padding(area.width)),
@@ -3734,10 +3752,13 @@ mod tests {
     }
 
     #[test]
-    fn the_landing_notice_slot_takes_contributions_even_when_startup_was_clean() {
+    fn the_application_notice_slot_takes_contributions_even_when_startup_was_clean() {
         let slots = RenderSlots::testing([
-            TestContribution::landing_notice(Placement::Prepend, Ok("notice from an extension")),
-            TestContribution::landing_notice(Placement::Append, Err("notice failed")),
+            TestContribution::application_notice(
+                Placement::Prepend,
+                Ok("notice from an extension"),
+            ),
+            TestContribution::application_notice(Placement::Append, Err("notice failed")),
         ]);
         let application = Application {
             slots,
@@ -3747,7 +3768,7 @@ mod tests {
         let rows = rendered_rows(&application);
         let failure = rows
             .iter()
-            .position(|row| row.contains("Extension error · landing.notice"))
+            .position(|row| row.contains("Extension error · application.notice"))
             .unwrap();
         let notice = rows
             .iter()

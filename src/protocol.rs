@@ -969,6 +969,23 @@ pub struct SidebarSettings {
     pub auto_settle: AutoSettle,
 }
 
+/// Client presentation selected independently of whichever Server the reader
+/// is looking into. Theme names stay open strings because built-ins are only
+/// the first source; later tickets add Themes discovered from disk.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppearanceSettings {
+    pub theme: String,
+}
+
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            theme: "system".to_owned(),
+        }
+    }
+}
+
 /// Whether the user wants Suru to offer a Provider at all. Every Provider
 /// carries one, and each spells its own built-in default by hand rather than
 /// deriving it, because a derived `bool` is `false` and a Provider is on unless
@@ -1175,6 +1192,7 @@ impl Default for ServingSettings {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectiveSettings {
+    pub appearance: AppearanceSettings,
     pub transcript: TranscriptSettings,
     pub session: SessionSettings,
     pub sidebar: SidebarSettings,
@@ -1211,6 +1229,9 @@ impl EffectiveSettings {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "setting", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SettingMutation {
+    AppearanceTheme {
+        value: Option<String>,
+    },
     TranscriptDefaultFoldPosture {
         value: Option<FoldPosture>,
     },

@@ -23,5 +23,6 @@ mod sidebar;
 mod subagent_picker;
 mod subagent_view;
 mod support;
+mod theme;
 mod transcript;
 mod workspace_picker;

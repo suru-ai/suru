@@ -44,6 +44,7 @@ pub const FALLBACK_CONFIG_FILE: &str = "suru.json";
 
 // The dotted key of each Setting, named once so the schema and the typed
 // mutations that edit it can never drift apart.
+const APPEARANCE_THEME: &str = "appearance.theme";
 const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
 const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
 const TRANSCRIPT_COMMAND_AUTO_EXPAND: &str = "transcript.commandAutoExpand";
@@ -73,6 +74,8 @@ const EMPTY_DOCUMENT: &str = "{}\n";
 /// schema change and a Setting can never belong to two.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingGroup {
+    /// Settings governing how every Client surface is painted.
+    Appearance,
     /// Settings that configure no Provider.
     General,
     /// Settings scoped to one Provider, which the panel presents beside the
@@ -322,22 +325,29 @@ impl SettingValues {
     }
 }
 
-/// One value a Setting can hold, and the pin that puts it in force.
+/// One value a Setting can hold, and the mutation factory that pins it.
 pub struct SettingChoice {
     /// The value as a Config Document spells it, which is also what a client
     /// shows: what the reader sees and what they would type are the same word.
     /// The spelling elides JSON's own quoting, so a string choice reads
     /// `folded` rather than `"folded"` and a boolean one reads `true`.
     pub value: &'static str,
-    /// The mutation that pins this value, even when it is the built-in default.
-    pub pin: SettingMutation,
+    /// Builds the mutation that pins this value, even when it is the built-in default.
+    pub build_mutation: fn() -> SettingMutation,
 }
 
 impl SettingChoice {
+    /// Builds the typed mutation for this choice. A function keeps the static
+    /// schema able to name choices whose mutation owns data, such as a Theme
+    /// name, without leaking or special-casing that Setting.
+    pub fn mutation(&self) -> SettingMutation {
+        (self.build_mutation)()
+    }
+
     /// The JSON this choice's pin writes into a Config Document, which is what
     /// the loader reads back.
     fn pinned_value(&self) -> Value {
-        pin_for(&self.pin)
+        pin_for(&self.mutation())
             .1
             .expect("a Setting's choice always pins a value")
     }
@@ -404,7 +414,7 @@ impl SettingDescriptor {
         self.values
             .named()
             .iter()
-            .position(|choice| pins_effective_value(&choice.pin, settings))
+            .position(|choice| pins_effective_value(&choice.mutation(), settings))
     }
 
     /// The accepted values, phrased for a diagnostic's "why" clause. Read off
@@ -435,6 +445,9 @@ impl SettingDescriptor {
 /// already have it.
 fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings) -> bool {
     match mutation {
+        SettingMutation::AppearanceTheme { value } => {
+            value.as_ref() == Some(&settings.appearance.theme)
+        }
         SettingMutation::TranscriptDefaultFoldPosture { value } => {
             *value == Some(settings.transcript.default_fold_posture)
         }
@@ -489,6 +502,32 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
 /// above, so the three can never drift apart.
 pub const SCHEMA: &[SettingDescriptor] = &[
     SettingDescriptor {
+        key: APPEARANCE_THEME,
+        label: "Theme",
+        description: "The Theme every open view is painted in",
+        group: SettingGroup::Appearance,
+        scope: SettingScope::Client,
+        values: SettingValues::Open {
+            named: &[SettingChoice {
+                value: "system",
+                build_mutation: || SettingMutation::AppearanceTheme {
+                    value: Some("system".to_owned()),
+                },
+            }],
+            accepts: "a Theme name",
+            spell: |settings| settings.appearance.theme.clone(),
+            // The Theme picker owns choosing discovered names in its own
+            // ticket. Until then Enter deliberately has nowhere to open.
+            chosen_at: None,
+        },
+        reset: SettingMutation::AppearanceTheme { value: None },
+        apply: |settings, value| {
+            apply_value(value, |theme| {
+                settings.appearance.theme = theme;
+            })
+        },
+    },
+    SettingDescriptor {
         key: TRANSCRIPT_DEFAULT_FOLD_POSTURE,
         label: "Default Fold posture",
         description: "How a Session view opens: folded to its markers, or expanded in full",
@@ -497,13 +536,13 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "folded",
-                pin: SettingMutation::TranscriptDefaultFoldPosture {
+                build_mutation: || SettingMutation::TranscriptDefaultFoldPosture {
                     value: Some(FoldPosture::Folded),
                 },
             },
             SettingChoice {
                 value: "expanded",
-                pin: SettingMutation::TranscriptDefaultFoldPosture {
+                build_mutation: || SettingMutation::TranscriptDefaultFoldPosture {
                     value: Some(FoldPosture::Expanded),
                 },
             },
@@ -524,13 +563,13 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "hidden",
-                pin: SettingMutation::TranscriptReasoningVisibility {
+                build_mutation: || SettingMutation::TranscriptReasoningVisibility {
                     value: Some(ReasoningVisibility::Hidden),
                 },
             },
             SettingChoice {
                 value: "shown",
-                pin: SettingMutation::TranscriptReasoningVisibility {
+                build_mutation: || SettingMutation::TranscriptReasoningVisibility {
                     value: Some(ReasoningVisibility::Shown),
                 },
             },
@@ -554,7 +593,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
                 // Config Document spelling, which is the boolean `false` the
                 // Setting accepts rather than a second string spelling.
                 value: "false",
-                pin: SettingMutation::TranscriptCommandAutoExpand {
+                build_mutation: || SettingMutation::TranscriptCommandAutoExpand {
                     value: Some(CommandAutoExpand::Off),
                 },
             }],
@@ -583,7 +622,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         values: SettingValues::Open {
             named: &[SettingChoice {
                 value: "fill",
-                pin: SettingMutation::SessionContentWidth {
+                build_mutation: || SettingMutation::SessionContentWidth {
                     value: Some(SessionContentWidth::Fill),
                 },
             }],
@@ -613,13 +652,13 @@ pub const SCHEMA: &[SettingDescriptor] = &[
             named: &[
                 SettingChoice {
                     value: "session",
-                    pin: SettingMutation::SessionTitleErrand {
+                    build_mutation: || SettingMutation::SessionTitleErrand {
                         value: Some(TitleErrand::FollowSession),
                     },
                 },
                 SettingChoice {
                     value: "off",
-                    pin: SettingMutation::SessionTitleErrand {
+                    build_mutation: || SettingMutation::SessionTitleErrand {
                         value: Some(TitleErrand::Off),
                     },
                 },
@@ -669,13 +708,13 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "shown",
-                pin: SettingMutation::SidebarInitialVisibility {
+                build_mutation: || SettingMutation::SidebarInitialVisibility {
                     value: Some(SidebarVisibility::Shown),
                 },
             },
             SettingChoice {
                 value: "hidden",
-                pin: SettingMutation::SidebarInitialVisibility {
+                build_mutation: || SettingMutation::SidebarInitialVisibility {
                     value: Some(SidebarVisibility::Hidden),
                 },
             },
@@ -696,19 +735,19 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "all_workspaces",
-                pin: SettingMutation::SidebarInitialScope {
+                build_mutation: || SettingMutation::SidebarInitialScope {
                     value: Some(SidebarScope::AllWorkspaces),
                 },
             },
             SettingChoice {
                 value: "current_workspace",
-                pin: SettingMutation::SidebarInitialScope {
+                build_mutation: || SettingMutation::SidebarInitialScope {
                     value: Some(SidebarScope::CurrentWorkspace),
                 },
             },
             SettingChoice {
                 value: "everywhere",
-                pin: SettingMutation::SidebarInitialScope {
+                build_mutation: || SettingMutation::SidebarInitialScope {
                     value: Some(SidebarScope::Everywhere),
                 },
             },
@@ -732,7 +771,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         values: SettingValues::Open {
             named: &[SettingChoice {
                 value: "off",
-                pin: SettingMutation::SidebarAutoSettle {
+                build_mutation: || SettingMutation::SidebarAutoSettle {
                     value: Some(AutoSettle::Off),
                 },
             }],
@@ -763,11 +802,11 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "true",
-                pin: SettingMutation::ProviderCodexEnabled { value: Some(true) },
+                build_mutation: || SettingMutation::ProviderCodexEnabled { value: Some(true) },
             },
             SettingChoice {
                 value: "false",
-                pin: SettingMutation::ProviderCodexEnabled { value: Some(false) },
+                build_mutation: || SettingMutation::ProviderCodexEnabled { value: Some(false) },
             },
         ]),
         reset: SettingMutation::ProviderCodexEnabled { value: None },
@@ -788,25 +827,25 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "auto",
-                pin: SettingMutation::ProviderCodexReasoningSummary {
+                build_mutation: || SettingMutation::ProviderCodexReasoningSummary {
                     value: Some(ReasoningSummaryDetail::Auto),
                 },
             },
             SettingChoice {
                 value: "concise",
-                pin: SettingMutation::ProviderCodexReasoningSummary {
+                build_mutation: || SettingMutation::ProviderCodexReasoningSummary {
                     value: Some(ReasoningSummaryDetail::Concise),
                 },
             },
             SettingChoice {
                 value: "detailed",
-                pin: SettingMutation::ProviderCodexReasoningSummary {
+                build_mutation: || SettingMutation::ProviderCodexReasoningSummary {
                     value: Some(ReasoningSummaryDetail::Detailed),
                 },
             },
             SettingChoice {
                 value: "none",
-                pin: SettingMutation::ProviderCodexReasoningSummary {
+                build_mutation: || SettingMutation::ProviderCodexReasoningSummary {
                     value: Some(ReasoningSummaryDetail::None),
                 },
             },
@@ -827,11 +866,11 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "true",
-                pin: SettingMutation::ProviderCopilotEnabled { value: Some(true) },
+                build_mutation: || SettingMutation::ProviderCopilotEnabled { value: Some(true) },
             },
             SettingChoice {
                 value: "false",
-                pin: SettingMutation::ProviderCopilotEnabled { value: Some(false) },
+                build_mutation: || SettingMutation::ProviderCopilotEnabled { value: Some(false) },
             },
         ]),
         reset: SettingMutation::ProviderCopilotEnabled { value: None },
@@ -850,11 +889,11 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "true",
-                pin: SettingMutation::ProviderClaudeEnabled { value: Some(true) },
+                build_mutation: || SettingMutation::ProviderClaudeEnabled { value: Some(true) },
             },
             SettingChoice {
                 value: "false",
-                pin: SettingMutation::ProviderClaudeEnabled { value: Some(false) },
+                build_mutation: || SettingMutation::ProviderClaudeEnabled { value: Some(false) },
             },
         ]),
         reset: SettingMutation::ProviderClaudeEnabled { value: None },
@@ -874,13 +913,13 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "hidden",
-                pin: SettingMutation::SessionTitleEmoji {
+                build_mutation: || SettingMutation::SessionTitleEmoji {
                     value: Some(EmojiVisibility::Hidden),
                 },
             },
             SettingChoice {
                 value: "shown",
-                pin: SettingMutation::SessionTitleEmoji {
+                build_mutation: || SettingMutation::SessionTitleEmoji {
                     value: Some(EmojiVisibility::Shown),
                 },
             },
@@ -901,11 +940,11 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "false",
-                pin: SettingMutation::ServingEnabled { value: Some(false) },
+                build_mutation: || SettingMutation::ServingEnabled { value: Some(false) },
             },
             SettingChoice {
                 value: "true",
-                pin: SettingMutation::ServingEnabled { value: Some(true) },
+                build_mutation: || SettingMutation::ServingEnabled { value: Some(true) },
             },
         ]),
         reset: SettingMutation::ServingEnabled { value: None },
@@ -944,25 +983,25 @@ pub const SCHEMA: &[SettingDescriptor] = &[
             named: &[
                 SettingChoice {
                     value: "127.0.0.1",
-                    pin: SettingMutation::ServingBindAddress {
+                    build_mutation: || SettingMutation::ServingBindAddress {
                         value: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                     },
                 },
                 SettingChoice {
                     value: "::1",
-                    pin: SettingMutation::ServingBindAddress {
+                    build_mutation: || SettingMutation::ServingBindAddress {
                         value: Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
                     },
                 },
                 SettingChoice {
                     value: "0.0.0.0",
-                    pin: SettingMutation::ServingBindAddress {
+                    build_mutation: || SettingMutation::ServingBindAddress {
                         value: Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
                     },
                 },
                 SettingChoice {
                     value: "::",
-                    pin: SettingMutation::ServingBindAddress {
+                    build_mutation: || SettingMutation::ServingBindAddress {
                         value: Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
                     },
                 },
@@ -1126,6 +1165,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
             .map(|value| serde_json::to_value(value).expect("Setting values always serialize"))
     }
     match mutation {
+        SettingMutation::AppearanceTheme { value } => (APPEARANCE_THEME, pinned(value)),
         SettingMutation::TranscriptDefaultFoldPosture { value } => {
             (TRANSCRIPT_DEFAULT_FOLD_POSTURE, pinned(value))
         }
@@ -1517,7 +1557,7 @@ mod tests {
     /// them must describe and the other cannot express at all.
     const FOLDED: &[SettingChoice] = &[SettingChoice {
         value: "folded",
-        pin: SettingMutation::TranscriptDefaultFoldPosture {
+        build_mutation: || SettingMutation::TranscriptDefaultFoldPosture {
             value: Some(FoldPosture::Folded),
         },
     }];
@@ -1557,7 +1597,7 @@ mod tests {
     fn every_choice_is_spelled_the_way_the_config_document_spells_it() {
         for descriptor in every_setting() {
             for choice in descriptor.values.named() {
-                let spelled = match pinned_value(&choice.pin) {
+                let spelled = match pinned_value(&choice.mutation()) {
                     Value::String(text) => text,
                     other => other.to_string(),
                 };
@@ -1576,7 +1616,7 @@ mod tests {
             for choice in descriptor.values.named() {
                 let mut settings = EffectiveSettings::default();
                 assert!(
-                    (descriptor.apply)(&mut settings, &pinned_value(&choice.pin)),
+                    (descriptor.apply)(&mut settings, &pinned_value(&choice.mutation())),
                     "{} rejects its own choice {:?}",
                     descriptor.key,
                     choice.value
@@ -1616,7 +1656,7 @@ mod tests {
                     .next_choice(&settings)
                     .expect("a Setting always offers somewhere to step");
                 assert!(
-                    (descriptor.apply)(&mut settings, &pinned_value(&next.pin)),
+                    (descriptor.apply)(&mut settings, &pinned_value(&next.mutation())),
                     "{} rejects the choice it stepped to",
                     descriptor.key
                 );
@@ -1653,6 +1693,7 @@ mod tests {
         assert_eq!(
             expected,
             vec![
+                "one of \"system\" or a Theme name".to_owned(),
                 "one of \"folded\" or \"expanded\"".to_owned(),
                 "one of \"hidden\" or \"shown\"".to_owned(),
                 "one of false or a whole number of milliseconds".to_owned(),

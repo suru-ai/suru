@@ -1,6 +1,10 @@
 //! Semantic terminal styles used by built-in renderers.
 
+use std::{collections::HashMap, fmt, sync::OnceLock};
+
 use ratatui::style::{Color, Modifier, Style};
+use serde::Deserialize;
+use serde_json::{Map, Value};
 
 use crate::terminal::TerminalFacts;
 
@@ -28,6 +32,9 @@ pub(crate) struct TextRoles {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SurfaceRoles {
+    /// The application's own canvas. `Color::Reset` means the attached
+    /// terminal keeps showing through.
+    pub(crate) base: Style,
     pub(crate) elevated: Style,
     pub(crate) overlay: Style,
 }
@@ -135,9 +142,216 @@ pub(crate) struct SelectionRoles {
     pub(crate) open_rail: Style,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ThemeError(String);
+
+impl fmt::Display for ThemeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ThemeError {}
+
+#[derive(Deserialize)]
+struct ThemeDocument {
+    version: Option<u64>,
+    #[serde(default)]
+    defs: Map<String, Value>,
+    theme: Map<String, Value>,
+}
+
+struct DocumentResolver<'a> {
+    defs: &'a Map<String, Value>,
+    theme: &'a Map<String, Value>,
+    resolved: HashMap<String, Color>,
+}
+
+impl<'a> DocumentResolver<'a> {
+    fn new(document: &'a ThemeDocument) -> Self {
+        Self {
+            defs: &document.defs,
+            theme: &document.theme,
+            resolved: HashMap::new(),
+        }
+    }
+
+    fn required(&mut self, key: &str) -> Result<Color, ThemeError> {
+        if let Some(color) = self.resolved.get(key) {
+            return Ok(*color);
+        }
+        let value = self
+            .theme
+            .get(key)
+            .ok_or_else(|| ThemeError(format!("Theme key {key:?} is missing")))?;
+        let color = self.value(value, &mut Vec::new())?;
+        self.resolved.insert(key.to_owned(), color);
+        Ok(color)
+    }
+
+    fn optional(&mut self, key: &str, fallback: &str) -> Result<Color, ThemeError> {
+        if !self.theme.contains_key(key) {
+            return self.required(fallback);
+        }
+        self.required(key)
+    }
+
+    fn value(&self, value: &Value, chain: &mut Vec<String>) -> Result<Color, ThemeError> {
+        match value {
+            Value::String(value) if value == "transparent" || value == "none" => Ok(Color::Reset),
+            Value::String(value) if value.starts_with('#') => parse_hex(value),
+            Value::String(reference) => {
+                if chain.iter().any(|seen| seen == reference) {
+                    chain.push(reference.clone());
+                    return Err(ThemeError(format!(
+                        "Circular color reference: {}",
+                        chain.join(" -> ")
+                    )));
+                }
+                let next = self
+                    .defs
+                    .get(reference)
+                    .or_else(|| self.theme.get(reference))
+                    .ok_or_else(|| {
+                        ThemeError(format!(
+                            "Color reference {reference:?} not found in defs or theme"
+                        ))
+                    })?;
+                chain.push(reference.clone());
+                let result = self.value(next, chain);
+                chain.pop();
+                result
+            }
+            Value::Number(index) => index
+                .as_u64()
+                .and_then(|index| u8::try_from(index).ok())
+                .map(ansi_color)
+                .ok_or_else(|| ThemeError(format!("ANSI palette index {index} is not 0..255"))),
+            Value::Object(variants) => variants
+                .get("dark")
+                .ok_or_else(|| ThemeError("color pair has no dark value".to_owned()))
+                .and_then(|dark| self.value(dark, chain)),
+            _ => Err(ThemeError(format!("invalid Theme color value {value}"))),
+        }
+    }
+}
+
+fn parse_hex(value: &str) -> Result<Color, ThemeError> {
+    let expanded;
+    let digits = match value.len() {
+        4 => {
+            expanded = value[1..]
+                .chars()
+                .flat_map(|digit| [digit, digit])
+                .collect::<String>();
+            expanded.as_str()
+        }
+        // Ratatui has no alpha channel. OpenCode's translucent accent roles
+        // retain their authored RGB while the terminal supplies the surface.
+        7 | 9 => &value[1..7],
+        _ => return Err(ThemeError(format!("invalid hex color {value:?}"))),
+    };
+    let channel = |start| {
+        u8::from_str_radix(&digits[start..start + 2], 16)
+            .map_err(|_| ThemeError(format!("invalid hex color {value:?}")))
+    };
+    Ok(Color::Rgb(channel(0)?, channel(2)?, channel(4)?))
+}
+
+fn ansi_color(index: u8) -> Color {
+    const BASIC: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    let rgb = if index < 16 {
+        BASIC[usize::from(index)]
+    } else if index < 232 {
+        let index = index - 16;
+        let channel = |part: u8| if part == 0 { 0 } else { part * 40 + 55 };
+        (
+            channel(index / 36),
+            channel((index / 6) % 6),
+            channel(index % 6),
+        )
+    } else {
+        let gray = (index - 232) * 10 + 8;
+        (gray, gray, gray)
+    };
+    Color::Rgb(rgb.0, rgb.1, rgb.2)
+}
+
+macro_rules! built_in_themes {
+    ($($name:literal),+ $(,)?) => {
+        pub(crate) const BUILT_IN_THEMES: &[(&str, &str)] = &[
+            $(($name, include_str!(concat!("theme/assets/", $name, ".json")))),+
+        ];
+    };
+}
+
+built_in_themes!(
+    "aura",
+    "ayu",
+    "carbonfox",
+    "catppuccin-frappe",
+    "catppuccin-macchiato",
+    "catppuccin",
+    "cobalt2",
+    "cursor",
+    "dracula",
+    "everforest",
+    "flexoki",
+    "github",
+    "gruvbox",
+    "kanagawa",
+    "lucent-orng",
+    "material",
+    "matrix",
+    "mercury",
+    "monokai",
+    "nightowl",
+    "nord",
+    "one-dark",
+    "opencode",
+    "orng",
+    "osaka-jade",
+    "palenight",
+    "rosepine",
+    "solarized",
+    "synthwave84",
+    "tokyonight",
+    "vercel",
+    "vesper",
+    "zenburn",
+);
+
+pub(crate) fn built_in_themes() -> &'static [(&'static str, &'static str)] {
+    BUILT_IN_THEMES
+}
+
+static RESOLVED_BUILT_INS: OnceLock<Vec<(&'static str, Result<Theme, ThemeError>)>> =
+    OnceLock::new();
+
 impl Theme {
-    pub(crate) fn resolve(_terminal_facts: &TerminalFacts) -> Self {
-        Self::system()
+    pub(crate) fn resolve(name: &str, _terminal_facts: &TerminalFacts) -> Result<Self, ThemeError> {
+        if name == "system" {
+            return Ok(Self::system());
+        }
+        Self::named(name)
+            .unwrap_or_else(|| Err(ThemeError(format!("Theme {name:?} was not found"))))
     }
 
     pub(crate) fn system() -> Self {
@@ -163,6 +377,7 @@ impl Theme {
                 subdued: Style::default().fg(Color::DarkGray),
             },
             surface: SurfaceRoles {
+                base: Style::default().bg(Color::Reset),
                 elevated: Style::default().bg(Color::Black),
                 overlay: Style::default().bg(Color::Black),
             },
@@ -225,6 +440,242 @@ impl Theme {
                 open,
                 open_rail: open,
             },
+        }
+    }
+
+    pub(crate) fn from_document(source: &str) -> Result<Self, ThemeError> {
+        let document: ThemeDocument = serde_json::from_str(source)
+            .map_err(|error| ThemeError(format!("Theme document is not valid JSON: {error}")))?;
+        if let Some(version) = document.version
+            && version != 1
+        {
+            return Err(ThemeError(format!(
+                "Theme version {version} is not supported"
+            )));
+        }
+        let mut colors = DocumentResolver::new(&document);
+        let primary = colors.required("primary")?;
+        let secondary = colors.required("secondary")?;
+        let accent = colors.required("accent")?;
+        let error = colors.required("error")?;
+        let warning = colors.required("warning")?;
+        let success = colors.required("success")?;
+        let info = colors.required("info")?;
+        let text = colors.required("text")?;
+        let muted = colors.required("textMuted")?;
+        let background = colors.required("background")?;
+        let panel = colors.required("backgroundPanel")?;
+        let element = colors.required("backgroundElement")?;
+        let menu = colors.optional("backgroundMenu", "backgroundElement")?;
+        let border = colors.required("border")?;
+        let border_active = colors.required("borderActive")?;
+        let border_subtle = colors.required("borderSubtle")?;
+        let selected_text = colors.optional("selectedListItemText", "background")?;
+        let heading = colors.required("markdownHeading")?;
+        let link = colors.required("markdownLink")?;
+        let markdown_code = colors.required("markdownCode")?;
+        let emphasis = colors.required("markdownEmph")?;
+        let strong = colors.required("markdownStrong")?;
+        let list_marker = colors.required("markdownListItem")?;
+        let code_block = colors.required("markdownCodeBlock")?;
+        let style = |color| Style::default().fg(color);
+        let surface = |color| Style::default().bg(color);
+        let feedback = FeedbackRoles {
+            error: style(error),
+            warning: style(warning),
+            success: style(success),
+            info: style(info),
+        };
+        let normal = AnsiColors {
+            black: panel,
+            red: error,
+            green: success,
+            yellow: warning,
+            blue: primary,
+            magenta: secondary,
+            cyan: info,
+            white: text,
+        };
+        Ok(Self {
+            text: TextRoles {
+                primary: style(text),
+                subdued: style(muted),
+            },
+            surface: SurfaceRoles {
+                base: surface(background),
+                elevated: surface(panel),
+                overlay: surface(menu),
+            },
+            accent: AccentRoles {
+                primary: style(primary),
+            },
+            ansi: AnsiPalette {
+                normal,
+                bright: normal,
+            },
+            action: ActionRoles {
+                primary: style(primary).add_modifier(Modifier::BOLD),
+                disabled: style(muted),
+            },
+            form_field: FormFieldRoles {
+                text: style(text),
+                placeholder: style(muted),
+                border: style(border_active),
+                invalid: style(error),
+            },
+            feedback,
+            border: BorderRoles {
+                default: style(border),
+                subdued: style(border_subtle),
+            },
+            markdown: MarkdownRoles {
+                heading: style(heading).add_modifier(Modifier::BOLD),
+                emphasis: style(emphasis).add_modifier(Modifier::ITALIC),
+                strong: style(strong).add_modifier(Modifier::BOLD),
+                link: style(link).add_modifier(Modifier::UNDERLINED),
+                inline_code: style(markdown_code),
+                code_block: style(code_block),
+                list_marker: style(list_marker),
+            },
+            selection: SelectionRoles {
+                focused: style(selected_text).bg(primary),
+                unfocused: style(text).bg(element),
+                open: style(selected_text).bg(accent),
+                open_rail: surface(accent),
+            },
+        })
+    }
+
+    pub(crate) fn named(name: &str) -> Option<Result<Self, ThemeError>> {
+        RESOLVED_BUILT_INS
+            .get_or_init(|| {
+                built_in_themes()
+                    .iter()
+                    .map(|(name, source)| (*name, Self::from_document(source)))
+                    .collect()
+            })
+            .iter()
+            .find(|(built_in, _)| *built_in == name)
+            .map(|(_, theme)| theme.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Map, Value, json};
+
+    use super::*;
+
+    fn document(defs: Value, changes: &[(&str, Value)]) -> String {
+        let mut theme = Map::from_iter([
+            ("primary".to_owned(), json!("#010101")),
+            ("secondary".to_owned(), json!("#020202")),
+            ("accent".to_owned(), json!("#030303")),
+            ("error".to_owned(), json!("#040404")),
+            ("warning".to_owned(), json!("#050505")),
+            ("success".to_owned(), json!("#060606")),
+            ("info".to_owned(), json!("#070707")),
+            ("text".to_owned(), json!("#080808")),
+            ("textMuted".to_owned(), json!("#090909")),
+            ("background".to_owned(), json!("#101010")),
+            ("backgroundPanel".to_owned(), json!("#111111")),
+            ("backgroundElement".to_owned(), json!("#121212")),
+            ("border".to_owned(), json!("#131313")),
+            ("borderActive".to_owned(), json!("#141414")),
+            ("borderSubtle".to_owned(), json!("#151515")),
+            ("markdownHeading".to_owned(), json!("#161616")),
+            ("markdownLink".to_owned(), json!("#171717")),
+            ("markdownCode".to_owned(), json!("#181818")),
+            ("markdownEmph".to_owned(), json!("#191919")),
+            ("markdownStrong".to_owned(), json!("#202020")),
+            ("markdownListItem".to_owned(), json!("#212121")),
+            ("markdownCodeBlock".to_owned(), json!("#222222")),
+        ]);
+        for (key, value) in changes {
+            theme.insert((*key).to_owned(), value.clone());
+        }
+        json!({ "defs": defs, "theme": theme }).to_string()
+    }
+
+    #[test]
+    fn defs_and_theme_references_resolve_into_roles() {
+        let source = document(
+            json!({ "brand": "#123456" }),
+            &[("primary", json!("brand")), ("secondary", json!("primary"))],
+        );
+        let theme = Theme::from_document(&source).expect("resolve references");
+
+        assert_eq!(theme.accent.primary.fg, Some(Color::Rgb(0x12, 0x34, 0x56)));
+        assert_eq!(theme.ansi.normal.magenta, Color::Rgb(0x12, 0x34, 0x56));
+    }
+
+    #[test]
+    fn circular_references_are_rejected() {
+        let source = document(
+            json!({ "first": "second", "second": "first" }),
+            &[("primary", json!("first"))],
+        );
+        let error = Theme::from_document(&source).expect_err("reject a reference cycle");
+        assert!(error.to_string().contains("first -> second -> first"));
+    }
+
+    #[test]
+    fn unknown_references_are_rejected() {
+        let source = document(json!({}), &[("primary", json!("missing"))]);
+        let error = Theme::from_document(&source).expect_err("reject an unknown reference");
+        assert!(error.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn dark_is_selected_from_a_dark_light_pair() {
+        let source = document(
+            json!({}),
+            &[("primary", json!({ "dark": "#102030", "light": "#f0e0d0" }))],
+        );
+        let theme = Theme::from_document(&source).expect("resolve the dark variant");
+        assert_eq!(theme.accent.primary.fg, Some(Color::Rgb(0x10, 0x20, 0x30)));
+    }
+
+    #[test]
+    fn ansi_indices_resolve_to_the_xterm_palette() {
+        let source = document(json!({}), &[("primary", json!(196))]);
+        let theme = Theme::from_document(&source).expect("resolve an ANSI index");
+        assert_eq!(theme.accent.primary.fg, Some(Color::Rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn transparent_background_resets_the_terminal_background() {
+        let source = document(json!({}), &[("background", json!("transparent"))]);
+        let theme = Theme::from_document(&source).expect("resolve transparency");
+        assert_eq!(theme.surface.base.bg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn optional_selection_text_and_menu_background_take_opencode_defaults() {
+        let source = document(json!({}), &[]);
+        let theme = Theme::from_document(&source).expect("resolve optional defaults");
+        assert_eq!(
+            theme.selection.focused.fg,
+            Some(Color::Rgb(0x10, 0x10, 0x10))
+        );
+        assert_eq!(theme.surface.overlay.bg, Some(Color::Rgb(0x12, 0x12, 0x12)));
+    }
+
+    #[test]
+    fn version_two_documents_are_rejected() {
+        let mut value: Value = serde_json::from_str(&document(json!({}), &[])).unwrap();
+        value["version"] = json!(2);
+        let error = Theme::from_document(&value.to_string()).expect_err("reject v2");
+        assert!(error.to_string().contains("version 2"));
+    }
+
+    #[test]
+    fn every_vendored_theme_resolves() {
+        let themes = built_in_themes();
+        assert_eq!(themes.len(), 33);
+        for (name, source) in themes {
+            Theme::from_document(source)
+                .unwrap_or_else(|error| panic!("built-in Theme {name:?} failed: {error}"));
         }
     }
 }
