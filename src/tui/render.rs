@@ -48,6 +48,7 @@ use super::{
     state::{CommandId, CommandMode, QueuedPrompt, TranscriptViewport, TuiState},
     subagent_picker::working_subagents,
     text_layout::TextLayout,
+    theme_picker::ThemePickerRow,
     transcript::{TranscriptDisclosure, client_error_lines},
     usage::{compact_cost, compact_count},
     workspace_picker::WorkspacePickerRow,
@@ -165,10 +166,13 @@ pub(super) fn render_with_slots(
             render_numeric_editor(frame, state, main, theme);
         }
     }
-    // Last of the overlays, because a settings panel row opens it: the picker
-    // is what the reader is answering, so it is drawn over whatever asked.
+    // Choice pickers can be opened by a settings row, so they are drawn over
+    // the panel that asked and take the reader's answer first.
     if state.model_picker.is_open() && !state.reconnect_overlay_visible {
         render_model_picker(frame, state, main, theme);
+    }
+    if state.theme_picker.is_open() && !state.reconnect_overlay_visible {
+        render_theme_picker(frame, state, main, theme);
     }
     if state.serve_overlay.is_open() && !state.reconnect_overlay_visible {
         render_serve_overlay(frame, state, main, theme);
@@ -181,6 +185,7 @@ pub(super) fn render_with_slots(
     } else if !state.session_picker.is_open()
         && !state.workspace_picker.is_open()
         && !state.model_picker.is_open()
+        && !state.theme_picker.is_open()
         && !state.model_options.is_open()
         && !state.settings_panel.is_open()
         && !state.serve_overlay.is_open()
@@ -859,6 +864,70 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Models ")
+                .border_style(theme.border.default)
+                .style(theme.surface.overlay),
+        ),
+        area,
+    );
+}
+
+fn render_theme_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
+    let area = centered_rect(
+        main,
+        main.width.saturating_sub(4).min(64),
+        main.height.saturating_sub(2).min(14),
+    );
+    let content_width = area.width.saturating_sub(2);
+    let content_height = area.height.saturating_sub(2);
+    let mut lines = Vec::with_capacity(usize::from(content_height));
+    if content_height >= 3 {
+        lines.push(Line::styled(
+            picker_search_line(state.theme_picker.query(), usize::from(content_width)),
+            theme.text.subdued,
+        ));
+    }
+    let footer_rows = usize::from(content_height >= 3);
+    let row_capacity = usize::from(content_height).saturating_sub(lines.len() + footer_rows);
+    lines.extend(state.theme_picker.visible_rows(row_capacity).map(
+        |ThemePickerRow {
+             name,
+             selected,
+             current,
+         }| {
+            let marker = if selected { "› " } else { "  " };
+            let current = if current { " · [current]" } else { "" };
+            let display_name = if name == "system" { "System" } else { name };
+            Line::styled(
+                truncate_to_width(
+                    &format!("{marker}{display_name}{current}"),
+                    usize::from(content_width),
+                ),
+                if selected {
+                    theme.selection.focused
+                } else {
+                    theme.text.primary
+                },
+            )
+        },
+    ));
+    if !state.theme_picker.has_rows() && lines.len() < usize::from(content_height) {
+        lines.push(Line::styled("No Themes found", theme.text.subdued));
+    }
+    if content_height >= 3 && lines.len() < usize::from(content_height) {
+        lines.push(Line::styled(
+            truncate_to_width(
+                "Type to search · Enter select · Esc cancel",
+                usize::from(content_width),
+            ),
+            theme.text.subdued,
+        ));
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Themes ")
                 .border_style(theme.border.default)
                 .style(theme.surface.overlay),
         ),

@@ -19,7 +19,7 @@ use suru::{
         SessionSnapshot, SessionStatus, SessionTimestamp, SessionUpdate, TranscriptItem, Turn,
         TurnId, TurnStatus, Usage, UsageTotal, Workspace,
     },
-    tui::{Application, ApplicationEvent, ApplicationTransition},
+    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
 
 /// A parent Session whose Transcript carries one Subagent row, answering with
@@ -170,14 +170,11 @@ fn a_settled_subagent_row_in_history_still_opens_the_child() {
         .expect("attach a Session whose Subagent settled");
     // The settled Turn folds to its marker, so the reader opens the Turn
     // Folds before the row is theirs to press.
-    for key in [
-        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
-    ] {
-        application
-            .handle_terminal_event(InputEvent::Key(key))
-            .expect("open the settled Turn Folds");
-    }
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::TranscriptTurnsToggle,
+        )))
+        .expect("open the settled Turn Folds");
 
     assert_eq!(
         press_text(&mut application, 80, 22, "Explore: Map the provider seams"),

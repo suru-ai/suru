@@ -24,6 +24,7 @@ mod spinner;
 mod state;
 mod subagent_picker;
 mod text_layout;
+mod theme_picker;
 mod transcript;
 mod usage;
 mod workspace_picker;

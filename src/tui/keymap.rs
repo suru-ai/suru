@@ -296,6 +296,10 @@ pub(super) fn command_for_model_picker_event(event: InputEvent) -> Option<Comman
     command_for_picker_event(event, &MODEL_PICKER_COMMANDS)
 }
 
+pub(super) fn command_for_theme_picker_event(event: InputEvent) -> Option<CommandId> {
+    command_for_picker_event(event, &THEME_PICKER_COMMANDS)
+}
+
 pub(super) fn command_for_workspace_picker_event(event: InputEvent) -> Option<CommandId> {
     command_for_picker_event(event, &WORKSPACE_PICKER_COMMANDS)
 }
@@ -542,6 +546,20 @@ const MODEL_PICKER_COMMANDS: PickerCommandBindings = PickerCommandBindings {
     search: Some(PickerSearchBindings {
         delete_backward: CommandId::DeleteModelSearchBackward,
         insert: CommandId::InsertModelSearch,
+    }),
+    toggle_scope: None,
+};
+
+const THEME_PICKER_COMMANDS: PickerCommandBindings = PickerCommandBindings {
+    previous: CommandId::SelectPreviousTheme,
+    next: CommandId::SelectNextTheme,
+    page_previous: CommandId::PagePreviousThemes,
+    page_next: CommandId::PageNextThemes,
+    select: CommandId::SelectTheme,
+    close: CommandId::CloseThemePicker,
+    search: Some(PickerSearchBindings {
+        delete_backward: CommandId::DeleteThemeSearchBackward,
+        insert: CommandId::InsertThemeSearch,
     }),
     toggle_scope: None,
 };

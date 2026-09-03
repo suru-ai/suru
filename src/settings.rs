@@ -162,6 +162,12 @@ pub enum SettingChoiceSurface {
     /// The panel only hosts the editor; it never needs to know which typed
     /// field the number belongs to or how that Setting spells it.
     Numeric(NumericSettingChoice),
+    /// A Theme picker carrying only the current name and the mutation that
+    /// pins a chosen name. The picker need not know which Setting opened it.
+    Theme {
+        current: fn(&EffectiveSettings) -> String,
+        pin: fn(String) -> SettingMutation,
+    },
 }
 
 /// Everything a reusable numeric editor needs to edit one Setting. Callers
@@ -516,9 +522,10 @@ pub const SCHEMA: &[SettingDescriptor] = &[
             }],
             accepts: "a Theme name",
             spell: |settings| settings.appearance.theme.clone(),
-            // The Theme picker owns choosing discovered names in its own
-            // ticket. Until then Enter deliberately has nowhere to open.
-            chosen_at: None,
+            chosen_at: Some(SettingChoiceSurface::Theme {
+                current: |settings| settings.appearance.theme.clone(),
+                pin: |theme| SettingMutation::AppearanceTheme { value: Some(theme) },
+            }),
         },
         reset: SettingMutation::AppearanceTheme { value: None },
         apply: |settings, value| {

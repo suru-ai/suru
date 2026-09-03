@@ -9,6 +9,7 @@ pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SemanticCommandId {
     ApplicationExit,
+    ThemeList,
     ModelList,
     ModelOptions,
     ModelOptionsPrevious,
@@ -202,6 +203,7 @@ impl SemanticCommandId {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ApplicationExit => "application.exit",
+            Self::ThemeList => "theme.list",
             Self::ModelList => "model.list",
             Self::ModelOptions => "model.options",
             Self::ModelOptionsPrevious => "model.options.previous",
@@ -338,6 +340,21 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             aliases: &["quit"],
         }),
         keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ThemeList,
+        title: "Choose Theme",
+        description: "Search and preview Themes",
+        slash: Some(SlashCommand {
+            name: "themes",
+            aliases: &["theme"],
+        }),
+        keybinding: Some(SemanticKeybinding {
+            prefix: Some(LEADER_PREFIX),
+            code: KeyCode::Char('t'),
+            modifiers: KeyModifiers::NONE,
+            label: "Ctrl+X T",
+        }),
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::ModelList,
@@ -495,12 +512,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Toggle Turn Folds",
         description: "Open every settled Turn's Fold, or fold them back down",
         slash: None,
-        keybinding: Some(SemanticKeybinding {
-            prefix: Some(LEADER_PREFIX),
-            code: KeyCode::Char('t'),
-            modifiers: KeyModifiers::NONE,
-            label: "Ctrl+X T",
-        }),
+        keybinding: None,
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::SessionNew,

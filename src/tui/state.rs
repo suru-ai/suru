@@ -44,7 +44,7 @@ use super::{
         command_for_settings_panel_event, command_for_sidebar_event,
         command_for_sidebar_menu_event, command_for_subagent_picker_event,
         command_for_subagent_view_event, command_for_terminal_event,
-        command_for_workspace_picker_event,
+        command_for_theme_picker_event, command_for_workspace_picker_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
@@ -56,6 +56,7 @@ use super::{
     sidebar::{Sidebar, SidebarActivation, SidebarPress},
     slots::RenderSlots,
     subagent_picker::{SubagentPicker, working_subagents},
+    theme_picker::ThemePicker,
     transcript::{
         FoldDisclosure, FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups,
         TranscriptTurnFolds, UnitKey, UnitStart,
@@ -415,6 +416,7 @@ pub struct TuiState {
     pending_model_options: bool,
     pub(super) model_options: ModelOptions,
     pub(super) model_picker: ModelPicker,
+    pub(super) theme_picker: ThemePicker,
     pub(super) session_picker: SessionPicker,
     pub(super) workspace_picker: WorkspacePicker,
     pub(super) subagent_picker: SubagentPicker,
@@ -539,6 +541,7 @@ impl TuiState {
             pending_model_options: false,
             model_options: ModelOptions::default(),
             model_picker: ModelPicker::default(),
+            theme_picker: ThemePicker::default(),
             session_picker: SessionPicker::new(workspace.clone()),
             workspace_picker: WorkspacePicker::new(workspace.clone()),
             subagent_picker: SubagentPicker::default(),
@@ -1841,7 +1844,8 @@ impl TuiState {
     /// opened over it, and the row it stands on goes on saying which row it
     /// acts upon.
     fn overlay_owns_input(&self) -> bool {
-        self.model_picker.is_open()
+        self.theme_picker.is_open()
+            || self.model_picker.is_open()
             || self.connect_overlay.is_open()
             || self.serve_overlay.is_open()
             || self.settings_panel.is_open()
@@ -2304,6 +2308,14 @@ pub enum CommandId {
     PageNextModels,
     SelectModel,
     CloseModelPicker,
+    InsertThemeSearch(String),
+    DeleteThemeSearchBackward,
+    SelectPreviousTheme,
+    SelectNextTheme,
+    PagePreviousThemes,
+    PageNextThemes,
+    SelectTheme,
+    CloseThemePicker,
     InsertWorkspaceSearch(String),
     DeleteWorkspaceSearchBackward,
     SelectPreviousWorkspace,
@@ -2452,12 +2464,21 @@ impl Application {
     }
 
     fn resolve_theme(&mut self) {
-        let name = self.state.settings.appearance.theme.clone();
-        match Theme::resolve(&name, &self.terminal_facts) {
+        let name = self
+            .state
+            .theme_picker
+            .preview()
+            .unwrap_or(&self.state.settings.appearance.theme)
+            .to_owned();
+        self.resolve_theme_name(&name);
+    }
+
+    fn resolve_theme_name(&mut self, name: &str) {
+        match Theme::resolve(name, &self.terminal_facts) {
             Ok(theme) => self.theme = theme,
             Err(_) => {
                 self.theme = Theme::system();
-                self.state.application_notice.receive_theme_fallback(&name);
+                self.state.application_notice.receive_theme_fallback(name);
             }
         }
     }
@@ -2512,10 +2533,15 @@ impl Application {
                     ..
                 }
         );
+        let mutation_failed = matches!(&event, ApplicationEvent::SettingMutationFailed(_));
         let theme_name = self.state.settings.appearance.theme.clone();
         self.state.remember_agent_selection_presentation();
         let transition = self.handle_event_inner(event)?;
-        if carries_settings || self.state.settings.appearance.theme != theme_name {
+        if carries_settings || mutation_failed {
+            self.state.theme_picker.settle_preview();
+        }
+        if carries_settings || mutation_failed || self.state.settings.appearance.theme != theme_name
+        {
             self.resolve_theme();
         }
         self.state.remember_agent_selection_presentation();
@@ -2950,6 +2976,14 @@ impl Application {
             | CommandId::PageNextModels
             | CommandId::SelectModel
             | CommandId::CloseModelPicker) => self.handle_model_picker_command(command),
+            command @ (CommandId::InsertThemeSearch(_)
+            | CommandId::DeleteThemeSearchBackward
+            | CommandId::SelectPreviousTheme
+            | CommandId::SelectNextTheme
+            | CommandId::PagePreviousThemes
+            | CommandId::PageNextThemes
+            | CommandId::SelectTheme
+            | CommandId::CloseThemePicker) => Ok(self.handle_theme_picker_command(command)),
             command @ (CommandId::InsertWorkspaceSearch(_)
             | CommandId::DeleteWorkspaceSearchBackward
             | CommandId::SelectPreviousWorkspace
@@ -3492,6 +3526,53 @@ impl Application {
         Ok(ApplicationTransition::Continue)
     }
 
+    /// Applies Theme picker movement entirely inside this Client. Only a
+    /// confirmed choice becomes a Setting mutation for the runtime to send.
+    fn handle_theme_picker_command(&mut self, command: CommandId) -> ApplicationTransition {
+        let mut restore = None;
+        let transition = match command {
+            CommandId::InsertThemeSearch(text) => {
+                self.state.theme_picker.insert(&text);
+                ApplicationTransition::Continue
+            }
+            CommandId::DeleteThemeSearchBackward => {
+                self.state.theme_picker.delete_backward();
+                ApplicationTransition::Continue
+            }
+            CommandId::SelectPreviousTheme => {
+                self.state.theme_picker.select_previous();
+                ApplicationTransition::Continue
+            }
+            CommandId::SelectNextTheme => {
+                self.state.theme_picker.select_next();
+                ApplicationTransition::Continue
+            }
+            CommandId::PagePreviousThemes => {
+                self.state.theme_picker.page_previous();
+                ApplicationTransition::Continue
+            }
+            CommandId::PageNextThemes => {
+                self.state.theme_picker.page_next();
+                ApplicationTransition::Continue
+            }
+            CommandId::SelectTheme => self.state.theme_picker.confirm().map_or(
+                ApplicationTransition::Continue,
+                ApplicationTransition::MutateSetting,
+            ),
+            CommandId::CloseThemePicker => {
+                restore = self.state.theme_picker.cancel();
+                ApplicationTransition::Continue
+            }
+            _ => ApplicationTransition::Continue,
+        };
+        if let Some(name) = restore {
+            self.resolve_theme_name(&name);
+        } else {
+            self.resolve_theme();
+        }
+        transition
+    }
+
     fn choose_model(&mut self) -> Result<ApplicationTransition> {
         let purpose = self.state.model_picker.purpose();
         match self.state.model_picker.choose() {
@@ -3972,10 +4053,10 @@ impl Application {
         {
             return Ok(ApplicationTransition::Continue);
         }
-        // The Model picker is the one overlay that can sit above the settings
-        // panel. Semantic invocations obey the same ownership as terminal
-        // input: an editor hidden beneath that newer overlay accepts nothing.
-        if self.state.model_picker.is_open()
+        // Choice pickers can sit above the settings panel. Semantic
+        // invocations obey the same ownership as terminal input: an editor
+        // hidden beneath a newer overlay accepts nothing.
+        if (self.state.theme_picker.is_open() || self.state.model_picker.is_open())
             && matches!(
                 command,
                 SemanticCommandId::SettingsNumericInsert(_)
@@ -4103,6 +4184,16 @@ impl Application {
                 );
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::ListModels(request))
+            }
+            SemanticCommandId::ThemeList => {
+                let current = self.state.settings.appearance.theme.clone();
+                self.state
+                    .theme_picker
+                    .open(&current, |theme| SettingMutation::AppearanceTheme {
+                        value: Some(theme),
+                    });
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::Continue)
             }
             command @ (SemanticCommandId::ModelOptions
             | SemanticCommandId::ModelOptionsPrevious
@@ -4354,6 +4445,10 @@ impl Application {
                             self.state
                                 .settings_panel
                                 .open_numeric_editor(choice, &self.state.settings);
+                        }
+                        SettingChoiceSurface::Theme { current, pin } => {
+                            let current = current(&self.state.settings);
+                            self.state.theme_picker.open(&current, pin);
                         }
                     }
                 }
@@ -4681,12 +4776,11 @@ impl Application {
     /// Translates a terminal event through the active input mode. `None` means
     /// the event changes nothing, so callers can skip redrawing.
     pub fn command_for_terminal_input(&self, event: InputEvent) -> Option<CommandId> {
-        // The Model picker is tested first because it is the one surface that
-        // can now open over another: a settings panel row opens it, so while it
-        // is up it is the newer surface, drawn over the panel, and every key
-        // belongs to it until the reader is done choosing. The order among the
-        // rest is unchanged and carries no meaning — no two of them are ever
-        // open at once.
+        // A choice picker can open over the settings panel, so the newest
+        // surface owns every key until the reader is done choosing.
+        if self.state.theme_picker.is_open() {
+            return command_for_theme_picker_event(event);
+        }
         if self.state.model_picker.is_open() {
             return command_for_model_picker_event(event);
         }

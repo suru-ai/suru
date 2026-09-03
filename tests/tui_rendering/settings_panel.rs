@@ -423,7 +423,7 @@ fn the_tab_bar_names_every_tab_and_left_and_right_switch_between_them_with_wrap(
 }
 
 #[test]
-fn the_appearance_tab_lists_the_effective_theme_and_opening_it_waits_for_the_picker() {
+fn the_appearance_theme_row_opens_the_picker_and_cancel_returns_to_the_row() {
     let workspace = workspace_dir();
     let settings = EffectiveSettings {
         appearance: AppearanceSettings {
@@ -442,13 +442,41 @@ fn the_appearance_tab_lists_the_effective_theme_and_opening_it_waits_for_the_pic
         "the row shows the effective open Setting value: {theme:?}"
     );
     assert_eq!(focused_key(&application), "appearance.theme");
-    let before = rendered_application_rows(&application);
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
         ApplicationTransition::Continue,
-        "the row opens nothing until the Theme picker lands"
+        "opening a Theme picker is entirely client-local"
     );
-    assert_eq!(rendered_application_rows(&application), before);
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains(" Themes ")
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Esc, KeyModifiers::NONE),
+        ApplicationTransition::Continue
+    );
+    assert!(has_row(&application, "Theme"));
+    assert_eq!(focused_key(&application), "appearance.theme");
+
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    for character in ['s', 'y', 's'] {
+        press(
+            &mut application,
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+        );
+    }
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::AppearanceTheme {
+            value: Some("system".to_owned()),
+        }),
+        "the picker returns through the Theme row's typed pin"
+    );
+    assert!(has_row(&application, "Theme"));
+    assert_eq!(focused_key(&application), "appearance.theme");
 }
 
 /// The Experimental tab is the last of the bar, past the Providers, and it is

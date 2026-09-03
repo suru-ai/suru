@@ -225,6 +225,80 @@ fn models_commands_dispatch_one_semantic_model_list_action() {
 }
 
 #[test]
+fn themes_command_alias_and_keybinding_open_the_same_picker() {
+    let mut canonical = Application::default();
+    type_terminal_text(&mut canonical, "/themes");
+    assert!(
+        rendered_application_rows(&canonical)
+            .join("\n")
+            .contains("Choose Theme")
+    );
+    assert_eq!(
+        canonical
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("select /themes"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        rendered_application_rows(&canonical)
+            .join("\n")
+            .contains(" Themes ")
+    );
+
+    let mut alias = Application::default();
+    type_terminal_text(&mut alias, "/theme");
+    assert!(
+        rendered_application_rows(&alias)
+            .join("\n")
+            .contains("/themes")
+    );
+    assert_eq!(
+        alias
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("select /theme"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        rendered_application_rows(&alias)
+            .join("\n")
+            .contains(" Themes ")
+    );
+
+    let mut keybinding = Application::default();
+    keybinding
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("begin semantic leader keybinding");
+    assert_eq!(
+        keybinding
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('t'),
+                KeyModifiers::NONE,
+            )))
+            .expect("invoke Theme picker"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        rendered_application_rows(&keybinding)
+            .join("\n")
+            .contains(" Themes ")
+    );
+
+    assert_eq!(
+        suru::tui::SemanticCommandId::ThemeList.as_str(),
+        "theme.list"
+    );
+}
+
+#[test]
 fn options_commands_dispatch_one_semantic_model_options_action() {
     let mut canonical = Application::default();
     type_terminal_text(&mut canonical, "/options");

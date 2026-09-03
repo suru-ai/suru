@@ -37,7 +37,7 @@ use suru::{
         TranscriptSettings, Turn, TurnId, TurnStatus, Usage, Workspace,
     },
     server::{AgentOutput, ServerConfig},
-    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId},
+    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
 
 /// Puts a fixture's Turn — and the Session running it — in flight, which is
@@ -2442,7 +2442,11 @@ fn the_expanded_default_fold_posture_leaves_the_turn_fold_axis_alone() {
          as its Turn Fold marker: {opened}"
     );
 
-    press_leader_chord(&mut application, 't');
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::TranscriptTurnsToggle,
+        )))
+        .expect("open every Turn Fold");
 
     let expanded = rendered_application_rows_at(&application, 80, 36).join("\n");
     assert!(
@@ -6071,7 +6075,11 @@ fn toggling_the_turn_posture_flips_every_turn_fold_and_clears_per_turn_overrides
         .handle_terminal_event(left_click_at(rendered_row(&folded_rows, "✓ Worked") as u16))
         .expect("expand the first Turn by hand");
 
-    press_leader_chord(&mut application, 't');
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::TranscriptTurnsToggle,
+        )))
+        .expect("open every Turn Fold");
 
     let expanded = rendered_application_rows_at(&application, 80, 36).join("\n");
     for revealed in [
@@ -6085,7 +6093,11 @@ fn toggling_the_turn_posture_flips_every_turn_fold_and_clears_per_turn_overrides
         );
     }
 
-    press_leader_chord(&mut application, 't');
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::TranscriptTurnsToggle,
+        )))
+        .expect("fold every Turn Fold");
 
     let refolded = rendered_application_rows_at(&application, 80, 36).join("\n");
     for hidden in [
