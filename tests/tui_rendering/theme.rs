@@ -5,7 +5,8 @@ use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Color;
 use suru::{
     protocol::{
-        AppearanceSettings, EffectiveSettings, SettingMutation, SidebarSettings, SidebarVisibility,
+        AppearanceMode, AppearanceSettings, EffectiveSettings, SettingMutation, SidebarSettings,
+        SidebarVisibility,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -21,9 +22,14 @@ use crate::support::{
 use crate::transcript::{application_with_ansi_palette_output, assert_ansi_palette};
 
 fn themed(name: &str) -> EffectiveSettings {
+    themed_in_mode(name, AppearanceMode::System)
+}
+
+fn themed_in_mode(name: &str, mode: AppearanceMode) -> EffectiveSettings {
     EffectiveSettings {
         appearance: AppearanceSettings {
             theme: name.to_owned(),
+            mode,
         },
         ..EffectiveSettings::default()
     }
@@ -417,6 +423,117 @@ fn a_named_theme_paints_ordinary_text_with_its_own_foreground() {
 }
 
 #[test]
+fn a_two_variant_theme_repaints_when_mode_changes() {
+    let workspace = workspace_dir();
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), TerminalFacts::unprobed(true));
+
+    deliver_settings(
+        &mut application,
+        themed_in_mode("catppuccin", AppearanceMode::Dark),
+    );
+    let dark = rendered_application_buffer(&application, 100, 20);
+    assert_eq!(dark.cell((99, 0)).unwrap().bg, Color::Rgb(30, 30, 46));
+
+    deliver_settings(
+        &mut application,
+        themed_in_mode("catppuccin", AppearanceMode::Light),
+    );
+    let light = rendered_application_buffer(&application, 100, 20);
+    assert_eq!(light.cell((99, 0)).unwrap().bg, Color::Rgb(239, 241, 245));
+    assert_eq!(
+        light
+            .cell(text_position(&light, "What would you like to work on?"))
+            .unwrap()
+            .fg,
+        Color::Rgb(76, 79, 105)
+    );
+}
+
+#[test]
+fn a_single_variant_theme_does_not_repaint_when_mode_changes() {
+    let workspace = workspace_dir();
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), TerminalFacts::unprobed(true));
+    deliver_settings(
+        &mut application,
+        themed_in_mode("aura", AppearanceMode::Dark),
+    );
+    let dark = rendered_application_buffer(&application, 100, 20);
+
+    deliver_settings(
+        &mut application,
+        themed_in_mode("aura", AppearanceMode::Light),
+    );
+    let light = rendered_application_buffer(&application, 100, 20);
+    assert_eq!(light, dark);
+}
+
+#[test]
+fn an_unprobed_terminal_uses_the_dark_variant_in_system_mode() {
+    let workspace = workspace_dir();
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), TerminalFacts::unprobed(true));
+    deliver_settings(&mut application, themed("catppuccin"));
+
+    let buffer = rendered_application_buffer(&application, 100, 20);
+    assert_eq!(buffer.cell((99, 0)).unwrap().bg, Color::Rgb(30, 30, 46));
+}
+
+#[test]
+fn system_mode_follows_the_terminal_background_luminance() {
+    let workspace = workspace_dir();
+    let facts = |background| {
+        TerminalFacts::new(
+            Some(TerminalColorProbe::new([None; 16], None, Some(background))),
+            true,
+        )
+    };
+    let mut application = connected_application_with_terminal_facts(
+        workspace.path(),
+        facts(TerminalColor::new(0, 0, 0)),
+    );
+    deliver_settings(&mut application, themed("catppuccin"));
+    let dark = rendered_application_buffer(&application, 100, 20);
+    assert_eq!(dark.cell((99, 0)).unwrap().bg, Color::Rgb(30, 30, 46));
+
+    application.set_terminal_facts(facts(TerminalColor::new(255, 255, 255)));
+    let light = rendered_application_buffer(&application, 100, 20);
+    assert_eq!(light.cell((99, 0)).unwrap().bg, Color::Rgb(239, 241, 245));
+}
+
+#[test]
+fn system_theme_uses_a_locked_light_ramp_against_a_dark_terminal_background() {
+    let workspace = workspace_dir();
+    let mut application = connected_application_with_terminal_facts(
+        workspace.path(),
+        TerminalFacts::new(
+            Some(TerminalColorProbe::new(
+                [None; 16],
+                Some(TerminalColor::new(238, 238, 238)),
+                Some(TerminalColor::new(40, 40, 40)),
+            )),
+            true,
+        ),
+    );
+    deliver_settings(
+        &mut application,
+        themed_in_mode("system", AppearanceMode::Light),
+    );
+    let buffer = rendered_application_buffer(&application, 100, 20);
+    let placeholder = text_position(&buffer, "Type a Prompt and press Enter");
+    let composer_corner = (placeholder.0 - 2, placeholder.1 - 1);
+
+    assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Rgb(37, 37, 37));
+    assert_eq!(buffer.cell(placeholder).unwrap().fg, Color::Rgb(60, 60, 60));
+    assert_eq!(
+        buffer.cell(composer_corner).unwrap().fg,
+        Color::Rgb(29, 29, 29)
+    );
+    assert_eq!(buffer.cell((99, 0)).unwrap().bg, Color::Reset);
+}
+
+#[test]
 fn system_paints_light_terminal_surfaces_borders_and_muted_text_light() {
     let application = probed_system_application(
         TerminalColor::new(255, 255, 255),
@@ -611,6 +728,7 @@ fn a_missing_theme_falls_back_to_system_and_notices_the_preserved_pin_in_an_open
     let settings = EffectiveSettings {
         appearance: AppearanceSettings {
             theme: "gone-away".to_owned(),
+            ..AppearanceSettings::default()
         },
         sidebar: SidebarSettings {
             initial_visibility: SidebarVisibility::Hidden,

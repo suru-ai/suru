@@ -297,6 +297,7 @@ fn named_theme_base_ansi_foregrounds_and_backgrounds_use_its_derived_palette() {
         EffectiveSettings {
             appearance: AppearanceSettings {
                 theme: "catppuccin".to_owned(),
+                ..AppearanceSettings::default()
             },
             ..EffectiveSettings::default()
         },
@@ -534,6 +535,7 @@ fn named_themes_leave_extended_sgr_foregrounds_and_backgrounds_untouched() {
         EffectiveSettings {
             appearance: AppearanceSettings {
                 theme: "catppuccin".to_owned(),
+                ..AppearanceSettings::default()
             },
             ..EffectiveSettings::default()
         },

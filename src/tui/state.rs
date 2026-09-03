@@ -2474,7 +2474,11 @@ impl Application {
     }
 
     fn resolve_theme_name(&mut self, name: &str) {
-        match Theme::resolve(name, &self.terminal_facts) {
+        match Theme::resolve(
+            name,
+            self.state.settings.appearance.mode,
+            &self.terminal_facts,
+        ) {
             Ok(theme) => self.theme = theme,
             Err(_) => {
                 self.theme = Theme::system();

@@ -8,10 +8,10 @@ use std::{net::IpAddr, path::Path};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        AgentSelection, AutoSettle, CommandAutoExpand, EmojiVisibility, FoldPosture, ModelId,
-        ProviderId, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
-        SettingMutation, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope,
-        SidebarVisibility, TitleErrand,
+        AgentSelection, AppearanceMode, AutoSettle, CommandAutoExpand, EmojiVisibility,
+        FoldPosture, ModelId, ProviderId, ReasoningSummaryDetail, ReasoningVisibility,
+        SessionContentWidth, SettingMutation, SettingsDiagnosticSeverity, SettingsSnapshot,
+        SidebarScope, SidebarVisibility, TitleErrand,
     },
     server::{self, ServerConfig},
 };
@@ -93,6 +93,95 @@ async fn appearance_theme_round_trips_byte_preservingly_and_reaches_every_client
 
     drop(editor);
     drop(onlooker);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn appearance_mode_round_trips_byte_preservingly_and_reaches_every_client() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let original = concat!(
+        "{\n",
+        "  // Keep this Theme in its light variant.\n",
+        "  \"appearance\": { \"mode\":    \"light\" },\n",
+        "  \"transcript\": { \"reasoningVisibility\": \"shown\" },\n",
+        "}\n",
+    );
+    std::fs::write(config_dir.path().join("suru.jsonc"), original).expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-mode")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    let (mut editor, opening) = attach(state_dir.path(), "settings-mode").await;
+    let (mut onlooker, _) = attach(state_dir.path(), "settings-mode").await;
+
+    assert_eq!(opening.settings.appearance.mode, AppearanceMode::Light);
+    assert_eq!(
+        opening.pinned,
+        ["appearance.mode", "transcript.reasoningVisibility"]
+    );
+    assert_eq!(opening.diagnostics, []);
+
+    let answered = editor
+        .mutate_setting(SettingMutation::AppearanceMode {
+            value: Some(AppearanceMode::Dark),
+        })
+        .await
+        .expect("lock appearance to dark mode");
+    assert_eq!(answered.settings.appearance.mode, AppearanceMode::Dark);
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, answered);
+    }
+    assert_eq!(
+        config_document(config_dir.path()),
+        original.replace("\"light\"", "\"dark\""),
+        "only the Mode pin's bytes change"
+    );
+
+    drop(editor);
+    drop(onlooker);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn an_invalid_appearance_mode_is_ignored_alone_and_names_all_three_accepted_values() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            "appearance": { "mode": "sepia" },
+            "transcript": { "reasoningVisibility": "shown" }
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-mode-invalid")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let snapshot = attach(state_dir.path(), "settings-mode-invalid").await.1;
+    assert_eq!(snapshot.settings.appearance.mode, AppearanceMode::System);
+    assert_eq!(
+        snapshot.settings.transcript.reasoning_visibility,
+        ReasoningVisibility::Shown
+    );
+    assert_eq!(snapshot.pinned, ["transcript.reasoningVisibility"]);
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one diagnostic, got {:?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.key.as_deref(), Some("appearance.mode"));
+    assert_eq!(
+        diagnostic.message,
+        "ignored because its value is not one of \"system\", \"dark\", or \"light\""
+    );
+
     server.shutdown().await.expect("shut down server");
 }
 

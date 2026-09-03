@@ -577,6 +577,17 @@ pub enum SettingScope {
     Server,
 }
 
+/// Which lightness variant a Theme paints with. `System` follows the attached
+/// terminal when it can and otherwise takes the dark variant.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppearanceMode {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
 /// The default Fold posture a Session view opens with.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -976,12 +987,14 @@ pub struct SidebarSettings {
 #[serde(deny_unknown_fields)]
 pub struct AppearanceSettings {
     pub theme: String,
+    pub mode: AppearanceMode,
 }
 
 impl Default for AppearanceSettings {
     fn default() -> Self {
         Self {
             theme: "system".to_owned(),
+            mode: AppearanceMode::System,
         }
     }
 }
@@ -1231,6 +1244,9 @@ impl EffectiveSettings {
 pub enum SettingMutation {
     AppearanceTheme {
         value: Option<String>,
+    },
+    AppearanceMode {
+        value: Option<AppearanceMode>,
     },
     TranscriptDefaultFoldPosture {
         value: Option<FoldPosture>,

@@ -6,7 +6,10 @@ use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::terminal::{TerminalColor, TerminalFacts};
+use crate::{
+    protocol::AppearanceMode,
+    terminal::{TerminalColor, TerminalFacts},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Theme {
@@ -161,17 +164,48 @@ struct ThemeDocument {
     theme: Map<String, Value>,
 }
 
+#[derive(Clone, Copy)]
+enum ThemeVariant {
+    Dark,
+    Light,
+}
+
+impl ThemeVariant {
+    fn for_mode(mode: AppearanceMode, terminal_facts: &TerminalFacts) -> Self {
+        match mode {
+            AppearanceMode::Dark => Self::Dark,
+            AppearanceMode::Light => Self::Light,
+            AppearanceMode::System => terminal_background(terminal_facts)
+                .filter(|background| terminal_luminance(*background) > 127.5)
+                .map_or(Self::Dark, |_| Self::Light),
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    fn is_dark(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+}
+
 struct DocumentResolver<'a> {
     defs: &'a Map<String, Value>,
     theme: &'a Map<String, Value>,
+    variant: ThemeVariant,
     resolved: HashMap<String, Color>,
 }
 
 impl<'a> DocumentResolver<'a> {
-    fn new(document: &'a ThemeDocument) -> Self {
+    fn new(document: &'a ThemeDocument, variant: ThemeVariant) -> Self {
         Self {
             defs: &document.defs,
             theme: &document.theme,
+            variant,
             resolved: HashMap::new(),
         }
     }
@@ -228,9 +262,11 @@ impl<'a> DocumentResolver<'a> {
                 .map(ansi_color)
                 .ok_or_else(|| ThemeError(format!("ANSI palette index {index} is not 0..255"))),
             Value::Object(variants) => variants
-                .get("dark")
-                .ok_or_else(|| ThemeError("color pair has no dark value".to_owned()))
-                .and_then(|dark| self.value(dark, chain)),
+                .get(self.variant.key())
+                .ok_or_else(|| {
+                    ThemeError(format!("color pair has no {} value", self.variant.key()))
+                })
+                .and_then(|variant| self.value(variant, chain)),
             _ => Err(ThemeError(format!("invalid Theme color value {value}"))),
         }
     }
@@ -540,11 +576,36 @@ pub(crate) fn built_in_themes() -> &'static [(&'static str, &'static str)] {
     BUILT_IN_THEMES
 }
 
-static RESOLVED_BUILT_INS: OnceLock<Vec<(&'static str, Result<Theme, ThemeError>)>> =
-    OnceLock::new();
+struct ResolvedThemeVariants {
+    dark: Result<Theme, ThemeError>,
+    light: Result<Theme, ThemeError>,
+}
+
+impl ResolvedThemeVariants {
+    fn from_document(source: &str) -> Self {
+        Self {
+            dark: Theme::from_document(source, ThemeVariant::Dark),
+            light: Theme::from_document(source, ThemeVariant::Light),
+        }
+    }
+
+    fn get(&self, variant: ThemeVariant) -> Result<Theme, ThemeError> {
+        match variant {
+            ThemeVariant::Dark => self.dark.clone(),
+            ThemeVariant::Light => self.light.clone(),
+        }
+    }
+}
+
+static RESOLVED_BUILT_INS: OnceLock<Vec<(&'static str, ResolvedThemeVariants)>> = OnceLock::new();
 
 impl Theme {
-    pub(crate) fn resolve(name: &str, terminal_facts: &TerminalFacts) -> Result<Self, ThemeError> {
+    pub(crate) fn resolve(
+        name: &str,
+        mode: AppearanceMode,
+        terminal_facts: &TerminalFacts,
+    ) -> Result<Self, ThemeError> {
+        let variant = ThemeVariant::for_mode(mode, terminal_facts);
         if name == "system" {
             let Some(probe) = terminal_facts.probe else {
                 return Ok(Self::system());
@@ -552,14 +613,14 @@ impl Theme {
             if probe.background.is_none() && probe.palette[0].is_none() {
                 return Ok(Self::system());
             }
-            let theme = Self::from_terminal_probe(probe);
+            let theme = Self::from_terminal_probe(probe, variant);
             return Ok(if terminal_facts.truecolor {
                 theme
             } else {
                 theme.quantized(&IndexedPalette::from_terminal_facts(terminal_facts))
             });
         }
-        Self::named(name)
+        Self::named(name, variant)
             .unwrap_or_else(|| Err(ThemeError(format!("Theme {name:?} was not found"))))
             .map(|theme| {
                 if terminal_facts.truecolor {
@@ -659,7 +720,10 @@ impl Theme {
         }
     }
 
-    fn from_terminal_probe(probe: crate::terminal::TerminalColorProbe) -> Self {
+    fn from_terminal_probe(
+        probe: crate::terminal::TerminalColorProbe,
+        variant: ThemeVariant,
+    ) -> Self {
         let fallback = Self::system();
         let reported = |index: usize, fallback: Color| {
             probe.palette[index]
@@ -683,7 +747,7 @@ impl Theme {
             background_rgb.blue,
         );
         let luminance = terminal_luminance(background_rgb);
-        let dark = luminance <= 127.5;
+        let dark = variant.is_dark();
         let grays = terminal_grays(background_rgb, luminance, dark);
         let muted = terminal_muted(luminance, dark);
         let primary = reported(6, fallback.accent.primary.fg.unwrap_or(Color::Cyan));
@@ -770,7 +834,7 @@ impl Theme {
         }
     }
 
-    pub(crate) fn from_document(source: &str) -> Result<Self, ThemeError> {
+    fn from_document(source: &str, variant: ThemeVariant) -> Result<Self, ThemeError> {
         let document: ThemeDocument = serde_json::from_str(source)
             .map_err(|error| ThemeError(format!("Theme document is not valid JSON: {error}")))?;
         if let Some(version) = document.version
@@ -780,7 +844,7 @@ impl Theme {
                 "Theme version {version} is not supported"
             )));
         }
-        let mut colors = DocumentResolver::new(&document);
+        let mut colors = DocumentResolver::new(&document, variant);
         let primary = colors.required("primary")?;
         let secondary = colors.required("secondary")?;
         let accent = colors.required("accent")?;
@@ -873,18 +937,24 @@ impl Theme {
         })
     }
 
-    pub(crate) fn named(name: &str) -> Option<Result<Self, ThemeError>> {
+    fn named(name: &str, variant: ThemeVariant) -> Option<Result<Self, ThemeError>> {
         RESOLVED_BUILT_INS
             .get_or_init(|| {
                 built_in_themes()
                     .iter()
-                    .map(|(name, source)| (*name, Self::from_document(source)))
+                    .map(|(name, source)| (*name, ResolvedThemeVariants::from_document(source)))
                     .collect()
             })
             .iter()
             .find(|(built_in, _)| *built_in == name)
-            .map(|(_, theme)| theme.clone())
+            .map(|(_, themes)| themes.get(variant))
     }
+}
+
+fn terminal_background(terminal_facts: &TerminalFacts) -> Option<TerminalColor> {
+    terminal_facts
+        .probe
+        .and_then(|probe| probe.background.or(probe.palette[0]))
 }
 
 fn terminal_luminance(color: TerminalColor) -> f64 {
@@ -1000,7 +1070,7 @@ mod tests {
             json!({ "brand": "#123456" }),
             &[("primary", json!("brand")), ("secondary", json!("primary"))],
         );
-        let theme = Theme::from_document(&source).expect("resolve references");
+        let theme = Theme::from_document(&source, ThemeVariant::Dark).expect("resolve references");
 
         assert_eq!(theme.accent.primary.fg, Some(Color::Rgb(0x12, 0x34, 0x56)));
         assert_eq!(theme.ansi.normal.magenta, Color::Rgb(0x12, 0x34, 0x56));
@@ -1012,14 +1082,16 @@ mod tests {
             json!({ "first": "second", "second": "first" }),
             &[("primary", json!("first"))],
         );
-        let error = Theme::from_document(&source).expect_err("reject a reference cycle");
+        let error = Theme::from_document(&source, ThemeVariant::Dark)
+            .expect_err("reject a reference cycle");
         assert!(error.to_string().contains("first -> second -> first"));
     }
 
     #[test]
     fn unknown_references_are_rejected() {
         let source = document(json!({}), &[("primary", json!("missing"))]);
-        let error = Theme::from_document(&source).expect_err("reject an unknown reference");
+        let error = Theme::from_document(&source, ThemeVariant::Dark)
+            .expect_err("reject an unknown reference");
         assert!(error.to_string().contains("missing"));
     }
 
@@ -1029,28 +1101,32 @@ mod tests {
             json!({}),
             &[("primary", json!({ "dark": "#102030", "light": "#f0e0d0" }))],
         );
-        let theme = Theme::from_document(&source).expect("resolve the dark variant");
+        let theme =
+            Theme::from_document(&source, ThemeVariant::Dark).expect("resolve the dark variant");
         assert_eq!(theme.accent.primary.fg, Some(Color::Rgb(0x10, 0x20, 0x30)));
     }
 
     #[test]
     fn ansi_indices_resolve_to_the_xterm_palette() {
         let source = document(json!({}), &[("primary", json!(196))]);
-        let theme = Theme::from_document(&source).expect("resolve an ANSI index");
+        let theme =
+            Theme::from_document(&source, ThemeVariant::Dark).expect("resolve an ANSI index");
         assert_eq!(theme.accent.primary.fg, Some(Color::Rgb(255, 0, 0)));
     }
 
     #[test]
     fn transparent_background_resets_the_terminal_background() {
         let source = document(json!({}), &[("background", json!("transparent"))]);
-        let theme = Theme::from_document(&source).expect("resolve transparency");
+        let theme =
+            Theme::from_document(&source, ThemeVariant::Dark).expect("resolve transparency");
         assert_eq!(theme.surface.base.bg, Some(Color::Reset));
     }
 
     #[test]
     fn optional_selection_text_and_menu_background_take_opencode_defaults() {
         let source = document(json!({}), &[]);
-        let theme = Theme::from_document(&source).expect("resolve optional defaults");
+        let theme =
+            Theme::from_document(&source, ThemeVariant::Dark).expect("resolve optional defaults");
         assert_eq!(
             theme.selection.focused.fg,
             Some(Color::Rgb(0x10, 0x10, 0x10))
@@ -1062,7 +1138,8 @@ mod tests {
     fn version_two_documents_are_rejected() {
         let mut value: Value = serde_json::from_str(&document(json!({}), &[])).unwrap();
         value["version"] = json!(2);
-        let error = Theme::from_document(&value.to_string()).expect_err("reject v2");
+        let error =
+            Theme::from_document(&value.to_string(), ThemeVariant::Dark).expect_err("reject v2");
         assert!(error.to_string().contains("version 2"));
     }
 
@@ -1071,8 +1148,14 @@ mod tests {
         let themes = built_in_themes();
         assert_eq!(themes.len(), 33);
         for (name, source) in themes {
-            Theme::from_document(source)
-                .unwrap_or_else(|error| panic!("built-in Theme {name:?} failed: {error}"));
+            for variant in [ThemeVariant::Dark, ThemeVariant::Light] {
+                Theme::from_document(source, variant).unwrap_or_else(|error| {
+                    panic!(
+                        "built-in Theme {name:?} {} variant failed: {error}",
+                        variant.key()
+                    )
+                });
+            }
         }
     }
 }

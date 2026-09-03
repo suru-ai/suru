@@ -31,10 +31,10 @@ use jsonc_parser::{
 use serde_json::Value;
 
 use crate::protocol::{
-    AgentSelection, AutoSettle, CommandAutoExpand, EffectiveSettings, EmojiVisibility, FoldPosture,
-    ProviderId, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
-    SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope,
-    SidebarVisibility, TitleErrand,
+    AgentSelection, AppearanceMode, AutoSettle, CommandAutoExpand, EffectiveSettings,
+    EmojiVisibility, FoldPosture, ProviderId, ReasoningSummaryDetail, ReasoningVisibility,
+    SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
+    SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility, TitleErrand,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -45,6 +45,7 @@ pub const FALLBACK_CONFIG_FILE: &str = "suru.json";
 // The dotted key of each Setting, named once so the schema and the typed
 // mutations that edit it can never drift apart.
 const APPEARANCE_THEME: &str = "appearance.theme";
+const APPEARANCE_MODE: &str = "appearance.mode";
 const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
 const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
 const TRANSCRIPT_COMMAND_AUTO_EXPAND: &str = "transcript.commandAutoExpand";
@@ -454,6 +455,7 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::AppearanceTheme { value } => {
             value.as_ref() == Some(&settings.appearance.theme)
         }
+        SettingMutation::AppearanceMode { value } => *value == Some(settings.appearance.mode),
         SettingMutation::TranscriptDefaultFoldPosture { value } => {
             *value == Some(settings.transcript.default_fold_posture)
         }
@@ -531,6 +533,39 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |theme| {
                 settings.appearance.theme = theme;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: APPEARANCE_MODE,
+        label: "Mode",
+        description: "Whether Themes follow the terminal or use a dark or light variant",
+        group: SettingGroup::Appearance,
+        scope: SettingScope::Client,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "system",
+                build_mutation: || SettingMutation::AppearanceMode {
+                    value: Some(AppearanceMode::System),
+                },
+            },
+            SettingChoice {
+                value: "dark",
+                build_mutation: || SettingMutation::AppearanceMode {
+                    value: Some(AppearanceMode::Dark),
+                },
+            },
+            SettingChoice {
+                value: "light",
+                build_mutation: || SettingMutation::AppearanceMode {
+                    value: Some(AppearanceMode::Light),
+                },
+            },
+        ]),
+        reset: SettingMutation::AppearanceMode { value: None },
+        apply: |settings, value| {
+            apply_value(value, |mode| {
+                settings.appearance.mode = mode;
             })
         },
     },
@@ -1173,6 +1208,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
     }
     match mutation {
         SettingMutation::AppearanceTheme { value } => (APPEARANCE_THEME, pinned(value)),
+        SettingMutation::AppearanceMode { value } => (APPEARANCE_MODE, pinned(value)),
         SettingMutation::TranscriptDefaultFoldPosture { value } => {
             (TRANSCRIPT_DEFAULT_FOLD_POSTURE, pinned(value))
         }
@@ -1701,6 +1737,7 @@ mod tests {
             expected,
             vec![
                 "one of \"system\" or a Theme name".to_owned(),
+                "one of \"system\", \"dark\", or \"light\"".to_owned(),
                 "one of \"folded\" or \"expanded\"".to_owned(),
                 "one of \"hidden\" or \"shown\"".to_owned(),
                 "one of false or a whole number of milliseconds".to_owned(),

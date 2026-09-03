@@ -19,13 +19,13 @@ use crate::support::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AgentSelection, AppearanceSettings, AutoSettle, CodexSettings, CopilotSettings,
-        EffectiveSettings, EmojiVisibility, FoldPosture, ModelAvailability, ModelCatalog, ModelId,
-        ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
-        ModelOptionKind, ModelOptionRole, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
-        ProviderSettings, ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility,
-        SessionContentWidth, SessionId, SessionSettings, SettingMutation, SettingScope,
-        SettingsSnapshot, SidebarScope, SidebarSettings, TitleErrand, TitleSettings,
+        AgentSelection, AppearanceMode, AppearanceSettings, AutoSettle, CodexSettings,
+        CopilotSettings, EffectiveSettings, EmojiVisibility, FoldPosture, ModelAvailability,
+        ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor,
+        ModelOptionId, ModelOptionKind, ModelOptionRole, ProviderCatalogStatus, ProviderId,
+        ProviderModelCatalog, ProviderSettings, ProviderUnavailability, ReasoningSummaryDetail,
+        ReasoningVisibility, SessionContentWidth, SessionId, SessionSettings, SettingMutation,
+        SettingScope, SettingsSnapshot, SidebarScope, SidebarSettings, TitleErrand, TitleSettings,
         TranscriptSettings,
     },
     settings::SettingGroup,
@@ -428,6 +428,7 @@ fn the_appearance_theme_row_opens_the_picker_and_cancel_returns_to_the_row() {
     let settings = EffectiveSettings {
         appearance: AppearanceSettings {
             theme: "catppuccin".to_owned(),
+            ..AppearanceSettings::default()
         },
         ..EffectiveSettings::default()
     };
@@ -477,6 +478,56 @@ fn the_appearance_theme_row_opens_the_picker_and_cancel_returns_to_the_row() {
     );
     assert!(has_row(&application, "Theme"));
     assert_eq!(focused_key(&application), "appearance.theme");
+}
+
+#[test]
+fn space_cycles_appearance_mode_through_system_dark_and_light_then_wraps() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    focus_setting(&mut application, "appearance.mode");
+
+    assert!(row(&application, "Mode").contains("system"));
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::AppearanceMode {
+            value: Some(AppearanceMode::Dark),
+        })
+    );
+
+    let dark = EffectiveSettings {
+        appearance: AppearanceSettings {
+            mode: AppearanceMode::Dark,
+            ..AppearanceSettings::default()
+        },
+        ..EffectiveSettings::default()
+    };
+    deliver_snapshot(&mut application, dark, &["appearance.mode"]);
+    assert!(row(&application, "Mode").contains("dark [pinned]"));
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::AppearanceMode {
+            value: Some(AppearanceMode::Light),
+        })
+    );
+
+    let light = EffectiveSettings {
+        appearance: AppearanceSettings {
+            mode: AppearanceMode::Light,
+            ..AppearanceSettings::default()
+        },
+        ..EffectiveSettings::default()
+    };
+    deliver_snapshot(&mut application, light, &["appearance.mode"]);
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::AppearanceMode {
+            value: Some(AppearanceMode::System),
+        }),
+        "Space wraps past light to follow the terminal again"
+    );
 }
 
 /// The Experimental tab is the last of the bar, past the Providers, and it is
