@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::terminal::TerminalFacts;
+use crate::terminal::{TerminalColor, TerminalFacts};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Theme {
@@ -258,41 +258,239 @@ fn parse_hex(value: &str) -> Result<Color, ThemeError> {
     Ok(Color::Rgb(channel(0)?, channel(2)?, channel(4)?))
 }
 
-fn ansi_color(index: u8) -> Color {
-    const BASIC: [(u8, u8, u8); 16] = [
-        (0, 0, 0),
-        (128, 0, 0),
-        (0, 128, 0),
-        (128, 128, 0),
-        (0, 0, 128),
-        (128, 0, 128),
-        (0, 128, 128),
-        (192, 192, 192),
-        (128, 128, 128),
-        (255, 0, 0),
-        (0, 255, 0),
-        (255, 255, 0),
-        (0, 0, 255),
-        (255, 0, 255),
-        (0, 255, 255),
-        (255, 255, 255),
+#[derive(Clone, Copy)]
+struct Rgb {
+    red: u8,
+    green: u8,
+    blue: u8,
+}
+
+impl Rgb {
+    const fn new(red: u8, green: u8, blue: u8) -> Self {
+        Self { red, green, blue }
+    }
+}
+
+impl From<TerminalColor> for Rgb {
+    fn from(color: TerminalColor) -> Self {
+        Self::new(color.red, color.green, color.blue)
+    }
+}
+
+fn ansi_rgb(index: u8) -> Rgb {
+    const BASIC: [Rgb; 16] = [
+        Rgb::new(0, 0, 0),
+        Rgb::new(128, 0, 0),
+        Rgb::new(0, 128, 0),
+        Rgb::new(128, 128, 0),
+        Rgb::new(0, 0, 128),
+        Rgb::new(128, 0, 128),
+        Rgb::new(0, 128, 128),
+        Rgb::new(192, 192, 192),
+        Rgb::new(128, 128, 128),
+        Rgb::new(255, 0, 0),
+        Rgb::new(0, 255, 0),
+        Rgb::new(255, 255, 0),
+        Rgb::new(0, 0, 255),
+        Rgb::new(255, 0, 255),
+        Rgb::new(0, 255, 255),
+        Rgb::new(255, 255, 255),
     ];
-    let rgb = if index < 16 {
+    if index < 16 {
         BASIC[usize::from(index)]
     } else if index < 232 {
         let index = index - 16;
         let channel = |part: u8| if part == 0 { 0 } else { part * 40 + 55 };
-        (
+        Rgb::new(
             channel(index / 36),
             channel((index / 6) % 6),
             channel(index % 6),
         )
     } else {
         let gray = (index - 232) * 10 + 8;
-        (gray, gray, gray)
-    };
-    Color::Rgb(rgb.0, rgb.1, rgb.2)
+        Rgb::new(gray, gray, gray)
+    }
 }
+
+fn ansi_color(index: u8) -> Color {
+    let rgb = ansi_rgb(index);
+    Color::Rgb(rgb.red, rgb.green, rgb.blue)
+}
+
+#[derive(Clone, Copy)]
+struct Oklab {
+    lightness: f64,
+    green_red: f64,
+    blue_yellow: f64,
+}
+
+impl Oklab {
+    fn from_rgb(rgb: Rgb) -> Self {
+        let red = srgb_to_linear(rgb.red);
+        let green = srgb_to_linear(rgb.green);
+        let blue = srgb_to_linear(rgb.blue);
+        let lightness =
+            (0.412_221_470_8 * red + 0.536_332_536_3 * green + 0.051_445_992_9 * blue).cbrt();
+        let medium =
+            (0.211_903_498_2 * red + 0.680_699_545_1 * green + 0.107_396_956_6 * blue).cbrt();
+        let short =
+            (0.088_302_461_9 * red + 0.281_718_837_6 * green + 0.629_978_700_5 * blue).cbrt();
+        Self {
+            lightness: 0.210_454_255_3 * lightness + 0.793_617_785 * medium
+                - 0.004_072_046_8 * short,
+            green_red: 1.977_998_495_1 * lightness - 2.428_592_205 * medium
+                + 0.450_593_709_9 * short,
+            blue_yellow: 0.025_904_037_1 * lightness + 0.782_771_766_2 * medium
+                - 0.808_675_766 * short,
+        }
+    }
+
+    fn distance_from(self, other: Self) -> f64 {
+        let lightness = self.lightness - other.lightness;
+        let green_red = self.green_red - other.green_red;
+        let blue_yellow = self.blue_yellow - other.blue_yellow;
+        lightness * lightness * 2.0 + green_red * green_red + blue_yellow * blue_yellow
+    }
+}
+
+struct IndexedPalette {
+    colors: [Oklab; 256],
+}
+
+impl IndexedPalette {
+    fn from_terminal_facts(terminal_facts: &TerminalFacts) -> Self {
+        Self {
+            colors: std::array::from_fn(|index| {
+                let rgb = terminal_facts
+                    .probe
+                    .and_then(|probe| probe.palette.get(index).copied().flatten())
+                    .map(Rgb::from)
+                    .unwrap_or_else(|| ansi_rgb(index as u8));
+                Oklab::from_rgb(rgb)
+            }),
+        }
+    }
+
+    fn nearest(&self, rgb: Rgb) -> u8 {
+        // Match by perceived color rather than channel distance. This is the
+        // weighted OKLab comparison OpenCode uses for indexed output.
+        let target = Oklab::from_rgb(rgb);
+        self.colors
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| {
+                left.distance_from(target)
+                    .total_cmp(&right.distance_from(target))
+            })
+            .map(|(index, _)| index as u8)
+            .expect("the indexed terminal palette is never empty")
+    }
+}
+
+fn srgb_to_linear(channel: u8) -> f64 {
+    let channel = f64::from(channel) / 255.0;
+    if channel <= 0.040_45 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+trait Quantized {
+    fn quantized(self, palette: &IndexedPalette) -> Self;
+}
+
+impl Quantized for Color {
+    fn quantized(self, palette: &IndexedPalette) -> Self {
+        match self {
+            Self::Rgb(red, green, blue) => {
+                Self::Indexed(palette.nearest(Rgb::new(red, green, blue)))
+            }
+            color => color,
+        }
+    }
+}
+
+impl Quantized for Style {
+    fn quantized(mut self, palette: &IndexedPalette) -> Self {
+        self.fg = self.fg.map(|color| color.quantized(palette));
+        self.bg = self.bg.map(|color| color.quantized(palette));
+        self
+    }
+}
+
+macro_rules! quantized_fields {
+    ($role:ident { $($field:ident),+ $(,)? }) => {
+        impl Quantized for $role {
+            fn quantized(self, palette: &IndexedPalette) -> Self {
+                let Self { $($field),+ } = self;
+                Self {
+                    $($field: $field.quantized(palette)),+
+                }
+            }
+        }
+    };
+}
+
+quantized_fields!(TextRoles { primary, subdued });
+quantized_fields!(SurfaceRoles {
+    base,
+    elevated,
+    overlay,
+});
+quantized_fields!(AccentRoles { primary });
+quantized_fields!(AnsiColors {
+    black,
+    red,
+    green,
+    yellow,
+    blue,
+    magenta,
+    cyan,
+    white,
+});
+quantized_fields!(AnsiPalette { normal, bright });
+quantized_fields!(ActionRoles { primary, disabled });
+quantized_fields!(FormFieldRoles {
+    text,
+    placeholder,
+    border,
+    invalid,
+});
+quantized_fields!(FeedbackRoles {
+    error,
+    warning,
+    success,
+    info,
+});
+quantized_fields!(BorderRoles { default, subdued });
+quantized_fields!(MarkdownRoles {
+    heading,
+    emphasis,
+    strong,
+    link,
+    inline_code,
+    code_block,
+    list_marker,
+});
+quantized_fields!(SelectionRoles {
+    focused,
+    unfocused,
+    open,
+    open_rail,
+});
+quantized_fields!(Theme {
+    text,
+    surface,
+    accent,
+    ansi,
+    action,
+    form_field,
+    feedback,
+    border,
+    markdown,
+    selection,
+});
 
 macro_rules! built_in_themes {
     ($($name:literal),+ $(,)?) => {
@@ -346,12 +544,19 @@ static RESOLVED_BUILT_INS: OnceLock<Vec<(&'static str, Result<Theme, ThemeError>
     OnceLock::new();
 
 impl Theme {
-    pub(crate) fn resolve(name: &str, _terminal_facts: &TerminalFacts) -> Result<Self, ThemeError> {
+    pub(crate) fn resolve(name: &str, terminal_facts: &TerminalFacts) -> Result<Self, ThemeError> {
         if name == "system" {
             return Ok(Self::system());
         }
         Self::named(name)
             .unwrap_or_else(|| Err(ThemeError(format!("Theme {name:?} was not found"))))
+            .map(|theme| {
+                if terminal_facts.truecolor {
+                    theme
+                } else {
+                    theme.quantized(&IndexedPalette::from_terminal_facts(terminal_facts))
+                }
+            })
     }
 
     pub(crate) fn system() -> Self {

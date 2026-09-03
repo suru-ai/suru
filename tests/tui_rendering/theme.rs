@@ -7,12 +7,16 @@ use suru::{
     protocol::{
         AppearanceSettings, EffectiveSettings, SettingMutation, SidebarSettings, SidebarVisibility,
     },
-    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
+    tui::{
+        Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
+        TerminalColor, TerminalColorProbe, TerminalFacts,
+    },
 };
 
 use crate::support::{
-    connected_application, deliver_settings, enter_session, rendered_application_buffer,
-    rendered_application_rows, text_position, workspace_dir,
+    connected_application, connected_application_with_terminal_facts, deliver_settings,
+    enter_session, rendered_application_buffer, rendered_application_rows, text_position,
+    workspace_dir,
 };
 
 fn themed(name: &str) -> EffectiveSettings {
@@ -30,6 +34,12 @@ fn open_theme_picker(application: &mut Application) -> ApplicationTransition {
             SemanticCommandId::ThemeList,
         )))
         .expect("open Theme picker")
+}
+
+fn truecolor_application() -> Application {
+    let mut application = Application::default();
+    application.set_terminal_facts(TerminalFacts::unprobed(true));
+    application
 }
 
 fn press(
@@ -61,7 +71,8 @@ fn picker_orders_system_first_then_the_built_ins_alphabetically() {
 #[test]
 fn moving_and_filtering_preview_the_top_match_without_leaving_the_client() {
     let workspace = workspace_dir();
-    let mut application = connected_application(workspace.path());
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), TerminalFacts::unprobed(true));
     deliver_settings(&mut application, EffectiveSettings::default());
     enter_session(&mut application, workspace.path());
     open_theme_picker(&mut application);
@@ -117,7 +128,7 @@ fn moving_and_filtering_preview_the_top_match_without_leaving_the_client() {
 
 #[test]
 fn escape_restores_the_opening_theme_and_enter_holds_preview_until_snapshot() {
-    let mut application = Application::default();
+    let mut application = truecolor_application();
     open_theme_picker(&mut application);
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
     assert_eq!(
@@ -171,7 +182,7 @@ fn escape_restores_the_opening_theme_and_enter_holds_preview_until_snapshot() {
 
 #[test]
 fn an_unrelated_snapshot_does_not_end_a_preview_still_being_browsed() {
-    let mut application = Application::default();
+    let mut application = truecolor_application();
     open_theme_picker(&mut application);
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
 
@@ -193,7 +204,7 @@ fn an_unrelated_snapshot_does_not_end_a_preview_still_being_browsed() {
 
 #[test]
 fn escape_restores_the_opening_theme_after_another_client_changes_the_pin() {
-    let mut application = Application::default();
+    let mut application = truecolor_application();
     open_theme_picker(&mut application);
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
 
@@ -224,7 +235,7 @@ fn escape_restores_the_opening_theme_after_another_client_changes_the_pin() {
 
 #[test]
 fn reopening_before_the_snapshot_keeps_the_confirmed_preview_as_the_opening_theme() {
-    let mut application = Application::default();
+    let mut application = truecolor_application();
     open_theme_picker(&mut application);
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
     assert!(matches!(
@@ -306,7 +317,8 @@ fn enter_cannot_confirm_a_theme_filtered_out_of_the_list() {
 #[test]
 fn a_snapshot_repaints_an_open_view_and_its_overlay_in_the_named_theme() {
     let workspace = workspace_dir();
-    let mut application = connected_application(workspace.path());
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), TerminalFacts::unprobed(true));
     enter_session(&mut application, workspace.path());
     let before = rendered_application_buffer(&application, 100, 20);
 
@@ -372,7 +384,8 @@ fn a_snapshot_repaints_an_open_view_and_its_overlay_in_the_named_theme() {
 #[test]
 fn a_named_theme_paints_ordinary_text_with_its_own_foreground() {
     let workspace = workspace_dir();
-    let mut application = connected_application(workspace.path());
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), TerminalFacts::unprobed(true));
     deliver_settings(&mut application, themed("catppuccin"));
 
     let landing = rendered_application_buffer(&application, 100, 20);
@@ -382,6 +395,63 @@ fn a_named_theme_paints_ordinary_text_with_its_own_foreground() {
             .unwrap()
             .fg,
         Color::Rgb(205, 214, 244)
+    );
+}
+
+#[test]
+fn a_named_theme_follows_the_terminals_truecolor_capability() {
+    let workspace = workspace_dir();
+    let mut indexed =
+        connected_application_with_terminal_facts(workspace.path(), TerminalFacts::unprobed(false));
+    deliver_settings(&mut indexed, themed("catppuccin"));
+
+    let indexed = rendered_application_buffer(&indexed, 100, 20);
+    assert!(
+        indexed.content().iter().all(|cell| {
+            !matches!(cell.fg, Color::Rgb(_, _, _)) && !matches!(cell.bg, Color::Rgb(_, _, _))
+        }),
+        "a terminal without truecolor receives no RGB Theme colors"
+    );
+    assert_eq!(
+        indexed
+            .cell(text_position(&indexed, "What would you like to work on?"))
+            .unwrap()
+            .fg,
+        Color::Indexed(189),
+        "Catppuccin text is nearest to xterm-256 slot 189"
+    );
+
+    let mut truecolor =
+        connected_application_with_terminal_facts(workspace.path(), TerminalFacts::unprobed(true));
+    deliver_settings(&mut truecolor, themed("catppuccin"));
+
+    let truecolor = rendered_application_buffer(&truecolor, 100, 20);
+    assert_eq!(
+        truecolor
+            .cell(text_position(&truecolor, "What would you like to work on?"))
+            .unwrap()
+            .fg,
+        Color::Rgb(205, 214, 244)
+    );
+}
+
+#[test]
+fn a_named_theme_quantizes_against_the_terminals_reported_indexed_colors() {
+    let workspace = workspace_dir();
+    let mut palette = [None; 16];
+    palette[1] = Some(TerminalColor::new(205, 214, 244));
+    let facts = TerminalFacts::new(Some(TerminalColorProbe::new(palette, None, None)), false);
+    let mut application = connected_application_with_terminal_facts(workspace.path(), facts);
+    deliver_settings(&mut application, themed("catppuccin"));
+
+    let buffer = rendered_application_buffer(&application, 100, 20);
+    assert_eq!(
+        buffer
+            .cell(text_position(&buffer, "What would you like to work on?"))
+            .unwrap()
+            .fg,
+        Color::Indexed(1),
+        "an exact terminal palette match wins over an xterm-256 approximation"
     );
 }
 

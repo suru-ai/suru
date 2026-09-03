@@ -29,15 +29,18 @@ use suru::{
         ManagedClient, ManagedClientConfig, ManagedEvent, SessionEvent, SessionSubscription,
     },
     protocol::{
-        Activity, ActivityId, ActivityStatus, CommandAutoExpand, Cost, CostBasis,
-        CreateSessionRequest, EffectiveSettings, FileChange, FoldPosture, InitialPrompt, Message,
-        MessageId, MessageRole, MessageStatus, NativeMeter, Prompt, PromptDelivery, PromptId,
-        PromptOrder, PromptStatus, ReasoningVisibility, SessionChange, SessionId, SessionRevision,
-        SessionStatus, SessionTimestamp, SessionUpdate, SettingsSnapshot, TranscriptItem,
-        TranscriptSettings, Turn, TurnId, TurnStatus, Usage, Workspace,
+        Activity, ActivityId, ActivityStatus, AppearanceSettings, CommandAutoExpand, Cost,
+        CostBasis, CreateSessionRequest, EffectiveSettings, FileChange, FoldPosture, InitialPrompt,
+        Message, MessageId, MessageRole, MessageStatus, NativeMeter, Prompt, PromptDelivery,
+        PromptId, PromptOrder, PromptStatus, ReasoningVisibility, SessionChange, SessionId,
+        SessionRevision, SessionStatus, SessionTimestamp, SessionUpdate, SettingsSnapshot,
+        TranscriptItem, TranscriptSettings, Turn, TurnId, TurnStatus, Usage, Workspace,
     },
     server::{AgentOutput, ServerConfig},
-    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
+    tui::{
+        Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
+        TerminalFacts,
+    },
 };
 
 /// Puts a fixture's Turn — and the Session running it — in flight, which is
@@ -71,6 +74,20 @@ fn text_cell<'a>(buffer: &'a Buffer, needle: &str) -> &'a Cell {
     buffer
         .cell(text_position(buffer, needle))
         .expect("rendered text position is inside the buffer")
+}
+
+const EXTENDED_SGR_PAIRS: &str = concat!(
+    "\x1b[38;5;201;48;5;22mindexed pair\x1b[0m ",
+    "\x1b[38;2;1;2;3;48;2;4;5;6mtruecolor pair\x1b[0m ",
+);
+
+fn assert_extended_sgr_pairs(buffer: &Buffer) {
+    let indexed = text_cell(buffer, "indexed pair");
+    assert_eq!(indexed.fg, Color::Indexed(201));
+    assert_eq!(indexed.bg, Color::Indexed(22));
+    let truecolor = text_cell(buffer, "truecolor pair");
+    assert_eq!(truecolor.fg, Color::Rgb(1, 2, 3));
+    assert_eq!(truecolor.bg, Color::Rgb(4, 5, 6));
 }
 
 #[test]
@@ -244,8 +261,68 @@ fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
 #[test]
 fn all_base_ansi_foregrounds_and_backgrounds_render_through_the_theme_palette() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path(), Default::default());
-    let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
+    let application =
+        application_with_ansi_palette_output(workspace.path(), TerminalFacts::default());
+    let buffer = rendered_application_buffer(&application, 160, 30);
+    let normal = [
+        Color::Black,
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Gray,
+    ];
+    let bright = [
+        Color::DarkGray,
+        Color::LightRed,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::LightCyan,
+        Color::White,
+    ];
+    assert_ansi_palette(&buffer, &normal, &bright);
+}
+
+#[test]
+fn named_theme_base_ansi_foregrounds_and_backgrounds_use_its_derived_palette() {
+    let workspace = workspace_dir();
+    let mut application =
+        application_with_ansi_palette_output(workspace.path(), TerminalFacts::unprobed(true));
+    deliver_settings(
+        &mut application,
+        EffectiveSettings {
+            appearance: AppearanceSettings {
+                theme: "catppuccin".to_owned(),
+            },
+            ..EffectiveSettings::default()
+        },
+        &[],
+    );
+
+    let buffer = rendered_application_buffer(&application, 160, 30);
+    let derived = [
+        Color::Rgb(24, 24, 37),
+        Color::Rgb(243, 139, 168),
+        Color::Rgb(166, 227, 161),
+        Color::Rgb(249, 226, 175),
+        Color::Rgb(137, 180, 250),
+        Color::Rgb(203, 166, 247),
+        Color::Rgb(148, 226, 213),
+        Color::Rgb(205, 214, 244),
+    ];
+    assert_ansi_palette(&buffer, &derived, &derived);
+}
+
+fn application_with_ansi_palette_output(
+    workspace: &std::path::Path,
+    terminal_facts: TerminalFacts,
+) -> Application {
+    let mut application = Application::new(workspace, terminal_facts);
+    let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace, 1);
     let turn_id = snapshot.turns[0].id;
     set_turn_in_flight(&mut snapshot, turn_id);
     let activity_id = ActivityId::new();
@@ -280,35 +357,17 @@ fn all_base_ansi_foregrounds_and_backgrounds_render_through_the_theme_palette() 
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach Session with every base ANSI color");
     press_leader_chord(&mut application, 'f');
+    application
+}
 
-    let buffer = rendered_application_buffer(&application, 160, 30);
-    let normal = [
-        Color::Black,
-        Color::Red,
-        Color::Green,
-        Color::Yellow,
-        Color::Blue,
-        Color::Magenta,
-        Color::Cyan,
-        Color::Gray,
-    ];
-    let bright = [
-        Color::DarkGray,
-        Color::LightRed,
-        Color::LightGreen,
-        Color::LightYellow,
-        Color::LightBlue,
-        Color::LightMagenta,
-        Color::LightCyan,
-        Color::White,
-    ];
-    for (index, expected) in normal.into_iter().enumerate() {
-        assert_eq!(text_cell(&buffer, &format!("nfg{index}")).fg, expected);
-        assert_eq!(text_cell(&buffer, &format!("nbg{index}")).bg, expected);
+fn assert_ansi_palette(buffer: &Buffer, normal: &[Color; 8], bright: &[Color; 8]) {
+    for (index, expected) in normal.iter().copied().enumerate() {
+        assert_eq!(text_cell(buffer, &format!("nfg{index}")).fg, expected);
+        assert_eq!(text_cell(buffer, &format!("nbg{index}")).bg, expected);
     }
-    for (index, expected) in bright.into_iter().enumerate() {
-        assert_eq!(text_cell(&buffer, &format!("bfg{index}")).fg, expected);
-        assert_eq!(text_cell(&buffer, &format!("bbg{index}")).bg, expected);
+    for (index, expected) in bright.iter().copied().enumerate() {
+        assert_eq!(text_cell(buffer, &format!("bfg{index}")).fg, expected);
+        assert_eq!(text_cell(buffer, &format!("bbg{index}")).bg, expected);
     }
 }
 
@@ -396,13 +455,10 @@ fn activity_sgr_styles_patch_over_each_activity_base_style() {
             status: ActivityStatus::Completed,
             command: "colored-output".to_owned(),
             cwd: None,
-            output: concat!(
-                "\x1b[38;5;201;48;5;22mindexed pair\x1b[0m ",
-                "\x1b[38;2;1;2;3;48;2;4;5;6mtruecolor pair\x1b[0m ",
-                "\x1b[38:2::7:8:9;48:5:42mcolon pair\x1b[m ",
-                "\x1b[2mdim text\x1b[0m \x1b[3mitalic text\x1b[0m"
-            )
-            .to_owned(),
+            output: format!(
+                "{EXTENDED_SGR_PAIRS}\x1b[38:2::7:8:9;48:5:42mcolon pair\x1b[m \
+                 \x1b[2mdim text\x1b[0m \x1b[3mitalic text\x1b[0m"
+            ),
             output_truncated: false,
             exit_status: Some(0),
         },
@@ -432,12 +488,7 @@ fn activity_sgr_styles_patch_over_each_activity_base_style() {
     assert!(!plain_error.modifier.contains(Modifier::UNDERLINED));
     assert!(!plain_error.modifier.contains(Modifier::REVERSED));
 
-    let indexed = text_cell(&buffer, "indexed pair");
-    assert_eq!(indexed.fg, Color::Indexed(201));
-    assert_eq!(indexed.bg, Color::Indexed(22));
-    let truecolor = text_cell(&buffer, "truecolor pair");
-    assert_eq!(truecolor.fg, Color::Rgb(1, 2, 3));
-    assert_eq!(truecolor.bg, Color::Rgb(4, 5, 6));
+    assert_extended_sgr_pairs(&buffer);
     let colon = text_cell(&buffer, "colon pair");
     assert_eq!(colon.fg, Color::Rgb(7, 8, 9));
     assert_eq!(colon.bg, Color::Indexed(42));
@@ -451,6 +502,46 @@ fn activity_sgr_styles_patch_over_each_activity_base_style() {
             .modifier
             .contains(Modifier::ITALIC)
     );
+}
+
+#[test]
+fn named_themes_leave_extended_sgr_foregrounds_and_backgrounds_untouched() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), TerminalFacts::unprobed(true));
+    let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
+    let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
+    let activity = Activity::Command {
+        id: ActivityId::new(),
+        turn_id,
+        status: ActivityStatus::Completed,
+        command: "show extended colors".to_owned(),
+        cwd: None,
+        output: EXTENDED_SGR_PAIRS.to_owned(),
+        output_truncated: false,
+        exit_status: Some(0),
+    };
+    snapshot.transcript.push(TranscriptItem::Activity {
+        activity_id: activity.id(),
+    });
+    snapshot.activities.push(activity);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach Session with extended SGR colors");
+    press_leader_chord(&mut application, 'f');
+    deliver_settings(
+        &mut application,
+        EffectiveSettings {
+            appearance: AppearanceSettings {
+                theme: "catppuccin".to_owned(),
+            },
+            ..EffectiveSettings::default()
+        },
+        &[],
+    );
+
+    let buffer = rendered_application_buffer(&application, 120, 24);
+    assert_extended_sgr_pairs(&buffer);
 }
 
 #[test]
