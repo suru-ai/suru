@@ -3,14 +3,12 @@
 //! carry out the transitions the Application returns.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     future::{Future, pending},
-    io::{self, Stdout, stdout},
     net::{IpAddr, SocketAddr, SocketAddrV6},
     ops::ControlFlow,
     path::PathBuf,
     pin::Pin,
-    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -30,13 +28,14 @@ use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     cursor::{Hide, Show},
-    event::{DisableBracketedPaste, EnableBracketedPaste, Event as InputEvent, EventStream},
+    event::{DisableBracketedPaste, EnableBracketedPaste, Event as InputEvent},
     execute,
     style::available_color_count,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
+use termina::Terminal as _;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::attachment::{AttachmentOperationId, AttachmentOutcome, SessionAttachment};
@@ -46,231 +45,30 @@ use super::state::{
     SessionListRequest, SessionListSurface, WorkspaceResolutionSurface,
 };
 use crate::terminal::{
-    DEFAULT_TERMINAL_PROBE_BUDGET, LateTerminalColorResponse, TerminalFacts,
-    could_be_terminal_color_response, is_terminal_color_response, probe_terminal_colors,
+    DEFAULT_TERMINAL_PROBE_BUDGET, TerminalEvents, TerminalFacts, TerminalInput,
+    request_terminal_colors,
 };
 
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
-const MAX_LATE_COLOR_RESPONSE_CHARS: usize = 64 * 1024;
-
-/// Filters a valid OSC color response that missed the startup probe's budget.
-/// Crossterm 0.28 projects an OSC sequence into Alt+] followed by ordinary key
-/// events, so the Application must not see those bytes as something the reader
-/// typed. Invalid lookalikes are replayed unchanged.
-#[derive(Default)]
-struct LateColorReplyFilter {
-    candidate: Option<LateColorReplyCandidate>,
-    awaiting_osc_open: bool,
-    enabled: bool,
-}
-
-struct LateColorReplyCandidate {
-    events: Vec<InputEvent>,
-    payload: String,
-    awaiting_st_end: bool,
-}
-
-impl LateColorReplyFilter {
-    fn new(late_response: LateTerminalColorResponse) -> Self {
-        match late_response {
-            LateTerminalColorResponse::Disabled => Self::default(),
-            LateTerminalColorResponse::AwaitingResponse => Self {
-                candidate: None,
-                awaiting_osc_open: false,
-                enabled: true,
-            },
-            LateTerminalColorResponse::Escape => Self {
-                candidate: None,
-                awaiting_osc_open: true,
-                enabled: true,
-            },
-            LateTerminalColorResponse::Osc {
-                payload,
-                escape_terminator,
-            } => Self {
-                candidate: Some(LateColorReplyCandidate {
-                    events: Vec::new(),
-                    payload,
-                    awaiting_st_end: escape_terminator,
-                }),
-                awaiting_osc_open: false,
-                enabled: true,
-            },
-        }
-    }
-
-    fn push(&mut self, event: InputEvent) -> Vec<InputEvent> {
-        if !self.enabled {
-            return vec![event];
-        }
-        if self.awaiting_osc_open {
-            self.awaiting_osc_open = false;
-            if is_plain_character(&event, ']') {
-                self.candidate = Some(LateColorReplyCandidate {
-                    events: Vec::new(),
-                    payload: String::new(),
-                    awaiting_st_end: false,
-                });
-                return Vec::new();
-            }
-            return vec![event];
-        }
-
-        let Some(candidate) = &mut self.candidate else {
-            if is_osc_open(&event) {
-                self.candidate = Some(LateColorReplyCandidate {
-                    events: vec![event],
-                    payload: String::new(),
-                    awaiting_st_end: false,
-                });
-                return Vec::new();
-            }
-            return vec![event];
-        };
-
-        candidate.events.push(event.clone());
-        if candidate.awaiting_st_end {
-            let candidate = self.candidate.take().expect("candidate is present");
-            return if is_plain_character(&event, '\\')
-                && is_terminal_color_response(&candidate.payload)
-            {
-                Vec::new()
-            } else {
-                candidate.events
-            };
-        }
-        if is_osc_end(&event) {
-            let candidate = self.candidate.take().expect("candidate is present");
-            return if is_terminal_color_response(&candidate.payload) {
-                Vec::new()
-            } else {
-                candidate.events
-            };
-        }
-        let Some(character) = plain_terminal_character(&event) else {
-            return self.take_candidate();
-        };
-        candidate.payload.push(character);
-        if candidate.payload.len() > MAX_LATE_COLOR_RESPONSE_CHARS
-            || !could_be_terminal_color_response(&candidate.payload)
-        {
-            return self.take_candidate();
-        }
-        Vec::new()
-    }
-
-    fn finish(&mut self) -> Vec<InputEvent> {
-        self.take_candidate()
-    }
-
-    fn take_candidate(&mut self) -> Vec<InputEvent> {
-        self.candidate
-            .take()
-            .map_or_else(Vec::new, |candidate| candidate.events)
-    }
-}
-
-fn is_osc_open(event: &InputEvent) -> bool {
-    matches!(
-        event,
-        InputEvent::Key(key)
-            if key.code == crossterm::event::KeyCode::Char(']')
-                && key.modifiers == crossterm::event::KeyModifiers::ALT
-    )
-}
-
-fn is_osc_end(event: &InputEvent) -> bool {
-    matches!(
-        event,
-        InputEvent::Key(key)
-            if (key.code == crossterm::event::KeyCode::Char('g')
-                && key.modifiers == crossterm::event::KeyModifiers::CONTROL)
-                || (key.code == crossterm::event::KeyCode::Char('\\')
-                    && key.modifiers == crossterm::event::KeyModifiers::ALT)
-    )
-}
-
-fn plain_terminal_character(event: &InputEvent) -> Option<char> {
-    let InputEvent::Key(key) = event else {
-        return None;
-    };
-    matches!(
-        key.modifiers,
-        crossterm::event::KeyModifiers::NONE | crossterm::event::KeyModifiers::SHIFT
-    )
-    .then_some(())?;
-    let crossterm::event::KeyCode::Char(character) = key.code else {
-        return None;
-    };
-    Some(character)
-}
-
-fn is_plain_character(event: &InputEvent, expected: char) -> bool {
-    plain_terminal_character(event) == Some(expected)
-}
-
-struct TerminalEvents {
-    source: EventStream,
-    filter: LateColorReplyFilter,
-    ready: VecDeque<io::Result<InputEvent>>,
-    source_done: bool,
-}
-
-impl TerminalEvents {
-    fn new(late_response: LateTerminalColorResponse) -> Self {
-        Self {
-            source: EventStream::new(),
-            filter: LateColorReplyFilter::new(late_response),
-            ready: VecDeque::new(),
-            source_done: false,
-        }
-    }
-}
-
-impl Stream for TerminalEvents {
-    type Item = io::Result<InputEvent>;
-
-    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            if let Some(event) = this.ready.pop_front() {
-                return Poll::Ready(Some(event));
-            }
-            if this.source_done {
-                return Poll::Ready(None);
-            }
-            match Pin::new(&mut this.source).poll_next(context) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Some(Ok(event))) => {
-                    this.ready
-                        .extend(this.filter.push(event).into_iter().map(Ok));
-                }
-                Poll::Ready(Some(Err(error))) => {
-                    this.ready.extend(this.filter.finish().into_iter().map(Ok));
-                    this.ready.push_back(Err(error));
-                }
-                Poll::Ready(None) => {
-                    this.ready.extend(this.filter.finish().into_iter().map(Ok));
-                    this.source_done = true;
-                }
-            }
-        }
-    }
-}
 
 pub async fn run(client: ManagedClient) -> Result<()> {
     let workspace =
         std::env::current_dir().map_err(|error| anyhow!("read current Workspace: {error}"))?;
     let mut session = TerminalSession::enter()?;
-    let terminal_probe = probe_terminal_colors(DEFAULT_TERMINAL_PROBE_BUDGET);
-    let terminal_facts =
-        TerminalFacts::new(terminal_probe.probe, available_color_count() == u16::MAX);
+    let mut input = TerminalEvents::open()?;
+    let terminal_probe = input
+        .probe_colors(
+            session.terminal.backend_mut(),
+            DEFAULT_TERMINAL_PROBE_BUDGET,
+        )
+        .await?;
+    let terminal_facts = TerminalFacts::new(terminal_probe, available_color_count() == u16::MAX);
     run_loop(
         &mut session.terminal,
         client,
         workspace,
         terminal_facts,
-        terminal_probe.late_response,
+        input,
     )
     .await
 }
@@ -652,11 +450,11 @@ struct RunLoop {
 }
 
 async fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<termina::PlatformTerminal>>,
     client: ManagedClient,
     workspace: PathBuf,
     terminal_facts: TerminalFacts,
-    late_terminal_response: LateTerminalColorResponse,
+    mut input: TerminalEvents,
 ) -> Result<()> {
     let config_root = client.config_dir().map(PathBuf::from);
     let (submissions, mut submission_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -691,8 +489,6 @@ async fn run_loop(
         spinner_tick: None,
         needs_redraw: true,
     };
-    let mut input = TerminalEvents::new(late_terminal_response);
-
     loop {
         run.sync_skill_catalog();
         if run.needs_redraw && run.application.first_frame_ready() {
@@ -727,10 +523,7 @@ async fn run_loop(
             workspace = workspace_rx.recv() => run.receive_workspace_result(workspace)?,
             catalog = origin_catalog_rx.recv() => run.receive_origin_catalog(catalog)?,
             input_event = input.next() => match input_event {
-                Some(Ok(event)) => {
-                    let mut output = TerminalOutput(terminal.backend_mut());
-                    run.handle_input_event(event, &mut output)?
-                }
+                Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut())?,
                 Some(Err(error)) => return Err(error.into()),
                 None => ControlFlow::Break(Exit::Now),
             },
@@ -759,10 +552,7 @@ async fn run_loop(
                 break;
             };
             let step = match pending_input {
-                Some(Ok(event)) => {
-                    let mut output = TerminalOutput(terminal.backend_mut());
-                    run.handle_input_event(event, &mut output)?
-                }
+                Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut())?,
                 Some(Err(error)) => return Err(error.into()),
                 None => ControlFlow::Break(Exit::Now),
             };
@@ -774,7 +564,7 @@ async fn run_loop(
 }
 
 fn leave_run_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<termina::PlatformTerminal>>,
     application: &Application,
     exit: Exit,
 ) -> Result<()> {
@@ -785,6 +575,31 @@ fn leave_run_loop(
 }
 
 impl RunLoop {
+    fn handle_terminal_input(
+        &mut self,
+        input: TerminalInput,
+        output: &mut impl std::io::Write,
+    ) -> Result<ControlFlow<Exit>> {
+        match input {
+            TerminalInput::Event(event) => {
+                self.handle_input_event(event, &mut TerminalOutput(output))
+            }
+            TerminalInput::Colors(update) => {
+                let mut facts = self.application.terminal_facts;
+                facts.merge_probe(update);
+                if facts != self.application.terminal_facts {
+                    self.application.set_terminal_facts(facts);
+                    self.needs_redraw = true;
+                }
+                Ok(ControlFlow::Continue(()))
+            }
+            TerminalInput::Reprobe => {
+                request_terminal_colors(output)?;
+                Ok(ControlFlow::Continue(()))
+            }
+        }
+    }
+
     fn sync_skill_catalog(&mut self) {
         let Some(request) = self.application.skill_catalog_request() else {
             return;
@@ -2546,7 +2361,7 @@ async fn wait_for_spinner_tick(tick: &mut Option<Pin<Box<tokio::time::Sleep>>>) 
 }
 
 struct TerminalSession {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<CrosstermBackend<termina::PlatformTerminal>>,
 }
 
 /// Enables button-press and wheel reporting (1000) with SGR encoding (1006).
@@ -2561,20 +2376,8 @@ impl crossterm::Command for EnableMouseButtonReporting {
     }
 
     #[cfg(windows)]
-    fn execute_winapi(&self) -> std::io::Result<()> {
-        crossterm::event::EnableMouseCapture.execute_winapi()
-    }
-
-    /// A Windows console hands mouse input to the program as console records
-    /// rather than as the ANSI replies this sequence asks for, and it only does
-    /// so once quick-edit selection is off — otherwise the console keeps the
-    /// clicks for its own text selection. Nothing written to the output stream
-    /// turns quick-edit off, so Windows always takes the console API path. That
-    /// path has no dial for motion tracking, so the motion records it delivers
-    /// are dropped later, when `command_for_terminal_event` maps the event.
-    #[cfg(windows)]
     fn is_ansi_code_supported(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -2586,22 +2389,14 @@ impl crossterm::Command for DisableMouseButtonReporting {
     }
 
     #[cfg(windows)]
-    fn execute_winapi(&self) -> std::io::Result<()> {
-        crossterm::event::DisableMouseCapture.execute_winapi()
-    }
-
-    /// Restores the console mode [`EnableMouseButtonReporting`] replaced, so it
-    /// has to take the same console API path.
-    #[cfg(windows)]
     fn is_ansi_code_supported(&self) -> bool {
-        false
+        true
     }
 }
 
 /// Asks for modified-key disambiguation, the first level of the kitty keyboard
-/// protocol. crossterm's own `PushKeyboardEnhancementFlags` reports the escape
-/// sequence as unsupported on Windows and fails outright there, so this writes
-/// the sequence itself; terminals that do not implement the protocol ignore it.
+/// protocol. This is emitted as VT on every platform because the owned input
+/// stream parses the terminal's replies itself.
 struct PushModifiedKeyReporting;
 
 impl crossterm::Command for PushModifiedKeyReporting {
@@ -2616,6 +2411,11 @@ impl crossterm::Command for PushModifiedKeyReporting {
         )
         .execute_winapi()
     }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
 }
 
 struct PopModifiedKeyReporting;
@@ -2629,12 +2429,55 @@ impl crossterm::Command for PopModifiedKeyReporting {
     fn execute_winapi(&self) -> std::io::Result<()> {
         crossterm::event::PopKeyboardEnhancementFlags.execute_winapi()
     }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+/// Subscribes to terminal dark/light notifications (DEC private mode 2031).
+/// A supporting terminal reports changes as `CSI ? 997 ; 1|2 n`; terminals
+/// that do not know the mode ignore it.
+struct EnableTerminalThemeUpdates;
+
+impl crossterm::Command for EnableTerminalThemeUpdates {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?2031h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+struct DisableTerminalThemeUpdates;
+
+impl crossterm::Command for DisableTerminalThemeUpdates {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?2031l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
 }
 
 /// Terminal features are progressive: a terminal that does not implement one
-/// ignores its escape sequence, and the legacy Windows console API answers
-/// `Unsupported` for the features it has no equivalent of. Neither is a reason
-/// to refuse to draw the TUI, while a terminal that has gone away still is.
+/// ignores its escape sequence. That is not a reason to refuse to draw the TUI,
+/// while a terminal that has gone away still is.
 fn ignore_unsupported(result: std::io::Result<()>) -> std::io::Result<()> {
     match result {
         Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(()),
@@ -2643,14 +2486,8 @@ fn ignore_unsupported(result: std::io::Result<()>) -> std::io::Result<()> {
 }
 
 /// The seam every terminal-mode change is written through. Production routes
-/// each command through crossterm's `execute!`, which decides per command
-/// whether the terminal is driven by an ANSI sequence or by the Windows console
-/// API; tests substitute a sink that records the ANSI rendering, so the order of
-/// the sequence can be asserted identically on every platform. `execute!`
-/// against an in-memory buffer cannot serve that purpose: crossterm picks its
-/// path from a process-global probe of the attached console rather than from the
-/// writer it is handed, so the same call records the sequence on a developer's
-/// terminal and records nothing on a machine with no VT-capable console.
+/// each command through crossterm's `execute!`; tests substitute a sink that
+/// records the ANSI rendering so the order can be asserted on every platform.
 trait TerminalSink {
     fn apply(&mut self, command: impl crossterm::Command) -> std::io::Result<()>;
 }
@@ -2688,17 +2525,19 @@ fn enable_terminal_features(output: &mut impl TerminalSink) -> std::io::Result<(
     // Mouse reporting is the one feature with no graceful degradation: a TUI
     // that cannot read clicks or the wheel is worth refusing to start.
     output.apply(EnableMouseButtonReporting)?;
-    ignore_unsupported(output.apply(PushModifiedKeyReporting))
+    ignore_unsupported(output.apply(PushModifiedKeyReporting))?;
+    ignore_unsupported(output.apply(EnableTerminalThemeUpdates))
 }
 
 /// Every restore is attempted even after one of them fails: leaving the terminal
 /// in mouse capture is worse than a restore whose error nobody could act on. The
 /// first failure is the one reported.
 fn disable_terminal_features(output: &mut impl TerminalSink) -> std::io::Result<()> {
+    let theme_updates = ignore_unsupported(output.apply(DisableTerminalThemeUpdates));
     let modified_keys = ignore_unsupported(output.apply(PopModifiedKeyReporting));
     let mouse = output.apply(DisableMouseButtonReporting);
     let paste = ignore_unsupported(output.apply(DisableBracketedPaste));
-    modified_keys.and(mouse).and(paste)
+    theme_updates.and(modified_keys).and(mouse).and(paste)
 }
 
 /// Gives the terminal back the screen it was showing and the cursor it was
@@ -2739,20 +2578,13 @@ fn leave_terminal_display(output: &mut impl TerminalSink) -> std::io::Result<()>
 
 impl TerminalSession {
     fn enter() -> Result<Self> {
-        enable_raw_mode()?;
-        let mut output = TerminalOutput(stdout());
-        if let Err(error) = enter_terminal_display(&mut output) {
-            let _ = disable_raw_mode();
+        let mut platform = termina::PlatformTerminal::new()?;
+        platform.enter_raw_mode()?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(platform))?;
+        if let Err(error) = enter_terminal_display(&mut TerminalOutput(terminal.backend_mut())) {
             return Err(error.into());
         }
-        match Terminal::new(CrosstermBackend::new(output.0)) {
-            Ok(terminal) => Ok(Self { terminal }),
-            Err(error) => {
-                let _ = leave_terminal_display(&mut TerminalOutput(stdout()));
-                let _ = disable_raw_mode();
-                Err(error.into())
-            }
-        }
+        Ok(Self { terminal })
     }
 }
 
@@ -2762,29 +2594,23 @@ impl Drop for TerminalSession {
         {
             tracing::warn!("could not restore the terminal: {error}");
         }
-        if let Err(error) = disable_raw_mode() {
-            tracing::warn!("could not disable raw mode: {error}");
-        }
+        // The Termina writer restores its captured platform mode on drop.
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crossterm::{
-        Command,
-        event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers},
-    };
+    use crossterm::Command;
 
     use super::{
         Application, ApplicationEvent, DisableMouseButtonReporting, EnableMouseButtonReporting,
-        LateColorReplyFilter, PopModifiedKeyReporting, PushModifiedKeyReporting, TerminalSink,
-        copy_to_clipboard, enter_terminal_display, ignore_unsupported, leave_terminal_display,
+        PopModifiedKeyReporting, PushModifiedKeyReporting, TerminalSink, copy_to_clipboard,
+        enter_terminal_display, ignore_unsupported, leave_terminal_display,
         remote_failure_from_session_error,
     };
     use crate::{
         managed_client::{ManagedEvent, SessionStreamError},
         protocol::{EffectiveSettings, Outlook, RemoteStatus, SettingsSnapshot},
-        terminal::LateTerminalColorResponse,
     };
 
     #[test]
@@ -2876,129 +2702,6 @@ mod tests {
         assert_eq!(transcript, "\x1b]52;c;c3VydS12MS1leGFtcGxl\x07");
     }
 
-    #[test]
-    fn a_late_terminal_color_reply_never_becomes_reader_key_events() {
-        let key = |character, modifiers| {
-            InputEvent::Key(KeyEvent::new(KeyCode::Char(character), modifiers))
-        };
-        let mut filter = LateColorReplyFilter::new(LateTerminalColorResponse::AwaitingResponse);
-        let mut observed = Vec::new();
-        for event in std::iter::once(key(']', KeyModifiers::ALT))
-            .chain("11;rgb:ffff/ffff/ffff".chars().map(|character| {
-                key(
-                    character,
-                    if character.is_uppercase() {
-                        KeyModifiers::SHIFT
-                    } else {
-                        KeyModifiers::NONE
-                    },
-                )
-            }))
-            .chain(std::iter::once(key('\\', KeyModifiers::ALT)))
-        {
-            observed.extend(filter.push(event));
-        }
-
-        assert!(observed.is_empty());
-        assert_eq!(
-            filter.push(key('x', KeyModifiers::NONE)),
-            vec![key('x', KeyModifiers::NONE)],
-            "ordinary input after the late response is untouched"
-        );
-    }
-
-    #[test]
-    fn an_alt_bracket_that_is_not_a_color_reply_is_replayed_unchanged() {
-        let alt_bracket = InputEvent::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT));
-        let typed = InputEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-        let mut filter = LateColorReplyFilter::new(LateTerminalColorResponse::AwaitingResponse);
-
-        assert!(filter.push(alt_bracket.clone()).is_empty());
-        assert_eq!(filter.push(typed.clone()), vec![alt_bracket, typed]);
-    }
-
-    #[test]
-    fn a_color_reply_split_across_the_probe_budget_never_becomes_key_events() {
-        let key = |character| {
-            InputEvent::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
-        };
-        let mut filter = LateColorReplyFilter::new(LateTerminalColorResponse::Osc {
-            payload: "11;rgb:ff".to_owned(),
-            escape_terminator: false,
-        });
-        let mut observed = Vec::new();
-        for event in "/ff/ff"
-            .chars()
-            .map(key)
-            .chain(std::iter::once(InputEvent::Key(KeyEvent::new(
-                KeyCode::Char('g'),
-                KeyModifiers::CONTROL,
-            ))))
-        {
-            observed.extend(filter.push(event));
-        }
-
-        assert!(observed.is_empty());
-        assert_eq!(filter.push(key('x')), vec![key('x')]);
-    }
-
-    #[test]
-    fn a_split_st_terminator_finishes_the_late_color_reply() {
-        let key = |character| {
-            InputEvent::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
-        };
-        let mut filter = LateColorReplyFilter::new(LateTerminalColorResponse::Osc {
-            payload: "10;rgb:ffff/ffff/ffff".to_owned(),
-            escape_terminator: true,
-        });
-
-        assert!(filter.push(key('\\')).is_empty());
-        assert_eq!(filter.push(key('x')), vec![key('x')]);
-    }
-
-    #[test]
-    fn a_batched_palette_reply_larger_than_a_short_key_sequence_is_filtered() {
-        let key = |character, modifiers| {
-            InputEvent::Key(KeyEvent::new(KeyCode::Char(character), modifiers))
-        };
-        let mut payload = String::from("4");
-        for index in 0..16 {
-            payload.push_str(&format!(";{index};rgb:ffff/aaaa/0000"));
-        }
-        assert!(payload.len() > 64);
-        let mut filter = LateColorReplyFilter::new(LateTerminalColorResponse::AwaitingResponse);
-        let mut observed = filter.push(key(']', KeyModifiers::ALT));
-        for character in payload.chars() {
-            observed.extend(filter.push(key(character, KeyModifiers::NONE)));
-        }
-        observed.extend(filter.push(key('g', KeyModifiers::CONTROL)));
-
-        assert!(observed.is_empty());
-    }
-
-    #[test]
-    fn osc_shaped_input_passes_through_when_no_probe_was_sent() {
-        let key = |character, modifiers| {
-            InputEvent::Key(KeyEvent::new(KeyCode::Char(character), modifiers))
-        };
-        let input = [
-            key(']', KeyModifiers::ALT),
-            key('1', KeyModifiers::NONE),
-            key('1', KeyModifiers::NONE),
-            key(';', KeyModifiers::NONE),
-            key('g', KeyModifiers::CONTROL),
-        ];
-        let mut filter = LateColorReplyFilter::new(LateTerminalColorResponse::Disabled);
-
-        let observed = input
-            .iter()
-            .cloned()
-            .flat_map(|event| filter.push(event))
-            .collect::<Vec<_>>();
-
-        assert_eq!(observed, input);
-    }
-
     /// The screen has to be taken before the input features are turned on: a
     /// terminal that starts reporting mouse and paste input while the shell is
     /// still on screen delivers that input to whatever is running there.
@@ -3013,6 +2716,7 @@ mod tests {
                 "\x1b[?2004h", // bracketed paste
                 "\x1b[?1000h", // mouse button reporting
                 "\x1b[>1u",    // modified key reporting
+                "\x1b[?2031h", // terminal Theme updates
             ],
         );
         assert!(
@@ -3030,6 +2734,7 @@ mod tests {
         let positions = AnsiTranscript::positions(
             &transcript,
             &[
+                "\x1b[?2031l", // terminal Theme updates
                 "\x1b[<1u",    // modified key reporting
                 "\x1b[?1000l", // mouse button reporting
                 "\x1b[?2004l", // bracketed paste
@@ -3056,6 +2761,7 @@ mod tests {
             ("\x1b[?1000h", "\x1b[?1000l"),
             ("\x1b[?1006h", "\x1b[?1006l"),
             ("\x1b[>1u", "\x1b[<1u"),
+            ("\x1b[?2031h", "\x1b[?2031l"),
         ] {
             assert!(
                 entered.contains(enabled),
@@ -3067,8 +2773,7 @@ mod tests {
             );
         }
     }
-    /// Pins the sequence an ANSI terminal receives. Windows takes the console
-    /// API for mouse reporting instead, which the sibling tests cover.
+    /// Pins the input feature sequences every supported platform receives.
     #[test]
     fn terminal_input_capabilities_enable_mouse_and_modified_key_reporting() {
         let mut enabled = String::new();
@@ -3118,38 +2823,26 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
-    /// Windows reports mouse input as console records rather than the ANSI
-    /// replies the escape sequence asks for, so the escape sequence alone leaves
-    /// the TUI blind to clicks.
+    /// The owned Windows reader consumes VT bytes, so input features must ask
+    /// Windows Terminal for the same ANSI reports used on Unix.
     #[cfg(windows)]
     #[test]
-    fn mouse_reporting_uses_the_windows_console_api() {
+    fn input_features_use_virtual_terminal_sequences_on_windows() {
         assert!(
-            !EnableMouseButtonReporting.is_ansi_code_supported(),
-            "enabling mouse reporting bypassed the Windows console API"
+            EnableMouseButtonReporting.is_ansi_code_supported(),
+            "mouse reporting did not use the VT input stream"
         );
         assert!(
-            !DisableMouseButtonReporting.is_ansi_code_supported(),
-            "disabling mouse reporting bypassed the Windows console API"
+            DisableMouseButtonReporting.is_ansi_code_supported(),
+            "mouse reporting restoration did not use the VT input stream"
         );
-    }
-
-    /// crossterm forces its own `PushKeyboardEnhancementFlags` onto the Windows
-    /// console API, where the flags have no equivalent and the call can only
-    /// fail. Modified-key reporting has to keep asking the terminal instead.
-    #[cfg(windows)]
-    #[test]
-    fn modified_key_reporting_follows_the_terminals_own_ansi_support() {
-        let ansi = crossterm::ansi_support::supports_ansi();
-        assert_eq!(
+        assert!(
             PushModifiedKeyReporting.is_ansi_code_supported(),
-            ansi,
-            "enabling modified key reporting ignored the terminal's ANSI support"
+            "modified-key reporting did not use the VT input stream"
         );
-        assert_eq!(
+        assert!(
             PopModifiedKeyReporting.is_ansi_code_supported(),
-            ansi,
-            "restoring modified key reporting ignored the terminal's ANSI support"
+            "modified-key restoration did not use the VT input stream"
         );
     }
 }

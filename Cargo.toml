@@ -9,7 +9,7 @@ axum = "0.8.4"
 base64 = "0.22.1"
 blake3 = "1.8.2"
 clap = { version = "4.5.46", features = ["derive"] }
-crossterm = { version = "0.28.1", features = ["event-stream"] }
+crossterm = "0.28.1"
 dirs = "6.0.0"
 diesel = { version = "2", features = ["sqlite"] }
 diesel_migrations = "2"
@@ -30,6 +30,7 @@ shlex = "2"
 socket2 = "0.6.5"
 subtle = "2.6.1"
 tempfile = "3.21.0"
+termina = "0.4.0"
 time = { version = "0.3", features = ["formatting", "macros"] }
 tokio = { version = "1.47.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }

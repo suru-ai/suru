@@ -1153,9 +1153,9 @@ fn answer_cursor_position_report(shown: &[u8], terminal: &Mutex<Box<dyn std::io:
     let _ = terminal.flush();
 }
 
-/// Answers Suru's one-shot Unix palette probe with a complete light-terminal
-/// palette. The real pseudo-terminal is deliberately otherwise inert, so this
-/// is the terminal-emulator half of the startup boundary under test.
+/// Answers Suru's startup palette probe with a complete light-terminal palette.
+/// The real pseudo-terminal is deliberately otherwise inert, so this is the
+/// terminal-emulator half of the startup boundary under test.
 #[cfg(unix)]
 fn answer_terminal_color_queries(
     shown: &[u8],

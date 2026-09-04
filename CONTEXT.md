@@ -253,7 +253,7 @@ The named set of colors a Client paints its surfaces with, chosen as a Setting, 
 _Avoid_: Color scheme, skin, palette (for the user-facing choice)
 
 **System**:
-The Theme that paints with the terminal's own colors and leaves its background to the terminal, so Suru looks like whatever the terminal already is. It is the Theme every Client starts with.
+The Theme that paints with the terminal's own colors and leaves its background to the terminal, so Suru looks like whatever the terminal already is. When the terminal reports that its colors changed, a Client using System reads them again and repaints without restarting. It is the Theme every Client starts with.
 _Avoid_: Default theme, terminal theme, no theme
 
 **Code Block**:

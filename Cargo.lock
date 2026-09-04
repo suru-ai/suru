@@ -468,7 +468,6 @@ checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
  "bitflags 2.13.1",
  "crossterm_winapi",
- "futures-core",
  "mio",
  "parking_lot",
  "rustix 0.38.44",
@@ -2552,6 +2551,7 @@ dependencies = [
  "subtle",
  "sysinfo",
  "tempfile",
+ "termina",
  "time",
  "tokio",
  "tokio-rustls",
@@ -2648,6 +2648,19 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "termina"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "881a7f20ade48167027822c52a0aeca879afa3174b15c71997827826bce669f9"
+dependencies = [
+ "bitflags 2.13.1",
+ "parking_lot",
+ "rustix 1.1.4",
+ "signal-hook",
  "windows-sys 0.61.2",
 ]
 
