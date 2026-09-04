@@ -6,7 +6,7 @@ use std::path::Path;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Position, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
@@ -1818,7 +1818,9 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
 /// Paints each active row's Standing Rail over the column of padding at its
 /// left. The glyph and feedback foreground sit over the row's existing
 /// background, so focused rows keep their block while still saying what their
-/// work is doing. Settled rows contribute no span here.
+/// work is doing. Where the feedback colour is the focus block's own, the
+/// glyph takes the block's text foreground instead, so the Rail is never
+/// painted invisibly. Settled rows contribute no span here.
 ///
 /// Needs Intervention has no producer yet; issue #168
 /// (<https://github.com/jake-tucker/suru/issues/168>) tracks the Approval and Input labels that
@@ -1826,7 +1828,12 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
 fn paint_standing_rails(frame: &mut Frame<'_>, rails: &[StandingRail], column: u16, theme: &Theme) {
     let buffer = frame.buffer_mut();
     for rail in rails {
-        let style = rail.standing.presentation().feedback.style(theme);
+        let feedback = rail.standing.presentation().feedback.style(theme);
+        let style = if rail.focused && feedback.fg == theme.selection.focused.bg {
+            Style::default().fg(theme.selection.focused.fg.unwrap_or(Color::Reset))
+        } else {
+            feedback
+        };
         for row in rail.rows.clone() {
             if let Some(cell) = buffer.cell_mut(Position::new(column, row)) {
                 if rail.focused {
@@ -2562,7 +2569,9 @@ fn sidebar_row_style(row: SidebarRow<'_>, driving: bool, theme: &Theme) -> Optio
 ///
 /// Row focus supplies the background. A readable open Session patches the
 /// accent foreground over either base, while unreadable and recovering rows
-/// stay subdued so their warning is never disguised as ordinary work.
+/// stay subdued so their warning is never disguised as ordinary work. Where
+/// the accent is the focus block's own colour, the open Title keeps the
+/// block's text foreground instead of vanishing into it.
 fn sidebar_title_style(row: SidebarRow<'_>, highlight: Option<Style>, theme: &Theme) -> Style {
     let unavailable = row.unreadable || row.recovering;
     let style = highlight.unwrap_or(if unavailable {
@@ -2570,7 +2579,12 @@ fn sidebar_title_style(row: SidebarRow<'_>, highlight: Option<Style>, theme: &Th
     } else {
         theme.text.primary
     });
-    if row.open && !unavailable {
+    let accent_vanishes = theme
+        .selection
+        .open_title
+        .fg
+        .is_some_and(|fg| style.bg == Some(fg));
+    if row.open && !unavailable && !accent_vanishes {
         style.patch(theme.selection.open_title)
     } else {
         style

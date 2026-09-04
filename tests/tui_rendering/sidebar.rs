@@ -35,7 +35,7 @@ use suru::{
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
-        SessionListScope, SessionListSurface,
+        SessionListScope, SessionListSurface, TerminalColor, TerminalColorProbe, TerminalFacts,
     },
 };
 
@@ -2059,6 +2059,62 @@ fn a_working_row_that_is_open_and_focused_keeps_all_three_readings() {
     );
     let buffer = rendered_application_buffer(&application, WIDE, 20);
     assert_standing_rail(&buffer, title, Color::LightBlue, Color::Blue);
+}
+
+#[test]
+fn a_rail_whose_colour_is_the_focus_block_takes_the_blocks_text_colour_instead() {
+    // A probed terminal that reports no palette paints Working's info colour,
+    // the open Title's accent, and the focus block in the same fallback cyan,
+    // so a focused Working row would lose both its Rail and its Title into the
+    // block unless they borrowed the block's text foreground, which is the
+    // terminal background.
+    let workspace = workspace_dir();
+    let focused = SessionId::new();
+    let sessions = vec![
+        working(
+            listed_as(focused, "The work focused", workspace.path(), 2),
+            seconds_ago(90),
+        ),
+        working(
+            listed_as(SessionId::new(), "The work beside", workspace.path(), 1),
+            seconds_ago(90),
+        ),
+    ];
+    let mut application = sidebar_showing(workspace.path(), sessions.clone());
+    application.set_terminal_facts(TerminalFacts::new(
+        Some(TerminalColorProbe::new(
+            [None; 16],
+            Some(TerminalColor::new(220, 220, 220)),
+            Some(TerminalColor::new(20, 20, 20)),
+        )),
+        true,
+    ));
+    open_session(&mut application, workspace.path(), focused);
+    enter_the_sidebar(&mut application, sessions);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let focused_title = u16::try_from(rendered_row(&rows, "The work focused")).expect("a row");
+    let beside_title = u16::try_from(rendered_row(&rows, "The work beside")).expect("a row");
+    assert_standing_rail(&buffer, focused_title, Color::Rgb(20, 20, 20), Color::Cyan);
+    let title = buffer
+        .cell(text_position(&buffer, "The work focused"))
+        .expect("the focused open Title");
+    assert_eq!(
+        (title.fg, title.bg),
+        (Color::Rgb(20, 20, 20), Color::Cyan),
+        "and the open Title, whose accent is that same cyan, keeps the block's text colour too"
+    );
+    let beside = buffer
+        .cell((0, beside_title))
+        .expect("the unfocused Working row's Rail cell");
+    assert_eq!(beside.symbol(), "▎");
+    assert_eq!(
+        beside.fg,
+        Color::Cyan,
+        "the row without the keys keeps its Rail in the info colour"
+    );
+    assert_ne!(beside.bg, Color::Cyan, "over the Sidebar's own surface");
 }
 
 #[test]

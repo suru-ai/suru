@@ -134,8 +134,11 @@ pub(crate) struct MarkdownRoles {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SelectionRoles {
     /// The row the keys are on, drawn only while the surface holding it has
-    /// them. Every feedback foreground must remain legible against its
-    /// background because a Sidebar Rail is painted over this block.
+    /// them. It is a block in the accent colour with its own text foreground,
+    /// so it stands out from the surface behind it even where that surface is
+    /// already the element gray a menu is painted on. A Sidebar Rail painted
+    /// over this block falls back to this foreground where its feedback
+    /// colour would vanish into the block.
     pub(crate) focused: Style,
     /// The row a surface that has given the keys up would come back to, where
     /// that surface keeps one. The Sidebar keeps none: its row focus goes with
@@ -976,7 +979,7 @@ impl Theme {
                 list_marker: style(blue),
             },
             selection: SelectionRoles {
-                focused: style(background).bg(grays.element()),
+                focused: style(background).bg(primary),
                 unfocused: style(foreground).bg(grays.element()),
                 open_title: style(primary),
             },
@@ -1078,7 +1081,7 @@ impl Theme {
                 list_marker: style(list_marker),
             },
             selection: SelectionRoles {
-                focused: style(selected_text).bg(element),
+                focused: style(selected_text).bg(primary),
                 unfocused: style(text).bg(element),
                 open_title: style(accent),
             },
@@ -1313,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn every_built_in_keeps_open_and_feedback_foregrounds_legible_over_focus() {
+    fn every_built_in_keeps_the_focused_row_legible_over_its_block() {
         let mut themes = vec![("system", Theme::system())];
         for (name, source) in built_in_themes() {
             for variant in [ThemeVariant::Dark, ThemeVariant::Light] {
@@ -1339,18 +1342,25 @@ mod tests {
                 .focused
                 .bg
                 .unwrap_or_else(|| panic!("built-in Theme {name:?} has no focus background"));
-            for (role, feedback) in [
-                ("warning", theme.feedback.warning),
-                ("info", theme.feedback.info),
-                ("error", theme.feedback.error),
-                ("success", theme.feedback.success),
-            ] {
-                assert_ne!(
-                    feedback.fg,
-                    Some(focus),
-                    "built-in Theme {name:?} {role} foreground disappears over focus"
-                );
-            }
+            let text = theme
+                .selection
+                .focused
+                .fg
+                .unwrap_or_else(|| panic!("built-in Theme {name:?} has no focus foreground"));
+            assert_ne!(
+                text, focus,
+                "built-in Theme {name:?} paints the focused row's text in its own block colour"
+            );
+            assert_ne!(
+                Some(focus),
+                theme.surface.overlay.bg,
+                "built-in Theme {name:?} paints the focused row in the menu's own background"
+            );
+            assert_ne!(
+                Some(focus),
+                theme.surface.elevated.bg,
+                "built-in Theme {name:?} paints the focused row in the Sidebar's own background"
+            );
         }
     }
 }
