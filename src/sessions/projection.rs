@@ -6,7 +6,8 @@ use anyhow::anyhow;
 
 use crate::protocol::{
     PromptOrder, SessionCatalogChange, SessionChange, SessionId, SessionRevision, SessionSnapshot,
-    SessionStatus, SessionTimestamp, SessionUpdate, TurnId, TurnStatus, UsageTotal,
+    SessionStandingInputs, SessionStatus, SessionTimestamp, SessionUpdate, TurnId, TurnStatus,
+    UsageTotal,
 };
 use crate::session_projection::apply_update;
 use crate::storage::StorageSink;
@@ -47,6 +48,11 @@ impl SessionStoreState {
         // transition that changes it, but cannot inject a competing clock.
         changes.retain(|change| !matches!(change, SessionChange::SessionWorkingChanged { .. }));
         stamp_turn_timing(&mut changes, updated_at);
+        let turn_settled = changes.iter().any(|change| match change {
+            SessionChange::TurnAdded { turn } => turn.status.is_terminal(),
+            SessionChange::TurnStatusChanged { status, .. } => status.is_terminal(),
+            _ => false,
+        });
         let projected = self
             .sessions
             .get(&session_id)
@@ -62,6 +68,13 @@ impl SessionStoreState {
             .get_mut(&session_id)
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
         let update = record.commit(storage, session_id, changes, updated_at)?;
+        let standing_inputs = record.summary.standing_inputs;
+        if turn_settled && self.ancestry(session_id).announces(session_id) {
+            self.publish_catalog_change(SessionCatalogChange::StandingInputsChanged {
+                session_id,
+                inputs: standing_inputs,
+            });
+        }
         if working_changed && self.ancestry(session_id).announces(session_id) {
             self.publish_catalog_change(SessionCatalogChange::WorkingChanged {
                 session_id,
@@ -418,6 +431,7 @@ impl SessionRecord {
             .retain(|_, turn_id| !terminal_turns.contains(turn_id));
         self.snapshot = next;
         self.summary.session = self.snapshot.session.clone();
+        self.summary.standing_inputs = SessionStandingInputs::from_turns(&self.snapshot.turns);
         // `session.working_since` is deliberately left alone here: it carries
         // the whole subtree's reading, which only the state can derive, so
         // [`SessionStoreState::reconcile_working`] maintains it after every

@@ -8,8 +8,9 @@ use crate::support::{
 };
 use suru::{
     protocol::{
-        Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, MessageRole, PromptDelivery,
-        PromptId, SessionCatalogChange, SessionId, SessionListItem, TurnStatus,
+        Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, LatestTurnStatus, MessageRole,
+        PromptDelivery, PromptId, SessionCatalogChange, SessionId, SessionListItem,
+        SessionStandingInputs, TurnStatus,
     },
     provider::{ProviderEvent, ProviderSubagentId, ProviderSubagentStatus},
 };
@@ -179,8 +180,8 @@ async fn working_reads_from_the_subtree_until_the_last_subagent_settles() {
         .await;
 
     // The overlapping parent Turn and Subagent form one uninterrupted Working
-    // interval, so settling the Turn neither resets the clock nor announces a
-    // catalog change.
+    // interval, so settling the Turn does not reset its clock. The outcome is
+    // still announced while Working remains ahead of it in Standing.
     let listed = fixture
         .client
         .get(format!(
@@ -200,6 +201,18 @@ async fn working_reads_from_the_subtree_until_the_last_subagent_settles() {
         listed[0].working_since().is_some(),
         "the listing reads Working while the Subagent runs on"
     );
+    assert!(matches!(
+        crate::server_support::next_catalog_change(&mut catalog).await,
+        SessionCatalogChange::StandingInputsChanged {
+            session_id,
+            inputs: SessionStandingInputs {
+                latest_turn: Some(LatestTurnStatus {
+                    status: TurnStatus::Completed,
+                    settled_at: Some(_),
+                }),
+            },
+        } if session_id == fixture.session_id
+    ));
 
     // The last Subagent settling is the next Working change: it clears the
     // uninterrupted interval.

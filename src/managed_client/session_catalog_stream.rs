@@ -15,8 +15,8 @@ use crate::protocol::{
     Outlook, RuntimeDescriptor, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
     SKILL_CATALOG_UPDATED_EVENT, SessionCatalogChange, SessionCatalogRevision,
     SessionCatalogSnapshot, SessionCatalogUpdate, SessionCreated, SessionDeleted, SessionId,
-    SessionSettlementChanged, SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged,
-    SkillCatalog,
+    SessionSettlementChanged, SessionStandingInputsChanged, SessionTitleChanged,
+    SessionUsageChanged, SessionWorkingChanged, SkillCatalog,
 };
 
 use super::{
@@ -372,6 +372,14 @@ fn apply_update(
                 session_id,
                 working_since,
             }))
+        }
+        SessionCatalogChange::StandingInputsChanged { session_id, inputs } => {
+            if !known.contains(&session_id) {
+                bail!("Session catalog reported Standing on an unknown Session");
+            }
+            Ok(ManagedEvent::SessionStandingInputsChanged(
+                SessionStandingInputsChanged { session_id, inputs },
+            ))
         }
         SessionCatalogChange::UsageChanged {
             session_id,

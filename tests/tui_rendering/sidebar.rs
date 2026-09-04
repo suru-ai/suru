@@ -23,13 +23,15 @@ use ratatui::{buffer::Buffer, style::Color};
 use suru::{
     managed_client::{ManagedEvent, RecoveryStatus, SessionEvent},
     protocol::{
-        AutoSettle, EffectiveSettings, EmojiVisibility, Message, MessageId, MessageRole,
-        MessageStatus, ModelAvailability, Outlook, PromptId, Remote, RemoteStatus, ServerShutdown,
-        Session, SessionCatalogRevision, SessionCatalogSnapshot, SessionChange, SessionCreated,
-        SessionDeleted, SessionId, SessionListItem, SessionReference, SessionRevision,
-        SessionSettings, SessionSettlementChanged, SessionStatus, SessionSummary, SessionTimestamp,
+        AutoSettle, EffectiveSettings, EmojiVisibility, LatestTurnStatus, Message, MessageId,
+        MessageRole, MessageStatus, ModelAvailability, Outlook, PromptId, Remote, RemoteStatus,
+        ServerShutdown, Session, SessionCatalogRevision, SessionCatalogSnapshot, SessionChange,
+        SessionCreated, SessionDeleted, SessionId, SessionListItem, SessionReference,
+        SessionRevision, SessionSettings, SessionSettlementChanged, SessionStandingInputs,
+        SessionStandingInputsChanged, SessionStatus, SessionSummary, SessionTimestamp,
         SessionTitleChanged, SessionUpdate, SessionWorkingChanged, ShutdownReason, SidebarScope,
-        SidebarSettings, SidebarVisibility, TitleSettings, UnreadableSessionSummary, Workspace,
+        SidebarSettings, SidebarVisibility, TitleSettings, TurnStatus, UnreadableSessionSummary,
+        Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -296,6 +298,90 @@ fn a_working_active_row_draws_an_info_rail_and_an_idle_row_draws_none() {
     let idle_title = u16::try_from(rendered_row(&rows, "Waiting quietly")).expect("screen row");
     for row in idle_title - 1..=idle_title + 1 {
         assert_ne!(buffer.cell((0, row)).expect("idle Rail cell").symbol(), "▎");
+    }
+}
+
+#[test]
+fn latest_turn_outcomes_draw_failed_and_done_but_leave_interrupted_quiet() {
+    let workspace = workspace_dir();
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![
+            latest_turn(
+                listed("Failed work", None, workspace.path(), 3, now()),
+                TurnStatus::Failed,
+                now(),
+            ),
+            latest_turn(
+                listed("Completed work", None, workspace.path(), 2, now()),
+                TurnStatus::Completed,
+                now(),
+            ),
+            latest_turn(
+                listed("Stopped work", None, workspace.path(), 1, now()),
+                TurnStatus::Interrupted,
+                now(),
+            ),
+        ],
+    );
+
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let rows = crate::support::buffer_rows(&buffer);
+    let failed = u16::try_from(rendered_row(&rows, "Failed work")).expect("screen row");
+    assert_standing_rail(&buffer, failed, Color::Red, Color::Black);
+    assert!(sidebar_column(&rows[usize::from(failed - 1)]).ends_with("Failed"));
+    let done = u16::try_from(rendered_row(&rows, "Completed work")).expect("screen row");
+    assert_standing_rail(&buffer, done, Color::Green, Color::Black);
+    assert!(sidebar_column(&rows[usize::from(done - 1)]).ends_with("Done"));
+    let stopped = u16::try_from(rendered_row(&rows, "Stopped work")).expect("screen row");
+    for row in stopped - 1..=stopped + 1 {
+        assert_ne!(
+            buffer.cell((0, row)).expect("stopped Rail cell").symbol(),
+            "▎"
+        );
+    }
+    assert!(!sidebar_column(&rows[usize::from(stopped - 1)]).contains("Stopped"));
+}
+
+#[test]
+fn a_catalog_outcome_changes_the_row_in_place_and_new_work_takes_precedence() {
+    let workspace = workspace_dir();
+    for (status, word) in [
+        (TurnStatus::Completed, "Done"),
+        (TurnStatus::Failed, "Failed"),
+    ] {
+        let session_id = SessionId::new();
+        let mut application = sidebar_showing(
+            workspace.path(),
+            vec![listed_as(session_id, "Work elsewhere", workspace.path(), 1)],
+        );
+
+        let transition = standing_elsewhere(
+            &mut application,
+            session_id,
+            status,
+            SessionTimestamp(now()),
+        );
+        assert!(matches!(transition, ApplicationTransition::ListSessions(_)));
+        let rows = rendered_application_rows_at(&application, WIDE, 20);
+        let title = u16::try_from(rendered_row(&rows, "Work elsewhere")).expect("screen row");
+        assert!(sidebar_column(&rows[usize::from(title - 1)]).ends_with(word));
+        assert_eq!(
+            standing_rail_rows(&application),
+            vec![title - 1, title, title + 1]
+        );
+
+        work_elsewhere(
+            &mut application,
+            session_id,
+            Some(SessionTimestamp(seconds_ago(3))),
+        );
+        let rows = rendered_application_rows_at(&application, WIDE, 20);
+        let title = rendered_row(&rows, "Work elsewhere");
+        assert!(
+            sidebar_column(&rows[title - 1]).contains("Working"),
+            "a new Turn's Working reading stands ahead of the previous {word} outcome"
+        );
     }
 }
 
@@ -867,6 +953,7 @@ fn listed(
         title: title.to_owned(),
         emoji: emoji.map(str::to_owned),
         settled_at: None,
+        standing_inputs: Default::default(),
         total_usage: None,
         created_at: SessionTimestamp(created_at),
         updated_at: SessionTimestamp(updated_at),
@@ -2762,6 +2849,27 @@ fn work_elsewhere(
         .expect("take the Turn the catalog stream reported")
 }
 
+fn standing_elsewhere(
+    application: &mut Application,
+    session_id: SessionId,
+    status: TurnStatus,
+    settled_at: SessionTimestamp,
+) -> ApplicationTransition {
+    application
+        .handle_event(ApplicationEvent::Managed(
+            ManagedEvent::SessionStandingInputsChanged(SessionStandingInputsChanged {
+                session_id,
+                inputs: SessionStandingInputs {
+                    latest_turn: Some(LatestTurnStatus {
+                        status,
+                        settled_at: Some(settled_at),
+                    }),
+                },
+            }),
+        ))
+        .expect("take the Turn outcome the catalog stream reported")
+}
+
 /// A settlement another client made, arriving on the session-catalog stream,
 /// reporting whatever the Sidebar asks for in answer.
 fn settle_elsewhere(
@@ -2837,6 +2945,19 @@ fn working(session: SessionListItem, working_since: u64) -> SessionListItem {
     };
     summary.session.status = SessionStatus::Active;
     summary.session.working_since = Some(SessionTimestamp(working_since));
+    SessionListItem::Readable(summary)
+}
+
+fn latest_turn(session: SessionListItem, status: TurnStatus, settled_at: u64) -> SessionListItem {
+    let SessionListItem::Readable(mut summary) = session else {
+        unreachable!("the fixture builds a readable Session");
+    };
+    summary.standing_inputs = SessionStandingInputs {
+        latest_turn: Some(LatestTurnStatus {
+            status,
+            settled_at: Some(SessionTimestamp(settled_at)),
+        }),
+    };
     SessionListItem::Readable(summary)
 }
 
@@ -4902,6 +5023,59 @@ fn a_remote_catalog_change_updates_only_that_origins_rows() {
     assert!(drawn_in_sidebar(&rows, "Local title"));
     assert!(drawn_in_sidebar(&rows, "Retitled remotely [studio]"));
     assert!(!drawn_in_sidebar(&rows, "Remote title"));
+}
+
+#[test]
+fn a_remote_turn_outcome_lights_that_outlooks_row_in_place() {
+    let workspace = workspace_dir();
+    let shared_id = SessionId::new();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let EverywhereListing { requests, .. } = choose_everywhere(
+        &mut application,
+        vec![remote("studio", RemoteStatus::Available)],
+    );
+    for request in requests {
+        let title = match request.outlook() {
+            Outlook::Local => "Local work",
+            Outlook::Remote(_) => "Remote work",
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed {
+                request,
+                sessions: vec![listed_as(shared_id, title, workspace.path(), 1)],
+            })
+            .expect("load both Origin-local rows");
+    }
+
+    let transition = application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::SessionStandingInputsChanged(SessionStandingInputsChanged {
+                session_id: shared_id,
+                inputs: SessionStandingInputs {
+                    latest_turn: Some(LatestTurnStatus {
+                        status: TurnStatus::Failed,
+                        settled_at: Some(SessionTimestamp(now())),
+                    }),
+                },
+            }),
+        })
+        .expect("take the Remote Turn outcome");
+
+    let ApplicationTransition::ListSessions(request) = transition else {
+        panic!("the Remote outcome catches up its Origin");
+    };
+    assert_eq!(request.outlook(), &Outlook::Remote("studio".to_owned()));
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let rows = crate::support::buffer_rows(&buffer);
+    let remote = u16::try_from(rendered_row(&rows, "Remote work")).expect("screen row");
+    assert_standing_rail(&buffer, remote, Color::Red, Color::Black);
+    assert!(sidebar_column(&rows[usize::from(remote - 1)]).ends_with("Failed"));
+    let local = u16::try_from(rendered_row(&rows, "Local work")).expect("screen row");
+    assert_ne!(
+        buffer.cell((0, local)).expect("local Rail cell").symbol(),
+        "▎"
+    );
 }
 
 #[test]

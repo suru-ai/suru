@@ -1016,7 +1016,8 @@ impl TuiState {
             // The picker takes nothing in place: it draws no Working label, so
             // what the change carries is nothing it shows — and it asks for a
             // fresh listing every time it opens.
-            ManagedEvent::SessionWorkingChanged(_) => {}
+            ManagedEvent::SessionWorkingChanged(_)
+            | ManagedEvent::SessionStandingInputsChanged(_) => {}
             // Neither listing surface states a Session's total yet — the
             // footer of the Session in view reads its own — so the roll-up
             // the catalog announces moves nothing this client draws.
@@ -1064,6 +1065,9 @@ impl TuiState {
                 working.session_id,
                 working.working_since,
             ),
+            ManagedEvent::SessionStandingInputsChanged(changed) => self
+                .sidebar
+                .set_standing_inputs_origin(outlook.clone(), changed.session_id, changed.inputs),
             ManagedEvent::SessionCatalogReconciled(snapshot) => self
                 .sidebar
                 .retain_origin_catalog(outlook.clone(), &snapshot.session_ids),
@@ -1089,6 +1093,7 @@ impl TuiState {
         match event {
             ManagedEvent::SessionCreated(_)
             | ManagedEvent::SessionWorkingChanged(_)
+            | ManagedEvent::SessionStandingInputsChanged(_)
             | ManagedEvent::SessionUsageChanged(_) => {}
             ManagedEvent::SessionDeleted(deleted) => self
                 .session_picker

@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 
 use crate::protocol::{
     AgentIdentity, PromptOrder, Session, SessionId, SessionRevision, SessionSnapshot,
-    SessionStatus, SessionSummary, Turn, TurnId, TurnStatus,
+    SessionStandingInputs, SessionStatus, SessionSummary, Turn, TurnId, TurnStatus,
 };
 
 use super::{SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore};
@@ -90,6 +90,7 @@ impl SessionStore {
             // derives it a Title, so no Emoji ever arrives beside one.
             emoji: None,
             settled_at: None,
+            standing_inputs: SessionStandingInputs::from_turns(&snapshot.turns),
             total_usage: snapshot.total_usage(),
             created_at: timestamp,
             updated_at: timestamp,

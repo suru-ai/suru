@@ -12,10 +12,10 @@ use suru::{
     managed_client::SessionEvent,
     protocol::{
         Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelectionOperationId, Cost,
-        CostBasis, CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId, SessionError,
-        SessionErrorCode, SessionId, SessionListItem, SessionRevision, SessionSnapshot,
-        SessionStatus, SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan, TurnStatus,
-        UpdateAgentSelectionRequest, Usage, Workspace,
+        CostBasis, CreateSessionRequest, InitialPrompt, LatestTurnStatus, PromptDelivery, PromptId,
+        SessionError, SessionErrorCode, SessionId, SessionListItem, SessionRevision,
+        SessionSnapshot, SessionStatus, SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan,
+        TurnStatus, UpdateAgentSelectionRequest, Usage, Workspace,
     },
     provider::{MeteredCost, ProviderActivityId, ProviderCommandStatus, ProviderEvent},
     server::{self, ServerConfig},
@@ -945,6 +945,29 @@ async fn turn_timing_survives_a_restart_and_a_session_stored_before_it_stays_rea
     assert_eq!(
         reopened.turns, completed.turns,
         "Turn timing survives a restart"
+    );
+    let listing = client
+        .get(format!("{}/v1/sessions", restarted.descriptor().base_url))
+        .bearer_auth(&restarted.descriptor().token)
+        .send()
+        .await
+        .expect("list Sessions after restart")
+        .error_for_status()
+        .expect("restored listing succeeds")
+        .json::<Vec<SessionListItem>>()
+        .await
+        .expect("decode restored listing");
+    assert_eq!(
+        listing[0]
+            .readable()
+            .expect("the restored Session remains readable")
+            .standing_inputs
+            .latest_turn,
+        Some(LatestTurnStatus {
+            status: TurnStatus::Completed,
+            settled_at: completed.turns[0].settled_at,
+        }),
+        "the restored listing derives its latest Turn reading from durable Turns"
     );
     restarted.shutdown().await.expect("stop restarted server");
 

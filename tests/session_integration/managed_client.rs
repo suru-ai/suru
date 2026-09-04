@@ -259,6 +259,16 @@ async fn managed_clients_observe_durable_session_deletion() {
         Some(ManagedEvent::SessionCreated(SessionCreated { session_id })),
         "a Session one client made is announced to every other client listing Sessions"
     );
+    assert!(matches!(
+        timeout(Duration::from_secs(1), observing_client.next())
+            .await
+            .expect("the failed Turn outcome reaches the connected client"),
+        Some(ManagedEvent::SessionStandingInputsChanged(changed))
+            if changed.session_id == session_id
+                && changed.inputs.latest_turn.is_some_and(|latest| {
+                    latest.status == TurnStatus::Failed && latest.settled_at.is_some()
+                })
+    ));
 
     deleting_client
         .delete_session(session_id)

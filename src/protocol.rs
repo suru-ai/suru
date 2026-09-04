@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 29;
+pub const PROTOCOL_VERSION: u32 = 30;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
@@ -1551,6 +1551,42 @@ impl Session {
     }
 }
 
+/// The latest Turn facts a Session listing needs to derive its Standing. The
+/// status and Settle moment travel together so a client never combines facts
+/// from different Turns.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LatestTurnStatus {
+    pub status: TurnStatus,
+    pub settled_at: Option<SessionTimestamp>,
+}
+
+/// The server facts from which a listed Session's Standing is derived. Kept as
+/// one value so every catalog change replaces the reading whole; the Viewed
+/// moment introduced by issue #254 can join `latest_turn` here.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionStandingInputs {
+    #[serde(default)]
+    pub latest_turn: Option<LatestTurnStatus>,
+}
+
+impl SessionStandingInputs {
+    pub(crate) fn from_turns(turns: &[Turn]) -> Self {
+        Self {
+            latest_turn: turns.last().map(|turn| LatestTurnStatus {
+                status: turn.status,
+                settled_at: turn.settled_at,
+            }),
+        }
+    }
+
+    pub(crate) fn latest_turn_settled_as(self, status: TurnStatus) -> bool {
+        self.latest_turn
+            .is_some_and(|latest| latest.status == status && latest.settled_at.is_some())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSummary {
@@ -1571,6 +1607,11 @@ pub struct SessionSummary {
     /// much as the fact of it.
     #[serde(default)]
     pub settled_at: Option<SessionTimestamp>,
+    /// The latest Turn facts used to derive this Session's Standing, and no
+    /// latest Turn for a Session whose first Prompt has not begun one. Derived
+    /// from the Turns rather than stored beside them, just like Working.
+    #[serde(default)]
+    pub standing_inputs: SessionStandingInputs,
     /// What this Session and its Subagent subtree have consumed together, and
     /// `None` where nothing has reported anything — which is every Session
     /// stored before Usage recording.
@@ -1727,6 +1768,13 @@ pub enum SessionCatalogChange {
     WorkingChanged {
         session_id: SessionId,
         working_since: Option<SessionTimestamp>,
+    },
+    /// The inputs from which a listed Session's Standing is read changed when
+    /// its latest Turn Settled. It carries the reading whole so every client
+    /// can revise its listing in place without asking for it again first.
+    StandingInputsChanged {
+        session_id: SessionId,
+        inputs: SessionStandingInputs,
     },
     /// A Session's total — its own Turns and its Subagent subtree together —
     /// moved. It rides the catalog stream for the same reason Working does:
@@ -2586,6 +2634,15 @@ pub struct SessionSettlementChanged {
 pub struct SessionWorkingChanged {
     pub session_id: SessionId,
     pub working_since: Option<SessionTimestamp>,
+}
+
+/// A Session's complete Standing input, carried to a client that may be
+/// listing that Session without having it open.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionStandingInputsChanged {
+    pub session_id: SessionId,
+    pub inputs: SessionStandingInputs,
 }
 
 /// A Session's total Usage — its own Turns and its Subagent subtree together

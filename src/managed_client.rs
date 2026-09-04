@@ -20,9 +20,9 @@ use crate::{
         PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest, Remote, RemoteHealth,
         ResolveWorkspaceRequest, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
         SessionCreated, SessionDeleted, SessionError, SessionId, SessionListItem,
-        SessionSettlementChanged, SessionSnapshot, SessionSummary, SessionTitleChanged,
-        SessionUsageChanged, SessionWorkingChanged, SettingMutation, SettingsSnapshot,
-        SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
+        SessionSettlementChanged, SessionSnapshot, SessionStandingInputsChanged, SessionSummary,
+        SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged, SettingMutation,
+        SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
         UpdateAgentSelectionRequest,
     },
 };
@@ -184,6 +184,9 @@ pub enum ManagedEvent {
     /// change, and for the same reason: every client lists the Session, and
     /// only some have it open.
     SessionWorkingChanged(SessionWorkingChanged),
+    /// A Session's latest Turn Settled, replacing the facts from which every
+    /// client derives its Sidebar Standing.
+    SessionStandingInputsChanged(SessionStandingInputsChanged),
     /// A Session's total Usage moved, its own Turns and its Subagent subtree
     /// counted together. It arrives on the same terms as a Working change, so
     /// a client listing Sessions it has never opened can state what each of
@@ -225,6 +228,7 @@ impl ManagedEvent {
                 | Self::SessionTitleChanged(_)
                 | Self::SessionSettlementChanged(_)
                 | Self::SessionWorkingChanged(_)
+                | Self::SessionStandingInputsChanged(_)
                 | Self::SessionCatalogReconciled(_)
         )
     }

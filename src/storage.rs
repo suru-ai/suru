@@ -422,6 +422,7 @@ fn load_session(
     };
     // Working is reconstructed across the complete Session tree after every
     // stored Session has been loaded; one row cannot see that subtree here.
+    summary.standing_inputs = crate::protocol::SessionStandingInputs::from_turns(&snapshot.turns);
     summary.total_usage = snapshot.total_usage();
     Ok(PersistedSession {
         summary,

@@ -227,6 +227,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         title: "Explain this workspace".to_owned(),
         emoji: Some("\u{1F5FA}\u{FE0F}".to_owned()),
         settled_at: Some(SessionTimestamp(1_755_497_600_999)),
+        standing_inputs: Default::default(),
         total_usage: Some(UsageTotal {
             fresh_input_tokens: Some(1_200),
             cache_read_tokens: Some(300),
@@ -243,6 +244,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         "title": "Explain this workspace",
         "emoji": "\u{1F5FA}\u{FE0F}",
         "settled_at": 1_755_497_600_999_u64,
+        "standing_inputs": { "latest_turn": null },
         "working_since": 1_755_497_600_100_u64,
         "total_usage": {
             "fresh_input_tokens": 1_200,

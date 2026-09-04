@@ -393,9 +393,9 @@ async fn child_sessions_join_no_listing_and_ride_no_catalog_stream() {
         "the catalog stream's own snapshot carries no child either"
     );
 
-    // Drive commits into the child — content, then its settle — and then one
-    // parent-visible change. The parent's is the first the stream announces,
-    // which is what proves the child's commits rode no catalog stream.
+    // Drive commits into the child — content, then its settle — and then the
+    // parent Turn's own outcome. That parent's Standing is the first change
+    // announced, which proves the child's commits rode no catalog stream.
     fixture
         .provider_session
         .emit_attributed_and_wait_until_observed(
@@ -418,13 +418,18 @@ async fn child_sessions_join_no_listing_and_ride_no_catalog_stream() {
         })
         .await;
     fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+    assert!(matches!(
+        crate::server_support::next_catalog_change(&mut catalog).await,
+        SessionCatalogChange::StandingInputsChanged { session_id, .. }
+            if session_id == fixture.session_id
+    ));
     assert_eq!(
         crate::server_support::next_catalog_change(&mut catalog).await,
         SessionCatalogChange::WorkingChanged {
             session_id: fixture.session_id,
             working_since: None,
         },
-        "the first announced change is the parent's own settle"
+        "the parent Turn's settle then clears the listed root's Working reading"
     );
 
     drop(fixture.provider_session);
@@ -502,6 +507,15 @@ async fn working_duration_stays_continuous_when_only_subagents_remain() {
         summary.session.working_since,
         Some(started_at),
         "the Sidebar and open Session share one continuous Working clock"
+    );
+    assert_eq!(
+        summary
+            .standing_inputs
+            .latest_turn
+            .expect("the settled parent Turn is the latest Turn")
+            .status,
+        TurnStatus::Completed,
+        "the outcome is present but Working still takes precedence while the Subagent lives"
     );
 
     drop(fixture.provider_session);

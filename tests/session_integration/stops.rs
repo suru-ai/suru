@@ -171,8 +171,9 @@ async fn interrupting_with_no_turn_active_stops_every_subagent_and_clears_workin
                     session_id,
                     working_since: None,
                 } if session_id == fixture.session_id => return,
-                SessionCatalogChange::WorkingChanged { .. } => {}
-                other => panic!("only Working moves here, got {other:?}"),
+                SessionCatalogChange::WorkingChanged { .. }
+                | SessionCatalogChange::StandingInputsChanged { .. } => {}
+                other => panic!("only work and its Standing move here, got {other:?}"),
             }
         }
     })

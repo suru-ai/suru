@@ -311,13 +311,20 @@ async fn settlement_changes_are_announced_on_the_session_catalog_stream() {
         .await
         .settled_at
         .expect("settling stamps the moment it happened");
-    assert_eq!(
-        next_catalog_change(&mut catalog).await,
-        SessionCatalogChange::SettlementChanged {
-            session_id: created,
-            settled_at: Some(marked_at),
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if next_catalog_change(&mut catalog).await
+                == (SessionCatalogChange::SettlementChanged {
+                    session_id: created,
+                    settled_at: Some(marked_at),
+                })
+            {
+                return;
+            }
         }
-    );
+    })
+    .await
+    .expect("the Session settlement change follows any Turn settlement changes");
 
     // Saying it twice changes nothing, so it announces nothing: the very next
     // change on the stream is the one that follows it.

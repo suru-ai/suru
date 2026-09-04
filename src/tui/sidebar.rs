@@ -12,8 +12,8 @@ use ratatui::layout::Position;
 
 use crate::protocol::{
     AutoSettle, EffectiveSettings, EmojiVisibility, Outlook, Remote, ResolveWorkspaceRequest,
-    SessionId, SessionListItem, SessionReference, SessionTimestamp,
-    SidebarScope as InitialSidebarScope, SidebarVisibility,
+    SessionId, SessionListItem, SessionReference, SessionStandingInputs as ListedStandingInputs,
+    SessionTimestamp, SidebarScope as InitialSidebarScope, SidebarVisibility,
 };
 
 use super::{
@@ -354,9 +354,8 @@ pub(super) enum SessionStanding {
     Done,
 }
 
-/// The facts from which a Session's Standing is read. Only `working` has a
-/// producer today; the remaining inputs reserve their place so adding them
-/// changes this reading instead of either of its presentations.
+/// The facts from which a Session's Standing is read. Needs Intervention is
+/// reserved; the remaining inputs come from the Session listing.
 #[derive(Clone, Copy, Debug, Default)]
 struct StandingInputs {
     needs_intervention: bool,
@@ -1586,6 +1585,16 @@ impl Sidebar {
             .set_working_origin(outlook, session_id, working_since);
     }
 
+    pub(super) fn set_standing_inputs_origin(
+        &mut self,
+        outlook: Outlook,
+        session_id: SessionId,
+        standing_inputs: ListedStandingInputs,
+    ) {
+        self.listing
+            .set_standing_inputs_origin(outlook, session_id, standing_inputs);
+    }
+
     pub(super) fn remove_origin(&mut self, outlook: Outlook, session_id: SessionId) {
         let before = self.focus_order_before_change();
         self.listing.remove_origin(outlook, session_id);
@@ -2044,6 +2053,16 @@ impl Sidebar {
                     open,
                     session_standing(StandingInputs {
                         working: session.working_since().is_some(),
+                        failed: session.readable().is_some_and(|summary| {
+                            summary
+                                .standing_inputs
+                                .latest_turn_settled_as(crate::protocol::TurnStatus::Failed)
+                        }),
+                        done: session.readable().is_some_and(|summary| {
+                            summary
+                                .standing_inputs
+                                .latest_turn_settled_as(crate::protocol::TurnStatus::Completed)
+                        }),
                         ..StandingInputs::default()
                     }),
                     SidebarShelf::Active {
@@ -3435,6 +3454,7 @@ mod tests {
             title: title.to_owned(),
             emoji: None,
             settled_at: None,
+            standing_inputs: Default::default(),
             total_usage: None,
             created_at: SessionTimestamp(created_at),
             updated_at: SessionTimestamp(updated_at),

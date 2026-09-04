@@ -1820,9 +1820,9 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
 /// background, so focused rows keep their block while still saying what their
 /// work is doing. Settled rows contribute no span here.
 ///
-/// Needs Intervention, Failed, and Done have no producer yet; issue #251
-/// (<https://github.com/jake-tucker/suru/issues/251>) defines their eventual inputs and issue #168
-/// (<https://github.com/jake-tucker/suru/issues/168>) tracks the labels they will bring with them.
+/// Needs Intervention has no producer yet; issue #168
+/// (<https://github.com/jake-tucker/suru/issues/168>) tracks the Approval and Input labels that
+/// will eventually feed it.
 fn paint_standing_rails(frame: &mut Frame<'_>, rails: &[StandingRail], column: u16, theme: &Theme) {
     let buffer = frame.buffer_mut();
     for rail in rails {
@@ -2387,8 +2387,8 @@ fn sidebar_settled_row_line(
 /// the compact time since the Session last moved, which is what a row says
 /// when there is nothing louder to say.
 ///
-/// The complete Standing inputs arrive under issue #251
-/// (<https://github.com/jake-tucker/suru/issues/251>). Approval and Input remain tied to the
+/// Viewed joins the Standing inputs under issue #254
+/// (<https://github.com/jake-tucker/suru/issues/254>). Approval and Input remain tied to the
 /// reserved Needs Intervention variant under issue #168
 /// (<https://github.com/jake-tucker/suru/issues/168>).
 fn sidebar_active_slot(

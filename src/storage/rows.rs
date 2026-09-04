@@ -17,8 +17,8 @@ use crate::{
         CostBasis, FileChange, Message, MessageId, MessageRole, MessageStatus, ModelId,
         ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue, Prompt,
         PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session, SessionId,
-        SessionRevision, SessionSummary, SessionTimestamp, SkillInvocation, TranscriptItem, Turn,
-        TurnId, TurnStatus, UnreadableSessionSummary, Usage, Workspace,
+        SessionRevision, SessionStandingInputs, SessionSummary, SessionTimestamp, SkillInvocation,
+        TranscriptItem, Turn, TurnId, TurnStatus, UnreadableSessionSummary, Usage, Workspace,
     },
     provider::ProviderResumeState,
 };
@@ -325,6 +325,7 @@ impl SessionRow {
                 .map(|settled_at| i64_to_u64(&session_id, "settled_at", settled_at))
                 .transpose()?
                 .map(SessionTimestamp),
+            standing_inputs: SessionStandingInputs::default(),
             total_usage: None,
             created_at: SessionTimestamp(i64_to_u64(&session_id, "created_at", self.created_at)?),
             updated_at: SessionTimestamp(i64_to_u64(&session_id, "updated_at", self.updated_at)?),

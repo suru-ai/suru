@@ -13,11 +13,12 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection,
-        CreateSessionRequest, FileChange, InitialPrompt, MessageRole, MessageStatus, ModelId,
-        PromptDelivery, PromptId, PromptStatus, ProviderId, SessionCatalogChange, SessionChange,
-        SessionError, SessionErrorCode, SessionId, SessionListItem, SessionRevision,
-        SessionSnapshot, SessionStatus, SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan,
-        TranscriptItem, TurnStatus, Workspace,
+        CreateSessionRequest, FileChange, InitialPrompt, LatestTurnStatus, MessageRole,
+        MessageStatus, ModelId, PromptDelivery, PromptId, PromptStatus, ProviderId,
+        SessionCatalogChange, SessionChange, SessionError, SessionErrorCode, SessionId,
+        SessionListItem, SessionRevision, SessionSnapshot, SessionStandingInputs, SessionStatus,
+        SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan, TranscriptItem, TurnStatus,
+        Workspace,
     },
     provider::{
         ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderEventAttribution,
@@ -1748,15 +1749,24 @@ async fn turn_timing_spans_the_delivery_commit_and_every_settle_path() {
 
     let mut started = Vec::new();
     let mut settled = Vec::new();
-    for (prompt_text, settle) in [
-        ("Complete this Turn", ProviderEvent::TurnCompleted),
+    for (prompt_text, expected_status, settle) in [
+        (
+            "Complete this Turn",
+            TurnStatus::Completed,
+            ProviderEvent::TurnCompleted,
+        ),
         (
             "Fail this Turn",
+            TurnStatus::Failed,
             ProviderEvent::TurnFailed {
                 message: "the Provider gave up".to_owned(),
             },
         ),
-        ("Interrupt this Turn", ProviderEvent::TurnInterrupted),
+        (
+            "Interrupt this Turn",
+            TurnStatus::Interrupted,
+            ProviderEvent::TurnInterrupted,
+        ),
     ] {
         if !started.is_empty() {
             client
@@ -1798,17 +1808,27 @@ async fn turn_timing_spans_the_delivery_commit_and_every_settle_path() {
         provider_session.next_turn().await.succeed();
         provider_session.emit(settle);
         let settlement = next_session_update(&mut feed).await;
-        settled.push(
-            settlement
-                .changes
-                .iter()
-                .find_map(|change| match change {
-                    SessionChange::TurnStatusChanged { settled_at, .. } => {
-                        Some(settled_at.expect("the settle commit stamps when the Turn settled"))
-                    }
-                    _ => None,
-                })
-                .expect("settling a Turn changes its status"),
+        let settled_at = settlement
+            .changes
+            .iter()
+            .find_map(|change| match change {
+                SessionChange::TurnStatusChanged { settled_at, .. } => {
+                    Some(settled_at.expect("the settle commit stamps when the Turn settled"))
+                }
+                _ => None,
+            })
+            .expect("settling a Turn changes its status");
+        settled.push(settled_at);
+        assert_eq!(
+            listed_summary(&mut client, created.session.id)
+                .await
+                .standing_inputs
+                .latest_turn,
+            Some(LatestTurnStatus {
+                status: expected_status,
+                settled_at: Some(settled_at),
+            }),
+            "the listing reports the latest Turn's terminal status and Settle moment"
         );
     }
 
@@ -1884,6 +1904,14 @@ async fn a_listed_summary_says_when_its_running_turn_began_and_stops_once_it_set
         })
         .await
         .expect("create Session");
+    assert_eq!(
+        listed_summary(&mut client, created.session.id)
+            .await
+            .standing_inputs
+            .latest_turn,
+        None,
+        "a Session whose pending Prompt has not begun a Turn has no latest Turn reading"
+    );
     let mut feed = client
         .subscribe_session(created.session.id)
         .await
@@ -1924,16 +1952,40 @@ async fn a_listed_summary_says_when_its_running_turn_began_and_stops_once_it_set
         "a listing says live work has been running since its Turn began, \
          which is what a client draws a Working duration from"
     );
+    assert_eq!(
+        running.standing_inputs.latest_turn,
+        Some(LatestTurnStatus {
+            status: TurnStatus::Active,
+            settled_at: None,
+        }),
+        "the latest Turn reading is derived while that Turn is still active"
+    );
 
     provider_session.next_turn().await.succeed();
     provider_session.emit(ProviderEvent::TurnCompleted);
-    next_session_update(&mut feed).await;
+    let settlement = next_session_update(&mut feed).await;
+    let settled_at = settlement
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            SessionChange::TurnStatusChanged { settled_at, .. } => *settled_at,
+            _ => None,
+        })
+        .expect("the settle commit stamps the completed Turn");
 
     let done = listed_summary(&mut client, created.session.id).await;
     assert_eq!(done.session.status, SessionStatus::Idle);
     assert_eq!(
         done.session.working_since, None,
         "a settled Turn leaves nothing running to say how long about"
+    );
+    assert_eq!(
+        done.standing_inputs.latest_turn,
+        Some(LatestTurnStatus {
+            status: TurnStatus::Completed,
+            settled_at: Some(settled_at),
+        }),
+        "the listing reports how its latest Turn settled"
     );
     assert!(
         done.updated_at > running.updated_at,
@@ -2029,7 +2081,28 @@ async fn turn_liveness_is_announced_on_the_session_catalog_stream() {
 
     provider_session.next_turn().await.succeed();
     provider_session.emit(ProviderEvent::TurnCompleted);
-    next_session_update(&mut feed).await;
+    let settlement = next_session_update(&mut feed).await;
+    let settled_at = settlement
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            SessionChange::TurnStatusChanged { settled_at, .. } => *settled_at,
+            _ => None,
+        })
+        .expect("the settle commit stamps the completed Turn");
+    assert_eq!(
+        next_catalog_change(&mut catalog).await,
+        SessionCatalogChange::StandingInputsChanged {
+            session_id,
+            inputs: SessionStandingInputs {
+                latest_turn: Some(LatestTurnStatus {
+                    status: TurnStatus::Completed,
+                    settled_at: Some(settled_at),
+                }),
+            },
+        },
+        "a Turn settling announces the whole Standing input to every client"
+    );
     assert_eq!(
         next_catalog_change(&mut catalog).await,
         SessionCatalogChange::WorkingChanged {

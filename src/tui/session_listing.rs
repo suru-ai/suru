@@ -10,8 +10,8 @@ use std::{
 };
 
 use crate::protocol::{
-    Outlook, Remote, RemoteStatus, SessionId, SessionListItem, SessionReference, SessionSummary,
-    SessionTimestamp,
+    Outlook, Remote, RemoteStatus, SessionId, SessionListItem, SessionReference,
+    SessionStandingInputs, SessionSummary, SessionTimestamp,
 };
 
 use super::{SessionListRequest, SessionListScope, SessionListSurface};
@@ -349,6 +349,20 @@ impl SessionListing {
     ) {
         if let Some(summary) = self.readable_mut(&outlook, session_id) {
             summary.session.working_since = working_since;
+        }
+    }
+
+    /// Replaces the server facts from which this Session's Standing is read.
+    /// The catalog carries them whole so a row already drawn can change its
+    /// Rail and right slot before the catch-up listing arrives.
+    pub(super) fn set_standing_inputs_origin(
+        &mut self,
+        outlook: Outlook,
+        session_id: SessionId,
+        standing_inputs: SessionStandingInputs,
+    ) {
+        if let Some(summary) = self.readable_mut(&outlook, session_id) {
+            summary.standing_inputs = standing_inputs;
         }
     }
 
@@ -1005,6 +1019,7 @@ mod tests {
             title: title.to_owned(),
             emoji: None,
             settled_at: None,
+            standing_inputs: Default::default(),
             total_usage: None,
             created_at: SessionTimestamp(1),
             updated_at: SessionTimestamp(updated_at),
