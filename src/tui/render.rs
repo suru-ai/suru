@@ -2387,9 +2387,8 @@ fn sidebar_settled_row_line(
 /// the compact time since the Session last moved, which is what a row says
 /// when there is nothing louder to say.
 ///
-/// Viewed joins the Standing inputs under issue #254
-/// (<https://github.com/jake-tucker/suru/issues/254>). Approval and Input remain tied to the
-/// reserved Needs Intervention variant under issue #168
+/// Viewed suppresses settled outcomes already seen by any Client. Approval and
+/// Input remain tied to the reserved Needs Intervention variant under issue #168
 /// (<https://github.com/jake-tucker/suru/issues/168>).
 fn sidebar_active_slot(
     standing: Option<SessionStanding>,

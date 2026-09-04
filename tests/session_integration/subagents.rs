@@ -14,7 +14,8 @@ use suru::{
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, MessageRole, PromptDelivery,
         PromptId, SessionCatalogChange, SessionChange, SessionError, SessionErrorCode,
-        SessionListItem, SessionRevision, SessionSnapshot, TurnStatus,
+        SessionListItem, SessionRevision, SessionSnapshot, TurnStatus, ViewSessionOperationId,
+        ViewSessionRequest,
     },
     provider::{
         ProviderActivityId, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
@@ -99,6 +100,84 @@ async fn a_spawn_opens_a_subagent_row_in_the_parent_and_a_child_session_with_a_p
     );
     assert!(child.messages.is_empty());
     assert!(child.activities.is_empty());
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn viewing_a_subagent_session_is_refused_without_changing_its_parent() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-viewed-test").await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: ProviderSubagentId::new("viewed-child"),
+            name: "Reader".to_owned(),
+            description: "Inspect the child".to_owned(),
+        })
+        .await;
+    let parent = read_session_at_least_revision(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        SessionRevision(4),
+    )
+    .await;
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&parent)
+    else {
+        unreachable!()
+    };
+
+    let response = fixture
+        .client
+        .post(format!(
+            "{}/v1/sessions/{child_id}/viewed",
+            fixture.server.descriptor().base_url
+        ))
+        .bearer_auth(&fixture.server.descriptor().token)
+        .json(&ViewSessionRequest {
+            operation_id: ViewSessionOperationId::new(),
+        })
+        .send()
+        .await
+        .expect("report the Subagent Session viewed");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response
+            .json::<SessionError>()
+            .await
+            .expect("decode the refusal")
+            .code,
+        SessionErrorCode::SubagentSession
+    );
+    let listed = fixture
+        .client
+        .get(format!(
+            "{}/v1/sessions",
+            fixture.server.descriptor().base_url
+        ))
+        .bearer_auth(&fixture.server.descriptor().token)
+        .send()
+        .await
+        .expect("list Sessions")
+        .error_for_status()
+        .expect("Session listing succeeds")
+        .json::<Vec<SessionListItem>>()
+        .await
+        .expect("decode Session listing");
+    assert_eq!(
+        listed[0]
+            .readable()
+            .expect("the listed parent is readable")
+            .standing_inputs
+            .viewed_at,
+        None,
+        "a child view never changes the parent's reading"
+    );
 
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");

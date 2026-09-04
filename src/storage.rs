@@ -35,7 +35,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20260827010000";
+const CURRENT_SCHEMA_VERSION: &str = "20260904000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -44,6 +44,7 @@ diesel::table! {
         title -> Text,
         emoji -> Nullable<Text>,
         settled_at -> Nullable<BigInt>,
+        viewed_at -> Nullable<BigInt>,
         created_at -> BigInt,
         updated_at -> BigInt,
         workspace -> Text,
@@ -422,7 +423,8 @@ fn load_session(
     };
     // Working is reconstructed across the complete Session tree after every
     // stored Session has been loaded; one row cannot see that subtree here.
-    summary.standing_inputs = crate::protocol::SessionStandingInputs::from_turns(&snapshot.turns);
+    summary.standing_inputs.latest_turn =
+        crate::protocol::SessionStandingInputs::from_turns(&snapshot.turns).latest_turn;
     summary.total_usage = snapshot.total_usage();
     Ok(PersistedSession {
         summary,

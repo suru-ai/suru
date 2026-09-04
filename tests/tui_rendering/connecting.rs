@@ -560,7 +560,7 @@ fn a_remote_session_row_carries_its_origin_into_attachment() {
 
     assert_eq!(
         press(&mut application, KeyCode::Enter),
-        ApplicationTransition::AttachSession(SessionReference {
+        ApplicationTransition::ViewAndAttachSession(SessionReference {
             origin: Outlook::Remote("studio".to_owned()),
             session_id,
         })

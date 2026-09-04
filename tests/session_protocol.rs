@@ -12,7 +12,8 @@ use suru::protocol::{
     SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog,
     SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId,
     SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, TranscriptItem, Turn, TurnId,
-    TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal, Workspace,
+    TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId,
+    ViewSessionRequest, Workspace,
 };
 use uuid::Uuid;
 
@@ -244,7 +245,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         "title": "Explain this workspace",
         "emoji": "\u{1F5FA}\u{FE0F}",
         "settled_at": 1_755_497_600_999_u64,
-        "standing_inputs": { "latest_turn": null },
+        "standing_inputs": { "latest_turn": null, "viewed_at": null },
         "working_since": 1_755_497_600_100_u64,
         "total_usage": {
             "fresh_input_tokens": 1_200,
@@ -1176,6 +1177,35 @@ fn agent_selection_command_round_trips_with_its_operation_identity() {
         }))
         .is_err(),
         "Agent Selection commands reject unknown fields"
+    );
+}
+
+#[test]
+fn viewed_command_round_trips_with_its_operation_identity() {
+    let command = ViewSessionRequest {
+        operation_id: ViewSessionOperationId::from_uuid(fixture_id(
+            "0198b27e-4aa1-72dd-9ec8-65398d17ec16",
+        )),
+    };
+    let expected = json!({
+        "operation_id": "0198b27e-4aa1-72dd-9ec8-65398d17ec16"
+    });
+
+    assert_eq!(
+        serde_json::to_value(command).expect("encode Viewed command"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<ViewSessionRequest>(expected).expect("decode Viewed command"),
+        command
+    );
+    assert!(
+        serde_json::from_value::<ViewSessionRequest>(json!({
+            "operation_id": "0198b27e-4aa1-72dd-9ec8-65398d17ec16",
+            "unexpected": true
+        }))
+        .is_err(),
+        "Viewed commands reject unknown fields"
     );
 }
 

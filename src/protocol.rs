@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 30;
+pub const PROTOCOL_VERSION: u32 = 31;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
@@ -57,6 +57,7 @@ session_identity!(TurnId);
 session_identity!(MessageId);
 session_identity!(ActivityId);
 session_identity!(AgentSelectionOperationId);
+session_identity!(ViewSessionOperationId);
 
 macro_rules! named_identity {
     ($name:ident) => {
@@ -1562,13 +1563,17 @@ pub struct LatestTurnStatus {
 }
 
 /// The server facts from which a listed Session's Standing is derived. Kept as
-/// one value so every catalog change replaces the reading whole; the Viewed
-/// moment introduced by issue #254 can join `latest_turn` here.
+/// one value so every catalog change replaces the reading whole and Viewed
+/// can be compared with the matching latest Turn.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionStandingInputs {
     #[serde(default)]
     pub latest_turn: Option<LatestTurnStatus>,
+    /// When any Client last reported this Session open in its main view.
+    /// Shared server state rather than per-Client presentation.
+    #[serde(default)]
+    pub viewed_at: Option<SessionTimestamp>,
 }
 
 impl SessionStandingInputs {
@@ -1578,12 +1583,17 @@ impl SessionStandingInputs {
                 status: turn.status,
                 settled_at: turn.settled_at,
             }),
+            viewed_at: None,
         }
     }
 
     pub(crate) fn latest_turn_settled_as(self, status: TurnStatus) -> bool {
-        self.latest_turn
-            .is_some_and(|latest| latest.status == status && latest.settled_at.is_some())
+        self.latest_turn.is_some_and(|latest| {
+            latest.status == status
+                && latest.settled_at.is_some_and(|settled_at| {
+                    self.viewed_at.is_none_or(|viewed| settled_at > viewed)
+                })
+        })
     }
 }
 
@@ -2368,6 +2378,14 @@ pub struct AdmitPromptRequest {
 #[serde(deny_unknown_fields)]
 pub struct SettleSessionRequest {
     pub settled: bool,
+}
+
+/// One report that a Client has a root Session open in its main view. The
+/// identity makes transport retries one operation rather than later Views.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewSessionRequest {
+    pub operation_id: ViewSessionOperationId,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -23,7 +23,7 @@ use crate::{
         SessionSettlementChanged, SessionSnapshot, SessionStandingInputsChanged, SessionSummary,
         SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged, SettingMutation,
         SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
-        UpdateAgentSelectionRequest,
+        UpdateAgentSelectionRequest, ViewSessionRequest,
     },
 };
 
@@ -446,6 +446,16 @@ impl ManagedClient {
             .await
     }
 
+    pub async fn view_session(
+        &self,
+        session_id: SessionId,
+        request: ViewSessionRequest,
+    ) -> Result<SessionSummary> {
+        self.session_commands()
+            .view_session(session_id, request)
+            .await
+    }
+
     pub async fn list_sessions(&self, workspace: Option<&Path>) -> Result<Vec<SessionListItem>> {
         self.session_commands().list_sessions(workspace).await
     }
@@ -566,6 +576,14 @@ impl OutlookClient {
         settled: bool,
     ) -> Result<SessionSummary> {
         self.commands.settle_session(session_id, settled).await
+    }
+
+    pub async fn view_session(
+        &self,
+        session_id: SessionId,
+        request: ViewSessionRequest,
+    ) -> Result<SessionSummary> {
+        self.commands.view_session(session_id, request).await
     }
 
     pub async fn list_sessions(&self, workspace: Option<&Path>) -> Result<Vec<SessionListItem>> {
@@ -963,6 +981,20 @@ impl SessionCommandClient {
             &format!("/v1/sessions/{session_id}/settlement"),
             &SettleSessionRequest { settled },
             "Session settlement",
+        )
+        .await
+    }
+
+    /// Reports that this Client has the Session open in its main view.
+    pub(crate) async fn view_session(
+        &self,
+        session_id: SessionId,
+        request: ViewSessionRequest,
+    ) -> Result<SessionSummary> {
+        self.post_session_command(
+            &format!("/v1/sessions/{session_id}/viewed"),
+            &request,
+            "Session viewed",
         )
         .await
     }

@@ -2099,6 +2099,7 @@ async fn turn_liveness_is_announced_on_the_session_catalog_stream() {
                     status: TurnStatus::Completed,
                     settled_at: Some(settled_at),
                 }),
+                viewed_at: None,
             },
         },
         "a Turn settling announces the whole Standing input to every client"

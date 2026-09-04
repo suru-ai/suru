@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -16,7 +16,7 @@ use crate::protocol::{
     AgentSelection, AgentSelectionOperationId, PromptId, PromptOrder, ProviderId,
     SessionCatalogChange, SessionCatalogSnapshot, SessionCatalogUpdate, SessionId, SessionListItem,
     SessionSnapshot, SessionSummary, SessionTimestamp, SessionUpdate, TurnId,
-    UnreadableSessionSummary,
+    UnreadableSessionSummary, ViewSessionOperationId,
 };
 use crate::provider::ProviderResumeState;
 use crate::storage::{PersistedSession, RestoredSessions, StorageSink, StoredResumeState};
@@ -31,6 +31,7 @@ mod settled;
 mod settlement;
 mod subagents;
 mod title;
+mod viewed;
 
 pub(crate) use output::{
     command_output_changes, message_content_changes, reasoning_content_changes,
@@ -46,6 +47,7 @@ pub(crate) use settlement::{
     TrailingCommandOutput,
 };
 pub(crate) use title::TitleDerivation;
+pub(crate) use viewed::ViewSessionError;
 
 use catalog::SessionCatalogPublisher;
 use prompts::{PromptOrigin, PromptOwner};
@@ -79,6 +81,7 @@ struct SessionRecord {
     next_prompt_order: PromptOrder,
     steer_targets: HashMap<PromptId, TurnId>,
     selection_operations: HashMap<AgentSelectionOperationId, AgentSelection>,
+    viewed_operations: HashSet<ViewSessionOperationId>,
     selection_retry_prompt: Option<PromptId>,
     resume_states: HashMap<ProviderId, ProviderResumeState>,
 }
@@ -124,6 +127,7 @@ impl SessionStore {
                 [
                     Some(persisted.summary.updated_at),
                     persisted.summary.settled_at,
+                    persisted.summary.standing_inputs.viewed_at,
                 ]
             })
             .flatten()
@@ -169,6 +173,7 @@ impl SessionStore {
                     next_prompt_order,
                     steer_targets: HashMap::new(),
                     selection_operations: HashMap::new(),
+                    viewed_operations: HashSet::new(),
                     selection_retry_prompt: None,
                     resume_states,
                 },

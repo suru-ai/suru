@@ -431,7 +431,8 @@ impl SessionRecord {
             .retain(|_, turn_id| !terminal_turns.contains(turn_id));
         self.snapshot = next;
         self.summary.session = self.snapshot.session.clone();
-        self.summary.standing_inputs = SessionStandingInputs::from_turns(&self.snapshot.turns);
+        self.summary.standing_inputs.latest_turn =
+            SessionStandingInputs::from_turns(&self.snapshot.turns).latest_turn;
         // `session.working_since` is deliberately left alone here: it carries
         // the whole subtree's reading, which only the state can derive, so
         // [`SessionStoreState::reconcile_working`] maintains it after every

@@ -39,7 +39,7 @@ use crate::protocol::{
     SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode, SessionId,
     SessionRevision, SessionUpdate, SettingMutation, SettingsSnapshot, SettleSessionRequest,
     ShutdownReason, SkillCatalog, SkillCatalogRequest, SkillPromptDelivery, TurnId,
-    UpdateAgentSelectionRequest,
+    UpdateAgentSelectionRequest, ViewSessionRequest,
 };
 use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
@@ -569,6 +569,7 @@ pub async fn spawn_with_providers_and_timings(
             post(update_agent_selection),
         )
         .route("/v1/sessions/{session_id}/settlement", post(settle_session))
+        .route("/v1/sessions/{session_id}/viewed", post(view_session))
         .route("/v1/sessions/{session_id}/prompts", post(admit_prompt))
         .route(
             "/v1/sessions/{session_id}/prompts/{prompt_id}/promote",
@@ -1687,6 +1688,33 @@ async fn settle_session(
             StatusCode::NOT_FOUND,
             SessionErrorCode::SessionNotFound,
             "Session does not exist on this server instance",
+        ),
+    }
+}
+
+/// Records that a Client has this root Session open in its main view.
+async fn view_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    request: Request,
+) -> Response {
+    let viewed =
+        match decode_session_command::<ViewSessionRequest>(&state, request, "Session viewed").await
+        {
+            Ok(viewed) => viewed,
+            Err(response) => return response,
+        };
+    match state.sessions.view(session_id, viewed) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(crate::sessions::ViewSessionError::SessionNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        Err(crate::sessions::ViewSessionError::SubagentSession) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::SubagentSession,
+            "A Subagent's Session does not carry Viewed state",
         ),
     }
 }

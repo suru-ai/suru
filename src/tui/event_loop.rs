@@ -701,6 +701,15 @@ impl RunLoop {
             ApplicationTransition::SubscribeSession(_) => {
                 unreachable!("terminal input cannot end a Session subscription")
             }
+            ApplicationTransition::ViewSession(reference) => {
+                spawn_session_view(
+                    self.client.session_commands_for(reference.origin.clone()),
+                    reference,
+                );
+            }
+            ApplicationTransition::ViewAndAttachSession(reference) => {
+                self.view_and_attach(reference);
+            }
             ApplicationTransition::AttachSession(reference) => {
                 let commands = self.client.session_commands_for(reference.origin.clone());
                 self.tasks
@@ -830,14 +839,13 @@ impl RunLoop {
                     );
                 }
             }
-            ApplicationTransition::TurnOutlookAndAttach {
+            ApplicationTransition::TurnOutlookAndViewAndAttach {
                 session,
                 catalog_origins,
             } => {
                 self.prepare_outlook_turn(catalog_origins);
                 self.dispatch_pending_listing_after_turn();
-                let commands = self.client.session_commands_for(session.origin.clone());
-                self.tasks.attach(commands, session, &self.channels.pickers);
+                self.view_and_attach(session);
             }
             ApplicationTransition::ResolveWorkspace {
                 outlook,
@@ -911,6 +919,13 @@ impl RunLoop {
             .list_sessions(commands, request, &self.channels.pickers);
     }
 
+    fn view_and_attach(&mut self, reference: SessionReference) {
+        let commands = self.client.session_commands_for(reference.origin.clone());
+        spawn_session_view(commands.clone(), reference.clone());
+        self.tasks
+            .attach(commands, reference, &self.channels.pickers);
+    }
+
     fn reconcile_catalog_origins(
         &mut self,
         catalog_origins: HashSet<Outlook>,
@@ -982,6 +997,8 @@ impl RunLoop {
             | ApplicationTransition::CancelPrompt { .. }
             | ApplicationTransition::InterruptSession { .. }
             | ApplicationTransition::SubscribeSession(_)
+            | ApplicationTransition::ViewSession(_)
+            | ApplicationTransition::ViewAndAttachSession(_)
             | ApplicationTransition::AttachSession(_)
             | ApplicationTransition::ListModels(_)
             | ApplicationTransition::RefreshSkills(_)
@@ -996,7 +1013,7 @@ impl RunLoop {
             | ApplicationTransition::PreviewInvite(_)
             | ApplicationTransition::RedeemInvite(_)
             | ApplicationTransition::TurnOutlook { .. }
-            | ApplicationTransition::TurnOutlookAndAttach { .. }
+            | ApplicationTransition::TurnOutlookAndViewAndAttach { .. }
             | ApplicationTransition::ResolveWorkspace { .. }
             | ApplicationTransition::CancelWorkspaceResolution(_) => {
                 unreachable!("managed events issue no other Session command");
@@ -1085,8 +1102,18 @@ impl RunLoop {
         self.needs_redraw = true;
         match event {
             Some(Ok(event)) => {
-                self.application
+                let transition = self
+                    .application
                     .handle_event(ApplicationEvent::Session(event))?;
+                match transition {
+                    ApplicationTransition::Continue => {}
+                    ApplicationTransition::ViewSession(_) => {
+                        let _ = self.dispatch_transition(transition);
+                    }
+                    other => unreachable!(
+                        "an open Session event only continues or reports Viewed: {other:?}"
+                    ),
+                }
             }
             Some(Err(error)) => {
                 if let Some(event) =
@@ -1409,15 +1436,17 @@ impl RunLoop {
                 subscription,
                 ..
             } => {
-                self.application
-                    .handle_event(ApplicationEvent::OriginSessionAttached {
-                        reference: reference.clone(),
-                        snapshot: *snapshot,
-                    })?;
+                let transition =
+                    self.application
+                        .handle_event(ApplicationEvent::OriginSessionAttached {
+                            reference: reference.clone(),
+                            snapshot: *snapshot,
+                        })?;
                 if self.application.session_reference().as_ref() == Some(&reference) {
                     self.tasks.adopt(subscription);
                     self.tasks.abort_subscribing();
                 }
+                return Ok(self.dispatch_transition(transition));
             }
             SessionPickerResult::AttachmentFailed {
                 reference, error, ..
@@ -2283,6 +2312,30 @@ fn spawn_session_operation(
     tokio::spawn(async move {
         let result = operation.run(commands, session).await;
         let _ = results.send(result);
+    });
+}
+
+/// Reports a root Session open without coupling navigation to the request's
+/// answer. The catalog stream carries the authoritative Viewed moment back to
+/// every client, including this one; a transient reporting failure must not
+/// cancel an attachment that can still succeed.
+fn spawn_session_view(commands: SessionCommandClient, session: SessionReference) {
+    tokio::spawn(async move {
+        if let Err(error) = commands
+            .view_session(
+                session.session_id,
+                crate::protocol::ViewSessionRequest {
+                    operation_id: crate::protocol::ViewSessionOperationId::new(),
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                session_id = %session.session_id,
+                origin = ?session.origin,
+                "could not report Session Viewed: {error}"
+            );
+        }
     });
 }
 

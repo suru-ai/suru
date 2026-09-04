@@ -344,6 +344,68 @@ fn latest_turn_outcomes_draw_failed_and_done_but_leave_interrupted_quiet() {
 }
 
 #[test]
+fn failed_and_done_draw_only_when_the_latest_turn_settled_after_viewed() {
+    let workspace = workspace_dir();
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![
+            viewed(
+                latest_turn(
+                    listed("Already viewed", None, workspace.path(), 2, now()),
+                    TurnStatus::Failed,
+                    100,
+                ),
+                100,
+            ),
+            viewed(
+                latest_turn(
+                    listed("New since viewed", None, workspace.path(), 1, now()),
+                    TurnStatus::Completed,
+                    100,
+                ),
+                99,
+            ),
+        ],
+    );
+
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let rows = crate::support::buffer_rows(&buffer);
+    let cleared = u16::try_from(rendered_row(&rows, "Already viewed")).expect("screen row");
+    for row in cleared - 1..=cleared + 1 {
+        assert_ne!(
+            buffer.cell((0, row)).expect("cleared Rail cell").symbol(),
+            "▎"
+        );
+    }
+    assert!(!sidebar_column(&rows[usize::from(cleared - 1)]).contains("Failed"));
+    let unseen = u16::try_from(rendered_row(&rows, "New since viewed")).expect("screen row");
+    assert_standing_rail(&buffer, unseen, Color::Green, Color::Black);
+    assert!(sidebar_column(&rows[usize::from(unseen - 1)]).ends_with("Done"));
+}
+
+#[test]
+fn an_open_session_never_draws_an_outcome_while_viewed_catches_up() {
+    let workspace = workspace_dir();
+    let session_id = SessionId::new();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![latest_turn(
+            listed_as(session_id, "Watched settle", workspace.path(), 1),
+            TurnStatus::Failed,
+            100,
+        )],
+    );
+    open_session(&mut application, workspace.path(), session_id);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(standing_rail_rows(&application).is_empty());
+    assert!(
+        !sidebar_column(&rows[rendered_row(&rows, "Watched settle") - 1]).contains("Failed"),
+        "the main view itself means this Client has Viewed the outcome"
+    );
+}
+
+#[test]
 fn a_catalog_outcome_changes_the_row_in_place_and_new_work_takes_precedence() {
     let workspace = workspace_dir();
     for (status, word) in [
@@ -383,6 +445,45 @@ fn a_catalog_outcome_changes_the_row_in_place_and_new_work_takes_precedence() {
             "a new Turn's Working reading stands ahead of the previous {word} outcome"
         );
     }
+}
+
+#[test]
+fn a_catalog_viewed_change_clears_another_clients_outcome_in_place() {
+    let workspace = workspace_dir();
+    let session_id = SessionId::new();
+    let settled_at = SessionTimestamp(100);
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![latest_turn(
+            listed_as(session_id, "Shared result", workspace.path(), 1),
+            TurnStatus::Completed,
+            settled_at.0,
+        )],
+    );
+    assert_eq!(standing_rail_rows(&application).len(), 3);
+
+    let transition = application
+        .handle_event(ApplicationEvent::Managed(
+            ManagedEvent::SessionStandingInputsChanged(SessionStandingInputsChanged {
+                session_id,
+                inputs: SessionStandingInputs {
+                    latest_turn: Some(LatestTurnStatus {
+                        status: TurnStatus::Completed,
+                        settled_at: Some(settled_at),
+                    }),
+                    viewed_at: Some(SessionTimestamp(101)),
+                },
+            }),
+        ))
+        .expect("take the Viewed moment another Client reported");
+
+    assert!(matches!(transition, ApplicationTransition::ListSessions(_)));
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(standing_rail_rows(&application).is_empty());
+    assert!(
+        !sidebar_column(&rows[rendered_row(&rows, "Shared result") - 1]).contains("Done"),
+        "the streamed Viewed moment clears the word before the listing round trip"
+    );
 }
 
 #[test]
@@ -1178,7 +1279,7 @@ fn enter_attaches_the_selected_session_in_place() {
 
     assert_eq!(
         press_sidebar_key(&mut application, KeyCode::Enter),
-        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+        ApplicationTransition::ViewAndAttachSession(suru::protocol::SessionReference::new(
             suru::protocol::Outlook::Local,
             wanted,
         )),
@@ -1201,7 +1302,7 @@ fn leaving_for_the_landing_while_a_session_is_opening_reports_the_client_letting
     step_onto_the_list(&mut application);
     assert!(matches!(
         press_sidebar_key(&mut application, KeyCode::Enter),
-        ApplicationTransition::AttachSession(_)
+        ApplicationTransition::ViewAndAttachSession(_)
     ));
 
     assert_eq!(
@@ -1234,7 +1335,7 @@ fn moving_workspace_while_a_session_is_opening_reports_the_client_letting_go() {
     step_onto_the_list(&mut application);
     assert!(matches!(
         press_sidebar_key(&mut application, KeyCode::Enter),
-        ApplicationTransition::AttachSession(_)
+        ApplicationTransition::ViewAndAttachSession(_)
     ));
 
     let listing = expect_workspace_picker_listing(
@@ -2864,6 +2965,7 @@ fn standing_elsewhere(
                         status,
                         settled_at: Some(settled_at),
                     }),
+                    viewed_at: None,
                 },
             }),
         ))
@@ -2957,7 +3059,16 @@ fn latest_turn(session: SessionListItem, status: TurnStatus, settled_at: u64) ->
             status,
             settled_at: Some(SessionTimestamp(settled_at)),
         }),
+        viewed_at: None,
     };
+    SessionListItem::Readable(summary)
+}
+
+fn viewed(session: SessionListItem, viewed_at: u64) -> SessionListItem {
+    let SessionListItem::Readable(mut summary) = session else {
+        unreachable!("the fixture builds a readable Session");
+    };
+    summary.standing_inputs.viewed_at = Some(SessionTimestamp(viewed_at));
     SessionListItem::Readable(summary)
 }
 
@@ -3214,7 +3325,7 @@ fn enter_attaches_the_result_the_reader_is_on() {
     );
     assert_eq!(
         press_sidebar_key(&mut application, KeyCode::Enter),
-        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+        ApplicationTransition::ViewAndAttachSession(suru::protocol::SessionReference::new(
             suru::protocol::Outlook::Local,
             wanted,
         )),
@@ -3482,7 +3593,7 @@ fn a_left_press_on_a_row_attaches_the_session_it_stands_on() {
 
     assert_eq!(
         press_line(&mut application, MouseButton::Left, "Wanted work"),
-        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+        ApplicationTransition::ViewAndAttachSession(suru::protocol::SessionReference::new(
             suru::protocol::Outlook::Local,
             wanted,
         )),
@@ -4243,7 +4354,7 @@ fn opening_a_foreign_row_keeps_the_pickers_everywhere_streams() {
     );
     assert_eq!(
         press_sidebar_key(&mut application, KeyCode::Enter),
-        ApplicationTransition::TurnOutlookAndAttach {
+        ApplicationTransition::TurnOutlookAndViewAndAttach {
             session: SessionReference::new(Outlook::Remote("studio".to_owned()), foreign),
             catalog_origins: std::collections::HashSet::from([
                 Outlook::Remote("studio".to_owned()),
@@ -4286,7 +4397,7 @@ fn enter_on_a_foreign_row_turns_then_opens_it_without_disturbing_everywhere() {
     );
     assert_eq!(
         press_sidebar_key(&mut application, KeyCode::Enter),
-        ApplicationTransition::TurnOutlookAndAttach {
+        ApplicationTransition::TurnOutlookAndViewAndAttach {
             session: SessionReference::new(Outlook::Remote("studio".to_owned()), foreign),
             catalog_origins,
         },
@@ -4357,7 +4468,7 @@ fn a_pointer_turn_uses_the_sessions_workspace_then_remembers_it_for_that_outlook
 
     assert_eq!(
         press_line(&mut application, MouseButton::Left, "First studio work"),
-        ApplicationTransition::TurnOutlookAndAttach {
+        ApplicationTransition::TurnOutlookAndViewAndAttach {
             session: SessionReference::new(Outlook::Remote("studio".to_owned()), first),
             catalog_origins: catalog_origins.clone(),
         }
@@ -4380,14 +4491,14 @@ fn a_pointer_turn_uses_the_sessions_workspace_then_remembers_it_for_that_outlook
 
     assert_eq!(
         press_line(&mut application, MouseButton::Left, "Local work"),
-        ApplicationTransition::TurnOutlookAndAttach {
+        ApplicationTransition::TurnOutlookAndViewAndAttach {
             session: SessionReference::new(Outlook::Local, local),
             catalog_origins: catalog_origins.clone(),
         }
     );
     assert_eq!(
         press_line(&mut application, MouseButton::Left, "Second studio work"),
-        ApplicationTransition::TurnOutlookAndAttach {
+        ApplicationTransition::TurnOutlookAndViewAndAttach {
             session: SessionReference::new(Outlook::Remote("studio".to_owned()), second),
             catalog_origins,
         }
@@ -5057,6 +5168,7 @@ fn a_remote_turn_outcome_lights_that_outlooks_row_in_place() {
                         status: TurnStatus::Failed,
                         settled_at: Some(SessionTimestamp(now())),
                     }),
+                    viewed_at: None,
                 },
             }),
         })
@@ -6704,7 +6816,7 @@ fn press_composer_key(application: &mut Application, code: KeyCode) {
 
 /// Opens the row focus stands on, which is the reader committing to it.
 fn open_the_focused_row(application: &mut Application) -> SessionId {
-    let ApplicationTransition::AttachSession(target) =
+    let ApplicationTransition::ViewAndAttachSession(target) =
         press_sidebar_key(application, KeyCode::Enter)
     else {
         panic!("Enter on a readable row opens the Session it stands for");
@@ -6784,6 +6896,118 @@ fn opening_a_session_carries_the_reader_into_it_before_its_snapshot_lands() {
     assert!(
         !highlighted.contains("The work being read"),
         "and the Session left behind is no longer open: {highlighted:?}"
+    );
+}
+
+#[test]
+fn opening_a_sidebar_session_yields_a_viewed_request_with_its_attachment() {
+    let workspace = workspace_dir();
+    let (open, target) = (SessionId::new(), SessionId::new());
+    let mut application = reading_one_and_listing_another(workspace.path(), open, target);
+    step_onto_the_wanted_row(&mut application);
+
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::ViewAndAttachSession(local_session(target)),
+        "optimistic opening reports Viewed as it begins the attachment"
+    );
+}
+
+#[test]
+fn a_turn_settling_in_the_open_root_session_yields_a_viewed_request() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let (session_id, snapshot, turn_id) = enter_active_session(&mut application, workspace.path());
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+                SessionUpdate {
+                    session_id,
+                    revision: SessionRevision(snapshot.revision.0 + 1),
+                    changes: vec![SessionChange::TurnStatusChanged {
+                        turn_id,
+                        status: TurnStatus::Completed,
+                        settled_at: Some(SessionTimestamp(100)),
+                    }],
+                },
+            )))
+            .expect("settle the open Session's Turn"),
+        ApplicationTransition::ViewSession(local_session(session_id)),
+        "the Session on screen is reported Viewed when its Turn Settles"
+    );
+}
+
+#[test]
+fn hydrating_an_open_root_session_yields_a_viewed_request_after_the_opening_race() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let session_id = SessionId::new();
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
+                session_id,
+                PromptId::new(),
+                "Already settled while opening",
+                workspace.path(),
+            )))
+            .expect("hydrate the root Session after opening"),
+        ApplicationTransition::ViewSession(local_session(session_id)),
+        "hydration reports Viewed again so a settle racing the first request cannot light the rail"
+    );
+}
+
+#[test]
+fn a_recovery_snapshot_for_the_open_root_session_yields_a_viewed_request() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let (session_id, snapshot, _) = enter_active_session(&mut application, workspace.path());
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Session(SessionEvent::Snapshot(Box::new(
+                snapshot,
+            ))))
+            .expect("replace the open projection from a recovery snapshot"),
+        ApplicationTransition::ViewSession(local_session(session_id)),
+        "a reconnect snapshot covers settlements missed while the stream was down"
+    );
+}
+
+#[test]
+fn a_turn_settling_for_the_session_left_behind_yields_no_viewed_request() {
+    let workspace = workspace_dir();
+    let target = SessionId::new();
+    let mut application = connected_application(workspace.path());
+    deliver_initial_visibility(&mut application, SidebarVisibility::Hidden);
+    let (open, snapshot, turn_id) = enter_active_session(&mut application, workspace.path());
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![listed_as(target, WANTED, workspace.path(), 1)],
+        })
+        .expect("hydrate the Sidebar beside the open Session");
+    step_onto_the_list(&mut application);
+    open_the_focused_row(&mut application);
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+                SessionUpdate {
+                    session_id: open,
+                    revision: SessionRevision(snapshot.revision.0 + 1),
+                    changes: vec![SessionChange::TurnStatusChanged {
+                        turn_id,
+                        status: TurnStatus::Failed,
+                        settled_at: Some(SessionTimestamp(100)),
+                    }],
+                },
+            )))
+            .expect("settle the Session left behind"),
+        ApplicationTransition::Continue,
+        "an event from the old subscription is not a view of the optimistic target"
     );
 }
 
@@ -6970,7 +7194,7 @@ fn enter_on_the_failed_open_row_retries_with_a_fresh_quiet_window() {
     enter_the_sidebar(&mut application, sessions);
     assert_eq!(
         press_sidebar_key(&mut application, KeyCode::Enter),
-        ApplicationTransition::AttachSession(local_session(target)),
+        ApplicationTransition::ViewAndAttachSession(local_session(target)),
         "Enter on the failed target dispatches another correlated attachment"
     );
 
@@ -7031,14 +7255,14 @@ fn a_pointer_press_on_the_failed_open_row_retries_without_taking_keyboard_focus(
     ));
     assert_eq!(
         press_line(&mut application, MouseButton::Left, WANTED),
-        ApplicationTransition::AttachSession(local_session(target))
+        ApplicationTransition::ViewAndAttachSession(local_session(target))
     );
     advance_opening_clock(&now, Duration::from_millis(300));
     fail_opening_session(&mut application, target, "connection closed");
 
     assert_eq!(
         press_line(&mut application, MouseButton::Left, WANTED),
-        ApplicationTransition::AttachSession(local_session(target)),
+        ApplicationTransition::ViewAndAttachSession(local_session(target)),
         "pressing the failed target row retries its attachment"
     );
     assert!(
@@ -7609,7 +7833,7 @@ fn a_press_opens_a_session_the_way_enter_does_and_raises_no_row_focus() {
 
     assert_eq!(
         press_line(&mut application, MouseButton::Left, WANTED),
-        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+        ApplicationTransition::ViewAndAttachSession(suru::protocol::SessionReference::new(
             suru::protocol::Outlook::Local,
             target,
         )),

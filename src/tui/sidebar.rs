@@ -2233,6 +2233,20 @@ impl Sidebar {
         standing: Option<SessionStanding>,
         shelf: SidebarShelf<'a>,
     ) -> SidebarEntry<'a> {
+        let open = open == Some(session.reference());
+        // Opening is itself this Client's Viewed report. Clear outcome
+        // presentation optimistically while the Server's stamped moment makes
+        // its round trip; Working and the reserved intervention reading still
+        // describe live work and remain visible on the open row.
+        let standing = if open
+            && matches!(
+                standing,
+                Some(SessionStanding::Failed | SessionStanding::Done)
+            ) {
+            None
+        } else {
+            standing
+        };
         SidebarEntry::Row(SidebarRow {
             reference: session.reference(),
             emoji: self.emoji.drawn_emoji(session.emoji()),
@@ -2242,7 +2256,7 @@ impl Sidebar {
             } else {
                 None
             },
-            open: open == Some(session.reference()),
+            open,
             focused: self.focus.as_ref()
                 == Some(&SidebarFocus::Session(session.reference().clone())),
             unreadable: session.readable().is_none(),

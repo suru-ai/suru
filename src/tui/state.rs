@@ -1271,6 +1271,30 @@ impl TuiState {
         Ok(())
     }
 
+    /// The root Session to report Viewed when this event Settles one of its
+    /// Turns or replaces it with a recovery snapshot. A fresh snapshot closes
+    /// the gap while the subscription was down; neither case applies after
+    /// navigation has moved away or while a Subagent is open.
+    fn open_root_viewed_by(&self, event: &SessionEvent) -> Option<SessionReference> {
+        if self.session_events_blocked
+            || self
+                .session
+                .as_ref()
+                .is_none_or(|session| session.snapshot().session.is_subagent())
+        {
+            return None;
+        }
+        let viewed = match event {
+            SessionEvent::Snapshot(_) => true,
+            SessionEvent::Updated(update) => update.changes.iter().any(|change| match change {
+                SessionChange::TurnAdded { turn } => turn.status.is_terminal(),
+                SessionChange::TurnStatusChanged { status, .. } => status.is_terminal(),
+                _ => false,
+            }),
+        };
+        viewed.then(|| self.session_reference.clone()).flatten()
+    }
+
     fn apply_created_session(&mut self, snapshot: SessionSnapshot) -> Result<()> {
         self.session_events_blocked = false;
         self.apply_session(SessionEvent::snapshot(snapshot))
@@ -2384,6 +2408,13 @@ pub enum ApplicationTransition {
         session: SessionReference,
     },
     SubscribeSession(SessionReference),
+    /// Report a root Session as Viewed without changing the main-view route.
+    /// Produced when its Turn Settles while it is already open.
+    ViewSession(SessionReference),
+    /// Report a listed root Session as Viewed while beginning its attachment.
+    /// Keeping this distinct from `AttachSession` makes Subagent navigation
+    /// incapable of accidentally reporting a child as Viewed.
+    ViewAndAttachSession(SessionReference),
     AttachSession(SessionReference),
     ListSessions(SessionListRequest),
     /// Reconcile the Remote catalog streams owned by the run loop and dispatch
@@ -2428,9 +2459,9 @@ pub enum ApplicationTransition {
         outlook: Outlook,
         catalog_origins: HashSet<Outlook>,
     },
-    /// Turn to a foreign Session row's Origin and attach it, in that order,
-    /// while retaining the independent scopes of the listing surfaces.
-    TurnOutlookAndAttach {
+    /// Turn to a foreign listed Session's Origin, report it Viewed, and attach
+    /// it, while retaining the independent scopes of the listing surfaces.
+    TurnOutlookAndViewAndAttach {
         session: SessionReference,
         catalog_origins: HashSet<Outlook>,
     },
@@ -2606,8 +2637,12 @@ impl Application {
                 self.handle_origin_catalog(outlook, event)
             }
             ApplicationEvent::Session(event) => {
+                let viewed = self.state.open_root_viewed_by(&event);
                 self.state.apply_session(event)?;
-                Ok(ApplicationTransition::Continue)
+                Ok(viewed.map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::ViewSession,
+                ))
             }
             ApplicationEvent::SessionSubscriptionEnded => Ok(self
                 .session_reference()
@@ -2635,7 +2670,9 @@ impl Application {
                 self.attach_session(reference, snapshot)
             }
             ApplicationEvent::SessionAttachmentFailed(error) => {
-                if self.state.sidebar.is_attaching() {
+                if self.state.sidebar.is_attaching()
+                    || (self.state.route.is_some() && self.state.session.is_none())
+                {
                     // The target remains the route and the refusal belongs to
                     // its main content, not to the listing that led there.
                     Ok(self.fail_open_session_attachment(error))
@@ -3398,14 +3435,16 @@ impl Application {
                     return ApplicationTransition::Continue;
                 };
                 if target.origin == self.state.outlook {
-                    return ApplicationTransition::AttachSession(target);
+                    self.state.session_picker.close();
+                    self.state.open_session_route(target.clone());
+                    return ApplicationTransition::ViewAndAttachSession(target);
                 }
                 let Some(workspace) = self.state.session_picker.workspace_of(&target) else {
                     return ApplicationTransition::Continue;
                 };
                 self.state
                     .turn_outlook_for_session(target.clone(), workspace);
-                return ApplicationTransition::TurnOutlookAndAttach {
+                return ApplicationTransition::TurnOutlookAndViewAndAttach {
                     catalog_origins: self.state.catalog_origins(),
                     session: target,
                 };
@@ -3492,11 +3531,11 @@ impl Application {
                     SidebarActivation::Attach { session, workspace } => {
                         if session.origin == self.state.outlook {
                             self.state.open_session_route(session.clone());
-                            ApplicationTransition::AttachSession(session)
+                            ApplicationTransition::ViewAndAttachSession(session)
                         } else {
                             self.state
                                 .turn_outlook_for_session(session.clone(), workspace);
-                            ApplicationTransition::TurnOutlookAndAttach {
+                            ApplicationTransition::TurnOutlookAndViewAndAttach {
                                 catalog_origins: self.state.catalog_origins(),
                                 session,
                             }
@@ -3926,6 +3965,7 @@ impl Application {
     ) -> Result<ApplicationTransition> {
         let closes_picker = self.state.session_picker.attaching_to(&reference);
         let answers_sidebar = self.state.sidebar.attaching_to(&reference);
+        let views_root = !snapshot.session.is_subagent();
         self.state.apply_attached_session(snapshot)?;
         if closes_picker {
             self.state.session_picker.close();
@@ -3933,7 +3973,11 @@ impl Application {
         if answers_sidebar {
             self.state.sidebar.finish_attachment();
         }
-        Ok(ApplicationTransition::Continue)
+        Ok(if views_root {
+            ApplicationTransition::ViewSession(reference)
+        } else {
+            ApplicationTransition::Continue
+        })
     }
 
     fn fail_open_session_attachment(&mut self, error: String) -> ApplicationTransition {
@@ -4315,7 +4359,7 @@ impl Application {
                 .open_subagent_parent()
                 .zip(self.session_reference())
                 .map_or(ApplicationTransition::Continue, |(parent, session)| {
-                    ApplicationTransition::AttachSession(SessionReference::new(
+                    ApplicationTransition::ViewAndAttachSession(SessionReference::new(
                         session.origin,
                         parent,
                     ))

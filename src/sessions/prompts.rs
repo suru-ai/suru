@@ -271,6 +271,7 @@ impl SessionStore {
                 next_prompt_order: PromptOrder(2),
                 steer_targets: HashMap::new(),
                 selection_operations: HashMap::new(),
+                viewed_operations: Default::default(),
                 selection_retry_prompt: None,
                 resume_states: HashMap::new(),
             },

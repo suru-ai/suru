@@ -199,11 +199,42 @@ fn escape_in_a_subagent_session_returns_to_the_parent() {
 
     assert_eq!(
         press_key(&mut application, KeyCode::Esc),
-        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+        ApplicationTransition::ViewAndAttachSession(suru::protocol::SessionReference::new(
             suru::protocol::Outlook::Local,
             parent_id,
         )),
-        "Escape asks to open the parent Session, never to interrupt the child"
+        "Escape reports the root parent Viewed while opening it, never interrupting the child"
+    );
+}
+
+#[test]
+fn a_turn_settling_in_an_open_subagent_view_yields_no_viewed_request() {
+    let workspace = workspace_dir();
+    let child_id = SessionId::new();
+    let child = child_session_snapshot(child_id, SessionId::new(), workspace.path());
+    let turn_id = child.turns[0].id;
+    let revision = SessionRevision(child.revision.0 + 1);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(child))
+        .expect("attach a Subagent's Session");
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+                SessionUpdate {
+                    session_id: child_id,
+                    revision,
+                    changes: vec![SessionChange::TurnStatusChanged {
+                        turn_id,
+                        status: TurnStatus::Completed,
+                        settled_at: Some(SessionTimestamp(100)),
+                    }],
+                },
+            )))
+            .expect("settle the Subagent's Turn"),
+        ApplicationTransition::Continue,
+        "a Subagent view never reports Viewed"
     );
 }
 
@@ -237,11 +268,11 @@ fn returning_to_the_parent_restores_the_readers_view_state() {
     rendered_application_rows_at(&application, 80, 15);
     assert_eq!(
         press_key(&mut application, KeyCode::Esc),
-        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+        ApplicationTransition::ViewAndAttachSession(suru::protocol::SessionReference::new(
             suru::protocol::Outlook::Local,
             parent_id,
         )),
-        "Escape asks for the parent back"
+        "Escape reports the root parent Viewed while asking for it back"
     );
     application
         .handle_event(ApplicationEvent::SessionAttached(parent))

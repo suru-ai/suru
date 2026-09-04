@@ -151,7 +151,7 @@ fn session_picker_orders_marks_focuses_and_wraps_live_sessions() {
                 KeyModifiers::NONE,
             )))
             .expect("select wrapped Session row"),
-        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+        ApplicationTransition::ViewAndAttachSession(suru::protocol::SessionReference::new(
             suru::protocol::Outlook::Local,
             newest_id,
         ))
@@ -275,7 +275,7 @@ fn reconnect_catalog_removes_a_missed_current_session_deletion() {
 }
 
 #[test]
-fn session_attachment_failure_preserves_the_original_until_target_hydration() {
+fn session_picker_selection_opens_the_target_optimistically_and_keeps_the_old_draft() {
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
     let (original_id, original_snapshot, _) =
@@ -319,54 +319,27 @@ fn session_attachment_failure_preserves_the_original_until_target_hydration() {
                 KeyModifiers::NONE,
             )))
             .expect("begin target attachment"),
-        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+        ApplicationTransition::ViewAndAttachSession(suru::protocol::SessionReference::new(
             suru::protocol::Outlook::Local,
             target_id,
         ))
     );
-    assert!(
-        rendered_application_rows(&application)
-            .join("\n")
-            .contains("Attaching")
-    );
+    let opening = rendered_application_rows(&application).join("\n");
+    assert!(!opening.contains("Sessions"));
+    assert!(!opening.contains("Long-running work"));
 
-    let refresh_request = expect_session_list_request(
-        application
-            .handle_event(ApplicationEvent::SessionAttachmentFailed(
-                "target disappeared".to_owned(),
-            ))
-            .expect("report failed attachment"),
-        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
-    );
     application
-        .handle_event(ApplicationEvent::SessionsListed {
-            request: refresh_request,
-            sessions: vec![session_summary(
-                original_id,
-                workspace.path(),
-                "Original Session",
-                SessionStatus::Active,
-                30,
-            )],
-        })
+        .handle_event(ApplicationEvent::SessionAttachmentFailed(
+            "target disappeared".to_owned(),
+        ))
         .expect("refresh point-in-time Session status");
     let failed = rendered_application_rows(&application).join("\n");
     assert!(failed.contains("target disappeared"));
+    assert!(!failed.contains("Long-running work"));
     let tiny_failure = rendered_application_rows_at(&application, 28, 5).join("\n");
     assert!(tiny_failure.contains("Error"));
-    assert!(tiny_failure.contains("Original"));
     let short_failure = rendered_application_rows_at(&application, 28, 7).join("\n");
     assert!(short_failure.contains("Error"));
-    assert!(short_failure.contains("Original"));
-    application
-        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
-            KeyCode::Esc,
-            KeyModifiers::NONE,
-        )))
-        .expect("close picker after failed attachment");
-    let original = rendered_application_rows(&application).join("\n");
-    assert!(original.contains("Long-running work"));
-    assert!(original.contains("preserved draft"));
 
     open_session_picker_with(
         &mut application,
@@ -387,12 +360,6 @@ fn session_attachment_failure_preserves_the_original_until_target_hydration() {
             ),
         ],
     );
-    application
-        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
-            KeyCode::Down,
-            KeyModifiers::NONE,
-        )))
-        .expect("focus target Session again");
     application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::Enter,
@@ -909,7 +876,7 @@ fn choosing_a_foreign_picker_row_turns_and_opens_without_moving_sidebar_scope() 
                 KeyModifiers::NONE,
             )))
             .expect("choose the foreign Session"),
-        ApplicationTransition::TurnOutlookAndAttach {
+        ApplicationTransition::TurnOutlookAndViewAndAttach {
             catalog_origins: std::collections::HashSet::from([Outlook::Remote(
                 "studio".to_owned(),
             )]),
@@ -1257,7 +1224,7 @@ fn session_picker_scroll_window_keeps_the_current_session_visible() {
                 KeyModifiers::NONE,
             )))
             .expect("select wrapped newest Session"),
-        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+        ApplicationTransition::ViewAndAttachSession(suru::protocol::SessionReference::new(
             suru::protocol::Outlook::Local,
             newest_id,
         ))
