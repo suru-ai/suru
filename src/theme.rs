@@ -134,20 +134,17 @@ pub(crate) struct MarkdownRoles {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SelectionRoles {
     /// The row the keys are on, drawn only while the surface holding it has
-    /// them.
+    /// them. Every feedback foreground must remain legible against its
+    /// background because a Sidebar Rail is painted over this block.
     pub(crate) focused: Style,
     /// The row a surface that has given the keys up would come back to, where
     /// that surface keeps one. The Sidebar keeps none: its row focus goes with
     /// the keys.
     pub(crate) unfocused: Style,
-    /// The row standing for what the main view is already showing, which is
-    /// true whoever holds the keys.
-    pub(crate) open: Style,
-    /// The column down the left of that row, which is the combined state's own
-    /// role: it is what says "open" while the row itself carries the focus
-    /// style, and so it is the one a theme has to keep legible against
-    /// [`Self::focused`] rather than against the surface behind it.
-    pub(crate) open_rail: Style,
+    /// The Title standing for what the main view is already showing, which is
+    /// true whoever holds the keys. It is a foreground-only role so row focus
+    /// can keep its background while the open Title remains distinct.
+    pub(crate) open_title: Style,
 }
 
 #[derive(Clone, Debug)]
@@ -529,8 +526,7 @@ quantized_fields!(MarkdownRoles {
 quantized_fields!(SelectionRoles {
     focused,
     unfocused,
-    open,
-    open_rail,
+    open_title,
 });
 quantized_fields!(Theme {
     text,
@@ -798,18 +794,11 @@ impl Theme {
         let accent = AccentRoles {
             primary: Style::default().fg(Color::Cyan),
         };
-        // The accent's own colour, carried into a block rather than into text:
-        // the open row is the one the accent has always stood for, and a theme
-        // that moves the accent moves it. The rail is the same block one
-        // column further left, because it stands for the same thing.
-        let open = Style::default()
-            .fg(Color::Black)
-            .bg(accent.primary.fg.unwrap_or(Color::Cyan));
         let feedback = FeedbackRoles {
             error: Style::default().fg(Color::Red),
             warning: Style::default().fg(Color::Yellow),
             success: Style::default().fg(Color::Green),
-            info: Style::default().fg(Color::Blue),
+            info: Style::default().fg(Color::LightBlue),
         };
         Self {
             text: TextRoles {
@@ -828,7 +817,7 @@ impl Theme {
                     red: feedback.error.fg.unwrap_or(Color::Red),
                     green: feedback.success.fg.unwrap_or(Color::Green),
                     yellow: feedback.warning.fg.unwrap_or(Color::Yellow),
-                    blue: feedback.info.fg.unwrap_or(Color::Blue),
+                    blue: Color::Blue,
                     magenta: Color::Magenta,
                     cyan: accent.primary.fg.unwrap_or(Color::Cyan),
                     white: Color::Gray,
@@ -877,8 +866,7 @@ impl Theme {
             selection: SelectionRoles {
                 focused: Style::default().fg(Color::Black).bg(Color::Blue),
                 unfocused: Style::default().fg(Color::Reset).bg(Color::DarkGray),
-                open,
-                open_rail: open,
+                open_title: accent.primary,
             },
         }
     }
@@ -949,7 +937,6 @@ impl Theme {
             success: style(green),
             info: style(primary),
         };
-        let open = style(background).bg(primary);
         Self {
             text: TextRoles {
                 primary: style(foreground),
@@ -989,10 +976,9 @@ impl Theme {
                 list_marker: style(blue),
             },
             selection: SelectionRoles {
-                focused: style(background).bg(primary),
+                focused: style(background).bg(grays.element()),
                 unfocused: style(foreground).bg(grays.element()),
-                open,
-                open_rail: surface(primary),
+                open_title: style(primary),
             },
         }
     }
@@ -1092,10 +1078,9 @@ impl Theme {
                 list_marker: style(list_marker),
             },
             selection: SelectionRoles {
-                focused: style(selected_text).bg(primary),
+                focused: style(selected_text).bg(element),
                 unfocused: style(text).bg(element),
-                open: style(selected_text).bg(accent),
-                open_rail: surface(accent),
+                open_title: style(accent),
             },
         })
     }
@@ -1237,6 +1222,11 @@ mod tests {
 
         assert_eq!(theme.accent.primary.fg, Some(Color::Rgb(0x12, 0x34, 0x56)));
         assert_eq!(theme.ansi.normal.magenta, Color::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(
+            theme.selection.open_title.fg,
+            Some(Color::Rgb(0x03, 0x03, 0x03)),
+            "the document's accent key supplies the open Title"
+        );
     }
 
     #[test]
@@ -1318,6 +1308,48 @@ mod tests {
                         variant.key()
                     )
                 });
+            }
+        }
+    }
+
+    #[test]
+    fn every_built_in_keeps_open_and_feedback_foregrounds_legible_over_focus() {
+        let mut themes = vec![("system", Theme::system())];
+        for (name, source) in built_in_themes() {
+            for variant in [ThemeVariant::Dark, ThemeVariant::Light] {
+                themes.push((
+                    *name,
+                    Theme::from_document(source, variant).unwrap_or_else(|error| {
+                        panic!(
+                            "built-in Theme {name:?} {} variant failed: {error}",
+                            variant.key()
+                        )
+                    }),
+                ));
+            }
+        }
+
+        for (name, theme) in themes {
+            assert!(
+                theme.selection.open_title.fg.is_some(),
+                "built-in Theme {name:?} resolves its open Title role"
+            );
+            let focus = theme
+                .selection
+                .focused
+                .bg
+                .unwrap_or_else(|| panic!("built-in Theme {name:?} has no focus background"));
+            for (role, feedback) in [
+                ("warning", theme.feedback.warning),
+                ("info", theme.feedback.info),
+                ("error", theme.feedback.error),
+                ("success", theme.feedback.success),
+            ] {
+                assert_ne!(
+                    feedback.fg,
+                    Some(focus),
+                    "built-in Theme {name:?} {role} foreground disappears over focus"
+                );
             }
         }
     }

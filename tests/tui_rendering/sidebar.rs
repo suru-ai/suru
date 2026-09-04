@@ -19,7 +19,7 @@ use crate::support::{
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::style::Color;
+use ratatui::{buffer::Buffer, style::Color};
 use suru::{
     managed_client::{ManagedEvent, RecoveryStatus, SessionEvent},
     protocol::{
@@ -272,6 +272,65 @@ fn the_right_slot_says_working_and_how_long_while_the_latest_turn_is_unsettled()
     assert!(
         slot.ends_with("Working 1m"),
         "the right slot says the work is live and how long it has been: {slot:?}"
+    );
+}
+
+#[test]
+fn a_working_active_row_draws_an_info_rail_and_an_idle_row_draws_none() {
+    let workspace = workspace_dir();
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![
+            working(
+                listed("Running a build", None, workspace.path(), 2, now()),
+                seconds_ago(90),
+            ),
+            listed("Waiting quietly", None, workspace.path(), 1, now()),
+        ],
+    );
+
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let rows = crate::support::buffer_rows(&buffer);
+    let working_title = u16::try_from(rendered_row(&rows, "Running a build")).expect("screen row");
+    assert_standing_rail(&buffer, working_title, Color::LightBlue, Color::Black);
+    let idle_title = u16::try_from(rendered_row(&rows, "Waiting quietly")).expect("screen row");
+    for row in idle_title - 1..=idle_title + 1 {
+        assert_ne!(buffer.cell((0, row)).expect("idle Rail cell").symbol(), "▎");
+    }
+}
+
+#[test]
+fn search_keeps_an_active_working_rail_but_never_gives_one_to_a_settled_row() {
+    let workspace = workspace_dir();
+    let running = working(
+        listed("Running work", None, workspace.path(), 2, now()),
+        seconds_ago(90),
+    );
+    let history = set_aside(
+        working(
+            listed("Settled work", None, workspace.path(), 1, now()),
+            seconds_ago(90),
+        ),
+        now(),
+    );
+    let sessions = vec![running, history];
+    let mut application = sidebar_showing(workspace.path(), sessions.clone());
+    enter_the_sidebar(&mut application, sessions);
+    type_terminal_text(&mut application, "work");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let active_title = u16::try_from(rendered_row(&rows, "Running work")).expect("screen row");
+    assert_eq!(
+        standing_rail_rows(&application),
+        vec![active_title - 1, active_title, active_title + 1]
+    );
+    let settled_row = u16::try_from(rendered_row(&rows, "Settled work")).expect("screen row");
+    assert_ne!(
+        rendered_application_buffer(&application, WIDE, 20)
+            .cell((0, settled_row))
+            .expect("settled row padding")
+            .symbol(),
+        "▎"
     );
 }
 
@@ -1405,10 +1464,15 @@ fn seeding_passes_over_an_open_session_that_arrives_unreadable() {
         "so they start where they start whenever the open Session has no openable row — on the \
          Workspace selector: {marked:?}"
     );
-    assert!(
-        open_sidebar_text(&application).contains("Broken work"),
-        "while the damaged row keeps the open highlight, because it is still the Session the \
-         reader is looking at"
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let (column, row) = text_position(&buffer, "Broken work");
+    assert_eq!(
+        buffer
+            .cell((column, row))
+            .expect("unreadable open Title")
+            .fg,
+        Color::DarkGray,
+        "the damaged open row stays subdued rather than disguising its unreadable state"
     );
 }
 
@@ -1615,20 +1679,39 @@ fn selected_sidebar_text(application: &Application) -> String {
 
 /// The Sidebar row standing for the Session the main view has open.
 fn open_sidebar_text(application: &Application) -> String {
-    sidebar_text_on(application, Color::Cyan)
+    let buffer = rendered_application_buffer(application, WIDE, 20);
+    (0..20)
+        .map(|row| {
+            (0..31)
+                .filter_map(|column| buffer.cell((column, row)))
+                .filter(|cell| cell.fg == Color::Cyan)
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        })
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// The screen rows whose leftmost Sidebar column carries the open Session's
-/// rail, which is what says "open" when the row itself carries row focus.
-fn open_rail_rows(application: &Application) -> Vec<u16> {
+/// The screen rows whose leftmost Sidebar column carries a Standing Rail.
+fn standing_rail_rows(application: &Application) -> Vec<u16> {
     let buffer = rendered_application_buffer(application, WIDE, 20);
     (0..20)
         .filter(|row| {
             buffer
                 .cell((0, *row))
-                .is_some_and(|cell| cell.bg == Color::Cyan)
+                .is_some_and(|cell| cell.symbol() == "▎")
         })
         .collect()
+}
+
+fn assert_standing_rail(buffer: &Buffer, title_row: u16, foreground: Color, background: Color) {
+    for row in title_row - 1..=title_row + 1 {
+        let rail = buffer.cell((0, row)).expect("Standing Rail cell");
+        assert_eq!(rail.symbol(), "▎");
+        assert_eq!(rail.fg, foreground);
+        assert_eq!(rail.bg, background);
+    }
 }
 
 /// Puts a Session in the main view without going through the Sidebar, which is
@@ -1669,9 +1752,36 @@ fn enter_the_sidebar(application: &mut Application, sessions: Vec<SessionListIte
         .expect("hydrate the Sidebar the reader opened");
 }
 
-// The Sidebar's two states, kept apart: the persistent cyan highlight on the
+// The Sidebar's two states, kept apart: the persistent accent Title on the
 // Session the main view has open, and the transient blue focus on the row the
 // keys are on.
+
+#[test]
+fn the_open_session_draws_only_its_title_in_the_accent_style() {
+    let workspace = workspace_dir();
+    let open = SessionId::new();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![listed_as(open, "The work open", workspace.path(), 1)],
+    );
+    open_session(&mut application, workspace.path(), open);
+
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let (title_column, title_row) = text_position(&buffer, "The work open");
+    let title = buffer
+        .cell((title_column, title_row))
+        .expect("open Title cell");
+    assert_eq!(title.fg, Color::Cyan);
+    assert_eq!(title.bg, Color::Black);
+    assert!(
+        buffer
+            .content()
+            .iter()
+            .take(usize::from(buffer.area.width) * 20)
+            .all(|cell| cell.bg != Color::Cyan),
+        "the open reading never repaints the row background"
+    );
+}
 
 #[test]
 fn the_landing_highlights_no_session_row() {
@@ -1693,13 +1803,13 @@ fn the_landing_highlights_no_session_row() {
         "no Session is open on the Landing, so no row stands for one"
     );
     assert!(
-        open_rail_rows(&application).is_empty(),
+        standing_rail_rows(&application).is_empty(),
         "and nothing carries the rail either"
     );
 }
 
 #[test]
-fn the_open_session_row_is_highlighted_whoever_holds_the_keys() {
+fn the_open_session_title_is_accented_whoever_holds_the_keys() {
     let workspace = workspace_dir();
     let open = SessionId::new();
     let sessions = vec![
@@ -1712,7 +1822,7 @@ fn the_open_session_row_is_highlighted_whoever_holds_the_keys() {
     let highlighted = open_sidebar_text(&application);
     assert!(
         highlighted.contains("The work open"),
-        "the open Session's row is highlighted while the reader writes into it: {highlighted:?}"
+        "the open Session's Title is accented while the reader writes into it: {highlighted:?}"
     );
     assert!(
         !highlighted.contains("Other work"),
@@ -1722,9 +1832,8 @@ fn the_open_session_row_is_highlighted_whoever_holds_the_keys() {
     enter_the_sidebar(&mut application, sessions);
 
     assert!(
-        open_rail_rows(&application).len() == 3,
-        "the keys moving to the Sidebar leave the open Session open: its row carries the rail \
-         down all three of its lines"
+        standing_rail_rows(&application).is_empty(),
+        "an idle open Session has no Standing Rail"
     );
     assert!(
         selected_sidebar_text(&application).contains("The work open"),
@@ -1733,10 +1842,13 @@ fn the_open_session_row_is_highlighted_whoever_holds_the_keys() {
 }
 
 #[test]
-fn a_row_that_is_both_open_and_focused_is_a_blue_row_with_a_cyan_rail() {
+fn a_working_row_that_is_open_and_focused_keeps_all_three_readings() {
     let workspace = workspace_dir();
     let open = SessionId::new();
-    let sessions = vec![listed_as(open, "The work open", workspace.path(), 1)];
+    let sessions = vec![working(
+        listed_as(open, "The work open", workspace.path(), 1),
+        seconds_ago(90),
+    )];
     let mut application = sidebar_showing(workspace.path(), sessions.clone());
     open_session(&mut application, workspace.path(), open);
     enter_the_sidebar(&mut application, sessions);
@@ -1748,11 +1860,17 @@ fn a_row_that_is_both_open_and_focused_is_a_blue_row_with_a_cyan_rail() {
         selected_sidebar_text(&application).contains("The work open"),
         "row focus takes the row itself, because it is the state the arrows move"
     );
-    assert_eq!(
-        open_rail_rows(&application),
-        vec![title - 1, title, title + 1],
-        "and the open Session keeps the rail down the row's left, so neither state is hidden"
+    assert!(
+        open_sidebar_text(&application).contains("The work open"),
+        "the open Title keeps its accent foreground over the focus block"
     );
+    assert_eq!(
+        standing_rail_rows(&application),
+        vec![title - 1, title, title + 1],
+        "and Working keeps its Rail down the row's left, so none of the three states is hidden"
+    );
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    assert_standing_rail(&buffer, title, Color::LightBlue, Color::Blue);
 }
 
 #[test]
@@ -1761,7 +1879,10 @@ fn the_arrows_move_row_focus_without_changing_the_open_session() {
     let open = SessionId::new();
     let sessions = vec![
         listed_as(SessionId::new(), "Newer work", workspace.path(), 2),
-        listed_as(open, "The work open", workspace.path(), 1),
+        working(
+            listed_as(open, "The work open", workspace.path(), 1),
+            seconds_ago(90),
+        ),
     ];
     let mut application = sidebar_showing(workspace.path(), sessions.clone());
     open_session(&mut application, workspace.path(), open);
@@ -1780,9 +1901,9 @@ fn the_arrows_move_row_focus_without_changing_the_open_session() {
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     let title = u16::try_from(rendered_row(&rows, "The work open")).expect("a screen row");
     assert_eq!(
-        open_rail_rows(&application),
+        standing_rail_rows(&application),
         vec![title - 1, title, title + 1],
-        "and leave the open Session exactly where it was"
+        "and leave the open Working Session's Rail exactly where it was"
     );
     assert!(
         open_sidebar_text(&application).contains("The work open"),
@@ -1847,7 +1968,7 @@ fn a_query_that_leaves_the_open_session_out_highlights_nothing() {
         "so no row is highlighted at all"
     );
     assert!(
-        open_rail_rows(&application).is_empty(),
+        standing_rail_rows(&application).is_empty(),
         "and no result stands in for the Session that is open"
     );
 }
@@ -1937,7 +2058,7 @@ fn an_open_subagent_session_highlights_nothing_and_seeds_the_selector() {
         open_sidebar_text(&application).is_empty(),
         "but it is no stand-in for the Subagent Session that is open"
     );
-    assert!(open_rail_rows(&application).is_empty());
+    assert!(standing_rail_rows(&application).is_empty());
 
     enter_the_sidebar(&mut application, sessions);
 
@@ -4056,8 +4177,8 @@ fn enter_on_a_foreign_row_turns_then_opens_it_without_disturbing_everywhere() {
     assert!(drawn_in_sidebar(&rows, "Local work"));
     assert!(drawn_in_sidebar(&rows, "Studio work [studio]"));
     assert!(
-        open_sidebar_text(&application).contains("Studio work [studio]"),
-        "the open highlight lands on the foreign row"
+        open_sidebar_text(&application).contains("Studio work"),
+        "the open Title accent lands on the foreign row without repainting its Origin tag"
     );
     let reference = SessionReference::new(Outlook::Remote("studio".to_owned()), foreign);
     application
@@ -4186,12 +4307,15 @@ fn a_transient_remote_drop_dims_only_its_rows_and_marks_it_unreachable() {
                 minutes_ago(2),
                 minutes_ago(1),
             )],
-            Outlook::Remote(name) if name == "studio" => vec![listed(
-                "Studio work",
-                None,
-                &workspace.path().join("studio"),
-                3,
-                now(),
+            Outlook::Remote(name) if name == "studio" => vec![working(
+                listed(
+                    "Studio work",
+                    None,
+                    &workspace.path().join("studio"),
+                    3,
+                    now(),
+                ),
+                seconds_ago(90),
             )],
             Outlook::Remote(name) if name == "laptop" => vec![listed(
                 "Laptop work",
@@ -4234,6 +4358,7 @@ fn a_transient_remote_drop_dims_only_its_rows_and_marks_it_unreachable() {
         Color::DarkGray,
         "cached rows from the dropped Remote are dimmed"
     );
+    assert_standing_rail(&buffer, studio.1, Color::LightBlue, Color::Black);
     let laptop = text_position(&buffer, "Laptop work");
     assert_eq!(
         buffer.cell(laptop).expect("draw the Laptop row").fg,

@@ -300,6 +300,9 @@ pub(super) struct SidebarRow<'a> {
     pub(super) unreadable: bool,
     /// Whether this is a cached row from a recovering Remote.
     pub(super) recovering: bool,
+    /// The one reading presented by both this active row's Rail and right
+    /// slot. Settled rows carry none even if their latest work once did.
+    pub(super) standing: Option<SessionStanding>,
     pub(super) shelf: SidebarShelf<'a>,
 }
 
@@ -338,6 +341,42 @@ pub(super) enum SidebarShelf<'a> {
         /// disagree with where it sits.
         ended_at: SessionTimestamp,
     },
+}
+
+/// What an active Sidebar row says about its Session's work. The ordering is
+/// part of the reading: when more than one input applies, the first variant
+/// here is the one the row presents through both its Rail and right slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SessionStanding {
+    NeedsIntervention,
+    Working,
+    Failed,
+    Done,
+}
+
+/// The facts from which a Session's Standing is read. Only `working` has a
+/// producer today; the remaining inputs reserve their place so adding them
+/// changes this reading instead of either of its presentations.
+#[derive(Clone, Copy, Debug, Default)]
+struct StandingInputs {
+    needs_intervention: bool,
+    working: bool,
+    failed: bool,
+    done: bool,
+}
+
+const fn session_standing(inputs: StandingInputs) -> Option<SessionStanding> {
+    if inputs.needs_intervention {
+        Some(SessionStanding::NeedsIntervention)
+    } else if inputs.working {
+        Some(SessionStanding::Working)
+    } else if inputs.failed {
+        Some(SessionStanding::Failed)
+    } else if inputs.done {
+        Some(SessionStanding::Done)
+    } else {
+        None
+    }
 }
 
 impl SidebarShelf<'_> {
@@ -430,13 +469,22 @@ impl SidebarEntry<'_> {
 
     /// Whether this is the entry the keys are on. The divider never is: it
     /// is a rule rather than a row, so the arrows step over it.
-    const fn is_focused(&self) -> bool {
+    pub(super) const fn is_focused(&self) -> bool {
         match self {
             Self::Row(row) => row.focused,
             Self::ShowMore(more) => more.focused,
             Self::Scope(scope) => scope.focused,
             Self::Unreachable(remote) => remote.focused,
             Self::Divider => false,
+        }
+    }
+
+    /// The Standing whose Rail an active Session row draws. Every other entry,
+    /// including a settled Session row, has no Rail.
+    pub(super) const fn standing(&self) -> Option<SessionStanding> {
+        match self {
+            Self::Row(row) => row.standing,
+            Self::Unreachable(_) | Self::Scope(_) | Self::Divider | Self::ShowMore(_) => None,
         }
     }
 
@@ -1994,6 +2042,10 @@ impl Sidebar {
                 BodyEntry::Session(session, Standing::Active) => self.row(
                     session,
                     open,
+                    session_standing(StandingInputs {
+                        working: session.working_since().is_some(),
+                        ..StandingInputs::default()
+                    }),
                     SidebarShelf::Active {
                         workspace: session
                             .workspace()
@@ -2005,6 +2057,7 @@ impl Sidebar {
                 BodyEntry::Session(session, Standing::Settled) => self.row(
                     session,
                     open,
+                    None,
                     SidebarShelf::Settled {
                         ended_at: ended_at(session),
                     },
@@ -2158,6 +2211,7 @@ impl Sidebar {
         &self,
         session: &'a ListedSession,
         open: Option<&SessionReference>,
+        standing: Option<SessionStanding>,
         shelf: SidebarShelf<'a>,
     ) -> SidebarEntry<'a> {
         SidebarEntry::Row(SidebarRow {
@@ -2176,6 +2230,7 @@ impl Sidebar {
             recovering: self
                 .recovering_origins
                 .contains(&session.reference().origin),
+            standing,
             shelf,
         })
     }
@@ -2575,11 +2630,56 @@ mod tests {
             SessionListRequest,
             commands::SemanticCommandId,
             sidebar::{
-                MINIMUM_MAIN_WIDTH, SIDEBAR_WIDTH, Sidebar, SidebarActivation, SidebarEntry,
-                SidebarPress, SidebarSpan, SidebarTarget, width_beside, workspace_name,
+                MINIMUM_MAIN_WIDTH, SIDEBAR_WIDTH, SessionStanding, Sidebar, SidebarActivation,
+                SidebarEntry, SidebarPress, SidebarSpan, SidebarTarget, StandingInputs,
+                session_standing, width_beside, workspace_name,
             },
         },
     };
+
+    #[test]
+    fn session_standing_uses_its_full_precedence() {
+        let cases = [
+            (
+                StandingInputs {
+                    needs_intervention: true,
+                    working: true,
+                    failed: true,
+                    done: true,
+                },
+                Some(SessionStanding::NeedsIntervention),
+            ),
+            (
+                StandingInputs {
+                    working: true,
+                    failed: true,
+                    done: true,
+                    ..StandingInputs::default()
+                },
+                Some(SessionStanding::Working),
+            ),
+            (
+                StandingInputs {
+                    failed: true,
+                    done: true,
+                    ..StandingInputs::default()
+                },
+                Some(SessionStanding::Failed),
+            ),
+            (
+                StandingInputs {
+                    done: true,
+                    ..StandingInputs::default()
+                },
+                Some(SessionStanding::Done),
+            ),
+            (StandingInputs::default(), None),
+        ];
+
+        for (inputs, expected) in cases {
+            assert_eq!(session_standing(inputs), expected);
+        }
+    }
 
     #[test]
     fn a_row_highlights_and_acts_on_its_own_origin() {

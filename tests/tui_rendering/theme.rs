@@ -672,7 +672,7 @@ fn a_snapshot_repaints_an_open_view_and_its_overlay_in_the_named_theme() {
     assert_eq!(after.cell((0, 0)).unwrap().bg, Color::Rgb(24, 24, 37));
     let theme_row = text_position(&after, "Theme · catppuccin");
     assert_eq!(after.cell(theme_row).unwrap().fg, Color::Rgb(30, 30, 46));
-    assert_eq!(after.cell(theme_row).unwrap().bg, Color::Rgb(137, 180, 250));
+    assert_eq!(after.cell(theme_row).unwrap().bg, Color::Rgb(17, 17, 27));
     let settings_title = text_position(&after, "Settings");
     assert_eq!(
         after.cell(settings_title).unwrap().bg,

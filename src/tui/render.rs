@@ -15,8 +15,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     managed_client::SessionProjection,
     protocol::{
-        ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth, SessionReference,
-        SessionSnapshot, SessionStatus, SessionTimestamp,
+        ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth, SessionSnapshot,
+        SessionStatus, SessionTimestamp,
     },
     theme::Theme,
 };
@@ -34,9 +34,9 @@ use super::{
     },
     shimmer,
     sidebar::{
-        self, ADD_WORKSPACE, Sidebar, SidebarEntry, SidebarMenuGeometry, SidebarRow,
-        SidebarScopeEntry, SidebarSelectorView, SidebarShelf, SidebarShowMore, SidebarSpan,
-        SidebarTarget, SidebarUnreachable, SidebarWorkspaceEntryView,
+        self, ADD_WORKSPACE, SessionStanding, Sidebar, SidebarEntry, SidebarMenuGeometry,
+        SidebarRow, SidebarScopeEntry, SidebarSelectorView, SidebarShelf, SidebarShowMore,
+        SidebarSpan, SidebarTarget, SidebarUnreachable, SidebarWorkspaceEntryView,
     },
     slots::{
         ApplicationNoticeSlotContext, LandingFooterSlotContext, PromptContextSlotContext,
@@ -1802,11 +1802,9 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     let inside = block.inner(column);
     let content = horizontally_inset(inside, 1);
     frame.render_widget(block, column);
-    let (lines, rows) = sidebar_lines(state, content, theme);
+    let (lines, rows, rails) = sidebar_lines(state, content, theme);
     frame.render_widget(Paragraph::new(lines).style(theme.surface.elevated), content);
-    if let Some(open) = state.open_session_reference() {
-        paint_open_rail(frame, &rows, open, inside.x, theme);
-    }
+    paint_standing_rails(frame, &rails, inside.x, theme);
     // The columns inside the rule rather than the content's own, so the
     // padding a row is inset by presses the row it insets. The spans the body
     // narrows to a run of one line are measured from the same edges, in
@@ -1817,35 +1815,87 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     main
 }
 
-/// Marks the open Session's row down its left edge, in the column of padding
-/// the body is inset by.
+/// Paints each active row's Standing Rail over the column of padding at its
+/// left. The glyph and feedback foreground sit over the row's existing
+/// background, so focused rows keep their block while still saying what their
+/// work is doing. Settled rows contribute no span here.
 ///
-/// The rail is drawn over the lines rather than laid out among them, so it
-/// costs the rows no columns and the body reads the same width whatever is
-/// open. It is what says "open" when the row itself has given its background
-/// over to row focus; where nothing else claims the row the rail simply
-/// carries the same highlight one column further left.
-///
-/// A Session with no drawn row gets no rail: the Sidebar marks the row it has,
-/// and never stands one row in for another.
-fn paint_open_rail(
-    frame: &mut Frame<'_>,
-    spans: &[SidebarSpan],
-    open: &SessionReference,
-    column: u16,
-    theme: &Theme,
-) {
-    let Some(span) = spans
-        .iter()
-        .find(|span| span.target == SidebarTarget::Session(open.clone()))
-    else {
-        return;
-    };
-    let rows = span.rows.clone();
+/// Needs Intervention, Failed, and Done have no producer yet; issue #251
+/// (<https://github.com/jake-tucker/suru/issues/251>) defines their eventual inputs and issue #168
+/// (<https://github.com/jake-tucker/suru/issues/168>) tracks the labels they will bring with them.
+fn paint_standing_rails(frame: &mut Frame<'_>, rails: &[StandingRail], column: u16, theme: &Theme) {
     let buffer = frame.buffer_mut();
-    for row in rows {
-        if let Some(cell) = buffer.cell_mut(Position::new(column, row)) {
-            cell.set_style(theme.selection.open_rail);
+    for rail in rails {
+        let style = rail.standing.presentation().feedback.style(theme);
+        for row in rail.rows.clone() {
+            if let Some(cell) = buffer.cell_mut(Position::new(column, row)) {
+                if rail.focused {
+                    cell.set_style(theme.selection.focused);
+                }
+                cell.set_symbol("▎");
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
+struct StandingRail {
+    rows: std::ops::Range<u16>,
+    standing: SessionStanding,
+    focused: bool,
+}
+
+#[derive(Clone, Copy)]
+struct StandingPresentation {
+    feedback: StandingFeedback,
+    slot: StandingSlot,
+}
+
+#[derive(Clone, Copy)]
+enum StandingFeedback {
+    Warning,
+    Info,
+    Error,
+    Success,
+}
+
+impl StandingFeedback {
+    const fn style(self, theme: &Theme) -> Style {
+        match self {
+            Self::Warning => theme.feedback.warning,
+            Self::Info => theme.feedback.info,
+            Self::Error => theme.feedback.error,
+            Self::Success => theme.feedback.success,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StandingSlot {
+    CompactTime,
+    WorkingDuration,
+    Word(&'static str),
+}
+
+impl SessionStanding {
+    const fn presentation(self) -> StandingPresentation {
+        match self {
+            Self::NeedsIntervention => StandingPresentation {
+                feedback: StandingFeedback::Warning,
+                slot: StandingSlot::CompactTime,
+            },
+            Self::Working => StandingPresentation {
+                feedback: StandingFeedback::Info,
+                slot: StandingSlot::WorkingDuration,
+            },
+            Self::Failed => StandingPresentation {
+                feedback: StandingFeedback::Error,
+                slot: StandingSlot::Word("Failed"),
+            },
+            Self::Done => StandingPresentation {
+                feedback: StandingFeedback::Success,
+                slot: StandingSlot::Word("Done"),
+            },
         }
     }
 }
@@ -1930,7 +1980,7 @@ fn sidebar_lines(
     state: &TuiState,
     content: Rect,
     theme: &Theme,
-) -> (Vec<Line<'static>>, Vec<SidebarSpan>) {
+) -> (Vec<Line<'static>>, Vec<SidebarSpan>, Vec<StandingRail>) {
     let width = usize::from(content.width);
     let driving = state.sidebar_owns_input();
     let mut lines = vec![sidebar_search_line(state.sidebar.query(), width, theme)];
@@ -1979,7 +2029,7 @@ fn sidebar_lines(
     // able to be done with it the same way.
     if let Some(entry) = state.sidebar.workspace_entry() {
         lines.extend(sidebar_workspace_entry_lines(&entry, width, theme));
-        return (lines, rows);
+        return (lines, rows, Vec::new());
     }
     let capacity = usize::from(content.height).saturating_sub(lines.len());
     let entries = state
@@ -1990,16 +2040,26 @@ fn sidebar_lines(
             sidebar_empty_reading(&state.sidebar)
                 .map(|reading| Line::styled(reading, theme.text.subdued)),
         );
-        return (lines, rows);
+        return (lines, rows, Vec::new());
     }
     let now = SessionTimestamp::now().0;
     let mut top = content
         .y
         .saturating_add(u16::try_from(lines.len()).unwrap_or_default());
+    let mut rails = Vec::new();
     for entry in entries {
+        let standing = entry.standing();
+        let focused = driving && entry.is_focused();
         let target = entry.target();
         let drawn = sidebar_entry_lines(entry, width, now, driving, theme);
         let bottom = top.saturating_add(u16::try_from(drawn.len()).unwrap_or_default());
+        if let Some(standing) = standing {
+            rails.push(StandingRail {
+                rows: top..bottom,
+                standing,
+                focused,
+            });
+        }
         if let Some(target) = target {
             rows.push(SidebarSpan {
                 rows: top..bottom,
@@ -2010,7 +2070,7 @@ fn sidebar_lines(
         top = bottom;
         lines.extend(drawn);
     }
-    (lines, rows)
+    (lines, rows, rails)
 }
 
 /// The Sidebar's search box, standing at the top of the column whether or not
@@ -2095,7 +2155,7 @@ fn sidebar_entry_lines(
             } => sidebar_active_row_lines(
                 row,
                 workspace,
-                sidebar_active_slot(working_since, updated_at, now),
+                sidebar_active_slot(row.standing, working_since, updated_at, now),
                 width,
                 driving,
                 theme,
@@ -2327,18 +2387,26 @@ fn sidebar_settled_row_line(
 /// the compact time since the Session last moved, which is what a row says
 /// when there is nothing louder to say.
 ///
-/// t3 resolves this slot through a fuller precedence — Working, Monitoring,
-/// Approval, Input, Failed, Woke, Done, then the time. The rest hang off state
-/// Suru does not track yet, so each label lands here when its backing state
-/// does: <https://github.com/jake-tucker/suru/issues/168>.
+/// The complete Standing inputs arrive under issue #251
+/// (<https://github.com/jake-tucker/suru/issues/251>). Approval and Input remain tied to the
+/// reserved Needs Intervention variant under issue #168
+/// (<https://github.com/jake-tucker/suru/issues/168>).
 fn sidebar_active_slot(
+    standing: Option<SessionStanding>,
     working_since: Option<SessionTimestamp>,
     updated_at: SessionTimestamp,
     now: u64,
 ) -> String {
-    match working_since {
-        Some(since) => format!("Working {}", working_duration(since, now)),
-        None => relative_update_time_compact(updated_at, now),
+    match standing
+        .map(SessionStanding::presentation)
+        .map(|reading| reading.slot)
+    {
+        Some(StandingSlot::WorkingDuration) => working_since.map_or_else(
+            || relative_update_time_compact(updated_at, now),
+            |since| format!("Working {}", working_duration(since, now)),
+        ),
+        Some(StandingSlot::Word(word)) => word.to_owned(),
+        Some(StandingSlot::CompactTime) | None => relative_update_time_compact(updated_at, now),
     }
 }
 
@@ -2483,34 +2551,31 @@ fn sidebar_slotted_title_line(
     line
 }
 
-/// How a Sidebar row is drawn, which is a reading of the two things a row can
-/// be at once: the Session the main view has open, and the row the keys are
-/// on.
-///
-/// Focus wins the row itself, because it is the state the reader is moving and
-/// the one that says what Enter would act on. The open Session keeps the rail
-/// down the row's left — drawn separately, over the padding — so a row that is
-/// both still says both. And the open highlight does not answer to who holds
-/// the keys: which Session is on screen is true whether the reader is writing
-/// into it or looking down the column.
+/// How a Sidebar row is drawn. Only focus paints the row itself; which Session
+/// is open is carried by its Title instead.
 fn sidebar_row_style(row: SidebarRow<'_>, driving: bool, theme: &Theme) -> Option<Style> {
     sidebar_focus_style(row.focused, driving, theme)
-        .or_else(|| row.open.then_some(theme.selection.open))
 }
 
 /// How a Session's name is drawn where no highlight covers the row: subdued
 /// for one the client could not read or whose Remote is recovering, and plain
 /// otherwise.
 ///
-/// A highlight wins either way. An open Session the listing reports unreadable
-/// keeps its highlight and its marker both: the reader is looking at it, and
-/// the row has to say why they cannot get back into it.
+/// Row focus supplies the background. A readable open Session patches the
+/// accent foreground over either base, while unreadable and recovering rows
+/// stay subdued so their warning is never disguised as ordinary work.
 fn sidebar_title_style(row: SidebarRow<'_>, highlight: Option<Style>, theme: &Theme) -> Style {
-    highlight.unwrap_or(if row.unreadable || row.recovering {
+    let unavailable = row.unreadable || row.recovering;
+    let style = highlight.unwrap_or(if unavailable {
         theme.text.subdued
     } else {
         theme.text.primary
-    })
+    });
+    if row.open && !unavailable {
+        style.patch(theme.selection.open_title)
+    } else {
+        style
+    }
 }
 
 /// `text` with enough trailing spaces to fill `width` columns, so a line that
