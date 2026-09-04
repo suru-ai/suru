@@ -28,6 +28,8 @@ pub(crate) struct Theme {
     pub(crate) feedback: FeedbackRoles,
     pub(crate) border: BorderRoles,
     pub(crate) markdown: MarkdownRoles,
+    #[allow(dead_code)] // Painted once the Code Block renderer highlights by fence language.
+    pub(crate) syntax: SyntaxRoles,
     #[allow(dead_code)] // Reserved by the required semantic contract for selectable UI.
     pub(crate) selection: SelectionRoles,
 }
@@ -126,6 +128,61 @@ pub(crate) struct MarkdownRoles {
     pub(crate) inline_code: Style,
     pub(crate) code_block: Style,
     pub(crate) list_marker: Style,
+}
+
+/// The colors a Code Block paints its tokens with. A theme document names
+/// them with the `syntax*` keys; a role the document leaves out takes the
+/// code block color so the block reads as it did before highlighting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Painted once the Code Block renderer highlights by fence language.
+pub(crate) struct SyntaxRoles {
+    pub(crate) comment: Style,
+    pub(crate) keyword: Style,
+    pub(crate) function: Style,
+    pub(crate) variable: Style,
+    pub(crate) string: Style,
+    pub(crate) number: Style,
+    pub(crate) r#type: Style,
+    pub(crate) operator: Style,
+    pub(crate) punctuation: Style,
+}
+
+/// The document keys a Theme document spells [`SyntaxRoles`] with.
+const SYNTAX_KEYS: [&str; 9] = [
+    "syntaxComment",
+    "syntaxKeyword",
+    "syntaxFunction",
+    "syntaxVariable",
+    "syntaxString",
+    "syntaxNumber",
+    "syntaxType",
+    "syntaxOperator",
+    "syntaxPunctuation",
+];
+
+impl SyntaxRoles {
+    /// The System theme's roles, drawn from the terminal's own colors: the
+    /// accent and feedback styles carry keywords, operators, variables,
+    /// strings, numbers, and types so a probed palette flows through, while
+    /// functions take the terminal's blue.
+    fn from_terminal_roles(
+        text: TextRoles,
+        accent: AccentRoles,
+        feedback: FeedbackRoles,
+        blue: Color,
+    ) -> Self {
+        Self {
+            comment: text.subdued,
+            keyword: accent.primary,
+            function: Style::default().fg(blue),
+            variable: feedback.error,
+            string: feedback.success,
+            number: feedback.warning,
+            r#type: feedback.warning,
+            operator: accent.primary,
+            punctuation: text.primary,
+        }
+    }
 }
 
 /// How a surface says which of its rows a reader means. The two questions are
@@ -526,6 +583,17 @@ quantized_fields!(MarkdownRoles {
     code_block,
     list_marker,
 });
+quantized_fields!(SyntaxRoles {
+    comment,
+    keyword,
+    function,
+    variable,
+    string,
+    number,
+    r#type,
+    operator,
+    punctuation,
+});
 quantized_fields!(SelectionRoles {
     focused,
     unfocused,
@@ -541,6 +609,7 @@ quantized_fields!(Theme {
     feedback,
     border,
     markdown,
+    syntax,
     selection,
 });
 
@@ -803,11 +872,12 @@ impl Theme {
             success: Style::default().fg(Color::Green),
             info: Style::default().fg(Color::LightBlue),
         };
+        let text = TextRoles {
+            primary: Style::default().fg(Color::Reset),
+            subdued: Style::default().fg(Color::DarkGray),
+        };
         Self {
-            text: TextRoles {
-                primary: Style::default().fg(Color::Reset),
-                subdued: Style::default().fg(Color::DarkGray),
-            },
+            text,
             surface: SurfaceRoles {
                 base: Style::default().bg(Color::Reset),
                 elevated: Style::default().bg(Color::Black),
@@ -866,6 +936,7 @@ impl Theme {
                 code_block: Style::default().fg(Color::Green),
                 list_marker: Style::default().fg(Color::Cyan),
             },
+            syntax: SyntaxRoles::from_terminal_roles(text, accent, feedback, Color::Blue),
             selection: SelectionRoles {
                 focused: Style::default().fg(Color::Black).bg(Color::Blue),
                 unfocused: Style::default().fg(Color::Reset).bg(Color::DarkGray),
@@ -940,19 +1011,21 @@ impl Theme {
             success: style(green),
             info: style(primary),
         };
+        let text = TextRoles {
+            primary: style(foreground),
+            subdued: style(muted),
+        };
+        let accent = AccentRoles {
+            primary: style(primary),
+        };
         Self {
-            text: TextRoles {
-                primary: style(foreground),
-                subdued: style(muted),
-            },
+            text,
             surface: SurfaceRoles {
                 base: surface(Color::Reset),
                 elevated: surface(grays.panel()),
                 overlay: surface(grays.element()),
             },
-            accent: AccentRoles {
-                primary: style(primary),
-            },
+            accent,
             ansi,
             action: ActionRoles {
                 primary: style(primary).add_modifier(Modifier::BOLD),
@@ -978,6 +1051,7 @@ impl Theme {
                 code_block: style(foreground),
                 list_marker: style(blue),
             },
+            syntax: SyntaxRoles::from_terminal_roles(text, accent, feedback, blue),
             selection: SelectionRoles {
                 focused: style(background).bg(primary),
                 unfocused: style(foreground).bg(grays.element()),
@@ -1021,6 +1095,18 @@ impl Theme {
         let strong = colors.required("markdownStrong")?;
         let list_marker = colors.required("markdownListItem")?;
         let code_block = colors.required("markdownCodeBlock")?;
+        let mut syntax_role = |key| colors.optional(key, "markdownCodeBlock");
+        let syntax = SyntaxRoles {
+            comment: Style::default().fg(syntax_role("syntaxComment")?),
+            keyword: Style::default().fg(syntax_role("syntaxKeyword")?),
+            function: Style::default().fg(syntax_role("syntaxFunction")?),
+            variable: Style::default().fg(syntax_role("syntaxVariable")?),
+            string: Style::default().fg(syntax_role("syntaxString")?),
+            number: Style::default().fg(syntax_role("syntaxNumber")?),
+            r#type: Style::default().fg(syntax_role("syntaxType")?),
+            operator: Style::default().fg(syntax_role("syntaxOperator")?),
+            punctuation: Style::default().fg(syntax_role("syntaxPunctuation")?),
+        };
         let style = |color| Style::default().fg(color);
         let surface = |color| Style::default().bg(color);
         let feedback = FeedbackRoles {
@@ -1080,6 +1166,7 @@ impl Theme {
                 code_block: style(code_block),
                 list_marker: style(list_marker),
             },
+            syntax,
             selection: SelectionRoles {
                 focused: style(selected_text).bg(primary),
                 unfocused: style(text).bg(element),
@@ -1360,6 +1447,157 @@ mod tests {
                 Some(focus),
                 theme.surface.elevated.bg,
                 "built-in Theme {name:?} paints the focused row in the Sidebar's own background"
+            );
+        }
+    }
+
+    fn syntax_roles(theme: &Theme) -> [(&'static str, Style); 9] {
+        [
+            ("comment", theme.syntax.comment),
+            ("keyword", theme.syntax.keyword),
+            ("function", theme.syntax.function),
+            ("variable", theme.syntax.variable),
+            ("string", theme.syntax.string),
+            ("number", theme.syntax.number),
+            ("type", theme.syntax.r#type),
+            ("operator", theme.syntax.operator),
+            ("punctuation", theme.syntax.punctuation),
+        ]
+    }
+
+    #[test]
+    fn syntax_keys_resolve_into_syntax_roles() {
+        let source = document(
+            json!({ "ink": "#abcdef" }),
+            &[
+                ("syntaxComment", json!("#a1a1a1")),
+                ("syntaxKeyword", json!("ink")),
+                ("syntaxFunction", json!("#a3a3a3")),
+                ("syntaxVariable", json!("#a4a4a4")),
+                ("syntaxString", json!("#a5a5a5")),
+                ("syntaxNumber", json!("#a6a6a6")),
+                ("syntaxType", json!("#a7a7a7")),
+                ("syntaxOperator", json!("#a8a8a8")),
+                ("syntaxPunctuation", json!("#a9a9a9")),
+            ],
+        );
+        let theme = Theme::from_document(&source, ThemeVariant::Dark).expect("resolve syntax keys");
+
+        assert_eq!(theme.syntax.comment.fg, Some(Color::Rgb(0xa1, 0xa1, 0xa1)));
+        assert_eq!(theme.syntax.keyword.fg, Some(Color::Rgb(0xab, 0xcd, 0xef)));
+        assert_eq!(theme.syntax.function.fg, Some(Color::Rgb(0xa3, 0xa3, 0xa3)));
+        assert_eq!(theme.syntax.variable.fg, Some(Color::Rgb(0xa4, 0xa4, 0xa4)));
+        assert_eq!(theme.syntax.string.fg, Some(Color::Rgb(0xa5, 0xa5, 0xa5)));
+        assert_eq!(theme.syntax.number.fg, Some(Color::Rgb(0xa6, 0xa6, 0xa6)));
+        assert_eq!(theme.syntax.r#type.fg, Some(Color::Rgb(0xa7, 0xa7, 0xa7)));
+        assert_eq!(theme.syntax.operator.fg, Some(Color::Rgb(0xa8, 0xa8, 0xa8)));
+        assert_eq!(
+            theme.syntax.punctuation.fg,
+            Some(Color::Rgb(0xa9, 0xa9, 0xa9))
+        );
+    }
+
+    #[test]
+    fn syntax_roles_missing_from_a_document_fall_back_to_the_code_block_style() {
+        let source = document(json!({}), &[("syntaxKeyword", json!("#a2a2a2"))]);
+        let theme = Theme::from_document(&source, ThemeVariant::Dark).expect("resolve fallbacks");
+
+        assert_eq!(theme.syntax.keyword.fg, Some(Color::Rgb(0xa2, 0xa2, 0xa2)));
+        for (role, style) in syntax_roles(&theme) {
+            if role == "keyword" {
+                continue;
+            }
+            assert_eq!(
+                style, theme.markdown.code_block,
+                "the absent {role} role falls back to the code block style"
+            );
+        }
+    }
+
+    #[test]
+    fn every_vendored_theme_carries_every_syntax_role() {
+        for (name, source) in built_in_themes() {
+            let document: ThemeDocument = serde_json::from_str(source).unwrap();
+            for key in SYNTAX_KEYS {
+                assert!(
+                    document.theme.contains_key(key),
+                    "built-in Theme {name:?} carries {key:?}"
+                );
+            }
+            for variant in [ThemeVariant::Dark, ThemeVariant::Light] {
+                let theme = Theme::from_document(source, variant).unwrap();
+                for (role, style) in syntax_roles(&theme) {
+                    assert!(
+                        style.fg.is_some(),
+                        "built-in Theme {name:?} {} variant resolves the {role} role",
+                        variant.key()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn system_theme_paints_syntax_roles_with_terminal_colors() {
+        let theme = Theme::system();
+        assert_eq!(theme.syntax.comment.fg, Some(Color::DarkGray));
+        assert_eq!(theme.syntax.keyword, theme.accent.primary);
+        assert_eq!(theme.syntax.function.fg, Some(Color::Blue));
+        assert_eq!(theme.syntax.variable, theme.feedback.error);
+        assert_eq!(theme.syntax.string, theme.feedback.success);
+        assert_eq!(theme.syntax.number, theme.feedback.warning);
+        assert_eq!(theme.syntax.r#type, theme.feedback.warning);
+        assert_eq!(theme.syntax.operator.fg, Some(Color::Cyan));
+        assert_eq!(theme.syntax.punctuation, theme.text.primary);
+        assert_eq!(theme.syntax.punctuation.fg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn probed_palette_flows_through_the_system_syntax_roles() {
+        let mut palette = [None; 16];
+        palette[0] = Some(TerminalColor::new(1, 2, 3));
+        palette[1] = Some(TerminalColor::new(200, 10, 10));
+        palette[2] = Some(TerminalColor::new(10, 200, 10));
+        palette[3] = Some(TerminalColor::new(200, 200, 10));
+        palette[4] = Some(TerminalColor::new(10, 10, 200));
+        palette[6] = Some(TerminalColor::new(10, 200, 200));
+        let probe = crate::terminal::TerminalColorProbe::new(
+            palette,
+            Some(TerminalColor::new(230, 230, 230)),
+            Some(TerminalColor::new(1, 2, 3)),
+        );
+        let theme = Theme::from_terminal_probe(probe, ThemeVariant::Dark);
+
+        assert_eq!(theme.syntax.comment, theme.text.subdued);
+        assert_eq!(theme.syntax.keyword, theme.accent.primary);
+        assert_eq!(theme.syntax.keyword.fg, Some(Color::Rgb(10, 200, 200)));
+        assert_eq!(theme.syntax.function.fg, Some(Color::Rgb(10, 10, 200)));
+        assert_eq!(theme.syntax.variable, theme.feedback.error);
+        assert_eq!(theme.syntax.string, theme.feedback.success);
+        assert_eq!(theme.syntax.number, theme.feedback.warning);
+        assert_eq!(theme.syntax.r#type, theme.feedback.warning);
+        assert_eq!(theme.syntax.operator, theme.accent.primary);
+        assert_eq!(theme.syntax.punctuation, theme.text.primary);
+        assert_eq!(theme.syntax.punctuation.fg, Some(Color::Rgb(230, 230, 230)));
+    }
+
+    #[test]
+    fn quantization_to_indexed_color_covers_the_syntax_roles() {
+        let source = document(json!({}), &[("syntaxKeyword", json!("#ff0000"))]);
+        let theme = Theme::from_document(&source, ThemeVariant::Dark)
+            .expect("resolve syntax keys")
+            .for_terminal_capabilities(&TerminalFacts::unprobed(false));
+
+        assert_eq!(
+            theme.syntax.keyword.fg,
+            Some(Color::Indexed(9)),
+            "pure red lands on the terminal's own bright red"
+        );
+        for (role, style) in syntax_roles(&theme) {
+            assert!(
+                matches!(style.fg, Some(Color::Indexed(_))),
+                "the {role} role is quantized to an indexed color, got {:?}",
+                style.fg
             );
         }
     }

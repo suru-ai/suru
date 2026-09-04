@@ -1,6 +1,6 @@
 # Adopt OpenCode's v1 theme document format for Themes
 
-Suru's Themes, built-in and user-supplied alike, are JSON documents in the format OpenCode's TUI uses for its version-1 themes: a `defs` table of named colors and a `theme` table of semantic keys, where each value is a hex color, a reference into `defs`, an ANSI palette index, the word `transparent`, or a `{dark, light}` pair of any of those. Suru reads the keys its own role table consumes and ignores the rest. This lets Suru ship OpenCode's theme set by copying the files and lets users bring any theme written for OpenCode, at the cost of a vocabulary that names colors Suru does not paint yet (diff and syntax keys) and omits a few roles Suru derives instead.
+Suru's Themes, built-in and user-supplied alike, are JSON documents in the format OpenCode's TUI uses for its version-1 themes: a `defs` table of named colors and a `theme` table of semantic keys, where each value is a hex color, a reference into `defs`, an ANSI palette index, the word `transparent`, or a `{dark, light}` pair of any of those. Suru reads the keys its own role table consumes and ignores the rest. This lets Suru ship OpenCode's theme set by copying the files and lets users bring any theme written for OpenCode, at the cost of a vocabulary that names colors Suru does not paint yet (the diff keys; the syntax keys now resolve into Code Block roles) and omits a few roles Suru derives instead.
 
 ## Considered Options
 
