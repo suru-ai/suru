@@ -26,3 +26,5 @@ mod support;
 mod theme;
 mod transcript;
 mod workspace_picker;
+
+mod questionnaires;

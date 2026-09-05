@@ -139,9 +139,16 @@ impl SessionStore {
         for persisted in persisted_sessions {
             let PersistedSession {
                 summary,
-                snapshot,
+                mut snapshot,
                 resume_states,
             } = persisted;
+            for activity in &mut snapshot.activities {
+                if let crate::protocol::Activity::Questionnaire { outcome, .. } = activity
+                    && *outcome == crate::protocol::QuestionnaireOutcome::Pending
+                {
+                    *outcome = crate::protocol::QuestionnaireOutcome::Unavailable;
+                }
+            }
             let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
             let next_prompt_order = snapshot
                 .prompts

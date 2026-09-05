@@ -460,6 +460,12 @@ pub enum ProviderSubagentStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderEvent {
+    QuestionnaireRequested {
+        questionnaire: crate::protocol::Questionnaire,
+    },
+    QuestionnaireWithdrawn {
+        id: crate::protocol::QuestionnaireId,
+    },
     AgentSelectionChanged {
         selection: AgentSelection,
     },
@@ -859,6 +865,15 @@ pub(crate) fn validate_models(models: &[ModelDescriptor]) -> Result<(), Provider
 }
 
 pub trait ProviderSession: Send + Sync + 'static {
+    fn submit_questionnaire(
+        &self,
+        id: crate::protocol::QuestionnaireId,
+        submission: crate::protocol::QuestionnaireSubmission,
+    ) -> ProviderFuture<'_, ()> {
+        let _ = (id, submission);
+        Box::pin(async { Err(ProviderError::new("Questionnaire is unavailable")) })
+    }
+
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()>;
 
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()>;

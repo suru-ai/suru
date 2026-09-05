@@ -208,6 +208,25 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 }
                 message.status = MessageStatus::Completed;
             }
+            SessionChange::QuestionnaireSettled {
+                activity_id,
+                outcome,
+                answer,
+            } => {
+                let Some(Activity::Questionnaire {
+                    outcome: current,
+                    answer: stored,
+                    ..
+                }) = next.activities.iter_mut().find(|a| a.id() == *activity_id)
+                else {
+                    bail!("Unknown Questionnaire Activity");
+                };
+                if *current != crate::protocol::QuestionnaireOutcome::Pending {
+                    bail!("Questionnaire is already unavailable");
+                }
+                *current = *outcome;
+                *stored = answer.clone();
+            }
             SessionChange::ActivityAdded { activity } => {
                 if !next.turns.iter().any(|turn| turn.id == activity.turn_id()) {
                     bail!("Session update referenced an unknown Turn");

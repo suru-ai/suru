@@ -580,6 +580,10 @@ pub async fn spawn_with_providers_and_timings(
             post(cancel_prompt),
         )
         .route(
+            "/v1/sessions/{session_id}/questionnaires/{id}",
+            post(submit_questionnaire),
+        )
+        .route(
             "/v1/sessions/{session_id}/interrupt",
             post(interrupt_session),
         )
@@ -1495,6 +1499,29 @@ fn prompt_mutation_response(
             StatusCode::CONFLICT,
             SessionErrorCode::PromptNotPending,
             "Prompt is no longer pending",
+        ),
+    }
+}
+
+async fn submit_questionnaire(
+    State(state): State<AppState>,
+    AxumPath((session_id, id)): AxumPath<(SessionId, crate::protocol::QuestionnaireId)>,
+    headers: HeaderMap,
+    Json(submission): Json<crate::protocol::QuestionnaireSubmission>,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state
+        .providers
+        .submit_questionnaire(session_id, id, submission)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(message) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::QuestionnaireSubmissionFailed,
+            &message,
         ),
     }
 }

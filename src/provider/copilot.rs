@@ -27,6 +27,7 @@ mod errand;
 mod event_drain;
 mod pricing;
 mod projection;
+mod questionnaire;
 mod runtime;
 mod session;
 mod skills;

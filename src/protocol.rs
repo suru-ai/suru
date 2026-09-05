@@ -8,7 +8,11 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 31;
+pub const PROTOCOL_VERSION: u32 = 32;
+pub use crate::questionnaire::{
+    Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
+    QuestionnaireSubmission,
+};
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
@@ -58,6 +62,8 @@ session_identity!(MessageId);
 session_identity!(ActivityId);
 session_identity!(AgentSelectionOperationId);
 session_identity!(ViewSessionOperationId);
+
+session_identity!(QuestionnaireId);
 
 macro_rules! named_identity {
     ($name:ident) => {
@@ -1417,6 +1423,13 @@ pub enum FileChange {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Activity {
+    Questionnaire {
+        id: ActivityId,
+        turn_id: TurnId,
+        questionnaire: Questionnaire,
+        outcome: QuestionnaireOutcome,
+        answer: Option<Answer>,
+    },
     Status {
         id: ActivityId,
         turn_id: TurnId,
@@ -1488,7 +1501,8 @@ pub enum Activity {
 impl Activity {
     pub const fn id(&self) -> ActivityId {
         match self {
-            Self::Status { id, .. }
+            Self::Questionnaire { id, .. }
+            | Self::Status { id, .. }
             | Self::Error { id, .. }
             | Self::Command { id, .. }
             | Self::FileChange { id, .. }
@@ -1499,7 +1513,8 @@ impl Activity {
 
     pub const fn turn_id(&self) -> TurnId {
         match self {
-            Self::Status { turn_id, .. }
+            Self::Questionnaire { turn_id, .. }
+            | Self::Status { turn_id, .. }
             | Self::Error { turn_id, .. }
             | Self::Command { turn_id, .. }
             | Self::FileChange { turn_id, .. }
@@ -1512,6 +1527,13 @@ impl Activity {
     /// that report a moment rather than work in progress.
     pub const fn status(&self) -> Option<ActivityStatus> {
         match self {
+            Self::Questionnaire { outcome, .. } => Some(match outcome {
+                QuestionnaireOutcome::Pending => ActivityStatus::Active,
+                QuestionnaireOutcome::Answered | QuestionnaireOutcome::Declined => {
+                    ActivityStatus::Completed
+                }
+                _ => ActivityStatus::Failed,
+            }),
             Self::Status { .. } | Self::Error { .. } => None,
             Self::Command { status, .. }
             | Self::FileChange { status, .. }
@@ -2287,6 +2309,11 @@ pub enum SessionChange {
     MessageCompleted {
         message_id: MessageId,
     },
+    QuestionnaireSettled {
+        activity_id: ActivityId,
+        outcome: QuestionnaireOutcome,
+        answer: Option<Answer>,
+    },
     ActivityAdded {
         activity: Activity,
     },
@@ -2410,6 +2437,7 @@ pub enum SessionErrorCode {
     /// Subagent anywhere below the Session.
     NothingToInterrupt,
     InterruptionFailed,
+    QuestionnaireSubmissionFailed,
     /// A per-Subagent stop named a Subagent whose Provider offers none.
     SubagentStopUnsupported,
     AgentSelectionOperationConflict,

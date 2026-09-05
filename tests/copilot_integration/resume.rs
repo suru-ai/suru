@@ -290,3 +290,71 @@ fn session_parameter(requests: &[Value], method: &str) -> String {
         .unwrap_or_else(|| panic!("the scripted Copilot received a {method} naming a Session"))
         .to_owned()
 }
+
+#[tokio::test]
+async fn resumed_copilot_sessions_register_and_answer_native_questionnaires() {
+    use suru::protocol::{Activity, QuestionnaireSubmission};
+    let timeline = format!(
+        "      if [ \"$attempt\" -eq 1 ]; then\n        event first session.idle '{{}}'\n      else\n{}      fi\n",
+        crate::questionnaires::ASK
+    );
+    let fixture = ScriptedCopilot::new(&format!(
+        "{}{}{}{}{}",
+        conversation_arms(),
+        crate::support::resume_session_arm(),
+        crate::support::skills_reload_arm(),
+        send_arm(&timeline),
+        crate::questionnaires::ANSWERED
+    ));
+    let mut live = RestartedSession::establish(&fixture, "copilot-resume-question").await;
+    live.client
+        .admit_prompt(
+            live.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Ask me".into(),
+                    skill_invocations: vec![],
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .unwrap();
+    let snapshot = crate::support::session_where(
+        &live.client,
+        &mut live.feed,
+        live.session_id,
+        "resumed Questionnaire",
+        |s| {
+            s.activities
+                .iter()
+                .any(|a| matches!(a, Activity::Questionnaire { .. }))
+        },
+    )
+    .await;
+    let id = snapshot
+        .activities
+        .iter()
+        .find_map(|a| match a {
+            Activity::Questionnaire { questionnaire, .. } => Some(questionnaire.id),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        fixture.wait_for_request("session.resume").await["params"]["requestUserInput"],
+        true
+    );
+    live.client
+        .submit_questionnaire(live.session_id, id, QuestionnaireSubmission::Decline)
+        .await
+        .unwrap();
+    settled_session_on(&live.client, &mut live.feed, live.session_id, 1).await;
+    assert!(
+        fixture
+            .requests()
+            .iter()
+            .any(|r| r["id"] == 9001 && r["result"]["noResponse"] == true)
+    );
+    live.shutdown().await;
+}

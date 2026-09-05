@@ -387,6 +387,15 @@ pub(super) fn settle_in_flight_changes(
             continue;
         }
         match activity {
+            Activity::Questionnaire {
+                id,
+                outcome: crate::protocol::QuestionnaireOutcome::Pending,
+                ..
+            } => changes.push(SessionChange::QuestionnaireSettled {
+                activity_id: *id,
+                outcome: crate::protocol::QuestionnaireOutcome::TurnEnded,
+                answer: None,
+            }),
             Activity::Command {
                 id,
                 status: ActivityStatus::Active,

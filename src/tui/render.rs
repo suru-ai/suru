@@ -136,6 +136,26 @@ pub(super) fn render_with_slots(
     } else {
         render_landing(frame, state, main, slots, theme)
     };
+    if let Some(questionnaire) = state.open_questionnaire() {
+        state
+            .questionnaires
+            .render(frame, composer.area, questionnaire, theme);
+    } else if state.session.as_ref().is_some_and(|session| {
+        super::questionnaire::pending(session.snapshot())
+            .next()
+            .is_some()
+    }) {
+        let area = Rect::new(
+            composer.area.x,
+            composer.area.y.saturating_sub(1),
+            composer.area.width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new("Questionnaire pending · Ctrl+Q answer").style(theme.feedback.warning),
+            area,
+        );
+    }
     if state.composer_completion.is_visible() && !state.reconnect_overlay_visible {
         render_composer_completion(frame, state, composer.area, theme);
     }

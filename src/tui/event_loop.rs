@@ -681,6 +681,21 @@ impl RunLoop {
                     prompt_id,
                 },
             ),
+            ApplicationTransition::SubmitQuestionnaire {
+                session,
+                id,
+                submission,
+            } => {
+                let session_id = session.session_id;
+                self.spawn_operation(
+                    session,
+                    SessionOperation::SubmitQuestionnaire {
+                        session_id,
+                        id,
+                        submission,
+                    },
+                );
+            }
             ApplicationTransition::InterruptSession { session } => {
                 let session_id = session.session_id;
                 self.spawn_operation(session, SessionOperation::InterruptSession { session_id });
@@ -996,6 +1011,7 @@ impl RunLoop {
             | ApplicationTransition::AdmitPrompt { .. }
             | ApplicationTransition::PromotePrompt { .. }
             | ApplicationTransition::CancelPrompt { .. }
+            | ApplicationTransition::SubmitQuestionnaire { .. }
             | ApplicationTransition::InterruptSession { .. }
             | ApplicationTransition::SubscribeSession(_)
             | ApplicationTransition::ViewSession(_)
@@ -2213,6 +2229,11 @@ fn spawn_session_attachment(
 }
 
 enum SessionOperation {
+    SubmitQuestionnaire {
+        session_id: SessionId,
+        id: crate::protocol::QuestionnaireId,
+        submission: crate::protocol::QuestionnaireSubmission,
+    },
     DeleteSession {
         session_id: SessionId,
     },
@@ -2275,6 +2296,16 @@ impl SessionOperation {
                     .cancel_prompt(session_id, prompt_id)
                     .await
                     .map(|_| ()),
+            ),
+            Self::SubmitQuestionnaire {
+                session_id,
+                id,
+                submission,
+            } => operation_result(
+                session,
+                commands
+                    .submit_questionnaire(session_id, id, submission)
+                    .await,
             ),
             Self::InterruptSession { session_id } => {
                 operation_result(session, commands.interrupt_session(session_id).await)

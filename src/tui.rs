@@ -12,6 +12,7 @@ mod markdown;
 mod model_options;
 mod model_picker;
 mod notice;
+mod questionnaire;
 mod render;
 mod serve_overlay;
 mod session_listing;

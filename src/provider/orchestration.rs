@@ -161,6 +161,11 @@ impl ProviderUpdateGate {
 }
 
 enum ProviderCommand {
+    SubmitQuestionnaire {
+        id: crate::protocol::QuestionnaireId,
+        submission: crate::protocol::QuestionnaireSubmission,
+        response: oneshot::Sender<Result<(), String>>,
+    },
     StartPrompt {
         prompt_id: PromptId,
     },
@@ -805,6 +810,27 @@ impl ProviderOrchestrator {
             .map_err(|_| anyhow::anyhow!("Session Provider actor stopped unexpectedly"))
     }
 
+    pub(crate) async fn submit_questionnaire(
+        &self,
+        session_id: SessionId,
+        id: crate::protocol::QuestionnaireId,
+        submission: crate::protocol::QuestionnaireSubmission,
+    ) -> Result<(), String> {
+        let (response, received) = oneshot::channel();
+        self.schedule(
+            session_id,
+            ProviderCommand::SubmitQuestionnaire {
+                id,
+                submission,
+                response,
+            },
+        )
+        .map_err(|_| "Questionnaire is unavailable".to_owned())?;
+        received
+            .await
+            .map_err(|_| "Questionnaire delivery could not be confirmed".to_owned())?
+    }
+
     /// Stops what a Session is doing, whatever that is: the active Turn along
     /// with the Subagents it spawned, or — with no Turn running — the
     /// Subagents alone. Interrupting a Subagent's own Session stops that one
@@ -1093,6 +1119,10 @@ async fn run_provider_session(
             };
             let Some(command) = command else { break };
             let prompt_id = match command {
+                ProviderCommand::SubmitQuestionnaire { response, .. } => {
+                    let _ = response.send(Err("The owning Turn has ended".into()));
+                    continue;
+                }
                 ProviderCommand::StartPrompt { prompt_id } => prompt_id,
                 ProviderCommand::InterruptSession { response } => {
                     // With no Turn active, the interrupt reaches the
@@ -1366,6 +1396,21 @@ async fn run_provider_session(
                 }
                 // Otherwise the Prompt was admitted while a real Turn ran and
                 // stays pending until that Turn's settle delivers the queue.
+            }
+            ProviderInput::Command(Some(ProviderCommand::SubmitQuestionnaire {
+                id,
+                submission,
+                response,
+            })) => {
+                let result = submit_questionnaire(
+                    &sessions,
+                    session_id,
+                    provider_session.as_ref(),
+                    id,
+                    submission,
+                )
+                .await;
+                let _ = response.send(result);
             }
             ProviderInput::Command(Some(ProviderCommand::SteerPrompt)) => {
                 let current = active
@@ -1967,6 +2012,55 @@ fn project_provider_event(
 ) -> ProviderEventProjection {
     let Some(projected) = updates.apply(|| {
         let projection = match event {
+            ProviderEvent::QuestionnaireRequested { questionnaire } => {
+                if questionnaire.questions.is_empty() {
+                    Err(anyhow::anyhow!(
+                        "Provider sent a Questionnaire without Questions"
+                    ))
+                } else {
+                    sessions
+                        .publish_agent_output(
+                            session_id,
+                            SessionChange::ActivityAdded {
+                                activity: Activity::Questionnaire {
+                                    id: ActivityId::new(),
+                                    turn_id: active.turn_id,
+                                    questionnaire,
+                                    outcome: crate::protocol::QuestionnaireOutcome::Pending,
+                                    answer: None,
+                                },
+                            },
+                        )
+                        .map(|_| ProviderEventProjection::Continue)
+                }
+            }
+            ProviderEvent::QuestionnaireWithdrawn { id } => {
+                let activity = sessions.snapshot(session_id).and_then(|snapshot| {
+                    snapshot.activities.into_iter().find(|activity| {
+                        matches!(
+                            activity,
+                            Activity::Questionnaire {
+                                questionnaire,
+                                outcome: crate::protocol::QuestionnaireOutcome::Pending,
+                                ..
+                            } if questionnaire.id == id
+                        )
+                    })
+                });
+                match activity {
+                    Some(activity) => sessions
+                        .publish_agent_output(
+                            session_id,
+                            SessionChange::QuestionnaireSettled {
+                                activity_id: activity.id(),
+                                outcome: crate::protocol::QuestionnaireOutcome::Withdrawn,
+                                answer: None,
+                            },
+                        )
+                        .map(|_| ProviderEventProjection::Continue),
+                    None => Ok(ProviderEventProjection::Continue),
+                }
+            }
             ProviderEvent::AgentSelectionChanged { selection } => sessions
                 .reconcile_effective_agent_selection(
                     session_id,
@@ -2883,4 +2977,62 @@ mod tests {
         );
         assert!(routes.routes.is_empty());
     }
+}
+
+async fn submit_questionnaire(
+    sessions: &SessionStore,
+    session_id: SessionId,
+    provider: &dyn ProviderSession,
+    id: crate::protocol::QuestionnaireId,
+    submission: crate::protocol::QuestionnaireSubmission,
+) -> Result<(), String> {
+    use crate::protocol::{QuestionnaireOutcome, QuestionnaireSubmission};
+    let snapshot = sessions
+        .snapshot(session_id)
+        .ok_or("Session is unavailable")?;
+    let (activity_id, questionnaire) = snapshot
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::Questionnaire {
+                id: activity_id,
+                questionnaire,
+                outcome: QuestionnaireOutcome::Pending,
+                turn_id,
+                ..
+            } if questionnaire.id == id
+                && snapshot.turns.iter().any(|turn| {
+                    turn.id == *turn_id && turn.status == crate::protocol::TurnStatus::Active
+                }) =>
+            {
+                Some((*activity_id, questionnaire))
+            }
+            _ => None,
+        })
+        .ok_or("Questionnaire is unavailable")?;
+    let (outcome, answer) = match &submission {
+        QuestionnaireSubmission::Answer { answer } => {
+            questionnaire.validate(answer)?;
+            (
+                QuestionnaireOutcome::Answered,
+                Some(questionnaire.history_answer(answer)),
+            )
+        }
+        QuestionnaireSubmission::Decline => (QuestionnaireOutcome::Declined, None),
+    };
+    provider
+        .submit_questionnaire(id, submission)
+        .await
+        .map_err(|_| "Questionnaire submission failed".to_owned())?;
+    sessions
+        .publish_agent_output(
+            session_id,
+            SessionChange::QuestionnaireSettled {
+                activity_id,
+                outcome,
+                answer,
+            },
+        )
+        .map_err(|_| "Questionnaire delivery could not be confirmed".to_owned())?;
+    Ok(())
 }

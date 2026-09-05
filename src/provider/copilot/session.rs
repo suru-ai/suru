@@ -80,6 +80,10 @@ pub(super) async fn start_copilot_session(
     interrupt_request_timeout: Duration,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let handle = Arc::new(handle);
+    let (questionnaire_events, questionnaire_rx) = tokio::sync::mpsc::unbounded_channel();
+    let questionnaires = Arc::new(super::questionnaire::CopilotQuestionnaires::new(
+        questionnaire_events,
+    ));
     let workspace = request.workspace.clone();
     let (context, copilot_session_id, native) = match known_session_id(request.resume_state)? {
         // A restored Suru Session keeps the identifier its Copilot Session was created under,
@@ -97,7 +101,8 @@ pub(super) async fn start_copilot_session(
                 .with_include_sub_agent_streaming_events(true)
                 .with_enable_config_discovery(true)
                 .with_enable_skills(true)
-                .approve_all_permissions();
+                .approve_all_permissions()
+                .with_user_input_handler(questionnaires.clone());
             let native = until_crash(
                 &handle,
                 RESUME_CONTEXT,
@@ -120,7 +125,8 @@ pub(super) async fn start_copilot_session(
                 .with_include_sub_agent_streaming_events(true)
                 .with_enable_config_discovery(true)
                 .with_enable_skills(true)
-                .approve_all_permissions();
+                .approve_all_permissions()
+                .with_user_input_handler(questionnaires.clone());
             let native = until_crash(
                 &handle,
                 STARTUP_CONTEXT,
@@ -158,7 +164,27 @@ pub(super) async fn start_copilot_session(
         correlation.clone(),
         skills.clone(),
     );
+    let question_lifecycle = questionnaires.clone();
+    let events = futures_util::StreamExt::inspect(events, move |event| {
+        if matches!(
+            event,
+            Ok(crate::provider::AttributedProviderEvent {
+                attribution: crate::provider::ProviderEventAttribution::OwningSession,
+                event: crate::provider::ProviderEvent::TurnCompleted
+                    | crate::provider::ProviderEvent::TurnInterrupted
+                    | crate::provider::ProviderEvent::TurnFailed { .. }
+            })
+        ) || event.is_err()
+        {
+            question_lifecycle.cancel();
+        }
+    });
+    let requests = futures_util::stream::unfold(questionnaire_rx, |mut rx| async move {
+        rx.recv().await.map(|event| (event, rx))
+    });
+    let events = Box::pin(futures_util::stream::select(events, Box::pin(requests)));
     let session = Arc::new(CopilotSession {
+        questionnaires,
         native,
         handle,
         correlation,
@@ -283,6 +309,7 @@ fn context_tier(choice: &ModelOptionChoiceId) -> Option<ContextTier> {
 }
 
 struct CopilotSession {
+    questionnaires: Arc<super::questionnaire::CopilotQuestionnaires>,
     native: NativeSession,
     handle: Arc<SharedHarnessHandle<CopilotConnection>>,
     correlation: Arc<StdMutex<CopilotCorrelation>>,
@@ -384,6 +411,17 @@ pub(super) fn lower_selection_options(
 }
 
 impl ProviderSession for CopilotSession {
+    fn submit_questionnaire(
+        &self,
+        id: crate::protocol::QuestionnaireId,
+        submission: crate::protocol::QuestionnaireSubmission,
+    ) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            self.require_running_turn("answer")?;
+            self.questionnaires.submit(id, submission)
+        })
+    }
+
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             self.correlation
@@ -457,6 +495,7 @@ impl ProviderSession for CopilotSession {
     fn interrupt_turn(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             self.require_running_turn("interrupt")?;
+            self.questionnaires.cancel();
             // The Turn is Copilot's whole agentic loop, so stopping it is the whole-loop abort. The
             // Turn settles on the aborted idle that follows, not on this acknowledgement — which is
             // why an unanswered abort is bounded here rather than left to the loop to end.
@@ -495,6 +534,7 @@ impl ProviderSession for CopilotSession {
             // Session that is done with it lets go of its own event loop and leaves the process
             // running. Copilot keeps its own Session on disk, which is what a later resume of the
             // Suru Session picks back up.
+            self.questionnaires.cancel();
             self.native.stop_event_loop().await;
             Ok(())
         })

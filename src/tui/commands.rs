@@ -10,6 +10,17 @@ pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SemanticCommandId {
+    QuestionnaireScrollUp,
+    QuestionnaireScrollDown,
+    QuestionnaireOpen,
+    QuestionnaireHide,
+    QuestionnairePrevious,
+    QuestionnaireNext,
+    QuestionnaireSelect,
+    QuestionnaireReview,
+    QuestionnaireSubmit,
+    QuestionnaireDecline,
+
     ApplicationExit,
     ComposerPlaceCursor,
     ThemeList,
@@ -206,6 +217,16 @@ impl SemanticCommandId {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::QuestionnaireScrollUp => "questionnaire.scroll.up",
+            Self::QuestionnaireScrollDown => "questionnaire.scroll.down",
+            Self::QuestionnaireOpen => "questionnaire.open",
+            Self::QuestionnaireHide => "questionnaire.hide",
+            Self::QuestionnairePrevious => "questionnaire.previous",
+            Self::QuestionnaireNext => "questionnaire.next",
+            Self::QuestionnaireSelect => "questionnaire.select",
+            Self::QuestionnaireReview => "questionnaire.review",
+            Self::QuestionnaireSubmit => "questionnaire.submit",
+            Self::QuestionnaireDecline => "questionnaire.decline",
             Self::ComposerPlaceCursor => "composer.cursor.place",
             Self::ApplicationExit => "application.exit",
             Self::ThemeList => "theme.list",
@@ -336,6 +357,84 @@ const fn numeric_insert_descriptors() -> [SemanticCommandDescriptor; 10] {
 const NUMERIC_INSERT_COMMANDS: [SemanticCommandDescriptor; 10] = numeric_insert_descriptors();
 
 const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::QuestionnaireScrollUp,
+        title: "Scroll Questionnaire Up",
+        description: "Read more of the Question",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::QuestionnaireScrollDown,
+        title: "Scroll Questionnaire Down",
+        description: "Read more of the Question",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::QuestionnaireOpen,
+        title: "Open Questionnaire",
+        description: "Open the structured Answer panel",
+        slash: Some(SlashCommand {
+            name: "questions",
+            aliases: &["answer"],
+        }),
+        keybinding: Some(SemanticKeybinding {
+            prefix: None,
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::CONTROL,
+            label: "Ctrl+Q",
+        }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::QuestionnaireHide,
+        title: "Hide Questionnaire",
+        description: "Hide the structured Answer panel",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::QuestionnairePrevious,
+        title: "Previous Questionnaire",
+        description: "Previous the structured Answer panel",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::QuestionnaireNext,
+        title: "Next Questionnaire",
+        description: "Next the structured Answer panel",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::QuestionnaireSelect,
+        title: "Select Questionnaire",
+        description: "Select the structured Answer panel",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::QuestionnaireReview,
+        title: "Review Questionnaire",
+        description: "Review the structured Answer panel",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::QuestionnaireSubmit,
+        title: "Submit Questionnaire",
+        description: "Submit the structured Answer panel",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::QuestionnaireDecline,
+        title: "Decline Questionnaire",
+        description: "Decline the structured Answer panel",
+        slash: None,
+        keybinding: None,
+    },
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApplicationExit,
         title: "Exit Suru",

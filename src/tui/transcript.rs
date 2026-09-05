@@ -2052,6 +2052,7 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     (step as u8).hash(&mut hasher);
     match activity {
+        Activity::Questionnaire { outcome, .. } => (*outcome as u8).hash(&mut hasher),
         Activity::Status { .. } | Activity::Error { .. } => {}
         Activity::Command {
             status,
@@ -2224,6 +2225,43 @@ fn render_activity(
 ) -> Option<UnitAnchor> {
     let mut projection = ActivityProjection { lines, links };
     match activity {
+        Activity::Questionnaire {
+            questionnaire,
+            outcome,
+            answer,
+            ..
+        } => {
+            let folded = step != FoldStep::Expanded;
+            projection.lines.push(Line::styled(
+                format!(
+                    "  {} Questionnaire · {:?} · {} question(s){}",
+                    if folded { "▸" } else { "▾" },
+                    outcome,
+                    questionnaire.questions.len(),
+                    if *outcome == crate::protocol::QuestionnaireOutcome::Pending {
+                        " · Ctrl+Q answer"
+                    } else {
+                        ""
+                    }
+                ),
+                theme.accent.primary,
+            ));
+            if !folded {
+                for (index, question) in questionnaire.questions.iter().enumerate() {
+                    projection
+                        .lines
+                        .push(Line::from(format!("    {}", question.text)));
+                    let value = answer
+                        .as_ref()
+                        .and_then(|answer| answer.questions.get(index));
+                    projection.lines.push(Line::from(format!(
+                        "    {}",
+                        super::questionnaire::answer_text(questionnaire, value)
+                    )));
+                }
+            }
+            Some(UnitAnchor::binary(1, folded))
+        }
         Activity::Status { text, .. } => {
             push_styled_prefixed_lines(
                 &mut projection,
@@ -5120,7 +5158,8 @@ mod tests {
     /// entries belong to without spelling out every Activity kind.
     fn set_turn(activity: &mut Activity, turn_id: TurnId) {
         match activity {
-            Activity::Status { turn_id: id, .. }
+            Activity::Questionnaire { turn_id: id, .. }
+            | Activity::Status { turn_id: id, .. }
             | Activity::Error { turn_id: id, .. }
             | Activity::Command { turn_id: id, .. }
             | Activity::FileChange { turn_id: id, .. }

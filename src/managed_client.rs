@@ -424,6 +424,17 @@ impl ManagedClient {
     /// Stops what the Session is doing: its active Turn along with the
     /// Subagents it spawned, or — with no Turn active — its working Subagents
     /// alone. Interrupting a Subagent's own Session stops that one Subagent.
+    pub async fn submit_questionnaire(
+        &self,
+        session_id: SessionId,
+        id: crate::protocol::QuestionnaireId,
+        submission: crate::protocol::QuestionnaireSubmission,
+    ) -> Result<()> {
+        self.session_commands()
+            .submit_questionnaire(session_id, id, submission)
+            .await
+    }
+
     pub async fn interrupt_session(&self, session_id: SessionId) -> Result<()> {
         self.session_commands().interrupt_session(session_id).await
     }
@@ -778,6 +789,28 @@ impl SessionCommandClient {
             "Prompt cancellation",
         )
         .await
+    }
+
+    pub(crate) async fn submit_questionnaire(
+        &self,
+        session_id: SessionId,
+        id: crate::protocol::QuestionnaireId,
+        submission: crate::protocol::QuestionnaireSubmission,
+    ) -> Result<()> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                &format!("/v1/sessions/{session_id}/questionnaires/{id}"),
+            )?)
+            .bearer_auth(&descriptor.token)
+            .json(&submission)
+            .send()
+            .await
+            .context("send Questionnaire submission")?;
+        decode_empty_api_response(response, "Questionnaire submission").await
     }
 
     pub(crate) async fn interrupt_session(&self, session_id: SessionId) -> Result<()> {

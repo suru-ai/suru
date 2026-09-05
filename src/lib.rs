@@ -20,3 +20,5 @@ mod theme;
 pub mod tui;
 
 pub use runtime::RuntimeConfig;
+
+pub mod questionnaire;

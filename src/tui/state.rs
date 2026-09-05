@@ -335,6 +335,7 @@ pub struct TuiState {
     pub(super) fatal_error: Option<String>,
     pub(super) workspace: PathBuf,
     pub(super) composers: ComposerMemory,
+    pub(super) questionnaires: super::questionnaire::QuestionnairePanels,
     session_interactions: HashMap<SessionReference, SessionInteraction>,
     /// The effective value of every Setting, as the server last pushed it.
     /// Client Settings govern presentation from here. The snapshot leads the
@@ -505,6 +506,7 @@ impl TuiState {
             fatal_error: None,
             workspace: workspace.clone(),
             composers: ComposerMemory::default(),
+            questionnaires: super::questionnaire::QuestionnairePanels::default(),
             session_interactions: HashMap::new(),
             settings: EffectiveSettings::default(),
             settings_received: false,
@@ -1882,6 +1884,7 @@ impl TuiState {
             || self.session_picker.is_open()
             || self.workspace_picker.is_open()
             || self.subagent_picker.is_open()
+            || self.questionnaires.is_open(self.session_reference.as_ref())
     }
 
     pub(super) fn composer_border_style(&self, theme: &Theme) -> Style {
@@ -2278,6 +2281,8 @@ pub enum ApplicationEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandId {
+    QuestionnaireInsert(String),
+    QuestionnaireDelete,
     ClearOrExit,
     SubmitSteer,
     SubmitQueue,
@@ -2375,6 +2380,11 @@ pub enum CommandId {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplicationTransition {
+    SubmitQuestionnaire {
+        session: SessionReference,
+        id: crate::protocol::QuestionnaireId,
+        submission: crate::protocol::QuestionnaireSubmission,
+    },
     Continue,
     Exit,
     SessionEnded,
@@ -2607,6 +2617,13 @@ impl Application {
         let theme_name = self.state.settings.appearance.theme.clone();
         self.state.remember_agent_selection_presentation();
         let transition = self.handle_event_inner(event)?;
+        if let (Some(session), Some(projection)) =
+            (&self.state.session_reference, &self.state.session)
+        {
+            self.state
+                .questionnaires
+                .reconcile(session, projection.snapshot());
+        }
         if carries_settings || mutation_failed {
             self.state.theme_picker.settle_preview();
         }
@@ -2993,6 +3010,16 @@ impl Application {
             return Ok(ApplicationTransition::Continue);
         }
         match command {
+            CommandId::QuestionnaireInsert(text) => {
+                if let Some(questionnaire) = self.state.open_questionnaire().cloned() {
+                    self.state.questionnaires.insert(&questionnaire, &text);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            CommandId::QuestionnaireDelete => {
+                self.state.questionnaires.delete();
+                Ok(ApplicationTransition::Continue)
+            }
             CommandId::SubmitSteer => Ok(self.submit_prompt(PromptDelivery::Steer)),
             CommandId::SubmitQueue => Ok(self.submit_prompt(PromptDelivery::Queue)),
             CommandId::InvokeSemantic(command) => self.invoke_semantic(command),
@@ -4323,6 +4350,56 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(Self::session_picker_listing_transition(listing))
             }
+            SemanticCommandId::QuestionnaireOpen => {
+                if let (Some(session), Some(questionnaire)) = (
+                    self.state.session_reference.clone(),
+                    self.state
+                        .session
+                        .as_ref()
+                        .and_then(|s| super::questionnaire::pending(s.snapshot()).next())
+                        .cloned(),
+                ) {
+                    self.state.questionnaires.open(session, &questionnaire);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::QuestionnaireHide => {
+                self.state.questionnaires.hide();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::QuestionnaireDecline => {
+                if let (Some(session), Some(id)) = (
+                    self.state.session_reference.clone(),
+                    self.state.open_questionnaire().map(|q| q.id),
+                ) {
+                    Ok(ApplicationTransition::SubmitQuestionnaire {
+                        session,
+                        id,
+                        submission: crate::protocol::QuestionnaireSubmission::Decline,
+                    })
+                } else {
+                    Ok(ApplicationTransition::Continue)
+                }
+            }
+            SemanticCommandId::QuestionnaireScrollUp
+            | SemanticCommandId::QuestionnaireScrollDown
+            | SemanticCommandId::QuestionnairePrevious
+            | SemanticCommandId::QuestionnaireNext
+            | SemanticCommandId::QuestionnaireSelect
+            | SemanticCommandId::QuestionnaireReview
+            | SemanticCommandId::QuestionnaireSubmit => {
+                if let Some(questionnaire) = self.state.open_questionnaire().cloned()
+                    && let Some(answer) = self.state.questionnaires.command(&questionnaire, command)
+                    && let Some(session) = self.state.session_reference.clone()
+                {
+                    return Ok(ApplicationTransition::SubmitQuestionnaire {
+                        session,
+                        id: questionnaire.id,
+                        submission: crate::protocol::QuestionnaireSubmission::Answer { answer },
+                    });
+                }
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::WorkspaceList => {
                 let request = self.state.workspace_picker.open();
                 self.state.command_mode = CommandMode::Composer;
@@ -4955,6 +5032,35 @@ impl Application {
         if self.state.sidebar_owns_input() {
             return command_for_sidebar_event(event);
         }
+        if self
+            .state
+            .questionnaires
+            .is_open(self.state.session_reference.as_ref())
+        {
+            if matches!(self.state.command_mode, CommandMode::Leader) {
+                return command_for_leader_event(event);
+            }
+            if let InputEvent::Paste(text) = &event {
+                return Some(CommandId::QuestionnaireInsert(text.clone()));
+            }
+            if let Some(command) = super::questionnaire::key(&event) {
+                return Some(command);
+            }
+            return match command_for_terminal_event(event) {
+                Some(
+                    command @ (CommandId::ScrollTranscriptPageUp
+                    | CommandId::ScrollTranscriptPageDown
+                    | CommandId::ScrollTranscriptLinesUp
+                    | CommandId::ScrollTranscriptLinesDown
+                    | CommandId::FollowLatest
+                    | CommandId::BeginLeader
+                    | CommandId::InvokeSemantic(_)
+                    | CommandId::PressAt { .. }
+                    | CommandId::OpenContextMenuAt { .. }),
+                ) => Some(command),
+                _ => None,
+            };
+        }
         if self.state.composer_completion.is_visible()
             && let Some(command) = command_for_completion_event(event.clone())
         {
@@ -5045,5 +5151,16 @@ fn is_reader_interaction(event: &InputEvent) -> bool {
         InputEvent::Mouse(mouse) => !matches!(mouse.kind, MouseEventKind::Moved),
         InputEvent::Paste(_) => true,
         InputEvent::Resize(..) | InputEvent::FocusGained | InputEvent::FocusLost => false,
+    }
+}
+
+impl TuiState {
+    pub(super) fn open_questionnaire(&self) -> Option<&crate::protocol::Questionnaire> {
+        if !self.questionnaires.is_open(self.session_reference.as_ref()) {
+            return None;
+        }
+        let id = self.questionnaires.id()?;
+        super::questionnaire::pending(self.session.as_ref()?.snapshot())
+            .find(|questionnaire| questionnaire.id == id)
     }
 }

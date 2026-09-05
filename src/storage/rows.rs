@@ -720,6 +720,11 @@ struct StoredMessagePayload {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StoredActivityPayload {
+    Questionnaire {
+        questionnaire: crate::protocol::Questionnaire,
+        outcome: crate::protocol::QuestionnaireOutcome,
+        answer: Option<crate::protocol::Answer>,
+    },
     Status {
         text: String,
     },
@@ -757,6 +762,17 @@ enum StoredActivityPayload {
 impl StoredActivityPayload {
     fn into_activity(self, id: ActivityId, turn_id: TurnId) -> Activity {
         match self {
+            Self::Questionnaire {
+                questionnaire,
+                outcome,
+                answer,
+            } => Activity::Questionnaire {
+                id,
+                turn_id,
+                questionnaire,
+                outcome,
+                answer,
+            },
             Self::Status { text } => Activity::Status { id, turn_id, text },
             Self::Error { text } => Activity::Error { id, turn_id, text },
             Self::Command {
@@ -819,6 +835,16 @@ impl StoredActivityPayload {
 impl From<Activity> for StoredActivityPayload {
     fn from(activity: Activity) -> Self {
         match activity {
+            Activity::Questionnaire {
+                questionnaire,
+                outcome,
+                answer,
+                ..
+            } => Self::Questionnaire {
+                questionnaire,
+                outcome,
+                answer,
+            },
             Activity::Status { text, .. } => Self::Status { text },
             Activity::Error { text, .. } => Self::Error { text },
             Activity::Command {

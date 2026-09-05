@@ -84,6 +84,10 @@ pub struct ErrandRequest {
 }
 
 pub struct ControlledProviderSession {
+    questionnaires: mpsc::UnboundedReceiver<(
+        suru::protocol::QuestionnaireId,
+        suru::protocol::QuestionnaireSubmission,
+    )>,
     turns: mpsc::UnboundedReceiver<TurnStart>,
     steers: mpsc::UnboundedReceiver<TurnSteer>,
     interruptions: mpsc::UnboundedReceiver<TurnInterrupt>,
@@ -127,6 +131,10 @@ pub struct SubagentStop {
 }
 
 struct ControlledSessionHandle {
+    questionnaires: mpsc::UnboundedSender<(
+        suru::protocol::QuestionnaireId,
+        suru::protocol::QuestionnaireSubmission,
+    )>,
     turns: mpsc::UnboundedSender<TurnStart>,
     steers: mpsc::UnboundedSender<TurnSteer>,
     interruptions: mpsc::UnboundedSender<TurnInterrupt>,
@@ -359,6 +367,7 @@ impl StartRequest {
     }
 
     pub fn succeed(self, identity: AgentIdentity) -> ControlledProviderSession {
+        let (questionnaires_tx, questionnaires_rx) = mpsc::unbounded_channel();
         let (turns_tx, turns_rx) = mpsc::unbounded_channel();
         let (steers_tx, steers_rx) = mpsc::unbounded_channel();
         let (interruptions_tx, interruptions_rx) = mpsc::unbounded_channel();
@@ -378,6 +387,7 @@ impl StartRequest {
                 identity,
                 None,
                 Arc::new(ControlledSessionHandle {
+                    questionnaires: questionnaires_tx,
                     turns: turns_tx,
                     steers: steers_tx,
                     interruptions: interruptions_tx,
@@ -388,6 +398,7 @@ impl StartRequest {
             )))
             .unwrap_or_else(|_| panic!("Provider startup response remains connected"));
         ControlledProviderSession {
+            questionnaires: questionnaires_rx,
             turns: turns_rx,
             steers: steers_rx,
             interruptions: interruptions_rx,
@@ -413,6 +424,18 @@ impl StartRequest {
 }
 
 impl ControlledProviderSession {
+    pub async fn next_questionnaire_submission(
+        &mut self,
+    ) -> (
+        suru::protocol::QuestionnaireId,
+        suru::protocol::QuestionnaireSubmission,
+    ) {
+        self.questionnaires
+            .recv()
+            .await
+            .expect("Provider remains connected")
+    }
+
     pub async fn next_turn(&mut self) -> TurnStart {
         self.turns
             .recv()
@@ -825,6 +848,18 @@ fn dispatch_steer_operation(
 }
 
 impl ProviderSession for ControlledSessionHandle {
+    fn submit_questionnaire(
+        &self,
+        id: suru::protocol::QuestionnaireId,
+        submission: suru::protocol::QuestionnaireSubmission,
+    ) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            self.questionnaires
+                .send((id, submission))
+                .map_err(|_| ProviderError::new("test controller disconnected"))
+        })
+    }
+
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         dispatch_prompt_operation(
             self.turns.clone(),
