@@ -2078,7 +2078,7 @@ fn project_provider_event(
                             activity,
                             Activity::Questionnaire {
                                 questionnaire,
-                                outcome: crate::protocol::QuestionnaireOutcome::Pending | crate::protocol::QuestionnaireOutcome::Submitting,
+                                outcome: crate::protocol::QuestionnaireOutcome::Pending | crate::protocol::QuestionnaireOutcome::SubmissionRejected | crate::protocol::QuestionnaireOutcome::Submitting,
                                 ..
                             } if questionnaire.id == id
                         )

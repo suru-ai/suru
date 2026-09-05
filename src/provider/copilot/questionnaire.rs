@@ -46,7 +46,7 @@ impl CopilotQuestionnaires {
                     answer: text.clone(),
                     was_freeform: true,
                 }),
-                _ => return Err(ProviderError::new("Copilot requires one answer")),
+                _ => return Err(ProviderError::questionnaire_rejected("Copilot requires one answer")),
             },
         };
         self.pending

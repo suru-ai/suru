@@ -710,6 +710,7 @@ fn catalog_discards_only_unavailable_hidden_drafts_and_ignores_older_availabilit
             session_id,
             inputs: SessionStandingInputs {
                 pending_questionnaires: vec![second],
+                submitting_questionnaires: Vec::new(),
                 pending_questionnaires_revision: newer_revision,
                 ..Default::default()
             },
@@ -755,6 +756,7 @@ fn catalog_discards_only_unavailable_hidden_drafts_and_ignores_older_availabilit
             session_id,
             inputs: SessionStandingInputs {
                 pending_questionnaires: vec![],
+                submitting_questionnaires: Vec::new(),
                 pending_questionnaires_revision: SessionRevision(0),
                 ..Default::default()
             },

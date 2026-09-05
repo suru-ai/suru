@@ -915,6 +915,7 @@ impl TuiState {
                     &SessionReference::new(origin.clone(), changed.session_id),
                     changed.inputs.pending_questionnaires_revision,
                     &changed.inputs.pending_questionnaires,
+                    &changed.inputs.submitting_questionnaires,
                 )
             }
             ManagedEvent::SessionDeleted(deleted) => self
@@ -5272,7 +5273,9 @@ impl TuiState {
             return None;
         }
         let id = self.questionnaires.id()?;
-        self.pending_questionnaires()
-            .find(|questionnaire| questionnaire.id == id)
+        self.session.as_ref()?.snapshot().activities.iter().find_map(|activity| match activity {
+            Activity::Questionnaire { questionnaire, outcome, .. } if questionnaire.id == id && outcome.is_live() => Some(questionnaire),
+            _ => None,
+        })
     }
 }

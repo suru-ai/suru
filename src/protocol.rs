@@ -1528,7 +1528,7 @@ impl Activity {
     pub const fn status(&self) -> Option<ActivityStatus> {
         match self {
             Self::Questionnaire { outcome, .. } => Some(match outcome {
-                QuestionnaireOutcome::Pending | QuestionnaireOutcome::Submitting => {
+                QuestionnaireOutcome::Pending | QuestionnaireOutcome::SubmissionRejected | QuestionnaireOutcome::Submitting => {
                     ActivityStatus::Active
                 }
                 QuestionnaireOutcome::Answered | QuestionnaireOutcome::Declined => {
@@ -1597,6 +1597,9 @@ pub struct SessionStandingInputs {
     /// Live Questionnaires awaiting an Answer in this Session.
     #[serde(default)]
     pub pending_questionnaires: Vec<QuestionnaireId>,
+    /// Accepted submissions still awaiting Provider delivery; drafts stay disabled.
+    #[serde(default)]
+    pub submitting_questionnaires: Vec<QuestionnaireId>,
     /// Session revision at which live Questionnaire availability last changed.
     #[serde(default)]
     pub pending_questionnaires_revision: SessionRevision,
@@ -1622,6 +1625,7 @@ impl SessionStandingInputs {
         Self {
             subagent_questionnaires: Vec::new(),
             pending_questionnaires: Vec::new(),
+            submitting_questionnaires: Vec::new(),
             pending_questionnaires_revision: SessionRevision(0),
             latest_turn: turns.last().map(|turn| LatestTurnStatus {
                 status: turn.status,

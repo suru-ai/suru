@@ -368,6 +368,7 @@ impl SessionListing {
                 standing_inputs
                     .pending_questionnaires
                     .clone_from(&summary.standing_inputs.pending_questionnaires);
+                standing_inputs.submitting_questionnaires.clone_from(&summary.standing_inputs.submitting_questionnaires);
                 standing_inputs.pending_questionnaires_revision =
                     summary.standing_inputs.pending_questionnaires_revision;
             }

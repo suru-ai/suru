@@ -77,12 +77,24 @@ pub enum QuestionnaireOutcome {
     Pending,
     /// A Client won arbitration; Provider delivery is still in progress.
     Submitting,
+    /// Provider rejected delivery without consuming the live request; explicit retry is safe.
+    SubmissionRejected,
     Answered,
     Declined,
     Withdrawn,
     TurnEnded,
     Unavailable,
     DeliveryUncertain,
+}
+
+impl QuestionnaireOutcome {
+    pub fn is_answerable(self) -> bool {
+        matches!(self, Self::Pending | Self::SubmissionRejected)
+    }
+
+    pub fn is_live(self) -> bool {
+        self.is_answerable() || self == Self::Submitting
+    }
 }
 
 impl Questionnaire {

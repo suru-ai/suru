@@ -67,14 +67,10 @@ impl SessionStoreState {
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
-        let previous_pending = record
-            .summary
-            .standing_inputs
-            .pending_questionnaires
-            .clone();
+        let previous_standing = record.summary.standing_inputs.clone();
         let update = record.commit(storage, session_id, changes, updated_at)?;
         let standing_inputs = record.summary.standing_inputs.clone();
-        if (turn_settled || previous_pending != standing_inputs.pending_questionnaires)
+        if (turn_settled || previous_standing != standing_inputs)
             && self.ancestry(session_id).announces(session_id)
         {
             self.publish_catalog_change(SessionCatalogChange::StandingInputsChanged {
@@ -517,10 +513,10 @@ impl SessionRecord {
             .filter_map(|activity| match activity {
                 crate::protocol::Activity::Questionnaire {
                     questionnaire,
-                    outcome: crate::protocol::QuestionnaireOutcome::Pending,
+                    outcome,
                     turn_id,
                     ..
-                } if self
+                } if outcome.is_answerable() && self
                     .snapshot
                     .turns
                     .iter()
@@ -531,7 +527,12 @@ impl SessionRecord {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if self.summary.standing_inputs.pending_questionnaires != pending {
+        let submitting = self.snapshot.activities.iter().filter_map(|activity| match activity {
+            crate::protocol::Activity::Questionnaire { questionnaire, outcome: crate::protocol::QuestionnaireOutcome::Submitting, .. } => Some(questionnaire.id),
+            _ => None,
+        }).collect::<Vec<_>>();
+        if self.summary.standing_inputs.pending_questionnaires != pending || self.summary.standing_inputs.submitting_questionnaires != submitting {
+            self.summary.standing_inputs.submitting_questionnaires = submitting;
             self.summary.standing_inputs.pending_questionnaires = pending;
             self.summary.standing_inputs.pending_questionnaires_revision = self.snapshot.revision;
         }

@@ -147,10 +147,15 @@ impl SessionStore {
                     && matches!(
                         outcome,
                         crate::protocol::QuestionnaireOutcome::Pending
+                            | crate::protocol::QuestionnaireOutcome::SubmissionRejected
                             | crate::protocol::QuestionnaireOutcome::Submitting
                     )
                 {
-                    *outcome = crate::protocol::QuestionnaireOutcome::Unavailable;
+                    *outcome = if *outcome == crate::protocol::QuestionnaireOutcome::Submitting {
+                        crate::protocol::QuestionnaireOutcome::DeliveryUncertain
+                    } else {
+                        crate::protocol::QuestionnaireOutcome::Unavailable
+                    };
                 }
             }
             let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);

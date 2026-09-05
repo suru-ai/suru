@@ -219,6 +219,7 @@ pub struct ProviderError {
 enum ProviderErrorKind {
     Failure,
     SelectionRejected,
+    QuestionnaireRejected,
     /// The Provider itself cannot be used yet, for a reason the user fixes
     /// outside Suru. Carried on the error so whatever asked the runtime to
     /// work — Model discovery above all — can report the condition rather
@@ -233,6 +234,16 @@ impl ProviderError {
             session_lost: false,
             kind: ProviderErrorKind::Failure,
         }
+    }
+
+    /// Delivery definitely did not occur and the native request remains live.
+    /// Only this failure permits an explicit Questionnaire retry.
+    pub fn questionnaire_rejected(message: impl Into<String>) -> Self {
+        Self { message: message.into(), session_lost: false, kind: ProviderErrorKind::QuestionnaireRejected }
+    }
+
+    pub(crate) fn is_questionnaire_rejected(&self) -> bool {
+        self.kind == ProviderErrorKind::QuestionnaireRejected
     }
 
     pub fn selection_rejected(message: impl Into<String>) -> Self {
@@ -268,7 +279,7 @@ impl ProviderError {
     pub(crate) fn unavailability(&self) -> Option<ProviderUnavailability> {
         match self.kind {
             ProviderErrorKind::Unavailable(reason) => Some(reason),
-            ProviderErrorKind::Failure | ProviderErrorKind::SelectionRejected => None,
+            ProviderErrorKind::Failure | ProviderErrorKind::SelectionRejected | ProviderErrorKind::QuestionnaireRejected => None,
         }
     }
 

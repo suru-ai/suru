@@ -31,6 +31,7 @@ struct Panel {
     current: usize,
     review: bool,
     submitting: bool,
+    submission_rejected: bool,
     scroll: usize,
 }
 
@@ -106,10 +107,10 @@ pub(super) fn pending(snapshot: &SessionSnapshot) -> impl Iterator<Item = &Quest
         .filter_map(|activity| match activity {
             Activity::Questionnaire {
                 questionnaire,
-                outcome: QuestionnaireOutcome::Pending,
+                outcome,
                 turn_id,
                 ..
-            } if snapshot.turns.iter().any(|turn| {
+            } if outcome.is_answerable() && snapshot.turns.iter().any(|turn| {
                 turn.id == *turn_id && turn.status == crate::protocol::TurnStatus::Active
             }) =>
             {
@@ -179,7 +180,20 @@ impl QuestionnairePanels {
             session,
             snapshot.revision,
             &pending(snapshot).map(|q| q.id).collect::<Vec<_>>(),
+            &snapshot.activities.iter().filter_map(|activity| match activity {
+                Activity::Questionnaire { questionnaire, outcome: QuestionnaireOutcome::Submitting, .. } => Some(questionnaire.id),
+                _ => None,
+            }).collect::<Vec<_>>(),
         );
+        for activity in &snapshot.activities {
+            if let Activity::Questionnaire { questionnaire, outcome, .. } = activity
+                && let Some(panel) = self.drafts.get_mut(&(session.clone(), questionnaire.id))
+                && *outcome == QuestionnaireOutcome::SubmissionRejected
+            {
+                panel.submitting = false;
+                panel.submission_rejected = true;
+            }
+        }
     }
 
     pub(super) fn reconcile_subagents(
@@ -203,6 +217,7 @@ impl QuestionnairePanels {
         session: &SessionReference,
         revision: crate::protocol::SessionRevision,
         available: &[QuestionnaireId],
+        submitting: &[QuestionnaireId],
     ) {
         if self
             .availability
@@ -213,12 +228,14 @@ impl QuestionnairePanels {
         }
         self.availability
             .insert(session.clone(), (revision, available.to_vec()));
-        self.drafts
-            .retain(|(owner, id), _| owner != session || available.contains(id));
+        self.drafts.retain(|(owner, id), _| owner != session || available.contains(id) || submitting.contains(id));
+        for ((owner, id), panel) in &mut self.drafts {
+            if owner == session && submitting.contains(id) { panel.submitting = true; }
+        }
         if self
             .visible
             .as_ref()
-            .is_some_and(|(owner, id)| owner == session && !available.contains(id))
+            .is_some_and(|(owner, id)| owner == session && !available.contains(id) && !submitting.contains(id))
         {
             self.visible = None;
         }
@@ -377,6 +394,7 @@ impl QuestionnairePanels {
         let question = &questionnaire.questions[panel.current];
         let draft = &panel.questions[panel.current];
         let mut lines = Vec::new();
+        if panel.submission_rejected { lines.push(Line::from("Answer was not delivered. Review your draft and retry.")); }
         let navigation;
         if panel.review {
             lines.push(Line::styled("Review Answer", theme.accent.primary));

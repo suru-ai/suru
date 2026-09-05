@@ -2234,11 +2234,21 @@ fn render_activity(
             let folded = step != FoldStep::Expanded;
             projection.lines.push(Line::styled(
                 format!(
-                    "  {} Questionnaire · {:?} · {} question(s){}",
+                    "  {} Questionnaire · {} · {} question(s){}",
                     if folded { "▸" } else { "▾" },
-                    outcome,
+                    match outcome {
+                        crate::protocol::QuestionnaireOutcome::SubmissionRejected => "Answer not delivered; review and retry",
+                        crate::protocol::QuestionnaireOutcome::DeliveryUncertain => "Delivery uncertain; Answer will not be resent",
+                        crate::protocol::QuestionnaireOutcome::Unavailable => "Unavailable; previous Provider request is no longer live",
+                        crate::protocol::QuestionnaireOutcome::Pending => "Pending",
+                        crate::protocol::QuestionnaireOutcome::Submitting => "Submitting",
+                        crate::protocol::QuestionnaireOutcome::Answered => "Answered",
+                        crate::protocol::QuestionnaireOutcome::Declined => "Declined",
+                        crate::protocol::QuestionnaireOutcome::Withdrawn => "Withdrawn",
+                        crate::protocol::QuestionnaireOutcome::TurnEnded => "TurnEnded",
+                    },
                     questionnaire.questions.len(),
-                    if *outcome == crate::protocol::QuestionnaireOutcome::Pending {
+                    if outcome.is_answerable() {
                         " · Ctrl+Q answer"
                     } else {
                         ""

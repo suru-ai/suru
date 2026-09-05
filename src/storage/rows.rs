@@ -333,6 +333,7 @@ impl SessionRow {
                 .map(SessionTimestamp),
             standing_inputs: SessionStandingInputs {
                 pending_questionnaires: Vec::new(),
+                submitting_questionnaires: Vec::new(),
                 pending_questionnaires_revision: crate::protocol::SessionRevision(0),
                 subagent_questionnaires: Vec::new(),
                 latest_turn: None,

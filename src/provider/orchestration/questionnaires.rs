@@ -17,7 +17,7 @@ use crate::{
 
 #[derive(Default)]
 pub(super) struct LiveQuestionnaires {
-    pending: HashMap<QuestionnaireId, (ActivityId, Questionnaire)>,
+    registered: HashMap<QuestionnaireId, (ActivityId, Questionnaire)>,
 }
 
 impl LiveQuestionnaires {
@@ -35,8 +35,8 @@ impl LiveQuestionnaires {
         // A duplicate native event cannot revive a consumed request identity.
         if sessions.snapshot(session_id).is_some_and(|snapshot| {
             snapshot.activities.iter().any(|activity| {
-                matches!(activity, Activity::Questionnaire { questionnaire: previous, .. }
-                    if previous.id == questionnaire.id)
+                matches!(activity, Activity::Questionnaire { questionnaire: previous, outcome, .. }
+                    if previous.id == questionnaire.id && *outcome != QuestionnaireOutcome::Unavailable)
             })
         }) {
             return Ok(());
@@ -54,13 +54,13 @@ impl LiveQuestionnaires {
                 },
             },
         )?;
-        self.pending
+        self.registered
             .insert(questionnaire.id, (activity_id, questionnaire));
         Ok(())
     }
 
     pub(super) fn withdraw(&mut self, id: QuestionnaireId) {
-        self.pending.remove(&id);
+        self.registered.remove(&id);
     }
 
     fn reserve(
@@ -71,7 +71,7 @@ impl LiveQuestionnaires {
         submission: &QuestionnaireSubmission,
     ) -> Result<AcceptedSubmission, String> {
         let (activity_id, questionnaire) = self
-            .pending
+            .registered
             .get(&id)
             .ok_or("Questionnaire is unavailable")?;
         let (outcome, answer) = match submission {
@@ -98,7 +98,8 @@ impl LiveQuestionnaires {
                 },
             )
             .map_err(|_| "Questionnaire is unavailable".to_owned())?;
-        self.pending.remove(&id);
+        // History arbitrates consumption; retain the live callback identity so a
+        // definite Provider rejection can permit an explicit retry.
         Ok(accepted)
     }
 }
@@ -144,9 +145,12 @@ impl QuestionnaireDeliveries {
         let sessions = sessions.clone();
         let updates = updates.clone();
         let task = self.tasks.spawn(async move {
-            let delivered = provider.submit_questionnaire(id, submission).await.is_ok();
+            let delivery = provider.submit_questionnaire(id, submission).await;
+            let delivered = delivery.is_ok();
             let outcome = if delivered {
                 accepted.outcome
+            } else if delivery.as_ref().is_err_and(|error| error.is_questionnaire_rejected()) {
+                QuestionnaireOutcome::SubmissionRejected
             } else {
                 QuestionnaireOutcome::DeliveryUncertain
             };
@@ -163,7 +167,11 @@ impl QuestionnaireDeliveries {
                 )
             });
             let result = if !delivered {
-                Err("Questionnaire submission failed".into())
+                Err(if outcome == QuestionnaireOutcome::SubmissionRejected {
+                    "Answer was not delivered. Review your draft and retry.".into()
+                } else {
+                    "Provider delivery is uncertain. This Answer will not be resent.".into()
+                })
             } else if matches!(settled, Some(Ok(_))) {
                 Ok(())
             } else {

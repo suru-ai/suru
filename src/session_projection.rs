@@ -221,7 +221,7 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 else {
                     bail!("Unknown Questionnaire Activity");
                 };
-                if *outcome != crate::protocol::QuestionnaireOutcome::Pending
+                if !outcome.is_answerable()
                     || !next.turns.iter().any(|t| {
                         t.id == *turn_id && t.status == crate::protocol::TurnStatus::Active
                     })
@@ -243,11 +243,7 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 else {
                     bail!("Unknown Questionnaire Activity");
                 };
-                if !matches!(
-                    current,
-                    crate::protocol::QuestionnaireOutcome::Pending
-                        | crate::protocol::QuestionnaireOutcome::Submitting
-                ) || matches!(
+                if !current.is_live() || matches!(
                     outcome,
                     crate::protocol::QuestionnaireOutcome::Pending
                         | crate::protocol::QuestionnaireOutcome::Submitting

@@ -468,6 +468,7 @@ fn a_catalog_viewed_change_clears_another_clients_outcome_in_place() {
                 session_id,
                 inputs: SessionStandingInputs {
                     pending_questionnaires: Vec::new(),
+                    submitting_questionnaires: Vec::new(),
                     pending_questionnaires_revision: suru::protocol::SessionRevision(0),
                     subagent_questionnaires: Vec::new(),
                     latest_turn: Some(LatestTurnStatus {
@@ -3021,6 +3022,7 @@ fn standing_elsewhere(
                 session_id,
                 inputs: SessionStandingInputs {
                     pending_questionnaires: Vec::new(),
+                    submitting_questionnaires: Vec::new(),
                     pending_questionnaires_revision: suru::protocol::SessionRevision(0),
                     subagent_questionnaires: Vec::new(),
                     latest_turn: Some(LatestTurnStatus {
@@ -3118,6 +3120,7 @@ fn latest_turn(session: SessionListItem, status: TurnStatus, settled_at: u64) ->
     };
     summary.standing_inputs = SessionStandingInputs {
         pending_questionnaires: Vec::new(),
+        submitting_questionnaires: Vec::new(),
         pending_questionnaires_revision: suru::protocol::SessionRevision(0),
         subagent_questionnaires: Vec::new(),
         latest_turn: Some(LatestTurnStatus {
@@ -5230,6 +5233,7 @@ fn a_remote_turn_outcome_lights_that_outlooks_row_in_place() {
                 session_id: shared_id,
                 inputs: SessionStandingInputs {
                     pending_questionnaires: Vec::new(),
+                    submitting_questionnaires: Vec::new(),
                     pending_questionnaires_revision: suru::protocol::SessionRevision(0),
                     subagent_questionnaires: Vec::new(),
                     latest_turn: Some(LatestTurnStatus {
@@ -8004,6 +8008,7 @@ fn pending_questionnaires_mark_both_session_listings_and_clear_when_unavailable(
         ManagedEvent::SessionStandingInputsChanged(SessionStandingInputsChanged {
             session_id,
             inputs: SessionStandingInputs {
+                submitting_questionnaires: Vec::new(),
                 pending_questionnaires_revision: SessionRevision(4),
                 ..Default::default()
             },
