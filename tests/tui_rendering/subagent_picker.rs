@@ -534,25 +534,32 @@ fn a_press_outside_the_picker_dismisses_it() {
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a working Subagent");
+    type_terminal_text(&mut application, "hello world");
     press_key(&mut application, KeyCode::Down);
-    rendered_application_rows_at(&application, 80, 22);
+    let buffer = rendered_application_buffer(&application, 80, 22);
+    let (x, y) = text_position(&buffer, "hello world");
 
     assert_eq!(
         application
             .handle_terminal_event(InputEvent::Mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 2,
-                row: 2,
+                column: x,
+                row: y,
                 modifiers: KeyModifiers::NONE,
             }))
             .expect("press outside the picker"),
         ApplicationTransition::Continue,
         "a press outside the picker is how a reader dismisses it"
     );
+    type_terminal_text(&mut application, "!");
     let text = rendered_application_rows_at(&application, 80, 22).join("\n");
     assert!(
         !text.contains("Subagents"),
         "the dismissed picker is gone: {text}"
+    );
+    assert!(
+        text.contains("hello world!"),
+        "dismissing the picker leaves the cursor in place: {text}"
     );
 }
 

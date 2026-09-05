@@ -2,6 +2,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::text_layout::CursorTarget;
+
 use crate::protocol::{Outlook, SessionReference, TurnId};
 
 pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
@@ -9,6 +11,7 @@ pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SemanticCommandId {
     ApplicationExit,
+    ComposerPlaceCursor,
     ThemeList,
     ModelList,
     ModelOptions,
@@ -147,6 +150,7 @@ impl NumericDigit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SemanticSubject {
     View,
+    ComposerCursor(CursorTarget),
     Turn(TurnId),
     Origin(Outlook),
     /// One Session, which is what a reader names by acting on its row rather
@@ -202,6 +206,7 @@ impl SemanticCommandId {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ComposerPlaceCursor => "composer.cursor.place",
             Self::ApplicationExit => "application.exit",
             Self::ThemeList => "theme.list",
             Self::ModelList => "model.list",
@@ -723,6 +728,13 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         // a Session, and the account of the command names the rest of them.
         description: "Open the Session the Sidebar has selected, show more of the settled shelf, \
                       retry an unreachable Remote, or act on the Workspace selector",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ComposerPlaceCursor,
+        title: "Place Composer Cursor",
+        description: "Focus the composer and place its insertion point at a text offset",
         slash: None,
         keybinding: None,
     },

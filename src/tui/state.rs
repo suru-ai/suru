@@ -3197,7 +3197,7 @@ impl Application {
 
     /// Answers a press at one cell of the frame, asking the layers in the
     /// order they were drawn: the Sidebar owns the columns it drew, and a
-    /// press it does not claim falls through to the Transcript beside it.
+    /// press it does not claim reaches the composer or Transcript beside it.
     fn handle_press(&mut self, position: Position) -> Result<ApplicationTransition> {
         // The Subagent Picker stands over everything below while it is up, so
         // it answers first: a press on one of its rows opens the Subagent the
@@ -3219,6 +3219,16 @@ impl Application {
         let press = self.state.sidebar.press_at(position);
         if press != SidebarPress::Elsewhere {
             return self.answer_sidebar_press(press);
+        }
+        if let Some(target) = self
+            .state
+            .composers
+            .hit(self.state.composer_key(), position)
+        {
+            return self.invoke_semantic(SemanticInvocation {
+                id: SemanticCommandId::ComposerPlaceCursor,
+                subject: SemanticSubject::ComposerCursor(target),
+            });
         }
         match self.state.toggle_disclosure_at(position) {
             Some(invocation) => self.invoke_semantic(invocation),
@@ -4142,6 +4152,19 @@ impl Application {
             return Ok(ApplicationTransition::Continue);
         }
         match command {
+            SemanticCommandId::ComposerPlaceCursor => {
+                if !self.state.overlay_owns_input()
+                    && !self.state.reconnect_overlay_visible
+                    && self.state.open_subagent_parent().is_none()
+                    && let SemanticSubject::ComposerCursor(target) = invocation.subject
+                {
+                    self.state.sidebar.hand_back_keys();
+                    self.state.command_mode = CommandMode::Composer;
+                    self.state
+                        .navigate_composer(|composers, key| composers.place_cursor(key, target));
+                }
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::ApplicationExit => Ok(ApplicationTransition::Exit),
             SemanticCommandId::ConnectOpen => {
                 self.state.connect_overlay.open();
@@ -4328,9 +4351,10 @@ impl Application {
             // that names none has nothing to open and leaves the view put.
             SemanticCommandId::SubagentOpen => Ok(match invocation.subject {
                 SemanticSubject::Session(session) => ApplicationTransition::AttachSession(session),
-                SemanticSubject::View | SemanticSubject::Turn(_) | SemanticSubject::Origin(_) => {
-                    ApplicationTransition::Continue
-                }
+                SemanticSubject::View
+                | SemanticSubject::ComposerCursor(_)
+                | SemanticSubject::Turn(_)
+                | SemanticSubject::Origin(_) => ApplicationTransition::Continue,
             }),
             // Stopping a Subagent is interrupting its child Session, on the
             // same subject terms as opening one.
@@ -4338,9 +4362,10 @@ impl Application {
                 SemanticSubject::Session(session) => {
                     ApplicationTransition::InterruptSession { session }
                 }
-                SemanticSubject::View | SemanticSubject::Turn(_) | SemanticSubject::Origin(_) => {
-                    ApplicationTransition::Continue
-                }
+                SemanticSubject::View
+                | SemanticSubject::ComposerCursor(_)
+                | SemanticSubject::Turn(_)
+                | SemanticSubject::Origin(_) => ApplicationTransition::Continue,
             }),
             // Leaving acts on the Session the reader is in: only a Subagent's
             // Session has a parent to return to, so anywhere else the command
@@ -4373,6 +4398,7 @@ impl Application {
                 let named = match invocation.subject {
                     SemanticSubject::Session(session) => Some(session),
                     SemanticSubject::View
+                    | SemanticSubject::ComposerCursor(_)
                     | SemanticSubject::Turn(_)
                     | SemanticSubject::Origin(_) => self.session_reference(),
                 };
@@ -4409,9 +4435,10 @@ impl Application {
                         ApplicationTransition::RetryCatalogOrigin,
                     )
                 }
-                SemanticSubject::View | SemanticSubject::Turn(_) | SemanticSubject::Session(_) => {
-                    ApplicationTransition::Continue
-                }
+                SemanticSubject::View
+                | SemanticSubject::ComposerCursor(_)
+                | SemanticSubject::Turn(_)
+                | SemanticSubject::Session(_) => ApplicationTransition::Continue,
             }),
             // A command naming a Session takes that one away: the surface
             // that named it has already had the reader say it twice, which is

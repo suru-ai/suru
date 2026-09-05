@@ -917,7 +917,7 @@ impl Sidebar {
     /// Row focus goes too. It says what Enter would act on, and nothing here
     /// answers to Enter any more — a mark left standing would be the Sidebar
     /// claiming a Session the reader is not in.
-    fn hand_back_keys(&mut self) {
+    pub(super) fn hand_back_keys(&mut self) {
         self.focused = false;
         self.menu = None;
         // A path entry is a line the reader was typing into, and they have

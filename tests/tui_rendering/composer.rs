@@ -6,7 +6,9 @@ use crate::support::{
     rendered_application_rows, rendered_application_rows_at, text_position, type_terminal_text,
     workspace_dir,
 };
-use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Position;
 use ratatui::style::Color;
 use suru::{
@@ -1576,4 +1578,254 @@ fn application_with_skills(
         })
         .expect("load Skill Catalog");
     (workspace, application)
+}
+
+#[test]
+fn clicking_the_composer_places_the_insertion_point_on_landing_and_session() {
+    for session in [false, true] {
+        let workspace = workspace_dir();
+        let mut application = connected_application(workspace.path());
+        if session {
+            enter_session(&mut application, workspace.path());
+        }
+        type_terminal_text(&mut application, "hello world");
+        let buffer = rendered_application_buffer(&application, 100, 30);
+        let (x, y) = text_position(&buffer, "hello world");
+        click_composer(&mut application, x + 6, y);
+        type_terminal_text(&mut application, "beautiful ");
+        assert!(
+            rendered_application_rows_at(&application, 100, 30)
+                .join("\n")
+                .contains("hello beautiful world")
+        );
+    }
+}
+
+fn click_composer(application: &mut Application, column: u16, row: u16) {
+    application
+        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("click the composer");
+}
+
+#[test]
+fn composer_clicks_resolve_unicode_and_blank_cells_to_insertion_boundaries() {
+    for (text, dx, dy, expected) in [
+        ("a🙂β", 1, 0, "a!🙂β"),
+        ("a🙂β", 2, 0, "a!🙂β"),
+        ("a🙂β", 3, 0, "a🙂!β"),
+        ("ae\u{301}z", 2, 0, "ae\u{301}!z"),
+        ("first\nsecond", 3, 1, "first\nsec!ond"),
+        ("first\nsecond", 12, 0, "first!\nsecond"),
+        ("first\n\nlast", 12, 1, "first\n!\nlast"),
+        ("", 12, 0, "!"),
+    ] {
+        let workspace = workspace_dir();
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_terminal_event(InputEvent::Paste(text.to_owned()))
+            .unwrap();
+        let buffer = rendered_application_buffer(&application, 80, 30);
+        let block = prompt_block(&buffer_rows(&buffer));
+        click_composer(
+            &mut application,
+            block.left + 2 + dx,
+            block.top as u16 + 1 + dy,
+        );
+        type_terminal_text(&mut application, "!");
+        let ApplicationTransition::CreateSession(request) = application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("submit the edited Prompt")
+        else {
+            panic!("the edited Prompt should begin a Session");
+        };
+        assert_eq!(request.prompt.text, expected, "click in {text:?}");
+    }
+}
+
+#[test]
+fn composer_clicks_follow_word_wrapping_and_internal_scrolling_after_resize() {
+    let mut application = Application::default();
+    application
+        .handle_terminal_event(InputEvent::Paste(
+            "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo".to_owned(),
+        ))
+        .unwrap();
+    rendered_application_buffer(&application, 100, 30);
+    let buffer = rendered_application_buffer(&application, 40, 30);
+    let (x, y) = text_position(&buffer, "foxtrot");
+    let block = prompt_block(&buffer_rows(&buffer));
+    assert!(
+        usize::from(y) > block.top + 1,
+        "the clicked word has wrapped"
+    );
+    click_composer(&mut application, x + 3, y);
+    type_terminal_text(&mut application, "!");
+    assert!(
+        rendered_application_rows_at(&application, 40, 30)
+            .join("\n")
+            .contains("fox!trot")
+    );
+
+    let mut scrolled = Application::default();
+    scrolled
+        .handle_terminal_event(InputEvent::Paste(
+            (1..=20)
+                .map(|line| format!("line{line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ))
+        .unwrap();
+    let buffer = rendered_application_buffer(&scrolled, 80, 30);
+    assert!(!buffer_rows(&buffer).join("\n").contains("line01"));
+    let (x, y) = text_position(&buffer, "line15");
+    click_composer(&mut scrolled, x + 4, y);
+    type_terminal_text(&mut scrolled, "!");
+    assert!(
+        rendered_application_rows_at(&scrolled, 80, 30)
+            .join("\n")
+            .contains("line!15")
+    );
+}
+
+#[test]
+fn composer_clicks_ignore_borders_padding_and_non_press_mouse_events() {
+    for target in 0..7 {
+        let mut application = Application::default();
+        type_terminal_text(&mut application, "hello");
+        let buffer = rendered_application_buffer(&application, 80, 30);
+        let block = prompt_block(&buffer_rows(&buffer));
+        let row = block.top as u16 + 1;
+        let (column, row, kind) = match target {
+            0 => (block.left, row, MouseEventKind::Down(MouseButton::Left)),
+            1 => (block.left + 1, row, MouseEventKind::Down(MouseButton::Left)),
+            2 => (
+                block.right - 1,
+                row,
+                MouseEventKind::Down(MouseButton::Left),
+            ),
+            3 => (
+                block.left + 2,
+                row - 1,
+                MouseEventKind::Down(MouseButton::Left),
+            ),
+            4 => (block.left + 2, row, MouseEventKind::Up(MouseButton::Left)),
+            5 => (block.left + 2, row, MouseEventKind::Drag(MouseButton::Left)),
+            _ => (0, row, MouseEventKind::Down(MouseButton::Left)),
+        };
+        application
+            .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+        type_terminal_text(&mut application, "!");
+        assert!(
+            rendered_application_rows_at(&application, 80, 30)
+                .join("\n")
+                .contains("hello!")
+        );
+    }
+}
+
+#[test]
+fn clicking_the_composer_takes_keyboard_focus_back_from_the_sidebar() {
+    let mut application = Application::default();
+    type_terminal_text(&mut application, "hello world");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 120, 30);
+    let (x, y) = text_position(&buffer, "hello world");
+    click_composer(&mut application, x + 6, y);
+    type_terminal_text(&mut application, "beautiful ");
+    assert!(
+        rendered_application_rows_at(&application, 120, 30)
+            .join("\n")
+            .contains("hello beautiful world")
+    );
+}
+
+#[test]
+fn a_frame_without_a_composer_forgets_the_old_click_target() {
+    let mut application = Application::default();
+    type_terminal_text(&mut application, "hello");
+    let buffer = rendered_application_buffer(&application, 80, 30);
+    let (x, y) = text_position(&buffer, "hello");
+    rendered_application_buffer(&application, 20, 4);
+    click_composer(&mut application, x, y);
+    type_terminal_text(&mut application, "!");
+    assert!(
+        rendered_application_rows_at(&application, 80, 30)
+            .join("\n")
+            .contains("hello!")
+    );
+}
+
+#[test]
+fn clicking_blank_space_after_a_wrapped_row_keeps_the_cursor_on_that_row() {
+    let mut application = Application::default();
+    application
+        .handle_terminal_event(InputEvent::Paste(format!("hello {}", "z".repeat(100))))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 80, 30);
+    let (x, y) = text_position(&buffer, "hello");
+    click_composer(&mut application, x + 10, y);
+    assert_eq!(
+        rendered_application_cursor_at(&application, 80, 30),
+        Position::new(x + 6, y)
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::MoveCursorLeft))
+        .unwrap();
+    assert_eq!(
+        rendered_application_cursor_at(&application, 80, 30),
+        Position::new(x + 5, y)
+    );
+    type_terminal_text(&mut application, "!");
+    assert!(
+        rendered_application_rows_at(&application, 80, 30)
+            .join("\n")
+            .contains("hello!")
+    );
+}
+
+#[test]
+fn clicking_blank_space_after_a_wide_hard_wrap_preserves_the_insertion_offset() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let empty = rendered_application_buffer(&application, 80, 30);
+    let width = prompt_block(&buffer_rows(&empty)).content_width();
+    // An oversized word whose first row leaves one cell before the next emoji.
+    let prefix = "a".repeat(width - 3);
+    let text = format!("{prefix}🙂🙂🙂");
+    application
+        .handle_terminal_event(InputEvent::Paste(text))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 80, 30);
+    let block = prompt_block(&buffer_rows(&buffer));
+    let x = block.left + 2 + width as u16 - 1;
+    let y = block.top as u16 + 1;
+    click_composer(&mut application, x, y);
+    assert_eq!(
+        rendered_application_cursor_at(&application, 80, 30),
+        Position::new(x, y)
+    );
+    type_terminal_text(&mut application, "!");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .unwrap()
+    else {
+        panic!("submit the edited Prompt");
+    };
+    assert_eq!(request.prompt.text, format!("{prefix}🙂!🙂🙂"));
 }

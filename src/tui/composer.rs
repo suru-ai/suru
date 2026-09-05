@@ -1,7 +1,14 @@
 //! Client-local multiline composer memory keyed by landing route or Session.
 
-use std::collections::{HashMap, HashSet};
-use std::ops::Range;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
+
+use ratatui::layout::{Position, Rect};
+
+use super::text_layout::{CursorTarget, TextLayout};
 
 use crate::protocol::{
     InitialPrompt, PromptId, SessionReference, SkillDescriptor, SkillInvocation, SkillMarkerSpan,
@@ -17,12 +24,24 @@ pub(super) enum ComposerKey {
 #[derive(Clone, Debug, Default)]
 pub(super) struct ComposerMemory {
     composers: HashMap<ComposerKey, ComposerState>,
+    frame: RefCell<Option<ComposerFrame>>,
+}
+
+/// The editable rectangle and scroll drawn by the latest frame.
+#[derive(Clone, Debug)]
+struct ComposerFrame {
+    key: ComposerKey,
+    area: Rect,
+    scroll: u16,
 }
 
 #[derive(Clone, Debug, Default)]
 struct ComposerState {
     text: String,
     cursor: usize,
+    // Pointer placement may choose the end of the row before a wrap;
+    // ordinary editing and navigation return to the default wrap side.
+    prefer_previous_row: bool,
     history: Vec<String>,
     history_position: Option<usize>,
     history_scratch: Option<String>,
@@ -57,6 +76,43 @@ struct RetryPrompt {
 }
 
 impl ComposerMemory {
+    pub(super) fn forget_frame(&self) {
+        self.frame.replace(None);
+    }
+
+    pub(super) fn record_frame(&self, key: ComposerKey, area: Rect, scroll: u16) {
+        self.frame
+            .replace(Some(ComposerFrame { key, area, scroll }));
+    }
+
+    pub(super) fn hit(&self, key: ComposerKey, position: Position) -> Option<CursorTarget> {
+        let frame = self.frame.borrow();
+        let frame = frame.as_ref()?;
+        if frame.key != key || !frame.area.contains(position) {
+            return None;
+        }
+        Some(
+            TextLayout::new(self.text(key), frame.area.width).cursor_target(
+                frame.scroll.saturating_add(position.y - frame.area.y),
+                position.x - frame.area.x,
+            ),
+        )
+    }
+
+    pub(super) fn place_cursor(&mut self, key: ComposerKey, target: CursorTarget) {
+        let composer = self.composer_mut(key);
+        if composer.text.is_char_boundary(target.offset) {
+            composer.cursor = target.offset;
+            composer.prefer_previous_row = target.prefer_previous_row;
+        }
+    }
+
+    pub(super) fn prefers_previous_row(&self, key: ComposerKey) -> bool {
+        self.composers
+            .get(&key)
+            .is_some_and(|composer| composer.prefer_previous_row)
+    }
+
     pub(super) fn text(&self, key: ComposerKey) -> &str {
         self.composers
             .get(&key)
@@ -144,7 +200,10 @@ impl ComposerMemory {
         key: ComposerKey,
         catalog: Option<&crate::protocol::SkillCatalog>,
     ) {
-        self.composer_mut(key).resolve_skills(catalog);
+        self.composers
+            .entry(key)
+            .or_default()
+            .resolve_skills(catalog);
     }
 
     pub(super) fn delete_backward(&mut self, key: ComposerKey) {
@@ -240,8 +299,13 @@ impl ComposerMemory {
         self.composers.insert(ComposerKey::Landing, recovered);
     }
 
+    /// Prepares an edit or navigation, clearing the pointer's wrap-side
+    /// preference. Catalog-only refreshes bypass this because they leave the
+    /// insertion point untouched.
     fn composer_mut(&mut self, key: ComposerKey) -> &mut ComposerState {
-        self.composers.entry(key).or_default()
+        let composer = self.composers.entry(key).or_default();
+        composer.prefer_previous_row = false;
+        composer
     }
 
     fn with_migrated_composer<T>(

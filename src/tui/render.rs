@@ -23,7 +23,7 @@ use crate::{
 
 use super::{
     completion::CompletionRow,
-    composer::{ComposerKey, ComposerSkillMarkers},
+    composer::{ComposerKey, ComposerMemory, ComposerSkillMarkers},
     connect_overlay::ConnectOverlay,
     keymap::binding_label,
     model_options::ModelOptionChoiceRow,
@@ -115,6 +115,8 @@ pub(super) fn render_with_slots(
     // The Sidebar's own frame record, given up for the same reason: whether it
     // has the keys depends on whether the frame had the columns to draw it.
     state.sidebar.forget_frame();
+    // A frame without an editable composer must leave no pointer target.
+    state.composers.forget_frame();
     // The Subagent Picker's rows are pointable, so its record of where they
     // were drawn starts over with the frame as well.
     state.subagent_picker.forget_frame();
@@ -2670,7 +2672,7 @@ fn render_landing(
     let key = ComposerKey::Landing;
     let composer_text = state.composers.text(key.clone());
     let composer_cursor = state.composers.cursor(key.clone());
-    let skill_markers = state.composers.skill_markers(key);
+    let skill_markers = state.composers.skill_markers(key.clone());
     let composer_height = composer_block_height(
         area.height,
         72_u16.min(content.width),
@@ -2719,6 +2721,8 @@ fn render_landing(
         frame,
         composer_area,
         ComposerContent {
+            memory: &state.composers,
+            key,
             text: composer_text,
             cursor: composer_cursor,
             skill_markers: &skill_markers,
@@ -2768,7 +2772,7 @@ fn render_opening_session(
     );
     let composer_text = state.composers.text(key.clone());
     let composer_cursor = state.composers.cursor(key.clone());
-    let skill_markers = state.composers.skill_markers(key);
+    let skill_markers = state.composers.skill_markers(key.clone());
     let desired_composer_height =
         composer_block_height(area.height, content_width, composer_text, composer_cursor);
     // What the Session view keeps below its Transcript and above its composer:
@@ -2815,6 +2819,8 @@ fn render_opening_session(
         frame,
         composer_area,
         ComposerContent {
+            memory: &state.composers,
+            key,
             text: composer_text,
             cursor: composer_cursor,
             skill_markers: &skill_markers,
@@ -2861,7 +2867,7 @@ fn render_session(
     let key = ComposerKey::Session(session_reference.clone());
     let composer_text = state.composers.text(key.clone());
     let composer_cursor = state.composers.cursor(key.clone());
-    let skill_markers = state.composers.skill_markers(key);
+    let skill_markers = state.composers.skill_markers(key.clone());
     let desired_composer_height = if subagent_view {
         1
     } else {
@@ -3168,6 +3174,8 @@ fn render_session(
             frame,
             composer_area,
             ComposerContent {
+                memory: &state.composers,
+                key,
                 text: composer_text,
                 cursor: composer_cursor,
                 skill_markers: &skill_markers,
@@ -3374,6 +3382,8 @@ fn transcript_viewport_height(area: Rect) -> usize {
 }
 
 struct ComposerContent<'a> {
+    memory: &'a ComposerMemory,
+    key: ComposerKey,
     text: &'a str,
     cursor: usize,
     skill_markers: &'a ComposerSkillMarkers,
@@ -3388,6 +3398,8 @@ fn render_composer(
     theme: &Theme,
 ) -> Position {
     let ComposerContent {
+        memory,
+        key,
         text,
         cursor,
         skill_markers,
@@ -3405,11 +3417,17 @@ fn render_composer(
         .padding(Padding::horizontal(COMPOSER_TEXT_MARGIN))
         .title(title)
         .border_style(style);
+    let content_area = block.inner(area);
     let content_width = composer_content_width(area.width);
     let content_height = area.height.saturating_sub(2).max(1);
     let layout = TextLayout::new(text, content_width);
-    let (cursor_row, cursor_column) = layout.cursor_position(cursor);
+    let (cursor_row, cursor_column) = if memory.prefers_previous_row(key.clone()) {
+        layout.cursor_position_before_wrap(cursor)
+    } else {
+        layout.cursor_position(cursor)
+    };
     let scroll = cursor_row.saturating_sub(content_height.saturating_sub(1));
+    memory.record_frame(key, content_area, scroll);
     let paragraph = if text.is_empty() {
         Paragraph::new(Span::styled(
             "Type a Prompt and press Enter",

@@ -19,6 +19,13 @@ pub(super) struct LaidOutRow<'a> {
     pub(super) width: usize,
 }
 
+/// An insertion offset and which side of a visual wrap the pointer chose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CursorTarget {
+    pub(super) offset: usize,
+    pub(super) prefer_previous_row: bool,
+}
+
 /// Text laid out over content columns `width` wide, as the byte range of each
 /// visual row.
 pub(super) struct TextLayout<'a> {
@@ -110,6 +117,48 @@ impl<'a> TextLayout<'a> {
             text,
             width,
         }
+    }
+
+    /// The insertion offset at a displayed cell. Both cells of a wide
+    /// character point before it; blank space points to the row's end.
+    pub(super) fn cursor_target(&self, row: u16, column: u16) -> CursorTarget {
+        let Some(range) = self.rows.get(usize::from(row)) else {
+            return CursorTarget {
+                offset: self.text.len(),
+                prefer_previous_row: false,
+            };
+        };
+        let mut width = 0;
+        for (offset, character) in self.text[range.clone()].char_indices() {
+            width += display_width(character);
+            if usize::from(column) < width {
+                return CursorTarget {
+                    offset: range.start + offset,
+                    prefer_previous_row: false,
+                };
+            }
+        }
+        CursorTarget {
+            offset: range.end,
+            prefer_previous_row: self.cursor_position(range.end).0 > row,
+        }
+    }
+
+    /// A pointer can choose the end of a soft-wrapped row rather than the
+    /// next row's start, even though both share the same insertion offset.
+    pub(super) fn cursor_position_before_wrap(&self, cursor: usize) -> (u16, u16) {
+        if let Some((index, row)) = self
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.end == cursor && self.drawn(row).width < self.width)
+        {
+            return (
+                u16::try_from(index).unwrap_or(u16::MAX),
+                self.drawn(row).width as u16,
+            );
+        }
+        self.cursor_position(cursor)
     }
 
     /// How many rows the text occupies.
