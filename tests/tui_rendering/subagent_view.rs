@@ -450,6 +450,7 @@ fn child_questionnaire_attention_opens_the_child_panel_and_preserves_parent_and_
         .push(TranscriptItem::Activity { activity_id });
     child.revision.0 += 1;
     parent.subagent_questionnaires.push(SubagentQuestionnaires {
+        submitting_questionnaires: Vec::new(),
         session_id: child_id,
         via_session_id: child_id,
         revision: child.revision,
@@ -524,6 +525,7 @@ fn child_questionnaire_attention_opens_the_child_panel_and_preserves_parent_and_
                 session_id: parent.session.id,
                 inputs: suru::protocol::SessionStandingInputs {
                     subagent_questionnaires: vec![SubagentQuestionnaires {
+                        submitting_questionnaires: Vec::new(),
                         session_id: child_id,
                         via_session_id: child_id,
                         revision: SessionRevision(child.revision.0 + 1),

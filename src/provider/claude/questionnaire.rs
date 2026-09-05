@@ -210,10 +210,18 @@ impl ClaudeQuestionnaires {
         submission: QuestionnaireSubmission,
     ) -> Result<(), ProviderError> {
         let native = {
-            let mut pending = self.pending.lock().expect("Claude Questionnaire lock is not poisoned");
-            let native = pending.get(&id).ok_or_else(|| claude_error("Claude Questionnaire is unavailable"))?;
+            let mut pending = self
+                .pending
+                .lock()
+                .expect("Claude Questionnaire lock is not poisoned");
+            let native = pending
+                .get(&id)
+                .ok_or_else(|| claude_error("Claude Questionnaire is unavailable"))?;
             if let QuestionnaireSubmission::Answer { answer } = &submission {
-                native.questionnaire.validate(answer).map_err(ProviderError::questionnaire_rejected)?;
+                native
+                    .questionnaire
+                    .validate(answer)
+                    .map_err(ProviderError::questionnaire_rejected)?;
             }
             pending.remove(&id).expect("validated live Questionnaire")
         };
@@ -222,10 +230,6 @@ impl ClaudeQuestionnaires {
                 json!({"behavior":"deny", "message":"User declined the Questionnaire", "interrupt":false})
             }
             QuestionnaireSubmission::Answer { answer } => {
-                native
-                    .questionnaire
-                    .validate(&answer)
-                    .map_err(claude_error)?;
                 let mut answers = serde_json::Map::new();
                 for (question, answer) in
                     native.questionnaire.questions.iter().zip(answer.questions)

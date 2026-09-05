@@ -981,3 +981,399 @@ async fn nested_subagent_questionnaires_keep_ancestor_attention_and_answer_in_th
     drop(client);
     live.server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn definite_rejection_preserves_live_identity_for_explicit_retry_but_uncertainty_consumes_it()
+{
+    use std::sync::Arc;
+    for definite in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let channel = "questionnaire-recovery";
+        let mut live = working_turn(directory.path(), channel).await;
+        live.provider_session.gate_questionnaire_deliveries();
+        let client = Arc::new(
+            ManagedClient::connect(ManagedClientConfig::new(directory.path(), channel).unwrap())
+                .await
+                .unwrap(),
+        );
+        let question = questionnaire();
+        live.provider_session
+            .emit(ProviderEvent::QuestionnaireRequested {
+                questionnaire: question.clone(),
+            });
+        read_session_until(
+            &live.client,
+            live.server.descriptor(),
+            live.session_id,
+            "live question",
+            |s| outcome(s, QuestionnaireOutcome::Pending),
+        )
+        .await;
+        let submitter = client.clone();
+        let session_id = live.session_id;
+        let id = question.id;
+        let submission = tokio::spawn(async move {
+            submitter
+                .submit_questionnaire(session_id, id, QuestionnaireSubmission::Decline)
+                .await
+        });
+        let delivery = timeout(
+            Duration::from_secs(2),
+            live.provider_session.next_questionnaire_delivery(),
+        )
+        .await
+        .unwrap();
+        let listing = client.list_sessions(None).await.unwrap();
+        let standing = &listing
+            .iter()
+            .find_map(|row| row.readable().filter(|s| s.session.id == session_id))
+            .unwrap()
+            .standing_inputs;
+        assert!(standing.pending_questionnaires.is_empty());
+        assert_eq!(standing.submitting_questionnaires, vec![id]);
+        if definite {
+            delivery.reject();
+        } else {
+            drop(delivery);
+        }
+        let error = timeout(Duration::from_secs(2), submission)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(if definite {
+                "not delivered"
+            } else {
+                "uncertain"
+            }),
+            "{error}"
+        );
+        let expected = if definite {
+            QuestionnaireOutcome::SubmissionRejected
+        } else {
+            QuestionnaireOutcome::DeliveryUncertain
+        };
+        assert!(outcome(
+            &client.read_session(session_id).await.unwrap(),
+            expected
+        ));
+        // A repeated native event cannot make a consumed delivery live again.
+        live.provider_session
+            .emit(ProviderEvent::QuestionnaireRequested {
+                questionnaire: question,
+            });
+        if definite {
+            let submitter = client.clone();
+            let retry = tokio::spawn(async move {
+                submitter
+                    .submit_questionnaire(session_id, id, QuestionnaireSubmission::Decline)
+                    .await
+            });
+            timeout(
+                Duration::from_secs(2),
+                live.provider_session.next_questionnaire_delivery(),
+            )
+            .await
+            .unwrap()
+            .succeed();
+            retry.await.unwrap().unwrap();
+            assert!(outcome(
+                &client.read_session(session_id).await.unwrap(),
+                QuestionnaireOutcome::Declined
+            ));
+        }
+        assert!(
+            client
+                .submit_questionnaire(session_id, id, QuestionnaireSubmission::Decline)
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(
+                Duration::from_millis(30),
+                live.provider_session.next_questionnaire_delivery()
+            )
+            .await
+            .is_err()
+        );
+        drop(client);
+        live.server.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn lost_client_acknowledgement_reconciles_acceptance_without_duplicate_delivery() {
+    use std::sync::Arc;
+    let directory = tempfile::tempdir().unwrap();
+    let channel = "questionnaire-lost-ack";
+    let mut live = working_turn(directory.path(), channel).await;
+    live.provider_session.gate_questionnaire_deliveries();
+    let client = Arc::new(
+        ManagedClient::connect(ManagedClientConfig::new(directory.path(), channel).unwrap())
+            .await
+            .unwrap(),
+    );
+    let question = questionnaire();
+    live.provider_session
+        .emit(ProviderEvent::QuestionnaireRequested {
+            questionnaire: question.clone(),
+        });
+    read_session_until(
+        &live.client,
+        live.server.descriptor(),
+        live.session_id,
+        "live question",
+        |s| outcome(s, QuestionnaireOutcome::Pending),
+    )
+    .await;
+    let submitter = client.clone();
+    let session_id = live.session_id;
+    let id = question.id;
+    let submission = tokio::spawn(async move {
+        submitter
+            .submit_questionnaire(session_id, id, QuestionnaireSubmission::Decline)
+            .await
+    });
+    let delivery = timeout(
+        Duration::from_secs(2),
+        live.provider_session.next_questionnaire_delivery(),
+    )
+    .await
+    .unwrap();
+    // Drop the HTTP response future after the server won arbitration, before ack.
+    submission.abort();
+    assert!(submission.await.unwrap_err().is_cancelled());
+    assert!(outcome(
+        &client.read_session(session_id).await.unwrap(),
+        QuestionnaireOutcome::Submitting
+    ));
+    assert!(
+        client
+            .submit_questionnaire(session_id, id, QuestionnaireSubmission::Decline)
+            .await
+            .is_err()
+    );
+    delivery.succeed();
+    read_session_until(
+        &live.client,
+        live.server.descriptor(),
+        session_id,
+        "server confirms delivery despite lost ack",
+        |s| outcome(s, QuestionnaireOutcome::Declined),
+    )
+    .await;
+    assert!(
+        client
+            .submit_questionnaire(session_id, id, QuestionnaireSubmission::Decline)
+            .await
+            .is_err()
+    );
+    assert!(
+        timeout(
+            Duration::from_millis(30),
+            live.provider_session.next_questionnaire_delivery()
+        )
+        .await
+        .is_err()
+    );
+    drop(client);
+    live.server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_requires_a_genuinely_reissued_live_request_and_does_not_revive_consumed_identity()
+{
+    use crate::{provider_support::ControlledProvider, support::controlled_selection};
+    use suru::{
+        protocol::{
+            AdmitPromptRequest, AgentId, AgentIdentity, CreateSessionRequest, InitialPrompt,
+            PromptDelivery, PromptId, Workspace,
+        },
+        server::{self, ServerConfig},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let channel = "questionnaire-restoration";
+    let config = ServerConfig::new(directory.path(), channel).unwrap();
+    let (runtime, mut provider) = ControlledProvider::new();
+    let original = server::spawn_with_provider(config.clone(), runtime)
+        .await
+        .unwrap();
+    let client = std::sync::Arc::new(
+        ManagedClient::connect(ManagedClientConfig::new(directory.path(), channel).unwrap())
+            .await
+            .unwrap(),
+    );
+    let created = client
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            workspace: Workspace {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Start".into(),
+                skill_invocations: vec![],
+            },
+        })
+        .await
+        .unwrap();
+    let session_id = created.session.id;
+    let identity = AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-restore", "high", "fast"),
+    };
+    let mut native = timeout(Duration::from_secs(2), provider.next_start())
+        .await
+        .unwrap()
+        .succeed(identity.clone());
+    native.next_turn().await.succeed();
+    let pending = questionnaire();
+    let consumed = questionnaire();
+    for request in [&pending, &consumed] {
+        native.emit(ProviderEvent::QuestionnaireRequested {
+            questionnaire: request.clone(),
+        });
+    }
+    read_session_until(
+        &reqwest::Client::new(),
+        original.descriptor(),
+        session_id,
+        "both requests live",
+        |s| {
+            s.activities
+                .iter()
+                .filter(|a| matches!(a, Activity::Questionnaire { .. }))
+                .count()
+                == 2
+        },
+    )
+    .await;
+    client
+        .submit_questionnaire(session_id, consumed.id, QuestionnaireSubmission::Decline)
+        .await
+        .unwrap();
+    native.next_questionnaire_submission().await;
+    let uncertain = questionnaire();
+    native.gate_questionnaire_deliveries();
+    native.emit(ProviderEvent::QuestionnaireRequested {
+        questionnaire: uncertain.clone(),
+    });
+    read_session_until(&reqwest::Client::new(), original.descriptor(), session_id, "third request live", |s| s.activities.iter().any(|a| matches!(a, Activity::Questionnaire { questionnaire, .. } if questionnaire.id == uncertain.id))).await;
+    let submitter = client.clone();
+    let uncertain_id = uncertain.id;
+    let submission = tokio::spawn(async move {
+        submitter
+            .submit_questionnaire(session_id, uncertain_id, QuestionnaireSubmission::Decline)
+            .await
+    });
+    let delivery = timeout(Duration::from_secs(2), native.next_questionnaire_delivery())
+        .await
+        .unwrap();
+    submission.abort();
+    let _ = submission.await;
+    drop(client);
+    original.shutdown().await.unwrap();
+    // Seed a terminal persisted Turn with abandoned request history. Native
+    // restoration is tested on the next real conversation, independently of
+    // the existing recovery limitation for persisted Active Turns.
+    {
+        use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
+        let mut database =
+            SqliteConnection::establish(config.data_dir().join("suru.db").to_str().unwrap())
+                .unwrap();
+        database
+            .batch_execute("UPDATE turns SET payload = json_set(payload, '$.status', 'completed');")
+            .unwrap();
+    }
+    let (runtime, mut provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(config, runtime).await.unwrap();
+    let client =
+        ManagedClient::connect(ManagedClientConfig::new(directory.path(), channel).unwrap())
+            .await
+            .unwrap();
+    let historical = client.read_session(session_id).await.unwrap();
+    assert!(outcome(&historical, QuestionnaireOutcome::Unavailable));
+    assert!(outcome(&historical, QuestionnaireOutcome::Declined));
+    assert!(outcome(
+        &historical,
+        QuestionnaireOutcome::DeliveryUncertain
+    ));
+    drop(delivery);
+    let listing = client.list_sessions(None).await.unwrap();
+    let standing = &listing
+        .iter()
+        .find_map(|row| row.readable())
+        .unwrap()
+        .standing_inputs;
+    assert!(
+        standing.pending_questionnaires.is_empty() && standing.submitting_questionnaires.is_empty()
+    );
+    assert!(
+        client
+            .submit_questionnaire(session_id, pending.id, QuestionnaireSubmission::Decline)
+            .await
+            .is_err()
+    );
+    client
+        .admit_prompt(
+            session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Resume".into(),
+                    skill_invocations: vec![],
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .unwrap();
+    let mut native = timeout(Duration::from_secs(2), provider.next_start())
+        .await
+        .unwrap()
+        .succeed(identity);
+    timeout(Duration::from_secs(2), native.next_turn())
+        .await
+        .unwrap()
+        .succeed();
+    // Only this real event reinstates the previously unavailable request. The
+    // consumed request is deliberately repeated too and must stay consumed.
+    for request in [&pending, &consumed, &uncertain] {
+        native.emit(ProviderEvent::QuestionnaireRequested {
+            questionnaire: request.clone(),
+        });
+    }
+    let restored = read_session_until(
+        &reqwest::Client::new(),
+        restarted.descriptor(),
+        session_id,
+        "Provider reissued live request",
+        |s| outcome(s, QuestionnaireOutcome::Pending),
+    )
+    .await;
+    assert_eq!(restored.activities.iter().filter(|a| matches!(a, Activity::Questionnaire { questionnaire, .. } if questionnaire.id == consumed.id)).count(), 1);
+    client
+        .submit_questionnaire(session_id, pending.id, QuestionnaireSubmission::Decline)
+        .await
+        .unwrap();
+    assert_eq!(
+        native.next_questionnaire_submission().await,
+        (pending.id, QuestionnaireSubmission::Decline)
+    );
+    assert!(
+        client
+            .submit_questionnaire(session_id, consumed.id, QuestionnaireSubmission::Decline)
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .submit_questionnaire(session_id, uncertain.id, QuestionnaireSubmission::Decline)
+            .await
+            .is_err()
+    );
+    drop(client);
+    restarted.shutdown().await.unwrap();
+}

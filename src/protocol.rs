@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 35;
+pub const PROTOCOL_VERSION: u32 = 36;
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
     QuestionnaireSubmission,
@@ -1528,9 +1528,9 @@ impl Activity {
     pub const fn status(&self) -> Option<ActivityStatus> {
         match self {
             Self::Questionnaire { outcome, .. } => Some(match outcome {
-                QuestionnaireOutcome::Pending | QuestionnaireOutcome::SubmissionRejected | QuestionnaireOutcome::Submitting => {
-                    ActivityStatus::Active
-                }
+                QuestionnaireOutcome::Pending
+                | QuestionnaireOutcome::SubmissionRejected
+                | QuestionnaireOutcome::Submitting => ActivityStatus::Active,
                 QuestionnaireOutcome::Answered | QuestionnaireOutcome::Declined => {
                     ActivityStatus::Completed
                 }
@@ -2239,6 +2239,7 @@ pub struct SubagentQuestionnaires {
     pub via_session_id: SessionId,
     pub revision: SessionRevision,
     pub pending_questionnaires: Vec<QuestionnaireId>,
+    pub submitting_questionnaires: Vec<QuestionnaireId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

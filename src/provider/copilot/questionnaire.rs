@@ -33,6 +33,13 @@ impl CopilotQuestionnaires {
         id: QuestionnaireId,
         submission: QuestionnaireSubmission,
     ) -> Result<(), ProviderError> {
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("Copilot Questionnaire lock is not poisoned");
+        if !pending.contains_key(&id) {
+            return Err(ProviderError::new("Questionnaire is unavailable"));
+        }
         let response = match submission {
             QuestionnaireSubmission::Decline => None,
             QuestionnaireSubmission::Answer { answer } => match answer.questions.as_slice() {
@@ -46,14 +53,16 @@ impl CopilotQuestionnaires {
                     answer: text.clone(),
                     was_freeform: true,
                 }),
-                _ => return Err(ProviderError::questionnaire_rejected("Copilot requires one answer")),
+                _ => {
+                    return Err(ProviderError::questionnaire_rejected(
+                        "Copilot requires one answer",
+                    ));
+                }
             },
         };
-        self.pending
-            .lock()
-            .expect("Copilot Questionnaire lock is not poisoned")
+        pending
             .remove(&id)
-            .ok_or_else(|| ProviderError::new("Questionnaire is unavailable"))?
+            .expect("validated live Questionnaire")
             .send(response)
             .map_err(|_| ProviderError::new("Questionnaire is unavailable"))
     }

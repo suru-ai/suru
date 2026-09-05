@@ -239,7 +239,11 @@ impl ProviderError {
     /// Delivery definitely did not occur and the native request remains live.
     /// Only this failure permits an explicit Questionnaire retry.
     pub fn questionnaire_rejected(message: impl Into<String>) -> Self {
-        Self { message: message.into(), session_lost: false, kind: ProviderErrorKind::QuestionnaireRejected }
+        Self {
+            message: message.into(),
+            session_lost: false,
+            kind: ProviderErrorKind::QuestionnaireRejected,
+        }
     }
 
     pub(crate) fn is_questionnaire_rejected(&self) -> bool {
@@ -279,7 +283,9 @@ impl ProviderError {
     pub(crate) fn unavailability(&self) -> Option<ProviderUnavailability> {
         match self.kind {
             ProviderErrorKind::Unavailable(reason) => Some(reason),
-            ProviderErrorKind::Failure | ProviderErrorKind::SelectionRejected | ProviderErrorKind::QuestionnaireRejected => None,
+            ProviderErrorKind::Failure
+            | ProviderErrorKind::SelectionRejected
+            | ProviderErrorKind::QuestionnaireRejected => None,
         }
     }
 

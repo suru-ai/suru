@@ -70,7 +70,10 @@ impl SessionStoreState {
         let previous_standing = record.summary.standing_inputs.clone();
         let update = record.commit(storage, session_id, changes, updated_at)?;
         let standing_inputs = record.summary.standing_inputs.clone();
-        if (turn_settled || previous_standing != standing_inputs)
+        if (turn_settled
+            || previous_standing.pending_questionnaires != standing_inputs.pending_questionnaires
+            || previous_standing.submitting_questionnaires
+                != standing_inputs.submitting_questionnaires)
             && self.ancestry(session_id).announces(session_id)
         {
             self.publish_catalog_change(SessionCatalogChange::StandingInputsChanged {
@@ -121,6 +124,11 @@ impl SessionStoreState {
                         .summary
                         .standing_inputs
                         .pending_questionnaires_revision,
+                    submitting_questionnaires: child_record
+                        .summary
+                        .standing_inputs
+                        .submitting_questionnaires
+                        .clone(),
                     pending_questionnaires: child_record
                         .summary
                         .standing_inputs
@@ -506,32 +514,42 @@ impl SessionRecord {
             .clone_from(&self.snapshot.subagent_questionnaires);
         self.summary.standing_inputs.latest_turn =
             SessionStandingInputs::from_turns(&self.snapshot.turns).latest_turn;
-        let pending = self
+        let pending =
+            self.snapshot
+                .activities
+                .iter()
+                .filter_map(|activity| match activity {
+                    crate::protocol::Activity::Questionnaire {
+                        questionnaire,
+                        outcome,
+                        turn_id,
+                        ..
+                    } if outcome.is_answerable()
+                        && self.snapshot.turns.iter().any(|turn| {
+                            turn.id == *turn_id && turn.status == TurnStatus::Active
+                        }) =>
+                    {
+                        Some(questionnaire.id)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+        let submitting = self
             .snapshot
             .activities
             .iter()
             .filter_map(|activity| match activity {
                 crate::protocol::Activity::Questionnaire {
                     questionnaire,
-                    outcome,
-                    turn_id,
+                    outcome: crate::protocol::QuestionnaireOutcome::Submitting,
                     ..
-                } if outcome.is_answerable() && self
-                    .snapshot
-                    .turns
-                    .iter()
-                    .any(|turn| turn.id == *turn_id && turn.status == TurnStatus::Active) =>
-                {
-                    Some(questionnaire.id)
-                }
+                } => Some(questionnaire.id),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let submitting = self.snapshot.activities.iter().filter_map(|activity| match activity {
-            crate::protocol::Activity::Questionnaire { questionnaire, outcome: crate::protocol::QuestionnaireOutcome::Submitting, .. } => Some(questionnaire.id),
-            _ => None,
-        }).collect::<Vec<_>>();
-        if self.summary.standing_inputs.pending_questionnaires != pending || self.summary.standing_inputs.submitting_questionnaires != submitting {
+        if self.summary.standing_inputs.pending_questionnaires != pending
+            || self.summary.standing_inputs.submitting_questionnaires != submitting
+        {
             self.summary.standing_inputs.submitting_questionnaires = submitting;
             self.summary.standing_inputs.pending_questionnaires = pending;
             self.summary.standing_inputs.pending_questionnaires_revision = self.snapshot.revision;

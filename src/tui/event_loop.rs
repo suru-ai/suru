@@ -1227,6 +1227,21 @@ impl RunLoop {
                 };
                 self.application.handle_event(event)?;
             }
+            SubmissionResult::QuestionnaireReconciled {
+                session,
+                id,
+                snapshot,
+                error,
+            } => {
+                self.application.handle_event(
+                    ApplicationEvent::QuestionnaireSubmissionReconciled {
+                        session,
+                        id,
+                        snapshot,
+                        error,
+                    },
+                )?;
+            }
             SubmissionResult::OperationSucceeded(session) => {
                 if self.application.outlook() != &session.origin {
                     return Ok(ControlFlow::Continue(()));
@@ -1949,6 +1964,12 @@ enum SubmissionResult {
         prompt_id: PromptId,
         error: String,
     },
+    QuestionnaireReconciled {
+        id: crate::protocol::QuestionnaireId,
+        session: SessionReference,
+        snapshot: Option<SessionSnapshot>,
+        error: Option<String>,
+    },
     OperationSucceeded(SessionReference),
     SessionSettled(SessionReference),
     OperationFailed {
@@ -2301,12 +2322,51 @@ impl SessionOperation {
                 session_id,
                 id,
                 submission,
-            } => operation_result(
-                session,
-                commands
+            } => {
+                let delivery = commands
                     .submit_questionnaire(session_id, id, submission)
-                    .await,
-            ),
+                    .await;
+                // A failed acknowledgement says nothing about Provider delivery. Read
+                // server arbitration before permitting an explicit retry; never resend.
+                let snapshot = commands.read_session(session_id).await.ok();
+                let outcome = snapshot.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .activities
+                        .iter()
+                        .rev()
+                        .find_map(|activity| match activity {
+                            crate::protocol::Activity::Questionnaire {
+                                questionnaire,
+                                outcome,
+                                ..
+                            } if questionnaire.id == id => Some(*outcome),
+                            _ => None,
+                        })
+                });
+                let error = match outcome {
+                    Some(
+                        crate::protocol::QuestionnaireOutcome::Answered
+                        | crate::protocol::QuestionnaireOutcome::Declined,
+                    ) => None,
+                    Some(crate::protocol::QuestionnaireOutcome::DeliveryUncertain) => Some(
+                        "Provider delivery is uncertain. This Answer will not be resent.".into(),
+                    ),
+                    Some(crate::protocol::QuestionnaireOutcome::SubmissionRejected) => {
+                        Some("Answer was not delivered. Review your draft and retry.".into())
+                    }
+                    _ if snapshot.is_none() => Some(
+                        "Submission status is unconfirmed. Reconnect to check before retrying."
+                            .into(),
+                    ),
+                    _ => delivery.err().map(|error| error.to_string()),
+                };
+                SubmissionResult::QuestionnaireReconciled {
+                    session,
+                    id,
+                    snapshot,
+                    error,
+                }
+            }
             Self::InterruptSession { session_id } => {
                 operation_result(session, commands.interrupt_session(session_id).await)
             }

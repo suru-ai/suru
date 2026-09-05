@@ -207,7 +207,7 @@ async fn working_reads_from_the_subtree_until_the_last_subagent_settles() {
             session_id,
             inputs: SessionStandingInputs {
                 pending_questionnaires: _,
-                submitting_questionnaires: Vec::new(),
+                submitting_questionnaires: _,
                 pending_questionnaires_revision: suru::protocol::SessionRevision(0),
                 subagent_questionnaires: _,
                 latest_turn: Some(LatestTurnStatus {

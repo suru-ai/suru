@@ -2237,9 +2237,12 @@ fn render_activity(
                     "  {} Questionnaire · {} · {} question(s){}",
                     if folded { "▸" } else { "▾" },
                     match outcome {
-                        crate::protocol::QuestionnaireOutcome::SubmissionRejected => "Answer not delivered; review and retry",
-                        crate::protocol::QuestionnaireOutcome::DeliveryUncertain => "Delivery uncertain; Answer will not be resent",
-                        crate::protocol::QuestionnaireOutcome::Unavailable => "Unavailable; previous Provider request is no longer live",
+                        crate::protocol::QuestionnaireOutcome::SubmissionRejected =>
+                            "Answer not delivered; review and retry",
+                        crate::protocol::QuestionnaireOutcome::DeliveryUncertain =>
+                            "Delivery uncertain; Answer will not be resent",
+                        crate::protocol::QuestionnaireOutcome::Unavailable =>
+                            "Unavailable; previous Provider request is no longer live",
                         crate::protocol::QuestionnaireOutcome::Pending => "Pending",
                         crate::protocol::QuestionnaireOutcome::Submitting => "Submitting",
                         crate::protocol::QuestionnaireOutcome::Answered => "Answered",

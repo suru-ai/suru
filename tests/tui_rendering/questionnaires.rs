@@ -773,7 +773,7 @@ fn catalog_discards_only_unavailable_hidden_drafts_and_ignores_older_availabilit
 }
 
 #[test]
-fn another_clients_acceptance_discards_private_drafts_and_shows_the_authoritative_outcome() {
+fn another_clients_acceptance_disables_private_drafts_then_discards_them_on_settlement() {
     use suru::protocol::{SessionChange, SessionRevision, SessionUpdate};
     let workspace = workspace_dir();
     let mut first = connected_application(workspace.path());
@@ -843,10 +843,19 @@ fn another_clients_acceptance_discards_private_drafts_and_shows_the_authoritativ
         ));
         let screen = rendered_application_rows(app).join("\n");
         assert!(
-            screen.contains("Submitting") && screen.contains("Keep composer"),
+            screen.contains("Submitting") && screen.contains("private draft"),
             "{screen}"
         );
-        assert!(!screen.contains("private draft"), "{screen}");
+        assert!(matches!(
+            invoke(app, SemanticCommandId::QuestionnaireDecline),
+            ApplicationTransition::Continue
+        ));
+        invoke(app, SemanticCommandId::QuestionnaireHide);
+        assert!(
+            rendered_application_rows(app)
+                .join("\n")
+                .contains("Keep composer")
+        );
         invoke(app, SemanticCommandId::QuestionnaireOpen);
         assert!(
             !rendered_application_rows(app)
@@ -893,4 +902,150 @@ fn another_clients_acceptance_discards_private_drafts_and_shows_the_authoritativ
         invoke(&mut reconnected, SemanticCommandId::QuestionnaireSubmit),
         ApplicationTransition::Continue
     ));
+}
+
+#[test]
+fn submission_reconciliation_preserves_rejected_drafts_and_disables_unconfirmed_or_consumed_answers()
+ {
+    for terminal in [
+        QuestionnaireOutcome::DeliveryUncertain,
+        QuestionnaireOutcome::Answered,
+    ] {
+        let workspace = workspace_dir();
+        let mut app = connected_application(workspace.path());
+        let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
+        let activity_id = ActivityId::new();
+        let questionnaire = Questionnaire {
+            id: QuestionnaireId::new(),
+            questions: vec![Question {
+                id: "q".into(),
+                title: None,
+                text: "What should I use?".into(),
+                choices: vec![],
+                multiple: false,
+                freeform: true,
+                combine_freeform: false,
+                secret: false,
+                required: true,
+            }],
+        };
+        snapshot.activities.push(Activity::Questionnaire {
+            id: activity_id,
+            turn_id,
+            questionnaire: questionnaire.clone(),
+            outcome: QuestionnaireOutcome::Pending,
+            answer: None,
+        });
+        snapshot
+            .transcript
+            .push(TranscriptItem::Activity { activity_id });
+        app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+            snapshot.clone(),
+        )))
+        .unwrap();
+        invoke(&mut app, SemanticCommandId::QuestionnaireOpen);
+        type_terminal_text(&mut app, "Preserve my work");
+        invoke(&mut app, SemanticCommandId::QuestionnaireReview);
+        assert!(matches!(
+            invoke(&mut app, SemanticCommandId::QuestionnaireSubmit),
+            ApplicationTransition::SubmitQuestionnaire { .. }
+        ));
+        let session = suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            snapshot.session.id,
+        );
+        app.handle_event(ApplicationEvent::QuestionnaireSubmissionReconciled {
+            id: questionnaire.id,
+            session: session.clone(),
+            snapshot: None,
+            error: Some(
+                "Submission status is unconfirmed. Reconnect to check before retrying.".into(),
+            ),
+        })
+        .unwrap();
+        assert!(matches!(
+            invoke(&mut app, SemanticCommandId::QuestionnaireSubmit),
+            ApplicationTransition::Continue
+        ));
+        assert!(matches!(
+            invoke(&mut app, SemanticCommandId::QuestionnaireDecline),
+            ApplicationTransition::Continue
+        ));
+        assert!(
+            rendered_application_rows(&app)
+                .join("\n")
+                .contains("Preserve my work")
+        );
+        for state in [
+            QuestionnaireOutcome::Submitting,
+            QuestionnaireOutcome::SubmissionRejected,
+        ] {
+            if let Activity::Questionnaire { outcome, .. } = snapshot.activities.last_mut().unwrap()
+            {
+                *outcome = state;
+            }
+            snapshot.revision.0 += 1;
+            app.handle_event(ApplicationEvent::QuestionnaireSubmissionReconciled {
+                id: questionnaire.id,
+                session: session.clone(),
+                snapshot: Some(snapshot.clone()),
+                error: None,
+            })
+            .unwrap();
+        }
+        let screen = rendered_application_rows(&app).join("\n");
+        assert!(
+            screen.contains("Preserve my work") && screen.contains("not delivered"),
+            "{screen}"
+        );
+        assert!(
+            matches!(invoke(&mut app, SemanticCommandId::QuestionnaireSubmit), ApplicationTransition::SubmitQuestionnaire { submission: QuestionnaireSubmission::Answer { answer }, .. } if answer.questions == vec![QuestionAnswer::Freeform { text: "Preserve my work".into() }])
+        );
+        let rejected = snapshot.clone();
+        if let Activity::Questionnaire { outcome, .. } = snapshot.activities.last_mut().unwrap() {
+            *outcome = terminal;
+        }
+        snapshot.revision.0 += 1;
+        app.handle_event(ApplicationEvent::QuestionnaireSubmissionReconciled {
+            id: questionnaire.id,
+            session: session.clone(),
+            snapshot: Some(snapshot),
+            error: Some("Provider delivery is uncertain. This Answer will not be resent.".into()),
+        })
+        .unwrap();
+        let screen = rendered_application_rows(&app).join("\n");
+        assert!(
+            !screen.contains("Preserve my work")
+                && screen.contains(if terminal == QuestionnaireOutcome::Answered {
+                    "Answered"
+                } else {
+                    "uncertain"
+                }),
+            "{screen}"
+        );
+        assert!(matches!(
+            invoke(&mut app, SemanticCommandId::QuestionnaireSubmit),
+            ApplicationTransition::Continue
+        ));
+        if terminal == QuestionnaireOutcome::Answered {
+            for stale in [Some(rejected), None] {
+                app.handle_event(ApplicationEvent::QuestionnaireSubmissionReconciled {
+                    id: questionnaire.id,
+                    session: session.clone(),
+                    snapshot: stale,
+                    error: Some("Stale rejection must not replace accepted delivery".into()),
+                })
+                .unwrap();
+                let screen = rendered_application_rows(&app).join("\n");
+                assert!(
+                    screen.contains("Answered") && !screen.contains("Stale rejection"),
+                    "{screen}"
+                );
+                assert!(matches!(
+                    invoke(&mut app, SemanticCommandId::QuestionnaireSubmit),
+                    ApplicationTransition::Continue
+                ));
+            }
+        }
+    }
 }

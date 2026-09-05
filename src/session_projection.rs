@@ -243,11 +243,16 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 else {
                     bail!("Unknown Questionnaire Activity");
                 };
-                if !current.is_live() || matches!(
-                    outcome,
-                    crate::protocol::QuestionnaireOutcome::Pending
-                        | crate::protocol::QuestionnaireOutcome::Submitting
-                ) {
+                if !current.is_live()
+                    || (*outcome == crate::protocol::QuestionnaireOutcome::SubmissionRejected
+                        && (*current != crate::protocol::QuestionnaireOutcome::Submitting
+                            || answer.is_some()))
+                    || matches!(
+                        outcome,
+                        crate::protocol::QuestionnaireOutcome::Pending
+                            | crate::protocol::QuestionnaireOutcome::Submitting
+                    )
+                {
                     bail!("Questionnaire is already unavailable");
                 }
                 *current = *outcome;

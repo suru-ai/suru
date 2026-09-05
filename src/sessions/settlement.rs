@@ -391,6 +391,7 @@ pub(super) fn settle_in_flight_changes(
                 id,
                 outcome:
                     crate::protocol::QuestionnaireOutcome::Pending
+                    | crate::protocol::QuestionnaireOutcome::SubmissionRejected
                     | crate::protocol::QuestionnaireOutcome::Submitting,
                 ..
             } => changes.push(SessionChange::QuestionnaireSettled {

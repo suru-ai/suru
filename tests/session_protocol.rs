@@ -247,7 +247,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         "settled_at": 1_755_497_600_999_u64,
         "standing_inputs": {
             "subagent_questionnaires": [],
-            "pending_questionnaires": [],
+            "pending_questionnaires": [], "submitting_questionnaires": [],
             "pending_questionnaires_revision": 0,
             "latest_turn": null,
             "viewed_at": null

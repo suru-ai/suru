@@ -1349,6 +1349,11 @@ impl TuiState {
     }
 
     fn apply_attached_session(&mut self, snapshot: SessionSnapshot) -> Result<()> {
+        let reference = SessionReference::new(self.outlook.clone(), snapshot.session.id);
+        for questionnaire in super::questionnaire::pending(&snapshot) {
+            self.questionnaires
+                .reconcile_submission(&reference, questionnaire.id, &snapshot);
+        }
         self.session_events_blocked = false;
         self.apply_session(SessionEvent::snapshot(snapshot))
     }
@@ -2297,6 +2302,12 @@ pub enum ApplicationEvent {
     },
     SessionCreated(SessionSnapshot),
     SessionOperationFailed(String),
+    QuestionnaireSubmissionReconciled {
+        id: crate::protocol::QuestionnaireId,
+        session: SessionReference,
+        snapshot: Option<SessionSnapshot>,
+        error: Option<String>,
+    },
     /// The effective settings an accepted edit left in force.
     SettingMutated(SettingsSnapshot),
     SettingMutationFailed(String),
@@ -2723,6 +2734,17 @@ impl Application {
                 self.handle_origin_catalog(outlook, event)
             }
             ApplicationEvent::Session(event) => {
+                if let SessionEvent::Snapshot(snapshot) = &event {
+                    let reference =
+                        SessionReference::new(self.state.outlook.clone(), snapshot.session.id);
+                    for questionnaire in super::questionnaire::pending(snapshot) {
+                        self.state.questionnaires.reconcile_submission(
+                            &reference,
+                            questionnaire.id,
+                            snapshot,
+                        );
+                    }
+                }
                 let viewed = self.state.open_root_viewed_by(&event);
                 self.state.apply_session(event)?;
                 Ok(viewed.map_or(
@@ -2785,6 +2807,39 @@ impl Application {
                 // refusal is drawn where the reader was looking.
                 if !self.state.sidebar.fail_deletion(&reference, error.clone()) {
                     self.state.session_picker.fail_deletion(&reference, error);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::QuestionnaireSubmissionReconciled {
+                session,
+                id,
+                snapshot,
+                error,
+            } => {
+                if let Some(snapshot) = snapshot {
+                    if self.state.session_reference.as_ref() == Some(&session)
+                        && self.state.session.as_ref().is_some_and(|current| {
+                            current.snapshot().revision.0 > snapshot.revision.0
+                        })
+                    {
+                        return Ok(ApplicationTransition::Continue);
+                    }
+                    self.state
+                        .questionnaires
+                        .reconcile_submission(&session, id, &snapshot);
+                    if self.state.session_reference.as_ref() == Some(&session)
+                        && self.state.session.as_ref().is_none_or(|current| {
+                            current.snapshot().revision.0 <= snapshot.revision.0
+                        })
+                    {
+                        self.state
+                            .apply_session(SessionEvent::Snapshot(Box::new(snapshot)))?;
+                    }
+                }
+                if self.state.session_reference.as_ref() == Some(&session) {
+                    let confirmed = self.state.session.as_ref().is_some_and(|current| current.snapshot().activities.iter().any(|activity| matches!(activity,
+                        Activity::Questionnaire { questionnaire, outcome: crate::protocol::QuestionnaireOutcome::Answered | crate::protocol::QuestionnaireOutcome::Declined, .. } if questionnaire.id == id)));
+                    self.state.submission_error = if confirmed { None } else { error };
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -4466,6 +4521,9 @@ impl Application {
                     self.state.session_reference.clone(),
                     self.state.open_questionnaire().map(|q| q.id),
                 ) {
+                    if !self.state.questionnaires.begin_decline() {
+                        return Ok(ApplicationTransition::Continue);
+                    }
                     Ok(ApplicationTransition::SubmitQuestionnaire {
                         session,
                         id,
@@ -5273,9 +5331,18 @@ impl TuiState {
             return None;
         }
         let id = self.questionnaires.id()?;
-        self.session.as_ref()?.snapshot().activities.iter().find_map(|activity| match activity {
-            Activity::Questionnaire { questionnaire, outcome, .. } if questionnaire.id == id && outcome.is_live() => Some(questionnaire),
-            _ => None,
-        })
+        self.session
+            .as_ref()?
+            .snapshot()
+            .activities
+            .iter()
+            .find_map(|activity| match activity {
+                Activity::Questionnaire {
+                    questionnaire,
+                    outcome,
+                    ..
+                } if questionnaire.id == id && outcome.is_live() => Some(questionnaire),
+                _ => None,
+            })
     }
 }

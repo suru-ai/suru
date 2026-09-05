@@ -149,7 +149,10 @@ impl QuestionnaireDeliveries {
             let delivered = delivery.is_ok();
             let outcome = if delivered {
                 accepted.outcome
-            } else if delivery.as_ref().is_err_and(|error| error.is_questionnaire_rejected()) {
+            } else if delivery
+                .as_ref()
+                .is_err_and(|error| error.is_questionnaire_rejected())
+            {
                 QuestionnaireOutcome::SubmissionRejected
             } else {
                 QuestionnaireOutcome::DeliveryUncertain
@@ -166,16 +169,16 @@ impl QuestionnaireDeliveries {
                     },
                 )
             });
-            let result = if !delivered {
+            let result = if !matches!(settled, Some(Ok(_))) {
+                Err("Questionnaire delivery could not be confirmed".into())
+            } else if !delivered {
                 Err(if outcome == QuestionnaireOutcome::SubmissionRejected {
                     "Answer was not delivered. Review your draft and retry.".into()
                 } else {
                     "Provider delivery is uncertain. This Answer will not be resent.".into()
                 })
-            } else if matches!(settled, Some(Ok(_))) {
-                Ok(())
             } else {
-                Err("Questionnaire delivery could not be confirmed".into())
+                Ok(())
             };
             let _ = response.send(result);
         });

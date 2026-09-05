@@ -91,6 +91,15 @@ pub struct QuestionnaireDelivery {
 }
 
 impl QuestionnaireDelivery {
+    pub fn reject(self) {
+        self.response
+            .expect("delivery must be gated")
+            .send(Err(ProviderError::questionnaire_rejected(
+                "controlled definite rejection",
+            )))
+            .ok();
+    }
+
     pub fn succeed(self) {
         if let Some(response) = self.response {
             let _ = response.send(Ok(()));

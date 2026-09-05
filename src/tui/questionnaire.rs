@@ -31,6 +31,9 @@ struct Panel {
     current: usize,
     review: bool,
     submitting: bool,
+    // Local submission remains disabled until an authoritative read; catalog
+    // updates can independently report another Client's delivery in progress.
+    awaiting_confirmation: bool,
     submission_rejected: bool,
     scroll: usize,
 }
@@ -110,9 +113,10 @@ pub(super) fn pending(snapshot: &SessionSnapshot) -> impl Iterator<Item = &Quest
                 outcome,
                 turn_id,
                 ..
-            } if outcome.is_answerable() && snapshot.turns.iter().any(|turn| {
-                turn.id == *turn_id && turn.status == crate::protocol::TurnStatus::Active
-            }) =>
+            } if outcome.is_answerable()
+                && snapshot.turns.iter().any(|turn| {
+                    turn.id == *turn_id && turn.status == crate::protocol::TurnStatus::Active
+                }) =>
             {
                 Some(questionnaire)
             }
@@ -171,6 +175,13 @@ impl QuestionnairePanels {
     }
 
     pub(super) fn reconcile(&mut self, session: &SessionReference, snapshot: &SessionSnapshot) {
+        if self
+            .availability
+            .get(session)
+            .is_some_and(|(revision, _)| revision.0 > snapshot.revision.0)
+        {
+            return;
+        }
         if snapshot.session.parent.is_some() {
             self.unlisted_sessions.insert(session.clone());
         }
@@ -180,18 +191,59 @@ impl QuestionnairePanels {
             session,
             snapshot.revision,
             &pending(snapshot).map(|q| q.id).collect::<Vec<_>>(),
-            &snapshot.activities.iter().filter_map(|activity| match activity {
-                Activity::Questionnaire { questionnaire, outcome: QuestionnaireOutcome::Submitting, .. } => Some(questionnaire.id),
-                _ => None,
-            }).collect::<Vec<_>>(),
+            &snapshot
+                .activities
+                .iter()
+                .filter_map(|activity| match activity {
+                    Activity::Questionnaire {
+                        questionnaire,
+                        outcome: QuestionnaireOutcome::Submitting,
+                        ..
+                    } => Some(questionnaire.id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
         );
         for activity in &snapshot.activities {
-            if let Activity::Questionnaire { questionnaire, outcome, .. } = activity
+            if let Activity::Questionnaire {
+                questionnaire,
+                outcome,
+                ..
+            } = activity
                 && let Some(panel) = self.drafts.get_mut(&(session.clone(), questionnaire.id))
-                && *outcome == QuestionnaireOutcome::SubmissionRejected
+                && outcome.is_answerable()
+            {
+                panel.submission_rejected = *outcome == QuestionnaireOutcome::SubmissionRejected;
+            }
+        }
+    }
+
+    pub(super) fn reconcile_submission(
+        &mut self,
+        session: &SessionReference,
+        id: QuestionnaireId,
+        snapshot: &SessionSnapshot,
+    ) {
+        if self
+            .availability
+            .get(session)
+            .is_some_and(|(revision, _)| revision.0 > snapshot.revision.0)
+        {
+            return;
+        }
+        self.reconcile(session, snapshot);
+        for activity in &snapshot.activities {
+            if let Activity::Questionnaire {
+                questionnaire,
+                outcome,
+                ..
+            } = activity
+                && questionnaire.id == id
+                && outcome.is_answerable()
+                && let Some(panel) = self.drafts.get_mut(&(session.clone(), questionnaire.id))
             {
                 panel.submitting = false;
-                panel.submission_rejected = true;
+                panel.awaiting_confirmation = false;
             }
         }
     }
@@ -204,7 +256,12 @@ impl QuestionnairePanels {
         for entry in entries {
             let session = SessionReference::new(owner.origin.clone(), entry.session_id);
             self.unlisted_sessions.insert(session.clone());
-            self.reconcile_available(&session, entry.revision, &entry.pending_questionnaires);
+            self.reconcile_available(
+                &session,
+                entry.revision,
+                &entry.pending_questionnaires,
+                &entry.submitting_questionnaires,
+            );
             let descendants = self.descendants.entry(owner.clone()).or_default();
             if !descendants.contains(&session) {
                 descendants.push(session);
@@ -228,15 +285,17 @@ impl QuestionnairePanels {
         }
         self.availability
             .insert(session.clone(), (revision, available.to_vec()));
-        self.drafts.retain(|(owner, id), _| owner != session || available.contains(id) || submitting.contains(id));
+        self.drafts.retain(|(owner, id), _| {
+            owner != session || available.contains(id) || submitting.contains(id)
+        });
         for ((owner, id), panel) in &mut self.drafts {
-            if owner == session && submitting.contains(id) { panel.submitting = true; }
+            if owner == session {
+                panel.submitting = panel.awaiting_confirmation || submitting.contains(id);
+            }
         }
-        if self
-            .visible
-            .as_ref()
-            .is_some_and(|(owner, id)| owner == session && !available.contains(id) && !submitting.contains(id))
-        {
+        if self.visible.as_ref().is_some_and(|(owner, id)| {
+            owner == session && !available.contains(id) && !submitting.contains(id)
+        }) {
             self.visible = None;
         }
     }
@@ -261,6 +320,22 @@ impl QuestionnairePanels {
         });
         self.visible = Some(key);
     }
+    pub(super) fn begin_decline(&mut self) -> bool {
+        let Some(panel) = self
+            .visible
+            .as_ref()
+            .and_then(|key| self.drafts.get_mut(key))
+        else {
+            return false;
+        };
+        if panel.submitting {
+            return false;
+        }
+        panel.submitting = true;
+        panel.awaiting_confirmation = true;
+        true
+    }
+
     pub(super) fn hide(&mut self) {
         self.visible = None;
     }
@@ -373,6 +448,7 @@ impl QuestionnairePanels {
                 let answer = panel.answer();
                 if questionnaire.validate(&answer).is_ok() {
                     panel.submitting = true;
+                    panel.awaiting_confirmation = true;
                     return Some(answer);
                 }
             }
@@ -394,7 +470,11 @@ impl QuestionnairePanels {
         let question = &questionnaire.questions[panel.current];
         let draft = &panel.questions[panel.current];
         let mut lines = Vec::new();
-        if panel.submission_rejected { lines.push(Line::from("Answer was not delivered. Review your draft and retry.")); }
+        if panel.submission_rejected {
+            lines.push(Line::from(
+                "Answer was not delivered. Review your draft and retry.",
+            ));
+        }
         let navigation;
         if panel.review {
             lines.push(Line::styled("Review Answer", theme.accent.primary));
@@ -408,7 +488,7 @@ impl QuestionnairePanels {
                 lines.push(Line::from(answer_text(question, Some(&draft.answer()))));
             }
             navigation = if panel.submitting {
-                "Submitting…"
+                "Submitting… · waiting for server confirmation"
             } else {
                 "Ctrl+Enter submit · Shift+Tab back · Esc hide"
             }
@@ -489,10 +569,17 @@ impl QuestionnairePanels {
                 }
             );
         }
-        let footer = vec![
-            Line::from(navigation),
-            Line::from("Ctrl+D decline · Esc hide · then Esc Esc to interrupt"),
-        ];
+        let footer = if panel.submitting {
+            vec![
+                Line::from("Submitting… · waiting for server confirmation"),
+                Line::from("Esc hide · then Esc Esc to interrupt"),
+            ]
+        } else {
+            vec![
+                Line::from(navigation),
+                Line::from("Ctrl+D decline · Esc hide · then Esc Esc to interrupt"),
+            ]
+        };
         let paragraph = Paragraph::new(lines)
             .style(theme.text.primary)
             .wrap(Wrap { trim: false });
@@ -509,10 +596,15 @@ impl QuestionnairePanels {
             height,
         );
         frame.render_widget(ratatui::widgets::Clear, area);
-        let block = Block::default().borders(Borders::ALL).title(format!(
-            " Questionnaire {} of {} · Alt+←/→ switch ",
-            position.0, position.1
-        ));
+        let title = if panel.submitting {
+            " Questionnaire · Submitting ".to_owned()
+        } else {
+            format!(
+                " Questionnaire {} of {} · Alt+←/→ switch ",
+                position.0, position.1
+            )
+        };
+        let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let content = Rect::new(
