@@ -24,6 +24,7 @@ fn questionnaire() -> Questionnaire {
             }],
             multiple: false,
             freeform: true,
+            combine_freeform: false,
             secret: false,
             required: true,
         }],
@@ -207,6 +208,111 @@ async fn decline_sends_no_answer_without_ending_the_turn_and_withdrawal_disables
             .await
             .is_err()
     );
+    drop(client);
+    live.server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_batch_validation_preserves_each_question_and_only_accepts_supported_combined_answers()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let mut live = working_turn(directory.path(), "questionnaire-batch").await;
+    let mut batch = questionnaire();
+    let mut second = batch.questions[0].clone();
+    second.id = "checks".into();
+    second.text = "Which checks?".into();
+    second.multiple = true;
+    second.combine_freeform = true;
+    second.choices = vec![
+        QuestionChoice {
+            id: "unit".into(),
+            label: "Unit".into(),
+            description: None,
+            recommended: false,
+        },
+        QuestionChoice {
+            id: "integration".into(),
+            label: "Integration".into(),
+            description: None,
+            recommended: false,
+        },
+    ];
+    batch.questions.push(second);
+    live.provider_session
+        .emit(ProviderEvent::QuestionnaireRequested {
+            questionnaire: batch.clone(),
+        });
+    read_session_until(
+        &live.client,
+        live.server.descriptor(),
+        live.session_id,
+        "batch is pending",
+        |s| outcome(s, QuestionnaireOutcome::Pending),
+    )
+    .await;
+    let client = ManagedClient::connect(
+        ManagedClientConfig::new(directory.path(), "questionnaire-batch").unwrap(),
+    )
+    .await
+    .unwrap();
+    let invalid = Answer {
+        questions: vec![
+            QuestionAnswer::SelectedWithFreeform {
+                choices: vec!["local".into()],
+                text: "unsupported combination".into(),
+            },
+            QuestionAnswer::Selected {
+                choices: vec!["unit".into()],
+            },
+        ],
+    };
+    assert!(
+        client
+            .submit_questionnaire(
+                live.session_id,
+                batch.id,
+                QuestionnaireSubmission::Answer { answer: invalid }
+            )
+            .await
+            .is_err()
+    );
+    let answer = Answer {
+        questions: vec![
+            QuestionAnswer::Freeform {
+                text: "Remote environment".into(),
+            },
+            QuestionAnswer::SelectedWithFreeform {
+                choices: vec!["unit".into(), "integration".into()],
+                text: "Lint".into(),
+            },
+        ],
+    };
+    client
+        .submit_questionnaire(
+            live.session_id,
+            batch.id,
+            QuestionnaireSubmission::Answer {
+                answer: answer.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        timeout(
+            Duration::from_secs(1),
+            live.provider_session.next_questionnaire_submission()
+        )
+        .await
+        .unwrap(),
+        (
+            batch.id,
+            QuestionnaireSubmission::Answer {
+                answer: answer.clone()
+            }
+        )
+    );
+    let snapshot = client.read_session(live.session_id).await.unwrap();
+    assert!(snapshot.activities.iter().any(|a| matches!(a, Activity::Questionnaire { questionnaire, answer: Some(stored), .. } if questionnaire == &batch && stored == &answer)));
     drop(client);
     live.server.shutdown().await.unwrap();
 }

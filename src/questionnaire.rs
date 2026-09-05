@@ -18,6 +18,8 @@ pub struct Question {
     pub choices: Vec<QuestionChoice>,
     pub multiple: bool,
     pub freeform: bool,
+    /// Whether selected choices may be accompanied by free text in one answer.
+    pub combine_freeform: bool,
     pub secret: bool,
     pub required: bool,
 }
@@ -36,6 +38,10 @@ pub struct QuestionChoice {
 pub enum QuestionAnswer {
     Selected {
         choices: Vec<String>,
+    },
+    SelectedWithFreeform {
+        choices: Vec<String>,
+        text: String,
     },
     Freeform {
         text: String,
@@ -84,22 +90,7 @@ impl Questionnaire {
         }
         for (index, (question, answer)) in self.questions.iter().zip(&answer.questions).enumerate()
         {
-            let valid = match answer {
-                QuestionAnswer::Selected { choices } => {
-                    !choices.is_empty()
-                        && (question.multiple || choices.len() == 1)
-                        && choices
-                            .iter()
-                            .all(|id| question.choices.iter().any(|choice| &choice.id == id))
-                        && choices
-                            .iter()
-                            .enumerate()
-                            .all(|(i, id)| !choices[..i].contains(id))
-                }
-                QuestionAnswer::Freeform { text } => question.freeform && !text.trim().is_empty(),
-                QuestionAnswer::Omitted => !question.required,
-                QuestionAnswer::SecretAnswered => false,
-            };
+            let valid = question.accepts(answer);
             if !valid {
                 return Err(format!(
                     "Question {} requires a supported answer",
@@ -124,6 +115,34 @@ impl Questionnaire {
                     }
                 })
                 .collect(),
+        }
+    }
+}
+
+impl Question {
+    pub fn accepts(&self, answer: &QuestionAnswer) -> bool {
+        let selected = |choices: &[String]| {
+            !choices.is_empty()
+                && (self.multiple || choices.len() == 1)
+                && choices
+                    .iter()
+                    .all(|id| self.choices.iter().any(|choice| &choice.id == id))
+                && choices
+                    .iter()
+                    .enumerate()
+                    .all(|(i, id)| !choices[..i].contains(id))
+        };
+        match answer {
+            QuestionAnswer::Selected { choices } => selected(choices),
+            QuestionAnswer::SelectedWithFreeform { choices, text } => {
+                self.combine_freeform
+                    && self.freeform
+                    && selected(choices)
+                    && !text.trim().is_empty()
+            }
+            QuestionAnswer::Freeform { text } => self.freeform && !text.trim().is_empty(),
+            QuestionAnswer::Omitted => !self.required,
+            QuestionAnswer::SecretAnswered => false,
         }
     }
 }

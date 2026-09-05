@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 32;
+pub const PROTOCOL_VERSION: u32 = 33;
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
     QuestionnaireSubmission,

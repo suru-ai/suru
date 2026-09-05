@@ -2,8 +2,8 @@
 use super::{commands::SemanticCommandId, state::CommandId};
 use crate::{
     protocol::{
-        Activity, Answer, QuestionAnswer, Questionnaire, QuestionnaireId, QuestionnaireOutcome,
-        SessionReference, SessionSnapshot,
+        Activity, Answer, Question, QuestionAnswer, Questionnaire, QuestionnaireId,
+        QuestionnaireOutcome, SessionReference, SessionSnapshot,
     },
     theme::Theme,
 };
@@ -26,13 +26,76 @@ pub(super) struct QuestionnairePanels {
 }
 #[derive(Clone, Debug, Default)]
 struct Panel {
-    cursor: usize,
-    answer: Option<QuestionAnswer>,
+    questions: Vec<QuestionDraft>,
+    current: usize,
     review: bool,
-    error: Option<String>,
     submitting: bool,
-    editing_text: bool,
     scroll: usize,
+}
+
+#[derive(Clone, Default)]
+struct QuestionDraft {
+    cursor: usize,
+    choices: Vec<String>,
+    text: String,
+    editing_text: bool,
+    error: Option<String>,
+}
+
+impl std::fmt::Debug for QuestionDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QuestionDraft(<redacted>)")
+    }
+}
+
+impl QuestionDraft {
+    fn answer(&self) -> QuestionAnswer {
+        match (self.choices.is_empty(), self.text.is_empty()) {
+            (false, false) => QuestionAnswer::SelectedWithFreeform {
+                choices: self.choices.clone(),
+                text: self.text.clone(),
+            },
+            (false, true) => QuestionAnswer::Selected {
+                choices: self.choices.clone(),
+            },
+            (true, false) => QuestionAnswer::Freeform {
+                text: self.text.clone(),
+            },
+            (true, true) => QuestionAnswer::Omitted,
+        }
+    }
+}
+
+impl Panel {
+    fn answer(&self) -> Answer {
+        Answer {
+            questions: self.questions.iter().map(QuestionDraft::answer).collect(),
+        }
+    }
+    fn validate_question(&mut self, questionnaire: &Questionnaire, index: usize) -> bool {
+        if questionnaire.questions[index].accepts(&self.questions[index].answer()) {
+            self.questions[index].error = None;
+            true
+        } else {
+            self.current = index;
+            self.review = false;
+            self.scroll = 0;
+            self.questions[index].error = Some(format!(
+                "Question {} requires a supported answer",
+                index + 1
+            ));
+            false
+        }
+    }
+    fn review(&mut self, questionnaire: &Questionnaire) {
+        for index in 0..self.questions.len() {
+            if !self.validate_question(questionnaire, index) {
+                return;
+            }
+        }
+        self.review = true;
+        self.scroll = 0;
+    }
 }
 
 pub(super) fn pending(snapshot: &SessionSnapshot) -> impl Iterator<Item = &Questionnaire> {
@@ -152,7 +215,10 @@ impl QuestionnairePanels {
             return;
         }
         let key = (session, questionnaire.id);
-        self.drafts.entry(key.clone()).or_default();
+        self.drafts.entry(key.clone()).or_insert_with(|| Panel {
+            questions: vec![QuestionDraft::default(); questionnaire.questions.len()],
+            ..Panel::default()
+        });
         self.visible = Some(key);
     }
     pub(super) fn hide(&mut self) {
@@ -169,24 +235,17 @@ impl QuestionnairePanels {
         else {
             return;
         };
-        if panel.review || panel.submitting || !questionnaire.questions[0].freeform {
+        let question = &questionnaire.questions[panel.current];
+        if panel.review || panel.submitting || !question.freeform {
             return;
         }
-        let answer = panel
-            .answer
-            .get_or_insert_with(|| QuestionAnswer::Freeform {
-                text: String::new(),
-            });
-        if !matches!(answer, QuestionAnswer::Freeform { .. }) {
-            *answer = QuestionAnswer::Freeform {
-                text: String::new(),
-            };
+        let draft = &mut panel.questions[panel.current];
+        if !question.combine_freeform {
+            draft.choices.clear();
         }
-        if let QuestionAnswer::Freeform { text: value } = answer {
-            value.push_str(text);
-        }
-        panel.error = None;
-        panel.editing_text = true;
+        draft.text.push_str(text);
+        draft.error = None;
+        draft.editing_text = true;
     }
     pub(super) fn delete(&mut self) {
         if let Some(panel) = self
@@ -194,11 +253,8 @@ impl QuestionnairePanels {
             .as_ref()
             .and_then(|key| self.drafts.get_mut(key))
         {
-            if panel.review || panel.submitting {
-                return;
-            }
-            if let Some(QuestionAnswer::Freeform { text }) = &mut panel.answer {
-                text.pop();
+            if !panel.review && !panel.submitting {
+                panel.questions[panel.current].text.pop();
             }
         }
     }
@@ -207,6 +263,7 @@ impl QuestionnairePanels {
         questionnaire: &Questionnaire,
         command: SemanticCommandId,
     ) -> Option<Answer> {
+        use SemanticCommandId::*;
         let panel = self
             .visible
             .as_ref()
@@ -214,54 +271,66 @@ impl QuestionnairePanels {
         if panel.submitting {
             return None;
         }
-        let question = &questionnaire.questions[0];
+        let question = &questionnaire.questions[panel.current];
         match command {
-            SemanticCommandId::QuestionnaireScrollUp => {
-                panel.scroll = panel.scroll.saturating_sub(3)
-            }
-            SemanticCommandId::QuestionnaireScrollDown => {
-                panel.scroll = panel.scroll.saturating_add(3)
-            }
-            SemanticCommandId::QuestionnairePrevious => {
+            QuestionnaireScrollUp => panel.scroll = panel.scroll.saturating_sub(3),
+            QuestionnaireScrollDown => panel.scroll = panel.scroll.saturating_add(3),
+            QuestionnaireBack => {
+                if !panel.review {
+                    panel.current = panel.current.saturating_sub(1);
+                }
                 panel.review = false;
-                panel.cursor = panel.cursor.saturating_sub(1);
-                panel.editing_text = false;
+                panel.scroll = 0;
             }
-            SemanticCommandId::QuestionnaireNext => {
-                panel.review = false;
-                panel.editing_text = false;
-                panel.cursor = (panel.cursor + 1).min(question.choices.len().saturating_sub(1));
-            }
-            SemanticCommandId::QuestionnaireSelect if panel.editing_text && !panel.review => {
-                if let Some(QuestionAnswer::Freeform { text }) = &mut panel.answer {
-                    text.push(' ');
+            QuestionnaireNext => {
+                if !panel.validate_question(questionnaire, panel.current) {
+                    return None;
+                }
+                if panel.current + 1 < panel.questions.len() {
+                    panel.current += 1;
+                    panel.scroll = 0;
+                    panel.review = false;
+                } else {
+                    panel.review(questionnaire);
                 }
             }
-            SemanticCommandId::QuestionnaireSelect => {
+            QuestionnaireChoicePrevious | QuestionnaireChoiceNext => {
                 panel.review = false;
-                if let Some(choice) = question.choices.get(panel.cursor) {
-                    panel.answer = Some(QuestionAnswer::Selected {
-                        choices: vec![choice.id.clone()],
-                    });
-                    panel.error = None;
-                }
-            }
-            SemanticCommandId::QuestionnaireReview => {
-                let answer = Answer {
-                    questions: vec![panel.answer.clone().unwrap_or(QuestionAnswer::Omitted)],
+                let draft = &mut panel.questions[panel.current];
+                draft.editing_text = false;
+                draft.cursor = if command == QuestionnaireChoicePrevious {
+                    draft.cursor.saturating_sub(1)
+                } else {
+                    (draft.cursor + 1).min(question.choices.len().saturating_sub(1))
                 };
-                match questionnaire.validate(&answer) {
-                    Ok(()) => {
-                        panel.review = true;
-                        panel.error = None;
+            }
+            QuestionnaireSelect => {
+                let draft = &mut panel.questions[panel.current];
+                if draft.editing_text && !panel.review {
+                    draft.text.push(' ');
+                } else if let Some(choice) = question.choices.get(draft.cursor) {
+                    panel.review = false;
+                    if !question.combine_freeform {
+                        draft.text.clear();
                     }
-                    Err(error) => panel.error = Some(error),
+                    if let Some(index) = draft.choices.iter().position(|id| id == &choice.id) {
+                        draft.choices.remove(index);
+                    } else {
+                        if !question.multiple {
+                            draft.choices.clear();
+                        }
+                        draft.choices.push(choice.id.clone());
+                    }
+                    draft.error = None;
                 }
             }
-            SemanticCommandId::QuestionnaireSubmit if panel.review => {
-                let answer = Answer {
-                    questions: vec![panel.answer.clone()?],
-                };
+            QuestionnaireOmit if !question.required => {
+                panel.questions[panel.current] = QuestionDraft::default();
+                panel.review = false;
+            }
+            QuestionnaireReview => panel.review(questionnaire),
+            QuestionnaireSubmit if panel.review => {
+                let answer = panel.answer();
                 if questionnaire.validate(&answer).is_ok() {
                     panel.submitting = true;
                     return Some(answer);
@@ -282,43 +351,60 @@ impl QuestionnairePanels {
         let Some(panel) = self.visible.as_ref().and_then(|key| self.drafts.get(key)) else {
             return;
         };
-        let question = &questionnaire.questions[0];
-        let mut lines = vec![
-            Line::styled(
-                if panel.review {
-                    "Review Answer"
-                } else {
-                    "Question 1 of 1"
-                },
-                theme.accent.primary,
-            ),
-            Line::from(question.text.clone()),
-        ];
+        let question = &questionnaire.questions[panel.current];
+        let draft = &panel.questions[panel.current];
+        let mut lines = Vec::new();
+        let navigation;
         if panel.review {
-            lines.push(Line::from(answer_text(
-                questionnaire,
-                panel.answer.as_ref(),
-            )));
-            lines.push(Line::from(if panel.submitting {
+            lines.push(Line::styled("Review Answer", theme.accent.primary));
+            for (index, (question, draft)) in questionnaire
+                .questions
+                .iter()
+                .zip(&panel.questions)
+                .enumerate()
+            {
+                lines.push(Line::from(format!("{}. {}", index + 1, question.text)));
+                lines.push(Line::from(answer_text(question, Some(&draft.answer()))));
+            }
+            navigation = if panel.submitting {
                 "Submitting…"
             } else {
-                "Ctrl+Enter submit · Up edit · Esc hide"
-            }));
+                "Ctrl+Enter submit · Shift+Tab back · Esc hide"
+            }
+            .to_owned();
         } else {
+            lines.push(Line::styled(
+                format!(
+                    "Question {} of {}",
+                    panel.current + 1,
+                    questionnaire.questions.len()
+                ),
+                theme.accent.primary,
+            ));
+            if let Some(title) = &question.title {
+                lines.push(Line::styled(title.clone(), theme.text.subdued));
+            }
+            if let Some(error) = &draft.error {
+                lines.push(Line::styled(error.clone(), theme.feedback.error));
+            }
+            lines.push(Line::from(question.text.clone()));
             for (index, choice) in question.choices.iter().enumerate() {
-                let selected = matches!(&panel.answer, Some(QuestionAnswer::Selected { choices }) if choices.contains(&choice.id));
+                let selected = draft.choices.contains(&choice.id);
+                let recommendation = if choice.recommended
+                    && !choice.label.to_ascii_lowercase().ends_with("(recommended)")
+                {
+                    " (recommended)"
+                } else {
+                    ""
+                };
                 lines.push(Line::styled(
                     format!(
                         "{} {}{}",
                         if selected { "[x]" } else { "[ ]" },
                         choice.label,
-                        if choice.recommended {
-                            " (recommended)"
-                        } else {
-                            ""
-                        }
+                        recommendation
                     ),
-                    if index == panel.cursor {
+                    if index == draft.cursor {
                         theme.selection.focused
                     } else if choice.recommended {
                         theme.accent.primary
@@ -326,25 +412,46 @@ impl QuestionnairePanels {
                         theme.text.primary
                     },
                 ));
+                if let Some(description) = &choice.description {
+                    lines.push(Line::styled(
+                        format!("    {description}"),
+                        theme.text.subdued,
+                    ));
+                }
             }
             if question.freeform {
+                let value = if question.secret && !draft.text.is_empty() {
+                    "••••••••"
+                } else {
+                    &draft.text
+                };
                 lines.push(Line::from(format!(
-                    "Text: {}",
-                    answer_text(questionnaire, panel.answer.as_ref())
-                        .trim_start_matches("Not answered")
+                    "{}: {value}",
+                    if question.combine_freeform {
+                        "Additional text"
+                    } else {
+                        "Text"
+                    }
                 )));
             }
-            if let Some(error) = &panel.error {
-                lines.push(Line::styled(error.clone(), theme.feedback.error));
-            }
-            lines.push(Line::from(
-                "↑/↓ choose · Space select · Enter review · Esc hide",
-            ));
+            navigation = format!(
+                "↑/↓ choose · Space select · Enter {} · Shift+Tab back{}",
+                if panel.current + 1 < questionnaire.questions.len() {
+                    "next"
+                } else {
+                    "review"
+                },
+                if !question.required {
+                    " · Ctrl+O omit"
+                } else {
+                    ""
+                }
+            );
         }
-        lines.push(Line::from(
-            "Ctrl+D decline · Hide panel, then Esc Esc to interrupt",
-        ));
-        let footer = lines.split_off(lines.len().saturating_sub(2));
+        let footer = vec![
+            Line::from(navigation),
+            Line::from("Ctrl+D decline · Esc hide · then Esc Esc to interrupt"),
+        ];
         let paragraph = Paragraph::new(lines)
             .style(theme.text.primary)
             .wrap(Wrap { trim: false });
@@ -395,16 +502,29 @@ impl QuestionnairePanels {
     }
 }
 
-pub(super) fn answer_text(
-    questionnaire: &Questionnaire,
-    answer: Option<&QuestionAnswer>,
-) -> String {
+pub(super) fn answer_text(question: &Question, answer: Option<&QuestionAnswer>) -> String {
+    let labels = |choices: &[String]| {
+        choices
+            .iter()
+            .map(|id| {
+                question
+                    .choices
+                    .iter()
+                    .find(|choice| &choice.id == id)
+                    .map_or(id.as_str(), |choice| choice.label.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     match answer {
         Some(QuestionAnswer::SecretAnswered) => "Answered (secret)".into(),
-        Some(_) if questionnaire.questions[0].secret => "••••••••".into(),
-        Some(QuestionAnswer::Selected { choices }) => choices.join(", "),
+        Some(QuestionAnswer::Omitted) | None => "Not answered".into(),
+        Some(_) if question.secret => "••••••••".into(),
+        Some(QuestionAnswer::Selected { choices }) => labels(choices),
+        Some(QuestionAnswer::SelectedWithFreeform { choices, text }) => {
+            format!("{}; {}", labels(choices), text)
+        }
         Some(QuestionAnswer::Freeform { text }) => text.clone(),
-        _ => "Not answered".into(),
     }
 }
 
@@ -424,9 +544,11 @@ pub(super) fn key(event: &Event) -> Option<CommandId> {
         (KeyCode::Esc, _) => QuestionnaireHide,
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => QuestionnaireDecline,
         (KeyCode::Enter, KeyModifiers::CONTROL) => QuestionnaireSubmit,
-        (KeyCode::Enter, _) => QuestionnaireReview,
-        (KeyCode::Up, _) => QuestionnairePrevious,
-        (KeyCode::Down, _) => QuestionnaireNext,
+        (KeyCode::Enter, _) | (KeyCode::Tab, _) => QuestionnaireNext,
+        (KeyCode::BackTab, _) => QuestionnaireBack,
+        (KeyCode::Char('o'), KeyModifiers::CONTROL) => QuestionnaireOmit,
+        (KeyCode::Up, _) => QuestionnaireChoicePrevious,
+        (KeyCode::Down, _) => QuestionnaireChoiceNext,
         (KeyCode::Char(' '), KeyModifiers::NONE) => QuestionnaireSelect,
         (KeyCode::Backspace, _) => return Some(CommandId::QuestionnaireDelete),
         (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {

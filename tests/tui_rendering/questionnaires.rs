@@ -43,6 +43,7 @@ fn questionnaire_panel_requires_explicit_answer_review_and_submit_and_preserves_
             }],
             multiple: false,
             freeform: true,
+            combine_freeform: false,
             secret: false,
             required: true,
         }],
@@ -175,6 +176,7 @@ fn withdrawn_questionnaire_discards_the_answer_draft_and_explains_the_outcome() 
                 choices: vec![],
                 multiple: false,
                 freeform: true,
+                combine_freeform: false,
                 secret: false,
                 required: true,
             }],
@@ -229,6 +231,7 @@ fn long_questions_can_be_scrolled_without_losing_the_review_actions() {
                 choices: vec![],
                 multiple: false,
                 freeform: true,
+                combine_freeform: false,
                 secret: false,
                 required: true,
             }],
@@ -277,6 +280,7 @@ fn selected_answers_have_compact_expandable_history_and_panel_keeps_transcript_n
             }],
             multiple: false,
             freeform: false,
+            combine_freeform: false,
             secret: false,
             required: true,
         }],
@@ -366,8 +370,178 @@ fn selected_answers_have_compact_expandable_history_and_panel_keeps_transcript_n
     invoke(&mut app, SemanticCommandId::TranscriptFoldsToggle);
     let expanded = rendered_application_rows(&app).join("\n");
     assert!(
-        expanded.contains("Which build target?") && expanded.contains("remote"),
+        expanded.contains("Which build target?") && expanded.contains("Remote"),
         "{expanded}"
+    );
+}
+
+#[test]
+fn batch_navigation_retains_edits_and_reviews_supported_multiple_selections_and_omission() {
+    let workspace = workspace_dir();
+    let mut app = connected_application(workspace.path());
+    let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
+    let choice = |id: &str, recommended| QuestionChoice {
+        id: id.into(),
+        label: id.into(),
+        description: Some(format!("About {id}")),
+        recommended,
+    };
+    let questionnaire = Questionnaire {
+        id: QuestionnaireId::new(),
+        questions: vec![
+            Question {
+                id: "environment".into(),
+                title: Some("Environment".into()),
+                text: "Which environment?".into(),
+                choices: vec![choice("Local", true), choice("Remote", false)],
+                multiple: false,
+                freeform: true,
+                combine_freeform: false,
+                secret: false,
+                required: true,
+            },
+            Question {
+                id: "checks".into(),
+                title: Some("Checks".into()),
+                text: "Which checks?".into(),
+                choices: vec![choice("Unit", false), choice("Integration", false)],
+                multiple: true,
+                freeform: true,
+                combine_freeform: true,
+                secret: false,
+                required: true,
+            },
+            Question {
+                id: "note".into(),
+                title: None,
+                text: "Any optional note?".into(),
+                choices: vec![],
+                multiple: false,
+                freeform: true,
+                combine_freeform: false,
+                secret: false,
+                required: false,
+            },
+        ],
+    };
+    let id = ActivityId::new();
+    snapshot.activities.push(Activity::Questionnaire {
+        id,
+        turn_id,
+        questionnaire: questionnaire.clone(),
+        outcome: QuestionnaireOutcome::Pending,
+        answer: None,
+    });
+    snapshot
+        .transcript
+        .push(TranscriptItem::Activity { activity_id: id });
+    app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+        snapshot.clone(),
+    )))
+    .unwrap();
+    invoke(&mut app, SemanticCommandId::QuestionnaireOpen);
+    let first = crate::support::rendered_application_rows_at(&app, 80, 28).join("\n");
+    assert!(
+        first.contains("Question 1 of 3")
+            && first.contains("[ ] Local (recommended)")
+            && first.contains("About Local")
+    );
+    invoke(&mut app, SemanticCommandId::QuestionnaireOmit);
+    key(&mut app, KeyCode::Enter);
+    assert!(
+        crate::support::rendered_application_rows_at(&app, 80, 28)
+            .join("\n")
+            .contains("Question 1 requires a supported answer")
+    );
+    key(&mut app, KeyCode::Char(' '));
+    key(&mut app, KeyCode::Tab);
+    assert!(
+        crate::support::rendered_application_rows_at(&app, 80, 28)
+            .join("\n")
+            .contains("Question 2 of 3")
+    );
+    key(&mut app, KeyCode::Enter);
+    assert!(
+        crate::support::rendered_application_rows_at(&app, 80, 28)
+            .join("\n")
+            .contains("Question 2 requires a supported answer")
+    );
+    key(&mut app, KeyCode::Char(' '));
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Char(' '));
+    type_terminal_text(&mut app, "Extra lint");
+    key(&mut app, KeyCode::BackTab);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Char(' '));
+    key(&mut app, KeyCode::Tab);
+    let second = crate::support::rendered_application_rows_at(&app, 80, 28).join("\n");
+    assert!(
+        second.contains("[x] Unit")
+            && second.contains("[x] Integration")
+            && second.contains("Additional text: Extra lint"),
+        "{second}"
+    );
+    key(&mut app, KeyCode::Down); // Choice navigation switches from text editing without dropping its draft.
+    key(&mut app, KeyCode::Char(' ')); // Remove Integration explicitly.
+    key(&mut app, KeyCode::Tab);
+    assert!(
+        crate::support::rendered_application_rows_at(&app, 80, 28)
+            .join("\n")
+            .contains("Ctrl+O omit")
+    );
+    invoke(&mut app, SemanticCommandId::QuestionnaireOmit);
+    key(&mut app, KeyCode::Enter);
+    let review = crate::support::rendered_application_rows_at(&app, 80, 28).join("\n");
+    assert!(
+        review.contains("Review Answer")
+            && review.contains("Which environment?")
+            && review.contains("Remote")
+            && review.contains("Which checks?")
+            && review.contains("Unit; Extra lint")
+            && review.contains("Any optional note?"),
+        "{review}"
+    );
+    let ApplicationTransition::SubmitQuestionnaire {
+        submission: QuestionnaireSubmission::Answer { answer },
+        ..
+    } = invoke(&mut app, SemanticCommandId::QuestionnaireSubmit)
+    else {
+        panic!("whole batch submitted after review")
+    };
+    assert_eq!(
+        answer.questions,
+        vec![
+            QuestionAnswer::Selected {
+                choices: vec!["Remote".into()]
+            },
+            QuestionAnswer::SelectedWithFreeform {
+                choices: vec!["Unit".into()],
+                text: "Extra lint".into()
+            },
+            QuestionAnswer::Omitted
+        ]
+    );
+    let Activity::Questionnaire {
+        outcome,
+        answer: stored,
+        ..
+    } = snapshot.activities.last_mut().unwrap()
+    else {
+        unreachable!()
+    };
+    *outcome = QuestionnaireOutcome::Answered;
+    *stored = Some(answer);
+    app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
+        .unwrap();
+    invoke(&mut app, SemanticCommandId::TranscriptFoldsToggle);
+    let history = crate::support::rendered_application_rows_at(&app, 80, 28).join("\n");
+    assert!(
+        history.contains("3 question(s)")
+            && history.contains("Which environment?")
+            && history.contains("Which checks?")
+            && history.contains("Any optional note?")
+            && history.contains("Unit; Extra lint"),
+        "{history}"
     );
 }
 
@@ -390,6 +564,7 @@ fn add_request(
                 choices: vec![],
                 multiple: false,
                 freeform: true,
+                combine_freeform: false,
                 secret: false,
                 required: true,
             }],

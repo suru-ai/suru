@@ -2256,7 +2256,7 @@ fn render_activity(
                         .and_then(|answer| answer.questions.get(index));
                     projection.lines.push(Line::from(format!(
                         "    {}",
-                        super::questionnaire::answer_text(questionnaire, value)
+                        super::questionnaire::answer_text(question, value)
                     )));
                 }
             }

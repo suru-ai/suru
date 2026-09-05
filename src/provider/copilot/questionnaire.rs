@@ -100,6 +100,7 @@ impl UserInputHandler for CopilotQuestionnaires {
                     .collect(),
                 multiple: false,
                 freeform: allow_freeform.unwrap_or(true),
+                combine_freeform: false,
                 secret: false,
                 required: true,
             }],

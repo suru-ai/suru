@@ -70,9 +70,11 @@ const TASK_COMPLETED_STATUS: &str = "completed";
 pub(super) fn provider_events(
     messages: mpsc::UnboundedReceiver<Result<Value, ProviderError>>,
     turn: Arc<TurnInFlight>,
+    questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
 ) -> ProviderEventStream {
     Box::pin(stream::unfold(
         EventReceiver {
+            questionnaires,
             messages,
             projection: ClaudeProjection::new(turn),
             pending: VecDeque::new(),
@@ -82,6 +84,7 @@ pub(super) fn provider_events(
 }
 
 struct EventReceiver {
+    questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
     messages: mpsc::UnboundedReceiver<Result<Value, ProviderError>>,
     projection: ClaudeProjection,
     pending: VecDeque<Result<AttributedProviderEvent, ProviderError>>,
@@ -99,11 +102,42 @@ async fn next_provider_event(
         }
         let message = events.messages.recv().await?;
         match message {
-            Err(error) => return Some((Err(error), events)),
-            Ok(message) => match events.projection.project(message) {
-                Ok(projected) => events.pending.extend(projected.into_iter().map(Ok)),
-                Err(error) => events.pending.push_back(Err(error)),
-            },
+            Err(error) => {
+                events.questionnaires.clear();
+                return Some((Err(error), events));
+            }
+            Ok(message) => {
+                match events.questionnaires.receive(&message).await {
+                    Ok(Some(projected)) => {
+                        events
+                            .pending
+                            .extend(projected.into_iter().map(|event| Ok(event.into())));
+                        continue;
+                    }
+                    Err(error) => {
+                        events.pending.push_back(Err(error));
+                        continue;
+                    }
+                    Ok(None) => {}
+                }
+                match events.projection.project(message) {
+                    Ok(projected) => {
+                        if projected.iter().any(|event| {
+                            event.attribution == ProviderEventAttribution::OwningSession
+                                && matches!(
+                                    event.event,
+                                    ProviderEvent::TurnCompleted
+                                        | ProviderEvent::TurnInterrupted
+                                        | ProviderEvent::TurnFailed { .. }
+                                )
+                        }) {
+                            events.questionnaires.clear();
+                        }
+                        events.pending.extend(projected.into_iter().map(Ok));
+                    }
+                    Err(error) => events.pending.push_back(Err(error)),
+                }
+            }
         }
     }
 }

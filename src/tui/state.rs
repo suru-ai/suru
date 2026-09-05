@@ -4470,10 +4470,13 @@ impl Application {
                     Ok(ApplicationTransition::Continue)
                 }
             }
-            SemanticCommandId::QuestionnaireScrollUp
-            | SemanticCommandId::QuestionnaireScrollDown
-            | SemanticCommandId::QuestionnairePrevious
+            SemanticCommandId::QuestionnaireBack
             | SemanticCommandId::QuestionnaireNext
+            | SemanticCommandId::QuestionnaireOmit
+            | SemanticCommandId::QuestionnaireScrollUp
+            | SemanticCommandId::QuestionnaireScrollDown
+            | SemanticCommandId::QuestionnaireChoicePrevious
+            | SemanticCommandId::QuestionnaireChoiceNext
             | SemanticCommandId::QuestionnaireSelect
             | SemanticCommandId::QuestionnaireReview
             | SemanticCommandId::QuestionnaireSubmit => {

@@ -136,8 +136,10 @@ pub(super) async fn start_claude_session(
 
     let (conversation, messages) = tokio::sync::mpsc::unbounded_channel();
     let turn = TurnInFlight::new();
-    let events = provider_events(messages, turn.clone());
+    let questionnaires = Arc::new(super::questionnaire::ClaudeQuestionnaires::default());
+    let events = provider_events(messages, turn.clone(), questionnaires.clone());
     let session = Arc::new(ClaudeSession {
+        questionnaires,
         executable,
         processes,
         workspace: request.workspace,
@@ -206,6 +208,7 @@ async fn default_selection(
 }
 
 struct ClaudeSession {
+    questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
     executable: OsString,
     processes: ProcessRegistry,
     workspace: PathBuf,
@@ -283,6 +286,19 @@ impl ClaudeSession {
 }
 
 impl ProviderSession for ClaudeSession {
+    fn submit_questionnaire(
+        &self,
+        id: crate::protocol::QuestionnaireId,
+        submission: crate::protocol::QuestionnaireSubmission,
+    ) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            if !self.turn.is_running() {
+                return Err(no_live_turn("answer"));
+            }
+            self.questionnaires.submit(id, submission).await
+        })
+    }
+
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             const CONTEXT: &str = "Claude Turn startup failed";
@@ -327,6 +343,7 @@ impl ProviderSession for ClaudeSession {
                 .map_err(|error| claude_error_context(launch_context, error))?;
                 // The conversation is the CLI's to keep from here on, so every later child resumes
                 // it rather than asking for it to be minted again.
+                self.questionnaires.connect(transport.clone());
                 slot.next_spawn = ProviderSessionSpawn::Resume;
                 slot.running = Some(ClaudeChild {
                     transport,
@@ -399,6 +416,7 @@ impl ProviderSession for ClaudeSession {
             // background work goes first. The Turn settles on the terminal result that follows,
             // not on this acknowledgement — which is why an unanswered interrupt is bounded here
             // rather than left to the loop to end.
+            self.questionnaires.clear();
             self.stop_background_tasks(&transport).await;
             transport
                 .control_request(
@@ -430,6 +448,7 @@ impl ProviderSession for ClaudeSession {
                 slot.running.as_ref().map(|child| child.transport.clone())
             };
             if let Some(transport) = transport {
+                self.questionnaires.clear();
                 self.stop_background_tasks(&transport).await;
             }
             Ok(())
@@ -471,6 +490,7 @@ impl ProviderSession for ClaudeSession {
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             self.shutdown_started.store(true, Ordering::Release);
+            self.questionnaires.clear();
             let slot = self.child.lock().await;
             let Some(child) = slot.running.as_ref() else {
                 return Ok(());
@@ -497,6 +517,8 @@ fn spawn_args(
     let mut args: Vec<OsString> = [
         "--include-partial-messages",
         "--dangerously-skip-permissions",
+        "--permission-prompt-tool",
+        "stdio",
         spawn.identity_flag(),
         provider_session_id,
     ]
@@ -555,6 +577,9 @@ mod tests {
             processes.set_exit_grace(Duration::from_millis(200));
             let (conversation, _messages) = tokio::sync::mpsc::unbounded_channel();
             Arc::new(ClaudeSession {
+                questionnaires: Arc::new(
+                    crate::provider::claude::questionnaire::ClaudeQuestionnaires::default(),
+                ),
                 executable: executable.into(),
                 processes,
                 workspace: directory.path().to_owned(),
@@ -686,6 +711,8 @@ mod tests {
             [
                 "--include-partial-messages",
                 "--dangerously-skip-permissions",
+                "--permission-prompt-tool",
+                "stdio",
                 "--session-id",
                 "11111111-2222-3333-4444-555555555555",
                 "--model",
@@ -706,7 +733,7 @@ mod tests {
         )
         .expect("a resuming spawn lowers");
         assert_eq!(
-            args[2..4],
+            args[4..6],
             ["--resume", "11111111-2222-3333-4444-555555555555"].map(OsString::from),
             "the child continues the conversation rather than asking for a new one: {args:?}"
         );

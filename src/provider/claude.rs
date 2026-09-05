@@ -28,6 +28,7 @@ mod availability;
 mod catalog;
 mod errand;
 mod projection;
+mod questionnaire;
 mod runtime;
 mod session;
 mod skills;
